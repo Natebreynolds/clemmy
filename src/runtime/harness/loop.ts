@@ -7,14 +7,17 @@ import { clearRunInFlightAfterTerminal } from './restart-recovery.js';
 import { uncompensatedExternalWriteEvents } from './external-write-admission.js';
 import {
   acceptUserInputForRun,
+  appendConversationPreambleOnce,
   appendAsyncWorkDispatchBatchClosedOnce,
   appendAsyncWorkDispatchedOnce,
   appendEvent,
   clearKill,
   getActiveRunAttempt,
+  getRunAttemptSourceUserEvent,
   getLatestCanonicalTopLevelToolEvent,
   getLatestRunAttempt,
   getSession,
+  getToolOutput,
   isKillRequested,
   listEvents,
   listPendingAsyncWorkDispatchBatchClosedEvents,
@@ -27,6 +30,7 @@ import {
   type KillRequestTarget,
   type SessionRow,
 } from './eventlog.js';
+import { autonomousSendConsentPresentation } from './autonomous-send-consent.js';
 import { destinationCardSuffix } from './destination-gate.js';
 import {
   assertNotKilled,
@@ -54,6 +58,7 @@ import { windowScaleForModel } from './model-window-observations.js';
 import {
   pullRecentTurnsForHarnessHistory,
   renderRecentActionsForHarnessHistory,
+  renderSessionHistoryForModel,
   renderTranscriptTurns,
 } from './session-transcript.js';
 import { selectReasoningEffort, dynamicReasoningEnabled, continuationClassifyEnabled } from './reasoning-effort.js';
@@ -64,8 +69,10 @@ import { recordPromptComposition, summarizePromptComposition } from './prompt-co
 import {
   renderTurnOpennessForContext,
   resolveTurnOpenness,
+  turnOpennessBrainFamily,
   turnOpennessEnabled,
   turnOpennessWarranted,
+  type TurnOpenness,
 } from './turn-openness.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import { boundAgentMcpToolScope } from '../mcp-tool-authority.js';
@@ -93,6 +100,7 @@ import {
   commitTurnOutcome,
   deliveryMustHoldForHuman,
 } from './delivery-committer.js';
+import { auditAcceptedSourceSettlementTruth } from './accepted-source-settlement-audit.js';
 import {
   repairActionTerminalBeforeCommit,
   repairTerminalPresentation,
@@ -102,6 +110,7 @@ import { createAgentsTerminalPresentationRepairPort } from './terminal-presentat
 import {
   evaluateTerminalDelivery,
   type TerminalDeliveryJudgePort,
+  type TerminalDeliveryRecoveryCapability,
 } from './terminal-delivery-judge.js';
 import {
   turnOutcomeId,
@@ -199,8 +208,17 @@ import {
 } from './run-token-budget.js';
 import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
 import { withModelUsageAttribution } from '../usage-log.js';
-import type { TaskContinuationContext } from '../../types.js';
-import { effectiveTurnObjective } from './turn-control.js';
+import type {
+  ConversationPreambleDeliveryCallback,
+  TaskContinuationContext,
+} from '../../types.js';
+import { classifyTurnPreflight, effectiveTurnObjective } from './turn-control.js';
+import {
+  createAgentsPreflightConversationPort,
+  publishPreflightConversation,
+  startSettledPreflightConversationAuthor,
+  type PreflightConversationPort,
+} from './preflight-conversation.js';
 import { recordTurnGraphShadow, turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 // Lane wiring: the callable-surface oracle serves exact local schemas on this
 // lane (guardrail mandates are constructible only from proof).
@@ -210,7 +228,12 @@ import { requireKnownExpectedWorkContract } from './expected-work-contract.js';
 import { requireActionExpectedWorkActivation } from './action-expected-work-boundary.js';
 import { driveChatTurnSpine } from '../graph/chat-turn-spine.js';
 import { getProactivityPolicySnapshot } from '../../agents/proactivity-policy.js';
-import { claimGroundingNudge, extractDeliverablePointers, ungroundedPointers } from './claim-grounding.js';
+import {
+  claimGroundingNudge,
+  extractDeliverablePointers,
+  recallReadCallIdsForSource,
+  ungroundedPointers,
+} from './claim-grounding.js';
 import {
   getArtifactRootForSourceUserSeq,
   latestPendingArtifactRootForSession,
@@ -286,6 +309,19 @@ import {
   sameExactOriginDeliveryTarget,
 } from '../exact-origin-delivery.js';
 
+/** Deterministic floor for the judge's RESUME verb: a loop that has spent its
+ * final step cannot truthfully promise another in-run recovery turn. */
+function terminalRecoveryCapability(
+  stepIndex: number,
+  maxSteps: number,
+): TerminalDeliveryRecoveryCapability {
+  return {
+    liveContinuation: stepIndex < maxSteps,
+    toolsAvailable: true,
+    externalStateInspection: true,
+  };
+}
+
 /**
  * Wrap appendEvent so a transient SQLite write failure (lock, disk
  * full, etc.) inside the loop logs an error instead of unwinding the
@@ -326,6 +362,17 @@ function turnDispatchedBackgroundRun(sessionId: string, turn?: number): boolean 
     }
   } catch { /* evidence read is best-effort; absent = no salvage */ }
   return false;
+}
+
+function latestEffectiveCalledToolName(sessionId: string, turn: number): string {
+  try {
+    for (const event of listEvents(sessionId, { types: ['tool_called'], desc: true, limit: 200 })) {
+      if (event.turn !== turn) continue;
+      const toolName = effectiveCalledToolName(event.data);
+      if (toolName) return toolName;
+    }
+  } catch { /* exact control-receipt classification fails closed */ }
+  return '';
 }
 
 function safeAppend(input: AppendEventInput): void {
@@ -650,6 +697,7 @@ function reduceStandardConversationTerminal(input: {
   let outcome: TurnOutcome;
   let legacyReason: string;
   let reducedStatus = result.status;
+  let failureDetail: string | undefined;
   let transferredToTaskId: string | undefined;
   switch (result.status) {
     case 'dispatched':
@@ -793,6 +841,20 @@ function reduceStandardConversationTerminal(input: {
         presentation: { kind: 'error', text: PUBLIC_RUN_FAILURE_TEXT },
       };
       legacyReason = 'failed';
+      // The user-facing text stays generic; the terminal EVENT names the
+      // failure so diagnosis is one glance instead of a run_failed hunt
+      // (live 2026-08-12: an approve-turn's wall error surfaced only as
+      // "Something went wrong").
+      try {
+        const lastFailure = listEvents(result.sessionId, {
+          types: ['run_failed'],
+          desc: true,
+          limit: 1,
+        })[0];
+        if (typeof lastFailure?.data.error === 'string' && lastFailure.data.error) {
+          failureDetail = lastFailure.data.error.replace(/\s+/g, ' ').slice(0, 300);
+        }
+      } catch { /* advisory metadata only */ }
       break;
   }
 
@@ -802,6 +864,7 @@ function reduceStandardConversationTerminal(input: {
       steps: result.steps,
       ...(result.limitKind ? { limitKind: result.limitKind } : {}),
       ...(transferredToTaskId ? { transferredToTaskId } : {}),
+      ...(failureDetail ? { failureDetail } : {}),
     },
   });
   return { ...result, status: reducedStatus, publicPresentation: committed.presentation };
@@ -840,6 +903,27 @@ function commitStandardNeedsInputTerminal(input: {
       };
   return commitTurnOutcome(outcome, {
     ...(input.legacyReason ? { legacyReason: input.legacyReason } : {}),
+    metadata: input.metadata,
+  }).presentation;
+}
+
+function commitStandardTransferredTerminal(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  turn: number;
+  text: string;
+  metadata?: Record<string, unknown>;
+}): PresentationEvent {
+  const identity = standardTurnIdentity(input);
+  return commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'transferred',
+    resumable: false,
+    presentation: { kind: 'transferred', text: input.text },
+  }, {
+    legacyReason: 'transferred',
     metadata: input.metadata,
   }).presentation;
 }
@@ -950,6 +1034,16 @@ function parkForPendingStandardArtifacts(input: {
         question,
         options: ['Retry verification', 'Stop'],
         source: 'artifact_verification_pending',
+        // The accepted source is the awaiting row's STRONG identity. Without
+        // it, continuity minting falls back to matching the display turn
+        // counter, which legitimately differs from the loop's internal step
+        // counter — a mismatch that silently skipped packet minting for a
+        // real clarifying question (live 2026-08-12, seq 44039: awaiting
+        // turn 5 vs terminal turn 1 → no packet → the answer turn inherited
+        // nothing).
+        ...(Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
+          ? { sourceUserSeq: input.sourceUserSeq }
+          : {}),
         artifactRunScopeId: state.rootScopeId,
         pendingArtifacts: exactResources,
       },
@@ -1690,7 +1784,18 @@ function registerAndEmitApprovals(
     const baseSubject = extractApprovalSubject(interruption);
     const groundingNote = recipientGroundingNote(options.sessionId, interruption);
     const subject = groundingNote ? `${baseSubject}\n${groundingNote}` : baseSubject;
+    const activeAttempt = getActiveRunAttempt(options.sessionId);
+    const acceptedSource = activeAttempt ? getRunAttemptSourceUserEvent(activeAttempt) : null;
+    const presentation = acceptedSource
+      ? autonomousSendConsentPresentation(
+          interruption.toolName,
+          approvalArgs ?? {},
+          pendingActionSnapshot,
+          { source: acceptedSource },
+        )
+      : null;
     let approvalId: string | null = null;
+    let approvalPresentation: approvalRegistry.PendingApprovalRow['presentation'] = null;
     try {
       const authority = {
         approvalId: '',
@@ -1713,8 +1818,10 @@ function registerAndEmitApprovals(
         subject,
         tool: interruption.toolName,
         args: approvalArgs ?? null,
+        presentation,
       });
       approvalId = row.approvalId;
+      approvalPresentation = row.presentation;
       // Fan out to the notification delivery queue so every enabled
       // destination (Discord DMs, web_push subscriptions on the mobile
       // PWA, generic webhooks) hears about the new approval. The
@@ -1723,7 +1830,7 @@ function registerAndEmitApprovals(
       // approval don't spam.
       if (!existingExact) {
         try {
-          addNotification({
+          if (!row.presentation) addNotification({
             id: `approval-${row.approvalId}`,
             kind: 'approval',
             title: 'Approval pending',
@@ -1769,7 +1876,9 @@ function registerAndEmitApprovals(
       });
     }
     if (approvalId) approvalIds.push(approvalId);
-    safeAppend({
+    const approvalEvent = (() => {
+      try {
+        return appendEvent({
       sessionId: options.sessionId,
       turn: options.turn,
       role: 'Clem',
@@ -1784,8 +1893,29 @@ function registerAndEmitApprovals(
           ?? pendingActionApprovalViewFromArgs(approvalArgs),
         approvalId, // null when registry write failed; consumers fall
                     // back to old "single pending approval" routing.
+        ...(approvalPresentation ? {
+          approvalPresentation: 'conversation',
+          question: approvalPresentation.question,
+        } : {}),
       },
-    });
+        });
+      } catch (err) {
+        console.error('[harness] failed to write approval_requested event', {
+          sessionId: options.sessionId,
+          err: normalizeError(err),
+        });
+        return null;
+      }
+    })();
+    if (approvalEvent && approvalPresentation && approvalId) {
+      try {
+        approvalRegistry.bindConversationalApprovalPrompt({
+          approvalId,
+          promptEventId: approvalEvent.id,
+          promptEventSeq: approvalEvent.seq,
+        });
+      } catch { /* an unbound question remains unanswerable and formal-recoverable */ }
+    }
   }
   return approvalIds;
 }
@@ -2035,6 +2165,10 @@ export interface RunTurnOptions {
   makeRunner?: () => Runner;
   /** Test injection: run the Runner. Defaults to a real runner.run(). */
   runRunner?: RunRunnerFn;
+  /** Test injection for the structural one-turn/no-tool alignment author. */
+  preflightConversationPort?: PreflightConversationPort;
+  /** Awaited transport delivery for the nonterminal pre-execution prose. */
+  onConversationPreamble?: ConversationPreambleDeliveryCallback;
   /** @deprecated Raw executor deltas are private. Retained temporarily for API
    * compatibility; terminal delivery occurs through committed public events. */
   onChunk?: (delta: string) => void | Promise<void>;
@@ -2042,6 +2176,12 @@ export interface RunTurnOptions {
    *  harness's own synthetic re-prompts (judge/stall/grounding/YOLO). Only the
    *  first turn carries a real user message. (2026-06-23 fact-pollution fix.) */
   suppressMemoryCapture?: boolean;
+  /** This physical turn was authored by the runtime to continue the SAME
+   * accepted request. It may execute under the retained source authority, but
+   * it is not a new conversational opening and must never re-run preflight.
+   * Provider fallover retries deliberately leave this false: they replay the
+   * same physical user turn and reuse its already-persisted preamble. */
+  internalContinuation?: boolean;
   /** See RunConversationOptions.reuseRecordedUserInput. */
   reuseRecordedUserInput?: boolean;
   /** Exact accepted source event owned by this logical user request. */
@@ -2217,6 +2357,10 @@ export interface RunConversationOptions {
   makeRunner?: () => Runner;
   /** Test injection. */
   runRunner?: RunRunnerFn;
+  /** Test injection for the structural one-turn/no-tool alignment author. */
+  preflightConversationPort?: PreflightConversationPort;
+  /** Awaited transport delivery for the nonterminal pre-execution prose. */
+  onConversationPreamble?: ConversationPreambleDeliveryCallback;
   /** Test injection for the one sealed text-only presentation repair. Live
    * callers omit this and reuse the active brain model with no tools/history. */
   terminalPresentationRepairPort?: TerminalPresentationRepairPort;
@@ -4186,6 +4330,7 @@ async function runConversationCore(
       // A fallover re-attempt re-runs the SAME step → its input is already
       // recorded + captured, so suppress both regardless of stepIndex.
       suppressMemoryCapture: stepIndex > 1 || falloverReattempt,
+      internalContinuation: stepIndex > 1,
       reuseRecordedUserInput: falloverReattempt
         ? true
         : (stepIndex === 1 ? options.reuseRecordedUserInput : false),
@@ -4197,6 +4342,8 @@ async function runConversationCore(
       toolCallsPerTurn,
       makeRunner: options.makeRunner,
       runRunner: options.runRunner,
+      preflightConversationPort: options.preflightConversationPort,
+      onConversationPreamble: options.onConversationPreamble,
       // Defer the infra ask only while another brain is still available to try.
       deferInfraAsk: canStillFallover,
       mcpToolScope: options.mcpToolScope,
@@ -4485,6 +4632,7 @@ async function runConversationCore(
           deliveryConcern: reconciliationConcern,
           settlementAudit: terminalAssessment.settlementAudit,
           priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+          recoveryCapability: terminalRecoveryCapability(stepIndex, maxSteps),
         }, {
           ...(options.terminalDeliveryJudgePort
             ? { port: options.terminalDeliveryJudgePort }
@@ -4951,6 +5099,9 @@ async function runConversationCore(
             options: STALL_FLOOR_OPTIONS,
             source: 'stall_recovery',
             signal: structuredStallInfo.signal,
+            ...(Number.isSafeInteger(activeSourceUserSeq) && (activeSourceUserSeq ?? 0) > 0
+              ? { sourceUserSeq: activeSourceUserSeq }
+              : {}),
           },
         });
         commitStandardPauseTerminal({
@@ -5420,6 +5571,9 @@ async function runConversationCore(
               options: STALL_FLOOR_OPTIONS,
               source: 'stall_recovery',
               signal: stallInfo?.signal ?? null,
+              ...(Number.isSafeInteger(activeSourceUserSeq) && (activeSourceUserSeq ?? 0) > 0
+                ? { sourceUserSeq: activeSourceUserSeq }
+                : {}),
             },
           });
           commitStandardPauseTerminal({
@@ -5601,6 +5755,40 @@ async function runConversationCore(
           nextAction: decision.nextAction,
         },
       });
+    }
+    // A successful dispatch control receipt is the durable foreground result:
+    // execution ownership moved to the child, whose lifecycle is separate.
+    // Re-running completion/delivery judges here makes the parent poll work it
+    // no longer owns and can feed their synthetic recovery prose back through
+    // the accepted turn. The exact-current-turn tool call proves which control
+    // action produced this receipt; failed dispatches never carry the marker.
+    if (
+      doneStands
+      && decision.nextAction === 'completed'
+      && decision.controlReceipt === true
+      && latestEffectiveCalledToolName(options.sessionId, turnResult.turn) === 'dispatch_background_task'
+    ) {
+      const transferText = publicReplyText(decision.reply, '')
+        || publicReplyText(decision.summary, '');
+      const publicPresentation = commitStandardTransferredTerminal({
+        sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
+        turn: turnResult.turn,
+        text: transferText,
+        metadata: {
+          steps: stepIndex,
+          reason: 'background_dispatch_control_receipt',
+          controlReceipt: true,
+        },
+      });
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+        publicPresentation,
+      };
     }
     if (doneStands) {
       // Goal contract (Phase 3): a session with an ACTIVE parked goal
@@ -6349,6 +6537,25 @@ async function runConversationCore(
               candidates,
               { readOrComputeOnly: true },
             ).map((row) => row.output);
+            // Bytes the model re-read THIS RUN are observed by definition.
+            // Recall outputs are presentation-only for authority resolution
+            // and would be refused above, but a reply quoting freshly
+            // recalled content is exactly NOT a hallucinated pointer — the
+            // one thing this judge exists to catch (live 2026-08-12: the
+            // user's requested draft, quoted from an 8.5KB recall, bounced
+            // as ungrounded).
+            if (Number.isSafeInteger(activeSourceUserSeq) && (activeSourceUserSeq ?? 0) > 0) {
+              for (const recallCallId of recallReadCallIdsForSource(
+                listEvents(options.sessionId, {
+                  types: ['tool_called'],
+                  sinceSeq: activeSourceUserSeq as number,
+                }),
+                activeSourceUserSeq as number,
+              )) {
+                const recalled = getToolOutput(options.sessionId, recallCallId);
+                if (recalled?.output) evidence.push(recalled.output);
+              }
+            }
             return claimGroundingNudge(ungroundedPointers(pointers, evidence));
           } catch { return null; }
         })();
@@ -6518,6 +6725,7 @@ async function runConversationCore(
             deliveryConcern: concern,
             settlementAudit: assessment.settlementAudit,
             priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+            recoveryCapability: terminalRecoveryCapability(stepIndex, maxSteps),
           }, {
             ...(options.terminalDeliveryJudgePort
               ? { port: options.terminalDeliveryJudgePort }
@@ -6810,7 +7018,13 @@ async function runConversationCore(
           turn: turnResult.turn,
           role: 'Clem',
           type: 'awaiting_user_input',
-          data: { question, source: 'decision_awaiting' },
+          data: {
+            question,
+            source: 'decision_awaiting',
+            ...(Number.isSafeInteger(activeSourceUserSeq) && (activeSourceUserSeq ?? 0) > 0
+              ? { sourceUserSeq: activeSourceUserSeq }
+              : {}),
+          },
         });
       }
       // A goal session yielding for input is a check-in/blocker — record it so
@@ -8018,7 +8232,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     // stall-retry boilerplate must not trip it mid-run (turn-control review).
     suppressConfirmBeat: options.input === CONTINUATION_INPUT
       || Boolean(syntheticRetryOriginalInput)
-      || Boolean(options.semanticTaskInput),
+      || Boolean(options.semanticTaskInput)
+      || options.internalContinuation === true,
     suppressSemanticEnrichment: declinedContinuation,
     declinedParentWithNewTask,
     sourceUserSeq,
@@ -8031,15 +8246,71 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     },
   });
   const contextPacket = canonicalContext.turn;
+  let preparedPreflight: {
+    identity: TurnIdentity;
+    decision: ReturnType<typeof classifyTurnPreflight>;
+    conversationContext: string;
+    memoryContext: string;
+    capabilityContext: string;
+    port: PreflightConversationPort;
+    settledProceedAuthor?: Promise<string>;
+  } | null = null;
+  if (options.internalContinuation !== true && contextPacket.preflightPhase === 'align') {
+    if (Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0) {
+      const exactSourceUserSeq = sourceUserSeq as number;
+      const authorityInput = declinedContinuation
+        ? options.taskContinuation!.answer
+        : declinedParentWithNewTask
+          ? options.taskContinuation!.activeTaskInput ?? semanticInput
+          : (options.authoritativeUserInput
+            ?? syntheticRetryOriginalInput
+            ?? options.input);
+      const decision = classifyTurnPreflight({
+        message: authorityInput,
+        sessionId: options.sessionId,
+        sessionKind: session.sessionRow.kind,
+        isMultiItem: contextPacket.multiItem.detected,
+        itemCount: contextPacket.multiItem.itemCount,
+        sourceUserSeq: exactSourceUserSeq,
+      });
+      const activeModel = (options.agent as { model?: string | Model }).model ?? MODELS.primary;
+      const prepared = {
+        identity: {
+          sessionId: options.sessionId,
+          turn,
+          sourceUserSeq: exactSourceUserSeq,
+        },
+        decision,
+        conversationContext: renderSessionHistoryForModel(
+          options.sessionId,
+          8,
+          8_000,
+          exactSourceUserSeq,
+        ),
+        memoryContext: turnMemoryPrimer.text ?? '',
+        capabilityContext: renderCapabilityResolutionForContext(
+          contextPacket.capabilityResolution,
+          { focusInput: authorityInput },
+        ),
+        port: options.preflightConversationPort
+          ?? createAgentsPreflightConversationPort({ model: activeModel }),
+      };
+      preparedPreflight = {
+        ...prepared,
+        settledProceedAuthor: startSettledPreflightConversationAuthor(prepared),
+      };
+    }
+  }
   // WHAT IS STILL OPEN (parity with the Claude lane — one surface, both
   // brains). A separate cross-family pass over the readings of this request,
   // gated on the runtime's own resolved capabilities rather than on the
   // grammar of the sentence. Fail-open and time-boxed: it may inform this turn,
   // never delay or break it.
-  let opennessBlock = '';
+  let turnOpenness: TurnOpenness | null = null;
   if (
     session.sessionRow.kind === 'chat'
     && !declinedContinuation
+    && options.internalContinuation !== true
     && turnOpennessEnabled()
     // Either signal suffices — see the Claude lane for the live miss this
     // fixes. A consequential turn with no proven capability history is the
@@ -8048,16 +8319,20 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       || turnOpennessWarranted(contextPacket.capabilityResolution.entries))
   ) {
     try {
-      opennessBlock = renderTurnOpennessForContext(await resolveTurnOpenness({
+      turnOpenness = await resolveTurnOpenness({
         message: classifierInput,
+        brainFamily: turnOpennessBrainFamily(routedModelIdForBudget ?? MODELS.primary),
         capabilityBlock: renderCapabilityResolutionForContext(contextPacket.capabilityResolution),
         memoryBlock: turnMemoryPrimer.text ?? '',
-        deterministicOpen: contextPacket.preflightDestinationInstanceUnstated && contextPacket.preflightDestination
-          ? [`which ${contextPacket.preflightDestination} account/instance to use — you have more than one and none was named`]
-          : [],
-      }));
-    } catch { opennessBlock = ''; }
+      });
+    } catch { turnOpenness = null; }
   }
+  const opennessBlock = renderTurnOpennessForContext(turnOpenness);
+  // Filled only after a settled alignment has been durably published. The
+  // ordinary execution model sees the exact opening as private continuity so
+  // it continues the same conversation instead of repeating it or asking for
+  // generic permission a second time.
+  let sameTurnPreamble = '';
   safeAppend({
     sessionId: options.sessionId,
     turn,
@@ -8164,7 +8439,14 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // Observation only — this reads what is already being sent.
       recordPromptComposition(options.sessionId, 'codex', summarizePromptComposition({
         instructions: value.instructions ?? '',
-        contextPacket: [contextPacket.text, opennessBlock, options.continuationSteer]
+        contextPacket: [
+          contextPacket.text,
+          opennessBlock,
+          sameTurnPreamble
+            ? `[pre-execution opening already delivered for this exact request]\n${sameTurnPreamble}\nContinue the requested work now; do not repeat this opening or ask for generic permission.`
+            : '',
+          options.continuationSteer,
+        ]
           .filter(Boolean).join('\n\n'),
         currentMessage: typeof options.input === 'string' ? options.input : '',
       }), sourceUserSeq);
@@ -8228,7 +8510,14 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         ...toolPromptComponents,
       };
 
-      const contextPacketText = [contextPacket.text, opennessBlock, options.continuationSteer]
+      const contextPacketText = [
+        contextPacket.text,
+        opennessBlock,
+        sameTurnPreamble
+          ? `[pre-execution opening already delivered for this exact request]\n${sameTurnPreamble}\nContinue the requested work now; do not repeat this opening or ask for generic permission.`
+          : '',
+        options.continuationSteer,
+      ]
         .filter(Boolean).join('\n\n');
       if (contextPacketText) {
         promptComponents.contextPacket = estimateTokens(contextPacketText);
@@ -8368,6 +8657,66 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   }
 
   try {
+    if (options.internalContinuation !== true && contextPacket.preflightPhase === 'align') {
+      if (!preparedPreflight) {
+        if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
+          throw new Error('Structural preflight alignment requires an exact accepted user source.');
+        }
+        throw new Error('Structural preflight alignment was not prepared before openness resolution.');
+      }
+      const exactSourceUserSeq = preparedPreflight.identity.sourceUserSeq;
+      const disposition = await publishPreflightConversation({
+        ...preparedPreflight,
+        openness: turnOpenness,
+        transport: 'openai_agents_harness',
+      });
+      if (disposition.kind === 'ask') {
+        bumpTurnNumber(options.sessionId, turn);
+        return {
+          sessionId: options.sessionId,
+          turn,
+          status: 'awaiting_user_input',
+          finalOutput: disposition.presentation.text,
+          toolCalls: 0,
+        };
+      }
+      if (disposition.preamble) {
+        const persisted = appendConversationPreambleOnce({
+          source: acceptedUserEvent(options.sessionId, exactSourceUserSeq),
+          text: disposition.preamble,
+          ...(preparedPreflight.decision.intentKey
+            ? { intentKey: preparedPreflight.decision.intentKey }
+            : {}),
+        });
+        sameTurnPreamble = typeof persisted.event.data.text === 'string'
+          ? persisted.event.data.text
+          : disposition.preamble;
+        if (options.onConversationPreamble) {
+          const delivered = await options.onConversationPreamble(sameTurnPreamble);
+          if (delivered.status === 'failed') {
+            safeAppend({
+              sessionId: options.sessionId,
+              turn,
+              role: 'system',
+              type: 'run_failed',
+              data: {
+                error: `conversation preamble ${delivered.reason}`,
+                sourceUserSeq: exactSourceUserSeq,
+                stage: 'pre_execution_presentation',
+              },
+            });
+            bumpTurnNumber(options.sessionId, turn);
+            return {
+              sessionId: options.sessionId,
+              turn,
+              status: 'failed',
+              error: `conversation preamble ${delivered.reason}`,
+              toolCalls: 0,
+            };
+          }
+        }
+      }
+    }
     const run = options.runRunner ?? defaultRunRunner;
     // Hoisted so the post-turn auto-credit hook can read the recall runs the
     // turn's tool handlers registered (turnRecallRunIds). Built lazily inside
@@ -9557,6 +9906,7 @@ async function runConversationFromResumeCore(opts: {
             deliveryConcern: concern,
             settlementAudit: assessment.settlementAudit,
             priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+            recoveryCapability: terminalRecoveryCapability(stepIndex, maxSteps),
           }, {
             ...(opts.terminalDeliveryJudgePort
               ? { port: opts.terminalDeliveryJudgePort }
@@ -9757,7 +10107,13 @@ async function runConversationFromResumeCore(opts: {
             turn: lastTurn,
             role: 'Clem',
             type: 'awaiting_user_input',
-            data: { question, source: 'decision_awaiting' },
+            data: {
+            question,
+            source: 'decision_awaiting',
+            ...(Number.isSafeInteger(activeSourceUserSeq) && (activeSourceUserSeq ?? 0) > 0
+              ? { sourceUserSeq: activeSourceUserSeq }
+              : {}),
+          },
           });
         }
         const awaitingSummary = (decision.reply?.trim() ? decision.reply : decision.summary)
@@ -9918,6 +10274,7 @@ async function runConversationFromResumeCore(opts: {
       input: resumeContinuationInput,
       // Resume continuations are always harness-synthetic, never a user message.
       suppressMemoryCapture: true,
+      internalContinuation: true,
       sourceUserSeq: activeSourceUserSeq,
       runAttemptId: opts.runAttemptId,
       maxTurns,

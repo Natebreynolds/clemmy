@@ -597,7 +597,7 @@ export function registerBatchTools(server: McpServer): void {
           // only on HUMAN consent. A policy-minted approval (YOLO auto-approve,
           // Exhibit A's forgery point) is inert here — the honest path is the
           // approval card, which this refusal names.
-          if (pendingActionRequiresHumanApproval(record) && record.approvedBy !== 'human') {
+          if (pendingActionRequiresHumanApproval(record, { sessionId: record.sessionId }) && record.approvedBy !== 'human') {
             return textResult(
               `Pending action ${pending_action_id} is an irreversible send batch approved by POLICY, not by the user. `
               + 'It requires the user\'s explicit approval card before execution — file it with request_approval '
@@ -614,7 +614,7 @@ export function registerBatchTools(server: McpServer): void {
           // EXECUTING (or terminal truth) and never start a second batch.
           const claim = claimPendingActionExecution(record.id, 'run_batch', {
             expectedSessionId: sessionId,
-            requireResolvedHumanCard: pendingActionRequiresHumanApproval(record),
+            requireResolvedHumanCard: pendingActionRequiresHumanApproval(record, { sessionId: record.sessionId }),
             verifyExecutionAuthority: verifyBatchExecutionAuthority,
           });
           if (!claim.claimed || !claim.record || !claim.claimToken) {

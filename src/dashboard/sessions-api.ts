@@ -386,6 +386,14 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
       seen.add(approvalId);
       const rowNow = approvalRegistry.get(approvalId);
       if (!rowNow || rowNow.status !== 'pending') continue;
+      if (!approvalRegistry.isFormalApprovalSurface(rowNow)) {
+        turns.push({
+          role: 'assistant',
+          text: rowNow.presentation?.question ?? '',
+          createdAt: ev.createdAt,
+        });
+        continue;
+      }
       turns.push({
         role: 'assistant',
         text: '',

@@ -125,7 +125,7 @@ test('one raw-to-effective refinement becomes the only physical and settlement c
   }));
 });
 
-test('raw arguments cannot dispatch or settle after an effective contract is frozen', () => {
+test('raw arguments cannot dispatch after refinement, but the same call may settle under its admission identity', () => {
   const physicalTask = accept();
   const tool = 'alpha__records_create';
   const rawArgs = { value: 'raw', account_alias: 'ops' };
@@ -150,7 +150,7 @@ test('raw arguments cannot dispatch or settle after an effective contract is fro
     tool,
     effectiveArgs,
   }).status, 'refined');
-  assert.throws(() => settlement.settleToolAttempt({
+  const settled = settlement.settleToolAttempt({
     ...settlementTask,
     lane: 'agents_runner',
     toolName: tool,
@@ -158,7 +158,17 @@ test('raw arguments cannot dispatch or settle after an effective contract is fro
     args: rawArgs,
     businessCall: false,
     signals: { kind: 'policy_denial', evidence: 'nominal', dispatchState: 'not_started' },
-  }), settlement.ToolAttemptSettlementAuthorityError);
+  });
+  assert.equal(settled.duplicate, false);
+  const row = eventlog.openEventLog().prepare(`
+    SELECT state, conflict_reason FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(
+    settlementTask.sessionId,
+    settlementTask.sourceUserSeq,
+    settlementIdentity.logicalToolCallId,
+  ) as { state: string; conflict_reason: string | null };
+  assert.deepEqual(row, { state: 'settled', conflict_reason: null });
 });
 
 test('the raw and effective digests survive restart for audit without persisting either value', () => {

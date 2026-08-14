@@ -92,3 +92,21 @@ test('an action-shaped request reaches its artifact skill even when neighbors sh
   assert.deepEqual(findRelevantSkills('can you draft something for me'), [], 'a bare action verb surfaces nothing');
   assert.deepEqual(findRelevantSkills('whats on my calendar today'), [], 'an unrelated read stays quiet');
 });
+
+test('a fully specified compound data flow does not inject a one-substep skill', () => {
+  install(
+    'workspace-email-recipe',
+    'Build an interactive Workspace report with scheduled data pulls and one-click email actions.',
+  );
+  install(
+    'slack-sheet-review',
+    'Review Slack requests and append a daily digest to a Google Sheet workspace.',
+  );
+  const request = 'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.';
+  assert.deepEqual(
+    findRelevantSkills(request),
+    [],
+    'artifact/action overlap alone is not an applicability anchor for a compound flow',
+  );
+  assert.equal(renderRelevantSkillsForPrompt(request), '');
+});

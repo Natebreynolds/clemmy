@@ -449,3 +449,45 @@ import {
 }
 
 console.log('composio-batch-validator tests passed');
+
+// A missing-required-field refusal hands back the REPAIRED CALL, not just the
+// complaint. Live 2026-08-12: the refusal named `actorId` exactly, six times
+// across three lanes, and the model switched tools instead of filling it in.
+// The fix has to be the cheapest next move, not a fact to act on.
+{
+  const schema = {
+    type: 'object',
+    required: ['actorId', 'runInput'],
+    properties: {
+      actorId: { type: 'string', description: 'The Apify actor to run, e.g. compass~google-maps-scraper' },
+      runInput: { type: 'object', description: 'Actor input payload' },
+      timeout: { type: 'number' },
+    },
+  };
+  const error = validateArgsAgainstSchema(
+    'APIFY_RUN_ACTOR',
+    { runInput: { searchStrings: ['restaurants'] }, timeout: 60 },
+    schema,
+  );
+  if (!error) throw new Error('a missing required field must still be refused');
+  if (!/actorId/.test(error.reason)) throw new Error('the refusal must name the missing field');
+
+  const template = error.examples.find((line) => /Repair this exact call/.test(line));
+  if (!template) throw new Error('the refusal must carry a ready-to-send repaired call');
+  const payload = JSON.parse(template.slice(template.indexOf('{'))) as {
+    tool_slug: string;
+    arguments: Record<string, unknown>;
+  };
+  if (payload.tool_slug !== 'APIFY_RUN_ACTOR') throw new Error('the repair targets the same action');
+  // The caller's own values survive untouched; only the gap is marked.
+  if (JSON.stringify(payload.arguments.runInput) !== JSON.stringify({ searchStrings: ['restaurants'] })) {
+    throw new Error('supplied arguments must be preserved verbatim');
+  }
+  if (payload.arguments.timeout !== 60) throw new Error('unrelated arguments must be preserved');
+  if (!/^<FILL: /.test(String(payload.arguments.actorId))) {
+    throw new Error('the missing field must be marked as a fillable gap');
+  }
+  if (!/google-maps-scraper/.test(String(payload.arguments.actorId))) {
+    throw new Error('the field description must travel with the gap');
+  }
+}

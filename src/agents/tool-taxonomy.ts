@@ -35,7 +35,10 @@ import {
   recordAutoApproval,
   summarizeToolArgs,
 } from './plan-scope.js';
-import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import {
+  classifyCanonicalExternalEffect,
+  isIrreversibleSendSlug,
+} from '../runtime/harness/execution-gate.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import type { AutoApproveScope } from './proactivity-policy.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -648,6 +651,40 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
       return { needsApproval: false, reason: 'plan-scope', kind };
     }
     return { needsApproval: true, reason: 'destructive-hint', kind };
+  }
+  // A trusted provider carrier whose action is mutating but still semantically
+  // unknown cannot borrow blanket YOLO/workspace authority. It may pass only
+  // through an exact plan scope — the same human-reviewed authority available
+  // to other external multiplexers. Once the canonical operation registry or
+  // structural classifier knows the action, ordinary reversible writes retain
+  // the normal request-authority path below.
+  const externalEffect = classifyCanonicalExternalEffect(input.toolName, input.args);
+  if (
+    !resolved.nested
+    && !resolved.unsafeExternalMultiplexer
+    && externalEffect.external
+    && externalEffect.mutating
+    && !externalEffect.classificationKnown
+  ) {
+    const scoped = evaluateAutoApprove({
+      sessionId: input.sessionId,
+      toolName: input.toolName,
+      args: input.args,
+      scope: 'strict',
+      insideWorkspace: false,
+      kindHint: kind === 'send' ? 'send' : 'other',
+    });
+    if (scoped.autoApproved) {
+      if (input.sessionId) {
+        recordAutoApproval(
+          input.sessionId,
+          semanticTool,
+          `[${scoped.reason}] kind=${kind} ${summarizeToolArgs(semanticTool, semanticArgs)}`,
+        );
+      }
+      return { needsApproval: false, reason: 'plan-scope', kind };
+    }
+    return { needsApproval: true, reason: 'unknown', kind };
   }
   // A foreign shell/Composio gateway cannot inherit Clementine's local smart
   // semantics or ride YOLO. An exact plan-scoped Composio slug may still pass

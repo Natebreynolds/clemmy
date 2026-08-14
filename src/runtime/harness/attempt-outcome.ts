@@ -217,6 +217,14 @@ export interface AttemptSignals {
   providerReportedError?: boolean;
   /** The callable contract was available to hand back for repair. */
   schemaAvailable?: boolean;
+  /** A bounded structural inspection observed a real envelope contradiction. */
+  providerEnvelopeContradicted?: boolean;
+  /** The host observed a completed execution that failed, but no narrower
+   * provider-neutral recovery class is justified. */
+  executionFailed?: boolean;
+  /** The host observed the result crossing its durable output ceiling. The
+   * stored prefix is not evidence; a read may be narrowed/paged and retried. */
+  outputTruncated?: boolean;
   /**
    * The host invoked this tool in-process and it RETURNED without throwing.
    * Unlike a provider envelope there is nothing here to distrust: the absence
@@ -259,6 +267,11 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
   if (signals.droppedRequiredParameter) {
     return outcome('ignored_requirement', 'nominal', 'required_parameter_dropped');
   }
+  if (signals.outputTruncated) {
+    return signals.mutating
+      ? outcome('uncertain_write', 'nominal', 'output_truncated')
+      : outcome('invalid_arguments', 'nominal', 'output_truncated');
+  }
 
   // A request the provider REJECTED never became an effect, so its fate is not
   // in doubt. Only statuses that prove pre-effect rejection qualify — a 500 is
@@ -275,6 +288,16 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     && !rejectedBeforeEffect
   ) {
     return outcome('uncertain_write', 'nominal', 'unacknowledged_mutation');
+  }
+
+  // A real contradiction is different from an inspection bound. For a write,
+  // conflicting acknowledgement data leaves the effect uncertain; for a read,
+  // it is an inert structured failure. Neither case proves the candidate is
+  // unsupported or authorizes a sibling mutator.
+  if (signals.providerEnvelopeContradicted === true) {
+    return signals.mutating
+      ? outcome('uncertain_write', 'structured', 'provider_envelope_contradiction')
+      : outcome('unknown', 'structured', 'provider_envelope_contradiction');
   }
 
   // Structured — the transport or envelope carried a machine-readable verdict.
@@ -294,9 +317,13 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     if (status >= 200 && status < 300) return outcome('succeeded', 'structured', `http_${status}`);
   }
 
-  // MCP's own error flag is the server saying "this failed" in a field.
+  // MCP's own error flag says that THIS ATTEMPT failed; it does not say why.
+  // Candidate elimination requires narrower capability evidence (for example
+  // an explicit 404/405/501 above). Treating every generic MCP error as
+  // unsupported made a working tool disappear after an ordinary provider
+  // failure and sent long tasks shopping across sibling tools.
   if (signals.providerReportedError === true) {
-    return outcome('unsupported_capability', 'structured', 'mcp_is_error');
+    return outcome('unknown', 'structured', 'mcp_is_error');
   }
   if (signals.envelopeSuccessful === true || signals.providerReportedError === false) {
     return signals.emptyResult
@@ -304,9 +331,10 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
       : outcome('succeeded', 'structured', 'envelope');
   }
   if (signals.envelopeSuccessful === false) {
-    // A structured failure is real, but WHY it failed is not stated; treat the
-    // candidate as unproven rather than guessing a reason from prose.
-    return outcome('unsupported_capability', 'structured', 'envelope_failure');
+    // A structured failure is real, but WHY it failed is not stated. Keep the
+    // candidate unproven and recovery inert rather than manufacturing evidence
+    // that the capability itself is absent.
+    return outcome('unknown', 'structured', 'envelope_failure');
   }
 
   if (signals.emptyResult) return outcome('empty_result', 'structured', 'empty');
@@ -320,6 +348,9 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
         ? outcome('uncertain_write', 'nominal', name)
         : outcome('transient', 'nominal', name);
     }
+  }
+  if (signals.executionFailed === true) {
+    return outcome('unknown', 'nominal', 'execution_failed');
   }
 
   // The host ran it itself and it returned. This sits below every nominal and

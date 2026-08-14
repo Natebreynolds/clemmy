@@ -52,10 +52,10 @@ test('buildActionsForNotification: approvalId attaches SDK approve/edit/reject',
 test('buildActionsForNotification: checkInId attaches answer buttons', () => {
   const rows = buildActionsForNotification({ checkInId: 'chk-abc123' });
   const ids = customIds(rows);
-  assert.equal(ids.length, 3, 'expected 3 buttons: approve, answer, reject');
-  assert.ok(ids.some((id) => id.includes('checkin-approve:chk-abc123')));
+  assert.equal(ids.length, 1, 'a question gets one honestly labelled Answer control');
   assert.ok(ids.some((id) => id.includes('checkin-answer:chk-abc123')));
-  assert.ok(ids.some((id) => id.includes('checkin-reject:chk-abc123')));
+  assert.ok(!ids.some((id) => id.includes('checkin-approve:chk-abc123')));
+  assert.ok(!ids.some((id) => id.includes('checkin-reject:chk-abc123')));
 });
 
 test('buildActionsForNotification: stale goalDraftId does not attach dead buttons', () => {

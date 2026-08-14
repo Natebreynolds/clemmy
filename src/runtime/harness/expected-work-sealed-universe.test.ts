@@ -560,6 +560,20 @@ test('run_worker packet binding derives from the frozen contract exactly when un
   );
   assert.deepEqual(derive(['opp-2']), { requirementId: 'notify', universeId: 'opportunities' },
     'a partial batch inside the sealed universe still binds');
+  const hostBound = admission.bindWorkerPacketExpectedWork({
+    packet: {
+      item: 'opp-1',
+      expectedWork: { requirementId: 'model-invented', universeId: 'other-universe' },
+    },
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    items: ['opp-1'],
+  });
+  assert.deepEqual(
+    hostBound.expectedWork,
+    { requirementId: 'notify', universeId: 'opportunities' },
+    'model packet hints cannot override the host-derived frozen-work authority',
+  );
   assert.equal(derive(['opp-999']), null, 'an item outside the sealed universe must not bind');
   assert.equal(derive(['opp-1'], { sessionId: 'sess-does-not-exist' }), null, 'no contract → null, never a throw');
   assert.equal(derive(['opp-1'], { sourceUserSeq: undefined }), null, 'missing identity → null');

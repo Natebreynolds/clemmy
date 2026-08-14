@@ -242,10 +242,10 @@ let schemaLoader: SchemaLoader | null = null;
 async function loadSchemaFromProvider(toolSlug: string): Promise<LoadedSchema | null> {
   const load = schemaLoader ?? (async (slug: string) => {
     const client = await import('../integrations/composio/client.js');
-    // Ask ONLY when an SDK client already exists. Without one, the slug
-    // lookup falls back to listing the whole toolkit — a side effect no
-    // validation or warm-read admission step should cause on a keyless install.
-    if (!client.getComposio()) return null;
+    // This is one exact-slug metadata lookup. The client uses the SDK's direct
+    // filter when available and otherwise one toolkit-constrained CLI search
+    // that accepts only the exact primary slug plus a schema-backed result.
+    // It never executes the business tool or performs broad discovery.
     const tool = await client.getComposioToolBySlug(slug);
     return tool
       ? {

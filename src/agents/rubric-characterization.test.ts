@@ -45,7 +45,7 @@ const GOLDEN = {
   // literal identities/relationships so memory writes populate grounded graph.
   // 2026-07-16 tool subtraction: plan-lifecycle tools (create_plan/list_plans/
   // update_plan_step) killed → "PLAN vs EXECUTION COHERENCE" rewritten as
-  // "EXECUTION IS THE SOURCE OF TRUTH"; goal_create/goal_update/goal_get merged
+  // "EXECUTION CONTINUITY"; goal_create/goal_update/goal_get merged
   // into goal_upsert (goal_list unchanged).
   // 2026-07-16 memory_mark_used subtraction: both mark-used prompt rules removed
   // from the rubric — usage credit is now attributed in code post-turn
@@ -63,8 +63,8 @@ const GOLDEN = {
   // 2026-07-22 fan-out batch contract: "waves of up to 8" replaced with the
   // run_worker `items` batch (harness-pooled, full list in ONE call) in all
   // three fan-out clauses — the old wording contradicted the new deterministic
-  // pool; EXECUTION WRAP's hardcoded slug-verb list replaced with "the harness
-  // classifies mutating slugs" (the classifier is code, the list was drift-prone).
+  // pool; the old EXECUTION WRAP hardcoded slug-verb list was replaced with
+  // code-owned classification (the list was drift-prone).
   // 2026-07-22 (late): offer_background ceremony STRIPPED (subtraction) — the
   // structured offer tool is gone; the rubric teaches the same choice as ONE
   // plain prose sentence routed to dispatch_background_task / hold_task_for_later.
@@ -127,13 +127,19 @@ const GOLDEN = {
   // return exact mutation payloads for one parent-owned batch proposal/commit.
   // This preserves conversational/model reasoning while preventing worker-side
   // Composio writes and the duplicate/fallback dispatches observed live.
-  instructions: { len: 35773, sha16: '3c0040a116087153' },
-  native: { len: 34876, sha16: '0b1f795ddfe39836' },
-  claudeBrain: { len: 8316, sha16: '38747549671f7f3c' },
-  // 2026-07-27 live efficiency proof: execution_create already guards against
-  // a duplicate active lane, so the lean rubric no longer makes the model dump
-  // every user's old executions before opening/reusing the current one.
-  lean: { len: 12008, sha16: 'ada12ab4276fba2f' },
+  // 2026-08-13 bounded capability execution: injected retrieval is evidence,
+  // not a checklist. Resolved roles execute directly; one unresolved semantic
+  // role receives one federated broker attempt; exact schema failures repair
+  // the exact subject. Mandatory recall/history/skill/discovery rituals were
+  // removed after the live Ventura run spent 12 model turns reconfirming data
+  // the runtime had already supplied.
+  instructions: { len: 35002, sha16: '79ff1719fe173c4d' },
+  native: { len: 34105, sha16: 'ddb1765ce9d273e9' },
+  claudeBrain: { len: 8666, sha16: 'edab8f740b3064a6' },
+  // 2026-08-13 accepted-work authority: an admitted work_call carries the exact
+  // host-frozen execution binding. The model no longer opens a competing
+  // execution owner or searches global executions before a normal write.
+  lean: { len: 12079, sha16: '6f8e86f84c98fd1a' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -176,8 +182,8 @@ test('lean variant: registered behind the variant switch, materially leaner, kee
   assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('END YOUR TURN WITH PLAIN TEXT'), 'lean must keep the decision contract');
   //  - the anti-narration opener (the narrate-instead-of-call guard),
   assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('CALL TOOLS'), 'lean must keep the anti-narration rule');
-  //  - the execution-lane + fan-out Codex essentials the gates rely on,
-  assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('EXECUTION LANE'), 'lean must keep the execution-wrap rule');
+  //  - accepted-work authority + fan-out Codex essentials the gates rely on,
+  assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('ACCEPTED WORK AUTHORITY'), 'lean must keep accepted-work authority');
   assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('FAN OUT'), 'lean must keep the fan-out rule');
   //  - converse-first (the most important interaction rule).
   assert.ok(/CONVERSE FIRST/i.test(ORCHESTRATOR_INSTRUCTIONS_LEAN), 'lean must keep converse-first');
@@ -202,6 +208,36 @@ test('provider parity: focus context is injected, never a mandatory per-turn too
     assert.doesNotMatch(rubric, /focus_get`? at the START of every turn|non-negotiable for chat\/Discord/i, lane);
     assert.match(rubric, /Current Focus(?: block)? is (?:already )?injected/i, lane);
     assert.match(rubric, /focus_get[^.\n]*(?:only when (?:the user )?explicitly|only for explicit)/i, lane);
+  }
+});
+
+test('provider parity: resolved capabilities execute directly and discovery is one role-scoped repair path', () => {
+  for (const [lane, rubric] of [
+    ['standard', ORCHESTRATOR_INSTRUCTIONS],
+    ['claude', CLAUDE_BRAIN_RUBRIC],
+  ] as const) {
+    assert.match(rubric, /bounded retrieval result, not a checklist/i, lane);
+    assert.match(rubric, /(?:resolved exact capability and schema|injected packet resolves an exact capability and schema)[^.]*invoke it directly/i, lane);
+    assert.match(rubric, /(?:single runtime discovery broker once[^.]*semantic role|unresolved semantic role[^.]*single runtime discovery broker once)/i, lane);
+    assert.match(rubric, /exact call fails schema validation[^.]*exact subject once/i, lane);
+    assert.match(rubric, /skill candidates? (?:is|are) advisory/i, lane);
+    assert.doesNotMatch(
+      rubric,
+      /call `tool_choice_recall\(intent\)` BEFORE any discovery|fire all per-intent `tool_choice_recall`/i,
+      lane,
+    );
+  }
+});
+
+test('provider parity: accepted work_call authority never manufactures a second execution owner', () => {
+  for (const [lane, rubric] of [
+    ['standard', ORCHESTRATOR_INSTRUCTIONS],
+    ['lean-codex', ORCHESTRATOR_INSTRUCTIONS_LEAN],
+  ] as const) {
+    assert.match(rubric, /accepted (?:action|external work).*work_call|accepted work[^.]*work_call/i, lane);
+    assert.match(rubric, /host-frozen/i, lane);
+    assert.doesNotMatch(rubric, /before (?:a|any) MUTATING external write[^\n]*execution_create FIRST/i, lane);
+    assert.doesNotMatch(rubric, /before (?:the parent dispatches|a batch of)[^\n]*execution_create/i, lane);
   }
 });
 

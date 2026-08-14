@@ -719,6 +719,9 @@ export function findDuplicateQueuedWorkflowRun(
   opts?: {
     targetStepId?: string;
     retryFailedItems?: QueueWorkflowRunOptions['retryFailedItems'];
+    /** Immutable catalog identity. When present, prefer it over the mutable
+     * display name so a rename cannot admit a second active run. */
+    workflowSlug?: string;
     /** Only an exact source with a preparation callback can eventually release
      * this state. Legacy/scheduled callers must not inherit an orphan hold. */
     includeAwaitingChatDispatchSeal?: boolean;
@@ -730,11 +733,14 @@ export function findDuplicateQueuedWorkflowRun(
   const wanted = stableJson(normalizeWorkflowRunInputs(inputs));
   const wantedTargetStepId = normalizedOptionalString(opts?.targetStepId);
   const wantedRetryKey = retryFailedItemsKey(opts?.retryFailedItems);
+  const wantedWorkflowSlug = normalizedOptionalString(opts?.workflowSlug);
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse()) {
     try {
       const parsed = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as {
         id?: unknown;
         workflow?: unknown;
+        workflowSlug?: unknown;
+        workflowDefinitionSnapshot?: { workflowSlug?: unknown };
         inputs?: unknown;
         status?: unknown;
         targetStepId?: unknown;
@@ -748,8 +754,18 @@ export function findDuplicateQueuedWorkflowRun(
         && status !== 'queued'
         && status !== 'running'
         && status !== 'finalizing'
+        && status !== 'blocked_capability'
+        && status !== 'blocked_mutation'
       ) continue;
-      if (parsed.workflow !== workflowName) continue;
+      const recordedWorkflowSlug = normalizedOptionalString(parsed.workflowSlug)
+        ?? normalizedOptionalString(parsed.workflowDefinitionSnapshot?.workflowSlug);
+      if (wantedWorkflowSlug) {
+        if (recordedWorkflowSlug) {
+          if (recordedWorkflowSlug !== wantedWorkflowSlug) continue;
+        } else if (parsed.workflow !== workflowName && parsed.workflow !== wantedWorkflowSlug) {
+          continue;
+        }
+      } else if (parsed.workflow !== workflowName) continue;
       // A requeue-from-run must never see its own SOURCE run as the duplicate
       // (the source is still status:'running' on disk when a goal re-pursuit
       // queues the next attempt mid-completion).
@@ -1264,8 +1280,9 @@ export interface QueueWorkflowRunOptions {
    *  installs the run directly as awaiting_catchup_decision, so an independent
    *  drain tick can never start it between queueing and a later "hold" write. */
   holdForCatchupDecision?: boolean;
-  /** Stable workflow entry/directory slug. Required for held catch-ups because
-   *  the display name is mutable and cannot safely own a recovery decision. */
+  /** Stable workflow entry/directory slug. Required for scheduler admissions
+   * because the display name is mutable and cannot own occurrence, recovery,
+   * or exact-send mutation authority. */
   workflowSlug?: string;
   /** Oldest occurrence collapsed into this held decision. */
   catchupFirstDueAtMs?: number;
@@ -1421,6 +1438,35 @@ function admittedWorkflowDefinition(
       ? createWorkflowRunDefinitionSnapshot(workflowEntry.name, workflowEntry.data, admittedAt)
       : undefined,
   };
+}
+
+/** Upgrade/replay seam for scheduler records admitted before workflowSlug was
+ * projected separately from the display name. The canonical receipt and run
+ * identity must already match; only the missing projection may be repaired. */
+function reconcileScheduledWorkflowSlugProjection(
+  runId: string,
+  triggerReceiptId: string,
+  workflowSlug: string,
+): void {
+  const file = workflowRunFile(runId);
+  withWorkflowRunRecordLock(file, () => {
+    let record: Record<string, unknown>;
+    try {
+      record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+    } catch (error) {
+      throw new Error(`Scheduled workflow run ${runId} is unreadable during slug reconciliation.`, {
+        cause: error,
+      });
+    }
+    if (record.id !== runId || record.triggerReceiptId !== triggerReceiptId) {
+      throw new Error(`Scheduled workflow run ${runId} does not match its canonical trigger receipt.`);
+    }
+    if (record.workflowSlug === workflowSlug) return;
+    if (record.workflowSlug !== undefined) {
+      throw new Error(`Scheduled workflow run ${runId} is bound to a different workflow slug.`);
+    }
+    writeRunFileDurably(file, { ...record, workflowSlug });
+  });
 }
 
 function assertCompiledRunMatchesContract(input: {
@@ -2110,8 +2156,34 @@ function queueWorkflowRunUnlocked(
   opts?: QueueWorkflowRunOptions,
 ): QueueWorkflowRunResult {
   ensureDir(WORKFLOW_RUNS_DIR);
+  const createdAt = new Date().toISOString();
+  const { workflowEntry, snapshot: workflowDefinitionSnapshot } =
+    admittedWorkflowDefinition(name, createdAt);
+  const source = normalizedOptionalString(opts?.source);
   const triggerReceiptId = normalizedOptionalString(opts?.triggerReceiptId);
   const catchupHold = normalizeCatchupHold(opts, triggerReceiptId);
+  const requestedWorkflowSlug = normalizedOptionalString(opts?.workflowSlug);
+  if (requestedWorkflowSlug && workflowEntry && requestedWorkflowSlug !== workflowEntry.name) {
+    throw new Error(
+      `Workflow slug "${requestedWorkflowSlug}" does not match the admitted catalog identity "${workflowEntry.name}".`,
+    );
+  }
+  const workflowSlug = catchupHold?.workflowSlug
+    ?? requestedWorkflowSlug
+    ?? (source === 'schedule' ? workflowEntry?.name : undefined);
+  if (typeof triggerReceiptId === 'string' && triggerReceiptId.startsWith('workflow-schedule:v1:')) {
+    const scheduledReceipt = /^workflow-schedule:v1:([^:]+):(\d+)$/.exec(triggerReceiptId);
+    if (
+      source !== 'schedule'
+      || !scheduledReceipt
+      || !workflowSlug
+      || scheduledReceipt[1] !== workflowSlug
+    ) {
+      throw new Error(
+        'Canonical workflow schedule receipt must match source=schedule and the admitted workflow slug.',
+      );
+    }
+  }
   const boundTriggerMarker = triggerReceiptId
     ? readWorkflowTriggerReceiptMarker(triggerReceiptId)
     : null;
@@ -2139,6 +2211,7 @@ function queueWorkflowRunUnlocked(
       : findDuplicateQueuedWorkflowRun(name, normalizedInputs, opts?.excludeRunId, {
         targetStepId: opts?.targetStepId,
         retryFailedItems: opts?.retryFailedItems,
+        workflowSlug: workflowEntry?.name,
         includeAwaitingChatDispatchSeal: opts?.originObserver !== undefined,
       });
   }
@@ -2195,6 +2268,9 @@ function queueWorkflowRunUnlocked(
     ? []
     : normalizeOriginSessionIds(explicitPrimaryOrigin, opts?.originSessionIds);
   if (duplicate) {
+    if (triggerReceiptId?.startsWith('workflow-schedule:v1:') && workflowSlug) {
+      reconcileScheduledWorkflowSlugProjection(duplicate.id, triggerReceiptId, workflowSlug);
+    }
     const exactDuplicateAdmission = originObserver && queueRequestDigest && !admittedChatDispatchPreparation
       ? admitAndPrepareExactChatDispatch({
           candidateRunId: duplicate.id,
@@ -2239,12 +2315,13 @@ function queueWorkflowRunUnlocked(
       ...(chatDispatchPreparation ? { chatDispatchPreparation } : {}),
       message: catchupHold
         ? `This missed schedule occurrence for "${name}" was already accepted as workflow run ${duplicate.id}; no duplicate was created. Its existing Resume or Skip decision remains authoritative.`
-        : `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs — it's running in the background and will report back here when it finishes. No duplicate was queued; just tell the user it's already on it. (Only call workflow_run_status if the user explicitly asks for a progress check.)`,
+        : duplicate.status === 'blocked_mutation'
+          ? `Workflow "${name}" has an unresolved external mutation in run ${duplicate.id} that may already have committed. No duplicate was queued because retrying could repeat the write or send; reconcile the provider or destination receipt before retrying.`
+          : duplicate.status === 'blocked_capability'
+            ? `Workflow "${name}" is paused in run ${duplicate.id} because a required capability is unavailable. The provider dispatch was proven not to have started, so no duplicate was queued; restore the capability and resume this same run instead.`
+          : `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs — it's running in the background and will report back here when it finishes. No duplicate was queued; just tell the user it's already on it. (Only call workflow_run_status if the user explicitly asks for a progress check.)`,
     };
   }
-  const createdAt = new Date().toISOString();
-  const { workflowEntry, snapshot: workflowDefinitionSnapshot } =
-    admittedWorkflowDefinition(name, createdAt);
   const readinessTargetStepId = opts?.targetStepId ?? opts?.retryFailedItems?.stepId;
   let readiness: WorkflowRunReadinessCheck | undefined;
   if (workflowEntry) {
@@ -2263,7 +2340,6 @@ function queueWorkflowRunUnlocked(
     }
   }
   const origin = origins[0];
-  const source = normalizedOptionalString(opts?.source);
   const targetStepId = normalizedOptionalString(opts?.targetStepId);
   const requeuedFromRunId = normalizedOptionalString(opts?.requeuedFromRunId);
   const readinessSnapshot = readiness
@@ -2322,7 +2398,6 @@ function queueWorkflowRunUnlocked(
   const catchupMissedCount = catchupHold?.missedCount ?? (Number.isFinite(opts?.catchupMissedCount)
     ? Math.max(0, Math.floor(opts!.catchupMissedCount!))
     : undefined);
-  const workflowSlug = catchupHold?.workflowSlug ?? normalizedOptionalString(opts?.workflowSlug);
   // An executable queue record may only carry explicit resumed authority.
   // `held` is installed atomically above; `skipped` is terminal-only.
   const catchupDisposition = catchupHold

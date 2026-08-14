@@ -941,6 +941,25 @@ function renderTrigger(trigger: ProspectiveTrigger): string {
   return 'when manually resumed';
 }
 
+function projectedIntentionState(intention: ProspectiveIntention): {
+  label: string;
+  reconciliation: string;
+} {
+  if (intention.sourceKind !== 'background') {
+    return { label: intention.status.toUpperCase(), reconciliation: '' };
+  }
+  const rawChildStatus = intention.metadata?.status;
+  const childStatus = typeof rawChildStatus === 'string'
+    && /^[a-z][a-z0-9_]{0,63}$/i.test(rawChildStatus)
+    ? rawChildStatus.toLowerCase()
+    : 'unknown';
+  return {
+    label: `PRIOR-WORK CANDIDATE; child status: ${childStatus}`,
+    reconciliation:
+      '; reconcile the child task before resuming or starting duplicate work—the parent index is not proof of active or completed execution',
+  };
+}
+
 /**
  * Bounded model-facing projection. It is empty for ordinary unrelated turns:
  * global future commitments never become another every-turn prompt tax.
@@ -1016,8 +1035,8 @@ export function buildProspectiveIntentionContext(input: {
   const ids: string[] = [];
   let chars = lines.join('\n').length;
   for (const { intention } of ranked) {
-    const state = intention.status.toUpperCase();
-    const line = `- [${state}] ${intention.objective} — ${renderTrigger(intention.trigger)}; action: ${intention.action.kind}${intention.action.ref ? ` ${intention.action.ref}` : ''}; ref ${intention.id}@${intention.generation}`;
+    const state = projectedIntentionState(intention);
+    const line = `- [${state.label}] ${intention.objective} — ${renderTrigger(intention.trigger)}; action: ${intention.action.kind}${intention.action.ref ? ` ${intention.action.ref}` : ''}${state.reconciliation}; ref ${intention.id}@${intention.generation}`;
     if (chars + line.length + 1 > maxChars) continue;
     lines.push(line);
     ids.push(intention.id);

@@ -35,6 +35,60 @@ export interface RuntimeToolEffectDecision {
   source: 'shell' | 'composio' | 'native_mcp' | 'registry' | 'unknown';
 }
 
+/**
+ * Opaque host provenance for a physical dispatch whose durable identity has
+ * already been peeled to an inner provider tool. A bare provider slug is not
+ * enough to recover whether it arrived through the trusted Composio gateway;
+ * this carrier preserves that fact without letting a model-authored boolean or
+ * prose field grant effect authority.
+ *
+ * Runtime authority comes from membership in the module-private WeakSet, not
+ * from this object's visible fields. The symbol keeps the type opaque to other
+ * TypeScript callers; the WeakSet makes structural lookalikes fail closed even
+ * after an unsafe cast or a JSON round trip.
+ */
+const TRUSTED_RUNTIME_EFFECT_CARRIER = Symbol('clem.trustedRuntimeEffectCarrier');
+const trustedRuntimeEffectCarriers = new WeakSet<object>();
+
+export interface TrustedRuntimeEffectCarrier {
+  readonly toolName: string;
+  readonly args: unknown;
+  readonly [TRUSTED_RUNTIME_EFFECT_CARRIER]: true;
+}
+
+export interface TrustedRuntimeEffectCarrierInspection {
+  readonly toolName: string;
+  readonly args: unknown;
+  readonly decision: RuntimeToolEffectDecision;
+}
+
+/** Minted only by a host adapter at the point it still owns wrapper identity. */
+export function trustedRuntimeEffectCarrier(
+  toolName: string,
+  args: unknown,
+): TrustedRuntimeEffectCarrier {
+  const carrier = Object.freeze({
+    toolName,
+    args,
+    [TRUSTED_RUNTIME_EFFECT_CARRIER]: true as const,
+  });
+  trustedRuntimeEffectCarriers.add(carrier);
+  return carrier;
+}
+
+/** Validate opaque provenance and classify its original trusted wrapper. */
+export function inspectTrustedRuntimeEffectCarrier(
+  value: unknown,
+): TrustedRuntimeEffectCarrierInspection | null {
+  if (!value || typeof value !== 'object' || !trustedRuntimeEffectCarriers.has(value)) return null;
+  const carrier = value as TrustedRuntimeEffectCarrier;
+  return {
+    toolName: carrier.toolName,
+    args: carrier.args,
+    decision: classifyRuntimeToolEffect(carrier.toolName, carrier.args),
+  };
+}
+
 /** Minimal event shape shared by runtime/eval consumers. Kept independent of
  * EventRow so accounting helpers cannot introduce an eventlog import cycle. */
 export interface RuntimeToolEventLike {

@@ -694,7 +694,10 @@ test('wrapToolForHarness: forwards the execute call when flag is on', async () =
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   resetEventLog();
   const session = createSession({ kind: 'chat' });
-  const anchor = anchorAcceptedTask(session.id, 'Echo the value.');
+  // The wrapped unknown tool is treated as business work, so the fixture must
+  // own an action node. A plain conversational echo request correctly has no
+  // work node and would fail at settlement before this forwarding assertion.
+  const anchor = anchorAcceptedTask(session.id, 'Run the echo operation now.');
   try {
     let receivedInput: unknown;
     const wrapped = wrapToolForHarness({
@@ -2233,7 +2236,7 @@ test('same-source settled Composio read is recovered without a second provider d
       turn: 2,
       role: 'user',
       type: 'user_input_received',
-      data: { text: 'Refresh it again now.' },
+      data: { text: 'Refresh the proof release queue again now.' },
     });
     anchorExistingSource(sess.id, nextSource);
     const freshScope = `${sess.id}::turn:3`;
@@ -2430,7 +2433,7 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
   const sess = createSession({ kind: 'chat' });
   // Anchor text stays free of any site name/id so it can never confer
   // destination provenance on its own.
-  const anchor = anchorAcceptedTask(sess.id, 'Proceed with the plan.');
+  const anchor = anchorAcceptedTask(sess.id, 'Deploy the prepared site now.');
   try {
     const counter = new ToolCallsCounter(100);
     const wrapped = wrapToolForHarness({ name: 'run_shell_command', execute: async () => 'deployed' });

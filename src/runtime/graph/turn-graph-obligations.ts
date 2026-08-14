@@ -53,6 +53,9 @@ export interface AttachEvidenceObligationsInput {
   hasSourceRead?: boolean;
   /** True only for replacement-shaped mutations where old content may survive. */
   requiresStaleReconciliation?: boolean;
+  /** True when the frozen contract declared resolved-operation coverage for
+   * this read: the proof owed is durable observation, not source exhaustion. */
+  observationSufficient?: boolean;
 }
 
 function obligationsForNode(node: {
@@ -63,20 +66,28 @@ function obligationsForNode(node: {
   operationMode?: AttachEvidenceObligationsInput['operationMode'];
   hasSourceRead?: boolean;
   requiresStaleReconciliation?: boolean;
+  observationSufficient?: boolean;
 }): NodeObligation[] {
   const out: NodeObligation[] = [];
   const { id } = node;
 
   // A read owes completeness: a partial snapshot silently becomes a wrong
-  // answer downstream, and nothing later can detect it.
+  // answer downstream, and nothing later can detect it. The exception is a
+  // contract that only ever promised resolved-operation coverage — one
+  // grounded retrieval, not an exhaustive set — where the proof owed is that
+  // the exact result was durably observed. Demanding exhaustion there blocks
+  // honest answers a provider cannot even express as complete (live
+  // 2026-08-12: a bounded calendar view returned every event with no cursor,
+  // completeness 'unknown', and the terminal held a correct answer).
   if (node.effectKind === 'read') {
+    const observedOnly = node.operationMode === 'point_read'
+      || node.operationMode === 'finite_read'
+      || node.observationSufficient === true;
     out.push({
       nodeId: id,
-      obligation: node.operationMode === 'point_read' || node.operationMode === 'finite_read'
-        ? 'source_observed'
-        : 'source_completeness',
-      because: node.operationMode === 'point_read' || node.operationMode === 'finite_read'
-        ? 'the exact point result must be durably observed'
+      obligation: observedOnly ? 'source_observed' : 'source_completeness',
+      because: observedOnly
+        ? 'the exact retrieved result must be durably observed'
         : 'a read that stops early produces a confident, incomplete answer',
     });
   }
@@ -158,6 +169,9 @@ export function attachEvidenceObligations(
     ...(input.hasSourceRead !== undefined ? { hasSourceRead: input.hasSourceRead } : {}),
     ...(input.requiresStaleReconciliation !== undefined
       ? { requiresStaleReconciliation: input.requiresStaleReconciliation }
+      : {}),
+    ...(input.observationSufficient !== undefined
+      ? { observationSufficient: input.observationSufficient }
       : {}),
   });
 }

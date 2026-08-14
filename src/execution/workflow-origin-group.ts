@@ -73,7 +73,7 @@ function hash(parts: readonly (string | number)[]): string {
  * sibling run has been reaped. */
 export function workflowRunReportBackContentDigest(input: {
   workflowName: string;
-  outcome: WorkflowOriginGroupTerminalStatus;
+  outcome: WorkflowOriginGroupReportBackOutcome;
   detail: string;
 }): string {
   if (
@@ -373,7 +373,8 @@ export interface WorkflowOriginGroupTerminalIdentity {
   runId: string;
 }
 
-export type WorkflowOriginGroupTerminalStatus = 'done' | 'blocked' | 'failed';
+export type WorkflowOriginGroupReportBackOutcome = 'done' | 'blocked' | 'failed';
+export type WorkflowOriginGroupTerminalStatus = WorkflowOriginGroupReportBackOutcome | 'needs_input';
 
 export interface WorkflowOriginGroupMemberReportBackDigest {
   runId: string;
@@ -2099,7 +2100,12 @@ function workflowOriginTerminalDigest(input: WorkflowOriginGroupSettlementTermin
     || input.turn <= 0
     || !Number.isSafeInteger(input.sourceUserSeq)
     || input.sourceUserSeq <= 0
-    || (input.status !== 'done' && input.status !== 'blocked' && input.status !== 'failed')
+    || (
+      input.status !== 'done'
+      && input.status !== 'blocked'
+      && input.status !== 'failed'
+      && input.status !== 'needs_input'
+    )
     || !text
   ) {
     throw new Error('workflow origin group settlement terminal evidence is invalid');
@@ -2201,7 +2207,12 @@ function decodeWorkflowOriginGroupSettlementReceipt(
     || terminalIdentity.turn <= 0
     || !Number.isSafeInteger(terminalIdentity.sourceUserSeq)
     || terminalIdentity.sourceUserSeq <= 0
-    || (raw.terminalStatus !== 'done' && raw.terminalStatus !== 'blocked' && raw.terminalStatus !== 'failed')
+    || (
+      raw.terminalStatus !== 'done'
+      && raw.terminalStatus !== 'blocked'
+      && raw.terminalStatus !== 'failed'
+      && raw.terminalStatus !== 'needs_input'
+    )
     || !isDigest(raw.terminalDigest)
     || memberRunIds.length === 0
     || memberRunIds.some((runId) => !runId)
@@ -3170,7 +3181,7 @@ function runRecordAcknowledgesOriginObserver(
     && (() => {
       const localDigest = workflowRunReportBackContentDigest({
         workflowName: String(envelope.workflowName),
-        outcome: outcome as WorkflowOriginGroupTerminalStatus,
+        outcome: outcome as WorkflowOriginGroupReportBackOutcome,
         detail: envelope.detail,
       });
       return projection.reportBackDigest === localDigest

@@ -39,6 +39,7 @@ const {
   ClaudeSdkCapacityExhaustedError,
 } = mod;
 const { isAuthRecoverableError } = await import('../../execution/transient-error.js');
+const { withTerminalAuthoringEvidenceReceipt } = await import('../../tools/tool-registry.js');
 
 // The default posture is now 'yolo' (Autonomous, 2026-07-20) which auto-approves
 // reversible/local + CRM writes. The park-mode / approval-gate tests below verify
@@ -2431,6 +2432,47 @@ function streamWithToolReturn(): SDKMessage[] {
   ];
 }
 
+function sdkLocalToolReturnStream(input: {
+  callId: string;
+  toolName: string;
+  toolInput: unknown;
+  output: string;
+  isError?: boolean;
+}): SDKMessage[] {
+  return [
+    initOnlyMessage(),
+    {
+      type: 'assistant',
+      session_id: 'sdk-session',
+      uuid: `${input.callId}-use`,
+      parent_tool_use_id: null,
+      message: {
+        content: [{
+          type: 'tool_use',
+          id: input.callId,
+          name: input.toolName,
+          input: input.toolInput,
+        }],
+      },
+    } as any,
+    {
+      type: 'user',
+      session_id: 'sdk-session',
+      uuid: `${input.callId}-return`,
+      parent_tool_use_id: null,
+      message: {
+        content: [{
+          type: 'tool_result',
+          tool_use_id: input.callId,
+          content: input.output,
+          ...(input.isError ? { is_error: true } : {}),
+        }],
+      },
+    } as any,
+    successResultMessage('done'),
+  ];
+}
+
 test('runClaudeAgentSdk reflects each tool return into the learning pipeline (brain continuity)', async () => {
   setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages(streamWithToolReturn(), {})) as any);
   const reflected: Array<{ sessionId: string; callId: string; tool: string | null; output: string }> = [];
@@ -2475,6 +2517,99 @@ test('runClaudeAgentSdk reflects each tool return into the learning pipeline (br
     'the exact SDK return boundary—not a later tool-use summary—records successful business work',
   );
   assert.match(String(returned[0].data.preview ?? ''), /Acme Corp has 3 open opportunities/);
+});
+
+test('the canonical SDK return emits authoring evidence only for a successful registry-authorized workflow creation', async () => {
+  const runCase = async (input: {
+    label: string;
+    toolName: string;
+    toolInput: unknown;
+    output: string;
+    isError?: boolean;
+  }) => {
+    const session = eventlog.createSession({ id: `sdk-authoring-evidence-${input.label}`, kind: 'chat' });
+    const source = eventlog.appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Create a daily digest workflow.' },
+    });
+    setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages(sdkLocalToolReturnStream({
+      callId: `toolu_${input.label}`,
+      toolName: input.toolName,
+      toolInput: input.toolInput,
+      output: input.output,
+      isError: input.isError,
+    }), {})) as any);
+    await runClaudeAgentSdk({
+      prompt: 'Create a daily digest workflow.',
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      directOrchestrator: true,
+      toolProfile: 'local_authoring',
+      allowedLocalMcpTools: ['workflow_create', 'call_tool', 'pending_action_queue'],
+    });
+    const returned = eventlog.listEvents(session.id, { types: ['tool_returned'] });
+    assert.equal(returned.length, 1);
+    assert.equal(returned[0]!.data.accounting, 'top_level');
+    assert.equal(returned[0]!.data.sourceUserSeq, source.seq);
+    return returned[0]!;
+  };
+
+  const direct = await runCase({
+    label: 'direct-workflow-create',
+    toolName: 'mcp__clementine-local__workflow_create',
+    toolInput: { name: 'daily_digest', description: 'Daily digest' },
+    output: withTerminalAuthoringEvidenceReceipt(
+      'workflow_create',
+      'Created workflow "daily_digest".',
+    ),
+  });
+  assert.equal(direct.data.successfulAuthoringResult, true);
+  assert.equal(direct.data.successfulBusinessResult, false);
+
+  const acquired = await runCase({
+    label: 'call-tool-workflow-create',
+    toolName: 'mcp__clementine-local__call_tool',
+    toolInput: {
+      name: 'workflow_create',
+      args_json: JSON.stringify({ name: 'daily_digest', description: 'Daily digest' }),
+    },
+    output: withTerminalAuthoringEvidenceReceipt(
+      'workflow_create',
+      'Created workflow "daily_digest".',
+    ),
+  });
+  assert.equal(acquired.data.effectiveTool, 'workflow_create');
+  assert.equal(acquired.data.successfulAuthoringResult, true);
+
+  const unrelated = await runCase({
+    label: 'pending-action-control',
+    toolName: 'mcp__clementine-local__pending_action_queue',
+    toolInput: { tool: 'OUTLOOK_SEND_EMAIL' },
+    output: 'Pending action queued.',
+  });
+  assert.equal(
+    unrelated.data.successfulAuthoringResult,
+    undefined,
+    'a successful authoring-profile/lifecycle control is not terminal authoring evidence',
+  );
+
+  const failed = await runCase({
+    label: 'unstamped-workflow-create-refusal',
+    toolName: 'mcp__clementine-local__workflow_create',
+    toolInput: { name: 'daily_digest', description: 'Daily digest' },
+    // workflow_create historically returned validation/refusal text through an
+    // ordinary isError:false MCP envelope. Registry membership alone must not
+    // turn this successful-looking transport into terminal evidence.
+    output: 'Workflow "daily_digest" was NOT created — fix validation first.',
+  });
+  assert.equal(
+    failed.data.successfulAuthoringResult,
+    undefined,
+    'registry membership cannot turn an unstamped host refusal into evidence',
+  );
 });
 
 test('Claude local settled-read replay reuses the handler-authored outer occurrence without minting authority or learning', async () => {

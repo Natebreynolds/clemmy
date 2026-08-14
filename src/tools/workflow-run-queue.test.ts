@@ -811,6 +811,101 @@ test('queueWorkflowRun: finalizing remains active and cannot be queued twice', (
   assert.equal(runFiles().length, 1, 'the terminal-judge window must not duplicate external effects');
 });
 
+test('queueWorkflowRun: an ambiguous external mutation remains active and cannot be queued twice', () => {
+  const first = queueWorkflowRun('audit-brief', { url: 'https://ambiguous-mutation.example' });
+  assert.equal(first.status, 'queued');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${first.id}.json`);
+  const record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(file, JSON.stringify({
+    ...record,
+    status: 'blocked_mutation',
+    mutationBlock: {
+      stepId: 'blast',
+      tool: 'slack_send_message',
+      fingerprint: 'a'.repeat(64),
+      blockedAt: '2026-08-13T16:00:00.000Z',
+      state: 'awaiting_reconciliation',
+      providerRedispatched: false,
+    },
+  }), 'utf-8');
+
+  const duplicate = queueWorkflowRun('audit-brief', { url: 'https://ambiguous-mutation.example' });
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(duplicate.id, first.id);
+  assert.match(duplicate.message, /may already have committed/i);
+  assert.match(duplicate.message, /No duplicate was queued/i);
+  assert.equal(runFiles().length, 1, 'an ambiguous mutation must not admit a second external effect');
+});
+
+test('queueWorkflowRun: a capability-paused run remains active and cannot be queued twice', () => {
+  const first = queueWorkflowRun('audit-brief', { url: 'https://capability-paused.example' });
+  assert.equal(first.status, 'queued');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${first.id}.json`);
+  const record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(file, JSON.stringify({
+    ...record,
+    status: 'blocked_capability',
+    capabilityBlock: {
+      stepId: 'send-update',
+      tool: 'SLACK_SEND_MESSAGE',
+      toolkit: 'slack',
+      reason: 'not-connected',
+      message: 'Reconnect Slack.',
+      blockedAt: '2026-08-13T16:00:00.000Z',
+      retryAt: '2026-08-13T16:01:00.000Z',
+      retryCount: 1,
+      provenNoDispatch: true,
+      state: 'blocked',
+    },
+  }), 'utf-8');
+
+  const duplicate = queueWorkflowRun('audit-brief', { url: 'https://capability-paused.example' });
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(duplicate.id, first.id);
+  assert.match(duplicate.message, /provider dispatch was proven not to have started/i);
+  assert.match(duplicate.message, /resume this same run/i);
+  assert.equal(runFiles().length, 1, 'a capability pause must not admit a second future external effect');
+});
+
+test('queueWorkflowRun: a display-name rename cannot bypass a slug-bound capability pause', () => {
+  const workflowSlug = 'rename-safe-capability-pause';
+  const originalName = 'Original Capability Display';
+  const renamedName = 'Renamed Capability Display';
+  const definition = (name: string) => ({
+    name,
+    description: 'Keep one capability-paused occurrence bound to its catalog identity.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'prepare', prompt: 'Prepare the exact update.', sideEffect: 'read' as const }],
+  });
+  writeWorkflow(workflowSlug, definition(originalName));
+  const first = queueWorkflowRun(originalName, { payload: 'same' });
+  assert.equal(first.status, 'queued');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${first.id}.json`);
+  const record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(file, JSON.stringify({
+    ...record,
+    status: 'blocked_capability',
+    capabilityBlock: {
+      stepId: 'prepare',
+      tool: 'OPAQUE_SEND',
+      toolkit: 'opaque',
+      reason: 'not-connected',
+      blockedAt: '2026-08-13T16:00:00.000Z',
+      retryAt: '2026-08-13T16:01:00.000Z',
+      retryCount: 1,
+      provenNoDispatch: true,
+      state: 'blocked',
+    },
+  }), 'utf-8');
+
+  writeWorkflow(workflowSlug, definition(renamedName));
+  const duplicate = queueWorkflowRun(renamedName, { payload: 'same' });
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(duplicate.id, first.id);
+  assert.equal(runFiles().length, 1);
+});
+
 test('every resolvable queue lane pins the exact content-hashed workflow definition', () => {
   writeAuditWorkflow(false);
   const queued = [
@@ -1660,6 +1755,74 @@ test('queueWorkflowRun: dedupe false queues fresh scheduled-style records with a
   const records = runFiles().map((file) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>);
   assert.ok(records.every((record) => typeof record.id === 'string' && record.id.startsWith('sched-')));
   assert.ok(records.every((record) => record.source === 'schedule'));
+});
+
+test('queueWorkflowRun: scheduled authority persists the catalog slug separately from display name', () => {
+  const workflowSlug = 'scheduled-canonical-slug';
+  const displayName = 'Scheduled Canonical Display Name';
+  const occurrenceAtMs = 1_800_000_000_000;
+  writeWorkflow(workflowSlug, {
+    name: displayName,
+    description: 'Exercise immutable scheduled-run identity.',
+    enabled: true,
+    trigger: { schedule: '0 10 * * *', timezone: 'UTC' },
+    steps: [{ id: 'read', prompt: 'Read the immutable occurrence.', sideEffect: 'read' }],
+  });
+
+  const queued = queueWorkflowRun(displayName, {}, {
+    source: 'schedule',
+    idPrefix: 'sched',
+    dedupe: false,
+    workflowSlug,
+    triggerReceiptId: `workflow-schedule:v1:${workflowSlug}:${occurrenceAtMs}`,
+  });
+  assert.equal(queued.status, 'queued');
+  const record = JSON.parse(
+    readFileSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), 'utf-8'),
+  ) as Record<string, unknown>;
+  assert.equal(record.workflow, displayName);
+  assert.equal(record.workflowSlug, workflowSlug);
+  assert.equal(
+    (record.workflowDefinitionSnapshot as { workflowSlug?: unknown }).workflowSlug,
+    workflowSlug,
+  );
+
+  // A daemon crash after run install but before the acceptance marker should
+  // replay this same deterministic run and repair an older missing projection,
+  // never admit a second run or redispatch the occurrence.
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`),
+    JSON.stringify(Object.fromEntries(
+      Object.entries(record).filter(([key]) => key !== 'workflowSlug'),
+    )),
+    'utf-8',
+  );
+  const replay = queueWorkflowRun(displayName, {}, {
+    source: 'schedule',
+    idPrefix: 'sched',
+    dedupe: false,
+    workflowSlug,
+    triggerReceiptId: `workflow-schedule:v1:${workflowSlug}:${occurrenceAtMs}`,
+  });
+  assert.equal(replay.status, 'duplicate');
+  assert.equal(replay.id, queued.id);
+  assert.equal(runFiles().length, 1);
+  assert.equal(
+    (JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), 'utf-8')) as {
+      workflowSlug?: unknown;
+    }).workflowSlug,
+    workflowSlug,
+  );
+
+  assert.throws(
+    () => queueWorkflowRun(displayName, {}, {
+      source: 'schedule',
+      dedupe: false,
+      workflowSlug: 'forged-catalog-slug',
+      triggerReceiptId: `workflow-schedule:v1:forged-catalog-slug:${occurrenceAtMs + 60_000}`,
+    }),
+    /does not match the admitted catalog identity/i,
+  );
 });
 
 test('queueWorkflowRun: persists execution optimization recovery intent', () => {

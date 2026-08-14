@@ -22,9 +22,11 @@ const {
   __test__: harnessTest,
   bindDiscordHarnessSession,
   clearDiscordHarnessSession,
+  tryHandleHarnessApprovalReply,
 } = await import('./discord-harness.js');
 const { getOrCreateDiscordSessionId } = await import('./discord-store.js');
 const {
+  appendEvent,
   createSession,
   beginRunAttempt,
   getActiveRunAttempt,
@@ -32,10 +34,16 @@ const {
   isKillRequested,
 } = await import('../runtime/harness/eventlog.js');
 const {
+  classifyTurnPreflight,
+  recordTurnPreflightDecision,
+} = await import('../runtime/harness/turn-control.js');
+const { publishPreflightConversation } = await import('../runtime/harness/preflight-conversation.js');
+const {
   createBackgroundTask,
   getBackgroundTask,
   markBackgroundTaskRunning,
 } = await import('../execution/background-tasks.js');
+const { createCheckIn, getCheckIn } = await import('../agents/check-ins.js');
 
 after(() => {
   if (PREV_HARNESS_WEBHOOK === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
@@ -156,6 +164,168 @@ test('bare approval vocabulary only sees approvals linked to this Discord conver
     __test__.relevantApprovalsForContext(context, approvals).map((approval) => approval.id),
     ['current', 'legacy-user-only'],
   );
+});
+
+function noApprovalAssistant() {
+  return {
+    getRuntime() {
+      return { listPendingApprovals: () => [] };
+    },
+  } as never;
+}
+
+function refusingHarnessTransport() {
+  return {
+    async sendInitial() {
+      throw new Error('a bare conversational answer must not receive approval-control copy');
+    },
+    async sendError() {
+      throw new Error('a bare conversational answer must not fail in approval routing');
+    },
+    async update() {},
+    async final() {},
+  } as never;
+}
+
+test('gateway ingress leaves literal Go ahead/Yes for the next harness turn when no approval exists', async () => {
+  const channelId = 'chan-preflight-go-ahead-gateway';
+  const message = {
+    channelId,
+    guildId: 'guild-preflight-go-ahead',
+    author: { id: 'user-preflight-go-ahead' },
+    channel: {
+      isTextBased: () => true,
+      async send() {
+        throw new Error('the legacy command layer must not answer this message');
+      },
+    },
+  } as never;
+
+  for (const prompt of ['Go ahead', 'Yes']) {
+    const harnessHandled = await tryHandleHarnessApprovalReply({
+      channelId,
+      prompt,
+      transport: refusingHarnessTransport(),
+    });
+    assert.equal(harnessHandled, false, `${prompt} is not approval control without a card`);
+
+    const legacyHandled = await __test__.handleDiscordCommand(
+      message,
+      noApprovalAssistant(),
+      prompt,
+    );
+    assert.equal(legacyHandled, false, `${prompt} reaches handleDiscordHarnessMessage as a normal turn`);
+  }
+});
+
+test('DM-poll ingress leaves literal Go ahead/Yes for the next harness turn when no approval exists', async () => {
+  const channelId = 'chan-preflight-go-ahead-dm-poll';
+  for (const prompt of ['Go ahead', 'Yes']) {
+    const harnessHandled = await tryHandleHarnessApprovalReply({
+      channelId,
+      prompt,
+      transport: refusingHarnessTransport(),
+      allowGlobalApprovalFallback: true,
+    });
+    assert.equal(harnessHandled, false, `${prompt} is not global approval control without a card`);
+
+    const legacyHandled = await __test__.handleDiscordRestCommand({
+      assistant: noApprovalAssistant(),
+      prompt,
+      channelId,
+      userId: 'user-preflight-go-ahead-dm',
+      guildId: null,
+    });
+    assert.equal(legacyHandled, false, `${prompt} reaches runDiscordHarnessConversation as a normal DM turn`);
+  }
+});
+
+test('settled Discord preflight does not manufacture pending go-ahead authority', async () => {
+  const priorConfirmBeat = process.env.CLEMMY_CONFIRM_BEAT;
+  process.env.CLEMMY_CONFIRM_BEAT = 'on';
+  try {
+    const channelId = 'chan-preflight-continuation';
+    const sessionId = 'discord-preflight-continuation';
+    const objective = 'Create a Google Sheet with the top five Ventura restaurants, then email me the link.';
+    createSession({
+      id: sessionId,
+      kind: 'chat',
+      channel: `discord:guild-preflight:${channelId}`,
+      metadata: { source: 'discord', channelId },
+    });
+    const source = appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: objective },
+    });
+    const align = classifyTurnPreflight({
+      message: objective,
+      sessionId,
+      sessionKind: 'chat',
+      sourceUserSeq: source.seq,
+    });
+    assert.equal(align.phase, 'align');
+    recordTurnPreflightDecision(sessionId, align, source.seq);
+    const disposition = await publishPreflightConversation({
+      identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
+      decision: align,
+      openness: null,
+      port: { async render() { return 'I have the Ventura sheet and email handoff in mind, and I’m starting now.'; } },
+      transport: 'openai_agents_harness',
+    });
+    assert.equal(disposition.kind, 'proceed');
+
+    const prompt = 'Go ahead.';
+    assert.equal(await tryHandleHarnessApprovalReply({
+      channelId,
+      prompt,
+      transport: refusingHarnessTransport(),
+    }), false, 'no approval card owns the preflight answer');
+
+    const accepted = appendEvent({
+      sessionId,
+      turn: 2,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: prompt },
+    });
+    const continuation = classifyTurnPreflight({
+      message: prompt,
+      sessionId,
+      sessionKind: 'chat',
+      sourceUserSeq: accepted.seq,
+    });
+    assert.equal(continuation.phase, 'execute');
+    assert.equal(continuation.reason, 'ordinary_execution');
+    assert.equal(continuation.objective, undefined);
+    assert.equal(continuation.confirmedIntentKey, undefined);
+  } finally {
+    if (priorConfirmBeat === undefined) delete process.env.CLEMMY_CONFIRM_BEAT;
+    else process.env.CLEMMY_CONFIRM_BEAT = priorConfirmBeat;
+  }
+});
+
+test('bare Yes still answers a real open check-in instead of falling through as conversation', async () => {
+  const checkIn = createCheckIn({
+    agentSlug: 'discord-ingress-test',
+    question: 'Should the customer-facing release note name the migration explicitly for this rollout?',
+  });
+  const sent: string[] = [];
+  const handled = await __test__.handleDiscordCommand({
+    channelId: 'chan-open-check-in',
+    guildId: 'guild-open-check-in',
+    author: { id: 'user-open-check-in' },
+    channel: {
+      isTextBased: () => true,
+      async send(text: string) { sent.push(text); },
+    },
+  } as never, noApprovalAssistant(), 'Yes');
+
+  assert.equal(handled, true);
+  assert.equal(getCheckIn(checkIn.id)?.status, 'answered');
+  assert.match(sent.join('\n'), /Recorded approval for check-in/);
 });
 
 test('Discord stop targets the actual in-memory gateway attempt and linked background work', async () => {

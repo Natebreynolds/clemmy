@@ -22,29 +22,40 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-claude-one-gate\n', 'utf8');
 
 const brain = await import('./claude-agent-brain.js');
+const sdk = await import('./claude-agent-sdk.js');
 const eventlog = await import('./eventlog.js');
 const admission = await import('./expected-work-admission.js');
 const contracts = await import('./expected-work-contract.js');
 const audit = await import('./accepted-source-settlement-audit.js');
 const delivery = await import('./delivery-committer.js');
 const artifactLedger = await import('./artifact-ledger.js');
+const { withTerminalAuthoringEvidenceReceipt } = await import('../../tools/tool-registry.js');
 const { presentationEventFromCompletionData } = await import('./turn-outcome.js');
 
 const {
   respondViaClaudeAgentSdkBrain,
   setClaudeAgentSdkBrainJudgeForTest,
   setClaudeAgentSdkBrainPostTurnHooksForTest,
+  setClaudeAgentSdkBrainPreflightConversationPortForTest,
   setClaudeAgentSdkBrainRunForTest,
   setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest,
   setClaudeAgentSdkBrainTerminalPresentationRepairPortForTest,
   setClaudeAgentSdkBrainUnifiedPrimerForTest,
 } = brain;
+const { setClaudeAgentSdkQueryForTest } = sdk;
+const { _setOpennessJudgeForTests } = await import('./turn-openness.js');
 const UNAVAILABLE_TERMINAL_DELIVERY_JUDGE = {
   async resolveRoute() { return null; },
   async run() { throw new Error('unavailable fixture must not run'); },
 } satisfies import('./terminal-delivery-judge.js').TerminalDeliveryJudgePort;
 
 beforeEach(() => {
+  writeFileSync(path.join(TMP_HOME, 'state', 'claude-auth.json'), JSON.stringify({
+    accessToken: 'sk-ant-oat01-authoring-terminal-evidence',
+    refreshToken: 'refresh-authoring-terminal-evidence',
+    expiresAt: Date.now() + 60 * 60 * 1000,
+    scopes: ['user:inference'],
+  }), 'utf8');
   eventlog.resetEventLog();
   artifactLedger._resetArtifactLedgerForTests();
   process.env.AUTH_MODE = 'claude_oauth';
@@ -53,7 +64,12 @@ beforeEach(() => {
   delete process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS;
   delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE;
   setClaudeAgentSdkBrainRunForTest(null);
+  setClaudeAgentSdkQueryForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
+  _setOpennessJudgeForTests(async () => null);
+  setClaudeAgentSdkBrainPreflightConversationPortForTest({
+    async render() { return ''; },
+  });
   setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(UNAVAILABLE_TERMINAL_DELIVERY_JUDGE);
   setClaudeAgentSdkBrainTerminalPresentationRepairPortForTest(null);
   setClaudeAgentSdkBrainPostTurnHooksForTest(() => {});
@@ -68,7 +84,10 @@ beforeEach(() => {
 
 after(() => {
   setClaudeAgentSdkBrainRunForTest(null);
+  setClaudeAgentSdkQueryForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
+  _setOpennessJudgeForTests(null);
+  setClaudeAgentSdkBrainPreflightConversationPortForTest(null);
   setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(null);
   setClaudeAgentSdkBrainTerminalPresentationRepairPortForTest(null);
   setClaudeAgentSdkBrainPostTurnHooksForTest(null);
@@ -193,6 +212,89 @@ const REQUEST = 'Update the tracker with all five rows.';
 const PROPOSED_REPLY = 'Updated the tracker with all five rows.';
 const MODEL_HOLD = 'I could not verify that any tracker update landed, so this needs a human check.';
 const MODEL_DISCLOSURE = 'I updated the five rows, but one formatting attempt could not be verified.';
+
+function workflowCreateSdkQuery() {
+  const stream = (async function* () {
+    yield {
+      type: 'system', subtype: 'init', model: 'claude-sonnet-test', session_id: 'sdk-authoring-connection',
+      uuid: 'init-authoring-connection', apiKeySource: 'none', claude_code_version: 'test',
+      cwd: process.cwd(), tools: [
+        'mcp__clementine-local__memory_recall_all',
+        'mcp__clementine-local__tool_search',
+        'mcp__clementine-local__work_call',
+      ], mcp_servers: [], permissionMode: 'default',
+      slash_commands: [], output_style: 'default', skills: [], plugins: [],
+    } as any;
+    yield {
+      type: 'assistant', session_id: 'sdk-authoring-connection', uuid: 'use-authoring-connection',
+      parent_tool_use_id: null,
+      message: { content: [{
+        type: 'tool_use',
+        id: 'toolu_authoring_connection',
+        name: 'mcp__clementine-local__workflow_create',
+        input: { name: 'daily_digest', description: 'Create a daily digest.' },
+      }] },
+    } as any;
+    yield {
+      type: 'user', session_id: 'sdk-authoring-connection', uuid: 'return-authoring-connection',
+      parent_tool_use_id: null,
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'toolu_authoring_connection',
+        content: withTerminalAuthoringEvidenceReceipt(
+          'workflow_create',
+          'Created workflow "daily_digest".',
+        ),
+      }] },
+    } as any;
+    yield {
+      type: 'result', subtype: 'success', session_id: 'sdk-authoring-connection',
+      uuid: 'result-authoring-connection', result: 'Created the daily_digest workflow.',
+      duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1,
+      stop_reason: 'end_turn', total_cost_usd: 0,
+      usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+    } as any;
+  })();
+  return Object.assign(stream, {
+    close() {},
+    interrupt: async () => {},
+    setPermissionMode: async () => {},
+    setModel: async () => {},
+    setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
+    streamInput: async () => {},
+    stopTask: async () => false,
+    backgroundTasks: async () => false,
+  });
+}
+
+test('the full Claude SDK-to-brain-to-committer path publishes a successful workflow authoring return without a judge', async () => {
+  const sessionId = 'claude-authoring-evidence-full-connection';
+  setClaudeAgentSdkQueryForTest(((_options: any) => workflowCreateSdkQuery()) as any);
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Create a daily digest workflow.',
+    sessionId,
+    channel: 'desktop',
+  });
+
+  const source = eventlog.listEvents(sessionId, { types: ['user_input_received'] }).at(-1);
+  assert.ok(source);
+  const returned = eventlog.listEvents(sessionId, { types: ['tool_returned'] });
+  assert.equal(returned.length, 1);
+  assert.equal(returned[0]!.data.successfulAuthoringResult, true);
+  const settlementAudit = audit.auditAcceptedSourceSettlementTruth({
+    sessionId,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(settlementAudit.status, 'clean', JSON.stringify(settlementAudit));
+  assert.equal(settlementAudit.facts.successfulSdkAuthoringResults, 1);
+  assert.equal(settlementAudit.facts.successfulSdkBusinessResults, 0);
+  assert.equal(response.stoppedReason, 'success');
+  assert.match(response.text, /daily_digest/);
+  const { terminal } = terminalFor(sessionId);
+  assert.equal(terminal.status, 'done');
+  assert.match(terminal.text, /daily_digest/);
+});
 
 test('Claude repair still reaches the shared HOLD when no business work succeeded', async () => {
   const sessionId = 'claude-one-gate-hold';
@@ -464,7 +566,7 @@ test('the fresh-write floor reaches repair and the shared DISCLOSE edge after ot
   });
 
   const response = await respondViaClaudeAgentSdkBrain('home', {
-    message: 'Update Google Sheets now with the latest values.',
+    message: 'Update the Google Sheet at https://docs.google.com/spreadsheets/d/test-sheet with the latest values.',
     sessionId,
   });
 
@@ -555,7 +657,7 @@ test('genuine questions and approval pauses remain needs-input terminals', async
     stoppedReason: 'awaiting-input',
   }));
   const question = await respondViaClaudeAgentSdkBrain('home', {
-    message: 'Update my Google Sheet.',
+    message: 'Update the Google Sheet at https://docs.google.com/spreadsheets/d/test-sheet.',
     sessionId: 'claude-preserve-genuine-question',
   });
   assert.equal(question.stoppedReason, 'awaiting-input');

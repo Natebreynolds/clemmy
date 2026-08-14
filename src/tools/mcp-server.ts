@@ -43,6 +43,7 @@ import { registerRecallTools } from './recall-tools.js';
 import { registerArtifactClaimTools } from './artifact-claim-tools.js';
 import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
 import { registerToolSearchTool } from './tool-search-tool.js';
+import { buildAuthorizedToolSearchCandidateSources } from './tool-search-provider-sources.js';
 import {
   registerCallToolMcp,
   type BuiltinCapabilityAdmissionResult,
@@ -55,7 +56,10 @@ import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
-import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
+import {
+  mcpToolScopeAuthority,
+  type McpToolScope,
+} from '../runtime/mcp-tool-scope.js';
 import {
   assertDispatchLeaseCurrent,
   parseDispatchLease,
@@ -551,6 +555,14 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
 
   const actionExpectedWorkRequested = opts.actionExpectedWork
     ?? (process.env.CLEMENTINE_MCP_ACTION_EXPECTED_WORK ?? '').trim().toLowerCase() === 'on';
+  const actionDispatcherOptions = {
+    reachableBuiltinNames: deferredNames,
+    firstClassNames: registeredNames,
+    mcpToolScope: resolvedMcpToolScope(opts),
+    ...(capabilityController ? {
+      admitBuiltinAcquisition: (name: string) => capabilityController.admit(name),
+    } : {}),
+  };
   const actionWorkCallRegistered = registerClaudeActionWorkCall(server, {
     enabled: actionExpectedWorkRequested,
     sessionId: opts.sessionId,
@@ -558,12 +570,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
     runScopeId: opts.runScopeId,
     directOrchestrator: opts.directOrchestrator,
     dispatchLease: opts.dispatchLease,
-    reachableBuiltinNames: deferredNames,
-    firstClassNames: registeredNames,
-    mcpToolScope: resolvedMcpToolScope(opts),
-    ...(capabilityController ? {
-      admitBuiltinAcquisition: (name) => capabilityController.admit(name),
-    } : {}),
+    ...actionDispatcherOptions,
   });
   if (actionExpectedWorkRequested && !actionWorkCallRegistered) {
     throw new Error(
@@ -579,14 +586,19 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
     const codeModeSessionId = opts.sessionId?.trim() || process.env.CLEMENTINE_MCP_SESSION_ID?.trim() || '';
     server.tool(
       'run_tool_program',
-      codeModeDescription(),
+      codeModeDescription({ actionExpectedWork: actionWorkCallRegistered }),
       { program: z.string() },
       async (input: { program: string }) => {
-        const r = await runCodeModeForSession(input.program, codeModeSessionId);
+        const r = await runCodeModeForSession(
+          input.program,
+          codeModeSessionId,
+          actionWorkCallRegistered ? { workCallOptions: actionDispatcherOptions } : {},
+        );
         return textResult(
           r.ok
             ? `code-mode program returned (${r.rpcCalls} tool call${r.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(r.value)}`
             : `code-mode program failed: ${r.error}`,
+          { isError: !r.ok },
         );
       },
     );
@@ -645,12 +657,22 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   const searchableNames = deferredNames.size > 0
     ? new Set([...registeredNames, ...deferredNames])
     : registeredNames;
+  const brokerScope = resolvedMcpToolScope(opts);
+  const directOrchestrator = opts.directOrchestrator
+    ?? (process.env.CLEMENTINE_MCP_DIRECT_ORCHESTRATOR ?? '').trim().toLowerCase() === 'on';
+  const candidateSources = actionWorkCallRegistered
+    && directOrchestrator
+    && brokerScope
+    && mcpToolScopeAuthority(brokerScope) !== 'none'
+    ? buildAuthorizedToolSearchCandidateSources(brokerScope)
+    : undefined;
   registerToolSearchTool(server, {
     allowedNames: searchableNames,
     dispatchViaCallTool: deferredNames.size > 0 && !actionWorkCallRegistered,
     ...(deferredNames.size > 0 && actionWorkCallRegistered
       ? { dispatchCarrier: 'work_call' as const }
       : {}),
+    ...(candidateSources ? { candidateSources } : {}),
   });
   return server;
 }

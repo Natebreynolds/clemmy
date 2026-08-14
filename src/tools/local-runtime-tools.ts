@@ -40,7 +40,7 @@ import { registerProfileTools } from './profile-tools.js';
 import { registerRecallTools } from './recall-tools.js';
 import { registerArtifactClaimTools } from './artifact-claim-tools.js';
 import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
-import { registerToolSearchTool } from './tool-search-tool.js';
+import { registerToolSearchTool, type ToolSearchCandidateSource } from './tool-search-tool.js';
 import { registerHarnessStatusTools } from './harness-status-tools.js';
 import { registerSessionTools } from './session-tools.js';
 import { registerTeamTools } from './team-tools.js';
@@ -387,6 +387,8 @@ export function getLocalToolCatalog(): Array<{ name: string; description: string
 export function buildScopedLocalToolSearch(
   allowedNames: ReadonlySet<string>,
   dispatchCarrier: 'call_tool' | 'work_call' = 'call_tool',
+  dispatchCarrierForName?: (name: string) => 'call_tool' | 'work_call',
+  candidateSources?: readonly ToolSearchCandidateSource[],
 ): Tool<RuntimeContextValue> {
   const captured: CapturedLocalTool[] = [];
   const fakeServer = {
@@ -403,6 +405,8 @@ export function buildScopedLocalToolSearch(
     allowedNames,
     dispatchViaCallTool: dispatchCarrier === 'call_tool',
     dispatchCarrier,
+    ...(dispatchCarrierForName ? { dispatchCarrierForName } : {}),
+    ...(candidateSources ? { candidateSources } : {}),
   });
   const localTool = captured[0];
   if (!localTool) throw new Error('tool_search did not register');

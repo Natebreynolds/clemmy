@@ -27,6 +27,31 @@ function exactOutputSha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
+/** Host-authored typed result for an invocation whose exact output could not
+ * be persisted losslessly. This is an execution outcome, not provider prose:
+ * callers may narrow/page and retry, but no consumer may treat the stored
+ * prefix as business evidence. */
+export class TruncatedToolOutputResult {
+  readonly ok = false as const;
+  readonly error_kind = 'truncated_tool_output' as const;
+  readonly truncated_at_write = true as const;
+  readonly error: string;
+
+  constructor(
+    readonly result_handle: string,
+    readonly content_bytes: number,
+  ) {
+    this.error = `Tool result "${this.result_handle}" is incomplete (${this.content_bytes} original bytes exceeded the durable output cap), so the stored prefix cannot be used as evidence. Re-read/page the source with a narrower scope, or stage the full result as a file and read that artifact.`;
+  }
+}
+
+export function truncatedToolOutputResult(
+  callId: string,
+  contentBytes: number,
+): TruncatedToolOutputResult {
+  return new TruncatedToolOutputResult(callId, contentBytes);
+}
+
 /** Verify that the compact result returned by THIS invocation names the exact
  * bytes in the lossless store. The nonce is minted outside provider code and
  * inherited through nested tool-output contexts; call ids alone are reusable. */
@@ -58,6 +83,13 @@ export function exactToolOutputForInvocation(input: {
       input.callId,
       input.settlementNonce,
     );
+    if (
+      stored
+      && stored.tool === input.toolName
+      && stored.truncatedAtWrite
+    ) {
+      return truncatedToolOutputResult(input.callId, stored.contentBytes);
+    }
     if (
       stored
       && stored.tool === input.toolName

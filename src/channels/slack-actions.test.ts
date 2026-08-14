@@ -95,10 +95,10 @@ test('buildSlackActionsForNotification: a resolved approval never gets stale but
 
 test('buildSlackActionsForNotification: checkInId attaches answer buttons', () => {
   const ids = actionIds(buildSlackActionsForNotification({ checkInId: 'chk-abc123' }));
-  assert.equal(ids.length, 3, 'expected approve, answer, reject');
-  assert.ok(ids.includes('clementine:checkin-approve:chk-abc123'));
+  assert.equal(ids.length, 1, 'a question gets one honestly labelled Answer control');
   assert.ok(ids.includes('clementine:checkin-answer:chk-abc123'));
-  assert.ok(ids.includes('clementine:checkin-reject:chk-abc123'));
+  assert.ok(!ids.includes('clementine:checkin-approve:chk-abc123'));
+  assert.ok(!ids.includes('clementine:checkin-reject:chk-abc123'));
 });
 
 test('buildSlackActionsForNotification: stale planProposalId does not attach dead buttons', () => {

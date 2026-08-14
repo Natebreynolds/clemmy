@@ -40,7 +40,12 @@ const ACTION_VERB_RE = /\b(send|sends|sending|publish|publishes|publishing|deplo
 export function classifyTurnIntent(text: string | undefined | null): TurnIntent {
   const s = typeof text === 'string' ? text : '';
   const messageIntent = classifyMessageIntent(s).intent;
-  if (messageIntent === 'lookup' || messageIntent === 'meta_clarify' || messageIntent === 'casual') {
+  if (
+    messageIntent === 'lookup'
+    || messageIntent === 'meta_clarify'
+    || messageIntent === 'casual'
+    || messageIntent === 'conversation'
+  ) {
     return 'qa';
   }
   return classifyExternalEffectRequest(s).requested || ACTION_VERB_RE.test(s)

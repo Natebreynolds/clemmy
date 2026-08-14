@@ -75,7 +75,12 @@ function acceptedTask(label: string): AcceptedTask {
     turn: 1,
     role: 'user',
     type: 'user_input_received',
-    data: { text: `${label}: do the alpha work` },
+    // This is a settlement-wire fixture, so it must own a real action node.
+    // "Do the alpha work" is intentionally conversationally vague and now
+    // compiles as direct_reply; using it would make successful business work
+    // correctly fail for lack of an accepted work node before this seam is
+    // exercised.
+    data: { text: `${label}: run the alpha operation now` },
   });
   assert.ok(recordTurnGraphShadow({
     identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
@@ -219,7 +224,11 @@ const ROWS: LaneRow[] = [
     expectDispatches: 0,
     expectDispatchState: 'not_started',
     expectSucceeded: false,
-    expectOutput: /provider-dispatch:not-started:ambiguous-account/,
+    // A prior successful row may have durably learned its single account.
+    // With two different live accounts later, the honest typed refusal is
+    // either fresh ambiguity or identity-absent for that remembered account;
+    // both mean the user must choose and neither dispatches.
+    expectOutput: /provider-dispatch:not-started:(?:ambiguous-account|identity-absent)/,
     because: 'an ambiguity block is a refusal with a typed reason; losing it makes the retry unaccountable',
   },
   {

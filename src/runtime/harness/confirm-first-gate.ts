@@ -33,6 +33,7 @@
 import { getRuntimeEnv } from '../../config.js';
 import {
   classifyCanonicalExternalEffect,
+  type CanonicalExternalEffect,
   isIrreversibleSendSlug,
   IRREVERSIBLE_SEND_VERBS,
 } from './execution-gate.js';
@@ -50,6 +51,8 @@ export interface ExternalWriteShape {
   mutating: boolean;
   /** Whether the write is irreversible (SEND/PUBLISH). */
   irreversible: boolean;
+  /** Positive reversibility proof; never derived from `irreversible: false`. */
+  reversibility: CanonicalExternalEffect['reversibility'];
   /** Stable key the model fans out on — the canonical provider action.
    *  Unknown external mutations retain their carrier name and fail closed. */
   shapeKey: string | undefined;
@@ -68,6 +71,7 @@ export function classifyExternalWrite(toolName: string, rawArgs: unknown): Exter
     external: effect.external,
     mutating: effect.mutating,
     irreversible: effect.irreversible,
+    reversibility: effect.reversibility,
     shapeKey: effect.mutating ? effect.action ?? toolName : undefined,
     classificationKnown: effect.classificationKnown,
   };

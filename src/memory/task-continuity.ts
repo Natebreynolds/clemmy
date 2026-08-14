@@ -11,7 +11,7 @@
  * daemon restart, expire, and may be consumed only by the next real accepted
  * user source in that same session.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 
@@ -97,12 +97,22 @@ export interface TaskContinuityClockOptions {
 export type TaskContinuityLookupResult =
   | { status: 'available'; packet: TaskContinuityPacket }
   | { status: 'none' }
+  | { status: 'ambiguous' }
   | { status: 'expired'; packetId: string }
   | { status: 'malformed'; packetId: string };
 
 export interface ConsumeTaskContinuityPacketInput {
   sessionId: string;
   consumingSourceUserSeq: number;
+  resolution?: TaskContinuityFrozenResolution;
+}
+
+export interface TaskContinuityFrozenResolution {
+  resolverVersion: string;
+  disposition: 'affirmed' | 'declined' | 'declined_with_new_task' | 'selected' | 'provided';
+  selectedOption?: string;
+  activeTaskInput?: string;
+  semanticInputHash: string;
 }
 
 export interface DismissTaskContinuityPacketInput {
@@ -118,6 +128,7 @@ export type TaskContinuityDismissResult =
       dismissedAt: string;
     }
   | { status: 'none' }
+  | { status: 'ambiguous' }
   | { status: 'lost_race'; packetId: string };
 
 export type TaskContinuityConsumeResult =
@@ -127,16 +138,35 @@ export type TaskContinuityConsumeResult =
       consumingSourceUserSeq: number;
       consumingSourceEventId: string;
       consumedAt: string;
+      resolution: TaskContinuityFrozenResolution;
       /** False for the one logical CAS; true when the exact same accepted
        * source rehydrates it after physical retry/restart. */
       replay: boolean;
     }
   | { status: 'none' }
+  | { status: 'ambiguous' }
   | { status: 'expired'; packetId: string }
   | { status: 'malformed'; packetId: string }
   | { status: 'invalid_source'; packetId?: string }
   | { status: 'stale'; packetId: string }
   | { status: 'lost_race'; packetId: string };
+
+/** Read-only projection of an already consumed packet. This is the durable
+ * lineage verifier used after the answer resolver has closed the question;
+ * unlike consume(), it can never claim or retire a packet. */
+export type ConsumedTaskContinuityLookupResult =
+  | {
+      status: 'consumed';
+      packet: TaskContinuityPacket;
+      consumingSourceUserSeq: number;
+      consumingSourceEventId: string;
+      consumedAt: string;
+      resolution: TaskContinuityFrozenResolution;
+    }
+  | { status: 'none' }
+  | { status: 'ambiguous' }
+  | { status: 'malformed'; packetId: string }
+  | { status: 'invalid_source'; packetId?: string };
 
 interface RawPacketRow {
   packet_id: string;
@@ -157,6 +187,13 @@ interface RawPacketRow {
   expired_at: string | null;
   dismissed_at: string | null;
   dismissed_reason: string | null;
+  origin_audience_hash: string | null;
+  consumer_audience_hash: string | null;
+  resolver_version: string | null;
+  resolution_disposition: string | null;
+  resolution_selected_option: string | null;
+  resolution_active_task_input: string | null;
+  resolution_semantic_input_hash: string | null;
 }
 
 interface RawSourceRow {
@@ -174,6 +211,10 @@ interface AcceptedSource {
   eventId: string;
   sessionId: string;
   createdAt: string;
+  dataHash: string;
+  providerUserId?: string;
+  conversationKey?: string;
+  sharedChannel: boolean;
 }
 
 type DatabaseProvider = () => Database.Database;
@@ -197,6 +238,10 @@ const MAX_ACCOUNT_CHARS = 512;
 const MAX_RESOURCE_REFS = 24;
 const MAX_RESOURCE_REF_CHARS = 1_024;
 const MAX_SCHEMA_FINGERPRINT_CHARS = 512;
+const MAX_RESOLVER_VERSION_CHARS = 96;
+const FROZEN_DISPOSITIONS = new Set<TaskContinuityFrozenResolution['disposition']>([
+  'affirmed', 'declined', 'declined_with_new_task', 'selected', 'provided',
+]);
 
 function ensureSchema(db: Database.Database): void {
   if (initializedDatabases.has(db)) return;
@@ -224,11 +269,28 @@ function ensureSchema(db: Database.Database): void {
                                       CHECK (dismissed_reason IS NULL OR dismissed_reason IN (
                                         'topic_changed', 'user_declined', 'no_longer_needed', 'invalidated'
                                       )),
+      origin_audience_hash            TEXT,
+      consumer_audience_hash          TEXT,
+      resolver_version                TEXT,
+      resolution_disposition          TEXT,
+      resolution_selected_option      TEXT,
+      resolution_active_task_input    TEXT,
+      resolution_semantic_input_hash  TEXT,
       CHECK (expires_at > created_at),
       CHECK (
         (consumed_at IS NULL AND consumed_by_source_user_seq IS NULL AND consumed_by_source_event_id IS NULL)
         OR
         (consumed_at IS NOT NULL AND consumed_by_source_user_seq > 0 AND consumed_by_source_event_id IS NOT NULL)
+      ),
+      CHECK (
+        (consumed_at IS NULL AND consumer_audience_hash IS NULL
+          AND resolver_version IS NULL AND resolution_disposition IS NULL
+          AND resolution_selected_option IS NULL AND resolution_active_task_input IS NULL
+          AND resolution_semantic_input_hash IS NULL)
+        OR
+        (consumed_at IS NOT NULL AND consumer_audience_hash IS NOT NULL
+          AND resolver_version IS NOT NULL AND resolution_disposition IS NOT NULL
+          AND resolution_semantic_input_hash IS NOT NULL)
       ),
       CHECK (
         (dismissed_at IS NULL AND dismissed_reason IS NULL)
@@ -285,6 +347,26 @@ function ensureSchema(db: Database.Database): void {
     )
     BEGIN
       SELECT RAISE(ABORT, 'task continuity consumer is not an exact accepted user source');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS task_continuity_origin_audience_immutable
+    BEFORE UPDATE OF origin_audience_hash, consumer_audience_hash ON task_continuity_packets
+    FOR EACH ROW
+    WHEN OLD.consumer_audience_hash IS NOT NULL
+      OR OLD.origin_audience_hash IS NOT NEW.origin_audience_hash
+    BEGIN
+      SELECT RAISE(ABORT, 'task continuity origin audience is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS task_continuity_resolution_immutable
+    BEFORE UPDATE OF resolver_version, resolution_disposition,
+                     resolution_selected_option, resolution_active_task_input,
+                     resolution_semantic_input_hash
+      ON task_continuity_packets
+    FOR EACH ROW
+    WHEN OLD.consumed_at IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'task continuity frozen resolution is immutable');
     END;
   `);
   initializedDatabases.add(db);
@@ -383,6 +465,9 @@ function normalizePauseOptions(values: readonly string[] | undefined): string[] 
   if (!Array.isArray(raw) || raw.length > MAX_PAUSE_OPTIONS) {
     throw new Error(`Task continuity pause options must contain at most ${MAX_PAUSE_OPTIONS} rows.`);
   }
+  if (raw.length > 0) {
+    throw new Error('Task continuity pause options require an exact public delivery binding.');
+  }
   const normalized = raw.map((option) =>
     boundedString(option, 'pause option', MAX_PAUSE_OPTION_CHARS));
   if (new Set(normalized).size !== normalized.length) {
@@ -456,12 +541,128 @@ function acceptedSourceFromRow(row: RawSourceRow | null): AcceptedSource | null 
   } catch {
     return null;
   }
+  const providerUserId = typeof data.userId === 'string' && data.userId.trim()
+    ? data.userId.trim()
+    : undefined;
+  const conversationKey = typeof data.conversationKey === 'string' && data.conversationKey.trim()
+    ? data.conversationKey.trim()
+    : undefined;
+  const source = typeof data.source === 'string' ? data.source.trim().toLowerCase() : '';
+  const originTarget = isPlainObject(data.originReplyTarget) ? data.originReplyTarget : null;
+  const sharedChannel = source.startsWith('channel:')
+    || source.startsWith('channel_')
+    || /^[^:]+:/.test(conversationKey ?? '')
+    || (typeof originTarget?.type === 'string' && /_channel$/.test(originTarget.type));
   return {
     seq: row.seq,
     eventId: row.id,
     sessionId: row.session_id,
     createdAt: row.created_at,
+    dataHash: createHash('sha256').update(row.data_json, 'utf8').digest('hex'),
+    ...(providerUserId ? { providerUserId } : {}),
+    ...(conversationKey ? { conversationKey } : {}),
+    sharedChannel,
   };
+}
+
+function acceptedAudienceHash(source: AcceptedSource): string {
+  return createHash('sha256').update(JSON.stringify({
+    version: 1,
+    sessionId: source.sessionId,
+    sourceUserSeq: source.seq,
+    sourceEventId: source.eventId,
+    sourceDataHash: source.dataHash,
+    sharedChannel: source.sharedChannel,
+    providerUserId: source.providerUserId ?? null,
+    conversationKey: source.conversationKey ?? null,
+  }), 'utf8').digest('hex');
+}
+
+function normalizeFrozenResolution(
+  value: TaskContinuityFrozenResolution | undefined,
+): TaskContinuityFrozenResolution | null {
+  if (!value || typeof value !== 'object') return null;
+  const resolverVersion = typeof value.resolverVersion === 'string'
+    ? value.resolverVersion.trim()
+    : '';
+  const selectedOption = value.selectedOption === undefined
+    ? undefined
+    : typeof value.selectedOption === 'string'
+      ? value.selectedOption.trim()
+      : '';
+  const activeTaskInput = value.activeTaskInput === undefined
+    ? undefined
+    : typeof value.activeTaskInput === 'string'
+      ? value.activeTaskInput.trim()
+      : '';
+  if (
+    !resolverVersion
+    || resolverVersion.length > MAX_RESOLVER_VERSION_CHARS
+    || !FROZEN_DISPOSITIONS.has(value.disposition)
+    || !/^[a-f0-9]{64}$/.test(value.semanticInputHash)
+    || (value.selectedOption !== undefined && !selectedOption)
+    || (value.activeTaskInput !== undefined && !activeTaskInput)
+    || (value.disposition === 'declined_with_new_task' && !activeTaskInput)
+    || (value.disposition !== 'declined_with_new_task' && activeTaskInput !== undefined)
+  ) return null;
+  return {
+    resolverVersion,
+    disposition: value.disposition,
+    ...(selectedOption ? { selectedOption } : {}),
+    ...(activeTaskInput ? { activeTaskInput } : {}),
+    semanticInputHash: value.semanticInputHash,
+  };
+}
+
+function frozenResolutionFromRow(row: RawPacketRow): TaskContinuityFrozenResolution | null {
+  if (!row.resolver_version || !row.resolution_disposition || !row.resolution_semantic_input_hash) {
+    return null;
+  }
+  return normalizeFrozenResolution({
+    resolverVersion: row.resolver_version,
+    disposition: row.resolution_disposition as TaskContinuityFrozenResolution['disposition'],
+    ...(row.resolution_selected_option
+      ? { selectedOption: row.resolution_selected_option }
+      : {}),
+    ...(row.resolution_active_task_input
+      ? { activeTaskInput: row.resolution_active_task_input }
+      : {}),
+    semanticInputHash: row.resolution_semantic_input_hash,
+  });
+}
+
+function sameFrozenResolution(
+  left: TaskContinuityFrozenResolution,
+  right: TaskContinuityFrozenResolution,
+): boolean {
+  return left.resolverVersion === right.resolverVersion
+    && left.disposition === right.disposition
+    && left.selectedOption === right.selectedOption
+    && left.activeTaskInput === right.activeTaskInput
+    && left.semanticInputHash === right.semanticInputHash;
+}
+
+function sameAcceptedAudience(origin: AcceptedSource, consumer: AcceptedSource): boolean {
+  if (origin.sharedChannel || consumer.sharedChannel) {
+    return Boolean(
+      origin.providerUserId
+      && consumer.providerUserId
+      && origin.providerUserId === consumer.providerUserId
+      && origin.conversationKey
+      && consumer.conversationKey
+      && origin.conversationKey === consumer.conversationKey,
+    );
+  }
+  if (origin.conversationKey !== undefined || consumer.conversationKey !== undefined) {
+    if (!origin.conversationKey || origin.conversationKey !== consumer.conversationKey) return false;
+  }
+  if (origin.providerUserId !== undefined || consumer.providerUserId !== undefined) {
+    return Boolean(
+      origin.providerUserId
+      && origin.providerUserId === consumer.providerUserId,
+    );
+  }
+  return true;
 }
 
 function acceptedSource(db: Database.Database, sessionId: string, sourceUserSeq: number): AcceptedSource | null {
@@ -490,8 +691,8 @@ function nextAcceptedSource(db: Database.Database, sessionId: string, afterSeq: 
   return null;
 }
 
-function openPacketRow(db: Database.Database, sessionId: string): RawPacketRow | null {
-  return (db.prepare(`
+function openPacketRows(db: Database.Database, sessionId: string): RawPacketRow[] {
+  return db.prepare(`
     SELECT *
       FROM task_continuity_packets
      WHERE session_id = ?
@@ -500,24 +701,24 @@ function openPacketRow(db: Database.Database, sessionId: string): RawPacketRow |
        AND expired_at IS NULL
        AND dismissed_at IS NULL
      ORDER BY created_at DESC, rowid DESC
-     LIMIT 1
-  `).get(sessionId) as RawPacketRow | undefined) ?? null;
+     LIMIT 2
+  `).all(sessionId) as RawPacketRow[];
 }
 
-function consumedPacketRowForSource(
+function consumedPacketRowsForSource(
   db: Database.Database,
   sessionId: string,
   sourceUserSeq: number,
-): RawPacketRow | null {
-  return (db.prepare(`
+): RawPacketRow[] {
+  return db.prepare(`
     SELECT *
       FROM task_continuity_packets
      WHERE session_id = ?
        AND consumed_by_source_user_seq = ?
        AND consumed_at IS NOT NULL
      ORDER BY consumed_at DESC, rowid DESC
-     LIMIT 1
-  `).get(sessionId, sourceUserSeq) as RawPacketRow | undefined) ?? null;
+     LIMIT 2
+  `).all(sessionId, sourceUserSeq) as RawPacketRow[];
 }
 
 function rowToPacket(db: Database.Database, row: RawPacketRow): TaskContinuityPacket | null {
@@ -550,6 +751,9 @@ function rowToPacket(db: Database.Database, row: RawPacketRow): TaskContinuityPa
   if (expiresAt.ms <= createdAt.ms || expiresAt.ms - createdAt.ms > MAX_TASK_CONTINUITY_TTL_MS) return null;
   const origin = acceptedSource(db, sessionId, sourceSeq);
   if (!origin || origin.eventId !== row.originating_source_event_id) return null;
+  // v42 seals the audience as it existed when the packet was created. Legacy
+  // rows and later mutation of event.data user/channel identity fail closed.
+  if (!row.origin_audience_hash || row.origin_audience_hash !== acceptedAudienceHash(origin)) return null;
   if (createdAt.ms < Date.parse(origin.createdAt)) return null;
   return {
     version: TASK_CONTINUITY_PACKET_VERSION,
@@ -569,12 +773,53 @@ function lookupResult(
   sessionId: string,
   nowMs: number,
 ): TaskContinuityLookupResult {
-  const row = openPacketRow(db, sessionId);
+  const rows = openPacketRows(db, sessionId);
+  if (rows.length > 1) return { status: 'ambiguous' };
+  const row = rows[0];
   if (!row) return { status: 'none' };
   const packet = rowToPacket(db, row);
   if (!packet) return { status: 'malformed', packetId: row.packet_id };
   if (Date.parse(packet.expiresAt) <= nowMs) return { status: 'expired', packetId: packet.packetId };
   return { status: 'available', packet };
+}
+
+function consumedLookupResult(
+  db: Database.Database,
+  sessionId: string,
+  consumingSourceUserSeq: number,
+): ConsumedTaskContinuityLookupResult {
+  const consumer = acceptedSource(db, sessionId, consumingSourceUserSeq);
+  if (!consumer) return { status: 'invalid_source' };
+  const rows = consumedPacketRowsForSource(db, sessionId, consumer.seq);
+  if (rows.length === 0) return { status: 'none' };
+  if (rows.length > 1) return { status: 'ambiguous' };
+  const row = rows[0]!;
+  const packet = rowToPacket(db, row);
+  if (!packet) return { status: 'malformed', packetId: row.packet_id };
+  // Expiry limits how long an OPEN question may acquire a consumer. Once the
+  // exact next accepted source consumed it, that lineage is durable audit
+  // history and must remain rehydratable after a long restart.
+  if (
+    row.consumed_by_source_event_id !== consumer.eventId
+    || row.consumed_by_source_user_seq !== consumer.seq
+    || !row.consumed_at
+    || !row.consumer_audience_hash
+    || row.consumer_audience_hash !== acceptedAudienceHash(consumer)
+  ) return { status: 'invalid_source', packetId: packet.packetId };
+  const origin = acceptedSource(db, sessionId, packet.originatingSourceUserSeq);
+  if (!origin || !sameAcceptedAudience(origin, consumer)) {
+    return { status: 'invalid_source', packetId: packet.packetId };
+  }
+  const resolution = frozenResolutionFromRow(row);
+  if (!resolution) return { status: 'malformed', packetId: packet.packetId };
+  return {
+    status: 'consumed',
+    packet,
+    consumingSourceUserSeq: consumer.seq,
+    consumingSourceEventId: consumer.eventId,
+    consumedAt: row.consumed_at,
+    resolution,
+  };
 }
 
 export class TaskContinuityStore {
@@ -617,11 +862,17 @@ export class TaskContinuityStore {
           `Task continuity source ${sourceUserSeq} is not an accepted user source for ${sessionId}.`,
         );
       }
+      if (source.sharedChannel && (!source.providerUserId || !source.conversationKey)) {
+        throw new Error('Task continuity shared-channel source has no exact provider audience identity.');
+      }
       if (now.ms < Date.parse(source.createdAt)) {
         throw new Error('Task continuity cannot be created before its originating source.');
       }
       if (nextAcceptedSource(db, sessionId, sourceUserSeq)) {
         throw new Error('Task continuity cannot be created after a later accepted user source exists.');
+      }
+      if (openPacketRows(db, sessionId).length > 1) {
+        throw new Error('Task continuity has multiple open questions for one session.');
       }
 
       // Latest pause wins. Supersession is reversible audit history, not deletion.
@@ -641,8 +892,8 @@ export class TaskContinuityStore {
           packet_id, version, session_id,
           originating_source_user_seq, originating_source_event_id,
           pause_kind, pause_question, pause_options_json, capability_evidence_json,
-          created_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          created_at, expires_at, origin_audience_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         packetId,
         TASK_CONTINUITY_PACKET_VERSION,
@@ -655,6 +906,7 @@ export class TaskContinuityStore {
         JSON.stringify({ version: TASK_CONTINUITY_PACKET_VERSION, capabilities }),
         now.iso,
         expiresAt.iso,
+        acceptedAudienceHash(source),
       );
       const row = db.prepare('SELECT * FROM task_continuity_packets WHERE packet_id = ?')
         .get(packetId) as RawPacketRow;
@@ -676,6 +928,18 @@ export class TaskContinuityStore {
     return lookupResult(db, sessionId, now.ms);
   }
 
+  readConsumed(
+    input: ConsumeTaskContinuityPacketInput,
+    options: TaskContinuityClockOptions = {},
+  ): ConsumedTaskContinuityLookupResult {
+    const sessionId = normalizedSessionId(input.sessionId);
+    const consumingSourceUserSeq = positiveSeq(input.consumingSourceUserSeq, 'consumingSourceUserSeq');
+    if (options.now !== undefined) canonicalIso(options.now, 'now');
+    const db = this.databaseProvider();
+    ensureSchema(db);
+    return consumedLookupResult(db, sessionId, consumingSourceUserSeq);
+  }
+
   consume(
     input: ConsumeTaskContinuityPacketInput,
     options: TaskContinuityClockOptions = {},
@@ -686,29 +950,22 @@ export class TaskContinuityStore {
     const db = this.databaseProvider();
     ensureSchema(db);
     const consume = db.transaction((): TaskContinuityConsumeResult => {
-      const row = openPacketRow(db, sessionId);
+      const openRows = openPacketRows(db, sessionId);
+      if (openRows.length > 1) return { status: 'ambiguous' };
+      const row = openRows[0];
       if (!row) {
-        const consumer = acceptedSource(db, sessionId, consumingSourceUserSeq);
-        if (!consumer) return { status: 'none' };
-        const consumedRow = consumedPacketRowForSource(db, sessionId, consumer.seq);
-        if (!consumedRow) return { status: 'none' };
-        const packet = rowToPacket(db, consumedRow);
-        if (!packet) return { status: 'malformed', packetId: consumedRow.packet_id };
-        if (Date.parse(packet.expiresAt) <= now.ms) {
-          return { status: 'expired', packetId: packet.packetId };
-        }
-        if (
-          consumedRow.consumed_by_source_event_id !== consumer.eventId
-          || !consumedRow.consumed_at
-        ) return { status: 'invalid_source', packetId: packet.packetId };
-        return {
-          status: 'consumed',
-          packet,
-          consumingSourceUserSeq: consumer.seq,
-          consumingSourceEventId: consumer.eventId,
-          consumedAt: consumedRow.consumed_at,
-          replay: true,
-        };
+        const requestedResolution = normalizeFrozenResolution(input.resolution);
+        if (!requestedResolution) return { status: 'invalid_source' };
+        const replay = consumedLookupResult(
+          db,
+          sessionId,
+          consumingSourceUserSeq,
+        );
+        return replay.status === 'consumed'
+          ? sameFrozenResolution(replay.resolution, requestedResolution)
+            ? { ...replay, replay: true }
+            : { status: 'invalid_source', packetId: replay.packet.packetId }
+          : replay;
       }
       const packet = rowToPacket(db, row);
       if (!packet) return { status: 'malformed', packetId: row.packet_id };
@@ -727,6 +984,12 @@ export class TaskContinuityStore {
 
       const consumer = acceptedSource(db, sessionId, consumingSourceUserSeq);
       if (!consumer) return { status: 'invalid_source', packetId: packet.packetId };
+      const origin = acceptedSource(db, sessionId, packet.originatingSourceUserSeq);
+      if (!origin || !sameAcceptedAudience(origin, consumer)) {
+        return { status: 'invalid_source', packetId: packet.packetId };
+      }
+      const resolution = normalizeFrozenResolution(input.resolution);
+      if (!resolution) return { status: 'invalid_source', packetId: packet.packetId };
       const next = nextAcceptedSource(db, sessionId, packet.originatingSourceUserSeq);
       if (!next || next.seq !== consumer.seq || consumer.seq <= packet.originatingSourceUserSeq) {
         // Once another real user source intervenes, this packet can never safely
@@ -748,14 +1011,32 @@ export class TaskContinuityStore {
         UPDATE task_continuity_packets
            SET consumed_at = ?,
                consumed_by_source_user_seq = ?,
-               consumed_by_source_event_id = ?
+               consumed_by_source_event_id = ?,
+               consumer_audience_hash = ?,
+               resolver_version = ?,
+               resolution_disposition = ?,
+               resolution_selected_option = ?,
+               resolution_active_task_input = ?,
+               resolution_semantic_input_hash = ?
          WHERE packet_id = ?
            AND consumed_at IS NULL
            AND superseded_at IS NULL
            AND expired_at IS NULL
            AND dismissed_at IS NULL
            AND expires_at > ?
-      `).run(now.iso, consumer.seq, consumer.eventId, packet.packetId, now.iso);
+      `).run(
+        now.iso,
+        consumer.seq,
+        consumer.eventId,
+        acceptedAudienceHash(consumer),
+        resolution.resolverVersion,
+        resolution.disposition,
+        resolution.selectedOption ?? null,
+        resolution.activeTaskInput ?? null,
+        resolution.semanticInputHash,
+        packet.packetId,
+        now.iso,
+      );
       if (Number(changed.changes ?? 0) !== 1) {
         return { status: 'lost_race', packetId: packet.packetId };
       }
@@ -765,6 +1046,7 @@ export class TaskContinuityStore {
         consumingSourceUserSeq: consumer.seq,
         consumingSourceEventId: consumer.eventId,
         consumedAt: now.iso,
+        resolution,
         replay: false,
       };
     });
@@ -785,7 +1067,9 @@ export class TaskContinuityStore {
     const db = this.databaseProvider();
     ensureSchema(db);
     const dismiss = db.transaction((): TaskContinuityDismissResult => {
-      const row = openPacketRow(db, sessionId);
+      const rows = openPacketRows(db, sessionId);
+      if (rows.length > 1) return { status: 'ambiguous' };
+      const row = rows[0];
       if (!row) return { status: 'none' };
       // Dismissal never interprets or exposes packet evidence. This remains a
       // safe recovery path even when a row's JSON is malformed and unreadable.
@@ -833,6 +1117,13 @@ export function consumeTaskContinuityPacket(
   options: TaskContinuityClockOptions = {},
 ): TaskContinuityConsumeResult {
   return taskContinuityStore.consume(input, options);
+}
+
+export function readConsumedTaskContinuityPacket(
+  input: ConsumeTaskContinuityPacketInput,
+  options: TaskContinuityClockOptions = {},
+): ConsumedTaskContinuityLookupResult {
+  return taskContinuityStore.readConsumed(input, options);
 }
 
 export function dismissTaskContinuityPacket(

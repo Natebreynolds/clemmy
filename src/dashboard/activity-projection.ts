@@ -67,6 +67,7 @@ interface RawRunRecordLike {
   source?: unknown;
   error?: unknown;
   capabilityBlock?: unknown;
+  mutationBlock?: unknown;
 }
 
 function text(value: unknown): string | undefined {
@@ -81,7 +82,9 @@ const LIFECYCLES: Record<string, SurfaceLifecycle> = {
   running: 'reasoning',
   finalizing: 'completing',
   blocked_capability: 'blocked',
+  blocked_mutation: 'blocked',
   awaiting_approval: 'awaiting_approval',
+  awaiting_input: 'awaiting_input',
   parked: 'awaiting_approval',
   completed: 'completed',
   failed: 'failed',
@@ -127,6 +130,9 @@ export function projectWorkflowRunActivity(
   const block = raw.capabilityBlock && typeof raw.capabilityBlock === 'object'
     ? raw.capabilityBlock as { message?: unknown; toolkit?: unknown }
     : undefined;
+  const mutationBlock = raw.mutationBlock && typeof raw.mutationBlock === 'object'
+    ? raw.mutationBlock as { stepId?: unknown; fingerprint?: unknown }
+    : undefined;
 
   const lastEvidenceAt = text(raw.finishedAt) ?? text(raw.startedAt) ?? text(raw.createdAt) ?? observedAt;
   const snapshot = projectRunSnapshot({
@@ -135,9 +141,17 @@ export function projectWorkflowRunActivity(
     presentationLane: text(raw.source) === 'cron' ? 'scheduled' : 'detached',
     lifecycle,
     headline: workflow,
-    ...(lifecycle === 'blocked' && block
-      ? { detail: text(block.message)?.slice(0, 300) ?? `Connect ${text(block.toolkit) ?? 'the required account'} to resume.` }
-      : {}),
+    ...(lifecycle === 'blocked' && mutationBlock
+      ? {
+          detail: `Provider outcome needs reconciliation for step ${text(mutationBlock.stepId) ?? 'unknown'}${
+            text(mutationBlock.fingerprint)
+              ? ` (mutation ${text(mutationBlock.fingerprint)!.slice(0, 12)})`
+              : ''
+          }. The call was not sent again.`,
+        }
+      : lifecycle === 'blocked' && block
+        ? { detail: text(block.message)?.slice(0, 300) ?? `Connect ${text(block.toolkit) ?? 'the required account'} to resume.` }
+        : {}),
     startedAt: text(raw.startedAt) ?? text(raw.createdAt) ?? observedAt,
     // Durable-evidence time only: the record's own timestamps, never poll time.
     lastEvidenceAt,

@@ -22,6 +22,7 @@ import {
   publicReplyFromNarratedEnvelope,
 } from './envelope-narration.js';
 import {
+  assertPublicPresentationText,
   presentationEventFromCompletionData,
   type PresentationEvent,
 } from './turn-outcome.js';
@@ -58,6 +59,61 @@ const SAFE_TERMINAL_FALLBACK = 'I finished the turn, but the final reply was not
 export const PUBLIC_RUN_FAILURE_TEXT = 'Something went wrong on that turn. Please try again; the technical details are available in the activity log.';
 export const PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT =
   'I could not start this turn because no model runtime is connected. Open Settings > Models, connect a model, and try again.';
+
+const PUBLIC_CONVERSATION_PREAMBLE_KEYS = new Set([
+  'version',
+  'kind',
+  'sourceUserSeq',
+  'text',
+  'intentKey',
+]);
+const PUBLIC_CONVERSATION_PREAMBLE_INTENT_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const MAX_PUBLIC_CONVERSATION_PREAMBLE_CHARS = 8_000;
+
+/**
+ * Model-authored prose shown before execution begins. This is deliberately a
+ * nonterminal presentation record: it carries no status, outcome, need,
+ * approval, or effect authority. Keeping the payload closed prevents a future
+ * producer from smuggling control fields onto the public event plane.
+ */
+export interface PublicConversationPreambleData extends Record<string, unknown> {
+  version: 1;
+  kind: 'pre_execution';
+  sourceUserSeq: number;
+  text: string;
+  intentKey?: string;
+}
+
+/** Validate and normalize the only public pre-execution prose shape. */
+export function publicConversationPreambleData(
+  data: Record<string, unknown>,
+): PublicConversationPreambleData | null {
+  if (Object.keys(data).some((key) => !PUBLIC_CONVERSATION_PREAMBLE_KEYS.has(key))) return null;
+  const sourceUserSeq = data.sourceUserSeq;
+  if (
+    data.version !== 1
+    || data.kind !== 'pre_execution'
+    || !Number.isSafeInteger(sourceUserSeq)
+    || Number(sourceUserSeq) <= 0
+    || typeof data.text !== 'string'
+  ) return null;
+  let safeText: string;
+  try { safeText = assertPublicPresentationText(data.text); } catch { return null; }
+  if (safeText.length > MAX_PUBLIC_CONVERSATION_PREAMBLE_CHARS || safeText.includes('\0')) return null;
+  const intentKey = data.intentKey === undefined
+    ? undefined
+    : typeof data.intentKey === 'string'
+      ? data.intentKey.trim()
+      : '';
+  if (intentKey !== undefined && !PUBLIC_CONVERSATION_PREAMBLE_INTENT_KEY_RE.test(intentKey)) return null;
+  return {
+    version: 1,
+    kind: 'pre_execution',
+    sourceUserSeq: Number(sourceUserSeq),
+    text: safeText,
+    ...(intentKey ? { intentKey } : {}),
+  };
+}
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
@@ -522,6 +578,15 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     }
     case 'conversation_completed':
       return terminalData(data, event.sessionId);
+    case 'conversation_preamble':
+      // The dedicated eventlog CAS writer binds this event to its exact real
+      // user source. Retain a small event-level floor here as well so a
+      // malformed generic row cannot become public merely because its data
+      // object resembles the closed payload.
+      if (!event.parentEventId || event.role !== 'Clem' || !Number.isSafeInteger(event.turn) || event.turn < 0) {
+        return null;
+      }
+      return publicConversationPreambleData(data);
     case 'async_work_dispatched':
       return publicAsyncWorkDispatchedData(data);
     case 'awaiting_user_input': {
@@ -536,7 +601,10 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       const action = pendingActionProjection(data.pendingAction);
       const actionId = pendingActionId(data);
       return {
-        ...selected(data, ['approvalId', 'subject', 'tool', 'destructive', 'expiresAt', 'sourceId']),
+        ...selected(data, [
+          'approvalId', 'subject', 'tool', 'destructive', 'expiresAt', 'sourceId',
+          'approvalPresentation', 'question',
+        ]),
         ...(actionId ? { pendingActionId: actionId } : {}),
         ...(action ? { pendingAction: action } : {}),
       };

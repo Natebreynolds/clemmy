@@ -20,9 +20,35 @@
  */
 
 import { classifyExternalEffectRequest } from './external-effect-taxonomy.js';
+import {
+  isResultActionSemanticSegment,
+  requestSemanticSegments,
+} from './request-segments.js';
+
+/**
+ * A memory command at a clause boundary ("Remember this: …", "note that …",
+ * "keep in mind …"). Shared with auto-capture so the ROUTER and the CAPTURE
+ * path read the same shape: a memory instruction's completion authority is
+ * the durable intake receipt, never a retrieval — routing it as a
+ * default-bucket tool_intent froze a one-read contract for an ask that reads
+ * nothing (post-routing-change fixture sweep, 2026-08-12). A mid-sentence
+ * mention such as "explain what remember means" grants nothing.
+ */
+export const EXPLICIT_MEMORY_INSTRUCTION_RE = /(?:^|[.!?;]\s+|[—–]\s+|,\s*)(?:(?:and|also|then)\s+)?((?:please\s+)?(?:remember\b|note(?:\s+that\b|\s*:)|keep\s+in\s+mind\b|don'?t\s+forget\b|make\s+a\s+note\b))/i;
+
+/** Correction-shaped memory instructions ("Small correction for later: …").
+ * Router-only: auto-capture owns its own leader extraction and already
+ * handles corrections through separate machinery. */
+const CORRECTION_INSTRUCTION_RE = /(?:^|[.!?;]\s+)(?:small\s+|quick\s+|one\s+)?correction(?:\s+for\s+later)?\s*[:,—–-]/i;
+
+export function isExplicitMemoryInstruction(text: string): boolean {
+  return typeof text === 'string'
+    && (EXPLICIT_MEMORY_INSTRUCTION_RE.test(text) || CORRECTION_INSTRUCTION_RE.test(text));
+}
 
 export type MessageIntent =
   | 'casual'        // greetings, thanks, social check-ins
+  | 'conversation'  // ordinary statements/controls that request no tool work
   | 'lookup'        // "what is X", "show me Y", "how did we do Z"
   | 'action'        // "build X", "deploy Y", "set up Z", multi-step work
   | 'meta_clarify'  // questions about the agent itself / how to use it
@@ -50,6 +76,15 @@ const META_PATTERNS: RegExp[] = [
   /^help[.!?]*$/i,
   /^how do i\s+(?:use|work with|talk to|configure)\s+(?:you|clementine|this (?:agent|assistant))\b/i,
   /\bhow does this work\b/i,
+];
+
+/** Conversation-shaped controls are not tool fallback. They keep normal
+ * transcript/context (unlike a cheap casual greeting) but carry no request to
+ * retrieve or mutate anything. This typed distinction lets `tool_intent`
+ * retain its documented conservative meaning: likely needs tools. */
+const CONVERSATION_PATTERNS: RegExp[] = [
+  /^(?:ping|hmm(?:[,.! ]+interesting)?|interesting|i see|that makes sense)[.!?]*$/i,
+  /^(?:ask|check|confirm)\s+(?:with\s+)?me\s+before\b/i,
 ];
 
 const LOOKUP_CUES = [
@@ -240,16 +275,29 @@ export function classifyMessageIntent(message: string): IntentClassification {
     }
   }
 
+  for (const pat of CONVERSATION_PATTERNS) {
+    if (pat.test(trimmed) && !externalEffect.requested) {
+      return {
+        intent: 'conversation',
+        confidence: 0.9,
+        reasons: ['conversation-shaped control without requested work'],
+      };
+    }
+  }
+
   // Advice and read-only requests can mention consequential verbs as the
   // subject of discussion ("Should I publish?", "explain how to deploy") or
   // contain action-shaped nouns ("read the email"). Keep those turns light
   // unless the user adds a separate direct action clause.
   const readOnlyOpening = READ_ONLY_OPERATION_START_RE.test(trimmed);
+  const directReadPipelineAction = readOnlyOpening
+    && requestSemanticSegments(trimmed).slice(1).some(isResultActionSemanticSegment);
   const advisoryOpening = ADVISORY_ACTION_START_RE.test(trimmed)
     || POLITE_ADVISORY_ACTION_START_RE.test(trimmed);
   if (
     (readOnlyOpening || advisoryOpening)
     && !hasExplicitActionContinuation(trimmed, readOnlyOpening)
+    && !directReadPipelineAction
     && !externalEffect.requested
   ) {
     return {
@@ -264,7 +312,7 @@ export function classifyMessageIntent(message: string): IntentClassification {
     && !externalEffect.requested
   ) {
     return {
-      intent: 'tool_intent',
+      intent: 'conversation',
       confidence: 0.75,
       reasons: ['prohibition without a requested action'],
     };
@@ -275,7 +323,7 @@ export function classifyMessageIntent(message: string): IntentClassification {
     && !externalEffect.requested
   ) {
     return {
-      intent: 'tool_intent',
+      intent: 'conversation',
       confidence: 0.75,
       reasons: ['mentions a possible action without requesting it'],
     };
@@ -285,6 +333,13 @@ export function classifyMessageIntent(message: string): IntentClassification {
       intent: 'action',
       confidence: 0.9,
       reasons: [`direct external effect: ${externalEffect.kinds.join(', ')}`],
+    };
+  }
+  if (directReadPipelineAction) {
+    return {
+      intent: 'action',
+      confidence: 0.85,
+      reasons: ['direct read pipeline continues into a concrete result action'],
     };
   }
 
@@ -302,18 +357,24 @@ export function classifyMessageIntent(message: string): IntentClassification {
   // asking a question, not requesting work).
   const lower = trimmed.toLowerCase();
   const questionStart = QUESTION_STARTERS.some((q) => lower.startsWith(q));
+  const questionShaped = questionStart || /\?\s*$/.test(trimmed);
   if (
-    questionStart
-    && lookup.count > 0
+    questionShaped
     // A plain "and <verb>" can remain inside the subject of a question
     // ("what is the build and deploy status?"). Only a real clause boundary
     // such as "then" or punctuation can hand a question off to an action.
+    && !DIRECT_AMBIGUOUS_ACTION_RE.test(trimmed)
     && !hasExplicitActionContinuation(trimmed, false)
+    && !directReadPipelineAction
+    && (lookup.count > 0 || action.count === 0)
   ) {
     return {
       intent: 'lookup',
       confidence: 0.7 + Math.min(0.2, lookup.count * 0.05),
-      reasons: ['question-shaped opening + lookup cues present', `lookup cues: ${lookup.matched.slice(0, 3).join(', ')}`],
+      reasons: [
+        'question-shaped request without a direct action',
+        ...(lookup.count > 0 ? [`lookup cues: ${lookup.matched.slice(0, 3).join(', ')}`] : []),
+      ],
     };
   }
 
@@ -371,6 +432,10 @@ export function memoryBudgetFor(
       // Agent-self questions don't need vault recall; instructions
       // already describe capabilities.
       return { loadWorkingMemory: false, loadSessionBrief: true, vaultSearchTopK: 0, vaultFormatBytes: 0 };
+    case 'conversation':
+      // Corrections and standing controls need conversational continuity, but
+      // they do not justify a fresh semantic-vault search on their own.
+      return { loadWorkingMemory: true, loadSessionBrief: true, vaultSearchTopK: 0, vaultFormatBytes: 0 };
     case 'lookup':
       return { loadWorkingMemory: true, loadSessionBrief: true, vaultSearchTopK: 6, vaultFormatBytes: 1800 };
     case 'action':

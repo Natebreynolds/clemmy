@@ -1315,6 +1315,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     try {
       const approvals = approvalRegistry.listPending({ status: 'pending' })
         .filter((row) => !approvalRegistry.isExpired(row))
+        .filter((row) => approvalRegistry.isFormalApprovalSurface(row))
         .map(serializeApprovalForMobile);
       res.json({ approvals, count: approvals.length });
     } catch (err) {
@@ -1330,6 +1331,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const existing = approvalRegistry.get(id);
     if (!existing) {
       res.status(404).json({ error: 'approval not found' });
+      return;
+    }
+    if (!approvalRegistry.isFormalApprovalSurface(existing)) {
+      res.status(409).json({
+        error: 'This send is waiting for an ordinary answer in its exact original conversation, not a mobile approval action.',
+      });
       return;
     }
     const runId = mobileApprovalRunId(id, decision);

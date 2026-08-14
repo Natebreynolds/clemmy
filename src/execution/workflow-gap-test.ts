@@ -1,6 +1,7 @@
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { classifyStepSideEffect, stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
+import { exactScheduledSendDefinitionEligibility } from './workflow-validator.js';
 
 /**
  * Super-plan authoring gap test.
@@ -161,6 +162,14 @@ export function analyzeWorkflowGaps(def: WorkflowDefinition): WorkflowGap[] {
   // state had no exit and the user couldn't enable OR answer anything.
   for (const step of steps) {
     if (classifyStepSideEffect(step) !== 'send') continue;
+    // The exact scheduled-send class has already answered this question in a
+    // stronger machine-checkable form: one literal fixed target, explicit
+    // standing consent, a schedule, an exact non-empty payload, and host
+    // commit evidence. Asking whether that target should become dynamic both
+    // contradicts the safety class and silently disables a valid enabled
+    // create. Any incomplete/dynamic/approval/non-scheduled send still falls
+    // through to the ordinary clarification below.
+    if (exactScheduledSendDefinitionEligibility(def, step).eligible) continue;
     gaps.push({
       severity: 'clarify',
       stepId: step.id,

@@ -9,6 +9,7 @@ import {
 } from './discord-harness.js';
 import { SLACK_BOT_TOKEN } from '../config.js';
 import { isStatusCommand, buildBoardSummary, formatBoardSummaryText } from '../dashboard/board-summary.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 
 const logger = pino({ name: 'clementine-next.slack-harness' });
 
@@ -122,6 +123,7 @@ export function buildSlackHarnessTransport(opts: {
   threadTs?: string;
 }): DiscordHarnessTransport {
   const { client, channel, threadTs } = opts;
+  let messageTs: string | null = null;
   return {
     async sendInitial(content) {
       const posted = await client.chat.postMessage({
@@ -131,6 +133,7 @@ export function buildSlackHarnessTransport(opts: {
         mrkdwn: true,
       });
       const ts = posted.ts as string;
+      messageTs = ts;
       return {
         edit: async (next, options) => {
           const body = toSlackMrkdwn(next);
@@ -158,6 +161,19 @@ export function buildSlackHarnessTransport(opts: {
     },
     buildApprovalComponents(state) {
       return approvalBlocksForState(state);
+    },
+    async deliverConversationalApproval(input) {
+      if (!messageTs) throw new Error('Slack consent placeholder message is unavailable');
+      approvalRegistry.bindConversationalApprovalTransportTarget({
+        approvalId: input.approvalId,
+        target: { provider: 'slack', channelId: channel, messageTs, ...(threadTs ? { threadTs } : {}) },
+      });
+      await client.chat.update({
+        channel,
+        ts: messageTs,
+        text: toSlackMrkdwn(input.content) || '…',
+        blocks: [],
+      });
     },
   };
 }
@@ -332,6 +348,19 @@ export function buildSlackAssistantTransport(opts: {
         const hasApproval = (state.pendingApprovalIds?.length ?? 0) > 0 || !!state.pendingApprovalId;
         pushStatus(hasApproval ? 'is waiting for your approval…' : 'is working…');
       } catch { /* a progress sink must never break the run */ }
+    },
+    async deliverConversationalApproval(input) {
+      if (!messageTs) throw new Error('Slack consent placeholder message is unavailable');
+      approvalRegistry.bindConversationalApprovalTransportTarget({
+        approvalId: input.approvalId,
+        target: { provider: 'slack', channelId: channel, messageTs, ...(threadTs ? { threadTs } : {}) },
+      });
+      await client.chat.update({
+        channel,
+        ts: messageTs,
+        text: toSlackMrkdwn(input.content) || '…',
+        blocks: [],
+      });
     },
   };
 }

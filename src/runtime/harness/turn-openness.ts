@@ -40,7 +40,14 @@
  * make one fail.
  */
 import { getRuntimeEnv } from '../../config.js';
+import type { Model } from '@openai/agents-core';
 import { classifyCanonicalExternalEffect } from './execution-gate.js';
+import {
+  resolveProvider,
+  type ModelProviderClass,
+} from './model-wire-registry.js';
+import type { BoundaryJudgeRouting } from './debate-model.js';
+import { withJudgeTimeout } from './judge-family.js';
 
 export interface TurnOpenness {
   /** Dimensions on which reasonable readings DISAGREE materially. Never empty
@@ -135,6 +142,9 @@ export function parseOpennessVerdict(raw: unknown): TurnOpenness | null {
 
 export interface TurnOpennessInput {
   message: string;
+  /** The family serving the execution brain for THIS turn. Independence is
+   * checked against this value, never against a route's cached brain label. */
+  brainFamily: ModelProviderClass;
   /** The runtime's resolved facts for this ask — connections, proven tools,
    *  prior failures. This is what a text-only classifier cannot see. */
   capabilityBlock?: string;
@@ -155,6 +165,12 @@ export interface TurnOpennessInput {
    * was knowable at its first instant, and no model call was needed to know it.
    */
   deterministicOpen?: readonly string[];
+}
+
+/** Caller-boundary helper: derive the actual serving family from the selected
+ * brain model without duplicating model-id tables in the Codex/Claude lanes. */
+export function turnOpennessBrainFamily(modelId: string | undefined | null): ModelProviderClass {
+  return resolveProvider(modelId);
 }
 
 function buildOpennessPrompt(input: TurnOpennessInput): string {
@@ -180,40 +196,91 @@ export function _setOpennessJudgeForTests(fn: OpennessJudge | null): void {
   judgeOverride = fn;
 }
 
-async function runOpennessJudge(input: TurnOpennessInput): Promise<TurnOpenness | null> {
-  const [{ Agent, Runner }, { resolveBoundaryJudge }, { withJudgeTimeout }] = await Promise.all([
-    import('@openai/agents'),
-    import('./debate-model.js'),
-    import('./judge-family.js'),
-  ]);
-  // Cross-family by construction: a model is a poor judge of its own
-  // interpretation, and self-preference bias is measured, not theoretical.
-  const routing = resolveBoundaryJudge();
-  const agent = new Agent({
-    name: 'TurnOpennessJudge',
-    instructions: [
-      'Decide what is genuinely UNSETTLED about a request before an assistant acts on it.',
-      'Silently consider 2-4 distinct readings a careful assistant could act on.',
-      'A dimension is OPEN only if those readings would produce MATERIALLY DIFFERENT RESULTS —',
-      'which specific account/base/list/records, the time window, the destination, the output format,',
-      'or something named but not bound to a real thing.',
-      'A dimension is NOT open if the request states it, if the facts above answer it,',
-      'if memory already settled it, or if the assistant could simply look it up.',
-      'Style, wording, and reasonable defaults are NEVER open.',
-      'Reply with EXACTLY ONE LINE and nothing else, one of:',
-      '"SETTLED: <short reason>" — the readings agree on everything that changes the result. Prefer this; when in doubt, SETTLED.',
-      '"OPEN: <dimension> | <dimension>" — at most 3, each a short noun phrase naming what is undecided, most consequential first.',
-    ].join(' '),
-    model: routing.model ?? routing.modelId,
-    modelSettings: { reasoning: { effort: 'low' } },
-    tools: [],
-  });
-  const work = (async () => {
+export interface TurnOpennessJudgeRequest {
+  route: IndependentTurnOpennessJudgeRoute;
+  instructions: string;
+  prompt: string;
+  tools: readonly [];
+  maxTurns: 1;
+}
+
+export type IndependentTurnOpennessJudgeRoute = BoundaryJudgeRouting & { model: Model };
+
+export interface TurnOpennessJudgePort {
+  resolveRoutes(): Promise<readonly BoundaryJudgeRouting[]>;
+  run(request: TurnOpennessJudgeRequest): Promise<unknown>;
+}
+
+let judgePortOverride: TurnOpennessJudgePort | null = null;
+export function _setOpennessJudgePortForTests(port: TurnOpennessJudgePort | null): void {
+  judgePortOverride = port;
+}
+
+/** First model-bearing route whose family differs from the actual active brain.
+ * Route metadata about the brain may be stale; the caller's current family is
+ * the authority, while `selfJudge` remains a defense-in-depth refusal. Route
+ * discovery never executes or retries anything. */
+export function selectIndependentTurnOpennessJudgeRoute(
+  routes: readonly BoundaryJudgeRouting[],
+  brainFamily: ModelProviderClass,
+): IndependentTurnOpennessJudgeRoute | null {
+  for (const route of routes) {
+    if (route.model && !route.selfJudge && route.judgeFamily !== brainFamily) {
+      return route as IndependentTurnOpennessJudgeRoute;
+    }
+  }
+  return null;
+}
+
+const OPENNESS_JUDGE_INSTRUCTIONS = [
+  'Decide what is genuinely UNSETTLED about a request before an assistant acts on it.',
+  'Silently consider 2-4 distinct readings a careful assistant could act on.',
+  'A dimension is OPEN only if those readings would produce MATERIALLY DIFFERENT RESULTS —',
+  'which specific account/base/list/records, the time window, the destination, the output format,',
+  'or something named but not bound to a real thing.',
+  'A dimension is NOT open if the request states it, if the facts above answer it,',
+  'if memory already settled it, or if the assistant could simply look it up.',
+  'Style, wording, and reasonable defaults are NEVER open.',
+  'Reply with EXACTLY ONE LINE and nothing else, one of:',
+  '"SETTLED: <short reason>" — the readings agree on everything that changes the result. Prefer this; when in doubt, SETTLED.',
+  '"OPEN: <dimension> | <dimension>" — at most 3, each a short noun phrase naming what is undecided, most consequential first.',
+].join(' ');
+
+const productionOpennessJudgePort: TurnOpennessJudgePort = {
+  async resolveRoutes() {
+    const { resolveBoundaryJudgeChain } = await import('./debate-model.js');
+    return resolveBoundaryJudgeChain();
+  },
+  async run(request) {
+    const { Agent, Runner } = await import('@openai/agents');
+    const agent = new Agent({
+      name: 'TurnOpennessJudge',
+      instructions: request.instructions,
+      model: request.route.model,
+      modelSettings: { reasoning: { effort: 'low' } },
+      tools: [],
+    });
     const runner = new Runner({ workflowName: 'clementine-turn-openness' });
-    const result = await runner.run(agent, buildOpennessPrompt(input), { maxTurns: 1 });
-    return parseOpennessVerdict((result as { finalOutput?: unknown }).finalOutput);
-  })();
-  return (await withJudgeTimeout(work, turnOpennessTimeoutMs())) ?? null;
+    const result = await runner.run(agent, request.prompt, { maxTurns: request.maxTurns });
+    return (result as { finalOutput?: unknown }).finalOutput;
+  },
+};
+
+async function runOpennessJudge(input: TurnOpennessInput): Promise<TurnOpenness | null> {
+  const port = judgePortOverride ?? productionOpennessJudgePort;
+  const route = selectIndependentTurnOpennessJudgeRoute(
+    await port.resolveRoutes(),
+    input.brainFamily,
+  );
+  if (!route) return null;
+  const raw = await port.run({
+    route,
+    instructions: OPENNESS_JUDGE_INSTRUCTIONS,
+    prompt: buildOpennessPrompt(input),
+    tools: [],
+    maxTurns: 1,
+  });
+  return parseOpennessVerdict(raw);
 }
 
 /**
@@ -229,7 +296,13 @@ export async function resolveTurnOpenness(input: TurnOpennessInput): Promise<Tur
     .filter((dimension) => dimension.length >= 3);
   let judged: TurnOpenness | null = null;
   try {
-    judged = await (judgeOverride ?? runOpennessJudge)(input);
+    // Bound the entire pass from this public entrypoint: route/model setup and
+    // test/alternate ports are part of user-visible latency too, not exempt
+    // setup before an inner provider-only timer begins.
+    judged = (await withJudgeTimeout(
+      Promise.resolve().then(() => (judgeOverride ?? runOpennessJudge)(input)),
+      turnOpennessTimeoutMs(),
+    )) ?? null;
   } catch {
     judged = null;
   }

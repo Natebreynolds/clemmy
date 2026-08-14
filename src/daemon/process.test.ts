@@ -24,6 +24,7 @@ const {
   clearDaemonPid,
   daemonPidIsForeignReuse,
   DAEMON_LEASE_DIR,
+  isDaemonRunning,
   PID_FILE,
   readDaemonPid,
   stopDaemon,
@@ -354,6 +355,7 @@ test('daemon lease: a ZOMBIE owner pid is provably dead and taken over', async (
     }));
     // Node reaps its own children, so simulate the zombie state via the seam.
     _setPsStateReaderForTest((pid) => (pid === child.pid ? 'Z+' : null));
+    assert.equal(isDaemonRunning(), false, 'launcher status must not call a zombie daemon running');
     assert.equal(acquireDaemonLease(process.pid), true, 'a defunct owner must never retain the lease');
     assert.equal(readDaemonPid(), process.pid);
     // Sanity: with a LIVE state the same owner still blocks (the fix is
@@ -365,6 +367,7 @@ test('daemon lease: a ZOMBIE owner pid is provably dead and taken over', async (
       version: 1, pid: child.pid, token, startedAt: new Date().toISOString(),
     }));
     _setPsStateReaderForTest((pid) => (pid === child.pid ? 'S+' : null));
+    assert.equal(isDaemonRunning(), true, 'a live daemon-shaped owner remains running');
     assert.equal(acquireDaemonLease(process.pid), false, 'a live owner still blocks');
   } finally {
     _setPsStateReaderForTest(null);

@@ -42,7 +42,10 @@ function acceptedTask(label: string): { sessionId: string; sourceUserSeq: number
   const session = eventlog.createSession({ id: `trace-${label}`, kind: 'chat' });
   const source = eventlog.appendEvent({
     sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
-    data: { text: `${label} task` },
+    // These fixtures settle real AlphaSource reads. A vague "task" correctly
+    // compiles as conversational/tool-intent with no accepted work node, which
+    // is not the authority shape this settlement-kernel suite exercises.
+    data: { text: `Find the current ${label} records.` },
   });
   // Durable settlement authority: the accepted source above plus a persisted
   // turn graph for the accepted task (authority spine).
@@ -133,7 +136,7 @@ test('D1b (progress): re-encoding a call must not manufacture a completed step',
 
 // ── D2. Dependent pagination is one requirement, not fan-out ─────────────────
 
-test('D2 (pagination): following a cursor stays on one requirement and mints no progress', () => {
+test('D2 (pagination): following a cursor stays on one requirement and completes it once', () => {
   _resetAttemptSettlementStateForTests();
   const key = acceptedTask('pagination');
   const governor = new DiscoveryGovernor();
@@ -158,6 +161,7 @@ test('D2 (pagination): following a cursor stays on one requirement and mints no 
       // Pages belong to ONE obligation; the kernel must be told so structurally
       // rather than inferring it from arguments that differ every page.
       requirementId,
+      continuesRequirement: envelope.next_cursor !== undefined,
     } as never).creditedProgress);
     cursor = envelope.next_cursor;
     pages += 1;
@@ -165,9 +169,9 @@ test('D2 (pagination): following a cursor stays on one requirement and mints no 
 
   assert.equal(pages, 3, 'three pages exhaust the fixture source');
   assert.deepEqual(
-    credits.filter(Boolean).length,
-    0,
-    'pagination is progress toward a requirement, never satisfaction of one',
+    credits,
+    [false, false, true],
+    'intermediate pages continue one obligation; only exhaustion satisfies it',
   );
 });
 

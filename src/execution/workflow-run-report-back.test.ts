@@ -13,6 +13,8 @@ import {
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import type { BoundaryJudgeRouting } from '../runtime/harness/debate-model.js';
+import type { TerminalDeliveryJudgePort } from '../runtime/harness/terminal-delivery-judge.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-workflow-report-back-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -23,6 +25,7 @@ const {
   _setWorkflowRunReportBackAfterExactReceiptObservationForTests,
   _setWorkflowRunReportBackBeforeCheckpointLockForTests,
   _setWorkflowRunReportBackDeliveryForTests,
+  _setWorkflowRunReportBackTerminalJudgeForTests,
   attemptWorkflowRunReportBack,
   checkpointWorkflowRunReportBack,
   recordAndAttemptWorkflowRunReportBack,
@@ -74,6 +77,7 @@ test.after(() => {
   _setWorkflowRunReportBackAfterExactReceiptObservationForTests();
   _setWorkflowRunReportBackBeforeCheckpointLockForTests();
   _setWorkflowRunReportBackDeliveryForTests();
+  _setWorkflowRunReportBackTerminalJudgeForTests();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
@@ -85,6 +89,46 @@ async function waitForFile(file: string, timeoutMs = 60_000): Promise<void> {
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${file}`);
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+async function waitForCondition(
+  predicate: () => boolean,
+  message: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${message}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function terminalJudgePort(
+  output: unknown,
+  observePrompt?: (prompt: string) => void,
+): TerminalDeliveryJudgePort {
+  const route: BoundaryJudgeRouting = {
+    model: {} as BoundaryJudgeRouting['model'],
+    modelId: 'claude-haiku-4-5',
+    judgeFamily: 'claude',
+    brainFamily: 'codex',
+    transport: 'claude_subscription',
+    selfJudge: false,
+  };
+  return {
+    async resolveRoute() { return route; },
+    async run(request) {
+      observePrompt?.(request.prompt);
+      return output;
+    },
+  };
+}
+
+function unavailableTerminalJudgePort(): TerminalDeliveryJudgePort {
+  return {
+    async resolveRoute() { return null; },
+    async run() { throw new Error('unreachable'); },
+  };
 }
 
 function runFile(runId: string): string {
@@ -430,7 +474,7 @@ test('an exact desktop observer settles the original source directly without the
   assert.equal(receiptCarrier?.silent, true, 'origin_chat terminal must not create a second desktop toast');
 });
 
-test('a blocked member is qualified by the shared rule and report-back accepts the authoritative winner', () => {
+test('a blocked member is judged before report-back and DELIVER preserves the exact judge prose', async () => {
   const runId = 'report-exact-blocked-qualified';
   const origin = 'report-exact-blocked-qualified-origin';
   const source = addAcceptedSource({ sessionId: origin, channel: 'desktop' });
@@ -447,16 +491,37 @@ test('a blocked member is qualified by the shared rule and report-back accepts t
   markRunPartial(file);
   const observerId = addExactOrigin(runId, origin, source.seq);
   const authored = 'The main review completed, but one optional follow-up needs attention.';
-  assert.equal(recordAndAttemptWorkflowRunReportBack(file, {
-    workflowName: 'Ack Workflow',
-    outcome: 'blocked',
-    detail: authored,
-  }), true);
+  const judged = 'The main review completed. One optional follow-up could not be verified.';
+  _setWorkflowRunReportBackTerminalJudgeForTests(terminalJudgePort({
+    verb: 'deliver',
+    reason: 'the completed review is useful with the optional gap disclosed',
+    publicText: judged,
+  }));
+  try {
+    assert.equal(recordAndAttemptWorkflowRunReportBack(file, {
+      workflowName: 'Ack Workflow',
+      outcome: 'blocked',
+      detail: authored,
+    }), false, 'the synchronous report-back attempt waits for async terminal judgment');
+    await waitForCondition(
+      () => typeof readRun(file).reportBackAcknowledgedAt === 'string',
+      'judged workflow report-back acknowledgement',
+    );
+  } finally {
+    _setWorkflowRunReportBackTerminalJudgeForTests();
+  }
 
   const terminal = listEvents(origin, { types: ['conversation_completed'] })[0];
   assert.ok(terminal);
   assert.equal(terminal.data.presentation.status, 'done');
-  assert.equal(terminal.data.reply, authored);
+  assert.equal(terminal.data.reply, judged);
+  assert.equal(terminal.data.terminalJudgeDisposition, 'deliver');
+  assert.equal(
+    terminal.data.terminalJudgeReason,
+    'the completed review is useful with the optional gap disclosed',
+  );
+  assert.equal(terminal.data.terminalJudgeFamily, 'claude');
+  assert.equal(terminal.data.terminalJudgeResumeCount, 0);
   assert.equal(terminal.data.deliveryDisclosure, 'unverified_completion');
   assert.deepEqual(readRun(file).reportBack.acknowledgedOriginObserverIds, [observerId]);
   assert.equal(readRun(file).reportBackRetry, undefined);
@@ -464,6 +529,102 @@ test('a blocked member is qualified by the shared rule and report-back accepts t
     (entry) => entry.metadata?.originObserverId === observerId,
   );
   assert.equal(carrier?.title, 'Workflow completed: Ack Workflow');
+});
+
+test('workflow-origin ASK commits typed needs-input and settles the exact carrier with judge prose', async () => {
+  const runId = 'report-exact-blocked-ask';
+  const origin = 'report-exact-blocked-ask-origin';
+  const source = addAcceptedSource({
+    sessionId: origin,
+    channel: 'desktop',
+    text: 'Refresh the tracker and report back here.',
+  });
+  settleOriginBusinessCall(source, 'report-exact-blocked-ask-write', false);
+  const file = writeRun(runId, origin);
+  markRunPartial(file);
+  const { observerId, active } = addExactOriginGroup([runId], origin, source.seq);
+  const question = 'Which Google account should I use to finish the tracker refresh?';
+  _setWorkflowRunReportBackTerminalJudgeForTests(terminalJudgePort({
+    verb: 'ask',
+    reason: 'the required account cannot be inferred safely',
+    publicText: question,
+  }));
+  try {
+    assert.equal(recordAndAttemptWorkflowRunReportBack(file, {
+      workflowName: 'Ack Workflow',
+      outcome: 'blocked',
+      detail: 'The tracker refresh stopped before any update was verified.',
+    }), false);
+    await waitForCondition(
+      () => typeof readRun(file).reportBackAcknowledgedAt === 'string',
+      'needs-input exact-origin settlement',
+    );
+  } finally {
+    _setWorkflowRunReportBackTerminalJudgeForTests();
+  }
+
+  const terminal = listEvents(origin, { types: ['conversation_completed'] })[0];
+  assert.ok(terminal);
+  assert.equal(terminal.data.presentation.status, 'needs_input');
+  assert.deepEqual(terminal.data.presentation.needs, { kind: 'input' });
+  assert.equal(terminal.data.reply, question);
+  assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
+  assert.equal(terminal.data.terminalJudgeReason, 'the required account cannot be inferred safely');
+  assert.equal(terminal.data.terminalJudgeFamily, 'claude');
+  assert.equal(terminal.data.terminalJudgeResumeCount, 0);
+  assert.equal(terminal.data.awaitingUser, true);
+  assert.deepEqual(readRun(file).reportBack.acknowledgedOriginObserverIds, [observerId]);
+  const settlement = readWorkflowOriginGroupSettlement(active.sealed.sourceGroupId);
+  assert.equal(settlement?.terminalStatus, 'needs_input');
+  const carrier = listNotifications(2_000).find(
+    (entry) => entry.metadata?.originObserverId === observerId,
+  );
+  assert.equal(carrier?.title, 'Workflow needs input: Ack Workflow');
+  assert.equal(carrier?.body, question);
+});
+
+test('workflow-origin refuses RESUME without a same-run continuation and uses the conservative fallback', async () => {
+  const runId = 'report-exact-resume-unavailable';
+  const origin = 'report-exact-resume-unavailable-origin';
+  const source = addAcceptedSource({ sessionId: origin, channel: 'desktop' });
+  settleOriginBusinessCall(source, 'report-exact-resume-unavailable-write', false);
+  const file = writeRun(runId, origin);
+  markRunPartial(file);
+  const { active } = addExactOriginGroup([runId], origin, source.seq);
+  const authored = 'The workflow stopped before it could update the tracker.';
+  let prompt = '';
+  _setWorkflowRunReportBackTerminalJudgeForTests(terminalJudgePort({
+    verb: 'resume',
+    reason: 'a readback could otherwise close the gap',
+    recoveryInstruction: 'Read the retained spreadsheet identifier and verify the expected tracker rows now.',
+    askIfRepeated: 'I still cannot verify the tracker. Which account should I use?',
+  }, (value) => { prompt = value; }));
+  try {
+    assert.equal(recordAndAttemptWorkflowRunReportBack(file, {
+      workflowName: 'Ack Workflow',
+      outcome: 'blocked',
+      detail: authored,
+    }), false);
+    await waitForCondition(
+      () => typeof readRun(file).reportBackAcknowledgedAt === 'string',
+      'RESUME-unavailable conservative settlement',
+    );
+  } finally {
+    _setWorkflowRunReportBackTerminalJudgeForTests();
+  }
+
+  assert.match(prompt, /Live continuation: UNAVAILABLE/);
+  assert.match(prompt, /Tools during continuation: UNAVAILABLE/);
+  assert.match(prompt, /Read-only external-state inspection: UNAVAILABLE/);
+  const terminal = listEvents(origin, { types: ['conversation_completed'] })[0];
+  assert.ok(terminal);
+  assert.equal(terminal.data.presentation.status, 'blocked');
+  assert.equal(terminal.data.reply, authored);
+  assert.equal(terminal.data.terminalJudgeDisposition, undefined);
+  assert.equal(
+    readWorkflowOriginGroupSettlement(active.sealed.sourceGroupId)?.terminalStatus,
+    'blocked',
+  );
 });
 
 test('an observed exact receipt survives indefinitely until group settlement consumes it', () => {
@@ -962,7 +1123,7 @@ test('one accepted source with two out-of-order runs publishes one ordered reduc
   );
 });
 
-test('a blocked group reducer is qualified once and settles against the committer status', () => {
+test('a blocked group reducer keeps the conservative shared fallback when the judge is unavailable', async () => {
   const origin = 'report-group-blocked-qualified-origin';
   const source = addAcceptedSource({
     sessionId: origin,
@@ -978,17 +1139,26 @@ test('a blocked group reducer is qualified once and settles against the committe
   markRunPartial(fileB);
   const { observerId, active } = addExactOriginGroup([runA, runB], origin, source.seq);
 
-  assert.equal(recordAndAttemptWorkflowRunReportBack(fileB, {
-    workflowName: 'Optional Review',
-    outcome: 'blocked',
-    detail: 'The optional review needs attention.',
-  }), false, 'the partial member waits for its sealed sibling');
-  assert.equal(recordAndAttemptWorkflowRunReportBack(fileA, {
-    workflowName: 'Primary Review',
-    outcome: 'done',
-    detail: 'The primary review completed.',
-  }), true);
-  assert.equal(attemptWorkflowRunReportBack(fileB), true);
+  _setWorkflowRunReportBackTerminalJudgeForTests(unavailableTerminalJudgePort());
+  try {
+    assert.equal(recordAndAttemptWorkflowRunReportBack(fileB, {
+      workflowName: 'Optional Review',
+      outcome: 'blocked',
+      detail: 'The optional review needs attention.',
+    }), false, 'the partial member waits for its sealed sibling');
+    assert.equal(recordAndAttemptWorkflowRunReportBack(fileA, {
+      workflowName: 'Primary Review',
+      outcome: 'done',
+      detail: 'The primary review completed.',
+    }), false, 'the complete reducer waits for the async judge fallback');
+    await waitForCondition(
+      () => typeof readRun(fileA).reportBackAcknowledgedAt === 'string',
+      'unavailable-judge conservative report-back acknowledgement',
+    );
+    assert.equal(attemptWorkflowRunReportBack(fileB), true);
+  } finally {
+    _setWorkflowRunReportBackTerminalJudgeForTests();
+  }
 
   const terminals = listEvents(origin, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1);

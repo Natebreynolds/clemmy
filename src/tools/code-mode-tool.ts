@@ -28,7 +28,13 @@ import {
 import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
-import { appendEvent, resolveToolOutputForAuthority, writeToolOutput } from '../runtime/harness/eventlog.js';
+import {
+  appendEvent,
+  getToolOutputForInvocation,
+  resolveToolOutputForAuthority,
+  writeToolOutput,
+} from '../runtime/harness/eventlog.js';
+import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { deriveCodeModeSets } from './tool-registry.js';
@@ -40,6 +46,15 @@ import {
   settleDiscoveryBoundary,
 } from '../runtime/harness/discovery-boundary.js';
 import { toolOutputLooksSuccessful } from '../runtime/harness/tool-evidence.js';
+import {
+  actionTopologyRoleForRuntimeCall,
+  classifyRuntimeToolEffect,
+} from '../runtime/harness/tool-effect.js';
+import {
+  withLogicalToolCall,
+} from '../runtime/harness/attempt-identity.js';
+import type { BuildWorkCallOptions } from './work-call.js';
+import type { PendingActionExecutionCapability } from '../runtime/harness/pending-actions.js';
 // NB: getCoreTools is reached via DYNAMIC import in realToolsByName() — a static
 // import would form a registry ↔ code-mode-tool cycle (registry exposes
 // buildCodeModeTool). The dynamic import resolves at first dispatch, by when the
@@ -86,6 +101,18 @@ const programWorkerCounts = new WeakMap<ToolCallsCounter, number>();
 /** Mutating-call count per PROGRAM RUN, keyed by the run's counter identity
  *  (one ToolCallsCounter spans one program). WeakMap → no cleanup needed. */
 const programMutationCounts = new WeakMap<ToolCallsCounter, number>();
+
+/** Exact action-scoped authority installed by the outer provider lane. The
+ * runtime import of work-call stays dynamic: work-call -> call-tool -> this
+ * module is an intentional transport cycle, and a static value import would
+ * observe a partially initialized registry. */
+export interface CodeModeProgramOptions {
+  workCallOptions?: Omit<BuildWorkCallOptions, 'settlementLane'> | null;
+}
+
+interface PreparedCodeModeProgramOptions extends CodeModeProgramOptions {
+  workCallInvoker?: InvokableTool;
+}
 
 function currentEventAttribution(): { sourceUserSeq?: number; runScopeId?: string } {
   const ctx = harnessRunContextStorage.getStore();
@@ -253,12 +280,20 @@ function parseToolErrorText(raw: string): { ok: false; error: string; raw: strin
 export function normalizeCodeModeToolResult(
   method: string,
   out: unknown,
-  opts: { sessionId?: string; callId?: string } = {},
+  opts: { sessionId?: string; callId?: string; settlementNonce?: string } = {},
 ): unknown {
-  const resolution = opts.sessionId && opts.callId
+  // Code-mode owns the nonce for this exact child invocation. Prefer that
+  // row: it is safe before/independent of presentation clipping and cannot be
+  // confused with another invocation that reused an SDK call id. Detached
+  // callers retain the lifecycle-based compatibility resolver.
+  const exactInvocation = opts.sessionId && opts.callId && opts.settlementNonce
+    ? getToolOutputForInvocation(opts.sessionId, opts.callId, opts.settlementNonce)
+    : null;
+  const exactParked = exactInvocation?.tool === method ? exactInvocation : null;
+  const resolution = !exactParked && opts.sessionId && opts.callId
     ? resolveToolOutputForAuthority(opts.sessionId, opts.callId)
     : null;
-  const parked = resolution?.status === 'ok' ? resolution.record : null;
+  const parked = exactParked ?? (resolution?.status === 'ok' ? resolution.record : null);
   if (parked?.truncatedAtWrite) {
     return {
       ok: false,
@@ -268,8 +303,11 @@ export function normalizeCodeModeToolResult(
       ...(opts.callId ? { result_handle: opts.callId } : {}),
     };
   }
-  if (out == null || typeof out !== 'string') return out ?? null;
-  const raw = parked?.output ?? out;
+  // MCP transports return a structured presentation array. When this exact
+  // invocation parked a serializable normalized envelope, consume those bytes
+  // instead of short-circuiting on the array's non-string carrier.
+  if (!parked && (out == null || typeof out !== 'string')) return out ?? null;
+  const raw = parked?.output ?? (out as string);
   const shell = method === 'run_shell_command' || /^\s*exit_code:\s*/i.test(raw)
     ? parseShellToolOutput(raw, { callId: parked ? opts.callId : undefined, truncatedAtWrite: parked?.truncatedAtWrite })
     : null;
@@ -468,8 +506,19 @@ async function dispatchCodeModeWorker(args: unknown, sessionId: string, counter?
     return { ok: false, error: `run_worker: invalid spec — ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}` };
   }
   try {
+    // The model-authored packet is not work authority. Derive the same frozen
+    // requirement binding used by the direct worker lanes immediately before
+    // dispatch; dynamic import avoids the registry ↔ code-mode module cycle.
+    const ambient = harnessRunContextStorage.getStore();
+    const { bindWorkerPacketExpectedWork } = await import('../runtime/harness/expected-work-admission.js');
+    const packet = bindWorkerPacketExpectedWork({
+      packet: parsed.data,
+      sessionId: ambient?.sessionId === sessionId ? ambient.sessionId : sessionId,
+      sourceUserSeq: ambient?.sessionId === sessionId ? ambient.sourceUserSeq : undefined,
+      items: [parsed.data.item],
+    });
     const modelId = getSessionWorkerModelOverride(sessionId) ?? resolveRoleModel('worker').modelId;
-    const { text, model } = await runCodeModeWorker(parsed.data, modelId, sessionId);
+    const { text, model } = await runCodeModeWorker(packet, modelId, sessionId);
     return { ok: true, text, model };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -553,7 +602,136 @@ export async function describeCodeModeTool(name: unknown): Promise<unknown> {
   };
 }
 
-export async function dispatchCodeModeTool(method: string, args: unknown, sessionId: string, counter?: ToolCallsCounter): Promise<unknown> {
+async function enforceCodeModeProgramMutationCeiling(
+  method: string,
+  args: unknown,
+  counter?: ToolCallsCounter,
+): Promise<void> {
+  if (!codeModeSendGuardEnabled()) return;
+  try {
+    const { classifyExternalWrite } = await import('../runtime/harness/confirm-first-gate.js');
+    const shape = classifyExternalWrite(method, args);
+    if (shape.mutating && shape.irreversible) {
+      throw new Error(
+        `code-mode: refusing an irreversible external send (${shape.shapeKey ?? method}) inside run_tool_program — `
+        + 'a code program\'s deadline would lose or partially-complete a batch of sends. '
+        + 'Use run_batch for sends: propose ONE plan (tool composio_execute_tool, sideEffect "send", one item per recipient with fully-baked args), it certifies once, queues ONE approval, then executes deterministically with per-item gating and an honest ledger.',
+      );
+    }
+    if (shape.mutating && counter) {
+      const soFar = (programMutationCounts.get(counter) ?? 0) + 1;
+      programMutationCounts.set(counter, soFar);
+      if (soFar > 2) {
+        throw new Error(
+          `code-mode: refusing the ${soFar}rd/th mutating call (${shape.shapeKey ?? method}) in ONE program — `
+          + 'a mutation loop cannot finish inside the program deadline and dies mid-batch, losing track of completed writes. '
+          + 'Use run_batch: one plan, one item per record, certified once, executed deterministically with a per-item ledger.',
+        );
+      }
+    }
+  } catch (err) {
+    // A genuine guard trip (our Errors above) propagates; a classifier import/
+    // parse failure must NOT block the call (fail-open to legacy behavior).
+    if (err instanceof Error && err.message.startsWith('code-mode: refusing')) throw err;
+  }
+}
+
+function parsedJsonObject(raw: string): Record<string, unknown> | null {
+  const parsed = strictJsonParse(raw);
+  return parsed.ok && parsed.value !== null && typeof parsed.value === 'object' && !Array.isArray(parsed.value)
+    ? parsed.value as Record<string, unknown>
+    : null;
+}
+
+async function dispatchCodeModeWork(
+  args: unknown,
+  sessionId: string,
+  counter: ToolCallsCounter | undefined,
+  options: PreparedCodeModeProgramOptions,
+  onChildCall?: (info: { callId: string; tool: string }) => void,
+): Promise<unknown> {
+  const expectedWork = await import('../runtime/harness/expected-work-admission.js');
+  const parent = harnessRunContextStorage.getStore();
+  const sourceUserSeq = parent?.sessionId === sessionId
+    && Number.isSafeInteger(parent.sourceUserSeq)
+    && (parent.sourceUserSeq ?? 0) > 0
+    ? parent.sourceUserSeq as number
+    : undefined;
+  if (!sourceUserSeq) {
+    throw new expectedWork.ExpectedWorkBindingRequiredError(
+      'work_binding_required: clem.work needs the exact accepted action identity',
+    );
+  }
+  const workState = expectedWork.actionExpectedWorkState({ sessionId, sourceUserSeq });
+  if (workState.status !== 'required') {
+    throw new expectedWork.ExpectedWorkBindingRequiredError(
+      `work_binding_required: clem.work is action-only; accepted task work state is ${workState.status}`,
+    );
+  }
+  if (!options.workCallOptions) {
+    throw new expectedWork.ExpectedWorkBindingRequiredError(
+      'work_binding_required: the outer provider lane did not install this action\'s scoped work carrier; stop and explain the blocker conversationally',
+    );
+  }
+
+  const { WorkCallInputSchema, buildWorkCall } = await import('./work-call.js');
+  const parsed = WorkCallInputSchema.safeParse(args);
+  if (parsed.success) {
+    const innerName = parsed.data.name.trim();
+    if (!isCodeModeToolAllowed(innerName)) {
+      throw new expectedWork.ExpectedWorkBindingRequiredError(
+        `work_binding_required: inner tool "${innerName}" is outside the code-mode surface; use tool_search and choose an action-scoped reachable tool`,
+      );
+    }
+    const innerArgs = parsedJsonObject(parsed.data.args_json);
+    if (innerArgs) await enforceCodeModeProgramMutationCeiling(innerName, innerArgs, counter);
+  }
+
+  const callId = `codemode-work-${randomUUID()}`;
+  try { onChildCall?.({ callId, tool: 'work_call' }); } catch { /* provenance never blocks dispatch */ }
+  const wrapped = options.workCallInvoker ?? wrapToolForHarness(buildWorkCall({
+    ...options.workCallOptions,
+    settlementLane: 'code_mode',
+  }) as never) as InvokableTool;
+  if (typeof wrapped.invoke !== 'function') {
+    throw new expectedWork.ExpectedWorkBindingRequiredError(
+      'work_binding_required: the action-scoped work carrier is unavailable',
+    );
+  }
+  const output = await withToolOutputContext(
+    { sessionId, sourceUserSeq, callId, toolName: 'work_call' },
+    () => withHarnessRunContext({
+      ...inheritedNestedHarnessContext(sessionId),
+      sessionId,
+      counter: counter ?? new ToolCallsCounter(1000),
+      codeMode: true,
+    }, () => wrapped.invoke!(
+      { context: { sessionId } },
+      JSON.stringify(args ?? {}),
+      { toolCall: { callId } },
+    )),
+  );
+  if (output instanceof ExternalWritePreDispatchResult) {
+    const direct = strictJsonParse(output.output);
+    return direct.ok ? direct.value : { ok: false, error: output.output, error_kind: output.reason };
+  }
+  const innerName = parsed.success
+    ? (isMcpNamespacedTool(parsed.data.name) ? stripMcpToolCarrier(parsed.data.name) : parsed.data.name)
+    : 'work_call';
+  return normalizeCodeModeToolResult(innerName, output, { sessionId, callId });
+}
+
+export async function dispatchCodeModeTool(
+  method: string,
+  args: unknown,
+  sessionId: string,
+  counter?: ToolCallsCounter,
+  options: PreparedCodeModeProgramOptions = {},
+  /** Reports every BUSINESS child call id this dispatch mints — the run's
+   * durable evidence identities, surfaced to the model and to parked-result
+   * provenance. Discovery/schema helpers are not evidence and stay silent. */
+  onChildCall?: (info: { callId: string; tool: string }) => void,
+): Promise<unknown> {
   // Host-answered helpers remain free of the ordinary tool counter, but they
   // are still physical discovery/schema reads and therefore share the exact
   // accepted task's durable discovery budget. One call id is minted per helper
@@ -589,9 +767,30 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
     }
   }
   if (method === 'run_worker') return dispatchCodeModeWorker(args, sessionId, counter);
+  if (method === 'work') return dispatchCodeModeWork(args, sessionId, counter, options, onChildCall);
   if (!isCodeModeToolAllowed(method)) {
     const why = WRITE_TOOLS.has(method) ? 'writes are disabled (set CLEMMY_CODE_MODE_WRITES=on)' : 'not in the code-mode allowlist';
     throw new Error(`code-mode: tool "${method}" is not available — ${why}`);
+  }
+  const parent = harnessRunContextStorage.getStore();
+  const sourceUserSeq = parent?.sessionId === sessionId
+    && Number.isSafeInteger(parent.sourceUserSeq)
+    && (parent.sourceUserSeq ?? 0) > 0
+    ? parent.sourceUserSeq as number
+    : undefined;
+  const childToolName = isMcpNamespacedTool(method)
+    ? stripMcpToolCarrier(method)
+    : method;
+  if (sourceUserSeq && actionTopologyRoleForRuntimeCall(childToolName, args) !== 'control') {
+    const expectedWork = await import('../runtime/harness/expected-work-admission.js');
+    const workState = expectedWork.actionExpectedWorkState({ sessionId, sourceUserSeq });
+    if (workState.status !== 'not_action' && workState.status !== 'missing') {
+      throw new expectedWork.ExpectedWorkBindingRequiredError(
+        'work_binding_required: active action business calls must use '
+        + '`clem.work({ proposal, requirement_id, universe_item_id, universe_selector, name, args_json })`; '
+        + 'provide the complete proposal on the first call and proposal:null on later calls',
+      );
+    }
   }
   // HARD GUARD (2026-07-07): an IRREVERSIBLE external SEND (OUTLOOK_SEND_EMAIL,
   // *_PUBLISH, …) must NEVER run inside a code-mode program. Code mode has a 60s
@@ -602,56 +801,115 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
   // Sends belong in run_batch: one certification, a deterministic per-item loop
   // with its OWN per-item budget, honest ledger, and resumability. Refuse here so
   // the model is redirected BEFORE it burns 60s, not after.
-  if (codeModeSendGuardEnabled()) {
+  await enforceCodeModeProgramMutationCeiling(method, args, counter);
+  const callId = `codemode-${randomUUID()}`;
+  try { onChildCall?.({ callId, tool: childToolName }); } catch { /* provenance never blocks dispatch */ }
+  const settlementNonce = randomUUID();
+  const effect = classifyRuntimeToolEffect(childToolName, args).effect;
+  const dispatch = async (logicalToolCallId?: string): Promise<unknown> => {
+    const accounting = {
+      ...currentEventAttribution(),
+      tool: childToolName,
+      callId,
+      logicalToolCallId: logicalToolCallId ?? callId,
+      settlementNonce,
+      accounting: 'top_level',
+      codeMode: true,
+      effect,
+      effectiveTool: childToolName,
+    } as const;
+    // This is the one durable lifecycle for the child dispatch. The return is
+    // parented to this exact call below; previews remain bounded independently
+    // from the nonce-scoped bytes used by the program.
+    let called: ReturnType<typeof appendEvent> | null = null;
     try {
-      const { classifyExternalWrite } = await import('../runtime/harness/confirm-first-gate.js');
-      const shape = classifyExternalWrite(method, args);
-      if (shape.mutating && shape.irreversible) {
-        throw new Error(
-          `code-mode: refusing an irreversible external send (${shape.shapeKey ?? method}) inside run_tool_program — `
-          + 'a code program\'s deadline would lose or partially-complete a batch of sends. '
-          + 'Use run_batch for sends: propose ONE plan (tool composio_execute_tool, sideEffect "send", one item per recipient with fully-baked args), it certifies once, queues ONE approval, then executes deterministically with per-item gating and an honest ledger.',
-        );
-      }
-      // Escalation guard (same class, reversible writes): a program LOOPING
-      // mutations dies at the 60s cap mid-batch just like sends — the writes
-      // that landed before the kill are lost to the model. Allow the first
-      // couple (legit single-write programs), refuse the third with the same
-      // redirect. Counted per PROGRAM RUN via its counter identity.
-      if (shape.mutating && counter) {
-        const soFar = (programMutationCounts.get(counter) ?? 0) + 1;
-        programMutationCounts.set(counter, soFar);
-        if (soFar > 2) {
-          throw new Error(
-            `code-mode: refusing the ${soFar}rd/th mutating call (${shape.shapeKey ?? method}) in ONE program — `
-            + 'a mutation loop cannot finish inside the program deadline and dies mid-batch, losing track of completed writes. '
-            + 'Use run_batch: one plan, one item per record, certified once, executed deterministically with a per-item ledger.',
-          );
+      called = appendEvent({
+        sessionId,
+        turn: parent?.turn ?? 0,
+        role: 'Clem',
+        type: 'tool_called',
+        data: { ...accounting, args: JSON.stringify(args ?? {}).slice(0, 300) },
+      });
+    } catch {
+      // Detached/dev dispatchers historically use synthetic session ids. They
+      // have no durable authority to establish, so observability stays
+      // best-effort; accepted production tasks always have a real session.
+    }
+    try {
+      const out = await withToolOutputContext(
+        { sessionId, sourceUserSeq, callId, toolName: childToolName, settlementNonce },
+        () => isMcpNamespacedTool(method)
+          ? dispatchCodeModeMcpTool(method, args, sessionId, callId, counter)
+          : dispatchCodeModeLocalTool(method, args, sessionId, callId, counter),
+      );
+      // A formatter normally parks the exact provider bytes. Plain tools may
+      // return an unformatted serializable value, so park it here only when the
+      // exact invocation row is still absent. Never replace an existing row.
+      if (!getToolOutputForInvocation(sessionId, callId, settlementNonce)) {
+        const exact = typeof out === 'string' ? out : JSON.stringify(out ?? null);
+        try {
+          writeToolOutput({
+            sessionId,
+            callId,
+            tool: childToolName,
+            output: exact ?? 'null',
+            invocationNonce: settlementNonce,
+          });
+        } catch (error) {
+          // An accepted task must never consume bytes the host failed to park.
+          // Detached/dev calls have no durable session and keep their legacy
+          // direct-return behavior.
+          if (sourceUserSeq) throw error;
         }
       }
+      const normalized = normalizeCodeModeToolResult(childToolName, out, {
+        sessionId,
+        callId,
+        settlementNonce,
+      });
+      const ok = toolOutputLooksSuccessful(normalized);
+      if (called) {
+        appendEvent({
+          sessionId,
+          turn: parent?.turn ?? 0,
+          role: 'tool',
+          type: 'tool_returned',
+          parentEventId: called.id,
+          data: {
+            ...accounting,
+            ok,
+            preview: (typeof normalized === 'string'
+              ? normalized
+              : JSON.stringify(normalized ?? '')).slice(0, 400),
+          },
+        });
+      }
+      return normalized;
     } catch (err) {
-      // A genuine guard trip (our Errors above) propagates; a classifier import/
-      // parse failure must NOT block the call (fail-open to legacy behavior).
-      if (err instanceof Error && err.message.startsWith('code-mode: refusing')) throw err;
+      if (called) {
+        appendEvent({
+          sessionId,
+          turn: parent?.turn ?? 0,
+          role: 'tool',
+          type: 'tool_returned',
+          parentEventId: called.id,
+          data: {
+            ...accounting,
+            ok: false,
+            error: (err instanceof Error ? err.message : String(err)).slice(0, 400),
+          },
+        });
+      }
+      throw err;
     }
+  };
+  if (sourceUserSeq) {
+    return withLogicalToolCall(
+      { sessionId, sourceUserSeq, logicalToolCallId: callId, tool: childToolName, args },
+      (identity) => dispatch(identity.logicalToolCallId),
+    );
   }
-  const callId = `codemode-${randomUUID()}`;
-  // Observability: emit tool_called/tool_returned for each in-program call so the
-  // trace drawer / Tasks board shows what a code-mode program did (parity with
-  // discrete calls; `codeMode:true` tags them for adoption measurement).
-  try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { ...currentEventAttribution(), tool: method, callId, codeMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
-  try {
-    const out = isMcpNamespacedTool(method)
-      ? await dispatchCodeModeMcpTool(method, args, sessionId, counter)
-      : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter);
-    const normalized = normalizeCodeModeToolResult(method, out, { sessionId, callId });
-    const ok = toolOutputLooksSuccessful(normalized);
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...currentEventAttribution(), tool: method, callId, ok, codeMode: true, preview: (typeof normalized === 'string' ? normalized : JSON.stringify(normalized ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
-    return normalized;
-  } catch (err) {
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...currentEventAttribution(), tool: method, callId, ok: false, codeMode: true, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
-    throw err;
-  }
+  return dispatch();
 }
 
 /** A local clem tool: route through wrapToolForHarness (the full bracket gate
@@ -790,10 +1048,12 @@ async function dispatchCodeModeMcpTool(
   method: string,
   args: unknown,
   sessionId: string,
+  callId: string,
   counter?: ToolCallsCounter,
   certifiedBatch?: { batchId: string; payloadHash: string },
   batchItem?: boolean,
   scopeOverride?: McpToolScope | null,
+  pendingActionExecution?: PendingActionExecutionCapability,
 ): Promise<unknown> {
   const executableMethod = stripMcpToolCarrier(method);
   const scope = scopeOverride !== undefined
@@ -836,9 +1096,16 @@ async function dispatchCodeModeMcpTool(
       counter: counter ?? new ToolCallsCounter(1000),
       codeMode: true,
       ...(certifiedBatch ? { certifiedBatch } : {}),
+      ...(pendingActionExecution ? { pendingActionExecution } : {}),
+      ...(pendingActionExecution?.sourceUserSeq
+        ? { sourceUserSeq: pendingActionExecution.sourceUserSeq }
+        : {}),
       ...(batchItem ? { batchItem: true } : {}),
     },
-    () => shim.callTool(executableMethod, argObj),
+    () => withToolOutputContext(
+      { sessionId, callId, toolName: executableMethod },
+      () => shim.callTool(executableMethod, argObj),
+    ),
   );
 }
 
@@ -861,6 +1128,7 @@ export async function dispatchBatchItemTool(
   certifiedBatch?: { batchId: string; payloadHash: string },
   telemetry?: { accounting?: 'transport_mirror'; canonicalCallId?: string },
   mcpToolScopeOverride?: McpToolScope | null,
+  pendingActionExecution?: PendingActionExecutionCapability,
 ): Promise<unknown> {
   // `call_tool` is a transport mirror of the model's existing invocation, so
   // its inner bracket must carry the same logical id.  A real batch item has no
@@ -875,29 +1143,59 @@ export async function dispatchBatchItemTool(
     ...(telemetry?.accounting ? { accounting: telemetry.accounting } : {}),
     ...(telemetry?.canonicalCallId ? { canonicalCallId: telemetry.canonicalCallId } : {}),
   };
-  try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, batchMode: true, ...telemetryData, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
+  // call_tool/work_call reuse this dispatcher as a transport mirror of one
+  // ordinary inner invocation; they are not batch items. Marking them as a
+  // batch item suppressed normal artifact claiming/content contracts, so a
+  // generated Sheet created through the production work carrier could never
+  // connect to its exact readback. Calls without mirror telemetry are genuine
+  // batch items and retain the existing outer-owned artifact behavior.
+  const batchItem = telemetry?.accounting !== 'transport_mirror';
+  try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, batchMode: batchItem, ...telemetryData, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
   try {
     const out = isMcpNamespacedTool(method)
-      ? await dispatchCodeModeMcpTool(method, args, sessionId, counter, certifiedBatch, true, mcpToolScopeOverride)
-      : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter, certifiedBatch, true);
+      ? await dispatchCodeModeMcpTool(method, args, sessionId, callId, counter, certifiedBatch, batchItem, mcpToolScopeOverride, pendingActionExecution)
+      : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter, certifiedBatch, batchItem);
     const ok = toolOutputLooksSuccessful(out);
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok, batchMode: true, ...telemetryData, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok, batchMode: batchItem, ...telemetryData, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;
     try { return JSON.parse(out); } catch { return out; }
   } catch (err) {
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: false, batchMode: true, ...telemetryData, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: false, batchMode: batchItem, ...telemetryData, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
     throw err;
   }
 }
 
 /** Run a code-mode program for a session. ONE counter spans all in-program calls
  *  so loop-guard + batch gates see the program as a single turn (gate-parity). */
-export async function runCodeModeForSession(program: string, sessionId: string): Promise<CodeModeResult> {
+export async function runCodeModeForSession(
+  program: string,
+  sessionId: string,
+  options: CodeModeProgramOptions = {},
+): Promise<CodeModeResult> {
   const counter = new ToolCallsCounter(1000);
+  const preparedOptions: PreparedCodeModeProgramOptions = options.workCallOptions
+    ? {
+        ...options,
+        workCallInvoker: wrapToolForHarness((await import('./work-call.js')).buildWorkCall({
+          ...options.workCallOptions,
+          settlementLane: 'code_mode',
+        }) as never) as InvokableTool,
+      }
+    : options;
   const startedAt = Date.now();
+  // The program's return is a DERIVED value with no lifecycle of its own; the
+  // child call ids collected here are the run's real evidence identities.
+  const childCalls: Array<{ callId: string; tool: string }> = [];
   const result = await runCodeModeProgram(
     program,
-    (method, args) => dispatchCodeModeTool(method, args, sessionId, counter),
+    (method, args) => dispatchCodeModeTool(
+      method,
+      args,
+      sessionId,
+      counter,
+      preparedOptions,
+      (info) => childCalls.push(info),
+    ),
     {
       // clem.progress('…') → the same live-activity spine batch uses, so a long
       // program reads as supervised instead of a frozen spinner.
@@ -910,6 +1208,23 @@ export async function runCodeModeForSession(program: string, sessionId: string):
         try {
           const handle = `codemode-result-${randomUUID()}`;
           writeToolOutput({ sessionId, callId: handle, tool: 'run_tool_program', output: fullJson });
+          // A parked derived value can never be evidence authority (no
+          // lifecycle, no nonce, transformed bytes). Record WHICH child
+          // calls produced it so any gate refusing the handle can name the
+          // real evidence ids instead of sending the model in a circle
+          // (live 2026-08-12: a 10-minute reconciliation loop).
+          try {
+            appendEvent({
+              sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'codemode_result_parked',
+              data: {
+                handle,
+                childCallIds: childCalls.map((child) => child.callId).slice(0, 40),
+              },
+            });
+          } catch { /* provenance is advisory */ }
           return handle;
         } catch { return null; }
       },
@@ -936,10 +1251,35 @@ export async function runCodeModeForSession(program: string, sessionId: string):
       },
     });
   } catch { /* telemetry never blocks */ }
-  return result;
+  return {
+    ...result,
+    ...(childCalls.length > 0
+      ? { toolCallIds: childCalls.map((child) => child.callId).slice(0, 40) }
+      : {}),
+  };
 }
 
-export function codeModeDescription(): string {
+export const CODE_MODE_WORK_FIRST_CALL_EXAMPLE = {
+  proposal: {
+    version: 1,
+    operations: [{
+      id: 'read_source',
+      effect: 'read',
+      coverage: 'complete_set',
+      dependsOn: [],
+      dataFrom: [],
+      cardinality: { kind: 'once' },
+    }],
+    universes: [],
+  },
+  requirement_id: 'read_source',
+  universe_item_id: null,
+  universe_selector: null,
+  name: 'read_file',
+  args_json: '{"path":"source.json","max_chars":null}',
+} as const;
+
+export function codeModeDescription(options: { actionExpectedWork?: boolean } = {}): string {
   const writes = codeModeWritesEnabled();
   const surface = [...READ_ONLY_TOOLS, ...(writes ? WRITE_TOOLS : [])].join(', ');
   const fetchTools = writes ? 'composio_execute_tool(...) and MCP tools' : 'MCP tools';
@@ -952,6 +1292,11 @@ export function codeModeDescription(): string {
     'Obvious upstream tool-error banners return structured `{ ok:false, error, raw }`; branch on `ok === false` instead of trying to parse them as data.',
     'You can ALSO call any connected external MCP tool here by its `<server>__<tool>` name — e.g. `await clem["dataforseo__serp_organic_live_advanced"]({...})` — and they run through the SAME gates as a normal MCP call.',
     'BEST USE — do the FETCHES inside the program: for several DataForSEO / SEO / analytics / Salesforce lookups, call ' + fetchTools + ' here (Promise.all the independent ones), distill, and `return` only the small result — NOT many discrete tool calls each dumping raw JSON into the conversation.',
+    ...(options.actionExpectedWork ? [
+      'ACTION WORK — every business call inside this program MUST use `clem.work(input)`, never plain `clem.<businessTool>`. Control helpers such as describe/listTools/run_worker remain direct.',
+      `FIRST business call (freeze the complete provider-neutral topology and bind its first real call together): \`await clem.work(${JSON.stringify(CODE_MODE_WORK_FIRST_CALL_EXAMPLE)})\`.`,
+      `LATER business call (bind an existing frozen requirement; proposal must be null): \`await clem.work(${JSON.stringify({ ...CODE_MODE_WORK_FIRST_CALL_EXAMPLE, proposal: null, requirement_id: 'next_requirement' })})\`. Await the first freeze before starting parallel later calls.`,
+    ] : []),
     writes
       ? 'Writes ARE allowed and pass the SAME approval/grounding/destination gates as a normal tool call — a blocked write throws inside your program (catch it or let it surface).'
       : 'Local writes are off, but MCP reads work; a destructive MCP tool is still blocked by its approval gate.',
@@ -1004,18 +1349,25 @@ export function codeModeDistillReSteer(result: CodeModeResult): string {
 }
 
 /** The run_tool_program tool def. Only meaningful when codeModeEnabled(). */
-export function buildCodeModeTool() {
+export function buildCodeModeTool(options: CodeModeProgramOptions = {}) {
   return tool({
     name: 'run_tool_program',
-    description: codeModeDescription(),
+    description: codeModeDescription({ actionExpectedWork: Boolean(options.workCallOptions) }),
     parameters: z.object({
       program: z.string().min(1).describe('A JavaScript program body (async). Call `clem.<tool>(args)` and `return` a small distilled value.'),
     }),
     execute: async ({ program }: { program: string }) => {
       const sessionId = harnessRunContextStorage.getStore()?.sessionId ?? '';
-      const result = await runCodeModeForSession(program, sessionId);
+      const result = await runCodeModeForSession(program, sessionId, options);
       if (result.ok) {
-        return `code-mode program returned (${result.rpcCalls} tool call${result.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(result.value)}${codeModeDistillReSteer(result)}`;
+        // The evidence identities are the CHILD calls, not the program's
+        // derived return. Any gate that asks for "the exact call id of the
+        // read" (reconciliation, verification) needs these; the parked
+        // `codemode-result-*` handle is recall-only.
+        const evidenceLine = result.toolCallIds?.length
+          ? `\n[tool call id${result.toolCallIds.length === 1 ? '' : 's'} for evidence/verification: ${result.toolCallIds.join(', ')}]`
+          : '';
+        return `code-mode program returned (${result.rpcCalls} tool call${result.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(result.value)}${evidenceLine}${codeModeDistillReSteer(result)}`;
       }
       return formatCodeModeFailure(result);
     },

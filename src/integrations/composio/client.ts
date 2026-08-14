@@ -1,4 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Composio, ComposioToolNotFoundError } from '@composio/core';
@@ -1719,6 +1726,180 @@ export async function setupApiKeyToolkit(
   });
 }
 
+function normalizedComposioActionSlug(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toUpperCase();
+  return /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+function cliSchemaObject(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  return record.type === 'object'
+    || (record.properties && typeof record.properties === 'object' && !Array.isArray(record.properties))
+    ? record
+    : undefined;
+}
+
+/**
+ * Project one exact action schema from a CLI search result.
+ *
+ * The CLI may return inline schemas or absolute paths beneath its private
+ * `~/.composio/tool_definitions` cache. Search output is provider-controlled,
+ * so a path is accepted only when it is explicitly mapped to the requested
+ * PRIMARY slug, its real path remains beneath that fixed root, and its file
+ * name is the exact slug. Related/schema-less candidates never qualify.
+ * Exported as a pure test seam; production passes the real home directory.
+ */
+export function exactComposioCliSchemaFromSearch(
+  value: unknown,
+  requestedSlug: string,
+  homeDir = os.homedir(),
+): Record<string, unknown> | null {
+  const wanted = normalizedComposioActionSlug(requestedSlug);
+  if (!wanted) return null;
+  let root = value;
+  if (typeof root === 'string') {
+    try { root = JSON.parse(root) as unknown; } catch { return null; }
+  }
+
+  let exactPrimary = false;
+  let inlineSchema: Record<string, unknown> | undefined;
+  let mappedSchemaPath: string | undefined;
+  const seen = new Set<object>();
+  let visited = 0;
+  const visit = (node: unknown, depth: number, relatedContext = false): void => {
+    if (depth > 8 || visited >= 2_000 || node === null || node === undefined) return;
+    visited += 1;
+    if (typeof node === 'string') {
+      const trimmed = node.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try { visit(JSON.parse(trimmed) as unknown, depth + 1, relatedContext); } catch { /* plain provider text */ }
+      }
+      return;
+    }
+    if (typeof node !== 'object' || seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, depth + 1, relatedContext);
+      return;
+    }
+
+    const record = node as Record<string, unknown>;
+    const explicitSlug = normalizedComposioActionSlug(
+      record.tool_slug ?? record.toolSlug ?? record.slug,
+    );
+    if (!relatedContext && explicitSlug === wanted) {
+      exactPrimary = true;
+      inlineSchema = cliSchemaObject(
+        record.inputParameters
+        ?? record.input_parameters
+        ?? record.inputSchema
+        ?? record.input_schema
+        ?? record.parameters
+        ?? record.schema,
+      ) ?? inlineSchema;
+    }
+    if (!relatedContext && Array.isArray(record.primary_tool_slugs)) {
+      if (record.primary_tool_slugs.some((slug) => normalizedComposioActionSlug(slug) === wanted)) {
+        exactPrimary = true;
+      }
+    }
+    // Intentionally ignore related_tool_slugs: related search suggestions are
+    // discovery hints, not exact executable contract authority.
+    const toolSchemas = record.tool_schemas;
+    if (!relatedContext && toolSchemas && typeof toolSchemas === 'object' && !Array.isArray(toolSchemas)) {
+      const primary = (toolSchemas as Record<string, unknown>).primary;
+      if (primary && typeof primary === 'object' && !Array.isArray(primary)) {
+        for (const [slug, candidatePath] of Object.entries(primary as Record<string, unknown>)) {
+          if (normalizedComposioActionSlug(slug) === wanted && typeof candidatePath === 'string') {
+            mappedSchemaPath = candidatePath;
+          }
+        }
+      }
+    }
+    for (const [key, child] of Object.entries(record)) {
+      if (key === 'related_tool_slugs') continue;
+      if (child && (typeof child === 'object' || typeof child === 'string')) {
+        visit(child, depth + 1, relatedContext || /^related(?:_|$)/i.test(key));
+      }
+    }
+  };
+  visit(root, 0);
+  if (!exactPrimary) return null;
+  if (inlineSchema) {
+    try { return structuredClone(inlineSchema); } catch { return null; }
+  }
+  if (!mappedSchemaPath) return null;
+
+  let schemaRoot: string;
+  try {
+    schemaRoot = realpathSync(path.resolve(homeDir, '.composio', 'tool_definitions'));
+  } catch {
+    return null;
+  }
+  const expanded = mappedSchemaPath === '~'
+    ? homeDir
+    : mappedSchemaPath.startsWith('~/') || mappedSchemaPath.startsWith(`~${path.sep}`)
+      ? path.join(homeDir, mappedSchemaPath.slice(2))
+      : mappedSchemaPath;
+  if (!path.isAbsolute(expanded)) return null;
+  try {
+    const file = realpathSync(path.resolve(expanded));
+    if (file !== schemaRoot && !file.startsWith(`${schemaRoot}${path.sep}`)) return null;
+    if (path.basename(file).toUpperCase() !== `${wanted}.JSON`) return null;
+    const stats = statSync(file);
+    if (!stats.isFile() || stats.size <= 0 || stats.size > 1_000_000) return null;
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    const schema = cliSchemaObject(
+      record.inputSchema
+      ?? record.input_schema
+      ?? record.inputParameters
+      ?? record.input_parameters
+      ?? record,
+    );
+    return schema ? structuredClone(schema) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getComposioToolBySlugViaCli(wanted: string): Promise<ComposioToolkitTool | null> {
+  if (normalizedComposioActionSlug(wanted) !== wanted) return null;
+  const toolkitSlug = CURATED_TOOLKITS
+    .map((toolkit) => toolkit.slug)
+    .sort((left, right) => right.length - left.length)
+    .find((slug) => wanted.startsWith(`${slug.toUpperCase()}_`))
+    ?? (wanted.split('_')[0] ?? '').toLowerCase();
+  if (!toolkitSlug) return null;
+  // Authority is ordered by request START. A slower older search that returns
+  // after a newer observation must not roll the schema lease forward.
+  const observedAt = Date.now();
+  try {
+    const result = await searchComposioCliTools(wanted, {
+      ...composioCliOptions(),
+      toolkitSlug,
+      limit: 1,
+    });
+    const inputParameters = exactComposioCliSchemaFromSearch(result, wanted);
+    if (!inputParameters) return null;
+    const tool: ComposioToolkitTool = {
+      slug: wanted,
+      name: wanted,
+      toolkitSlug,
+      inputParameters,
+    };
+    toolSchemaObservedAt.set(tool, observedAt);
+    return tool;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Fetch ONE tool's raw definition by exact slug. The per-toolkit listing is
  * capped and large toolkits (Outlook alone clears 200 actions) can miss the
@@ -1727,9 +1908,13 @@ export async function setupApiKeyToolkit(
  * because some SDK versions ignore the `tools` filter.
  */
 export async function getComposioToolBySlug(slug: string): Promise<ComposioToolkitTool | null> {
-  const composio = getComposio() as any;
-  if (!composio || !slug) return null;
+  if (!slug) return null;
   const wanted = slug.toUpperCase();
+  const composio = getComposio() as any;
+  // Keyless/AUTO and explicit CLI installs have no SDK catalog. Renew only
+  // this requested action's schema through one constrained CLI search; never
+  // list or search unrelated toolkits as a fallback.
+  if (!composio) return getComposioToolBySlugViaCli(wanted);
   try {
     // Order observations by request start, not response completion. Two
     // overlapping lookups can finish out of order; a slower older request must

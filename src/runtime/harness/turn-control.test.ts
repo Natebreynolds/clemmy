@@ -36,8 +36,11 @@ const {
   setProvenStandardLineForTest,
   effectiveTurnObjective,
   recordTurnPreflightDecision,
+  PREFLIGHT_ALIGNMENT_SOURCE,
 } = await import('./turn-control.js');
 const { appendEvent } = await import('./eventlog.js');
+const { commitTurnOutcome } = await import('./delivery-committer.js');
+const { turnOutcomeId } = await import('./turn-outcome.js');
 
 let seq = 0;
 function freshSession(kind = 'chat'): string {
@@ -45,6 +48,43 @@ function freshSession(kind = 'chat'): string {
   const id = `turn-control-test-${Date.now().toString(36)}-${seq}`;
   createSession({ id, kind } as never);
   return id;
+}
+
+function commitStructuralAlignment(input: {
+  sessionId: string;
+  sourceSeq: number;
+  sourceTurn: number;
+  intentKey: string;
+  question?: string;
+}): void {
+  const question = input.question ?? 'I have the request. Should I go ahead?';
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: input.sourceTurn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question,
+      purpose: 'clarification',
+      source: PREFLIGHT_ALIGNMENT_SOURCE,
+      sourceUserSeq: input.sourceSeq,
+      intentKey: input.intentKey,
+    },
+  });
+  const identity = {
+    sessionId: input.sessionId,
+    turn: input.sourceTurn,
+    sourceUserSeq: input.sourceSeq,
+  };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: question },
+  }, { legacyReason: 'awaiting_user_input' });
 }
 
 beforeEach(() => {
@@ -367,7 +407,7 @@ test('confirm beat: old completions never grant permanent alignment; reads and n
 
 test('typed preflight is durable; approval binds to the exact pending request', () => {
   const sessionId = freshSession('chat');
-  appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Turn this into a Google Doc.' } });
+  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Turn this into a Google Doc.' } });
   const align = classifyTurnPreflight({
     message: 'Turn this into a Google Doc.',
     sessionId,
@@ -376,11 +416,103 @@ test('typed preflight is durable; approval binds to the exact pending request', 
   assert.equal(align.phase, 'align');
   recordTurnPreflightDecision(sessionId, align);
   assert.equal(listEvents(sessionId, { types: ['turn_preflight_decision'] }).length, 1, 'the align decision is durable');
+  commitStructuralAlignment({
+    sessionId,
+    sourceSeq: source.seq,
+    sourceTurn: source.turn,
+    intentKey: align.intentKey!,
+  });
 
   appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Go ahead.' } });
   const execute = classifyTurnPreflight({ message: 'Go ahead.', sessionId, sessionKind: 'chat' });
   assert.equal(execute.phase, 'execute');
   assert.equal(execute.confirmedIntentKey, align.intentKey, 'approval binds to the exact pending request');
+});
+
+test('an advisory align row alone never authorizes a later bare confirmation', () => {
+  const sessionId = freshSession('chat');
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Send this email.' },
+  });
+  const align = classifyTurnPreflight({
+    message: 'Send this email.', sessionId, sessionKind: 'chat', sourceUserSeq: source.seq,
+  });
+  recordTurnPreflightDecision(sessionId, align, source.seq);
+  const yes = appendEvent({
+    sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Go ahead.' },
+  });
+  const decision = classifyTurnPreflight({
+    message: 'Go ahead.', sessionId, sessionKind: 'chat', sourceUserSeq: yes.seq,
+  });
+  assert.equal(decision.confirmedIntentKey, undefined);
+});
+
+test('a pause committed after the confirmation source was accepted cannot authorize it retroactively', () => {
+  const sessionId = freshSession('chat');
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Send this email.' },
+  });
+  const align = classifyTurnPreflight({
+    message: 'Send this email.', sessionId, sessionKind: 'chat', sourceUserSeq: source.seq,
+  });
+  recordTurnPreflightDecision(sessionId, align, source.seq);
+  const yes = appendEvent({
+    sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Go ahead.' },
+  });
+  commitStructuralAlignment({
+    sessionId,
+    sourceSeq: source.seq,
+    sourceTurn: source.turn,
+    intentKey: align.intentKey!,
+  });
+  const decision = classifyTurnPreflight({
+    message: 'Go ahead.', sessionId, sessionKind: 'chat', sourceUserSeq: yes.seq,
+  });
+  assert.equal(decision.confirmedIntentKey, undefined);
+});
+
+test('a mismatched question terminal cannot authorize a bare confirmation', () => {
+  const sessionId = freshSession('chat');
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Send this email.' },
+  });
+  const align = classifyTurnPreflight({
+    message: 'Send this email.', sessionId, sessionKind: 'chat', sourceUserSeq: source.seq,
+  });
+  recordTurnPreflightDecision(sessionId, align, source.seq);
+  appendEvent({
+    sessionId,
+    turn: source.turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: 'Should I send it?',
+      purpose: 'clarification',
+      source: PREFLIGHT_ALIGNMENT_SOURCE,
+      sourceUserSeq: source.seq,
+      intentKey: align.intentKey,
+    },
+  });
+  const identity = { sessionId, turn: source.turn, sourceUserSeq: source.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: 'Which account should I use?' },
+  });
+  const yes = appendEvent({
+    sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Go ahead.' },
+  });
+  const decision = classifyTurnPreflight({
+    message: 'Go ahead.', sessionId, sessionKind: 'chat', sourceUserSeq: yes.seq,
+  });
+  assert.equal(decision.confirmedIntentKey, undefined);
 });
 
 test('preflight persistence is best-effort telemetry — a failed write never throws or breaks the turn', () => {
@@ -429,6 +561,12 @@ test('the aligned objective anchors acknowledgement turns (effectiveTurnObjectiv
     message: 'Create a Google Doc for the client.', sessionId, sessionKind: 'chat', sourceUserSeq: source.seq,
   });
   recordTurnPreflightDecision(sessionId, align, source.seq);
+  commitStructuralAlignment({
+    sessionId,
+    sourceSeq: source.seq,
+    sourceTurn: source.turn,
+    intentKey: align.intentKey!,
+  });
   const approval = appendEvent({
     sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Go ahead.' },
   });
@@ -612,28 +750,14 @@ test('a missing session id can never produce a beat', () => {
   );
 });
 
-test('the beat asks for a conversation, never a plan card', () => {
-  // The 2026-06-01 rollback was specifically about a plan/approve card being
-  // the first response to an action request; the owner's ideal is one natural
-  // line that states the reading and invites a correction. A beat that produces
-  // a briefing document re-creates the thing that was rolled back.
-  // UPGRADED (2026-08-07, live dashboard run): the model bulldozed the generic
-  // beat on a detailed prompt. The beat is now INFORMED (opens with what the
-  // capability resolution + memory already found) and INTELLIGENT about gaps
-  // (asks only about load-bearing unknowns; a fully-specified ask proceeds).
+test('the execution directive cannot recreate a blanket confirmation stop', () => {
   assert.match(CONFIRM_BEAT_TEXT, /capability resolution/i, 'the beat is grounded in what the turn already knows');
-  assert.match(CONFIRM_BEAT_TEXT, /Ground your opening in what you actually found/i, 'informed, not generic');
-  assert.match(CONFIRM_BEAT_TEXT, /load-bearing unknowns/i, 'gaps are reasoned about, not recited');
-  assert.match(CONFIRM_BEAT_TEXT, /Do not call tools yet; wait for the answer/i, 'a real question earns the pause');
-  assert.match(CONFIRM_BEAT_TEXT, /genuinely specifies everything load-bearing.*PROCEED/is, 'a fully-specified ask just goes');
-  assert.match(CONFIRM_BEAT_TEXT, /without asking again/i, 'approve once, then run — never per-step approvals');
+  assert.match(CONFIRM_BEAT_TEXT, /openness pass has already decided/i);
+  assert.match(CONFIRM_BEAT_TEXT, /Proceed with the requested work in this same turn/i);
+  assert.match(CONFIRM_BEAT_TEXT, /do not repeat it.*ask for generic permission/is);
+  assert.doesNotMatch(CONFIRM_BEAT_TEXT, /ask whether to go ahead|WAIT|Do not call tools yet/i);
   assert.doesNotMatch(CONFIRM_BEAT_TEXT, /2–3 lines|bulleted proposal is fine|checklist of steps/i);
-  assert.match(CONFIRM_BEAT_TEXT, /Never produce a plan summary/i, 'the plan-card shape is explicitly refused');
-  assert.match(CONFIRM_BEAT_TEXT, /no invented capabilities/i, 'grounding stays honest');
-  // VOICE-COSPLAY GUARD (owner rule, re-affirmed 2026-08-07): the directive
-  // describes what the beat must ACCOMPLISH — it never scripts sentences for
-  // the model to parrot. No quoted sample utterances, ever.
-  assert.match(CONFIRM_BEAT_TEXT, /the words are yours, in your own voice — never a template/i);
+  assert.match(CONFIRM_BEAT_TEXT, /approval and external-write authority still govern irreversible actions/i);
   assert.doesNotMatch(CONFIRM_BEAT_TEXT, /"(?:ok |your |I have |the Apify)/i, 'no scripted example sentences');
 });
 

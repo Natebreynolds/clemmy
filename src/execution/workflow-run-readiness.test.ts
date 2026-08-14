@@ -9,9 +9,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import type { WorkflowDefinition, WorkflowResourceBinding } from '../memory/workflow-store.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-workflow-readiness-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -19,6 +20,7 @@ process.env.HOME = TMP_HOME;
 
 const {
   buildWorkflowReadinessInventory,
+  checkWorkflowRunReadiness,
   partitionWorkflowReadiness,
   renderWorkflowRunReadinessMessage,
   renderWorkflowVisualContract,
@@ -38,6 +40,43 @@ function item(partial: Partial<ReadinessItem> & { kind: ReadinessItem['kind']; n
     status: partial.status,
     sources: partial.sources,
     evidence: partial.evidence,
+  };
+}
+
+const FRIDAY_SHAPE_SLUG = 'daily-dashboard-refresh-shape';
+const fridayShapeScriptsDir = path.join(
+  TMP_HOME,
+  'vault',
+  '00-System',
+  'workflows',
+  FRIDAY_SHAPE_SLUG,
+  'scripts',
+);
+mkdirSync(fridayShapeScriptsDir, { recursive: true });
+writeFileSync(path.join(fridayShapeScriptsDir, 'refresh.mjs'), 'process.stdout.write("{}\\n");\n', 'utf8');
+
+function workflowWithResources(resources: Record<string, WorkflowResourceBinding>): WorkflowDefinition {
+  return {
+    name: FRIDAY_SHAPE_SLUG,
+    description: 'Refresh a dashboard from a required source account.',
+    enabled: true,
+    trigger: { type: 'schedule', schedule: '0 7 * * *' },
+    resources,
+    steps: [{
+      id: 'refresh',
+      prompt: 'Refresh the dashboard.',
+      deterministic: { runner: 'refresh.mjs' },
+    }],
+  };
+}
+
+function requiredSalesforceAccount(account = 'ops@example.test'): WorkflowResourceBinding {
+  return {
+    id: 'salesforce_org',
+    kind: 'account',
+    cli: 'sf',
+    account,
+    required: true,
   };
 }
 
@@ -185,4 +224,166 @@ test('renderWorkflowVisualContract summarizes blocking and warning checks for au
   assert.match(msg, /\[BLOCK\] Add workflow script render.py/);
   assert.match(msg, /\[WARN\] Remove exact model pins/);
   assert.doesNotMatch(msg, /\[PASS\] Graph structure/);
+});
+
+test('required Salesforce account blocks a Friday-shaped run when fresh org display proves auth is missing', () => {
+  const calls: Array<{ command: string; args: readonly string[]; timeoutMs: number }> = [];
+  const readiness = checkWorkflowRunReadiness(
+    workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
+    FRIDAY_SHAPE_SLUG,
+    {
+      resourceProbeRunner: (request) => {
+        calls.push(request);
+        return {
+          status: 1,
+          stdout: JSON.stringify({
+            status: 1,
+            name: 'NamedOrgNotFoundError',
+            message: 'No authorization information found for ops@example.test.',
+          }),
+          stderr: 'Warning: a CLI update is available.',
+        };
+      },
+    },
+  );
+
+  assert.equal(readiness.ok, false);
+  assert.equal(readiness.blockers.length, 1);
+  assert.equal(readiness.blockers[0]?.status, 'missing');
+  assert.match(readiness.blockers[0]?.reason ?? '', /signed out or missing/i);
+  assert.match(readiness.message, /was not queued/);
+  assert.deepEqual(calls, [{
+    command: 'sf',
+    args: ['org', 'display', '--target-org', 'ops@example.test', '--json'],
+    timeoutMs: 8_000,
+  }]);
+});
+
+test('fresh successful Salesforce org display lets the required account pass', () => {
+  const readiness = checkWorkflowRunReadiness(
+    workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
+    FRIDAY_SHAPE_SLUG,
+    {
+      resourceProbeRunner: () => ({
+        status: 0,
+        stdout: JSON.stringify({
+          status: 0,
+          result: { username: 'ops@example.test', connectedStatus: 'Connected' },
+        }),
+        stderr: '',
+      }),
+    },
+  );
+
+  assert.equal(readiness.ok, true);
+  assert.equal(readiness.blockers.length, 0);
+  assert.equal(readiness.warnings.length, 0);
+});
+
+test('unsupported required account CLI is an informative warning, not a blocker', () => {
+  let calls = 0;
+  const readiness = checkWorkflowRunReadiness(
+    workflowWithResources({
+      source_account: {
+        id: 'source_account',
+        kind: 'account',
+        cli: 'future-crm',
+        account: 'ops@example.test',
+        required: true,
+      },
+    }),
+    FRIDAY_SHAPE_SLUG,
+    { resourceProbeRunner: () => { calls += 1; throw new Error('must not run'); } },
+  );
+
+  assert.equal(readiness.ok, true);
+  assert.equal(readiness.blockers.length, 0);
+  assert.equal(readiness.warnings.length, 1);
+  assert.match(readiness.warnings[0]?.reason ?? '', /no authoritative read-only account probe/i);
+  assert.equal(calls, 0);
+});
+
+test('probe errors and unrecognized failures warn without refusing the run', () => {
+  const thrown = checkWorkflowRunReadiness(
+    workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
+    FRIDAY_SHAPE_SLUG,
+    { resourceProbeRunner: () => { throw new Error('spawn failed'); } },
+  );
+  const unrecognized = checkWorkflowRunReadiness(
+    workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
+    FRIDAY_SHAPE_SLUG,
+    {
+      resourceProbeRunner: () => ({
+        status: 1,
+        stdout: JSON.stringify({ status: 1, name: 'UnexpectedError', message: 'Service unavailable.' }),
+        stderr: '',
+      }),
+    },
+  );
+
+  for (const readiness of [thrown, unrecognized]) {
+    assert.equal(readiness.ok, true);
+    assert.equal(readiness.blockers.length, 0);
+    assert.equal(readiness.warnings.length, 1);
+    assert.equal(readiness.warnings[0]?.status, 'unknown');
+  }
+});
+
+test('non-required account resources are not probed and cannot block', () => {
+  let calls = 0;
+  const account = requiredSalesforceAccount();
+  account.required = false;
+  const readiness = checkWorkflowRunReadiness(
+    workflowWithResources({ salesforce_org: account }),
+    FRIDAY_SHAPE_SLUG,
+    { resourceProbeRunner: () => { calls += 1; throw new Error('must not run'); } },
+  );
+
+  assert.equal(readiness.ok, true);
+  assert.equal(readiness.blockers.length, 0);
+  assert.equal(readiness.warnings.length, 0);
+  assert.equal(calls, 0);
+});
+
+test('account selector validation prevents option or shell injection and degrades to a warning', () => {
+  let calls = 0;
+  const readiness = checkWorkflowRunReadiness(
+    workflowWithResources({
+      salesforce_org: requiredSalesforceAccount('--json; touch /tmp/not-allowed'),
+    }),
+    FRIDAY_SHAPE_SLUG,
+    { resourceProbeRunner: () => { calls += 1; throw new Error('must not run'); } },
+  );
+
+  assert.equal(readiness.ok, true);
+  assert.equal(readiness.blockers.length, 0);
+  assert.equal(readiness.warnings.length, 1);
+  assert.match(readiness.warnings[0]?.reason ?? '', /cannot be safely probed/i);
+  assert.equal(calls, 0);
+});
+
+test('Salesforce readiness probe is read-only by construction and does not mutate the binding', () => {
+  const resource = Object.freeze(requiredSalesforceAccount('alias-1'));
+  const before = JSON.stringify(resource);
+  let observed: { command: string; args: readonly string[]; timeoutMs: number } | undefined;
+  const readiness = checkWorkflowRunReadiness(
+    workflowWithResources({ salesforce_org: resource }),
+    FRIDAY_SHAPE_SLUG,
+    {
+      resourceProbeRunner: (request) => {
+        observed = request;
+        return {
+          status: 0,
+          stdout: JSON.stringify({ status: 0, result: { alias: 'alias-1' } }),
+          stderr: '',
+        };
+      },
+    },
+  );
+
+  assert.equal(readiness.ok, true);
+  assert.equal(observed?.command, 'sf');
+  assert.deepEqual(observed?.args, ['org', 'display', '--target-org', 'alias-1', '--json']);
+  assert.equal(observed?.args.includes('login'), false);
+  assert.equal(JSON.stringify(resource), before);
 });

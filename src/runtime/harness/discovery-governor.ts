@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { createHash } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
 
 /**
@@ -63,6 +64,12 @@ export interface DiscoveryTaskKey {
 
 export interface DiscoveryTaskPolicy extends DiscoveryTaskKey {
   knownCapability: boolean;
+  /** True only after the exact accepted request's requirement projection was
+   * durably registered. Legacy/workflow callers without that projection retain
+   * the task-wide compatibility budget. */
+  roleScoped: boolean;
+  roleCount: number;
+  unresolvedRoleCount: number;
   /** Evidence epoch this task is currently searching under. Starts at 0. */
   epoch: number;
   broadDiscoveryAllowance: 0 | 1;
@@ -75,11 +82,11 @@ export interface DiscoveryClaim extends DiscoveryTaskKey {
   category: DiscoveryCategory;
   epoch: number;
   /**
-   * What the claim was about. Empty for a broad search (there is only one
-   * "everything" per epoch). For an exact schema refresh this is the tool
-   * identity, so fetching the callable schema of a DIFFERENT authorized tool is
-   * never charged against the first one — repairing an invalid-argument call is
-   * the whole point of that category.
+   * What the claim was about. For a role-scoped broad search this is the exact
+   * unresolved requirement role; legacy tasks retain empty. For an exact schema
+   * refresh this is the tool identity, so fetching the callable schema of a
+   * DIFFERENT authorized tool is never charged against the first one — repairing
+   * an invalid-argument call is the whole point of that category.
    */
   subject: string;
   callId: string;
@@ -91,9 +98,9 @@ export interface DiscoveryClaim extends DiscoveryTaskKey {
 
 export interface DiscoveryTaskState {
   policy: DiscoveryTaskPolicy;
-  /** Claims in the task's CURRENT epoch, keyed by category for the common
-   *  subject-less case. Exact-schema claims for specific subjects are in
-   *  `epochClaims`. */
+  roles: DiscoveryRequirementRole[];
+  /** Compatibility category view for the task's CURRENT epoch. Per-role broad
+   * claims and per-tool exact-schema claims are all preserved in `epochClaims`. */
   claims: Partial<Record<DiscoveryCategory, DiscoveryClaim>>;
   /** Every claim in the current epoch, including per-subject schema refreshes. */
   epochClaims: DiscoveryClaim[];
@@ -116,7 +123,9 @@ export type DiscoveryAdmissionReason =
   /** A prior epoch was closed by new evidence; this epoch has its own budget. */
   | 'new_evidence_admitted'
   | 'task_not_initialized'
-  | 'known_capability'
+  | 'role_required'
+  | 'role_not_unresolved'
+  | 'role_resolved'
   | 'category_budget_exhausted';
 
 export interface DiscoveryGovernorMetric {
@@ -181,7 +190,9 @@ export interface DiscoveryDeniedDecision extends DiscoveryDecisionBase {
   admitted: false;
   reason:
     | 'task_not_initialized'
-    | 'known_capability'
+    | 'role_required'
+    | 'role_not_unresolved'
+    | 'role_resolved'
     | 'category_budget_exhausted';
 }
 
@@ -196,11 +207,51 @@ export interface InitializeDiscoveryTaskInput extends DiscoveryTaskKey {
   knownCapability: boolean;
 }
 
+export interface DiscoveryRequirementRoleInput {
+  /** Opaque runtime-owned requirement identity. Provider/query words are never
+   * accepted as substitutes: admission performs an exact membership lookup. */
+  roleKey: string;
+  /** Exact fields emitted by `TurnCapabilityCandidates.requirements`. */
+  clauseIndex: number;
+  text: string;
+  resolved: boolean;
+}
+
+/** The governor may suppress alternate broad doors only when the visible
+ * broker proves it can return exact authorized external candidates itself. */
+export type DiscoveryBrokerCoverage = 'builtins_only' | 'authorized_external_v1';
+
+export interface DiscoveryRequirementRole extends DiscoveryTaskKey {
+  roleKey: string;
+  requirementIndex: number;
+  requirementDigest: string;
+  resolved: boolean;
+  registeredAt: string;
+  resolvedAt: string | null;
+}
+
+export type DiscoveryRoleInitializationStatus = 'initialized' | 'existing' | 'tightened';
+
+export interface InitializeDiscoveryRolesInput extends DiscoveryTaskKey {
+  /** The complete source-ordered projection for this accepted request. */
+  requirements: readonly DiscoveryRequirementRoleInput[];
+  /** Host-issued capability fact. Absence and `builtins_only` both retain
+   * legacy task-wide discovery so unresolved external work stays reachable. */
+  brokerCoverage?: DiscoveryBrokerCoverage;
+}
+
+export interface DiscoveryRoleInitialization {
+  status: DiscoveryRoleInitializationStatus;
+  policy: DiscoveryTaskPolicy;
+  roles: DiscoveryRequirementRole[];
+}
+
 export interface AdmitDiscoveryInput extends DiscoveryTaskKey {
   category: DiscoveryCategory;
   /** Stable physical provider/tool invocation identity. */
   callId: string;
-  /** Exact tool identity for a schema refresh; omitted for a broad search. */
+  /** Exact tool identity for schema refresh, or frozen unresolved role for a
+   * broad search. Omitted only by legacy task-wide broad discovery. */
   subject?: string;
 }
 
@@ -311,6 +362,27 @@ interface RawTaskRow {
   current_epoch: number;
   initialized_at: string;
   updated_at: string;
+}
+
+interface RawRoleSetRow {
+  session_id: string;
+  source_user_seq: number;
+  projection_digest: string;
+  role_count: number;
+  unresolved_count: number;
+  initialized_at: string;
+  updated_at: string;
+}
+
+interface RawRoleRow {
+  session_id: string;
+  source_user_seq: number;
+  role_key: string;
+  requirement_index: number;
+  requirement_digest: string;
+  resolved: number;
+  registered_at: string;
+  resolved_at: string | null;
 }
 
 interface RawClaimRow {
@@ -452,19 +524,127 @@ function normalizedDetail(detail: string | undefined): string | null {
   return value ? value.slice(0, 256) : null;
 }
 
-function rowToPolicy(row: RawTaskRow): DiscoveryTaskPolicy {
+function digestText(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function normalizedRoleKey(value: string): string {
+  const roleKey = value.trim();
+  if (!roleKey) throw new Error('DiscoveryGovernor requires a non-empty requirement role key.');
+  if (roleKey.length > 128) throw new Error('DiscoveryGovernor requirement role key exceeds 128 characters.');
+  return roleKey;
+}
+
+interface NormalizedRequirementRole {
+  roleKey: string;
+  requirementIndex: number;
+  requirementDigest: string;
+  resolved: boolean;
+}
+
+function normalizedRequirementRoles(
+  requirements: readonly DiscoveryRequirementRoleInput[],
+): { roles: NormalizedRequirementRole[]; projectionDigest: string } {
+  const roles = requirements.map((requirement) => {
+    if (!Number.isSafeInteger(requirement.clauseIndex) || requirement.clauseIndex < 0) {
+      throw new Error('DiscoveryGovernor requires a non-negative requirement index.');
+    }
+    const requirementText = requirement.text.replace(/\s+/g, ' ').trim();
+    if (!requirementText) throw new Error('DiscoveryGovernor requires requirement text for role authority.');
+    return {
+      roleKey: normalizedRoleKey(requirement.roleKey),
+      requirementIndex: requirement.clauseIndex,
+      requirementDigest: digestText(requirementText),
+      resolved: requirement.resolved === true,
+    };
+  }).sort((a, b) => a.requirementIndex - b.requirementIndex || a.roleKey.localeCompare(b.roleKey));
+  if (new Set(roles.map((role) => role.roleKey)).size !== roles.length) {
+    throw new Error('DiscoveryGovernor requirement role keys must be unique within one accepted request.');
+  }
+  if (new Set(roles.map((role) => role.requirementIndex)).size !== roles.length) {
+    throw new Error('DiscoveryGovernor requirement indexes must be unique within one accepted request.');
+  }
+  // Resolution is deliberately excluded. A later brain may tighten one exact
+  // role from unresolved to resolved, but can never alter membership/identity.
+  const projectionDigest = digestText(JSON.stringify(roles.map((role) => ({
+    roleKey: role.roleKey,
+    requirementIndex: role.requirementIndex,
+    requirementDigest: role.requirementDigest,
+  }))));
+  return { roles, projectionDigest };
+}
+
+function rawRoleSet(
+  db: Database.Database,
+  key: DiscoveryTaskKey,
+): RawRoleSetRow | null {
+  try {
+    return (db.prepare(`
+      SELECT * FROM discovery_governor_role_sets
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(key.sessionId, key.sourceUserSeq) as RawRoleSetRow | undefined) ?? null;
+  } catch (error) {
+    // Sparse pre-migration rehearsal databases retain the legacy task-wide
+    // policy. Production openEventLog applies the numbered migration first.
+    if (error instanceof Error && /no such table:\s*discovery_governor_role_sets/i.test(error.message)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function rawRoles(
+  db: Database.Database,
+  key: DiscoveryTaskKey,
+): RawRoleRow[] {
+  try {
+    return db.prepare(`
+      SELECT * FROM discovery_governor_roles
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY requirement_index, role_key
+    `).all(key.sessionId, key.sourceUserSeq) as RawRoleRow[];
+  } catch (error) {
+    if (error instanceof Error && /no such table:\s*discovery_governor_roles/i.test(error.message)) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+function rowToRole(row: RawRoleRow): DiscoveryRequirementRole {
+  return {
+    sessionId: row.session_id,
+    sourceUserSeq: row.source_user_seq,
+    roleKey: row.role_key,
+    requirementIndex: row.requirement_index,
+    requirementDigest: row.requirement_digest,
+    resolved: row.resolved === 1,
+    registeredAt: row.registered_at,
+    resolvedAt: row.resolved_at,
+  };
+}
+
+function rowToPolicy(row: RawTaskRow, roleSet: RawRoleSetRow | null = null): DiscoveryTaskPolicy {
   const knownCapability = row.known_capability === 1;
   const epoch = row.current_epoch ?? 0;
+  const roleScoped = roleSet !== null;
+  const unresolvedRoleCount = roleSet?.unresolved_count ?? 0;
   return {
     sessionId: row.session_id,
     sourceUserSeq: row.source_user_seq,
     knownCapability,
+    roleScoped,
+    roleCount: roleSet?.role_count ?? 0,
+    unresolvedRoleCount,
     epoch,
-    // A remembered capability means "try this before searching", and it says so
-    // only for the epoch the memory was formed against. Once observed evidence
-    // opens a new epoch, a warm user searches on exactly the same terms as a
-    // cold one — a receipt orders candidates, it never withholds recovery.
-    broadDiscoveryAllowance: knownCapability && epoch === 0 ? 0 : 1,
+    // `knownCapability` is task-level and therefore cannot prove COMPLETE
+    // coverage of a multi-capability request. It ranks remembered candidates in
+    // the prompt, but it never removes the task's one bounded search slot. Live
+    // 2026-08-12: a proven Google Sheets path otherwise withheld the first
+    // Apify search needed by the same accepted task.
+    broadDiscoveryAllowance: roleScoped
+      ? (unresolvedRoleCount > 0 ? 1 : 0)
+      : 1,
     exactSchemaRefreshAllowance: 1,
     initializedAt: row.initialized_at,
     updatedAt: row.updated_at,
@@ -493,14 +673,17 @@ function rowToClaim(row: RawClaimRow): DiscoveryClaim {
  * of the second tool a task needs is never charged against the first — that
  * was the mechanism behind the invalid-argument guessing spiral.
  *
- * A broad search is deliberately NOT charged per phrase. Query text is a poor
- * identity: "outlook unread mail" and "gmail unread mail" are one requirement
- * being shopped across providers, and any wording-based key would sell a fresh
- * budget for a synonym. A task earns another search by making PROGRESS, not by
- * asking differently — see `capability_satisfied`.
+ * A broad search is charged per opaque REQUIREMENT ROLE when the accepted task
+ * registered a role projection. Query text is still never identity: synonymous
+ * queries and different providers for the same role carry one exact role key
+ * and therefore collide on one claim. Legacy callers without a registered role
+ * projection retain the empty task-wide subject.
  */
 function normalizedSubject(category: DiscoveryCategory, subject: string | undefined): string {
-  if (category === 'broad_discovery') return '';
+  if (category === 'broad_discovery') {
+    const value = (subject ?? '').trim();
+    return value ? value.slice(0, 128) : '';
+  }
   const value = (subject ?? '').trim().toLowerCase();
   return value ? value.slice(0, 256) : '';
 }
@@ -688,7 +871,7 @@ export function recordDiscoveryEvidenceInTransaction(
       outcome: 'task_not_initialized', previousEpoch: 0, epoch: 0,
     });
   }
-  const policy = rowToPolicy(rawPolicy);
+  const policy = rowToPolicy(rawPolicy, rawRoleSet(db, key));
   const previousEpoch = policy.epoch;
   const spent = db.prepare(`
     SELECT COUNT(*) AS count FROM discovery_governor_claims
@@ -777,7 +960,141 @@ export class DiscoveryGovernor {
           : input.knownCapability && prior.known_capability === 0
             ? 'tightened'
             : 'existing',
-        policy: rowToPolicy(row),
+        policy: rowToPolicy(row, rawRoleSet(db, key)),
+      };
+    });
+    return initialize.immediate();
+  }
+
+  /**
+   * Freeze the exact accepted request's requirement membership before model
+   * discovery. This API is invoked only from the runtime's resolver seam; tool
+   * inputs can reference a role but can never register one.
+   */
+  initializeRoles(input: InitializeDiscoveryRolesInput): DiscoveryRoleInitialization {
+    const key = taskKey(input);
+    // Absence is not an all-resolved projection. If candidate resolution was
+    // unavailable or a mixed-version caller omitted requirements, retain the
+    // legacy path instead of freezing an empty set that strands novel work.
+    if (input.brokerCoverage !== 'authorized_external_v1' || input.requirements.length === 0) {
+      const db = this.databaseProvider();
+      ensureSchema(db);
+      const task = db.prepare(`
+        SELECT * FROM discovery_governor_tasks
+         WHERE session_id = ? AND source_user_seq = ?
+      `).get(key.sessionId, key.sourceUserSeq) as RawTaskRow | undefined;
+      if (!task) {
+        throw new Error('DiscoveryGovernor must initialize the accepted task before its requirement roles.');
+      }
+      return {
+        status: 'existing',
+        policy: rowToPolicy(task, rawRoleSet(db, key)),
+        roles: rawRoles(db, key).map(rowToRole),
+      };
+    }
+    const projection = normalizedRequirementRoles(input.requirements);
+    const db = this.databaseProvider();
+    ensureSchema(db);
+    const initialize = db.transaction((): DiscoveryRoleInitialization => {
+      const task = db.prepare(`
+        SELECT * FROM discovery_governor_tasks
+         WHERE session_id = ? AND source_user_seq = ?
+      `).get(key.sessionId, key.sourceUserSeq) as RawTaskRow | undefined;
+      if (!task) {
+        throw new Error('DiscoveryGovernor must initialize the accepted task before its requirement roles.');
+      }
+      const prior = rawRoleSet(db, key);
+      const now = new Date().toISOString();
+      if (!prior) {
+        db.prepare(`
+          INSERT INTO discovery_governor_role_sets
+            (session_id, source_user_seq, projection_digest, role_count,
+             unresolved_count, initialized_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          key.sessionId,
+          key.sourceUserSeq,
+          projection.projectionDigest,
+          projection.roles.length,
+          projection.roles.filter((role) => !role.resolved).length,
+          now,
+          now,
+        );
+        const insert = db.prepare(`
+          INSERT INTO discovery_governor_roles
+            (session_id, source_user_seq, role_key, requirement_index,
+             requirement_digest, resolved, registered_at, resolved_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        for (const role of projection.roles) {
+          insert.run(
+            key.sessionId,
+            key.sourceUserSeq,
+            role.roleKey,
+            role.requirementIndex,
+            role.requirementDigest,
+            role.resolved ? 1 : 0,
+            now,
+            role.resolved ? now : null,
+          );
+        }
+      } else {
+        const membership = rawRoles(db, key);
+        if (prior.role_count !== projection.roles.length || membership.length !== projection.roles.length) {
+          throw new Error('DiscoveryGovernor requirement projection conflicts with the frozen accepted task.');
+        }
+        const storedByIndex = new Map(membership.map((role) => [role.requirement_index, role]));
+        for (const role of projection.roles) {
+          const stored = storedByIndex.get(role.requirementIndex);
+          if (
+            !stored
+            || stored.requirement_digest !== role.requirementDigest
+            // Receipt-backed effect refinement may change `clause-N:unknown`
+            // to `clause-N:read|write` only as it RESOLVES that clause. Keep
+            // the frozen key and close it; an unresolved rename is a conflict.
+            || (stored.role_key !== role.roleKey && !role.resolved)
+          ) {
+            throw new Error('DiscoveryGovernor requirement projection conflicts with the frozen accepted task.');
+          }
+        }
+        const update = db.prepare(`
+          UPDATE discovery_governor_roles
+             SET resolved = 1, resolved_at = COALESCE(resolved_at, ?)
+           WHERE session_id = ? AND source_user_seq = ?
+             AND role_key = ? AND requirement_index = ?
+             AND requirement_digest = ? AND resolved = 0
+        `);
+        for (const role of projection.roles) {
+          if (!role.resolved) continue;
+          const stored = storedByIndex.get(role.requirementIndex)!;
+          update.run(
+            now,
+            key.sessionId,
+            key.sourceUserSeq,
+            stored.role_key,
+            stored.requirement_index,
+            stored.requirement_digest,
+          );
+        }
+        const updatedMembership = rawRoles(db, key);
+        const unresolved = updatedMembership.filter((role) => role.resolved === 0).length;
+        db.prepare(`
+          UPDATE discovery_governor_role_sets
+             SET unresolved_count = ?, updated_at = ?
+           WHERE session_id = ? AND source_user_seq = ?
+        `).run(unresolved, now, key.sessionId, key.sourceUserSeq);
+      }
+
+      const roleSet = rawRoleSet(db, key);
+      if (!roleSet) throw new Error('DiscoveryGovernor failed to persist requirement role membership.');
+      const roles = rawRoles(db, key).map(rowToRole);
+      const tightened = Boolean(
+        prior && roleSet.unresolved_count < prior.unresolved_count,
+      );
+      return {
+        status: !prior ? 'initialized' : tightened ? 'tightened' : 'existing',
+        policy: rowToPolicy(task, roleSet),
+        roles,
       };
     });
     return initialize.immediate();
@@ -786,7 +1103,7 @@ export class DiscoveryGovernor {
   admit(input: AdmitDiscoveryInput): DiscoveryDecision {
     const key = taskKey(input);
     const callId = normalizedCallId(input.callId);
-    const subject = normalizedSubject(input.category, input.subject);
+    let subject = normalizedSubject(input.category, input.subject);
     const db = this.databaseProvider();
     ensureSchema(db);
     const decide = db.transaction((): DiscoveryDecision => {
@@ -794,7 +1111,7 @@ export class DiscoveryGovernor {
         SELECT * FROM discovery_governor_tasks
          WHERE session_id = ? AND source_user_seq = ?
       `).get(key.sessionId, key.sourceUserSeq) as RawTaskRow | undefined;
-      const policy = rawPolicy ? rowToPolicy(rawPolicy) : null;
+      const policy = rawPolicy ? rowToPolicy(rawPolicy, rawRoleSet(db, key)) : null;
       if (!policy) {
         return buildDecision({
           key,
@@ -808,6 +1125,35 @@ export class DiscoveryGovernor {
           policy: null,
           claim: null,
         });
+      }
+
+      // A role key is meaningful only inside the exact host-frozen membership.
+      // Legacy/builtins-only tasks keep their single task-wide broad claim even
+      // if a model supplies an arbitrary role-shaped string.
+      if (input.category === 'broad_discovery' && !policy.roleScoped) subject = '';
+
+      if (input.category === 'broad_discovery' && policy.roleScoped) {
+        const denyRole = (
+          reason: 'role_required' | 'role_not_unresolved' | 'role_resolved',
+        ): DiscoveryDecision => buildDecision({
+          key,
+          category: input.category,
+          subject,
+          callId,
+          admitted: false,
+          reason,
+          replay: false,
+          consumedBudget: false,
+          policy,
+          claim: null,
+        });
+        if (!subject) return denyRole('role_required');
+        const role = db.prepare(`
+          SELECT * FROM discovery_governor_roles
+           WHERE session_id = ? AND source_user_seq = ? AND role_key = ?
+        `).get(key.sessionId, key.sourceUserSeq, subject) as RawRoleRow | undefined;
+        if (!role) return denyRole('role_not_unresolved');
+        if (role.resolved === 1) return denyRole('role_resolved');
       }
 
       const rawExisting = db.prepare(`
@@ -831,25 +1177,6 @@ export class DiscoveryGovernor {
           consumedBudget: false,
           policy,
           claim: existing,
-        });
-      }
-
-      // A remembered candidate is a starting point, not a verdict. It suppresses
-      // the FIRST broad search only — the one that would run before the known
-      // path was even tried. Any epoch opened by observed evidence searches
-      // freely, so a stale receipt costs one attempt, never the task.
-      if (input.category === 'broad_discovery' && policy.broadDiscoveryAllowance === 0) {
-        return buildDecision({
-          key,
-          category: input.category,
-          subject,
-          callId,
-          admitted: false,
-          reason: 'known_capability',
-          replay: false,
-          consumedBudget: false,
-          policy,
-          claim: null,
         });
       }
 
@@ -925,10 +1252,11 @@ export class DiscoveryGovernor {
   settle(input: SettleDiscoveryInput): DiscoverySettlement {
     const key = taskKey(input);
     const callId = normalizedCallId(input.callId);
-    const subject = normalizedSubject(input.category, input.subject);
+    let subject = normalizedSubject(input.category, input.subject);
     const detail = normalizedDetail(input.detail);
     const db = this.databaseProvider();
     ensureSchema(db);
+    if (input.category === 'broad_discovery' && !rawRoleSet(db, key)) subject = '';
     const settle = db.transaction((): DiscoverySettlement => {
       // Settle the claim this callId actually holds, wherever it sits. An epoch
       // may have advanced between dispatch and return; the in-flight attempt
@@ -1040,7 +1368,7 @@ export class DiscoveryGovernor {
        WHERE session_id = ? AND source_user_seq = ?
     `).get(key.sessionId, key.sourceUserSeq) as RawTaskRow | undefined;
     if (!rawPolicy) return null;
-    const policy = rowToPolicy(rawPolicy);
+    const policy = rowToPolicy(rawPolicy, rawRoleSet(db, key));
     const allClaims = (db.prepare(`
       SELECT * FROM discovery_governor_claims
        WHERE session_id = ? AND source_user_seq = ?
@@ -1048,12 +1376,18 @@ export class DiscoveryGovernor {
     `).all(key.sessionId, key.sourceUserSeq) as RawClaimRow[]).map(rowToClaim);
     const epochClaims = allClaims.filter((claim) => claim.epoch === policy.epoch);
     const claims: Partial<Record<DiscoveryCategory, DiscoveryClaim>> = {};
-    // The category view keeps the subject-less claim — the one a caller asking
-    // "was a broad search already spent this epoch?" means.
+    // The category view remains a compatibility projection; epochClaims keeps
+    // every role-scoped broad claim and every per-tool exact refresh.
     for (const claim of epochClaims) {
       if (claim.subject === '' || !claims[claim.category]) claims[claim.category] = claim;
     }
-    return { policy, claims, epochClaims, allClaims };
+    return {
+      policy,
+      roles: rawRoles(db, key).map(rowToRole),
+      claims,
+      epochClaims,
+      allClaims,
+    };
   }
 }
 

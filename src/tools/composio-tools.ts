@@ -69,9 +69,11 @@ import {
 import {
   authorizeResolvedLogicalCallContract,
   currentLogicalCall,
+  PhysicalDispatchPreDispatchError,
   withLogicalToolCall,
   withPhysicalDispatch,
 } from '../runtime/harness/attempt-identity.js';
+import { trustedRuntimeEffectCarrier } from '../runtime/harness/tool-effect.js';
 import { toolOutputContextStorage } from '../runtime/harness/tool-output-context.js';
 import type { AttemptSignals } from '../runtime/harness/attempt-outcome.js';
 import { classifyDiscoveryCall } from '../runtime/harness/discovery-boundary.js';
@@ -98,7 +100,11 @@ import {
 import { saveToolContractExample } from './tool-contract-store.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
-import { composioSlugIsReadOnly } from '../integrations/composio/slug-effect.js';
+import {
+  classifyComposioActionConsequence,
+  classifyComposioSlugEffect,
+  composioSlugIsReadOnly,
+} from '../integrations/composio/slug-effect.js';
 import { suggestNextSteps, type FailureType as FallbackFailureType } from '../runtime/fallback-chain-store.js';
 import { getCapabilitiesForIntent } from '../runtime/capability-registry.js';
 import { recordExecution } from '../runtime/graceful-degradation-engine.js';
@@ -106,7 +112,6 @@ import {
   suppressConnectionAfterHardAuthFailure,
   type ComposioConnectionSuppressionState,
 } from '../agents/composio-connection-suppression.js';
-import { classifyComposioActionConsequence, classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 import { ExternalWritePreDispatchError, ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
 import { getComposioCliDefaultAccountAuthority } from '../integrations/composio/cli-default-account-authority.js';
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
@@ -114,6 +119,16 @@ import { formatComposioCliDefaultReadAccountRoute } from '../integrations/compos
 import { normalizeProcedureAccountIdentity } from '../runtime/read-path/procedure-scope.js';
 
 export { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
+
+function trustedComposioPhysicalEffectCarrier(
+  toolSlug: string,
+  args: Record<string, unknown>,
+) {
+  return trustedRuntimeEffectCarrier('composio_execute_tool', {
+    tool_slug: toolSlug,
+    arguments: args,
+  });
+}
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -191,6 +206,8 @@ export interface FormatComposioToolOutputOptions {
   /** The Composio action slug, when this output is a real tool execution.
    *  Used to make a failure corrective specific (`slug=…`). */
   toolSlug?: string;
+  /** Immutable provider args when effect semantics require more authority than
+   * the slug alone (kept out of user-facing formatting). */
 }
 
 /**
@@ -278,10 +295,12 @@ export function composioFailureProvesNoCommit(value: unknown): boolean {
   return false;
 }
 
-/** Narrow thrown-error proof delegated to the provider client. Everything not
+/** Narrow nominal thrown-error proof owned by trusted host/client code.
+ * Provider-returned prose/JSON cannot forge either class; everything not
  * recognized here crossed an uncertain boundary and must park as ambiguous. */
 export function composioDispatchErrorProvesNoCommit(error: unknown): boolean {
-  return composioCliErrorProvesNoDispatch(error);
+  return error instanceof ExternalWritePreDispatchError
+    || composioCliErrorProvesNoDispatch(error);
 }
 
 /**
@@ -461,6 +480,18 @@ function composioFailureCorrective(
       `An offset/page token must be the EXACT opaque value returned in a prior response's \`offset\` field — never a guessed one. Most likely your previous list call returned everything but its result was CLIPPED for size: the FULL payload is stored.`,
       `Do this: call \`recall_tool_result\` on your previous list call to get the COMPLETE set in one shot — do NOT pass a guessed offset. Only paginate if a prior response actually returned a verbatim \`offset\` token.`,
     ].join('\n');
+  }
+  // A HARNESS-AUTHORITY refusal is not a broken capability. The action is
+  // fine; this call lacked permission/binding, so "use a different action or
+  // tool" is exactly the wrong advice — following it sent a run hunting for
+  // another modality (a browser workaround for a question one API read
+  // answers) and then parking on the user (live 2026-08-12).
+  if (/work_binding_required|work_contract|expected[- ]work|not bound to the frozen contract/i.test(summary)) {
+    return [
+      `⚠️ ${label} was not dispatched${where}: ${summary}`,
+      'This is an AUTHORITY refusal, not a capability failure — the action itself is fine and switching tools will not help.',
+      'Do ONE of these: (1) if this call is part of the accepted work, propose it through `work_call` with the requirement it satisfies; (2) if it is an irreversible send, get the user\'s approval first; (3) if you cannot resolve it, STOP and tell the user the exact blocker. Do NOT go looking for a different tool to do the same thing.',
+    ].join('\n\n');
   }
   return [
     `⚠️ ${label} FAILED${where}: ${summary}`,
@@ -974,6 +1005,20 @@ function settleComposioReturned(
 ): void {
   const run = harnessRunContextStorage.getStore();
   const invocation = toolOutputContextStorage.getStore();
+  // Reaching this function IS the backend's success contract: errors and
+  // non-zero exits settle through settleComposioThrown, and refusals settle
+  // pre-dispatch. A provider action that echoes its resource (a bare record,
+  // an array page) carries no `successful` flag, and without this stamp it
+  // settled 'unknown' — the settlement audit then held a fully verified
+  // workflow run as unrecovered business failure (platform49 proof,
+  // 2026-08-12). A payload that DOES carry its own envelope keeps its own
+  // verdict, and the contradicted-envelope downgrade still runs either way.
+  const record = result && typeof result === 'object' && !Array.isArray(result)
+    ? result as Record<string, unknown>
+    : null;
+  const carriesOwnEnvelope = record !== null && (
+    'successful' in record || 'success' in record || 'error' in record || 'errors' in record
+  );
   try {
     settleToolAttempt({
       sessionId: run?.sessionId,
@@ -986,6 +1031,7 @@ function settleComposioReturned(
       mutating: classifyComposioSlugEffect(toolSlug) !== 'read',
       businessCall: classifyDiscoveryCall(toolSlug, args) === null,
       result,
+      ...(carriesOwnEnvelope ? {} : { signals: { envelopeSuccessful: true } }),
       ...(continuesRequirement ? { continuesRequirement: true } : {}),
     });
   } catch (error) {
@@ -2284,6 +2330,7 @@ export async function resolveComposioDispatch(
       toolSlug,
       owner,
       readComposioConnectionSuppressionState() as unknown as ComposioConnectionSuppressionState,
+      Date.now(),
     );
     if (route.block) {
       emitComposioGatewayBlock(sid, toolSlug, 'suppressed');
@@ -2531,6 +2578,7 @@ export async function dispatchComposioTool(
               turn: run.turn,
               tool: toolSlug,
               args: resolved.args,
+              trustedEffectCarrier: trustedComposioPhysicalEffectCarrier(toolSlug, resolved.args),
             },
             () => executeComposioTool(
               toolSlug,
@@ -2569,7 +2617,16 @@ export async function dispatchComposioTool(
       // A returned failure was already settled from its structured provider
       // envelope. The Error below is only this adapter's outward disposition,
       // not a second outcome for the same logical call.
-      if (!providerOutcomeSettled) settleComposioThrown(toolSlug, resolved.args, err);
+      if (!providerOutcomeSettled) {
+        settleComposioThrown(
+          toolSlug,
+          resolved.args,
+          err,
+          err instanceof ExternalWritePreDispatchError
+            ? { preDispatch: true, policyRefused: true }
+            : {},
+        );
+      }
       if (isComposioReconnectRequiredError(err)) recordReconnectBreaker(opts.sessionId, toolSlug);
       throw err;
     }
@@ -2582,6 +2639,7 @@ export async function dispatchComposioTool(
         sourceUserSeq: run.sourceUserSeq as number,
         tool: toolSlug,
         args,
+        trustedEffectCarrier: trustedComposioPhysicalEffectCarrier(toolSlug, args),
       },
       dispatchOnce,
     );
@@ -2657,7 +2715,10 @@ function dataQualityCheckpointEnabled(): boolean {
  * so autonomy is redirected, never dead-ended (guardrails inform, don't
  * override). Kill-switch CLEMMY_DATA_QUALITY_CHECKPOINT.
  */
-function dataQualityWriteCheckpoint(sessionId: string | undefined, toolSlug: string): string | null {
+function dataQualityWriteCheckpoint(
+  sessionId: string | undefined,
+  toolSlug: string,
+): string | null {
   if (!dataQualityCheckpointEnabled()) return null;
   if (!sessionId || !sessionId.startsWith('background:')) return null;
   if (composioSlugIsReadOnly(toolSlug)) return null;
@@ -2683,7 +2744,11 @@ export function resetDataQualityForTest(): void {
   emptyResultStreaks.clear();
 }
 
-function emptyStreakAdvisory(sessionId: string | undefined, toolSlug: string, result: unknown): string {
+function emptyStreakAdvisory(
+  sessionId: string | undefined,
+  toolSlug: string,
+  result: unknown,
+): string {
   const key = `${sessionId ?? 'nosession'}::${toolSlug}`;
   const empty = composioResultLooksEmpty(result);
   if (composioSlugIsReadOnly(toolSlug)) recordDataQualityRead(sessionId, toolSlug, empty);
@@ -2709,6 +2774,8 @@ async function runComposioExecute(
     /** Narrow test authority: simulate the stable identity already resolved by
      * the gateway while still exercising the real execute→settlement path. */
     resolvedIdentityForTest?: string;
+    /** Test-only seam immediately before the physical-dispatch authority gate. */
+    beforePhysicalDispatchForTest?: () => void;
   } = {},
 ): Promise<string> {
   const runSid = sessionIdFromRunContext(options.context);
@@ -2723,6 +2790,7 @@ async function runComposioExecute(
         sourceUserSeq: attemptCtx.sourceUserSeq,
         tool: toolSlug,
         args,
+        trustedEffectCarrier: trustedComposioPhysicalEffectCarrier(toolSlug, args),
       },
       () => runComposioExecuteInner(toolSlug, args, connectedAccountId, options, hooks),
     );
@@ -2740,6 +2808,7 @@ async function runComposioExecuteInner(
     delay?: (ms: number) => Promise<void>;
     skipGateway?: boolean;
     resolvedIdentityForTest?: string;
+    beforePhysicalDispatchForTest?: () => void;
   } = {},
 ): Promise<string> {
   const runSid = sessionIdFromRunContext(options.context);
@@ -2847,8 +2916,11 @@ async function runComposioExecuteInner(
 
   // Retry loop with exponential backoff for transient errors
   let priorDispatchId: string | undefined;
+  let attemptStartedAt = Date.now();
   for (let attempt = 1; attempt <= maxDispatchAttempts; attempt++) {
+    attemptStartedAt = Date.now();
     try {
+      hooks.beforePhysicalDispatchForTest?.();
       // Each pass through this loop is a PAID provider crossing. One identity
       // spanning the whole loop reported "one tool call" for up to three
       // charges, which is precisely the cost a release comparison must see.
@@ -2859,6 +2931,7 @@ async function runComposioExecuteInner(
           turn: harnessRunContextStorage.getStore()?.turn,
           tool: toolSlug,
           args,
+          trustedEffectCarrier: trustedComposioPhysicalEffectCarrier(toolSlug, args),
           ...(priorDispatchId ? { retryOf: priorDispatchId } : {}),
         },
         async (crossing) => {
@@ -3092,6 +3165,24 @@ async function runComposioExecuteInner(
       return output;
     } catch (err) {
       if (err instanceof ToolAttemptSettlementAuthorityError) throw err;
+
+      // beginPhysicalDispatch is an authority boundary. Its nominal refusal
+      // proves the provider callback was never entered, but this class used to
+      // fall through to generic corrective prose. Across work_call that prose
+      // looked like a successful host return and minted a false result handle.
+      if (err instanceof PhysicalDispatchPreDispatchError) {
+        const reason = err.reason.startsWith('work_binding_required')
+          ? 'work-binding'
+          : 'dispatch-authority';
+        settleComposioThrown(toolSlug, args, err, {
+          preDispatch: true,
+          policyRefused: true,
+        });
+        return new ExternalWritePreDispatchResult(
+          `[provider-dispatch:not-started:${reason}] ${err.message}`,
+          `provider-dispatch:not-started:${reason}`,
+        ) as unknown as string;
+      }
       lastError = err;
       const errorMsg = err instanceof Error ? err.message : String(err ?? '');
       recentErrors.push(errorMsg);
@@ -3126,11 +3217,22 @@ async function runComposioExecuteInner(
       }
 
       // Check if we should retry
-      const decision = shouldRetryToolCall(err, attempt, recentErrors);
+      const decision = shouldRetryToolCall(err, attempt, recentErrors, Date.now() - attemptStartedAt);
       if (!decision.shouldRetry) {
         // Terminal error or circuit-breaker triggered: return error immediately
-        settleComposioThrown(toolSlug, args, err);
+        settleComposioThrown(
+          toolSlug,
+          args,
+          err,
+          // A long timeout leaves the remote work UNRESOLVED, not failed: the
+          // job it started may still be running. Say so in the settlement so
+          // recovery never reads it as a proven miss.
+          decision.remoteMayStillBeRunning ? { acknowledged: false } : {},
+        );
         return composioThrownErrorOutput(err, { ...options, toolSlug })
+          // The refusal carries the fix: check what it started, or switch to
+          // an async start + poll — never repeat the identical wait.
+          + (decision.remoteMayStillBeRunning ? `\n\n[retry-policy] ${decision.reason}` : '')
           + suppressComposioConnectionAfterHardFailure(effectiveConnectionId, err);
       }
 
@@ -3169,13 +3271,20 @@ export function runComposioExecuteForTestInSession(
   execute: typeof executeComposioTool,
   sessionId: string,
   resolvedIdentityForTest?: string,
+  beforePhysicalDispatchForTest?: () => void,
 ): Promise<string> {
   return runComposioExecute(
     toolSlug,
     args,
     undefined,
     { toolName: 'composio_execute_tool', toolSlug, context: { context: { sessionId } } as never },
-    { execute, delay: async () => {}, skipGateway: true, resolvedIdentityForTest },
+    {
+      execute,
+      delay: async () => {},
+      skipGateway: true,
+      resolvedIdentityForTest,
+      beforePhysicalDispatchForTest,
+    },
   );
 }
 
@@ -3464,11 +3573,80 @@ function describeDynamicTool(toolkitSlug: string, toolSlug: string, description?
   const tag = `[${toolkitSlug}]`;
   const base = real
     ? `${tag} ${real} (Composio action: ${toolSlug})`
-    : `${tag} Composio action ${toolSlug}. Call this directly when the fields are clear; use composio_list_tools first if you need to inspect the schema.`;
+    : `${tag} Composio action ${toolSlug}. Call this directly when the fields are clear. If its exact schema is missing or validation rejects the call, inspect this exact action once and repair the arguments; do not run broad discovery.`;
   // Tool-bound standing rules live IN the tool description: the model cannot
   // form a call to this tool without the rule in view, every single turn.
   const banner = renderToolkitConstraintBanner(toolkitSlug);
   return banner ? `${base}\n${banner}` : base;
+}
+
+export interface ComposioBrokerCandidate {
+  toolkit: string;
+  slug: string;
+  name: string;
+  description?: string;
+  score: number;
+  inputParameters: unknown;
+}
+
+/** Read-only provider adapter for the federated tool_search broker. It returns
+ * only schema-backed actions from the user's live connected Composio catalog;
+ * the broker remains provider-neutral and execution still goes through the
+ * ordinary composio_execute_tool/work_call boundary. */
+export async function searchComposioBrokerCandidates(
+  query: string,
+  limit = DEFAULT_SEARCH_TOTAL_LIMIT,
+): Promise<ComposioBrokerCandidate[]> {
+  const maxResults = Math.max(1, Math.min(limit, 50));
+  const credentials = getComposioCredentialStatus();
+  if (composioExecutionUsesCliOnlyLane(credentials)) {
+    const runtime = await getComposioRuntimeStatus();
+    if (!runtime.cli.installed || !runtime.cli.authenticated) return [];
+    const raw = await searchComposioToolsViaCli(query, { limit: maxResults });
+    return hydrateComposioCliSearchSchemas(
+      raw,
+      normalizeComposioCliSearchMatches(raw, query, maxResults),
+    ).filter((candidate) => candidate.inputParameters !== undefined)
+      .map((candidate) => ({
+        toolkit: candidate.toolkit,
+        slug: candidate.slug,
+        name: candidate.name,
+        ...(candidate.description ? { description: candidate.description } : {}),
+        score: candidate.score,
+        inputParameters: candidate.inputParameters,
+      }));
+  }
+  if (!credentials.enabled) return [];
+
+  const connections = await listUsableConnectedToolkits();
+  const toolkits = [...new Set(connections.map((connection) => connection.slug).filter(Boolean))];
+  const queryTerms = tokenize(query);
+  const perToolkit = await Promise.all(toolkits.map(async (toolkit) => {
+    try {
+      return (await listComposioToolkitTools(toolkit, DEFAULT_SEARCH_TOOLKIT_LIMIT))
+        .map((candidate) => ({
+          toolkit,
+          slug: candidate.slug,
+          name: candidate.name,
+          ...(candidate.description ? { description: candidate.description } : {}),
+          score: scoreComposioTool(
+            toolkit,
+            candidate.slug,
+            candidate.name,
+            candidate.description,
+            queryTerms,
+          ),
+          inputParameters: candidate.inputParameters,
+        }))
+        .filter((candidate) => queryTerms.length === 0 || candidate.score > 0);
+    } catch {
+      return [];
+    }
+  }));
+  return perToolkit.flat()
+    .filter((candidate) => candidate.slug && candidate.inputParameters !== undefined)
+    .sort((left, right) => right.score - left.score || left.slug.localeCompare(right.slug))
+    .slice(0, maxResults);
 }
 
 export async function getDynamicComposioRuntimeTools(options: {
@@ -3934,7 +4112,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
 
   const composio_execute_tool = tool({
     name: 'composio_execute_tool',
-    description: 'Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search, Salesforce query, etc.). Never invent slugs — always call `composio_search_tools` first with a plain-English query, then pass the returned slug here. Arguments must be a JSON object string. Uses the connected OAuth account and approval policy. FILES: actions that return files (attachment/export downloads) save them locally and include the local `filePath` in the result — pass that exact path onward; file-input params (uploads, attachments) accept a local file path string, so download→upload flows (e.g. Outlook attachment → Drive) chain the returned filePath directly.',
+    description: 'Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search, Salesforce query, etc.). Use an exact slug already supplied by the runtime or a proven capability directly. Never invent a slug: when this requirement is unresolved, use the single discovery broker once, then pass its exact result here. If the slug is known but its arguments fail validation, inspect that exact action once and repair the call instead of broad-searching again. Arguments must be a JSON object string. Uses the connected OAuth account and approval policy. FILES: actions that return files (attachment/export downloads) save them locally and include the local `filePath` in the result — pass that exact path onward; file-input params (uploads, attachments) accept a local file path string, so download→upload flows (e.g. Outlook attachment → Drive) chain the returned filePath directly.',
     parameters: z.object(COMPOSIO_EXECUTE_TOOL_PARAMS),
     // Taxonomy reads `tool_slug` from args to decide read-vs-send, so
     // GOOGLESHEETS_BATCH_GET autos through while GMAIL_SEND_EMAIL pauses

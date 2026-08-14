@@ -668,6 +668,36 @@ test('Google Sheets create extracts its root id and an exact range read verifies
   assert.deepEqual(ledger.listUnverifiedRunArtifacts(sid, runScope), []);
 });
 
+test('Google Sheets create never binds an ambient account id ahead of the spreadsheet id', () => {
+  const intent = ledger.artifactIntentForTool('composio_execute_tool', {
+    tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',
+    arguments: JSON.stringify({
+      title: 'Top 5 Ventura Restaurants',
+      sheet_name: 'Restaurants',
+      sheet_json: [{ name: 'Lure Fish House', rating: 4.6, address: 'Ventura, CA' }],
+    }),
+  });
+  assert.ok(intent);
+
+  const spreadsheetId = 'ventura_sheet_exact_123456789';
+  const resource = ledger.extractArtifactResource(intent!, {
+    successful: true,
+    data: {
+      account: { id: 'ambient_google_account_987654321' },
+      spreadsheet: {
+        spreadsheetId,
+        spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+      },
+    },
+  });
+
+  assert.deepEqual(resource, {
+    resourceId: spreadsheetId,
+    uri: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+    title: 'Top 5 Ventura Restaurants',
+  });
+});
+
 test('Google Sheets SHEET_FROM_JSON is a root create even without CREATE in the slug', () => {
   const intent = ledger.artifactIntentForTool('composio_execute_tool', {
     tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',

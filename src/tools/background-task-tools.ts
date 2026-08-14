@@ -25,6 +25,7 @@ import {
   windowAuthorityFor,
 } from '../execution/durable-fanout.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { publicConversationPreambleData } from '../runtime/harness/public-presentation.js';
 import { textResult } from './shared.js';
 
 /** Split an agreed plan (markdown bullets / numbered lines) into discrete next
@@ -210,21 +211,58 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       }
       void handoff_note; // consumed by the terminal reply renderer via output marker below
 
-      // STRUCTURAL alignment beat. Preflight classifies each accepted source;
-      // when the FIRST decision for this exact source said phase=align and
-      // consequential, the user has not yet seen or confirmed the plan — the
-      // tool description's CONVERSE FIRST was prompt-level and got ignored
-      // (live 2026-08-11: a consequential ask preflighted align and the model
-      // dispatched in the same turn; the user never saw the pinned goal).
-      // Their confirmation arrives as the NEXT accepted source, which
-      // preflights on its own merits.
+      // STRUCTURAL opening floor. A bare consequential ALIGN row is not enough
+      // to dispatch: older runtimes could enter the tool-capable model before
+      // any conversational opening was actually shown. The current protocol
+      // resolves openness first. OPEN owns an exact needs-input terminal;
+      // SETTLED publishes one exact-source preamble and continues in this SAME
+      // turn. That durable preamble proves the opening was paid — requiring a
+      // second go-ahead here would recreate the blanket confirmation stop this
+      // protocol removed.
       const beatSourceSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
       if (typeof beatSourceSeq === 'number' && beatSourceSeq > 0) {
         try {
-          const firstDecision = listHarnessEvents(sessionId, { types: ['turn_preflight_decision'] })
-            .find((event) => (event.data as { sourceUserSeq?: unknown })?.sourceUserSeq === beatSourceSeq);
-          const data = firstDecision?.data as { phase?: unknown; consequential?: unknown } | undefined;
-          if (data?.phase === 'align' && data?.consequential === true) {
+          const structuralRows = listHarnessEvents(sessionId, {
+            types: [
+              'user_input_received',
+              'turn_preflight_decision',
+              'conversation_preamble',
+              'awaiting_user_input',
+            ],
+          });
+          const firstDecision = structuralRows
+            .find((event) => event.type === 'turn_preflight_decision'
+              && (event.data as { sourceUserSeq?: unknown })?.sourceUserSeq === beatSourceSeq);
+          const data = firstDecision?.data as {
+            phase?: unknown;
+            consequential?: unknown;
+            intentKey?: unknown;
+          } | undefined;
+          const source = structuralRows.find((event) => event.type === 'user_input_received'
+            && event.seq === beatSourceSeq
+            && event.role === 'user'
+            && event.data.synthetic !== true);
+          const unresolvedOpenQuestion = structuralRows.some((event) => event.type === 'awaiting_user_input'
+            && event.data.sourceUserSeq === beatSourceSeq
+            && event.data.source === 'preflight_openness');
+          const settledOpening = source
+            ? structuralRows.find((event) => {
+                if (
+                  event.type !== 'conversation_preamble'
+                  || event.role !== 'Clem'
+                  || event.turn !== source.turn
+                  || event.parentEventId !== source.id
+                ) return false;
+                const preamble = publicConversationPreambleData(event.data);
+                return preamble?.sourceUserSeq === beatSourceSeq
+                  && (typeof data?.intentKey !== 'string' || preamble.intentKey === data.intentKey);
+              })
+            : undefined;
+          if (
+            data?.phase === 'align'
+            && data?.consequential === true
+            && (unresolvedOpenQuestion || !settledOpening)
+          ) {
             // The typed refusal prefix keeps this NON-HALTING at the
             // control-receipt fast path (an unmarked refusal was treated as a
             // successful receipt, the renderer fabricated a "Started …" line,
@@ -297,10 +335,17 @@ export function registerBackgroundTaskTools(server: McpServer): void {
           kind: 'background',
           ref: admitted.plan.planId,
         });
+        // The steering half of this result is FOR THE MODEL. Kept behind the
+        // harness-directive marker so it can never be echoed to the user as
+        // the reply — the model copied this text verbatim into Discord,
+        // instructions and plan id included (live 2026-08-12). Facts first,
+        // directive marked and last; publication refuses the marker.
         return textResult(
           `Admitted durable fan-out plan ${admitted.plan.planId}: ${manifest.items.length} items × ${phases.length} phase(s) `
           + `across ${windows} worker window(s) on the background runner. Every item settles exactly once (a restart resumes rather than redoes), `
-          + `and the combined result reports back HERE automatically after the last item. Tell the user it's running; do NOT process items yourself this turn.`,
+          + `and the combined result reports back HERE automatically after the last item.\n`
+          + `[harness-directive] Tell the user in your own words that it is running and what it will do; `
+          + `do NOT process items yourself this turn, and do NOT repeat this message or the plan id verbatim.`,
         );
       }
       const composedPrompt = [

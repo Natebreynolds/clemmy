@@ -28,12 +28,15 @@ const acceptedAuthority = await import('./accepted-task-authority.js');
 const expectedWork = await import('./expected-work-contract.js');
 const actionBoundary = await import('./action-expected-work-boundary.js');
 const actionAdmission = await import('./expected-work-admission.js');
+const discovery = await import('./discovery-governor.js');
 const mcpConfig = await import('../mcp-config.js');
 const mcpServers = await import('../mcp-servers.js');
 const localMcpServer = await import('../../tools/mcp-server.js');
 const sdk = await import('./claude-agent-sdk.js');
+const claudeLocalCorrelation = await import('./claude-local-tool-correlation.js');
 const brain = await import('./claude-agent-brain.js');
 const terminalRepair = await import('./terminal-presentation-repair.js');
+const codeMode = await import('../../tools/code-mode-tool.js');
 
 function writeClaudeToken(): void {
   writeFileSync(path.join(TMP_HOME, 'state', 'claude-auth.json'), JSON.stringify({
@@ -147,6 +150,7 @@ beforeEach(() => {
   brain.setClaudeAgentSdkBrainPostTurnHooksForTest(null);
   brain.setClaudeAgentSdkBrainJudgeForTest(null);
   brain.setClaudeAgentSdkBrainTerminalPresentationRepairPortForTest(null);
+  codeMode._setCodeModeToolsForTests(null);
   brain.setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => ({
     objective: query,
     hits: [],
@@ -163,6 +167,7 @@ after(() => {
   brain.setClaudeAgentSdkBrainJudgeForTest(null);
   brain.setClaudeAgentSdkBrainTerminalPresentationRepairPortForTest(null);
   brain.setClaudeAgentSdkBrainUnifiedPrimerForTest(null);
+  codeMode._setCodeModeToolsForTests(null);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -190,6 +195,65 @@ test('Claude brain activates the exact act source before entering model construc
     /intentional-stop-after-model-construction/,
   );
   assert.equal(modelEntries, 1);
+});
+
+test('connected Claude brain accepts the work_call action surface without requiring call_tool', async () => {
+  const sessionId = 'claude-action-work-call-sentinel';
+  let queries = 0;
+  let brokerCoverage = '';
+  sdk.setClaudeAgentSdkQueryForTest(((params: any) => {
+    queries += 1;
+    const registered = params.options.mcpServers['clementine-local']
+      .instance._registeredTools as Record<string, unknown>;
+    assert.ok(registered.memory_recall_all);
+    assert.ok(registered.tool_search);
+    assert.ok(registered.work_call);
+    assert.equal(registered.call_tool, undefined,
+      'the accepted action keeps work_call as its sole generic business carrier');
+    const messages = successMessages([
+      'mcp__clementine-local__memory_recall_all',
+      'mcp__clementine-local__tool_search',
+      'mcp__clementine-local__work_call',
+    ]);
+    const stream = (async function* () {
+      yield messages[0]!;
+      const searched = await (registered.tool_search as any).handler({
+        query: 'memory_recall',
+        limit: 1,
+      });
+      brokerCoverage = JSON.parse(searched.content[0].text).brokerCoverage;
+      yield messages[1]!;
+    })();
+    return Object.assign(stream, {
+      close() {},
+      interrupt: async () => {},
+      setPermissionMode: async () => {},
+      setModel: async () => {},
+      setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
+      streamInput: async () => {},
+      stopTask: async () => false,
+      backgroundTasks: async () => false,
+    }) as Query;
+  }) as never);
+
+  const response = await brain.respondViaClaudeAgentSdkBrain('home', {
+    message: 'Read the alpha source, then write every record into a new report.',
+    sessionId,
+    channel: 'desktop',
+  });
+
+  assert.equal(queries, 1, 'the connected brain reached the SDK query');
+  assert.equal(response.sessionId, sessionId);
+  assert.equal(brokerCoverage, 'authorized_external_v1');
+  const source = eventlog.listEvents(sessionId, { types: ['user_input_received'] }).at(-1);
+  assert.ok(source);
+  const state = discovery.discoveryGovernor.getTaskState({
+    sessionId,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(state?.policy.roleScoped, true, 'the connected Claude action freezes discovery roles');
+  assert.equal(state?.roles.length, 2, 'the compound request retains one role per semantic clause');
+  assert.ok(state?.roles.every((role) => !role.resolved));
 });
 
 test('an action carrier registration failure aborts the MCP surface instead of exposing call_tool', () => {
@@ -241,6 +305,12 @@ test('exact Claude act surface exposes work_call as its sole generic business ca
   assert.deepEqual(Object.keys(servers), ['clementine-local'], 'act does not expose a second native business surface');
   const registered = servers['clementine-local'].instance._registeredTools as Record<string, any>;
   assert.ok(registered.work_call);
+  assert.ok(registered.run_tool_program, 'Claude action lane retains the shared code-mode control carrier');
+  assert.match(
+    String(registered.run_tool_program.description ?? ''),
+    /clem\.work/,
+    'Claude action code mode receives the same explicit semantic carrier contract',
+  );
   assert.ok(registered.tool_search);
   assert.ok(registered.mcp_list_tools, 'control/discovery remains first-class');
   assert.equal(registered.call_tool, undefined, 'generic call_tool cannot compete with the bound carrier');
@@ -252,8 +322,13 @@ test('exact Claude act surface exposes work_call as its sole generic business ca
   assert.equal(registered.run_shell_command, undefined, 'business compute/writes are inner calls, not an unbound bypass');
 
   const searched = await registered.tool_search.handler({ query: 'run_shell_command', limit: 1 });
-  const searchBody = JSON.parse(searched.content[0].text) as { hint: string };
+  const searchBody = JSON.parse(searched.content[0].text) as {
+    hint: string;
+    brokerCoverage: string;
+  };
   assert.match(searchBody.hint, /inner name\/args_json of work_call/);
+  assert.equal(searchBody.brokerCoverage, 'builtins_only',
+    'an explicitly denied external scope cannot arm provider-backed role discovery');
 
   const workInput = {
     proposal: null,
@@ -261,7 +336,7 @@ test('exact Claude act surface exposes work_call as its sole generic business ca
     universe_item_id: null,
     universe_selector: null,
     name: 'run_shell_command',
-    args_json: JSON.stringify({ command: 'echo never-dispatched' }),
+    args_json: JSON.stringify({ command: 'echo gentle-work-needs-no-plan' }),
   };
   const uncorrelated = await registered.work_call.handler(workInput);
   assert.equal(uncorrelated.isError, true, 'handler entry without exact SDK admission fails closed');
@@ -275,22 +350,177 @@ test('exact Claude act surface exposes work_call as its sole generic business ca
     { signal: new AbortController().signal, toolUseID: 'toolu-semantic-work-refusal' },
   );
   assert.equal(permission.behavior, 'allow');
-  const refusal = await registered.work_call.handler(workInput);
-  assert.equal(refusal.isError, true, 'semantic pre-dispatch refusal stays failed on the MCP wire');
-  const refusalBody = JSON.parse(refusal.content[0].text) as { error: string; dispatch_state: string };
-  assert.equal(refusalBody.error, 'work_contract_required');
-  assert.equal(refusalBody.dispatch_state, 'not_started');
+  // A MISSING PLAN NO LONGER BLOCKS GENTLE WORK. The frozen contract is
+  // required where once-ness cannot be corrected — an irreversible effect —
+  // and a reversible shell read is not that (the wall's remaining jurisdiction
+  // is pinned in approved-mandate-admission.test.ts). Three live fan-out
+  // workers spent whole budgets being refused for contract grammar and made
+  // zero business calls before this boundary moved (2026-08-12).
+  const admitted = await registered.work_call.handler(workInput);
+  const admittedText = String(admitted.content[0].text ?? '');
+  assert.doesNotMatch(admittedText, /work_contract_required/,
+    'a gentle inner call is not refused for lacking a plan');
   const db = eventlog.openEventLog();
-  assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?`)
-    .get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 0);
   const settlements = db.prepare(`
     SELECT outcome_kind, execution_kind FROM logical_call_settlements
      WHERE session_id = ? AND source_user_seq = ?
   `).all(task.sessionId, task.sourceUserSeq) as Array<{ outcome_kind: string; execution_kind: string }>;
-  assert.deepEqual(settlements, [{ outcome_kind: 'invalid_arguments', execution_kind: 'refused_pre_dispatch' }]);
+  assert.equal(
+    settlements.some((row) => row.execution_kind === 'refused_pre_dispatch'
+      && row.outcome_kind === 'invalid_arguments'),
+    false,
+    'the contract grammar no longer produces a pre-dispatch refusal for gentle work',
+  );
 });
 
-test('Claude work_call resolves an exact authorized external MCP schema beyond advertisement', async () => {
+test('Claude accepted action reconciles background status and continues to work_call', async () => {
+  const task = prepareExactTask(
+    'Pull the top 5 Ventura restaurants, create a new Google Sheet, and email me the link.',
+  );
+  assert.equal(task.route, 'act');
+  let interrupts = 0;
+  sdk.setClaudeAgentSdkQueryForTest((() => {
+    const messages: SDKMessage[] = [
+      {
+        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6',
+        session_id: 'sdk-action-status', uuid: 'sdk-action-status-init', apiKeySource: 'none',
+        claude_code_version: '2.1.181', cwd: process.cwd(),
+        tools: [
+          'mcp__clementine-local__background_task_status',
+          'mcp__clementine-local__work_call',
+        ],
+        mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+        permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+      } as SDKMessage,
+      {
+        type: 'assistant', session_id: 'sdk-action-status', uuid: 'sdk-action-status-assistant-1',
+        parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_use', id: 'toolu-stale-status',
+          name: 'mcp__clementine-local__background_task_status',
+          input: { id: 'bg-stale' },
+        }] },
+      } as SDKMessage,
+      {
+        type: 'user', session_id: 'sdk-action-status', uuid: 'sdk-action-status-result-1',
+        parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_result', tool_use_id: 'toolu-stale-status',
+          content: '{"ok":true,"taskId":"bg-stale","status":"awaiting_input"}',
+        }] },
+      } as SDKMessage,
+      {
+        type: 'assistant', session_id: 'sdk-action-status', uuid: 'sdk-action-status-assistant-2',
+        parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_use', id: 'toolu-action-work',
+          name: 'mcp__clementine-local__work_call',
+          input: {
+            proposal: null, requirement_id: 'source-restaurants', universe_item_id: null,
+            universe_selector: null, name: 'APIFY_GET_DATASET_ITEMS', args_json: '{}',
+          },
+        }] },
+      } as SDKMessage,
+      {
+        type: 'user', session_id: 'sdk-action-status', uuid: 'sdk-action-status-result-2',
+        parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_result', tool_use_id: 'toolu-action-work',
+          content: '{"successful":true,"data":{"items":[{"name":"Restaurant A"}]}}',
+        }] },
+      } as SDKMessage,
+      {
+        type: 'result', subtype: 'success', session_id: 'sdk-action-status',
+        uuid: 'sdk-action-status-done', result: 'Continued the accepted action after reconciliation.',
+        duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 2,
+        stop_reason: 'end_turn', total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+      } as SDKMessage,
+    ];
+    const query = queryFromMessages(messages);
+    return Object.assign(query, { interrupt: async () => { interrupts += 1; } });
+  }) as never);
+
+  const result = await sdk.runClaudeAgentSdk({
+    prompt: 'Pull the top 5 Ventura restaurants, create a new Google Sheet, and email me the link.',
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    trackerScopeId: `${task.sessionId}::claude-status-reconcile`,
+    modelId: 'claude-sonnet-4-6',
+    agentic: true,
+    directOrchestrator: true,
+    allowedLocalMcpTools: ['background_task_status', 'work_call'],
+    mcpToolAllowlist: ['background_task_status', 'work_call'],
+    localMcpToolUniverse: ['background_task_status', 'work_call'],
+    nativeMcpToolScope: {
+      authority: 'none', reason: 'test', allowedServerSlugs: [], maxTools: 0,
+    },
+  });
+
+  assert.equal(interrupts, 0, 'status reconciliation cannot interrupt an accepted action');
+  assert.deepEqual(result.toolUses, [
+    'mcp__clementine-local__background_task_status',
+    'mcp__clementine-local__work_call',
+  ]);
+  assert.equal(result.text, 'Continued the accepted action after reconciliation.');
+});
+
+test('Claude local MCP run_tool_program carries scoped work_call through the real sandbox', async () => {
+  const task = prepareExactTask('Read the alpha source and write it into a new local report.');
+  assert.equal(task.route, 'act');
+  let innerExecutions = 0;
+  codeMode._setCodeModeToolsForTests(new Map([['user_profile_read', {
+    name: 'user_profile_read',
+    invoke: async () => {
+      innerExecutions += 1;
+      return { successful: true, data: { name: 'Clem' } };
+    },
+  }]]));
+  const server = localMcpServer.createClementineMcpServer({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    runScopeId: `${task.sessionId}::claude-code-work`,
+    directOrchestrator: true,
+    actionExpectedWork: true,
+    allowedTools: ['run_tool_program', 'work_call', 'tool_search'],
+    deferredTools: ['user_profile_read', 'write_file'],
+    mcpToolScope: null,
+  });
+  const registered = (server as any)._registeredTools as Record<string, any>;
+  const firstWork = {
+    proposal: {
+      version: 1,
+      operations: [
+        { id: 'read-source', effect: 'read', coverage: 'single', dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } },
+        { id: 'write-report', effect: 'local_write', coverage: null, dependsOn: ['read-source'], dataFrom: ['read-source'], cardinality: { kind: 'once' } },
+      ],
+      universes: [],
+    },
+    requirement_id: 'read-source',
+    universe_item_id: null,
+    universe_selector: null,
+    name: 'user_profile_read',
+    args_json: '{}',
+  };
+  const response = await registered.run_tool_program.handler({
+    program: `return await clem.work(${JSON.stringify(firstWork)});`,
+  });
+  assert.notEqual(response.isError, true);
+  assert.match(response.content[0].text, /successful/);
+  assert.equal(innerExecutions, 1);
+  const db = eventlog.openEventLog();
+  const binding = db.prepare(`
+    SELECT requirement_id, tool_name FROM expected_work_call_bindings
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(task.sessionId, task.sourceUserSeq) as { requirement_id: string; tool_name: string } | undefined;
+  assert.deepEqual(binding, { requirement_id: 'read-source', tool_name: 'user_profile_read' });
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS n FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND state = 'OPEN'
+  `).get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 0);
+});
+
+test('Claude work_call resolves an exact authorized external MCP schema and lets the host read outrank binding-plan ambiguity', async () => {
   const mcpDir = path.join(TMP_HOME, 'mcp');
   const mcpFile = path.join(mcpDir, 'servers.json');
   mkdirSync(mcpDir, { recursive: true });
@@ -398,17 +628,17 @@ test('Claude work_call resolves an exact authorized external MCP schema beyond a
       { signal: new AbortController().signal, toolUseID: 'toolu-exact-external-schema' },
     );
     assert.equal(permission.behavior, 'allow');
-    const refusal = await registered.work_call.handler(input);
-    assert.equal(refusal.isError, true);
-    const body = JSON.parse(refusal.content[0].text) as { error: string; detail: string; dispatch_state: string };
-    assert.equal(body.error, 'work_cardinality_mismatch');
-    assert.match(body.detail, /finite_selector_is_ambiguous/,
-      'the exact uncapped external schema, including both array fields, reached evidence refinement');
-    assert.equal(body.dispatch_state, 'not_started');
-    assert.equal(providerCrossings, 0);
+    const result = await registered.work_call.handler(input);
+    const body = String(result.content[0].text ?? '');
+    assert.match(body, /never.*reached/,
+      'the exact uncapped external schema resolved and the host-classified read reached its provider');
+    assert.doesNotMatch(body, /work_cardinality_mismatch|finite_selector_is_ambiguous/,
+      'binding-plan ambiguity cannot veto an objectively non-mutating host call');
+    assert.equal(providerCrossings, 1);
     const db = eventlog.openEventLog();
-    assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?`)
-      .get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 0);
+    assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM expected_work_call_bindings WHERE session_id = ? AND source_user_seq = ?`)
+      .get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 0,
+    'the read dispatched without fabricating a binding from the ambiguous plan');
     assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ?`)
       .get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 1);
   } finally {
@@ -476,16 +706,18 @@ test('malformed Claude work_call is denied once, settled once, and never dispatc
   }]);
 });
 
-test('Claude action work_call cannot pass permission without an exact durable admission', async () => {
+test('Claude action worker admits and claims one exact work_call without direct-orchestrator authority', async () => {
   const task = prepareExactTask('Read the alpha source and write every record into a new report.');
   let permission: any;
+  let admitted: any;
+  let replay: any;
   const input = {
     proposal: null,
     requirement_id: 'read-source',
     universe_item_id: null,
     universe_selector: null,
     name: 'run_shell_command',
-    args_json: JSON.stringify({ command: 'echo never-dispatched' }),
+    args_json: JSON.stringify({ command: 'echo worker-correlation-admitted' }),
   };
   sdk.setClaudeAgentSdkQueryForTest(((params: any) => {
     const generator = (async function* () {
@@ -493,8 +725,28 @@ test('Claude action work_call cannot pass permission without an exact durable ad
       permission = await params.options.canUseTool(
         'mcp__clementine-local__work_call',
         input,
-        { signal: new AbortController().signal, toolUseID: 'toolu-no-action-correlation' },
+        { signal: new AbortController().signal, toolUseID: 'toolu-worker-action-correlation' },
       );
+      const registered = params.options.mcpServers['clementine-local']
+        .instance._registeredTools as Record<string, any>;
+      admitted = await registered.work_call.handler(input);
+      yield {
+        type: 'assistant', session_id: 'sdk-worker-action-correlation',
+        uuid: 'sdk-worker-action-correlation-use', parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_use', id: 'toolu-worker-action-correlation',
+          name: 'mcp__clementine-local__work_call', input,
+        }] },
+      } as SDKMessage;
+      yield {
+        type: 'user', session_id: 'sdk-worker-action-correlation',
+        uuid: 'sdk-worker-action-correlation-result', parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_result', tool_use_id: 'toolu-worker-action-correlation',
+          content: String(admitted?.content?.[0]?.text ?? ''),
+        }] },
+      } as SDKMessage;
+      replay = await registered.work_call.handler(input);
       yield successMessages(['mcp__clementine-local__work_call'])[1]!;
     })();
     return Object.assign(generator, {
@@ -504,14 +756,15 @@ test('Claude action work_call cannot pass permission without an exact durable ad
     }) as Query;
   }) as never);
 
-  await sdk.runClaudeAgentSdk({
+  const result = await sdk.runClaudeAgentSdk({
     prompt: 'Read the alpha source and write every record into a new report.',
     sessionId: task.sessionId,
     sourceUserSeq: task.sourceUserSeq,
     trackerScopeId: `${task.sessionId}::missing-correlation`,
     agentic: true,
-    // Action work_call is direct-orchestrator authority. Deliberately omit it
-    // here to prove an adapter cannot fall back to a synthetic MCP call id.
+    workerScope: true,
+    // A worker is not the conversational orchestrator. Its work_call authority
+    // comes from the exact persisted action source, not from this lane label.
     directOrchestrator: false,
     allowedLocalMcpTools: ['mcp_list_tools', 'run_shell_command'],
     localMcpToolUniverse: ['mcp_list_tools', 'run_shell_command'],
@@ -520,16 +773,63 @@ test('Claude action work_call cannot pass permission without an exact durable ad
     },
   });
 
-  assert.equal(permission.behavior, 'deny');
-  const corrective = JSON.parse(permission.message) as Record<string, unknown>;
-  assert.equal(corrective.isError, true);
-  assert.equal(corrective.error, 'work_authority_unavailable');
-  assert.equal(corrective.dispatch_state, 'not_started');
+  assert.equal(permission.behavior, 'allow');
+  assert.notEqual(admitted?.isError, true, 'the exact admitted worker call reaches its inner read/compute once');
+  assert.match(String(admitted?.content?.[0]?.text ?? ''), /worker-correlation-admitted/);
+  assert.equal(replay?.isError, true, 'one permission marker cannot authorize a second handler entry');
+  const replayBody = JSON.parse(String(replay.content[0].text)) as Record<string, unknown>;
+  assert.equal(replayBody.error, 'work_authority_unavailable');
+  assert.equal(replayBody.dispatch_state, 'not_started');
   const db = eventlog.openEventLog();
-  assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?`)
-    .get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 0);
-  assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ?`)
-    .get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 1);
+  const admissions = eventlog.listEvents(task.sessionId, { types: ['claude_local_permission_admitted'] });
+  assert.equal(admissions.length, 1);
+  assert.equal(admissions[0]?.data.actionExpectedWork, true);
+  assert.equal(admissions[0]?.data.directOrchestrator, false);
+  assert.deepEqual(result.toolUses, ['mcp__clementine-local__work_call']);
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['tool_called'] }).filter((event) =>
+    event.data.accounting === 'top_level'
+    && event.data.callId === 'toolu-worker-action-correlation').length, 1,
+  'the later SDK frame reuses the handler-authored canonical occurrence');
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS n FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, 'toolu-worker-action-correlation') as { n: number }).n, 1);
+
+  assert.equal(claudeLocalCorrelation.recordClaudeLocalPermissionAdmission({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    runScopeId: `${task.sessionId}::worker:legacy-composio`,
+    providerCallId: 'toolu-worker-legacy-composio',
+    sdkToolName: 'mcp__clementine-local__composio_execute_tool',
+    input: { tool_slug: 'APIFY_ACTOR_RUNS_GET', arguments: '{}' },
+    directOrchestrator: false,
+    actionExpectedWork: true,
+  }), null, 'action authority must not widen the legacy direct-orchestrator-only Composio bridge');
+});
+
+test('Claude worker cannot register work_call without persisted action authority', async () => {
+  const task = prepareExactTask('Read the alpha source and write every record into a new report.', false);
+  assert.equal(task.route, 'act');
+  assert.notEqual(actionAdmission.actionExpectedWorkState(task).status, 'required');
+  await assert.rejects(
+    sdk.runClaudeAgentSdk({
+      prompt: 'Read the alpha source and write every record into a new report.',
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      trackerScopeId: `${task.sessionId}::worker:no-action-authority`,
+      agentic: true,
+      workerScope: true,
+      directOrchestrator: false,
+      allowedLocalMcpTools: ['mcp_list_tools', 'run_shell_command'],
+      localMcpToolUniverse: ['mcp_list_tools', 'run_shell_command'],
+      nativeMcpToolScope: {
+        authority: 'none', reason: 'test', allowedServerSlugs: [], maxTools: 0,
+      },
+    }),
+    /action expected-work activation conflict/,
+    'an act-classified source cannot construct any worker business surface before durable activation',
+  );
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['claude_local_permission_admitted'] }).length, 0);
 });
 
 test('Claude action terminal uses one sealed repair and publishes blocked when exact work remains unverified', async () => {

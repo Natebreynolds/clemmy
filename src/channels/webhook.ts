@@ -2670,6 +2670,11 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   app.post('/api/approvals/:id/approve', requireAuth, async (req, res) => {
     try {
       const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      const row = approvalRegistry.get(id);
+      if (row && !approvalRegistry.isFormalApprovalSurface(row)) {
+        res.status(409).json({ error: 'This send can only be answered in its exact original conversation.' });
+        return;
+      }
       const result = await resolveApprovalOrQueueBackgroundContinuation(assistant, id, true);
       res.json(result);
     } catch (err) {
@@ -2681,6 +2686,11 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   app.post('/api/approvals/:id/reject', requireAuth, async (req, res) => {
     try {
       const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      const row = approvalRegistry.get(id);
+      if (row && !approvalRegistry.isFormalApprovalSurface(row)) {
+        res.status(409).json({ error: 'This send can only be answered in its exact original conversation.' });
+        return;
+      }
       const result = await resolveApprovalOrQueueBackgroundContinuation(assistant, id, false);
       res.json(result);
     } catch (err) {
@@ -2692,7 +2702,8 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   app.get('/api/approvals', requireAuth, (_req, res) => {
     res.json({
       approvals: assistant.getRuntime().listPendingApprovals(),
-      harnessApprovals: approvalRegistry.listPending({ status: 'pending' }),
+      harnessApprovals: approvalRegistry.listPending({ status: 'pending' })
+        .filter(approvalRegistry.isFormalApprovalSurface),
     });
   });
 

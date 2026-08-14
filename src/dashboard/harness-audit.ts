@@ -191,7 +191,8 @@ function buildApprovalChecks(): HarnessAuditCheck[] {
   let pending = 0;
   let stalePending = 0;
   try {
-    const rows = approvalRegistry.listPending({ status: 'pending' });
+    const rows = approvalRegistry.listPending({ status: 'pending' })
+      .filter(approvalRegistry.isFormalApprovalSurface);
     pending = rows.length;
     const staleCutoff = Date.now() - 60 * 60_000;
     stalePending = rows.filter((row) => Date.parse(row.requestedAt) < staleCutoff).length;

@@ -30,7 +30,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { openEventLog } from './eventlog.js';
+import { listEvents, openEventLog } from './eventlog.js';
 import { markNotificationsReadByApprovalId } from '../notifications.js';
 import { updateToolChoiceOutcomeForIdentifier } from '../../memory/tool-choice-store.js';
 import {
@@ -51,6 +51,7 @@ import {
   resolveToolInvocation,
   toolActionSegment,
 } from '../../agents/tool-invocation.js';
+import type { ExactOriginDeliveryTarget } from '../exact-origin-delivery.js';
 
 /**
  * The tool-choice identifier an approval maps to (Thread 2 — outcome loop).
@@ -86,7 +87,45 @@ export interface PendingApprovalRow {
   resumeKey: string | null;
   /** Set atomically when an approved parked payload is reused. */
   consumedAt: string | null;
+  /** Durable user-surface contract. Null means a normal formal approval card. */
+  presentation: ConversationalApprovalPresentation | null;
 }
+
+export interface ConversationalApprovalPresentation {
+  version: 1;
+  kind: 'autonomous_send_consent';
+  question: string;
+  actionLabel: 'email' | 'message' | 'post' | 'send';
+  target: string;
+  subject: string | null;
+  bodyPreview: string | null;
+  resultUrl: string | null;
+  sourceUserSeq: number;
+  originReplyTarget: ExactOriginDeliveryTarget;
+  originReplyTargetDigest: string;
+  /** Provider conversation that displayed the question. This intentionally
+   * stays distinct from originReplyTarget: Slack DM terminal delivery strips
+   * threadTs, while a consent reply must remain in the pane/thread that asked. */
+  conversationKey: string;
+  audienceUserId: string;
+  promptEventId: string | null;
+  promptEventSeq: number | null;
+  presentedAt: string | null;
+  responseSourceUserSeq: number | null;
+  responseUserId: string | null;
+  /** Existing provider message selected before the live final edit. A crash
+   * after binding can edit this exact message on boot instead of posting a
+   * second question. Null means boot must use provider idempotency metadata. */
+  transportTarget:
+    | { provider: 'discord'; channelId: string; messageId: string }
+    | { provider: 'slack'; channelId: string; messageTs: string; threadTs?: string }
+    | null;
+}
+
+export type NewConversationalApprovalPresentation = Omit<
+  ConversationalApprovalPresentation,
+  'promptEventId' | 'promptEventSeq' | 'presentedAt' | 'responseSourceUserSeq' | 'responseUserId' | 'transportTarget'
+>;
 
 export const DEFAULT_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -151,6 +190,10 @@ export interface RegisterApprovalInput {
   ttlMs?: number;
   /** Opaque exact-payload key used only by durable workflow SDK parking. */
   resumeKey?: string | null;
+  /** Preferred ordinary-question surface. Registration keeps it only when
+   * this is the sole pending decision for the session; siblings atomically
+   * demote every row to formal cards. */
+  presentation?: NewConversationalApprovalPresentation | null;
 }
 
 interface ApprovalSqlRow {
@@ -170,6 +213,49 @@ interface ApprovalSqlRow {
   resume_key: string | null;
   consumed_at: string | null;
   resend_consumed_at: string | null;
+  presentation_json: string | null;
+}
+
+function parseConversationalPresentation(json: string | null): ConversationalApprovalPresentation | null {
+  if (!json) return null;
+  try {
+    const value = JSON.parse(json) as Partial<ConversationalApprovalPresentation>;
+    if (
+      value.version !== 1
+      || value.kind !== 'autonomous_send_consent'
+      || typeof value.question !== 'string'
+      || !['email', 'message', 'post', 'send'].includes(String(value.actionLabel))
+      || typeof value.target !== 'string'
+      || !(value.subject === null || typeof value.subject === 'string')
+      || !(value.bodyPreview === null || typeof value.bodyPreview === 'string')
+      || !(value.resultUrl === null || typeof value.resultUrl === 'string')
+      || !Number.isSafeInteger(value.sourceUserSeq)
+      || Number(value.sourceUserSeq) <= 0
+      || !value.originReplyTarget
+      || typeof value.originReplyTarget !== 'object'
+      || typeof value.originReplyTargetDigest !== 'string'
+      || typeof value.conversationKey !== 'string'
+      || !value.conversationKey.trim()
+      || typeof value.audienceUserId !== 'string'
+      || !(value.promptEventId === null || typeof value.promptEventId === 'string')
+      || !(value.promptEventSeq === null || Number.isSafeInteger(value.promptEventSeq))
+      || !(value.presentedAt === null || typeof value.presentedAt === 'string')
+      || !(value.responseSourceUserSeq === null || Number.isSafeInteger(value.responseSourceUserSeq))
+      || !(value.responseUserId === null || typeof value.responseUserId === 'string')
+    ) return null;
+    const target = value.transportTarget;
+    const transportTarget = target && typeof target === 'object'
+      && (
+        (target.provider === 'discord' && typeof target.channelId === 'string' && typeof target.messageId === 'string')
+        || (target.provider === 'slack' && typeof target.channelId === 'string' && typeof target.messageTs === 'string'
+          && (target.threadTs === undefined || typeof target.threadTs === 'string'))
+      )
+      ? target as ConversationalApprovalPresentation['transportTarget']
+      : null;
+    return { ...value, transportTarget } as ConversationalApprovalPresentation;
+  } catch {
+    return null;
+  }
 }
 
 function rowToPublic(row: ApprovalSqlRow): PendingApprovalRow {
@@ -189,6 +275,7 @@ function rowToPublic(row: ApprovalSqlRow): PendingApprovalRow {
     resolvedAt: row.resolved_at,
     resumeKey: row.resume_key,
     consumedAt: row.consumed_at,
+    presentation: parseConversationalPresentation(row.presentation_json),
   };
 }
 
@@ -393,6 +480,17 @@ function ensurePendingActionApprovalLinked(row: PendingApprovalRow): PendingAppr
   return row;
 }
 
+/** Boot/retry repair for the safe registration order: SQLite identity commits
+ * first, then the frozen file record links. No question may be projected until
+ * this returns a byte-matching link. */
+export function reconcileLinkedPendingActionRegistration(row: PendingApprovalRow): PendingApprovalRow | null {
+  try {
+    return ensurePendingActionApprovalLinked(row);
+  } catch {
+    return null;
+  }
+}
+
 function ensureResumableRowMatchesInput(
   row: PendingApprovalRow,
   input: RegisterApprovalInput & { resumeKey: string },
@@ -445,45 +543,85 @@ export function register(input: RegisterApprovalInput): PendingApprovalRow {
   const ttl = input.ttlMs ?? DEFAULT_APPROVAL_TTL_MS;
   const expiresAt = new Date(now.getTime() + ttl);
 
-  // Retry on collision (extremely unlikely but the PK enforces it).
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const approvalId = newApprovalId();
-    try {
-      db.prepare(`
-        INSERT INTO pending_approvals
-          (approval_id, session_id, channel, channel_id, requested_at,
-           expires_at, subject, tool, args_json, status, resume_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-      `).run(
-        approvalId,
-        input.sessionId,
-        input.channel ?? null,
-        input.channelId ?? null,
-        now.toISOString(),
-        expiresAt.toISOString(),
-        input.subject,
-        input.tool ?? null,
-        input.args ? JSON.stringify(input.args) : null,
-        input.resumeKey ?? null,
-      );
-      const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?').get(approvalId) as ApprovalSqlRow;
-      const publicRow = rowToPublic(row);
-      try {
-        return ensurePendingActionApprovalLinked(publicRow);
-      } catch (error) {
-        // The row has not been surfaced yet. Compensate so a later retry can
-        // mint/link one usable card instead of inheriting a split-brain row.
-        db.prepare(
-          "DELETE FROM pending_approvals WHERE approval_id = ? AND status = 'pending'",
-        ).run(approvalId);
-        throw error;
-      }
-    } catch (err) {
-      if ((err as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY') continue;
-      throw err;
+  const insert = db.transaction((): PendingApprovalRow => {
+    // A second independent decision means neither question can safely own a
+    // bare conversational reply. Demote all existing rows before inserting the
+    // sibling, and never mark the new row conversational in that state.
+    const conversationKey = input.presentation?.conversationKey ?? null;
+    const siblingRows = db.prepare(`
+      SELECT approval_id
+        FROM pending_approvals
+       WHERE status = 'pending'
+         AND (
+           session_id = ?
+           OR (? IS NOT NULL AND json_extract(presentation_json, '$.conversationKey') = ?)
+           OR (? IS NOT NULL AND ? IS NOT NULL AND channel = ? AND channel_id = ?)
+         )
+    `).all(
+      input.sessionId,
+      conversationKey,
+      conversationKey,
+      input.channel ?? null,
+      input.channelId ?? null,
+      input.channel ?? null,
+      input.channelId ?? null,
+    ) as Array<{ approval_id: string }>;
+    const sibling = siblingRows.length > 0;
+    if (sibling) {
+      const placeholders = siblingRows.map(() => '?').join(',');
+      db.prepare(
+        `UPDATE pending_approvals SET presentation_json = NULL WHERE approval_id IN (${placeholders})`,
+      ).run(...siblingRows.map((row) => row.approval_id));
     }
-  }
-  throw new Error('approval-registry: failed to generate a unique approval ID after 4 attempts');
+    const presentation = !sibling && input.presentation
+      ? JSON.stringify({
+          ...input.presentation,
+          promptEventId: null,
+          promptEventSeq: null,
+          presentedAt: null,
+          responseSourceUserSeq: null,
+          responseUserId: null,
+          transportTarget: null,
+        } satisfies ConversationalApprovalPresentation)
+      : null;
+
+    // Retry on collision (extremely unlikely but the PK enforces it).
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const approvalId = newApprovalId();
+      try {
+        db.prepare(`
+          INSERT INTO pending_approvals
+            (approval_id, session_id, channel, channel_id, requested_at,
+             expires_at, subject, tool, args_json, status, resume_key, presentation_json)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        `).run(
+          approvalId,
+          input.sessionId,
+          input.channel ?? null,
+          input.channelId ?? null,
+          now.toISOString(),
+          expiresAt.toISOString(),
+          input.subject,
+          input.tool ?? null,
+          input.args ? JSON.stringify(input.args) : null,
+          input.resumeKey ?? null,
+          presentation,
+        );
+        const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?').get(approvalId) as ApprovalSqlRow;
+        return rowToPublic(row);
+      } catch (err) {
+        if ((err as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY') continue;
+        throw err;
+      }
+    }
+    throw new Error('approval-registry: failed to generate a unique approval ID after 4 attempts');
+  });
+  // Commit the SQLite identity before touching the file-backed PendingAction.
+  // A hard death can now leave only a DB row plus the exact frozen PA, which a
+  // retry/reconciler can deterministically link. The old order wrote a PA link
+  // inside an uncommitted SQLite transaction and could leave a dangling id to
+  // a rolled-back row. Callers receive (and may surface) only a verified link.
+  return ensurePendingActionApprovalLinked(insert.immediate());
 }
 
 /**
@@ -531,7 +669,28 @@ export function registerResumable(
 
 export type ResumableApprovalClaim =
   | { state: 'none' }
-  | { state: 'pending' | 'approved' | 'rejected' | 'expired' | 'cancelled' | 'consumed'; row: PendingApprovalRow };
+  | { state: 'pending' | 'approved' | 'rejected' | 'expired' | 'cancelled' | 'consumed' | 'pending_action_owned'; row: PendingApprovalRow };
+
+/** Read-only state inspection for host-owned PendingActions. A native SDK
+ * retry must be able to observe the conversational row without spending its
+ * one-shot grant; only the PendingAction execution claim owns dispatch. */
+export function inspectResumableApproval(resumeKey: string): ResumableApprovalClaim {
+  const row = openEventLog().prepare(`
+    SELECT * FROM pending_approvals
+     WHERE resume_key = ?
+     ORDER BY requested_at DESC, rowid DESC
+     LIMIT 1
+  `).get(resumeKey) as ApprovalSqlRow | undefined;
+  if (!row) return { state: 'none' };
+  const current = rowToPublic(row);
+  if (current.status === 'pending' && isExpired(current)) return { state: 'expired', row: current };
+  if (current.status === 'pending') return { state: 'pending', row: current };
+  if (current.resolution === 'rejected') return { state: 'rejected', row: current };
+  if (current.resolution === 'expired' || current.status === 'expired') return { state: 'expired', row: current };
+  if (current.resolution === 'cancelled_by_user' || current.status === 'cancelled') return { state: 'cancelled', row: current };
+  if (current.resolution !== 'approved') return { state: 'expired', row: current };
+  return { state: current.consumedAt ? 'consumed' : 'approved', row: current };
+}
 
 /**
  * Inspect and, for an approved row, atomically consume the exact-payload grant.
@@ -565,6 +724,11 @@ export function claimResumableApproval(
     if (!row) return { state: 'none' };
 
     const current = rowToPublic(row);
+    // A conversational decision belongs to its immutable PendingAction. This
+    // registry API historically minted authority for replaying the original
+    // raw tool call; returning a distinct inert state closes that duplicate
+    // dispatch door centrally for every present and future caller.
+    if (current.presentation) return { state: 'pending_action_owned', row: current };
     if (current.status === 'pending' && isExpired(current)) {
       const expired = resolve(current.approvalId, 'expired', 'approval-resume');
       return { state: 'expired', row: expired.row ?? current };
@@ -793,6 +957,409 @@ export function listPending(filter: ListFilter = {}): PendingApprovalRow[] {
   return rows.map(rowToPublic);
 }
 
+/** True when a row belongs on formal approval-card surfaces. A conversational
+ * send still pauses execution in this registry, but presenting it as a card or
+ * accepting a dashboard/mobile approval would bypass the exact reply source. */
+export function isFormalApprovalSurface(row: PendingApprovalRow): boolean {
+  return row.presentation?.kind !== 'autonomous_send_consent';
+}
+
+/** The only public dependency a pending approval may expose. Conversational
+ * consent keeps its approval id private and projects the frozen exact-action
+ * question; every other row retains the formal approval-card contract. */
+export type PendingApprovalUserDependency =
+  | { kind: 'approval'; approvalId: string }
+  | { kind: 'input'; question: string };
+
+export function projectPendingApprovalUserDependency(
+  row: PendingApprovalRow,
+): PendingApprovalUserDependency {
+  return isFormalApprovalSurface(row)
+    ? { kind: 'approval', approvalId: row.approvalId }
+    : { kind: 'input', question: row.presentation!.question };
+}
+
+/** Stable provider idempotency identity shared by the first live question and
+ * every restart redelivery. It is derived from the durable approval identity,
+ * never from a replaceable prompt event id. */
+export function conversationalApprovalDeliveryKey(approvalId: string): string {
+  return `send-consent:${approvalId}`;
+}
+
+export function bindConversationalApprovalTransportTarget(input: {
+  approvalId: string;
+  target: NonNullable<ConversationalApprovalPresentation['transportTarget']>;
+}): PendingApprovalRow | null {
+  const db = openEventLog();
+  const tx = db.transaction((): PendingApprovalRow | null => {
+    const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(input.approvalId) as ApprovalSqlRow | undefined;
+    if (!row || row.status !== 'pending') return row ? rowToPublic(row) : null;
+    const presentation = parseConversationalPresentation(row.presentation_json);
+    if (!presentation) return rowToPublic(row);
+    if (presentation.transportTarget && JSON.stringify(presentation.transportTarget) !== JSON.stringify(input.target)) {
+      throw new Error('conversational approval transport target conflicts with its durable message');
+    }
+    db.prepare('UPDATE pending_approvals SET presentation_json = ? WHERE approval_id = ? AND status = \'pending\'')
+      .run(JSON.stringify({ ...presentation, transportTarget: input.target }), input.approvalId);
+    return rowToPublic(db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(input.approvalId) as ApprovalSqlRow);
+  });
+  return tx.immediate();
+}
+
+/** Bind the durable ordinary question to its exact public event and record
+ * successful transport delivery. Until this succeeds, bare replies cannot
+ * select the row; a restart can safely re-present it. */
+export function markConversationalApprovalPresented(input: {
+  approvalId: string;
+  promptEventId: string;
+  promptEventSeq: number;
+  presentedAt?: string;
+}): PendingApprovalRow | null {
+  const db = openEventLog();
+  const presentedAt = input.presentedAt ?? new Date().toISOString();
+  const tx = db.transaction((): PendingApprovalRow | null => {
+    const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(input.approvalId) as ApprovalSqlRow | undefined;
+    if (!row || row.status !== 'pending') return row ? rowToPublic(row) : null;
+    const presentation = parseConversationalPresentation(row.presentation_json);
+    if (!presentation) return rowToPublic(row);
+    if (
+      presentation.promptEventId !== null
+      && (
+        presentation.promptEventId !== input.promptEventId
+        || presentation.promptEventSeq !== input.promptEventSeq
+      )
+    ) throw new Error('conversational approval presentation conflicts with its durable prompt');
+    db.prepare(`
+      UPDATE pending_approvals
+         SET presentation_json = ?
+       WHERE approval_id = ? AND status = 'pending'
+    `).run(JSON.stringify({
+      ...presentation,
+      promptEventId: input.promptEventId,
+      promptEventSeq: input.promptEventSeq,
+      presentedAt: presentation.presentedAt ?? presentedAt,
+    } satisfies ConversationalApprovalPresentation), input.approvalId);
+    const updated = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(input.approvalId) as ApprovalSqlRow;
+    return rowToPublic(updated);
+  });
+  return tx.immediate();
+}
+
+/** SQLite CAS guarding the one public prompt-event append for a conversational
+ * row. `promptEventId === ''` is an internal in-progress sentinel and is never
+ * reply-eligible; bind replaces it with the exact persisted event. A daemon
+ * crash leaves the sentinel safely reprojectable on boot. */
+export function claimConversationalApprovalPromptSurface(approvalId: string): boolean {
+  const db = openEventLog();
+  const tx = db.transaction((): boolean => {
+    const raw = db.prepare('SELECT presentation_json FROM pending_approvals WHERE approval_id = ? AND status = \'pending\'')
+      .get(approvalId) as { presentation_json: string | null } | undefined;
+    const presentation = parseConversationalPresentation(raw?.presentation_json ?? null);
+    if (!presentation || presentation.promptEventId !== null) return false;
+    const changed = db.prepare(`
+      UPDATE pending_approvals SET presentation_json = ?
+       WHERE approval_id = ? AND status = 'pending' AND presentation_json = ?
+    `).run(JSON.stringify({ ...presentation, promptEventId: '' }), approvalId, raw!.presentation_json).changes;
+    return changed === 1;
+  });
+  return tx.immediate();
+}
+
+/** Bind the immutable question event before transport I/O. Delivery success is
+ * recorded separately, so a crash before the first edit remains re-presentable
+ * and cannot accept a reply. */
+export function bindConversationalApprovalPrompt(input: {
+  approvalId: string;
+  promptEventId: string;
+  promptEventSeq: number;
+}): PendingApprovalRow | null {
+  const db = openEventLog();
+  const tx = db.transaction((): PendingApprovalRow | null => {
+    const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(input.approvalId) as ApprovalSqlRow | undefined;
+    if (!row || row.status !== 'pending') return row ? rowToPublic(row) : null;
+    const presentation = parseConversationalPresentation(row.presentation_json);
+    if (!presentation) return rowToPublic(row);
+    if (
+      presentation.promptEventId !== null
+      && presentation.promptEventId !== ''
+      && presentation.presentedAt !== null
+      && (
+        presentation.promptEventId !== input.promptEventId
+        || presentation.promptEventSeq !== input.promptEventSeq
+      )
+    ) throw new Error('conversational approval prompt conflicts with its durable event');
+    const prompt = db.prepare('SELECT session_id, type, data_json FROM events WHERE id = ?')
+      .get(input.promptEventId) as { session_id: string; type: string; data_json: string } | undefined;
+    const promptData = prompt ? safeParse(prompt.data_json) : null;
+    if (
+      !prompt
+      || prompt.session_id !== row.session_id
+      || prompt.type !== 'approval_requested'
+      || promptData?.approvalId !== input.approvalId
+      || promptData?.approvalPresentation !== 'conversation'
+    ) throw new Error('conversational approval prompt event is not exact');
+    db.prepare('UPDATE pending_approvals SET presentation_json = ? WHERE approval_id = ? AND status = \'pending\'')
+      .run(JSON.stringify({
+        ...presentation,
+        promptEventId: input.promptEventId,
+        promptEventSeq: input.promptEventSeq,
+      } satisfies ConversationalApprovalPresentation), input.approvalId);
+    return rowToPublic(db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(input.approvalId) as ApprovalSqlRow);
+  });
+  return tx.immediate();
+}
+
+/** Atomic reply claim. This is selection authority, not execution authority:
+ * registry.resolve still owns the approved/rejected transition afterward. */
+export function claimConversationalApprovalReply(input: {
+  approvalId: string;
+  sourceUserSeq: number;
+  userId: string;
+  conversationKey: string;
+  decision: 'approve' | 'reject';
+}): PendingApprovalRow | null {
+  const db = openEventLog();
+  const tx = db.transaction((): PendingApprovalRow | null => {
+    const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(input.approvalId) as ApprovalSqlRow | undefined;
+    if (!row || row.status !== 'pending') return null;
+    const presentation = parseConversationalPresentation(row.presentation_json);
+    if (
+      !presentation
+      || !presentation.presentedAt
+      || !presentation.promptEventId
+      || !presentation.promptEventSeq
+      || presentation.responseSourceUserSeq !== null
+      || presentation.responseUserId !== null
+      || presentation.audienceUserId !== input.userId
+      || presentation.conversationKey !== input.conversationKey
+      || input.sourceUserSeq <= presentation.promptEventSeq
+    ) return null;
+    const prompt = db.prepare(
+      `SELECT id, seq, session_id, type, data_json FROM events WHERE id = ?`,
+    ).get(presentation.promptEventId) as {
+      id: string; seq: number; session_id: string; type: string; data_json: string;
+    } | undefined;
+    const response = db.prepare(
+      `SELECT seq, session_id, type, role, data_json FROM events WHERE seq = ?`,
+    ).get(input.sourceUserSeq) as {
+      seq: number; session_id: string; type: string; role: string; data_json: string;
+    } | undefined;
+    const promptData = prompt ? safeParse(prompt.data_json) : null;
+    const responseData = response ? safeParse(response.data_json) : null;
+    if (
+      !prompt
+      || prompt.seq !== presentation.promptEventSeq
+      || prompt.session_id !== row.session_id
+      || prompt.type !== 'approval_requested'
+      || promptData?.approvalId !== input.approvalId
+      || promptData?.approvalPresentation !== 'conversation'
+      || !response
+      || response.session_id !== row.session_id
+      || response.type !== 'user_input_received'
+      || response.role !== 'user'
+      || responseData?.synthetic === true
+      || responseData?.source !== 'channel_send_consent'
+      || responseData?.approvalId !== input.approvalId
+      || responseData?.decision !== input.decision
+      || responseData?.userId !== input.userId
+      || responseData?.conversationKey !== input.conversationKey
+    ) return null;
+    const intervening = db.prepare(`
+      SELECT 1 AS present
+        FROM events
+       WHERE session_id = ?
+         AND type = 'user_input_received'
+         AND seq > ?
+         AND seq < ?
+         AND COALESCE(json_extract(data_json, '$.synthetic'), 0) != 1
+       LIMIT 1
+    `).get(row.session_id, presentation.promptEventSeq, input.sourceUserSeq);
+    if (intervening) return null;
+    const changes = db.prepare(`
+      UPDATE pending_approvals
+         SET presentation_json = ?
+       WHERE approval_id = ?
+         AND status = 'pending'
+         AND presentation_json = ?
+    `).run(JSON.stringify({
+      ...presentation,
+      responseSourceUserSeq: input.sourceUserSeq,
+      responseUserId: input.userId,
+    } satisfies ConversationalApprovalPresentation), input.approvalId, row.presentation_json).changes;
+    if (changes !== 1) return null;
+    return rowToPublic(db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(input.approvalId) as ApprovalSqlRow);
+  });
+  return tx.immediate();
+}
+
+/** Claim the exact reply and decide the row in one SQLite transaction. This
+ * removes both crash cuts between response CAS and resolution. File-backed PA
+ * promotion happens after commit and is reconciled idempotently on ingress or
+ * boot from the canonical row. */
+export function resolveConversationalApprovalReply(input: {
+  approvalId: string;
+  sourceUserSeq: number;
+  userId: string;
+  conversationKey: string;
+  decision: 'approve' | 'reject';
+  resolver: string;
+}): ResolveResult {
+  const db = openEventLog();
+  const decided = db.transaction((): ResolveResult => {
+    const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(input.approvalId) as ApprovalSqlRow | undefined;
+    if (!row) return { ok: false, reason: 'not_found' };
+    if (row.status !== 'pending') return { ok: false, reason: 'already_resolved', row: rowToPublic(row) };
+    const presentation = parseConversationalPresentation(row.presentation_json);
+    if (
+      !presentation
+      || !presentation.presentedAt
+      || !presentation.promptEventId
+      || !presentation.promptEventSeq
+      || presentation.responseSourceUserSeq !== null
+      || presentation.responseUserId !== null
+      || presentation.audienceUserId !== input.userId
+      || presentation.conversationKey !== input.conversationKey
+      || input.sourceUserSeq <= presentation.promptEventSeq
+    ) return { ok: false, reason: 'already_resolved' };
+    const prompt = db.prepare('SELECT id, seq, session_id, type, data_json FROM events WHERE id = ?')
+      .get(presentation.promptEventId) as { id: string; seq: number; session_id: string; type: string; data_json: string } | undefined;
+    const response = db.prepare('SELECT seq, session_id, type, role, data_json FROM events WHERE seq = ?')
+      .get(input.sourceUserSeq) as { seq: number; session_id: string; type: string; role: string; data_json: string } | undefined;
+    const promptData = prompt ? safeParse(prompt.data_json) : null;
+    const responseData = response ? safeParse(response.data_json) : null;
+    if (
+      !prompt
+      || prompt.seq !== presentation.promptEventSeq
+      || prompt.session_id !== row.session_id
+      || prompt.type !== 'approval_requested'
+      || promptData?.approvalId !== input.approvalId
+      || promptData?.approvalPresentation !== 'conversation'
+      || !response
+      || response.session_id !== row.session_id
+      || response.type !== 'user_input_received'
+      || response.role !== 'user'
+      || responseData?.synthetic === true
+      || responseData?.source !== 'channel_send_consent'
+      || responseData?.approvalId !== input.approvalId
+      || responseData?.decision !== input.decision
+      || responseData?.userId !== input.userId
+      || responseData?.conversationKey !== input.conversationKey
+    ) return { ok: false, reason: 'already_resolved' };
+    const intervening = db.prepare(`
+      SELECT 1 AS present FROM events
+       WHERE session_id = ? AND type = 'user_input_received'
+         AND seq > ? AND seq < ?
+         AND COALESCE(json_extract(data_json, '$.synthetic'), 0) != 1
+       LIMIT 1
+    `).get(row.session_id, presentation.promptEventSeq, input.sourceUserSeq);
+    if (intervening) return { ok: false, reason: 'already_resolved' };
+    const now = new Date().toISOString();
+    const nextPresentation: ConversationalApprovalPresentation = {
+      ...presentation,
+      responseSourceUserSeq: input.sourceUserSeq,
+      responseUserId: input.userId,
+    };
+    const changes = db.prepare(`
+      UPDATE pending_approvals
+         SET presentation_json = ?, status = 'resolved', resolution = ?, resolver = ?, resolved_at = ?
+       WHERE approval_id = ? AND status = 'pending' AND presentation_json = ?
+    `).run(
+      JSON.stringify(nextPresentation),
+      input.decision === 'approve' ? 'approved' : 'rejected',
+      input.resolver,
+      now,
+      input.approvalId,
+      row.presentation_json,
+    ).changes;
+    if (changes !== 1) {
+      const reread = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+        .get(input.approvalId) as ApprovalSqlRow;
+      return { ok: false, reason: 'already_resolved', row: rowToPublic(reread) };
+    }
+    const updated = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(input.approvalId) as ApprovalSqlRow;
+    return { ok: true, row: rowToPublic(updated) };
+  }).immediate();
+  if (decided.ok && decided.row) finalizeResolvedRow(decided.row);
+  return decided;
+}
+
+export interface TaggedConversationalApprovalReply {
+  sourceUserSeq: number;
+  userId: string;
+  conversationKey: string;
+  decision: 'approve' | 'reject';
+  runId: string;
+}
+
+/** Recover the exact B event written before a process died ahead of the reply
+ * CAS. This is deliberately read-only: ingress can adopt the original runId
+ * and use the normal atomic resolver, while boot can perform that same resolver
+ * itself. More than one candidate (including a Yes/No race) is ambiguous and
+ * stays fail-closed. */
+export function taggedConversationalApprovalReply(
+  row: PendingApprovalRow,
+): TaggedConversationalApprovalReply | null {
+  const presentation = row.presentation;
+  if (
+    row.status !== 'pending'
+    || !presentation?.presentedAt
+    || !presentation.promptEventId
+    || !presentation.promptEventSeq
+    || presentation.responseSourceUserSeq !== null
+    || presentation.responseUserId !== null
+  ) return null;
+  const promptEventSeq = presentation.promptEventSeq;
+  const candidates = listEvents(row.sessionId, { types: ['user_input_received'] })
+    .filter((event) => event.seq > promptEventSeq)
+    .filter((event) => (
+      event.role === 'user'
+      && event.data.synthetic !== true
+      && event.data.source === 'channel_send_consent'
+      && event.data.approvalId === row.approvalId
+      && (event.data.decision === 'approve' || event.data.decision === 'reject')
+      && event.data.userId === presentation.audienceUserId
+      && event.data.conversationKey === presentation.conversationKey
+      && typeof event.data.runId === 'string'
+      && event.data.runId.trim()
+    ));
+  if (candidates.length !== 1) return null;
+  const candidate = candidates[0];
+  const firstReal = listEvents(row.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq > promptEventSeq && event.role === 'user' && event.data.synthetic !== true);
+  if (firstReal?.seq !== candidate.seq) return null;
+  return {
+    sourceUserSeq: candidate.seq,
+    userId: candidate.data.userId as string,
+    conversationKey: candidate.data.conversationKey as string,
+    decision: candidate.data.decision as 'approve' | 'reject',
+    runId: candidate.data.runId as string,
+  };
+}
+
+/** A changed/unrelated immediate reply must not leave a stale frozen version
+ * waiting to capture a later bare Yes. This removes conversational addressing;
+ * the still-pending row remains visible as a formal exact card for audit/manual
+ * disposition. */
+export function invalidateConversationalApprovalReply(approvalId: string): boolean {
+  return openEventLog().prepare(`
+    UPDATE pending_approvals
+       SET presentation_json = NULL
+     WHERE approval_id = ?
+       AND status = 'pending'
+       AND presentation_json IS NOT NULL
+  `).run(approvalId).changes === 1;
+}
+
 /**
  * Convenience predicate. Used by every "is this session paused?"
  * call-site so the answer is single-sourced — no more three
@@ -816,6 +1383,97 @@ export interface ResolveResult {
   ok: boolean;
   reason?: 'already_resolved' | 'not_found' | 'expired';
   row?: PendingApprovalRow;
+}
+
+function conversationConsentForRow(
+  row: PendingApprovalRow,
+): { by: 'human'; evidence: import('./pending-actions.js').PendingActionApprovalEvidence } | undefined {
+  const presentation = row.presentation;
+  return row.resolution === 'approved'
+    && presentation?.promptEventId
+    && presentation.promptEventSeq
+    && presentation.responseSourceUserSeq
+    && presentation.responseUserId
+    ? {
+        by: 'human',
+        evidence: {
+          kind: 'conversation',
+          approvalId: row.approvalId,
+          promptEventId: presentation.promptEventId,
+          promptEventSeq: presentation.promptEventSeq,
+          responseSourceUserSeq: presentation.responseSourceUserSeq,
+          sourceUserSeq: presentation.sourceUserSeq,
+          responderUserId: presentation.responseUserId,
+          conversationKey: presentation.conversationKey,
+          originReplyTargetDigest: presentation.originReplyTargetDigest,
+        },
+      }
+    : undefined;
+}
+
+/** Reconcile the durable file-backed action from the canonical SQLite
+ * decision. Safe to call at ingress, immediately after resolve, and on boot. */
+export function reconcileLinkedPendingActionResolution(row: PendingApprovalRow): boolean {
+  const pendingActionId = pendingActionIdFromArgs(row.args);
+  if (!pendingActionId || !row.resolution || row.status === 'pending') return false;
+  const pendingAction = getPendingAction(pendingActionId);
+  if (!pendingAction || pendingAction.sessionId !== row.sessionId || pendingAction.approvalId !== row.approvalId) {
+    return false;
+  }
+  const resolution = row.resolution;
+  try {
+    markPendingActionApprovalResolved(
+      pendingActionId,
+      resolution,
+      row.approvalId,
+      conversationConsentForRow(row),
+    );
+  } catch {
+    // The SQLite decision remains canonical. A transient transition-lock DB
+    // failure is pre-provider and retryable by the conversational settler.
+    return false;
+  }
+  const reconciled = getPendingAction(pendingActionId);
+  if (!reconciled || reconciled.approvalId !== row.approvalId) return false;
+  if (resolution === 'approved') {
+    return reconciled.status === 'approved'
+      && reconciled.approvedBy === 'human'
+      && reconciled.approvalEvidence?.kind === (row.presentation ? 'conversation' : 'card');
+  }
+  const expected = resolution === 'rejected' ? 'rejected'
+    : resolution === 'expired' ? 'expired'
+      : 'cancelled';
+  return reconciled.status === expected;
+}
+
+function finalizeResolvedRow(publicRow: PendingApprovalRow): void {
+  try {
+    markNotificationsReadByApprovalId(publicRow.approvalId, {
+      approvalStatus: publicRow.status,
+      approvalResolution: publicRow.resolution,
+      approvalResolver: publicRow.resolver,
+    });
+  } catch { /* registry decision remains canonical */ }
+  if (publicRow.resolution === 'approved' || publicRow.resolution === 'rejected') {
+    try {
+      const id = approvalChoiceIdentifier(publicRow.tool, publicRow.args);
+      if (id) updateToolChoiceOutcomeForIdentifier(id, publicRow.resolution);
+    } catch { /* best-effort */ }
+  }
+  try { reconcileLinkedPendingActionResolution(publicRow); } catch { /* boot/ingress retries */ }
+  try {
+    appendAuditRecord({
+      at: publicRow.resolvedAt ?? new Date().toISOString(),
+      kind: 'approval_resolved',
+      sessionId: publicRow.sessionId,
+      approvalId: publicRow.approvalId,
+      subject: publicRow.subject,
+      tool: publicRow.tool,
+      resolution: publicRow.resolution,
+      resolvedBy: publicRow.resolver ?? null,
+    });
+  } catch { /* the ledger never blocks resolution */ }
+  emitResolved(publicRow);
 }
 
 export function resolve(
@@ -854,62 +1512,8 @@ export function resolve(
   const row = db
     .prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
     .get(approvalId) as ApprovalSqlRow;
-  try {
-    markNotificationsReadByApprovalId(approvalId, {
-      approvalStatus: nextStatus,
-      approvalResolution: resolution,
-      approvalResolver: resolver,
-    });
-  } catch {
-    // Notification cleanup is best-effort; approval resolution is the
-    // source of truth and must not fail because the dashboard queue is
-    // temporarily unavailable.
-  }
-  // Thread 2 — feed the human's approve/reject back to procedural memory. A
-  // REJECTION is the strongest distinct signal (the tool never runs, so the
-  // execute-outcome loop never sees it); an approval is a soft positive
-  // (usually followed by an execute success that also credits it). Flag-gated
-  // no-op when off; never let it break resolution.
-  if (resolution === 'approved' || resolution === 'rejected') {
-    try {
-      const pub = rowToPublic(row);
-      const id = approvalChoiceIdentifier(pub.tool, pub.args);
-      if (id) updateToolChoiceOutcomeForIdentifier(id, resolution);
-    } catch {
-      /* best-effort */
-    }
-  }
   const publicRow = rowToPublic(row);
-  try {
-    const pendingActionId = pendingActionIdFromArgs(publicRow.args);
-    // A pending action may have been rebound to a replacement card while an
-    // older card remained pending. Resolve the old registry row for audit, but
-    // never let it overwrite/terminalize the action owned by the newer card.
-    if (pendingActionId) {
-      const pendingAction = getPendingAction(pendingActionId);
-      if (pendingAction?.approvalId === publicRow.approvalId) {
-        markPendingActionApprovalResolved(pendingActionId, resolution, publicRow.approvalId);
-      }
-    }
-  } catch {
-    // Pending-action status is auxiliary; never break approval resolution.
-  }
-  // Durable audit mirror (2026-07-20 attorney-bar B3): resolutions are
-  // ledgered from THIS canonical seam (not the eventlog mirror) so every
-  // surface's resolve — desktop, Discord, reaper — is captured exactly once.
-  try {
-    appendAuditRecord({
-      at: publicRow.resolvedAt ?? new Date().toISOString(),
-      kind: 'approval_resolved',
-      sessionId: publicRow.sessionId,
-      approvalId: publicRow.approvalId,
-      subject: publicRow.subject,
-      tool: publicRow.tool,
-      resolution: publicRow.resolution,
-      resolvedBy: publicRow.resolver ?? null,
-    });
-  } catch { /* the ledger never blocks resolution */ }
-  emitResolved(publicRow);
+  finalizeResolvedRow(publicRow);
   return { ok: true, row: publicRow };
 }
 

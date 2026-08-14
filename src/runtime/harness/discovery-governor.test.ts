@@ -61,7 +61,7 @@ test('fails closed until the exact accepted task is initialized', () => {
   });
 });
 
-test('known capability defers the FIRST broad search only; knowledge tightens but never strands', () => {
+test('known capability ranks candidates but never withholds the one bounded broad search', () => {
   const key = acceptedTask('known');
   const governor = new DiscoveryGovernor();
 
@@ -69,26 +69,25 @@ test('known capability defers the FIRST broad search only; knowledge tightens bu
   const tightened = governor.initializeTask({ ...key, knownCapability: true });
   assert.equal(tightened.status, 'tightened');
   assert.equal(tightened.policy.knownCapability, true);
-  assert.equal(tightened.policy.broadDiscoveryAllowance, 0);
+  assert.equal(tightened.policy.broadDiscoveryAllowance, 1);
 
   const cannotLoosen = governor.initializeTask({ ...key, knownCapability: false });
   assert.equal(cannotLoosen.status, 'existing');
   assert.equal(cannotLoosen.policy.knownCapability, true);
 
-  const denied = governor.admit({
+  const admitted = governor.admit({
     ...key,
     category: 'broad_discovery',
     callId: 'known-search',
   });
-  assert.equal(denied.admitted, false);
-  assert.equal(denied.reason, 'known_capability');
-  assert.equal(denied.telemetry.eventData.allowance, 0);
-  assert.equal(governor.getTaskState(key)?.claims.broad_discovery, undefined);
+  assert.equal(admitted.admitted, true);
+  assert.equal(admitted.reason, 'novel_discovery_admitted');
+  assert.equal(admitted.telemetry.eventData.allowance, 1);
+  assert.equal(governor.getTaskState(key)?.claims.broad_discovery?.callId, 'known-search');
 
-  // The suppression is scoped to the epoch the memory was formed against. Once
-  // the remembered path is observed to fail, a warm task searches on exactly
-  // the terms a cold one would — a receipt ranks candidates, it never decides
-  // whether recovery is permitted.
+  // Once the attempted candidate is observed to fail, the next evidence epoch
+  // receives one fresh slot. A receipt ranks candidates; the durable claim is
+  // what bounds search.
   assert.equal(
     governor.recordEvidence({ ...key, kind: 'candidate_unsupported' }).outcome,
     'epoch_opened',

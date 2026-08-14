@@ -8,6 +8,7 @@ import {
 } from '../../assistant/external-effect-taxonomy.js';
 import {
   classifyMessageIntent,
+  isExplicitMemoryInstruction,
   type IntentClassification,
 } from '../../assistant/message-intent.js';
 import {
@@ -160,8 +161,26 @@ function authorityFor(
   };
 }
 
-function routeFor(intent: IntentClassification, externalEffect: ExternalEffectClassification): TurnGraphRoute {
-  if (externalEffect.requested || intent.intent === 'action' || intent.intent === 'tool_intent') return 'act';
+function routeFor(
+  intent: IntentClassification,
+  externalEffect: ExternalEffectClassification,
+  memoryInstruction: boolean,
+): TurnGraphRoute {
+  if (
+    externalEffect.requested
+    || intent.intent === 'action'
+    || intent.intent === 'tool_intent'
+  ) return 'act';
+  // An explicit memory instruction reads nothing: its completion authority is
+  // the durable intake receipt on the ACTION path. Routing it through the
+  // default tool_intent bucket froze a one-read retrieve contract for
+  // "Remember this: …" and bypassed intake completion entirely
+  // (post-routing-change sweep, 2026-08-12).
+  if (memoryInstruction && intent.intent !== 'lookup') return 'act';
+  // Only an affirmative lookup may freeze the exact one-read topology. The
+  // conservative tool fallback deliberately stays on an unknown-effect action
+  // route above so novel wording is reasoned about rather than silently
+  // weakened to a read. Runtime tool admission still owns effect authority.
   if (intent.intent === 'lookup') return 'retrieve';
   return 'direct_reply';
 }
@@ -306,7 +325,7 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
   const projectShape = classifyProjectShape(input.input, intent);
   // Work shape may choose an execution envelope only after intent has already
   // selected the action route. It must never turn advice or a lookup into work.
-  const route = routeFor(intent, externalEffect);
+  const route = routeFor(intent, externalEffect, isExplicitMemoryInstruction(input.input));
   const fastPath = fastPathFor(route, multiItem, projectShape.isProject);
   const routeEffect = effectForRoute(route, externalEffect.requested);
   const allowedToolNames = normalizedNames(input.allowedToolNames);

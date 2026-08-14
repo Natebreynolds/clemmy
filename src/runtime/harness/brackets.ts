@@ -3,11 +3,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isKillRequested, appendEvent, getSession, listEvents, resolveToolOutputForAuthority, type KillRequestTarget } from './eventlog.js';
 import { effectiveTurnObjective } from './turn-control.js';
 import { runWithToolAbortSignal } from '../tool-abort-context.js';
-import { withToolOutputContext } from './tool-output-context.js';
+import { getToolOutputContext, withToolOutputContext } from './tool-output-context.js';
 import { steerBlockForToolBoundary } from './steer-notes.js';
 import { exactToolOutputForInvocation } from './tool-output-format.js';
 import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
 import {
+  ShellPolicyDenialError,
   takeShellExecutionOutcome,
   type ShellExecutionOutcome,
 } from '../shell-execution-outcome.js';
@@ -136,8 +137,10 @@ import {
   resolveArtifactRunScopeId,
   scopeArtifactIntentForObjective,
   verifyArtifactBindingFromToolResult,
+  verifyGeneratedArtifactContentFromToolResult,
   type ArtifactIntent,
 } from './artifact-ledger.js';
+import { compileGoogleSheetsSheetFromJsonContract } from './sheet-from-json-content-contract.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import {
   assertDispatchLeaseCurrent,
@@ -151,9 +154,11 @@ import {
   type DiscoveryBoundaryLease,
 } from './discovery-boundary.js';
 import {
+  attemptSignalsFromShellExecutionOutcome,
   settleToolAttempt,
   ToolAttemptSettlementAuthorityError,
 } from './attempt-settlement.js';
+import { currentExpectedWorkBinding } from './expected-work-admission.js';
 import {
   authorizeResolvedLogicalCallContract,
   currentLogicalCall,
@@ -166,6 +171,25 @@ import {
   isTrustedComposioGateway,
   isTrustedDynamicComposioTool,
 } from './runtime-tool-identity.js';
+
+/** One host invocation owns one output nonce even when it crosses a nested
+ * carrier (code mode/call_tool) and then the ordinary bracket. A nonce is
+ * reusable only when session, call id, and tool identity all match exactly. */
+function settlementNonceForInvocation(
+  sessionId: string | undefined,
+  callId: string,
+  toolName: string,
+): string {
+  const ambient = getToolOutputContext();
+  if (
+    ambient?.settlementNonce
+    && sessionId
+    && ambient.sessionId === sessionId
+    && ambient.callId === callId
+    && ambient.toolName === toolName
+  ) return ambient.settlementNonce;
+  return randomUUID();
+}
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -1163,6 +1187,10 @@ export interface HarnessRunContext {
    *  judges (goal-fidelity, output-grounding) are redundant latency, not safety,
    *  and are skipped. Every DETERMINISTIC gate still runs (see the write boundary). */
   certifiedBatch?: { batchId: string; payloadHash: string };
+  /** Exact host PendingAction execution authority. Unlike certifiedBatch this
+   * carries the opaque token from the winning approved→executing claim and may
+   * bypass a second provider approval gate only after byte-level verification. */
+  pendingActionExecution?: import('./pending-actions.js').PendingActionExecutionCapability;
   /** This tool call is ONE ITEM of a batch-runner plan (certified or not).
    *  Batch items never claim artifact slots: the batch lane is the sanctioned
    *  multi-item primitive with its own per-item ledger — N same-kind creates
@@ -2286,6 +2314,31 @@ function wrapperMustSettleLogicalCall(ctx: HarnessRunContext | undefined): boole
   throw new ToolAttemptSettlementAuthorityError(state.status, state.reason);
 }
 
+/** An admitted work_call already carries a stricter, exact owner than the
+ * legacy session execution row: its host-only binding was frozen only after
+ * the accepted task, logical call, normalized arguments, and runtime effect
+ * all matched. Re-prove those live ALS identities here; any absent or mismatched
+ * fact falls through to the ordinary execution-wrap requirement. */
+function expectedWorkBindingCarriesExecutionAuthority(
+  ctx: HarnessRunContext,
+  toolName: string,
+  args: unknown,
+): boolean {
+  try {
+    const binding = currentExpectedWorkBinding();
+    const logical = currentLogicalCall();
+    if (!binding || !logical) return false;
+    return binding.effect === 'external_write'
+      && classifyRuntimeToolEffect(toolName, args).effect === binding.effect
+      && binding.sessionId === ctx.sessionId
+      && binding.sourceUserSeq === ctx.sourceUserSeq
+      && binding.acceptedTaskId === logical.acceptedTaskId
+      && binding.logicalToolCallId === logical.logicalToolCallId;
+  } catch {
+    return false;
+  }
+}
+
 export function wrapToolForHarness<T extends WrappableTool>(
   tool: T,
   options: WrapToolOptions = {},
@@ -2623,10 +2676,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // GRANT INVARIANT I2 (Phase 1, THE-GRANT plan): after a human approved a
       // byte-pinned plan, no session-bookkeeping key may refuse the dispatch.
       // A certified batch item (ctx.certifiedBatch = approved pending action,
-      // payload hash pinned) carries its authority with it — Exhibit C
+      // payload hash pinned) carries its authority with it — Exhibit C. An
+      // exact accepted-work binding carries the same no-second-owner property
+      // after its source, logical call, normalized effect, and contract froze.
       // (2026-07-09): a certified + human-approved 25-email batch was refused
       // 0/25 by this gate because the session's execution row wasn't active.
-      const grantCarried = Boolean(ctx.certifiedBatch);
+      const grantCarried = Boolean(ctx.certifiedBatch)
+        || expectedWorkBindingCarriesExecutionAuthority(ctx, tool.name, parsedInput);
       if (!grantCarried && isExecutionGateEnabled() && isMutatingExternalWrite(tool.name, parsedInput)) {
         const sessionRow = getSession(ctx.sessionId);
         if (sessionRow?.kind === 'chat') {
@@ -3541,7 +3597,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
       effectiveTurnObjective(sessionId, recordedObjective, ctx.sourceUserSeq),
       parsedInput,
     );
-    const claim = claimArtifactSlot(sessionId, intent, callId, runScopeId);
+    const expectedBinding = currentExpectedWorkBinding();
+    const contentContract = expectedBinding?.generatedArtifactContentContract
+      ?? compileGoogleSheetsSheetFromJsonContract(tool.name, parsedInput);
+    const claim = claimArtifactSlot(
+      sessionId,
+      intent,
+      callId,
+      runScopeId,
+      contentContract ?? undefined,
+    );
     if (!claim.acquired) return { deny: artifactReuseMessage(claim.artifact) };
     return { dispatch: { sessionId, runScopeId, artifactId: claim.artifact.id, intent, callId } };
   };
@@ -3642,6 +3707,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
         callId,
       );
       if (verified) settleExternalWriteFromVerifiedArtifact(ctx.sessionId, verified, callId);
+      if (callId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0) {
+        verifyGeneratedArtifactContentFromToolResult({
+          sessionId: ctx.sessionId,
+          sourceUserSeq: ctx.sourceUserSeq as number,
+          verificationLogicalToolCallId: callId,
+          readToolName: tool.name,
+          readArgs: parsedInput,
+          readResult: result,
+        });
+      }
     } catch {
       // Verification bookkeeping is fail-closed for completion (the row stays
       // unverified) but must never turn a successful provider read into a tool
@@ -3714,7 +3789,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // correlate a future identical call back to this one's tool_outputs row.
       const invokeCall = (details as { toolCall?: { callId?: string; id?: string } } | undefined)?.toolCall;
       const invokeCallId = invokeCall?.callId ?? invokeCall?.id ?? `harness-${randomUUID()}`;
-      const settlementNonce = randomUUID();
+      const settlementNonce = settlementNonceForInvocation(
+        ctx?.sessionId,
+        invokeCallId,
+        tool.name,
+      );
       const invokeBody = async (): Promise<unknown> => {
       // Layer 1 — structural prevention. Bind $fromToolOutput references to REAL
       // values from the lossless store BEFORE gates + execution, so a high-stakes
@@ -3958,13 +4037,21 @@ export function wrapToolForHarness<T extends WrappableTool>(
             args: logicalContractArgs,
             mutating: isMutatingExternalWrite(tool.name, parsedInput),
             businessCall: bracketOutcome?.discovery == null,
-            result,
-            ...(bracketOutcome?.carrierMalformed
+            // Settlement consumes the exact nonce-scoped bytes, not the
+            // model-facing digest. If the durable cap was crossed this value
+            // is a typed TruncatedToolOutputResult, never a successful prefix.
+            result: exactEvidenceResult,
+            ...((shellOutcome || bracketOutcome?.carrierMalformed)
               ? {
                   signals: {
-                    preDispatch: true,
-                    argumentValidationFailed: true,
-                    schemaAvailable: true,
+                    ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
+                    ...(bracketOutcome?.carrierMalformed
+                      ? {
+                          preDispatch: true,
+                          argumentValidationFailed: true,
+                          schemaAvailable: true,
+                        }
+                      : {}),
                   },
                 }
               : {}),
@@ -4027,6 +4114,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
           err instanceof ToolTimeout ? 'timed_out' : 'failed',
           err instanceof ToolTimeout ? 'provider_timeout' : 'provider_error',
         );
+        const shellOutcome = tool.name === 'run_shell_command'
+          ? takeShellExecutionOutcome(invokeCallId)
+          : undefined;
         // The rejection path settles too. Only the RETURN path did, so a tool
         // that threw left the task holding a spent budget and no reason.
         if (wrapperMustSettleLogicalCall(ctx)) {
@@ -4041,20 +4131,22 @@ export function wrapToolForHarness<T extends WrappableTool>(
             mutating: isMutatingExternalWrite(tool.name, parsedInput),
             businessCall: bracketOutcome?.discovery == null,
             thrown: err,
-            ...(bracketOutcome?.carrierMalformed
+            ...((shellOutcome || bracketOutcome?.carrierMalformed || err instanceof ToolTimeout)
               ? {
                   signals: {
-                    preDispatch: true,
-                    argumentValidationFailed: true,
-                    schemaAvailable: true,
+                    ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
+                    ...(bracketOutcome?.carrierMalformed
+                      ? {
+                          preDispatch: true,
+                          argumentValidationFailed: true,
+                          schemaAvailable: true,
+                        }
+                      : err instanceof ToolTimeout ? { errorName: 'TimeoutError' } : {}),
                   },
                 }
-              : err instanceof ToolTimeout ? { signals: { errorName: 'TimeoutError' } } : {}),
+              : {}),
           });
         }
-        const shellOutcome = tool.name === 'run_shell_command'
-          ? takeShellExecutionOutcome(invokeCallId)
-          : undefined;
         failArtifact(artifact.dispatch, shellOutcome, err);
         recordExternalWriteSettlement(
           ctx?.sessionId,
@@ -4167,7 +4259,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
     const ctx = harnessRunContextStorage.getStore();
     const executeCallId = `harness-${randomUUID()}`;
-    const settlementNonce = randomUUID();
+    const settlementNonce = settlementNonceForInvocation(
+      ctx?.sessionId,
+      executeCallId,
+      tool.name,
+    );
     const executeBody = async (): Promise<unknown> => {
     // Layer 1 — bind $fromToolOutput references to real store values before gates
     // + execution (mirror of the invoke path). No-op without the syntax.
@@ -4294,6 +4390,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
         err instanceof ToolTimeout ? 'timed_out' : 'failed',
         err instanceof ToolTimeout ? 'provider_timeout' : 'provider_error',
       );
+      const shellOutcome = tool.name === 'run_shell_command'
+        ? takeShellExecutionOutcome(executeCallId)
+        : undefined;
       if (wrapperMustSettleLogicalCall(ctx)) {
         settleToolAttempt({
           sessionId: ctx?.sessionId,
@@ -4306,20 +4405,22 @@ export function wrapToolForHarness<T extends WrappableTool>(
           mutating: isMutatingExternalWrite(tool.name, input),
           businessCall: bracketOutcome?.discovery == null,
           thrown: err,
-          ...(bracketOutcome?.carrierMalformed
+          ...((shellOutcome || bracketOutcome?.carrierMalformed || err instanceof ToolTimeout)
             ? {
                 signals: {
-                  preDispatch: true,
-                  argumentValidationFailed: true,
-                  schemaAvailable: true,
+                  ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
+                  ...(bracketOutcome?.carrierMalformed
+                    ? {
+                        preDispatch: true,
+                        argumentValidationFailed: true,
+                        schemaAvailable: true,
+                      }
+                    : err instanceof ToolTimeout ? { errorName: 'TimeoutError' } : {}),
                 },
               }
-            : err instanceof ToolTimeout ? { signals: { errorName: 'TimeoutError' } } : {}),
+            : {}),
         });
       }
-      const shellOutcome = tool.name === 'run_shell_command'
-        ? takeShellExecutionOutcome(executeCallId)
-        : undefined;
       failArtifact(artifact.dispatch, shellOutcome, err);
       recordExternalWriteSettlement(
         ctx?.sessionId,
@@ -4372,13 +4473,20 @@ export function wrapToolForHarness<T extends WrappableTool>(
         args: input,
         mutating: isMutatingExternalWrite(tool.name, input),
         businessCall: bracketOutcome?.discovery == null,
-        result,
-        ...(bracketOutcome?.carrierMalformed
+        // Execute-path twin of the invoke seam above: durable evidence is the
+        // exact invocation result (or typed truncation), never presentation.
+        result: exactEvidenceResult,
+        ...((shellOutcome || bracketOutcome?.carrierMalformed)
           ? {
               signals: {
-                preDispatch: true,
-                argumentValidationFailed: true,
-                schemaAvailable: true,
+                ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
+                ...(bracketOutcome?.carrierMalformed
+                  ? {
+                      preDispatch: true,
+                      argumentValidationFailed: true,
+                      schemaAvailable: true,
+                    }
+                  : {}),
               },
             }
           : {}),
@@ -4460,6 +4568,7 @@ export function softToolError(err: unknown): string | null {
     err instanceof DuplicateExternalWriteError ||
     err instanceof ExternalWriteReservationError ||
     err instanceof ExternalWritePreDispatchError ||
+    err instanceof ShellPolicyDenialError ||
     err instanceof OrphanedWriteRetryError ||
     err instanceof ImplicitDestinationError ||
     err instanceof UnverifiedDestinationError

@@ -180,6 +180,12 @@ test('userFacingRunState distinguishes planning, execution, waiting, and stale w
   }, now), 'waiting_for_input');
 
   assert.equal(userFacingRunState({
+    status: 'awaiting_input',
+    updatedAt: '2026-05-29T10:29:30Z',
+    events: [{ type: 'input_required', createdAt: '2026-05-29T10:29:30Z' }],
+  }, now), 'waiting_for_input');
+
+  assert.equal(userFacingRunState({
     status: 'parked',
     updatedAt: '2026-05-29T10:29:30Z',
     events: [{ type: 'approval_required', createdAt: '2026-05-29T10:29:30Z' }],
@@ -311,4 +317,3 @@ test('narration skips dispatcher wrappers and never ships a dangling verb', () =
   assert.equal(progressNarration(['run_tool_program']), 'Still working.');
   assert.equal(progressNarration(['composio_execute_tool', 'call_tool']), 'Still working.');
 })
-

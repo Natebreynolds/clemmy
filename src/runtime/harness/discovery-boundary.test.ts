@@ -171,14 +171,16 @@ test('one physical broad call is admitted, settled, replay-safe, and a second is
   );
 });
 
-test('known tasks deny broad discovery but retain one exact schema refresh', () => {
+test('known tasks retain one bounded broad discovery and one exact schema refresh', () => {
   const key = acceptedTask('known', true);
-  assert.throws(() => admitDiscoveryBoundary({
+  const broad = admitDiscoveryBoundary({
     ...key,
     toolName: 'tool_search',
     input: { query: 'find a workspace inspection tool' },
     callId: 'known-broad',
-  }), DiscoveryBudgetDeniedError);
+  });
+  assert.ok(broad);
+  settleDiscoveryBoundary(broad, 'succeeded');
 
   const exact = admitDiscoveryBoundary({
     ...key,

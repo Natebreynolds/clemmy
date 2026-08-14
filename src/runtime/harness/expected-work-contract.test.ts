@@ -13,8 +13,10 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-expected-work
 
 const eventlog = await import('./eventlog.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
+const capabilityCandidates = await import('../read-path/capability-candidates.js');
 const authority = await import('./accepted-task-authority.js');
 const contracts = await import('./expected-work-contract.js');
+const { discoveryGovernor } = await import('./discovery-governor.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -78,6 +80,21 @@ function writeOnlyProposal(): contracts.ExpectedWorkProposalV1 {
     operations: [{
       id: 'commit_destination',
       effect: 'external_write',
+      dependsOn: [],
+      dataFrom: [],
+      cardinality: { kind: 'once' },
+    }],
+    universes: [],
+  };
+}
+
+function readOnlyProposal(): contracts.ExpectedWorkProposalV1 {
+  return {
+    version: 1,
+    operations: [{
+      id: 'resolve_current_state',
+      effect: 'read',
+      coverage: 'single',
       dependsOn: [],
       dataFrom: [],
       cardinality: { kind: 'once' },
@@ -167,6 +184,48 @@ test('an arbitrary action requires an explicit validated proposal and exact repl
   const loaded = contracts.loadExpectedWorkContract(task.sessionId, task.sourceUserSeq);
   assert.equal(loaded.status, 'ok');
   assert.deepEqual(loaded.status === 'ok' && loaded.contract, first.contract);
+});
+
+test('unknown tool planning may resolve to reads or writes, but an affirmative action may not weaken', () => {
+  const unknown = accept('Weather in Seattle');
+  assert.equal(unknown.graph.classification.messageIntent, 'tool_intent');
+  assert.equal(unknown.graph.classification.route, 'act');
+  assert.equal(unknown.graph.effectCeiling, 'unknown');
+  const resolvedRead = contracts.freezeActionExpectedWorkContract({
+    ...unknown,
+    proposal: readOnlyProposal(),
+  });
+  assert.equal(resolvedRead.status, 'fixed', JSON.stringify(resolvedRead));
+  assert.equal(
+    resolvedRead.status === 'fixed' && resolvedRead.contract.operations[0]?.effect,
+    'read',
+  );
+
+  const unknownWrite = accept('Opaque workspace task');
+  assert.equal(unknownWrite.graph.classification.messageIntent, 'tool_intent');
+  assert.equal(unknownWrite.graph.effectCeiling, 'unknown');
+  const resolvedWrite = contracts.freezeActionExpectedWorkContract({
+    ...unknownWrite,
+    proposal: writeOnlyProposal(),
+  });
+  assert.equal(resolvedWrite.status, 'fixed', JSON.stringify(resolvedWrite));
+  assert.equal(
+    resolvedWrite.status === 'fixed' && resolvedWrite.contract.operations[0]?.effect,
+    'external_write',
+  );
+
+  const action = accept('Create a new artifact.');
+  assert.equal(action.graph.classification.messageIntent, 'action');
+  assert.equal(action.graph.classification.route, 'act');
+  const weakened = contracts.freezeActionExpectedWorkContract({
+    ...action,
+    proposal: readOnlyProposal(),
+  });
+  assert.equal(weakened.status, 'invalid');
+  assert.match(
+    weakened.status === 'invalid' ? weakened.reason : '',
+    /cannot be weakened to read-only work/,
+  );
 });
 
 test('the staged production binder defers an action without guessing or poisoning it', () => {
@@ -471,4 +530,220 @@ test('concurrent different proposals elect one immutable winner and poison the s
     1,
   );
   assert.equal(contracts.loadExpectedWorkContract(task.sessionId, task.sourceUserSeq).status, 'conflict');
+});
+
+test('unambiguous proposal shapes are repaired, not refused (live 2026-08-12 fan-out)', () => {
+  // A fan-out worker burned its entire budget re-proposing against
+  // "coverage is only valid for reads" and "dataFrom X must also be a
+  // dependency", made zero business calls, and reported it could not verify
+  // anything. Both shapes state their intent unambiguously.
+  const session = eventlog.createSession({ id: `contract-normalize-${Date.now()}`, kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Scrape the five restaurants and put them in a new sheet.' },
+  });
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
+
+  const prepared = contracts.prepareActionExpectedWorkContract({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    proposal: {
+      version: 1,
+      operations: [
+        {
+          id: 'collect_places',
+          effect: 'read',
+          coverage: 'complete_set',
+          dependsOn: [],
+          dataFrom: [],
+          cardinality: { kind: 'once' },
+        },
+        {
+          // coverage on a WRITE — read vocabulary, meaningless here.
+          id: 'create_sheet',
+          effect: 'external_write',
+          coverage: 'single',
+          dependsOn: ['collect_places'],
+          dataFrom: ['collect_places'],
+          cardinality: { kind: 'once' },
+        },
+        {
+          // dataFrom naming an op absent from dependsOn — deriving from it IS
+          // depending on it.
+          id: 'write_rows',
+          effect: 'external_write',
+          dependsOn: [],
+          dataFrom: ['collect_places', 'create_sheet'],
+          cardinality: { kind: 'once' },
+        },
+        {
+          // a READ that named a producer: pure ordering, not derivation.
+          id: 'verify_sheet',
+          effect: 'read',
+          coverage: 'complete_set',
+          dependsOn: [],
+          dataFrom: ['write_rows'],
+          cardinality: { kind: 'once' },
+        },
+      ],
+      universes: [],
+    } as never,
+  });
+  assert.equal(prepared.status, 'prepared', JSON.stringify(prepared));
+  if (prepared.status !== 'prepared') throw new Error('the proposal was refused');
+
+  const byId = new Map(prepared.contract.operations.map((op) => [op.id, op]));
+  assert.equal(byId.get('create_sheet')?.coverage, undefined, 'write coverage is dropped');
+  assert.deepEqual(
+    [...(byId.get('write_rows')?.dependsOn ?? [])].sort(),
+    ['collect_places', 'create_sheet'],
+    'dataFrom entries become dependencies',
+  );
+  assert.deepEqual(byId.get('verify_sheet')?.dataFrom, [], 'a read derives nothing');
+  assert.deepEqual(byId.get('verify_sheet')?.dependsOn, ['write_rows'], 'its ordering survives');
+
+  // Genuinely ambiguous shapes are still refused with their exact reason.
+  const refused = contracts.prepareActionExpectedWorkContract({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    proposal: {
+      version: 1,
+      operations: [{
+        id: 'bad_read',
+        effect: 'read',
+        coverage: 'complete_set',
+        dependsOn: [],
+        dataFrom: [],
+        cardinality: { kind: 'each', universeId: 'items' },
+      }],
+      universes: [],
+    } as never,
+  });
+  assert.notEqual(refused.status, 'prepared', 'a coverage/cardinality contradiction still refuses');
+});
+
+test('source 50404 freezes the full restaurant to Sheet to verified email lineage, never one read', () => {
+  const request = 'Find me the best date night restaurants maybe 5 of them in pismo beach ca '
+    + 'put them in a sheet with reviews and send me an email with the link to the sheet please';
+  const task = accept(request);
+
+  assert.equal(task.graph.classification.route, 'act');
+  assert.equal(task.graph.classification.externalEffectRequested, true);
+  assert.equal(task.graph.effectCeiling, 'external_write');
+  assert.equal(contracts.compileDeterministicExpectedWorkProposal(task.graph), null,
+    'the compound request cannot be reduced to the retrieve route\'s one read');
+  assert.equal(contracts.freezeDeterministicExpectedWorkContract(task).status, 'planning_required');
+
+  const roleProjectionPromise = capabilityCandidates.resolveTurnCapabilityCandidates({
+    userInput: request,
+    semantic: false,
+    limit: 5,
+    choices: [{
+      intent: 'googlesheets.get_sheet_names',
+      description: 'Get names of sheets in a spreadsheet and put them in a list.',
+      choice: {
+        kind: 'composio', identifier: 'GOOGLESHEETS_GET_SHEET_NAMES',
+        testedAt: '2026-08-13T00:00:00.000Z',
+      },
+      fallbacks: [], body: '', filePath: '/fixture/GOOGLESHEETS_GET_SHEET_NAMES',
+    }] as never,
+  });
+
+  const frozen = contracts.freezeActionExpectedWorkContract({
+    ...task,
+    proposal: {
+      version: 1,
+      operations: [
+        {
+          id: 'fetch_restaurants', effect: 'read', coverage: 'complete_set',
+          dependsOn: [], dataFrom: [], cardinality: { kind: 'once' },
+        },
+        {
+          id: 'create_sheet', effect: 'external_write',
+          dependsOn: ['fetch_restaurants'], dataFrom: ['fetch_restaurants'],
+          cardinality: { kind: 'once' },
+        },
+        {
+          id: 'verify_sheet', effect: 'read', coverage: 'complete_set',
+          dependsOn: ['create_sheet'], dataFrom: ['create_sheet'],
+          cardinality: { kind: 'once' },
+        },
+        {
+          id: 'send_link', effect: 'external_write',
+          dependsOn: ['verify_sheet'], dataFrom: ['verify_sheet'],
+          cardinality: { kind: 'once' },
+        },
+      ],
+      universes: [],
+    },
+  });
+  assert.equal(frozen.status, 'fixed', JSON.stringify(frozen));
+  if (frozen.status !== 'fixed') return;
+
+  assert.equal(frozen.contract.operations.length, 4, 'accepted action contract is nonzero and multi-step');
+  const byId = new Map(frozen.contract.operations.map((operation) => [operation.id, operation]));
+  assert.deepEqual(byId.get('fetch_restaurants'), {
+    id: 'fetch_restaurants', effect: 'read', coverage: 'complete_set',
+    dependsOn: [], dataFrom: [], cardinality: { kind: 'once' },
+  });
+  assert.deepEqual(byId.get('create_sheet')?.dependsOn, ['fetch_restaurants']);
+  assert.deepEqual(byId.get('create_sheet')?.dataFrom, ['fetch_restaurants']);
+  assert.deepEqual(byId.get('verify_sheet')?.dependsOn, ['create_sheet']);
+  assert.deepEqual(byId.get('verify_sheet')?.dataFrom, [],
+    'verification is ordered after the Sheet receipt without pretending a read is a derived write');
+  assert.deepEqual(byId.get('send_link')?.dependsOn, ['verify_sheet']);
+  assert.deepEqual(byId.get('send_link')?.dataFrom, ['verify_sheet']);
+
+  const loaded = contracts.loadExpectedWorkContract(task.sessionId, task.sourceUserSeq);
+  assert.equal(loaded.status, 'ok');
+  assert.equal(loaded.status === 'ok' && loaded.contract.contractId, frozen.contract.contractId);
+  assert.equal(loaded.status === 'ok' && loaded.contract.operations.length, 4);
+
+  return roleProjectionPromise.then((projection) => {
+    assert.deepEqual(projection.requirements.map((requirement) => ({
+      roleKey: requirement.roleKey,
+      resolved: requirement.resolved,
+    })), [
+      { roleKey: 'clause-0:read', resolved: false },
+      { roleKey: 'clause-1:write', resolved: false },
+      { roleKey: 'clause-2:write', resolved: false },
+    ]);
+
+    discoveryGovernor.initializeTask({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      // Reproduce the live state: whole-request advisory memory exists, but it
+      // does not cover any of the three requirement roles.
+      knownCapability: projection.candidates.length > 0,
+    });
+    const initialized = discoveryGovernor.initializeRoles({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      requirements: projection.requirements,
+      brokerCoverage: 'authorized_external_v1',
+    });
+    assert.equal(initialized.policy.roleScoped, true);
+    assert.equal(initialized.policy.roleCount, 3);
+    assert.equal(initialized.policy.unresolvedRoleCount, 3);
+    assert.deepEqual(initialized.roles.map((role) => role.roleKey), [
+      'clause-0:read',
+      'clause-1:write',
+      'clause-2:write',
+    ]);
+    for (const [index, role] of initialized.roles.entries()) {
+      const admitted = discoveryGovernor.admit({
+        sessionId: task.sessionId,
+        sourceUserSeq: task.sourceUserSeq,
+        category: 'broad_discovery',
+        subject: role.roleKey,
+        callId: `source-50404-role-${index}`,
+      });
+      assert.equal(admitted.admitted, true, `${role.roleKey}: ${admitted.reason}`);
+    }
+  });
 });

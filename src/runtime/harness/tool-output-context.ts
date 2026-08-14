@@ -29,8 +29,23 @@ export function withToolOutputContext<T>(
   context: ToolOutputContext,
   work: () => T | Promise<T>,
 ): T | Promise<T> {
+  const parent = toolOutputContextStorage.getStore();
+  // A settlement nonce identifies one exact invocation, not a general nested
+  // execution scope.  Reusing it for a different child call lets that child's
+  // formatter overwrite (session, call, nonce) evidence belonging to its
+  // parent.  Inherit only when every identity component names the same call;
+  // callers opening a real child dispatch must supply its own nonce.
+  const sameInvocation = Boolean(
+    parent
+    && context.sessionId
+    && context.callId
+    && context.toolName
+    && context.sessionId === parent.sessionId
+    && context.callId === parent.callId
+    && context.toolName === parent.toolName,
+  );
   const inheritedNonce = context.settlementNonce
-    ?? toolOutputContextStorage.getStore()?.settlementNonce;
+    ?? (sameInvocation ? parent?.settlementNonce : undefined);
   return toolOutputContextStorage.run(
     inheritedNonce ? { ...context, settlementNonce: inheritedNonce } : context,
     work,

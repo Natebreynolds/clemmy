@@ -1,7 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import { WorkerToolCallSchema, uniformFailureSignature, workerCallItems, workerPacketKey, workerResultIndicatesFailure, type WorkerToolCall, type WorkerToolInput } from '../agents/worker-job-packet.js';
-import { deriveWorkerPacketExpectedWork } from '../runtime/harness/expected-work-admission.js';
+import { bindWorkerPacketExpectedWork } from '../runtime/harness/expected-work-admission.js';
 import { runBoundedPool } from '../execution/bounded-pool.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from '../agents/subagent-runs.js';
 import { runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
@@ -203,21 +203,15 @@ export function registerWorkerTools(server: McpServer): void {
           : `Manifest guidance: this requested slice is already proven for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. Do not repeat these items; continue only with canonical items that remain incomplete.`
         : null;
       const { items: _batch, ...packetRaw } = call;
-      // Contracted fan-out: when the parent is under a frozen work contract
-      // and exactly one open per-item requirement covers every fanned item,
-      // hand each worker its binding. Without it a contracted worker sees no
-      // first-class business tools and can conclude the capability is missing
-      // (live 2026-08-11: five workers quit with zero calls). Parent-supplied
-      // values win; derivation is advisory and never blocks the dispatch.
-      let packetBase = packetRaw;
-      if (!packetRaw.expectedWork && manifestSessionId) {
-        const derived = deriveWorkerPacketExpectedWork({
-          sessionId: manifestSessionId,
-          sourceUserSeq: manifestSourceUserSeq,
-          items: callItems,
-        });
-        if (derived) packetBase = { ...packetRaw, expectedWork: { requirementId: derived.requirementId, universeId: derived.universeId } };
-      }
+      // One authority-derived packet shape across SDK-brain, orchestrator and
+      // code-mode worker lanes. Model-provided expectedWork is only a hint;
+      // the durable accepted-task contract supplies the binding when proven.
+      const packetBase = bindWorkerPacketExpectedWork({
+        packet: packetRaw,
+        sessionId: manifestSessionId,
+        sourceUserSeq: manifestSourceUserSeq,
+        items: callItems,
+      });
       if (callItems.length > 1) {
         // Deterministic batch: the harness owns the parallelism (bounded pool;
         // real provider throttling stays with the per-item worker slots), so a

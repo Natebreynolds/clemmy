@@ -4,6 +4,7 @@ import { BASE_DIR, getOpenAiApiKey } from '../../config.js';
 import { getFocusSnapshot } from '../../memory/focus.js';
 import {
   listActiveSkills,
+  skillHasApplicabilityAnchor,
   skillEligibleForAutomaticRecall,
 } from '../../memory/skill-store.js';
 import { listWorkflows } from '../../memory/workflow-store.js';
@@ -319,6 +320,7 @@ function rankSkills(
         || skillEligibleForAutomaticRecall(skill)
         || explicitlyNamesCandidate(input, skill.name)
       ))
+      .filter((skill) => skillHasApplicabilityAnchor(input, skill))
       .map((skill) => {
         const description = skill.frontmatter.description || skill.bodyPreview || '';
         const { score, matched } = candidateScore(queryTokens, [
@@ -796,7 +798,11 @@ export function buildAgentContextPacket(
     suppressSemanticEnrichment ? '' : providerAccessLine(),
     ...(suppressSemanticEnrichment
       ? []
-      : renderCandidates('Likely skills', skills, 'If one is relevant, call skill_read before creating the deliverable.')),
+      : renderCandidates(
+          'Likely skills',
+          skills,
+          'Candidates only, not a checklist: call skill_read only when the skill\'s declared purpose fits this request; otherwise continue directly.',
+        )),
     // Pre-flight error library: the freshest distilled lessons for the skills
     // this turn will likely use — surfaced BEFORE acting so a known mistake
     // isn't repeated (they used to be reachable only via skill_read).

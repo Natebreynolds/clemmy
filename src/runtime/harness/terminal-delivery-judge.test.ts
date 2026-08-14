@@ -30,6 +30,7 @@ function audit(
       businessSettlements: 2,
       successfulBusinessSettlements: 1,
       successfulSdkBusinessResults: 0,
+      successfulSdkAuthoringResults: 0,
       unrecoveredBusinessFailures: status === 'unrecovered_failure' ? 1 : 0,
       confirmedWrites: 1,
       uncertainWrites: status === 'uncertain_write' ? 1 : 0,
@@ -50,6 +51,11 @@ function input(overrides: Partial<TerminalDeliveryJudgeInput> = {}): TerminalDel
     },
     settlementAudit: audit(),
     priorConsecutiveResumes: 0,
+    recoveryCapability: {
+      liveContinuation: true,
+      toolsAvailable: true,
+      externalStateInspection: true,
+    },
     ...overrides,
   };
 }
@@ -153,11 +159,16 @@ test('prompt is bounded, names the audit floor and strike count, and asks for al
   assert.match(prompt, /Create the sheet/);
   assert.match(prompt, /Five rows are ready/);
   assert.match(prompt, /IRREVERSIBLE UNCERTAINTY: YES — ASK is mandatory/);
+  assert.match(prompt, /Live continuation: AVAILABLE/);
+  assert.match(prompt, /Tools during continuation: AVAILABLE/);
+  assert.match(prompt, /Read-only external-state inspection: AVAILABLE/);
   assert.match(prompt, /Consecutive RESUME verdicts already honored: 1/);
   assert.ok(prompt.length < 20_000, `prompt was not bounded: ${prompt.length}`);
   assert.match(TERMINAL_DELIVERY_JUDGE_SYSTEM_PROMPT, /"verb":"resume"/);
   assert.match(TERMINAL_DELIVERY_JUDGE_SYSTEM_PROMPT, /"verb":"ask"/);
   assert.match(TERMINAL_DELIVERY_JUDGE_SYSTEM_PROMPT, /"verb":"deliver"/);
+  assert.match(TERMINAL_DELIVERY_JUDGE_SYSTEM_PROMPT, /never ASK the user to inspect a provider/i);
+  assert.match(TERMINAL_DELIVERY_JUDGE_SYSTEM_PROMPT, /specific read-only recovery instruction/i);
 });
 
 test('first RESUME returns one specific recovery edge through one tool-less call', async () => {
@@ -183,7 +194,7 @@ test('first RESUME returns one specific recovery edge through one tool-less call
   assert.equal(fixture.request()?.maxTurns, 1);
 });
 
-test('a second consecutive RESUME deterministically becomes ASK using judge-authored fallback text', async () => {
+test('a second consecutive RESUME becomes ASK even after the recovery edge is spent', async () => {
   const askIfRepeated = 'The exact readback still failed. Which Google account should I use to inspect the sheet with you?';
   const fixture = injectedPort({
     verb: 'resume',
@@ -191,7 +202,14 @@ test('a second consecutive RESUME deterministically becomes ASK using judge-auth
     recoveryInstruction: 'Read the retained sheet once through the account-scoped Sheets connection and bind its rows.',
     askIfRepeated,
   });
-  const result = await evaluateTerminalDelivery(input({ priorConsecutiveResumes: 1 }), {
+  const result = await evaluateTerminalDelivery(input({
+    priorConsecutiveResumes: 1,
+    recoveryCapability: {
+      liveContinuation: false,
+      toolsAvailable: true,
+      externalStateInspection: true,
+    },
+  }), {
     port: fixture.port,
     timeoutMs: 100,
   });
@@ -205,6 +223,58 @@ test('a second consecutive RESUME deterministically becomes ASK using judge-auth
     judge: { modelId: 'claude-haiku-4-5', judgeFamily: 'claude', brainFamily: 'codex' },
   });
   assert.equal(fixture.runCalls(), 1, 'the bound uses the one verdict; no escalation re-prompt occurs');
+});
+
+test('RESUME is unavailable unless the caller proves every recovery capability', async () => {
+  const verdict = {
+    verb: 'resume',
+    reason: 'one exact inspection could close the gap',
+    recoveryInstruction: 'Read the retained sheet by exact identifier and bind its current rows.',
+    askIfRepeated: 'Which connected account should I use to inspect the retained sheet?',
+  };
+  const cases: Array<{
+    name: string;
+    recoveryCapability: TerminalDeliveryJudgeInput['recoveryCapability'];
+  }> = [
+    {
+      name: 'no live continuation',
+      recoveryCapability: {
+        liveContinuation: false,
+        toolsAvailable: true,
+        externalStateInspection: true,
+      },
+    },
+    {
+      name: 'no tools',
+      recoveryCapability: {
+        liveContinuation: true,
+        toolsAvailable: false,
+        externalStateInspection: true,
+      },
+    },
+    {
+      name: 'no read-only inspection',
+      recoveryCapability: {
+        liveContinuation: true,
+        toolsAvailable: true,
+        externalStateInspection: false,
+      },
+    },
+  ];
+
+  for (const candidate of cases) {
+    const fixture = injectedPort(verdict);
+    const result = await evaluateTerminalDelivery(input({
+      recoveryCapability: candidate.recoveryCapability,
+    }), { port: fixture.port, timeoutMs: 100 });
+    assert.deepEqual(result, {
+      status: 'unavailable',
+      cause: 'resume_unavailable',
+      judge: { modelId: 'claude-haiku-4-5', judgeFamily: 'claude', brainFamily: 'codex' },
+    }, candidate.name);
+    assert.equal(fixture.runCalls(), 1, candidate.name);
+    assert.equal('recoveryInstruction' in result, false, candidate.name);
+  }
 });
 
 test('ASK and DELIVER return only their judge-authored public text', async () => {

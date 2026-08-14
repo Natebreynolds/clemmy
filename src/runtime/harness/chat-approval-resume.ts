@@ -32,10 +32,13 @@
  */
 
 import pino from 'pino';
+import { createHash } from 'node:crypto';
 import * as approvalRegistry from './approval-registry.js';
 import {
   beginRunAttempt,
+  finishRunAttempt,
   getActiveRunAttempt,
+  getRunAttemptSourceUserEvent,
   listEvents,
   recordRunAttemptUserInput,
   type EventRow,
@@ -46,6 +49,14 @@ import { getPendingAction } from './pending-actions.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { publicUserInputText } from './public-presentation.js';
 import { freshExternalWriteEvidenceStatus } from './tool-evidence.js';
+import { executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
+import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
+import { commitTurnOutcome } from './delivery-committer.js';
+import { turnOutcomeId, type TurnIdentity } from './turn-outcome.js';
+import { reprojectUndeliveredConversationalApproval } from './claude-agent-approval.js';
+import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
+import { requireActionExpectedWorkActivation } from './action-expected-work-boundary.js';
+import { ToolCallsCounter, withHarnessRunContext } from './brackets.js';
 
 const logger = pino({ name: 'clementine.chat-approval-resume' });
 
@@ -56,7 +67,51 @@ const queuedApprovalResumes = new Map<string, {
   dispatch: ChatApprovalResumeDispatch;
 }>();
 const resumeDrainTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const conversationalDecisionFlights = new Map<string, Promise<boolean>>();
+const conversationalDecisionRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const conversationalDecisionRetryAttempts = new Map<string, number>();
+const conversationalPromptDeliveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const RESUME_DRAIN_DELAY_MS = 25;
+const CONVERSATIONAL_TRANSITION_RETRY_MS = [25, 50, 100, 200] as const;
+
+function waitForConversationalTransition(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function clearConversationalDecisionRetry(approvalId: string): void {
+  const timer = conversationalDecisionRetryTimers.get(approvalId);
+  if (timer) clearTimeout(timer);
+  conversationalDecisionRetryTimers.delete(approvalId);
+  conversationalDecisionRetryAttempts.delete(approvalId);
+}
+
+function scheduleConversationalDecisionRetry(
+  row: approvalRegistry.PendingApprovalRow,
+  reason: string,
+): void {
+  if (conversationalDecisionRetryTimers.has(row.approvalId)) return;
+  const attempt = conversationalDecisionRetryAttempts.get(row.approvalId) ?? 0;
+  conversationalDecisionRetryAttempts.set(row.approvalId, attempt + 1);
+  const delayMs = Math.min(30_000, 250 * (2 ** Math.min(attempt, 7)));
+  const timer = setTimeout(() => {
+    conversationalDecisionRetryTimers.delete(row.approvalId);
+    const current = approvalRegistry.get(row.approvalId);
+    if (!current?.presentation || current.status === 'pending' || !current.resolution) {
+      clearConversationalDecisionRetry(row.approvalId);
+      return;
+    }
+    void settleConversationalApprovalDecision(current).catch((err) => {
+      logger.warn({
+        approvalId: row.approvalId,
+        reason,
+        err: err instanceof Error ? err.message : String(err),
+      }, 'conversational approval retry failed; keeping exact decision open');
+      scheduleConversationalDecisionRetry(current, reason);
+    });
+  }, delayMs);
+  timer.unref?.();
+  conversationalDecisionRetryTimers.set(row.approvalId, timer);
+}
 
 export interface ChatApprovalResumeSource {
   sourceUserSeq: number;
@@ -73,15 +128,133 @@ export type ChatApprovalResumeDispatch = (
   source: ChatApprovalResumeSource,
 ) => Promise<void>;
 
+function slackConversationTarget(
+  presentation: approvalRegistry.ConversationalApprovalPresentation,
+): { channelId: string; threadTs?: string } | null {
+  if (!presentation.conversationKey.startsWith('slack:')) return null;
+  const encoded = presentation.conversationKey.slice('slack:'.length);
+  const separator = encoded.indexOf(':');
+  const channelId = (separator < 0 ? encoded : encoded.slice(0, separator)).trim();
+  const threadTs = separator < 0 ? '' : encoded.slice(separator + 1).trim();
+  if (!/^[CDG][A-Z0-9]+$/.test(channelId)) return null;
+  if (threadTs && !/^\d{10,16}\.\d{6}$/.test(threadTs)) return null;
+  return { channelId, ...(threadTs ? { threadTs } : {}) };
+}
+
+/** Deliver a bound-but-unpresented ordinary question after restart. Provider
+ * idempotency (Discord nonce / Slack exact-delivery metadata) closes the crash
+ * between transport success and the SQLite presentedAt receipt. The retry is
+ * intentionally unref'ed and remains answer-ineligible until a send succeeds. */
+async function deliverUndeliveredConversationalPrompt(
+  approvalId: string,
+  attempt = 0,
+): Promise<void> {
+  conversationalPromptDeliveryTimers.delete(approvalId);
+  const row = approvalRegistry.get(approvalId);
+  const presentation = row?.presentation;
+  if (
+    !row
+    || row.status !== 'pending'
+    || !presentation
+    || presentation.presentedAt
+    || !presentation.promptEventId
+    || !presentation.promptEventSeq
+  ) return;
+  try {
+    const transportTarget = presentation.transportTarget;
+    const target = presentation.originReplyTarget;
+    if (transportTarget?.provider === 'discord') {
+      const { editDiscordChannelMessage } = await import('../../channels/discord.js');
+      await editDiscordChannelMessage(
+        transportTarget.channelId,
+        transportTarget.messageId,
+        presentation.question,
+      );
+    } else if (transportTarget?.provider === 'slack') {
+      const { editSlackChannelMessage } = await import('../../channels/slack.js');
+      await editSlackChannelMessage(
+        transportTarget.channelId,
+        transportTarget.messageTs,
+        presentation.question,
+      );
+    } else if (target.type === 'discord_channel') {
+      const { sendDiscordChannelMessage } = await import('../../channels/discord.js');
+      await sendDiscordChannelMessage(target.channelId, presentation.question, {
+        nonce: approvalRegistry.conversationalApprovalDeliveryKey(approvalId).slice(0, 25),
+        enforceNonce: true,
+      });
+    } else if (target.type === 'slack_channel') {
+      const exactConversation = slackConversationTarget(presentation);
+      if (!exactConversation) throw new Error('stored Slack consent conversation is invalid');
+      const { sendSlackChannelMessage } = await import('../../channels/slack.js');
+      await sendSlackChannelMessage(exactConversation.channelId, presentation.question, {
+        ...(exactConversation.threadTs ? { threadTs: exactConversation.threadTs } : {}),
+        exactDelivery: {
+          key: createHash('sha256').update(approvalRegistry.conversationalApprovalDeliveryKey(approvalId)).digest('hex').slice(0, 32),
+          oldestTs: String(Math.floor(Date.parse(row.requestedAt) / 1000)),
+        },
+      });
+    } else if (target.type === 'slack_user') {
+      const { sendSlackDirectMessage } = await import('../../channels/slack.js');
+      await sendSlackDirectMessage(target.userId, presentation.question, {
+        exactDelivery: {
+          key: createHash('sha256').update(approvalRegistry.conversationalApprovalDeliveryKey(approvalId)).digest('hex').slice(0, 32),
+          oldestTs: String(Math.floor(Date.parse(row.requestedAt) / 1000)),
+        },
+      });
+    } else {
+      // Local transcript clients mark delivery when they actually project the
+      // event. A boot scan must never invent that receipt.
+      return;
+    }
+    approvalRegistry.markConversationalApprovalPresented({
+      approvalId,
+      promptEventId: presentation.promptEventId,
+      promptEventSeq: presentation.promptEventSeq,
+    });
+  } catch (err) {
+    if (attempt === 0 || (attempt & (attempt - 1)) === 0) {
+      logger.warn({
+        approvalId,
+        attempt,
+        err: err instanceof Error ? err.message : String(err),
+      }, 'ordinary send-consent question delivery is pending; will retry');
+    }
+    const delayMs = Math.min(30_000, 1_000 * (2 ** Math.min(attempt, 5)));
+    const timer = setTimeout(() => {
+      void deliverUndeliveredConversationalPrompt(approvalId, attempt + 1);
+    }, delayMs);
+    timer.unref?.();
+    conversationalPromptDeliveryTimers.set(approvalId, timer);
+  }
+}
+
+/** Focused crash/restart verifier. Production scheduling stays private; tests
+ * may drive one deterministic delivery attempt without waiting on timers. */
+export async function _deliverUndeliveredConversationalPromptForTest(
+  approvalId: string,
+): Promise<void> {
+  await deliverUndeliveredConversationalPrompt(approvalId, 0);
+}
+
 function taggedApprovalResponse(row: approvalRegistry.PendingApprovalRow): EventRow | null {
-  const matches = listEvents(row.sessionId, {
-    types: ['user_input_received'],
-  }).filter((event) =>
-    event.data.approvalId === row.approvalId
-    && event.data.decision === 'approve');
-  // Multiple distinct accepted rows claiming one card make ownership
-  // ambiguous. Never guess based on recency.
-  return matches.length === 1 ? matches[0] : null;
+  const sourceUserSeq = row.presentation?.responseSourceUserSeq;
+  if (!row.presentation) {
+    const legacy = listEvents(row.sessionId, { types: ['user_input_received'] })
+      .filter((event) => event.data.approvalId === row.approvalId && event.data.decision === 'approve');
+    return legacy.length === 1 ? legacy[0] : null;
+  }
+  if (!sourceUserSeq) return null;
+  const event = listEvents(row.sessionId, { types: ['user_input_received'] })
+    .find((candidate) => candidate.seq === sourceUserSeq);
+  return event
+    && event.data.source === 'channel_send_consent'
+    && event.data.approvalId === row.approvalId
+    && event.data.decision === (row.resolution === 'approved' ? 'approve' : 'reject')
+    && event.data.userId === row.presentation?.responseUserId
+    && event.data.conversationKey === row.presentation?.conversationKey
+    ? event
+    : null;
 }
 
 /**
@@ -98,7 +271,10 @@ function activeAttemptOwnsApprovalResume(
   attempt: RunAttemptRef,
   row: approvalRegistry.PendingApprovalRow,
 ): boolean {
-  return attempt.runId === approvalResumeRunId(row.approvalId);
+  if (attempt.runId === approvalResumeRunId(row.approvalId)) return true;
+  const accepted = taggedApprovalResponse(row);
+  const source = getRunAttemptSourceUserEvent(attempt);
+  return Boolean(accepted && source?.seq === accepted.seq);
 }
 
 /** True when this logical approval-response source already has a public
@@ -144,6 +320,217 @@ function approvalSourceIsSafeToDispatch(row: approvalRegistry.PendingApprovalRow
   }
 }
 
+function settleConversationalSource(
+  row: approvalRegistry.PendingApprovalRow,
+  source: EventRow,
+  input: { text: string; status: 'done' | 'failed' | 'needs_input' },
+): boolean {
+  const identity: TurnIdentity = {
+    sessionId: source.sessionId,
+    turn: source.turn,
+    sourceUserSeq: source.seq,
+  };
+  try {
+    recordTurnGraphShadow({ identity });
+    const common = { version: 2 as const, id: turnOutcomeId(identity), identity };
+    const outcome = input.status === 'done'
+      ? {
+          ...common,
+          status: 'done' as const,
+          resumable: false as const,
+          presentation: { kind: 'answer' as const, text: input.text },
+        }
+      : input.status === 'needs_input'
+        ? {
+            ...common,
+            status: 'needs_input' as const,
+            resumable: true as const,
+            needs: { kind: 'input' as const },
+            presentation: { kind: 'question' as const, text: input.text },
+          }
+        : {
+            ...common,
+            status: 'failed' as const,
+            resumable: false as const,
+            presentation: { kind: 'error' as const, text: input.text },
+          };
+    commitTurnOutcome(outcome, {
+      legacyReason: 'conversational_send_consent_resolved',
+      metadata: { approvalId: row.approvalId, pendingActionId: pendingActionIdFromArgs(row.args) },
+    });
+    const attempt = getActiveRunAttempt(row.sessionId);
+    if (attempt && getRunAttemptSourceUserEvent(attempt)?.seq === source.seq) {
+      try { finishRunAttempt(attempt, input.status === 'failed' ? 'failed' : 'completed'); } catch { /* terminal wins */ }
+    }
+    HarnessSession.load(row.sessionId)?.clearRunInFlight();
+    return true;
+  } catch (err) {
+    logger.warn({ approvalId: row.approvalId, err: err instanceof Error ? err.message : String(err) },
+      'could not settle conversational send decision source');
+    return false;
+  }
+}
+
+/** Host-owned exact decision recovery. Approved rows execute only the linked
+ * immutable PendingAction; non-retryable PA states project their durable truth
+ * onto B without another provider call. */
+async function settleConversationalApprovalDecisionOnce(
+  candidate: approvalRegistry.PendingApprovalRow,
+): Promise<boolean> {
+  const row = approvalRegistry.get(candidate.approvalId) ?? candidate;
+  if (!row.presentation || row.status === 'pending' || !row.resolution) return false;
+  const source = taggedApprovalResponse(row);
+  if (!source) return false;
+  if (approvalSourceAlreadySettled(row)) return true;
+  const prepared = prepareApprovalResumeSource(row);
+  if (!prepared || prepared.sourceUserSeq !== source.seq) return false;
+  let resolutionReconciled = false;
+  for (let attempt = 0; attempt <= CONVERSATIONAL_TRANSITION_RETRY_MS.length; attempt += 1) {
+    resolutionReconciled = approvalRegistry.reconcileLinkedPendingActionResolution(row);
+    if (resolutionReconciled) break;
+    const delayMs = CONVERSATIONAL_TRANSITION_RETRY_MS[attempt];
+    if (delayMs === undefined) break;
+    await waitForConversationalTransition(delayMs);
+  }
+  if (row.resolution !== 'approved') {
+    // SQLite owns the decision, but the frozen action file must observe the
+    // same denial before B can terminalize. A transient file lock/crash leaves
+    // B open so the listener/boot retry reconciles it; it never turns a durable
+    // reject into a still-pending action record.
+    if (!resolutionReconciled) {
+      scheduleConversationalDecisionRetry(row, 'pending-action-denial-transition');
+      return false;
+    }
+    return settleConversationalSource(row, source, {
+      status: 'done',
+      text: `I left the exact ${row.presentation.actionLabel} unsent.`,
+    });
+  }
+  const pendingActionId = pendingActionIdFromArgs(row.args);
+  let pendingAction = pendingActionId ? getPendingAction(pendingActionId) : null;
+  if (!pendingActionId || !pendingAction || pendingAction.approvalId !== row.approvalId) {
+    return settleConversationalSource(row, source, {
+      status: 'failed',
+      text: 'The frozen send record could not be verified. Nothing was dispatched.',
+    });
+  }
+  if (pendingAction.status === 'approval_requested' && !resolutionReconciled) {
+    // Registry→PA promotion lost a lock or crashed between stores. Do not
+    // consume B with a misleading terminal; boot/ingress will retry the exact
+    // immutable promotion, then this same state machine continues.
+    scheduleConversationalDecisionRetry(row, 'pending-action-approval-transition');
+    return false;
+  }
+  if (pendingAction.status === 'approved') {
+    const approvedPendingAction = pendingAction;
+    recordTurnGraphShadow({ identity: { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq } });
+    // The ordinary "Yes" is a typed control edge over the immutable pending
+    // action, not a fresh conversational task. Rehydrate that exact action
+    // graph and arm the same accepted-task/expected-work authority every other
+    // provider lane must hold before the pending-action executor can cross.
+    // If any part of the frozen consent lineage cannot be reproduced, these
+    // boundaries fail closed before the action claim or provider dispatch.
+    requireAcceptedTaskAuthority({
+      sessionId: source.sessionId,
+      sourceUserSeq: source.seq,
+    });
+    requireActionExpectedWorkActivation({
+      sessionId: source.sessionId,
+      sourceUserSeq: source.seq,
+    });
+    for (let attempt = 0; attempt <= CONVERSATIONAL_TRANSITION_RETRY_MS.length; attempt += 1) {
+      const execution = await withHarnessRunContext({
+        sessionId: source.sessionId,
+        turn: source.turn,
+        sourceUserSeq: source.seq,
+        runAttemptId: prepared.runAttemptId,
+        behaviorScopeId: prepared.runId,
+        counter: new ToolCallsCounter(1),
+      }, () => executeApprovedPendingActionCall(approvedPendingAction.id, {
+        sessionId: row.sessionId,
+        sourceUserSeq: source.seq,
+      }));
+      if (!execution.retryable) break;
+      const delayMs = CONVERSATIONAL_TRANSITION_RETRY_MS[attempt];
+      if (delayMs === undefined) {
+        scheduleConversationalDecisionRetry(row, 'pending-action-execution-transition');
+        return false;
+      }
+      await waitForConversationalTransition(delayMs);
+    }
+    pendingAction = getPendingAction(approvedPendingAction.id);
+  }
+  if (!pendingAction) return false;
+  if (pendingAction.status === 'executed') {
+    return settleConversationalSource(row, source, {
+      status: 'done',
+      text: pendingAction.resultSummary ?? `Executed the exact approved ${pendingAction.toolName} call.`,
+    });
+  }
+  if (pendingAction.status === 'executing') {
+    return settleConversationalSource(row, source, {
+      status: 'failed',
+      text: pendingAction.resultSummary
+        ?? 'The send crossed into an execution attempt, but its outcome is uncertain. I will not retry it automatically.',
+    });
+  }
+  if (pendingAction.status === 'failed') {
+    return settleConversationalSource(row, source, {
+      status: 'failed',
+      text: pendingAction.resultSummary ?? 'The exact approved send failed or became uncertain. I will not retry it automatically.',
+    });
+  }
+  return settleConversationalSource(row, source, {
+    status: 'needs_input',
+    text: `The frozen send is ${pendingAction.status} and was not dispatched. Please ask me to prepare a fresh version if you still want it sent.`,
+  });
+}
+
+export function settleConversationalApprovalDecision(
+  candidate: approvalRegistry.PendingApprovalRow,
+): Promise<boolean> {
+  const existing = conversationalDecisionFlights.get(candidate.approvalId);
+  if (existing) return existing;
+  const flight = settleConversationalApprovalDecisionOnce(candidate)
+    .catch((err) => {
+      logger.warn({
+        approvalId: candidate.approvalId,
+        err: err instanceof Error ? err.message : String(err),
+      }, 'conversational approval settlement hit a pre-provider fault; retry scheduled');
+      scheduleConversationalDecisionRetry(candidate, 'settlement-pre-provider-fault');
+      return false;
+    })
+    .then((settled) => {
+      if (settled) clearConversationalDecisionRetry(candidate.approvalId);
+      return settled;
+    })
+    .finally(() => {
+      if (conversationalDecisionFlights.get(candidate.approvalId) === flight) {
+        conversationalDecisionFlights.delete(candidate.approvalId);
+      }
+    });
+  conversationalDecisionFlights.set(candidate.approvalId, flight);
+  return flight;
+}
+
+function settleConversationalApprovalDecisionInBackground(
+  row: approvalRegistry.PendingApprovalRow,
+  owner: string,
+): void {
+  void settleConversationalApprovalDecision(row).then((settled) => {
+    if (!settled) {
+      logger.warn({ approvalId: row.approvalId, owner },
+        'conversational approval settlement remains open after bounded retry');
+    }
+  }).catch((err) => {
+    logger.error({
+      approvalId: row.approvalId,
+      owner,
+      err: err instanceof Error ? err.message : String(err),
+    }, 'conversational approval background settlement failed');
+  });
+}
+
 /**
  * Bind the exact approval-response source and restart marker before execution.
  * Button/notification surfaces may not have a visible chat row, so the same
@@ -161,9 +548,11 @@ function prepareApprovalResumeSource(
     }).filter((event) => event.data.approvalId === row.approvalId);
     if (existingMatches.length > 0) return null;
   }
-  const attempt = beginRunAttempt(row.sessionId, {
-    runId,
-  });
+  const active = getActiveRunAttempt(row.sessionId);
+  const activeSource = active ? getRunAttemptSourceUserEvent(active) : null;
+  const attempt = active && accepted && activeSource?.seq === accepted.seq
+    ? active
+    : beginRunAttempt(row.sessionId, { runId });
   const source = recordRunAttemptUserInput(attempt, {
     turn: accepted?.turn ?? 0,
     role: 'user',
@@ -387,8 +776,27 @@ let listenerRegistered = false;
 let registeredDispatch: ChatApprovalResumeDispatch | null = null;
 const dispatchResolvedApproval = (row: approvalRegistry.PendingApprovalRow): void => {
   const dispatch = registeredDispatch;
-  if (dispatch) void handleResolvedApprovalForChatResume(row, dispatch);
+  // Conversational consent has a live ingress owner. Let that owner atomically
+  // resolve then await this resume, so the registry listener cannot race it and
+  // queue behind the same active source. Boot recovery below still drains the
+  // durable approved row after a crash.
+  if (row.presentation) {
+    settleConversationalApprovalDecisionInBackground(row, 'approval-resolution-listener');
+  } else if (dispatch) {
+    void handleResolvedApprovalForChatResume(row, dispatch);
+  }
 };
+
+/** Resume one conversation-owned decision with the daemon's registered
+ * dispatcher. The caller must keep the accepted source nonterminal until this
+ * returns; this function adopts that exact active attempt. */
+export async function resumeConversationalApproval(
+  row: approvalRegistry.PendingApprovalRow,
+): Promise<boolean> {
+  const dispatch = registeredDispatch;
+  if (!dispatch || !row.presentation) return false;
+  return handleResolvedApprovalForChatResume(row, dispatch);
+}
 export function startChatApprovalResume(dispatch: ChatApprovalResumeDispatch): void {
   if (started) return;
   started = true;
@@ -406,7 +814,7 @@ export function startChatApprovalResume(dispatch: ChatApprovalResumeDispatch): v
   // The normal handler owns all parked/exact-linked and terminal checks, so
   // rejected, expired, live-wait, consumed, and already-settled rows stay inert.
   const durableApproved = approvalRegistry.listPending({ status: 'resolved' })
-    .filter((row) => row.resolution === 'approved' && !row.consumedAt)
+    .filter((row) => !row.presentation && row.resolution === 'approved' && !row.consumedAt)
     .sort((left, right) =>
       (left.resolvedAt ?? left.requestedAt).localeCompare(right.resolvedAt ?? right.requestedAt)
       || left.approvalId.localeCompare(right.approvalId));
@@ -417,6 +825,47 @@ export function startChatApprovalResume(dispatch: ChatApprovalResumeDispatch): v
     // attempt own crash recovery while the callback runs.
     void handleResolvedApprovalForChatResume(row, dispatch);
   }
+
+  // Reconcile every conversational decision, including PA states that must be
+  // reported without dispatch (executing/failed/executed), and repair a
+  // SQLite-resolved → file-backed approval_requested crash.
+  for (const row of approvalRegistry.listPending({ status: 'resolved' })) {
+    if (row.presentation) {
+      settleConversationalApprovalDecisionInBackground(row, 'daemon-resolved-scan');
+    }
+  }
+
+  // A process may die after provider ingress durably accepted B but before the
+  // registry reply CAS. Adopt only the sole exact first tagged answer; a
+  // duplicate or Yes/No race remains ambiguous and inert.
+  for (const row of approvalRegistry.listPending({ status: 'pending' })) {
+    const tagged = approvalRegistry.taggedConversationalApprovalReply(row);
+    if (!tagged) continue;
+    const resolved = approvalRegistry.resolveConversationalApprovalReply({
+      approvalId: row.approvalId,
+      sourceUserSeq: tagged.sourceUserSeq,
+      userId: tagged.userId,
+      conversationKey: tagged.conversationKey,
+      decision: tagged.decision,
+      resolver: 'daemon-conversation-recovery',
+    });
+    if (resolved.ok && resolved.row) {
+      settleConversationalApprovalDecisionInBackground(resolved.row, 'daemon-tagged-reply-recovery');
+    }
+  }
+
+  // Registration may have committed before its PA link or before the SDK
+  // could publish the ordinary question. Repair the exact link, then re-emit
+  // the same prompt event; a provider transport must still mark presentedAt
+  // before any bare reply can claim it.
+  for (const row of approvalRegistry.listPending({ status: 'pending' })) {
+    if (!row.presentation || row.presentation.presentedAt) continue;
+    const linked = approvalRegistry.reconcileLinkedPendingActionRegistration(row);
+    if (linked) {
+      reprojectUndeliveredConversationalApproval(linked);
+      void deliverUndeliveredConversationalPrompt(linked.approvalId);
+    }
+  }
 }
 
 /** Test hook: clear the in-process one-shot memory. */
@@ -426,6 +875,12 @@ export function _resetChatApprovalResumeForTest(): void {
   queuedApprovalResumes.clear();
   for (const timer of resumeDrainTimers.values()) clearTimeout(timer);
   resumeDrainTimers.clear();
+  conversationalDecisionFlights.clear();
+  for (const timer of conversationalDecisionRetryTimers.values()) clearTimeout(timer);
+  conversationalDecisionRetryTimers.clear();
+  conversationalDecisionRetryAttempts.clear();
+  for (const timer of conversationalPromptDeliveryTimers.values()) clearTimeout(timer);
+  conversationalPromptDeliveryTimers.clear();
   started = false;
   registeredDispatch = null;
 }

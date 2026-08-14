@@ -4710,9 +4710,18 @@ async function finishWorkerRun(
     const parked = markBackgroundTaskAwaitingInput(task.id, questionId, response.text || 'I need your input to continue.');
     if (!acceptWorkerTransition(parked, 'awaiting_input')) return;
     finishRun(run.id, {
-      status: 'awaiting_approval', // run-record paused state (the task status is 'awaiting_input')
+      status: 'awaiting_input',
       message: 'Background task paused for your input.',
       outputPreview: response.text,
+      pendingInput: {
+        kind: 'clarifying_question',
+        questionId,
+        question: parked?.pendingQuestion ?? response.text ?? 'I need your input to continue.',
+        source: { kind: 'background_task', taskId: task.id },
+        nextAction: parked?.outcomeSnapshot?.nextAction
+          ?? response.text
+          ?? 'Reply with the missing input to resume this task.',
+      },
     });
     logger.info({ taskId: task.id, questionId }, 'Background task paused for clarifying input');
     return;
@@ -4748,9 +4757,16 @@ async function finishWorkerRun(
     const parked = markBackgroundTaskAwaitingContinue(task.id, reason, response.text);
     if (!acceptWorkerTransition(parked, 'awaiting_continue')) return;
     finishRun(run.id, {
-      status: 'awaiting_approval',
+      status: 'awaiting_input',
       message: `Background task ${task.id} paused at its run token budget and can be continued.`,
       outputPreview: response.text,
+      pendingInput: {
+        kind: 'continue_authorization',
+        questionId: `continue:${task.id}`,
+        question: reason,
+        source: { kind: 'background_task', taskId: task.id },
+        nextAction: parked?.outcomeSnapshot?.nextAction ?? reason,
+      },
     });
     logger.warn({ taskId: task.id, reason }, 'Background task paused at run token budget (awaiting continue, not done)');
     return;
@@ -4761,9 +4777,16 @@ async function finishWorkerRun(
     const parked = markBackgroundTaskAwaitingContinue(task.id, reason, response.text);
     if (!acceptWorkerTransition(parked, 'awaiting_continue')) return;
     finishRun(run.id, {
-      status: 'awaiting_approval',
+      status: 'awaiting_input',
       message: `Background task ${task.id} paused at its internal run budget and can be continued.`,
       outputPreview: response.text,
+      pendingInput: {
+        kind: 'continue_authorization',
+        questionId: `continue:${task.id}`,
+        question: reason,
+        source: { kind: 'background_task', taskId: task.id },
+        nextAction: parked?.outcomeSnapshot?.nextAction ?? reason,
+      },
     });
     logger.warn({ taskId: task.id, reason }, 'Background task paused awaiting continue (not done)');
     return;
@@ -4792,7 +4815,7 @@ async function finishWorkerRun(
     });
     if (reAnchored) {
       finishRun(run.id, {
-        status: 'awaiting_approval',
+        status: 'queued',
         message: `Background task ${task.id} concluded without its promised deliverable — auto-continuing with the objective re-anchored.`,
         outputPreview: response.text,
       });
@@ -4833,9 +4856,16 @@ async function finishWorkerRun(
       );
       if (!acceptWorkerTransition(parked, 'awaiting_input')) return;
       finishRun(run.id, {
-        status: 'awaiting_approval',
+        status: 'awaiting_input',
         message: `Background task ${task.id} paused on a resumable ${blockerType} dependency.`,
         outputPreview: response.text,
+        pendingInput: {
+          kind: 'clarifying_question',
+          questionId,
+          question: parked?.pendingQuestion ?? dependencyResumeQuestion(blockerType),
+          source: { kind: 'background_task', taskId: task.id },
+          nextAction: parked?.outcomeSnapshot?.nextAction ?? dependencyResumeQuestion(blockerType),
+        },
       });
       clearLedger(task.runSessionId);
       logger.info(
@@ -5120,9 +5150,16 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
           );
           if (!acceptApprovalTransition(parkedOnInput, 'awaiting_input', result.text)) continue;
           finishRun(run.id, {
-            status: 'awaiting_approval', // run-record paused state (the task status is 'awaiting_input')
+            status: 'awaiting_input',
             message: `Background task ${task.id} needs input after approval ${resolution.approvalId}: ${result.awaitingInputQuestion.slice(0, 200)}`,
             outputPreview: result.text,
+            pendingInput: {
+              kind: 'clarifying_question',
+              questionId,
+              question: parkedOnInput?.pendingQuestion ?? result.awaitingInputQuestion,
+              source: { kind: 'background_task', taskId: task.id },
+              nextAction: parkedOnInput?.outcomeSnapshot?.nextAction ?? result.awaitingInputQuestion,
+            },
           });
           logger.info({ taskId: task.id, approvalId: resolution.approvalId, questionId }, 'Background task awaiting input after approval continuation');
           continue;
@@ -5157,7 +5194,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
           });
           if (reAnchored) {
             finishRun(run.id, {
-              status: 'awaiting_approval',
+              status: 'queued',
               message: `Background task ${task.id} concluded without its promised deliverable — auto-continuing with the objective re-anchored.`,
               outputPreview: result.text,
             });
@@ -5189,9 +5226,16 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
             );
             if (!acceptApprovalTransition(parkedOnDependency, 'awaiting_input', result.text)) continue;
             finishRun(run.id, {
-              status: 'awaiting_approval',
+              status: 'awaiting_input',
               message: `Background task ${task.id} paused on a resumable ${blockerType} dependency after approval ${resolution.approvalId}.`,
               outputPreview: result.text,
+              pendingInput: {
+                kind: 'clarifying_question',
+                questionId,
+                question: parkedOnDependency?.pendingQuestion ?? dependencyResumeQuestion(blockerType),
+                source: { kind: 'background_task', taskId: task.id },
+                nextAction: parkedOnDependency?.outcomeSnapshot?.nextAction ?? dependencyResumeQuestion(blockerType),
+              },
             });
             clearLedger(task.runSessionId);
             logger.info(

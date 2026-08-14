@@ -49,8 +49,9 @@ export function workflowEditAdvisories(warnings: string[]): string[] {
 export function preflightWorkflow(
   def: WorkflowDefinition,
   runInputs: Record<string, string> = {},
+  opts: { exactSendCommittedReplayStepIds?: ReadonlySet<string> } = {},
 ): PreflightResult {
-  const check = checkWorkflowForWrite(def);
+  const check = checkWorkflowForWrite(def, opts);
   const capabilityErrors = workflowCapabilityErrors(def);
   const inputs = normalizeWorkflowRunInputs({
     ...Object.fromEntries(

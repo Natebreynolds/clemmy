@@ -50,6 +50,9 @@ const settlements = await import('../runtime/harness/logical-call-settlement-sto
 const { resolveWriteEvidence } = await import('../runtime/harness/work-report.js');
 const { recordStepResult } = await import('../tools/step-result-tool.js');
 const { getRun } = await import('../runtime/run-events.js');
+const {
+  queueWorkflowRunInputResolution,
+} = await import('./workflow-awaiting-input.js');
 
 // No live judge / no live voice model in this hermetic file.
 _setWorkflowWatcherForTests(async () => ({ onTrack: true, miss: '', steer: '' }));
@@ -382,6 +385,162 @@ test('a later accepted source cannot hide an older in-flight crossing in the sam
   assert.equal(audit.clean, false, `older open crossing was hidden: ${JSON.stringify(audit)}`);
   assert.ok(audit.reasons.some((reason: string) => reason.includes('remain open')), JSON.stringify(audit));
 });
+
+test('a harness clarification parks the same workflow run instead of completing a captured partial result', async () => {
+  const workflowName = 'Conversational Clarification Workflow';
+  writeWorkflow('conversational-clarification-workflow', {
+    name: workflowName,
+    description: '',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'choose_scope',
+      prompt: 'Prepare the account view. If the requested scope is ambiguous, ask which scope to use.',
+      sideEffect: 'read',
+      output: { type: 'object' },
+    }],
+  });
+  const runId = 'conversational-clarification-run';
+  const runFile = queueRun(workflowName, runId);
+  const question = 'Should I use the enterprise accounts or the full account list?';
+
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    runConversation: (async (request: { sessionId?: string }) => {
+      const sessionId = String(request.sessionId ?? '');
+      const task = stepSource(sessionId);
+      // A partial structured result exists, but the harness terminal is still a
+      // genuine user-input pause. The partial is recovery context, not authority
+      // to mark the step complete.
+      recordStepResult(sessionId, { prepared: true, rows: [] });
+      eventlog.appendEvent({
+        sessionId,
+        turn: task.turn,
+        role: 'Clem',
+        type: 'awaiting_user_input',
+        data: { question },
+      });
+      return {
+        sessionId,
+        status: 'awaiting_user_input',
+        steps: 1,
+        lastTurn: task.turn,
+        lastDecision: {
+          summary: 'Prepared the view and asked which scope to use.',
+          reply: question,
+          done: false,
+          nextAction: 'awaiting_user_input',
+          reason: 'scope is ambiguous',
+        },
+      };
+    }) as never,
+  });
+  try {
+    await drain();
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+  }
+
+  const durable = JSON.parse(readFileSync(runFile, 'utf-8')) as TerminalRunRecord & {
+    awaitingInput?: { questionId?: string; question?: string; stepId?: string };
+  };
+  assert.equal(
+    durable.status,
+    'awaiting_input',
+    'captured workflow_step_result incorrectly converted awaiting_user_input into a completed workflow',
+  );
+  assert.equal(durable.awaitingInput?.question, question);
+  assert.equal(durable.awaitingInput?.stepId, 'choose_scope');
+  assert.ok(durable.awaitingInput?.questionId, 'the question needs durable identity for conversational answer routing');
+  assert.equal(getRun(runId)?.status, 'awaiting_input', 'the shared RunRecord must mirror the workflow pause');
+});
+
+test('an exact answer re-admits and completes the same parked workflow run', async () => {
+  const workflowName = 'Conversational Resume Workflow';
+  writeWorkflow('conversational-resume-workflow', {
+    name: workflowName,
+    description: '',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'choose_scope',
+      prompt: 'Prepare the requested account view, asking for scope only if it is ambiguous.',
+      sideEffect: 'read',
+      output: { type: 'object' },
+    }],
+  });
+  const runId = 'conversational-resume-run';
+  const originSessionId = 'discord:conversational-resume-origin';
+  const runFile = queueRun(workflowName, runId, originSessionId);
+  const question = 'Should I use enterprise accounts or every account?';
+  let calls = 0;
+
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    runConversation: (async (request: { sessionId?: string; input?: string }) => {
+      calls += 1;
+      const sessionId = String(request.sessionId ?? '');
+      if (calls === 1) {
+        const task = stepSource(sessionId);
+        recordStepResult(sessionId, { prepared: true, rows: [] });
+        eventlog.appendEvent({
+          sessionId,
+          turn: task.turn,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: { question },
+        });
+        return {
+          sessionId,
+          status: 'awaiting_user_input',
+          steps: 1,
+          lastTurn: task.turn,
+          lastDecision: { reply: question, summary: question, done: false, nextAction: 'awaiting_user_input' },
+        };
+      }
+      assert.match(String(request.input ?? ''), /enterprise accounts/i, 'the resumed physical turn receives the exact user answer');
+      recordStepResult(sessionId, { scope: 'enterprise accounts', rows: [{ id: 'account-1' }] });
+      return {
+        sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 2,
+        lastDecision: { summary: 'Prepared the enterprise account view.' },
+      };
+    }) as never,
+  });
+  try {
+    await drain();
+    const paused = JSON.parse(readFileSync(runFile, 'utf-8')) as QueuedRunRecordForInputTest;
+    assert.equal(paused.status, 'awaiting_input');
+    const questionId = paused.awaitingInput?.questionId ?? '';
+    assert.ok(questionId, 'pause carries exact answer-routing identity');
+    assert.deepEqual(
+      queueWorkflowRunInputResolution({
+        runId,
+        questionId,
+        stepId: 'choose_scope',
+        originSessionId,
+        answer: 'Use the enterprise accounts.',
+      }),
+      { status: 'queued', runId, workflowName },
+    );
+    await drain();
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+  }
+
+  const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as QueuedRunRecordForInputTest;
+  assert.equal(calls, 2, 'the same step ran once before and once after the answer');
+  assert.equal(terminal.status, 'completed');
+  assert.equal(terminal.awaitingInput, undefined, 'terminal truth clears the consumed question');
+  assert.equal(getRun(runId)?.status, 'completed');
+  assert.equal(getRun(runId)?.pendingInput, undefined, 'the shared run card clears its consumed blocker');
+});
+
+interface QueuedRunRecordForInputTest extends TerminalRunRecord {
+  awaitingInput?: { questionId?: string; question?: string; stepId?: string; answer?: string };
+}
 
 test('a settlement-audit downgrade still converges the shared RunRecord to terminal needs-attention', async () => {
   const workflowName = 'Terminal Audit Downgrade Workflow';

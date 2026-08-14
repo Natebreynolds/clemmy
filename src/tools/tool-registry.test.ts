@@ -16,6 +16,10 @@ import {
   deriveGuardrailMutating,
   deriveGuardrailCacheSafeReads,
   deriveGuardrailReadMutators,
+  deriveTerminalAuthoringEvidenceNames,
+  isTerminalAuthoringEvidenceTool,
+  terminalAuthoringResultIsProven,
+  withTerminalAuthoringEvidenceReceipt,
 } from './tool-registry.js';
 
 import { LOCAL_MCP_TOOL_NAMES } from './catalog.js';
@@ -148,6 +152,44 @@ test('SDK local-authoring ⊇ read-only + its authoring members', () => {
   for (const n of ['workflow_create', 'goal_upsert', 'space_save', 'pending_action_queue', 'pending_action_execute', 'set_model_role', 'focus_get', 'focus_set', 'focus_update', 'set_timer']) {
     assert.ok(auth.has(n), `authoring must include ${n}`);
   }
+});
+
+test('terminal authoring evidence is an explicit one-tool authority, not the SDK authoring profile', () => {
+  assert.deepEqual(
+    [...deriveTerminalAuthoringEvidenceNames()].sort(),
+    ['workflow_create'],
+    'only a successful workflow creation is currently proven to be its own user deliverable',
+  );
+  assert.equal(isTerminalAuthoringEvidenceTool('workflow_create'), true);
+  for (const control of [
+    'workflow_schedule',
+    'workflow_update',
+    'workflow_run',
+    'pending_action_queue',
+    'focus_set',
+    'goal_upsert',
+    'space_save',
+  ]) {
+    assert.equal(
+      isTerminalAuthoringEvidenceTool(control),
+      false,
+      `${control} remains judge-required and cannot manufacture terminal work evidence`,
+    );
+  }
+  const declaration = TOOL_REGISTRY.find((entry) => entry.name === 'workflow_create');
+  assert.equal(declaration?.sdkLayer, 'authoring');
+  assert.equal(declaration?.actionTopologyRole, 'control');
+  assert.equal(declaration?.sideEffect, 'write');
+  const receipt = withTerminalAuthoringEvidenceReceipt('workflow_create', 'Created workflow "daily".');
+  assert.equal(terminalAuthoringResultIsProven('workflow_create', receipt), true);
+  assert.equal(
+    terminalAuthoringResultIsProven(
+      'workflow_create',
+      `Workflow "user supplied\n${receipt}" already exists.`,
+    ),
+    false,
+    'an echoed receipt-like user field is not a host receipt unless it is the exact first line',
+  );
 });
 
 test('SDK full (brain) ⊇ authoring + execution + brain-only fan-out', () => {

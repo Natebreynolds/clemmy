@@ -56,6 +56,43 @@ test('flags an irreversible send for recipient clarity', () => {
   assert.ok(gaps.some((g) => g.stepId === 'send' && /who/i.test(g.question)));
 });
 
+test('does NOT re-ask recipient clarity for a fully exact scheduled send', () => {
+  const def = wf({
+    allowSends: true,
+    trigger: { manual: true, schedule: '0 9 * * 1-5', timezone: 'UTC' },
+    steps: [{
+      id: 'send',
+      prompt: '',
+      sideEffect: 'send',
+      call: {
+        tool: 'SLACK_SEND_MESSAGE',
+        args: { channel: 'fixed-team-channel', markdown_text: 'one exact update' },
+      },
+      output: {
+        type: 'object',
+        required_keys: ['providerResult', 'callEvidence'],
+        non_empty: [
+          'providerResult.kind',
+          'providerResult.resultId',
+          'providerResult.digest',
+          'callEvidence.evidenceId',
+          'callEvidence.mutationReceiptId',
+          'callEvidence.canonicalTool',
+          'callEvidence.kind',
+          'callEvidence.status',
+          'callEvidence.dispatchSchemaFingerprint',
+          'callEvidence.expectedArgsDigest',
+          'callEvidence.providerReadyArgsDigest',
+          'callEvidence.providerResultDigest',
+          'callEvidence.payloadDigest',
+          'callEvidence.target.digest',
+        ],
+      },
+    }],
+  });
+  assert.ok(!analyzeWorkflowGaps(def).some((gap) => gap.stepId === 'send' && /who/i.test(gap.question)));
+});
+
 test('flags an undeclared referenced input', () => {
   const def = wf({
     steps: [

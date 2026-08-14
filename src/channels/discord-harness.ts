@@ -71,7 +71,12 @@ import {
 import { classifyBackgroundInputReply } from '../execution/background-input-reply.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
-import { pullRecentTurnsForSession, renderTranscriptTurns } from '../runtime/harness/session-transcript.js';
+import {
+  pullRecentTurnsForSession,
+  renderRelevantPriorWorkForModel,
+  renderTranscriptTurns,
+  type RelevantPriorWorkSource,
+} from '../runtime/harness/session-transcript.js';
 import {
   getActiveFocus as getActiveFocusForPrefix,
   createFocus as createFocusForPrefix,
@@ -85,6 +90,11 @@ import {
   pendingActionIdFromArgs,
   type PendingActionApprovalView,
 } from '../runtime/harness/pending-action-view.js';
+import {
+  parseAutonomousSendConsentReply,
+} from '../runtime/harness/autonomous-send-consent.js';
+import { listOpenCheckIns } from '../agents/check-ins.js';
+import { settleConversationalApprovalDecision } from '../runtime/harness/chat-approval-resume.js';
 import { listPlanProposals, approvePlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
@@ -95,12 +105,21 @@ import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { isStatusCommand, buildBoardSummary, formatBoardSummaryText } from '../dashboard/board-summary.js';
 import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
-import { turnOutcomeId, type TurnIdentity } from '../runtime/harness/turn-outcome.js';
+import {
+  assertPublicPresentationText,
+  turnOutcomeId,
+  type TurnIdentity,
+} from '../runtime/harness/turn-outcome.js';
 import { presentationEventFromCompletionData } from '../runtime/harness/turn-outcome.js';
 import {
   publicAsyncWorkDispatchedData,
+  publicConversationPreambleData,
   publicUserInputText,
 } from '../runtime/harness/public-presentation.js';
+import type {
+  ConversationPreambleDeliveryCallback,
+  ConversationPreambleDeliveryResult,
+} from '../types.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
 import {
@@ -257,6 +276,8 @@ function recordActiveChannelUserInput(
       text: modelText,
       displayText,
       progressPresentation,
+      userId: attempt.userId,
+      conversationKey: `${attempt.channel}:${attempt.channelId}`,
       attemptId: attempt.attemptId,
       source: `channel:${attempt.channel}`,
       ...replyAuthority,
@@ -448,6 +469,10 @@ function acceptDurableApprovalControl(input: {
   approvalId?: string;
   candidateApprovalIds?: string[];
   decision: 'approve' | 'reject';
+  userId?: string;
+  conversationKey?: string;
+  source?: 'channel_approval_control' | 'channel_send_consent';
+  preserveUnsettledReplay?: boolean;
 }): { source: EventRow; attempt: RunAttemptRef | null; replayText?: string } | null {
   if (!input.durableRequest) return null;
   if (input.durableRequest.sessionId && input.durableRequest.sessionId !== input.sessionId) {
@@ -468,6 +493,9 @@ function acceptDurableApprovalControl(input: {
       prior.source.data.approvalId !== input.approvalId
       || prior.source.data.decision !== input.decision
       || JSON.stringify(sourceCandidates) !== JSON.stringify(expectedCandidates)
+      || (input.userId !== undefined && prior.source.data.userId !== input.userId)
+      || (input.conversationKey !== undefined && prior.source.data.conversationKey !== input.conversationKey)
+      || prior.source.data.source !== (input.source ?? 'channel_approval_control')
     ) {
       throw new Error(`durable approval run ${input.durableRequest.runId} is bound to a different decision`);
     }
@@ -479,6 +507,10 @@ function acceptDurableApprovalControl(input: {
       }
       return { ...prior, replayText: outcome.text };
     }
+    // The exact consent-resume owner, not this ingress retry, must finish a
+    // source that may already be across the provider boundary. Preserve the
+    // active attempt for in-process adoption or boot recovery.
+    if (input.preserveUnsettledReplay) return prior;
     const failed = commitDiscordTerminal({
       source: prior.source,
       text: PUBLIC_CHANNEL_FAILURE_TEXT,
@@ -499,7 +531,9 @@ function acceptDurableApprovalControl(input: {
     data: {
       text: input.displayText,
       displayText: input.displayText,
-      source: 'channel_approval_control',
+      source: input.source ?? 'channel_approval_control',
+      ...(input.userId ? { userId: input.userId } : {}),
+      ...(input.conversationKey ? { conversationKey: input.conversationKey } : {}),
       ...(input.approvalId ? { approvalId: input.approvalId } : {}),
       ...(input.candidateApprovalIds && input.candidateApprovalIds.length > 0
         ? { candidateApprovalIds: input.candidateApprovalIds }
@@ -534,6 +568,67 @@ function settleDurableApprovalControl(
     clearChannelRunMarkerIfIdle(accepted.source.sessionId, accepted.attempt.attemptId);
   }
   return committed.presentation.text;
+}
+
+/** Accept an ordinary send-consent answer without replacing the physical run
+ * that may currently be paused inside the SDK permission hook. A generic
+ * beginRunAttempt would supersede that executor before its exact resumable
+ * claim can continue. The provider inbox already supplies the stable runId;
+ * this event is its durable one-shot source and is later adopted by a parked
+ * approval resume only when the original run no longer owns execution. */
+function acceptDurableConversationalControl(input: {
+  durableRequest: DurableChannelRequest;
+  sessionId: string;
+  displayText: string;
+  approvalId: string;
+  decision: 'approve' | 'reject';
+  userId: string;
+  conversationKey: string;
+}): { source: EventRow; attempt: RunAttemptRef | null; replayText?: string } {
+  if (input.durableRequest.sessionId && input.durableRequest.sessionId !== input.sessionId) {
+    throw new Error(`durable consent run ${input.durableRequest.runId} is bound to another session`);
+  }
+  const priorMatches = listHarnessEvents(input.sessionId, {
+    types: ['user_input_received'],
+  }).filter((event) => (
+    event.data.source === 'channel_send_consent'
+    && event.data.runId === input.durableRequest.runId
+  ));
+  if (priorMatches.length > 1) throw new Error('durable consent run has ambiguous accepted sources');
+  if (priorMatches.length === 1) {
+    const source = priorMatches[0];
+    if (
+      publicUserInputText(source.data) !== input.displayText.trim()
+      || source.data.approvalId !== input.approvalId
+      || source.data.decision !== input.decision
+      || source.data.userId !== input.userId
+      || source.data.conversationKey !== input.conversationKey
+    ) throw new Error('durable consent run is already bound to a different answer');
+    input.durableRequest.onSourceAccepted?.(source);
+    const previous = getLatestRunAttemptByRunId(input.sessionId, input.durableRequest.runId);
+    return { source, attempt: previous ?? null, replayText: acceptedChannelOutcome(source)?.text };
+  }
+  // The native SDK call was parked before provider dispatch and ownership now
+  // belongs to the host PendingAction machine. Give this exact reply its own
+  // durable physical attempt so provider execution and the terminal are both
+  // settled against B, never against the earlier request or a fresh model turn.
+  const attempt = beginRunAttempt(input.sessionId, { runId: input.durableRequest.runId });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 0,
+    role: 'user',
+    data: {
+      text: input.displayText,
+      displayText: input.displayText,
+      source: 'channel_send_consent',
+      approvalId: input.approvalId,
+      decision: input.decision,
+      userId: input.userId,
+      conversationKey: input.conversationKey,
+      runId: input.durableRequest.runId,
+    },
+  }, { armRunInFlight: true });
+  input.durableRequest.onSourceAccepted?.(source);
+  return { source, attempt };
 }
 
 export class UnboundDurableApprovalReplyError extends Error {
@@ -803,15 +898,17 @@ function getOrHydrateChannelSession(channelId: string, channel: string = 'discor
  */
 const STALE_SESSION_MS = 30 * 60 * 1000;
 
-function resolveOrCreateSession(opts: {
+async function resolveOrCreateSession(opts: {
   channelId: string;
   userId: string;
   guildId: string | null;
   prompt: string;
+  /** Exact human-authored objective for conservative prior-work matching. */
+  priorWorkObjective?: string;
   /** Channel kind for the harness session (default 'discord'). Slack passes
    *  'slack' so sessions/continuity/activity stay correctly attributed. */
   channel?: string;
-}): { id: string; isContinuation: boolean } {
+}): Promise<{ id: string; isContinuation: boolean }> {
   const channel = opts.channel ?? 'discord';
   const now = Date.now();
   const existing = getOrHydrateChannelSession(opts.channelId, channel);
@@ -861,7 +958,15 @@ function resolveOrCreateSession(opts: {
   // conversation; the new session asked for clarification on something
   // the prior session had already specified — 25/batch via firecrawl.)
   try {
-    seedCrossSessionPrefix(session.id, opts.channelId, now, opts.prompt, channel);
+    await seedCrossSessionPrefix(
+      session.id,
+      opts.channelId,
+      opts.userId,
+      now,
+      opts.prompt,
+      channel,
+      opts.priorWorkObjective ?? opts.prompt,
+    );
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err), channelId: opts.channelId }, 'cross-session prefix seed failed (non-fatal)');
   }
@@ -879,8 +984,59 @@ const CROSS_SESSION_PREFIX_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
 // e.g. five 5-minute sessions still surfaces its full arc.
 const PREFIX_LOOKBACK_SESSIONS = 4;
 const PREFIX_MAX_TURNS_PER_SESSION = 6;
+const HISTORICAL_PRIOR_WORK_WINDOW_MS = 14 * 24 * 60 * 60 * 1_000;
+const HISTORICAL_PRIOR_WORK_SOURCE_LIMIT = 24;
 
-function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: number, newMessage?: string, channel: string = 'discord'): void {
+function historicalPriorWorkSources(
+  db: ReturnType<typeof openEventLog>,
+  input: {
+    newSessionId: string;
+    channelId: string;
+    userId: string;
+    channel: string;
+    now: number;
+  },
+): RelevantPriorWorkSource[] {
+  const upperBound = new Date(input.now).toISOString();
+  const lowerBound = new Date(input.now - HISTORICAL_PRIOR_WORK_WINDOW_MS).toISOString();
+  return (db.prepare(
+    `SELECT e.session_id AS sourceSessionId, e.seq AS sourceUserSeq
+       FROM events e
+       JOIN sessions s ON s.id = e.session_id
+      WHERE e.type = 'user_input_received'
+        AND e.role = 'user'
+        AND COALESCE(json_extract(e.data_json, '$.synthetic'), 0) != 1
+        AND e.session_id != ?
+        AND s.channel = ?
+        AND COALESCE(s.user_id, json_extract(s.metadata_json, '$.userId')) = ?
+        AND json_extract(s.metadata_json, '$.channelId') = ?
+        AND e.created_at >= ?
+        AND e.created_at <= ?
+      ORDER BY e.seq DESC
+      LIMIT ?`,
+  ).all(
+    input.newSessionId,
+    input.channel,
+    input.userId,
+    input.channelId,
+    lowerBound,
+    upperBound,
+    HISTORICAL_PRIOR_WORK_SOURCE_LIMIT,
+  ) as Array<{ sourceSessionId: string; sourceUserSeq: number }>).map((row) => ({
+    sourceSessionId: row.sourceSessionId,
+    sourceUserSeq: row.sourceUserSeq,
+  }));
+}
+
+async function seedCrossSessionPrefix(
+  newSessionId: string,
+  channelId: string,
+  userId: string,
+  now: number,
+  newMessage?: string,
+  channel: string = 'discord',
+  priorWorkObjective: string = newMessage ?? '',
+): Promise<void> {
   const db = openEventLog();
   // Find the most recent N prior sessions for this channel (exclude
   // the newly-created one). We walk multiple sessions because the
@@ -895,14 +1051,12 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
        ORDER BY updated_at DESC
        LIMIT ?`,
   ).all(channel, newSessionId, channelId, PREFIX_LOOKBACK_SESSIONS) as Array<{ id: string; updated_at: string }>;
-  if (priorRows.length === 0) return;
 
   // Filter to those still inside the prefix window.
   const inWindow = priorRows.filter((r) => {
     const ms = Date.parse(r.updated_at);
     return Number.isFinite(ms) && now - ms <= CROSS_SESSION_PREFIX_WINDOW_MS;
   });
-  if (inWindow.length === 0) return;
 
   // Spend the char budget NEWEST-first (inWindow is updated_at DESC) so a
   // back-reference keeps the most-relevant recent sessions; the old code
@@ -920,8 +1074,22 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
     sectionBlocks.push(block);
     totalChars += block.length;
   }
-  if (sectionBlocks.length === 0) return;
   sectionBlocks.reverse(); // chronological (oldest → newest) for reading
+
+  // Historical candidates are deliberately broader than continuation: same
+  // human + channel, at most 24 accepted sources over 14 days. Exact source
+  // refs retain provenance while semantic ranking remains non-authoritative.
+  const priorWorkSources = historicalPriorWorkSources(db, {
+    newSessionId,
+    channelId,
+    userId,
+    channel,
+    now,
+  });
+  const priorWork = await renderRelevantPriorWorkForModel(db, {
+    currentObjective: priorWorkObjective,
+    priorSources: priorWorkSources,
+  });
 
   // Surface active focus state too — if a focus is pinned, the new
   // session should treat it as authoritative context.
@@ -947,10 +1115,21 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
     }
   } catch { /* ignore */ }
 
-  const headerLines = [
-    '[CONTINUATION CONTEXT — the user\'s message in this fresh session likely refers back to the recent conversation thread below. Treat this as authoritative context; do NOT ask the user to repeat decisions already made.]',
-  ];
-  if (focusBlock) headerLines.push('', focusBlock);
+  if (sectionBlocks.length === 0 && priorWork.count === 0) return;
+
+  const continuationLines: string[] = [];
+  if (sectionBlocks.length > 0) {
+    continuationLines.push(
+      '[CONTINUATION CONTEXT — the user\'s message in this fresh session likely refers back to the recent conversation thread below. Treat this as authoritative context; do NOT ask the user to repeat decisions already made.]',
+    );
+    if (focusBlock) continuationLines.push('', focusBlock);
+    continuationLines.push(
+      '',
+      ...sectionBlocks,
+      '',
+      '[End of continuation context. The user\'s next message follows.]',
+    );
+  }
 
   appendHarnessEvent({
     sessionId: newSessionId,
@@ -961,13 +1140,19 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
       priorSessionIds: inWindow.map((r) => r.id),
       sessionsIncluded: sectionBlocks.length,
       totalChars,
+      ...(priorWork.count > 0 ? {
+        priorWork: {
+          version: 2,
+          match: 'historical_candidates',
+          queryHash: priorWork.queryHash,
+          count: priorWork.count,
+          items: priorWork.items,
+        },
+      } : {}),
       text: [
-        ...headerLines,
-        '',
-        ...sectionBlocks,
-        '',
-        '[End of continuation context. The user\'s next message follows.]',
-      ].join('\n'),
+        ...(priorWork.text ? [priorWork.text, ''] : []),
+        ...continuationLines,
+      ].join('\n').trim(),
     },
   });
 }
@@ -1208,8 +1393,15 @@ export async function handleHarnessNew(opts: {
 
   if (entry) {
     const pending = approvalRegistry.listPending({ sessionId: entry.sessionId, status: 'pending' });
-    const addressableHint = pending.length > 0
-      ? ` The paused session is still reachable via \`approve ${pending[0].approvalId}\` (or \`reject\`).`
+    // A conversational send answer is valid only in the exact question slot.
+    // Starting a fresh session abandons that slot; never preserve it as an
+    // addressable apr-id capability (that surface is intentionally disabled).
+    for (const row of pending.filter((candidate) => !approvalRegistry.isFormalApprovalSurface(candidate))) {
+      approvalRegistry.resolve(row.approvalId, 'cancelled_by_user', `${opts.channel ?? 'discord'}-new-session`);
+    }
+    const formal = pending.filter(approvalRegistry.isFormalApprovalSurface);
+    const addressableHint = formal.length > 0
+      ? ` The paused session is still reachable via \`approve ${formal[0].approvalId}\` (or \`reject\`).`
       : '';
     await opts.transport.sendInitial(`🍊 Fresh session ready. Send your first message.${addressableHint}`);
   } else {
@@ -1244,7 +1436,8 @@ function collectDiscordSessionOptions(channelId: string, channel: string = 'disc
   const byId = new Map<string, DiscordSessionOption>();
   const pendingRows = approvalRegistry
     .listPending({ status: 'pending' })
-    .filter((row) => approvalRegistry.isActionable(row));
+    .filter((row) => approvalRegistry.isActionable(row))
+    .filter(approvalRegistry.isFormalApprovalSurface);
   const pendingBySession = new Map<string, approvalRegistry.PendingApprovalRow[]>();
   for (const row of pendingRows) {
     const rows = pendingBySession.get(row.sessionId) ?? [];
@@ -1613,7 +1806,190 @@ function approvalOriginMatchesDiscordChannel(
 function pendingDiscordApprovalsForChannel(channelId: string, channel: string = 'discord'): approvalRegistry.PendingApprovalRow[] {
   return approvalRegistry
     .listPending({ status: 'pending' })
+    .filter(approvalRegistry.isFormalApprovalSurface)
     .filter((row) => approvalBelongsToDiscordChannel(row, channelId, channel));
+}
+
+function approvalSessionTargetsChannel(
+  row: approvalRegistry.PendingApprovalRow,
+  channelId: string,
+  channel: string,
+): boolean {
+  if (isDiscordApproval(row, channel)) {
+    return approvalOriginMatchesDiscordChannel(row, channelId, channel);
+  }
+  const session = getHarnessSession(row.sessionId);
+  const metadata = session?.metadata ?? {};
+  if (channel === 'discord') {
+    return metadata.channelId === channelId || metadata.discordChannelId === channelId;
+  }
+  if (channel === 'slack') {
+    return metadata.channelId === channelId || metadata.slackChannelId === channelId;
+  }
+  return metadata.channelId === channelId;
+}
+
+/**
+ * A bare conversational yes/no can authorize only one exact, frozen send in
+ * this conversation. Search all durable rows related to the channel (including
+ * direct Claude-SDK rows whose legacy channel columns are null), then require
+ * a sole eligible row. Any sibling approval keeps the answer ambiguous and no
+ * authority is selected.
+ */
+function soleAutonomousSendConsentApproval(
+  channelId: string,
+  channel: string,
+  userId: string,
+  conversationKey: string,
+): approvalRegistry.PendingApprovalRow | null {
+  const rows = approvalRegistry
+    .listPending({ status: 'pending' })
+    .filter((row) => approvalRegistry.isActionable(row))
+    .filter((row) => approvalSessionTargetsChannel(row, channelId, channel));
+  if (rows.length !== 1) return null;
+  const row = rows[0];
+  const presentation = row.presentation;
+  if (
+    !presentation
+    || !presentation.presentedAt
+    || !presentation.promptEventId
+    || !presentation.promptEventSeq
+    || presentation.responseSourceUserSeq !== null
+    || presentation.responseUserId !== null
+    || presentation.audienceUserId !== userId
+    || presentation.conversationKey !== conversationKey
+  ) return null;
+  // A later visible question owns the next answer slot. Legacy check-ins do not
+  // yet carry provider conversation identity, so fail closed only for ones
+  // asked after this send question was actually delivered. Older/stale open
+  // files (including a clarification already consumed by continuity) cannot
+  // strand a newly-presented exact send consent.
+  const presentedAt = Date.parse(presentation.presentedAt);
+  if (listOpenCheckIns().some((checkIn) => {
+    const askedAt = Date.parse(checkIn.askedAt);
+    return !Number.isFinite(presentedAt) || !Number.isFinite(askedAt) || askedAt > presentedAt;
+  })) return null;
+  // Any later answer-slot event in this exact harness session supersedes P,
+  // even if it came from background/clarification work before another user
+  // input. Bare Yes must never answer an older send question still on disk.
+  const promptEventSeq = presentation.promptEventSeq;
+  const laterQuestion = listHarnessEvents(row.sessionId, {
+    types: ['awaiting_user_input'],
+    sinceSeq: promptEventSeq,
+  }).some((event) => event.seq > promptEventSeq);
+  if (laterQuestion) return null;
+  // Only the immediate next accepted real input can own this slot. A prior
+  // reply means the frozen version is stale even if it was not yes/no.
+  const intervening = listHarnessEvents(row.sessionId, {
+    types: ['user_input_received'],
+    sinceSeq: promptEventSeq,
+  }).some((event) => event.data.synthetic !== true);
+  return intervening ? null : row;
+}
+
+function addressedAutonomousSendConsentApproval(
+  channelId: string,
+  channel: string,
+  userId: string,
+  conversationKey: string,
+): approvalRegistry.PendingApprovalRow | null {
+  const rows = approvalRegistry
+    .listPending({ status: 'pending' })
+    .filter((row) => approvalRegistry.isActionable(row))
+    .filter((row) => approvalSessionTargetsChannel(row, channelId, channel));
+  if (rows.length !== 1) return null;
+  const presentation = rows[0].presentation;
+  return presentation
+    && presentation.presentedAt
+    && presentation.promptEventId
+    && presentation.promptEventSeq
+    && presentation.responseSourceUserSeq === null
+    && presentation.responseUserId === null
+    && presentation.audienceUserId === userId
+    && presentation.conversationKey === conversationKey
+    ? rows[0]
+    : null;
+}
+
+function recoverableAutonomousSendConsentApproval(input: {
+  channelId: string;
+  channel: string;
+  userId: string;
+  conversationKey: string;
+  runId: string;
+  decision: 'approve' | 'reject';
+}): approvalRegistry.PendingApprovalRow | null {
+  const matches = approvalRegistry.listPending({ status: 'pending' })
+    .filter((row) => approvalRegistry.isActionable(row))
+    .filter((row) => approvalSessionTargetsChannel(row, input.channelId, input.channel))
+    .filter((row) => {
+      const tagged = approvalRegistry.taggedConversationalApprovalReply(row);
+      return tagged?.runId === input.runId
+        && tagged.userId === input.userId
+        && tagged.conversationKey === input.conversationKey
+        && tagged.decision === input.decision;
+    });
+  return matches.length === 1 ? matches[0] : null;
+}
+
+async function handleAutonomousSendConsentReply(input: {
+  row: approvalRegistry.PendingApprovalRow;
+  decision: 'approve' | 'reject';
+  prompt: string;
+  userId: string;
+  conversationKey: string;
+  durableRequest: DurableChannelRequest;
+  transport: DiscordHarnessTransport;
+  channel: string;
+}): Promise<boolean> {
+  const accepted = acceptDurableConversationalControl({
+    durableRequest: input.durableRequest,
+    sessionId: input.row.sessionId,
+    displayText: input.prompt,
+    approvalId: input.row.approvalId,
+    decision: input.decision,
+    userId: input.userId,
+    conversationKey: input.conversationKey,
+  });
+  if (accepted.replayText) {
+    await input.transport.sendInitial(accepted.replayText);
+    return true;
+  }
+  const resolved = approvalRegistry.resolveConversationalApprovalReply({
+    approvalId: input.row.approvalId,
+    sourceUserSeq: accepted.source.seq,
+    userId: input.userId,
+    conversationKey: input.conversationKey,
+    decision: input.decision,
+    resolver: `${input.channel}-conversation`,
+  });
+  if (!resolved.ok || !resolved.row) {
+    const text = settleDurableApprovalControl(
+      accepted,
+      'I did not authorize that send because this reply no longer matches the exact question, person, or conversation. The prepared version remains unsent.',
+      'needs_input',
+    );
+    await input.transport.sendInitial(text);
+    return true;
+  }
+
+  if (input.decision === 'reject') {
+    const text = settleDurableApprovalControl(
+      accepted,
+      `I left the exact ${resolved.row.presentation?.actionLabel ?? 'message'} unsent.`,
+      'done',
+    );
+    await input.transport.sendInitial(text);
+    return true;
+  }
+
+  // The shared host recovery machine owns execution and B's terminal. It also
+  // projects executing/executed/failed crash states without redispatch.
+  await settleConversationalApprovalDecision(resolved.row);
+  const outcome = acceptedChannelOutcome(accepted.source);
+  await input.transport.sendInitial(outcome?.text
+    ?? 'I recorded your decision for that exact version. Its protected execution state is being reconciled; I will not dispatch a duplicate.');
+  return true;
 }
 
 function exactBareApprovalCandidate(
@@ -1628,6 +2004,7 @@ function globalApprovalRowsForDm(channelId: string, channel: string = 'discord')
   if (boundSessionId) activeSessionIds.add(boundSessionId);
   return approvalRegistry
     .listPending({ status: 'pending' })
+    .filter(approvalRegistry.isFormalApprovalSurface)
     .filter((row) => {
       if (!approvalRegistry.isActionable(row)) return false;
       if (isDiscordApproval(row, channel)) return approvalBelongsToDiscordChannel(row, channelId, channel);
@@ -1694,6 +2071,7 @@ async function sendApprovalPicker(
 }
 
 export const __test__ = {
+  createChannelConversationPreambleDelivery,
   approvalBelongsToDiscordChannel,
   approvalComponentsForState,
   approvalPickerComponents,
@@ -1716,6 +2094,34 @@ export const __test__ = {
   progressPresentationForSessionForTest: progressPresentationForSession,
   commitDiscordAnswerForTest: commitDiscordAnswer,
   acceptedChannelOutcome,
+  seedCrossSessionPrefixForTest(input: {
+    newSessionId: string;
+    channelId: string;
+    userId: string;
+    now: number;
+    newMessage?: string;
+    channel?: string;
+    priorWorkObjective?: string;
+  }): Promise<void> {
+    return seedCrossSessionPrefix(
+      input.newSessionId,
+      input.channelId,
+      input.userId,
+      input.now,
+      input.newMessage,
+      input.channel ?? 'discord',
+      input.priorWorkObjective ?? input.newMessage ?? '',
+    );
+  },
+  historicalPriorWorkSourcesForTest(input: {
+    newSessionId: string;
+    channelId: string;
+    userId: string;
+    channel: string;
+    now: number;
+  }): RelevantPriorWorkSource[] {
+    return historicalPriorWorkSources(openEventLog(), input);
+  },
   applyEventToAcceptedChannelState,
   createChannelProgressLane,
   channelActivityForState,
@@ -1752,9 +2158,62 @@ export async function tryHandleHarnessApprovalReply(opts: {
   /** Synthetic stop→reject routing uses approval semantics only when a card
    *  actually exists; otherwise the caller must continue to its stop control. */
   onlyIfApprovalPending?: boolean;
+  /** Exact provider human and conversation for ordinary-question consent.
+   * Formal card/button routes intentionally do not depend on these fields. */
+  userId?: string;
+  conversationKey?: string;
 }): Promise<boolean> {
   const channel = opts.channel ?? 'discord';
-  const intent = parseApprovalIntent(opts.prompt);
+  const conversationalDecision = parseAutonomousSendConsentReply(opts.prompt);
+  const addressedConversation = opts.userId && opts.conversationKey
+    ? addressedAutonomousSendConsentApproval(
+        opts.channelId,
+        channel,
+        opts.userId,
+        opts.conversationKey,
+      )
+    : null;
+  if (
+    conversationalDecision
+    && opts.userId
+    && opts.conversationKey
+    && opts.durableRequest
+  ) {
+    const row = recoverableAutonomousSendConsentApproval({
+      channelId: opts.channelId,
+      channel,
+      userId: opts.userId,
+      conversationKey: opts.conversationKey,
+      runId: opts.durableRequest.runId,
+      decision: conversationalDecision,
+    }) ?? soleAutonomousSendConsentApproval(
+      opts.channelId, channel, opts.userId, opts.conversationKey,
+    );
+    if (row) {
+      return handleAutonomousSendConsentReply({
+        row,
+        decision: conversationalDecision,
+        prompt: opts.prompt,
+        userId: opts.userId,
+        conversationKey: opts.conversationKey,
+        durableRequest: opts.durableRequest,
+        transport: opts.transport,
+        channel,
+      });
+    }
+  }
+  // The first addressed reply consumes the slot even when it changes the
+  // subject/body or answers another visible check-in. Cancel the old frozen
+  // capability before the message falls through as an ordinary new task; a
+  // later bare Yes can never send the stale version.
+  if (addressedConversation) {
+    approvalRegistry.resolve(
+      addressedConversation.approvalId,
+      'cancelled_by_user',
+      `${channel}-conversation-changed`,
+    );
+  }
+  let intent = parseApprovalIntent(opts.prompt);
   if (!intent) return false;
   // T-WF-1 addendum: when the user types `approve apr-xxxx`, the
   // approval may belong to a WORKFLOW session that isn't bound to
@@ -1780,6 +2239,21 @@ export async function tryHandleHarnessApprovalReply(opts: {
         approvalId: intent.approvalId,
         transport: opts.transport,
         text: `No pending approval matches \`${intent.approvalId}\`. It may have already been resolved or expired.`,
+        status: 'needs_input',
+      });
+      return true;
+    }
+    if (row.presentation) {
+      await settleApprovalRoutingReply({
+        durableRequest: opts.durableRequest,
+        channelId: opts.channelId,
+        channel,
+        prompt: opts.prompt,
+        decision: intent.decision,
+        approvalId: row.approvalId,
+        candidateRows: [row],
+        transport: opts.transport,
+        text: 'That protected send is not a formal approval card and cannot be authorized by ID or from another surface. Answer the ordinary question in its original conversation; if that reply slot changed, ask me to prepare the send again.',
         status: 'needs_input',
       });
       return true;
@@ -1989,6 +2463,15 @@ export async function tryHandleHarnessApprovalReply(opts: {
   }
   if (!isChannelSessionAwaitingApproval(opts.channelId, channel)) {
     if (opts.onlyIfApprovalPending) return false;
+    // NOTHING IS PENDING, SO THIS WAS NEVER AN APPROVAL. Without an explicit
+    // apr-id, "go ahead" / "do it" / "proceed" is ordinary conversation —
+    // overwhelmingly the user answering Clem's own question ("Reply 'go
+    // ahead' and I'll run it"). Refusing it with "no pending approval is
+    // waiting" answered a question nobody asked and dropped the real
+    // instruction on the floor (live 2026-08-12, Discord). Fall through to
+    // the normal turn: the approval router only owns messages that resolve
+    // a card that actually exists.
+    if (!intent.approvalId) return false;
     await settleApprovalRoutingReply({
       durableRequest: opts.durableRequest,
       channelId: opts.channelId,
@@ -1997,7 +2480,7 @@ export async function tryHandleHarnessApprovalReply(opts: {
       decision: intent.decision,
       approvalId: intent.approvalId,
       transport: opts.transport,
-      text: 'No pending approval is waiting in this conversation.',
+      text: `No pending approval matches \`${intent.approvalId}\` in this conversation.`,
       status: 'needs_input',
     });
     return true;
@@ -2057,6 +2540,14 @@ export interface DiscordHarnessTransport {
    * byte-identical. Implementations must swallow their own errors.
    */
   onState?(state: DisplayState): void;
+  /** Provider-specific exact delivery hook used only for the final autonomous
+   * send question. Implementations must dedupe this stable key across live
+   * edit and restart redelivery, then return only after provider success. */
+  deliverConversationalApproval?(input: {
+    approvalId: string;
+    deliveryKey: string;
+    content: string;
+  }): Promise<void>;
 }
 
 export interface DiscordHarnessReplyHandle {
@@ -2083,6 +2574,12 @@ export interface DisplayState {
   // Cleared on approval_resolved / awaiting_user_input / completion.
   pendingApprovalId?: string;
   pendingApprovalIds?: string[];
+  /** Hidden durable approval whose only user surface is the ordinary question
+   * in summary. Kept separate so no component/card projector can mistake it
+   * for a formal approval. */
+  pendingConversationApprovalId?: string;
+  pendingConversationPromptEventId?: string;
+  pendingConversationPromptEventSeq?: number;
   // Exact queued-action cards approve one immutable payload. Editing those
   // args would break the approval authority binding, so the UI hides Edit.
   // Undefined preserves the legacy editable behavior for ordinary approvals
@@ -2106,6 +2603,48 @@ export interface DisplayState {
    * so every surface says the same thing about the same run.
    */
   activityLine?: string;
+}
+
+interface ChannelConversationPreambleDeliveryInput {
+  progressPresentation: ProgressPresentation;
+  state: DisplayState;
+  handle: DiscordHarnessReplyHandle;
+  transport: DiscordHarnessTransport;
+  isFinalized: () => boolean;
+  onPaint?: (body: string) => void;
+  onTokenExpired?: () => void;
+}
+
+/** Build the one awaited transport acknowledgement used before work begins. */
+function createChannelConversationPreambleDelivery(
+  input: ChannelConversationPreambleDeliveryInput,
+): ConversationPreambleDeliveryCallback {
+  return async (value): Promise<ConversationPreambleDeliveryResult> => {
+    let text: string;
+    try { text = assertPublicPresentationText(value); } catch {
+      return { status: 'failed', reason: 'delivery_failed' };
+    }
+    if (input.progressPresentation === 'quiet') return { status: 'delivered' };
+    if (input.isFinalized()) return { status: 'failed', reason: 'transport_unavailable' };
+    input.state.summary = text;
+    input.state.done = false;
+    if (input.state.toolCount === 0) input.state.status = 'starting';
+    const body = renderBody(input.state);
+    try {
+      await input.handle.edit(body);
+      input.onPaint?.(body);
+      return { status: 'delivered' };
+    } catch (err) {
+      if (isDiscordTokenExpired(err)) input.onTokenExpired?.();
+      if (!input.transport.sendFollowup) return { status: 'failed', reason: 'delivery_failed' };
+      try {
+        await input.transport.sendFollowup(text);
+        return { status: 'delivered' };
+      } catch {
+        return { status: 'failed', reason: 'delivery_failed' };
+      }
+    }
+  };
 }
 
 /**
@@ -2135,6 +2674,7 @@ function channelActivityForState(
   state: DisplayState,
 ): { lifecycle: SurfaceLifecycle; label: SurfaceActivityLabel } {
   if (state.pendingApprovalId) return { lifecycle: 'awaiting_approval', label: { phase: 'awaiting_approval' } };
+  if (state.pendingConversationApprovalId) return { lifecycle: 'awaiting_input', label: { phase: 'awaiting_input' } };
   if (state.status === 'awaiting reply') return { lifecycle: 'awaiting_input', label: { phase: 'awaiting_input' } };
   if (state.asyncWorkDispatched) return { lifecycle: 'completing', label: { phase: 'delivering' } };
   if (state.toolCount > 0) return { lifecycle: 'using_tool', label: { phase: 'working_items' } };
@@ -2474,7 +3014,8 @@ export function remainingApprovalDisplayState(
 ): DisplayState | null {
   const rows = approvalRegistry
     .listPending({ sessionId, status: 'pending' })
-    .filter((row) => approvalRegistry.isActionable(row));
+    .filter((row) => approvalRegistry.isActionable(row))
+    .filter(approvalRegistry.isFormalApprovalSurface);
   if (rows.length === 0) return null;
 
   const pendingApprovalIds = rows.map((row) => row.approvalId);
@@ -2518,7 +3059,11 @@ export function remainingApprovalDisplayState(
 }
 
 async function refreshPendingApprovalDisplay(state: DisplayState, sessionId: string): Promise<void> {
-  if (!state.pendingApprovalId && (!state.pendingApprovalIds || state.pendingApprovalIds.length === 0)) return;
+  if (
+    !state.pendingConversationApprovalId
+    && !state.pendingApprovalId
+    && (!state.pendingApprovalIds || state.pendingApprovalIds.length === 0)
+  ) return;
   // Approval interruptions can arrive as a burst of sibling events in
   // the same SDK pause. Give the registry a short tick so the Discord
   // card can summarize the whole batch instead of only the first row.
@@ -2527,6 +3072,24 @@ async function refreshPendingApprovalDisplay(state: DisplayState, sessionId: str
     .listPending({ sessionId, status: 'pending' })
     .filter((row) => approvalRegistry.isActionable(row));
   if (rows.length === 0) return;
+  const conversational = rows.length === 1 && rows[0].presentation
+    ? rows[0]
+    : null;
+  if (conversational?.presentation) {
+    state.pendingConversationApprovalId = conversational.approvalId;
+    state.pendingApprovalId = undefined;
+    state.pendingApprovalIds = undefined;
+    state.pendingApprovalEditable = undefined;
+    state.summary = conversational.presentation.question;
+    state.status = 'awaiting reply';
+    state.done = true;
+    return;
+  }
+  // Registration demotes every conversational sibling in the same IMMEDIATE
+  // transaction. A burst therefore becomes one coherent formal surface.
+  state.pendingConversationApprovalId = undefined;
+  state.pendingConversationPromptEventId = undefined;
+  state.pendingConversationPromptEventSeq = undefined;
   state.pendingApprovalIds = rows.map((row) => row.approvalId);
   state.pendingApprovalId = state.pendingApprovalIds[0];
   const exactPendingActionId = rows.length === 1
@@ -2559,6 +3122,38 @@ async function refreshPendingApprovalDisplay(state: DisplayState, sessionId: str
     }
   }
   state.summary = lines.join('\n');
+}
+
+function markConversationApprovalDelivered(state: DisplayState): void {
+  const approvalId = state.pendingConversationApprovalId;
+  const promptEventId = state.pendingConversationPromptEventId;
+  const promptEventSeq = state.pendingConversationPromptEventSeq;
+  if (!approvalId || !promptEventId || !promptEventSeq) return;
+  try {
+    approvalRegistry.markConversationalApprovalPresented({
+      approvalId,
+      promptEventId,
+      promptEventSeq,
+    });
+  } catch {
+    // Delivery without a durable receipt stays intentionally unanswerable;
+    // restart recovery may safely re-present the same exact question.
+  }
+}
+
+async function deliverConversationApprovalExactly(
+  state: DisplayState,
+  transport: DiscordHarnessTransport,
+): Promise<boolean> {
+  const approvalId = state.pendingConversationApprovalId;
+  if (!approvalId || !transport.deliverConversationalApproval) return false;
+  await transport.deliverConversationalApproval({
+    approvalId,
+    deliveryKey: approvalRegistry.conversationalApprovalDeliveryKey(approvalId),
+    content: renderBody(state),
+  });
+  markConversationApprovalDelivered(state);
+  return true;
 }
 
 function renderBody(state: DisplayState): string {
@@ -3002,7 +3597,14 @@ export async function runDiscordHarnessConversation(opts: {
   }
   const session = durableSession
     ? { id: durableSession.id, isContinuation: true }
-    : resolveOrCreateSession({ channelId, userId, guildId, prompt, channel });
+    : await resolveOrCreateSession({
+      channelId,
+      userId,
+      guildId,
+      prompt,
+      channel,
+      priorWorkObjective: rawPromptForIntent,
+    });
   if (durableSession) {
     bindDiscordHarnessSession({ channelId, sessionId: durableSession.id, userId, guildId });
   }
@@ -3185,6 +3787,19 @@ export async function runDiscordHarnessConversation(opts: {
     scheduleEdit();
   });
 
+  const onConversationPreamble = createChannelConversationPreambleDelivery({
+    progressPresentation,
+    state,
+    handle,
+    transport,
+    isFinalized: () => progressLane.finalized,
+    onPaint: (body) => {
+      lastPaintedBody = body;
+      lastEditAt = Date.now();
+    },
+    onTokenExpired: () => { tokenExpired = true; },
+  });
+
   const flush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
@@ -3245,6 +3860,7 @@ export async function runDiscordHarnessConversation(opts: {
         await handle.edit(body);
       }
       lastPaintedBody = body;
+      markConversationApprovalDelivered(state);
     } catch (err) {
       // Discord can transiently refuse edits (network blip, rate
       // limit, or — at minute 15+ — interaction-token expiry). The
@@ -3297,6 +3913,21 @@ export async function runDiscordHarnessConversation(opts: {
     const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
     const needsComponentUpdate = state.pendingApprovalId !== lastAttachedApprovalId || !!components;
 
+    if (state.pendingConversationApprovalId && transport.deliverConversationalApproval) {
+      try {
+        await deliverConversationApprovalExactly(state, transport);
+        lastPaintedBody = chunks[0] ?? '';
+        progressLane.settle(state, Date.now());
+      } catch (err) {
+        logger.warn({
+          err: err instanceof Error ? err.message : String(err),
+          sessionId: session.id,
+          stage: 'conversation-approval-exact-delivery',
+        }, 'ordinary send-consent question exact delivery failed');
+      }
+      return;
+    }
+
     // Token-expired path: skip handle.edit entirely and route the full
     // reply through sendFollowup as a fresh message in the channel.
     // Without this, runs that exceed 15 minutes go dark — the user
@@ -3307,6 +3938,7 @@ export async function runDiscordHarnessConversation(opts: {
           for (const chunk of chunks) {
             await transport.sendFollowup(chunk);
           }
+          markConversationApprovalDelivered(state);
           progressLane.settle(state, Date.now());
         } catch (err) {
           logger.warn(
@@ -3331,6 +3963,7 @@ export async function runDiscordHarnessConversation(opts: {
         }
       }
       lastPaintedBody = chunks[0] ?? '';
+      markConversationApprovalDelivered(state);
       progressLane.settle(state, Date.now());
     } catch (err) {
       // Token expired DURING the final flush (run was just at the 15-min
@@ -3347,6 +3980,7 @@ export async function runDiscordHarnessConversation(opts: {
             for (const chunk of chunks) {
               await transport.sendFollowup(chunk);
             }
+            markConversationApprovalDelivered(state);
             progressLane.settle(state, Date.now());
           } catch (followupErr) {
             logger.warn(
@@ -3560,6 +4194,7 @@ export async function runDiscordHarnessConversation(opts: {
           sourceUserSeq: acceptedUserInput.seq,
           runAttemptId: activeRun.attemptId,
           judgeCompletion: true,
+          onConversationPreamble,
           onChunk,
           reuseRecordedUserInput: true,
         });
@@ -3577,6 +4212,7 @@ export async function runDiscordHarnessConversation(opts: {
         // harness recovery / direct harness (structured JSON). Auto-classify the
         // first non-space character so Discord never flashes raw `{ "reply": ... }`.
         onChunk: bridgeOnChunk,
+        onConversationPreamble,
       }, async (req) => {
         if (claudeAgentSdkBrainEnabled(channel)) {
           return respondViaClaudeAgentSdkBrain(bridgeSurface, req);
@@ -4043,6 +4679,7 @@ async function runDiscordHarnessResume(opts: {
         await handle.edit(body);
       }
       lastPaintedBody = body;
+      markConversationApprovalDelivered(state);
     } catch {
       /* transient — next event retries */
     }
@@ -4060,6 +4697,16 @@ async function runDiscordHarnessResume(opts: {
     const chunks = splitForLongReply(fullBody);
     const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
     const needsComponentUpdate = state.pendingApprovalId !== lastAttachedApprovalId || !!components;
+    if (state.pendingConversationApprovalId && transport.deliverConversationalApproval) {
+      try {
+        await deliverConversationApprovalExactly(state, transport);
+        lastPaintedBody = chunks[0] ?? '';
+        progressLane.settle(state, Date.now());
+      } catch {
+        /* exact provider delivery remains retryable and unanswerable */
+      }
+      return;
+    }
     try {
       if (needsComponentUpdate) {
         await handle.edit(chunks[0] ?? '_working…_', { components: components ?? [] });
@@ -4073,6 +4720,7 @@ async function runDiscordHarnessResume(opts: {
         }
       }
       lastPaintedBody = chunks[0] ?? '';
+      markConversationApprovalDelivered(state);
       // Final only after the reply actually landed — a failed send leaves the
       // lane open so the next attempt can still deliver.
       progressLane.settle(state, Date.now());
@@ -4325,6 +4973,14 @@ function applyEventToAcceptedChannelState(
       && (event.data.sourceUserSeq === acceptedSource.seq
         || event.data.terminalKey === `turn:${acceptedSource.seq}`);
     if (!ownsPlaceholder) return false;
+  } else if (event.type === 'conversation_preamble') {
+    const preamble = publicConversationPreambleData(event.data);
+    if (
+      !preamble
+      || event.sessionId !== acceptedSource.sessionId
+      || event.turn !== acceptedSource.turn
+      || preamble.sourceUserSeq !== acceptedSource.seq
+    ) return false;
   } else if (event.type === 'async_work_dispatched') {
     const dispatch = publicAsyncWorkDispatchedData(event.data);
     if (
@@ -4341,6 +4997,17 @@ function applyEventToAcceptedChannelState(
 export function applyEventToState(event: EventRow, state: DisplayState): void {
   const data = event.data ?? {};
   switch (event.type) {
+    case 'conversation_preamble': {
+      const preamble = publicConversationPreambleData(data);
+      if (!preamble) return;
+      state.summary = preamble.text;
+      // A preamble is presentation, never settlement. Preserve a more useful
+      // tool/running status if work has already begun; final completion remains
+      // the only reducer event that sets done=true and replaces this prose.
+      if (state.toolCount === 0) state.status = 'starting';
+      state.done = false;
+      return;
+    }
     case 'async_work_dispatched': {
       const dispatch = publicAsyncWorkDispatchedData(data);
       if (!dispatch) return;
@@ -4451,12 +5118,37 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
             ? pendingAction.id.trim()
             : null
         );
+      const conversationQuestion = data.approvalPresentation === 'conversation'
+        && typeof data.question === 'string'
+        && data.question.trim()
+        ? data.question.trim()
+        : null;
+      if (approvalId && conversationQuestion) {
+        // Autonomous mode presents one ordinary conversational decision while
+        // retaining the same hidden approval id as frozen execution authority.
+        // No pendingApprovalId reaches the component renderer, so Discord and
+        // Slack attach no Approve/Edit/Reject card. A sole bare yes/no is later
+        // rebound to this exact row by tryHandleHarnessApprovalReply.
+        state.pendingApprovalId = undefined;
+        state.pendingApprovalIds = undefined;
+        state.pendingApprovalEditable = undefined;
+        state.pendingConversationApprovalId = approvalId;
+        state.pendingConversationPromptEventId = event.id;
+        state.pendingConversationPromptEventSeq = event.seq;
+        state.summary = conversationQuestion;
+        state.status = 'awaiting reply';
+        state.done = true;
+        return;
+      }
       // Stash the approval id so the next flush attaches Approve/Reject
       // buttons (rendered server-side by the Discord transport via the
       // standard buildApprovalActions helper). Text fallback stays in
       // the body for clients that ignore components or for users who
       // prefer to type — never required.
       if (approvalId) {
+        state.pendingConversationApprovalId = undefined;
+        state.pendingConversationPromptEventId = undefined;
+        state.pendingConversationPromptEventSeq = undefined;
         const ids = state.pendingApprovalIds ?? [];
         if (!ids.includes(approvalId)) ids.push(approvalId);
         state.pendingApprovalIds = ids;

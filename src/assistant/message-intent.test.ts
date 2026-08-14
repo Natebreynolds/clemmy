@@ -207,11 +207,17 @@ test('action: research followed by a requested artifact is work-bearing', () => 
 
 // ─── default fallback ──────────────────────────────────────────
 
-test('tool_intent: messages with no clear class', () => {
-  const result = classifyMessageIntent('hmm interesting');
+test('conversation: comments and prohibitions request no tool work', () => {
+  assert.equal(classifyMessageIntent('hmm interesting').intent, 'conversation');
+  assert.equal(classifyMessageIntent('ping').intent, 'conversation');
+  assert.equal(classifyMessageIntent('No, do not send it.').intent, 'conversation');
+  assert.equal(classifyMessageIntent('The plan is to deploy this later.').intent, 'conversation');
+});
+
+test('tool_intent: unclassified data-shaped asks keep the conservative fallback', () => {
+  const result = classifyMessageIntent('Weather in Seattle');
   assert.equal(result.intent, 'tool_intent');
   assert.ok(result.confidence < 0.6, 'fallback should be low-confidence');
-  assert.equal(classifyMessageIntent('No, do not send it.').intent, 'tool_intent');
 });
 
 // ─── empty ─────────────────────────────────────────────────────
@@ -248,6 +254,13 @@ test('memoryBudgetFor: tool_intent loads moderate context', () => {
   assert.equal(b.loadWorkingMemory, true);
   assert.ok(b.vaultSearchTopK > 0);
   assert.ok(b.vaultSearchTopK < memoryBudgetFor('action').vaultSearchTopK + 1);
+});
+
+test('memoryBudgetFor: conversation keeps continuity without a fresh vault search', () => {
+  const b = memoryBudgetFor('conversation');
+  assert.equal(b.loadWorkingMemory, true);
+  assert.equal(b.loadSessionBrief, true);
+  assert.equal(b.vaultSearchTopK, 0);
 });
 
 // ─── reasons ───────────────────────────────────────────────────

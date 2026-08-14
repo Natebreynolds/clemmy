@@ -2,8 +2,15 @@ import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sd
 import { createHash } from 'node:crypto';
 import * as approvalRegistry from './approval-registry.js';
 import { isExpired } from './approval-registry.js';
-import { appendEvent } from './eventlog.js';
-import { pendingActionApprovalViewFromArgs } from './pending-action-view.js';
+import { appendEvent, listEvents } from './eventlog.js';
+import {
+  pendingActionApprovalView,
+  pendingActionApprovalViewFromArgs,
+} from './pending-action-view.js';
+import {
+  getOrCreatePendingActionByPayloadAndSource,
+  type PendingActionRecord,
+} from './pending-actions.js';
 import { addNotification } from '../notifications.js';
 import {
   decideToolApproval,
@@ -19,6 +26,7 @@ import {
   toolActionSegment,
 } from '../../agents/tool-invocation.js';
 import { redactSensitiveText } from '../security.js';
+import { autonomousSendConsentPresentation } from './autonomous-send-consent.js';
 
 /** The execution trio must run the SAME per-call approval logic the Codex lane
  *  uses (smart shell deny-list, sensitive-path write checks, composio read/write
@@ -105,6 +113,60 @@ function approvalToolIdentity(toolName: string): ApprovalToolIdentity {
   };
 }
 
+function directConversationalPendingAction(input: {
+  sessionId: string;
+  tool: string;
+  args: Record<string, unknown>;
+  subject: string;
+  target: string;
+  preview: string;
+  sourceUserSeq: number;
+}): PendingActionRecord {
+  return getOrCreatePendingActionByPayloadAndSource({
+    title: input.subject,
+    summary: `Prepared the exact irreversible send to ${input.target}; execution is parked for the ordinary final question.`,
+    kind: 'external_send',
+    toolName: input.tool,
+    payload: input.args,
+    targetSummary: input.target,
+    preview: input.preview,
+    risk: 'This external send is irreversible after provider dispatch.',
+    rollback: 'Leave it unsent or prepare a changed version; a dispatched send cannot be recalled reliably.',
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    createdBy: 'claude-sdk-conversational-consent',
+  }).record;
+}
+
+function appendConversationalParkOnce(input: {
+  sessionId: string;
+  approvalId: string;
+  pendingActionId: string;
+  sourceUserSeq: number;
+  tool: string;
+  subject: string;
+  payloadHash: string;
+}): void {
+  const exists = listEvents(input.sessionId, { types: ['approval_parked'] })
+    .some((event) => event.data.approvalId === input.approvalId);
+  if (exists) return;
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 0,
+    role: 'system',
+    type: 'approval_parked',
+    data: {
+      approvalId: input.approvalId,
+      pendingActionId: input.pendingActionId,
+      sourceUserSeq: input.sourceUserSeq,
+      tool: input.tool,
+      subject: input.subject,
+      payloadHash: input.payloadHash,
+      reason: 'autonomous_conversational_send',
+    },
+  });
+}
+
 const SAFE_TARGET_KEYS = [
   'to',
   'to_email',
@@ -176,20 +238,25 @@ function approvalSubject(tool: string, args: Record<string, unknown>): string {
 
 function surfaceApproval(
   sessionId: string,
-  approvalId: string,
+  row: approvalRegistry.PendingApprovalRow,
   tool: string,
   args: Record<string, unknown>,
   subject: string,
 ): void {
+  const approvalId = row.approvalId;
   try {
-    addNotification({
+    if (!row.presentation) addNotification({
       id: `approval-${approvalId}`,
       kind: 'approval',
       title: 'Approval pending',
       body: subject,
       createdAt: new Date().toISOString(),
       read: false,
-      metadata: { approvalId, tool, sessionId },
+      metadata: {
+        approvalId,
+        tool,
+        sessionId,
+      },
     });
   } catch (err) {
     // Notification failure must not break the pause — the approval still lives
@@ -200,16 +267,67 @@ function surfaceApproval(
     });
   }
   try {
-    appendEvent({
+    const approvalEvent = appendEvent({
       sessionId,
       turn: 0,
       role: 'Clem',
       type: 'approval_requested',
-      data: { tool, subject, args, pendingAction: pendingActionApprovalViewFromArgs(args), approvalId },
+      data: {
+        tool,
+        subject,
+        args,
+        pendingAction: pendingActionApprovalViewFromArgs(args),
+        approvalId,
+        ...(row.presentation ? {
+          approvalPresentation: 'conversation',
+          question: row.presentation.question,
+        } : {}),
+      },
     });
-  } catch {
-    /* best-effort: the registry row is the source of truth */
+    if (row.presentation) {
+      approvalRegistry.bindConversationalApprovalPrompt({
+        approvalId,
+        promptEventId: approvalEvent.id,
+        promptEventSeq: approvalEvent.seq,
+      });
+    }
+  } catch (err) {
+    if (row.presentation) throw err;
+    /* legacy formal surfaces retain registry-as-source best effort */
   }
+}
+
+/** Publish a conversational question only after the SDK query has fully
+ * stopped. The permission hook itself freezes/registers/parks but must not
+ * expose an answer slot while the original executor can still run. */
+export function surfaceDeferredConversationalApproval(boundary: ClaudeAgentApprovalBoundary): string | null {
+  if (!boundary.conversational) return null;
+  const row = approvalRegistry.get(boundary.approvalId);
+  if (!row?.presentation || row.status !== 'pending') return row?.presentation?.question ?? null;
+  // Two concurrent SDK permission calls can converge on the same frozen row.
+  // Only the process that wins this short durable prompt claim may append the
+  // public event; every sibling observes the already-bound exact question.
+  const claimed = approvalRegistry.claimConversationalApprovalPromptSurface(row.approvalId);
+  if (!claimed) return approvalRegistry.get(row.approvalId)?.presentation?.question ?? null;
+  surfaceApproval(
+    row.sessionId,
+    row,
+    row.tool ?? boundary.tool,
+    row.args ?? boundary.args,
+    row.subject,
+  );
+  return row.presentation.question;
+}
+
+/** Restart twin for a row registered/parked before the SDK could publish it.
+ * Reuses the exact question bytes and replaces an undelivered prompt event;
+ * transport receipt still gates reply eligibility. */
+export function reprojectUndeliveredConversationalApproval(
+  row: approvalRegistry.PendingApprovalRow,
+): string | null {
+  if (!row.presentation || row.status !== 'pending' || row.presentation.presentedAt) return null;
+  surfaceApproval(row.sessionId, row, row.tool ?? 'request_approval', row.args ?? {}, row.subject);
+  return row.presentation.question;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -249,12 +367,17 @@ export interface ClaudeAgentApprovalBoundary {
   tool: string;
   args: Record<string, unknown>;
   state: ClaudeAgentApprovalBoundaryState;
+  /** The native call was converted to a host PendingAction. SDK shutdown owns
+   * publication; the raw permission promise never displays the question. */
+  conversational?: boolean;
 }
 
 export interface GatedToolPermissionOptions {
   /** Default `wait` preserves chat/worker behavior. `park` is workflow-only: the
    * SDK query is interrupted after the durable exact-payload card is stored. */
   approvalMode?: 'wait' | 'park';
+  /** Exact accepted channel source that owns this permission boundary. */
+  sourceUserSeq?: number;
   onApprovalBoundary?: (boundary: ClaudeAgentApprovalBoundary) => void;
 }
 
@@ -371,13 +494,83 @@ export function buildGatedToolPermission(
     let resumeKey: string;
     try {
       const subject = approvalSubject(authorityTool, args);
+      const acceptedSource = Number.isSafeInteger(gateOptions.sourceUserSeq)
+        && Number(gateOptions.sourceUserSeq) > 0
+        ? listEvents(sessionId, {
+            types: ['user_input_received'],
+            sinceSeq: Number(gateOptions.sourceUserSeq) - 1,
+            limit: 1,
+          }).find((event) => event.seq === gateOptions.sourceUserSeq)
+        : null;
+      let presentation = acceptedSource
+        ? autonomousSendConsentPresentation(
+            authorityTool,
+            args,
+            pendingActionApprovalViewFromArgs(args),
+            { source: acceptedSource },
+          )
+        : null;
+      let conversationalPendingAction: PendingActionRecord | null = null;
+      let approvalArgs = args;
+      // Autonomous direct SDK sends never wait inside the provider permission
+      // promise. Freeze the exact call in the host-owned PendingAction machine,
+      // link the ordinary question to that immutable snapshot, then park this
+      // SDK call pre-dispatch. The accepted Yes later executes only the stored
+      // bytes through pending_action_execute; a crash after its EXECUTING claim
+      // is explicit uncertain and cannot redispatch.
+      if (presentation && acceptedSource) {
+        conversationalPendingAction = directConversationalPendingAction({
+          sessionId,
+          tool: authorityTool,
+          args,
+          subject,
+          target: presentation.target,
+          preview: presentation.bodyPreview ?? presentation.question,
+          sourceUserSeq: acceptedSource.seq,
+        });
+        approvalArgs = {
+          pendingActionId: conversationalPendingAction.id,
+          pendingAction: pendingActionApprovalView(conversationalPendingAction),
+        };
+        presentation = autonomousSendConsentPresentation(
+          'request_approval',
+          approvalArgs,
+          pendingActionApprovalView(conversationalPendingAction),
+          { source: acceptedSource },
+        );
+        if (!presentation) {
+          throw new Error('conversational send lost its exact frozen pending-action presentation');
+        }
+      }
       if (gateOptions.approvalMode === 'park') {
-        resumeKey = workflowApprovalResumeKey(sessionId, authorityTool, args);
-        const prior = approvalRegistry.claimResumableApproval(resumeKey);
-        if (prior.state === 'approved') {
+        resumeKey = conversationalPendingAction
+          ? `pending-action-approval-v1:${sessionId}:${conversationalPendingAction.id}:${conversationalPendingAction.payloadHash}`
+          : workflowApprovalResumeKey(sessionId, authorityTool, args);
+        const prior = conversationalPendingAction
+          ? approvalRegistry.inspectResumableApproval(resumeKey)
+          : approvalRegistry.claimResumableApproval(resumeKey);
+        if (prior.state === 'approved' && !conversationalPendingAction) {
           // Atomic one-shot claim: this exact payload may proceed once. A later
           // identical call cannot reuse the same human decision.
           return { behavior: 'allow', updatedInput: args } as PermissionResult;
+        }
+        if (prior.state === 'approved' && conversationalPendingAction) {
+          // Conversational consent authorizes only the immutable host-owned
+          // PendingAction. Never spend the same row on the original native SDK
+          // call: pending_action_execute may be racing this replay and would
+          // otherwise dispatch the irreversible payload a second time.
+          gateOptions.onApprovalBoundary?.({
+            approvalId: prior.row.approvalId,
+            sessionId,
+            tool: authorityTool,
+            args,
+            state: 'pending',
+          });
+          return {
+            behavior: 'deny',
+            message: `The exact send is frozen as pending action ${conversationalPendingAction.id}; only the protected pending-action executor may dispatch it.`,
+            interrupt: false,
+          } as PermissionResult;
         }
         if (prior.state === 'pending') {
           gateOptions.onApprovalBoundary?.({
@@ -386,6 +579,7 @@ export function buildGatedToolPermission(
             tool: authorityTool,
             args,
             state: 'pending',
+            ...(prior.row.presentation ? { conversational: true } : {}),
           });
           return {
             behavior: 'deny',
@@ -430,18 +624,33 @@ export function buildGatedToolPermission(
         const registered = approvalRegistry.registerResumable({
           sessionId,
           subject,
-          tool: authorityTool,
-          args,
+          tool: conversationalPendingAction ? 'request_approval' : authorityTool,
+          args: approvalArgs,
           resumeKey,
+          presentation,
         });
         approvalId = registered.row.approvalId;
-        if (registered.created) surfaceApproval(sessionId, approvalId, authorityTool, args, subject);
+        if (registered.created && !registered.row.presentation) {
+          surfaceApproval(sessionId, registered.row, authorityTool, args, subject);
+        }
+        if (registered.row.presentation && conversationalPendingAction && acceptedSource) {
+          appendConversationalParkOnce({
+            sessionId,
+            approvalId,
+            pendingActionId: conversationalPendingAction.id,
+            sourceUserSeq: acceptedSource.seq,
+            tool: conversationalPendingAction.toolName,
+            subject,
+            payloadHash: conversationalPendingAction.payloadHash,
+          });
+        }
         gateOptions.onApprovalBoundary?.({
           approvalId,
           sessionId,
           tool: authorityTool,
           args,
           state: 'pending',
+          ...(registered.row.presentation ? { conversational: true } : {}),
         });
         return {
           behavior: 'deny',
@@ -461,16 +670,71 @@ export function buildGatedToolPermission(
       // new attempt: only registerResumable's pending-dedupe and the approved
       // one-shot claim change behavior, never the human's right to be asked.
       resumeKey = workflowApprovalResumeKey(sessionId, authorityTool, args);
-      const prior = approvalRegistry.claimResumableApproval(resumeKey);
-      if (prior.state === 'approved') {
+      if (conversationalPendingAction) {
+        resumeKey = `pending-action-approval-v1:${sessionId}:${conversationalPendingAction.id}:${conversationalPendingAction.payloadHash}`;
+      }
+      const prior = conversationalPendingAction
+        ? approvalRegistry.inspectResumableApproval(resumeKey)
+        : approvalRegistry.claimResumableApproval(resumeKey);
+      if (prior.state === 'approved' && !conversationalPendingAction) {
         return { behavior: 'allow', updatedInput: args } as PermissionResult;
+      }
+      if (conversationalPendingAction && prior.state === 'approved') {
+        return {
+          behavior: 'deny',
+          message: `The exact send remains owned by pending action ${conversationalPendingAction.id}; the original native call cannot dispatch it.`,
+          interrupt: false,
+        } as PermissionResult;
+      }
+      if (
+        conversationalPendingAction
+        && (prior.state === 'rejected' || prior.state === 'expired' || prior.state === 'cancelled' || prior.state === 'consumed')
+      ) {
+        return {
+          behavior: 'deny',
+          message: `The frozen send is ${prior.state} and the original native call was not run.`,
+          interrupt: false,
+        } as PermissionResult;
       }
       if (prior.state === 'pending') {
         approvalId = prior.row.approvalId;
       } else {
-        const registered = approvalRegistry.registerResumable({ sessionId, subject, tool: authorityTool, args, resumeKey });
+        const registered = approvalRegistry.registerResumable({
+          sessionId,
+          subject,
+          tool: conversationalPendingAction ? 'request_approval' : authorityTool,
+          args: approvalArgs,
+          resumeKey,
+          presentation,
+        });
         approvalId = registered.row.approvalId;
-        if (registered.created) surfaceApproval(sessionId, approvalId, authorityTool, args, subject);
+        if (registered.created && !registered.row.presentation) {
+          surfaceApproval(sessionId, registered.row, authorityTool, args, subject);
+        }
+      }
+      if (presentation && conversationalPendingAction && acceptedSource) {
+        appendConversationalParkOnce({
+          sessionId,
+          approvalId,
+          pendingActionId: conversationalPendingAction.id,
+          sourceUserSeq: acceptedSource.seq,
+          tool: conversationalPendingAction.toolName,
+          subject,
+          payloadHash: conversationalPendingAction.payloadHash,
+        });
+        gateOptions.onApprovalBoundary?.({
+          approvalId,
+          sessionId,
+          tool: authorityTool,
+          args,
+          state: 'pending',
+          conversational: true,
+        });
+        return {
+          behavior: 'deny',
+          message: `PARKED — the exact send is frozen as pending action ${conversationalPendingAction.id} and waiting for the ordinary final question. The original provider call did not start.`,
+          interrupt: true,
+        } as PermissionResult;
       }
     } catch (err) {
       return {

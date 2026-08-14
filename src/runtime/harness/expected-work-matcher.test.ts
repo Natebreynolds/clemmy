@@ -63,6 +63,7 @@ function observed(input: Partial<ObservedExpectedWorkOperationV1> & {
     coverage: input.coverage ?? (input.effect === 'read' ? 'observed' : 'not_applicable'),
     ...(input.requirementId ? { requirementId: input.requirementId } : {}),
     ...(input.universeItemId ? { universeItemId: input.universeItemId } : {}),
+    ...(input.reversibility ? { reversibility: input.reversibility } : {}),
   };
 }
 
@@ -379,4 +380,161 @@ test('duplicate once bindings, unknown requirement ids, and an open history fail
   });
   assert.equal(open.status, 'incomplete');
   assert.deepEqual(gapKinds(open), ['history_not_finalized']);
+});
+
+test('the deterministic retrieve accepts a substantive local compute execution as its read carrier', () => {
+  // A read-only CLI/shell answer is classified 'compute' by the safety
+  // taxonomy; that label must not decide semantic discharge (live 2026-08-11:
+  // a correct Salesforce CLI answer terminal-blocked as verification_required).
+  const retrieve = contract({
+    plannerSource: 'deterministic',
+    operations: [once({ id: 'retrieve', effect: 'read', coverage: 'resolved_operation' })],
+  });
+  const substantive = matchExpectedWork(retrieve, finalized([
+    observed({ id: 'shell-call', effect: 'compute', evidenceMode: 'compute', coverage: 'observed' }),
+  ]));
+  assert.equal(substantive.status, 'complete', JSON.stringify(substantive.gaps));
+  assert.deepEqual(substantive.bindings, [{
+    requirementId: 'retrieve',
+    observedOperationId: 'shell-call',
+  }]);
+});
+
+test('a compute execution without substantive redeemed evidence discharges nothing', () => {
+  const retrieve = contract({
+    plannerSource: 'deterministic',
+    operations: [once({ id: 'retrieve', effect: 'read', coverage: 'resolved_operation' })],
+  });
+  const hollow = matchExpectedWork(retrieve, finalized([
+    observed({ id: 'shell-call', effect: 'compute', evidenceMode: 'compute', coverage: 'not_applicable' }),
+  ]));
+  assert.equal(hollow.status, 'incomplete');
+  assert.ok(hollow.gaps.some((gap) =>
+    gap.kind === 'coverage_unproven' && gap.observedOperationId === 'shell-call'));
+
+  const failed = matchExpectedWork(retrieve, finalized([
+    observed({ id: 'shell-call', effect: 'compute', outcome: 'failed', coverage: 'observed' }),
+  ]));
+  assert.equal(failed.status, 'incomplete');
+  assert.ok(failed.gaps.some((gap) => gap.kind === 'outcome_failed'));
+});
+
+test('the compute door stays scoped to the deterministic implicit-retrieve shape', () => {
+  // A model-authored contract keeps exact effect vocabulary: compute cannot
+  // carry an explicitly bound read requirement outside the implicit route.
+  const modelAuthored = contract({
+    operations: [once({ id: 'retrieve', effect: 'read', coverage: 'resolved_operation' })],
+  });
+  const bound = matchExpectedWork(modelAuthored, finalized([
+    observed({
+      id: 'shell-call',
+      requirementId: 'retrieve',
+      effect: 'compute',
+      evidenceMode: 'compute',
+      coverage: 'observed',
+    }),
+  ]));
+  assert.equal(bound.status, 'conflict');
+  assert.ok(bound.gaps.some((gap) => gap.kind === 'effect_mismatch'));
+
+  // Two eligible carriers stay ambiguous rather than arbitrarily chosen.
+  const retrieve = contract({
+    plannerSource: 'deterministic',
+    operations: [once({ id: 'retrieve', effect: 'read', coverage: 'resolved_operation' })],
+  });
+  const ambiguous = matchExpectedWork(retrieve, finalized([
+    observed({ id: 'shell-call', effect: 'compute', evidenceMode: 'compute', coverage: 'observed' }),
+    observed({ id: 'read-call', effect: 'read', evidenceMode: 'point_read' }),
+  ]));
+  assert.equal(ambiguous.status, 'conflict');
+  assert.ok(ambiguous.gaps.some((gap) => gap.kind === 'requirement_ambiguous'));
+});
+
+test('resolved-operation coverage accepts an observed collection read that cannot prove exhaustion', () => {
+  // A provider with no completeness signal and no cursor (live 2026-08-12: a
+  // bounded Outlook calendar view) can never prove exhaustion. The retrieve
+  // contract promised one grounded retrieval, so durable observation
+  // discharges it; a provider-reported partial page still refuses above.
+  const retrieve = contract({
+    plannerSource: 'deterministic',
+    operations: [once({ id: 'retrieve', effect: 'read', coverage: 'resolved_operation' })],
+  });
+  const observedCollection = matchExpectedWork(retrieve, finalized([
+    observed({ id: 'calendar-view', effect: 'read', evidenceMode: 'collection_read', coverage: 'observed' }),
+  ]));
+  assert.equal(observedCollection.status, 'complete', JSON.stringify(observedCollection.gaps));
+
+  // complete_set coverage NEVER accepts mere observation — count-only asks
+  // keep their exhaustion bar.
+  const completeSet = contract({
+    plannerSource: 'deterministic',
+    operations: [once({ id: 'retrieve', effect: 'read', coverage: 'complete_set' })],
+  });
+  const refused = matchExpectedWork(completeSet, finalized([
+    observed({
+      id: 'calendar-view',
+      requirementId: 'retrieve',
+      effect: 'read',
+      evidenceMode: 'collection_read',
+      coverage: 'observed',
+    }),
+  ]));
+  assert.equal(refused.status, 'incomplete');
+  assert.ok(refused.gaps.some((gap) => gap.kind === 'coverage_unproven'));
+});
+
+test('off-plan REVERSIBLE work is extra, not a contract violation (live 2026-08-12)', () => {
+  // The turn scraped the data, created the sheet, wrote the rows and verified
+  // them — then the terminal refused it: "an unbound effectful business
+  // operation is outside the closed expected work" ×2, plus "more than one
+  // observed operation claims a once-cardinality requirement". Every one of
+  // those operations was a durably settled, evidenced, REVERSIBLE Sheets call.
+  const plan = contract({
+    plannerSource: 'structured_model',
+    operations: [
+      once({ id: 'scrape', effect: 'read', coverage: 'complete_set' }),
+      once({ id: 'create_sheet', effect: 'external_write', dependsOn: ['scrape'], dataFrom: ['scrape'] }),
+    ],
+  });
+  const complete = matchExpectedWork(plan, finalized([
+    observed({ id: 'scrape-call', requirementId: 'scrape', effect: 'read', evidenceMode: 'collection_read', coverage: 'complete' }),
+    observed({ id: 'create-call', requirementId: 'create_sheet', effect: 'external_write', reversibility: 'reversible' }),
+    // The rows write and the read-back verification: real work the plan never named.
+    observed({ id: 'rows-write', effect: 'external_write', reversibility: 'reversible' }),
+    observed({ id: 'verify-read', effect: 'read', evidenceMode: 'point_read', coverage: 'observed' }),
+  ]));
+  assert.equal(complete.status, 'complete', JSON.stringify(complete.gaps));
+  assert.ok(complete.extras.includes('rows-write'), 'off-plan work stays visible as an extra');
+
+  // An IRREVERSIBLE off-plan effect is still a conflict — that is the case the
+  // closed contract exists to catch.
+  const send = matchExpectedWork(plan, finalized([
+    observed({ id: 'scrape-call', requirementId: 'scrape', effect: 'read', evidenceMode: 'collection_read', coverage: 'complete' }),
+    observed({ id: 'create-call', requirementId: 'create_sheet', effect: 'external_write', reversibility: 'reversible' }),
+    observed({ id: 'rogue-send', effect: 'external_write', reversibility: 'irreversible' }),
+  ]));
+  assert.equal(send.status, 'conflict');
+  assert.ok(send.gaps.some((gap) => gap.kind === 'unexpected_effectful_observation'));
+});
+
+test('two claims on one once-requirement: reversible resolves, irreversible conflicts', () => {
+  const plan = contract({
+    plannerSource: 'structured_model',
+    operations: [once({ id: 'write_rows', effect: 'external_write' })],
+  });
+
+  // Two REVERSIBLE claims, one of which succeeded: the settled one satisfies.
+  const resolved = matchExpectedWork(plan, finalized([
+    observed({ id: 'attempt-1', requirementId: 'write_rows', effect: 'external_write', reversibility: 'reversible', outcome: 'failed' }),
+    observed({ id: 'attempt-2', requirementId: 'write_rows', effect: 'external_write', reversibility: 'reversible' }),
+  ]));
+  assert.equal(resolved.status, 'complete', JSON.stringify(resolved.gaps));
+
+  // Two IRREVERSIBLE claims: a possible double send always conflicts.
+  const doubled = matchExpectedWork(plan, finalized([
+    observed({ id: 'send-1', requirementId: 'write_rows', effect: 'external_write', reversibility: 'irreversible' }),
+    observed({ id: 'send-2', requirementId: 'write_rows', effect: 'external_write', reversibility: 'irreversible' }),
+  ]));
+  assert.equal(doubled.status, 'conflict');
+  assert.ok(doubled.gaps.some((gap) => gap.kind === 'requirement_ambiguous'));
 });

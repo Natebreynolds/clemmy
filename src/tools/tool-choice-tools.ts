@@ -36,7 +36,9 @@ import { textResult } from './shared.js';
 
 const KIND_VALUES = ['cli', 'composio', 'mcp'] as const;
 
-function formatChoiceRecall(intent: string): string {
+/** Exported for the contradiction pin: an active choice is never its own
+ *  known-failed fallback. */
+export function formatChoiceRecall(intent: string): string {
   const rec = recallToolChoice(intent);
   if (!rec) {
     return `No tool choice recorded yet for intent "${intent}".\nRun discovery (composio_search_tools / local_cli_list / MCP), pick the working tool, then call tool_choice_remember to save it.`;
@@ -62,11 +64,27 @@ function formatChoiceRecall(intent: string): string {
   } else {
     lines.push('Active choice: (none — last choice was invalidated; run fresh discovery before executing).');
   }
-  if (rec.fallbacks.length > 0) {
+  // A CHOICE CANNOT BE ITS OWN KNOWN-FAILED FALLBACK. The active choice is a
+  // LATER verified success for this intent, so an older failure of the same
+  // identifier is history, not a warning — and printing both told the model
+  // "use this tool" and "do NOT re-try this tool" in the same breath. Reading
+  // that, it abandoned a working capability after one argument error instead
+  // of repairing the call (live 2026-08-12: APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS
+  // was simultaneously the active choice and an auto-invalidated fallback).
+  const contradicted = rec.choice
+    ? rec.fallbacks.filter((f) => !(f.kind === rec.choice!.kind && f.identifier === rec.choice!.identifier))
+    : rec.fallbacks;
+  if (contradicted.length > 0) {
     lines.push('Known-failed fallbacks (do NOT re-try these blindly):');
-    for (const f of rec.fallbacks) {
+    for (const f of contradicted) {
       lines.push(`  - ${f.kind}:${f.identifier} — ${f.reason} (failed ${f.failedAt})`);
     }
+  }
+  if (rec.choice && contradicted.length < rec.fallbacks.length) {
+    lines.push(
+      `Note: ${rec.choice.identifier} failed earlier but has since been verified working — `
+      + 'an argument error is a repair, not a reason to switch tools.',
+    );
   }
   return lines.filter(Boolean).join('\n');
 }

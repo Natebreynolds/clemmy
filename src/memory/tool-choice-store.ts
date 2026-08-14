@@ -1945,6 +1945,10 @@ export interface StepToolChoiceMatch {
   /** Private, receipt-backed origin of a capability learned from a verified
    * read. It grants no dispatch authority and is never rendered to the model. */
   verifiedReadOrigin?: VerifiedReadCapabilityOrigin;
+  /** The entire accepted phrase exactly matches a receipt-backed alias. This
+   * is stronger than an ordinary medium lexical overlap for requirement
+   * resolution, while remaining advisory for execution. */
+  acceptedPhraseAlias?: true;
 }
 
 export interface MatchToolChoicesOptions {
@@ -2163,6 +2167,7 @@ export function matchToolChoicesForStep(
       ...(aliasHit.accountIdentity ? { accountIdentity: aliasHit.accountIdentity } : {}),
       effectClass: 'read',
       ...(rec.choice.verifiedReadOrigin ? { verifiedReadOrigin: rec.choice.verifiedReadOrigin } : {}),
+      acceptedPhraseAlias: true,
     });
   }
 

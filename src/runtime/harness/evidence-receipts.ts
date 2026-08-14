@@ -44,7 +44,7 @@ import {
   redeemSuccessfulSettlementResultForHost,
   type SuccessfulSettlementResultEvidence,
 } from './result-handle.js';
-import { providerEnvelopeHasContradiction } from './provider-read-evidence.js';
+import { inspectProviderEnvelope } from './provider-read-evidence.js';
 
 export const EVIDENCE_RECEIPT_EVENT = 'evidence_receipt' as const;
 
@@ -211,12 +211,20 @@ function readFacts(
   if (!result.handle.success) {
     return { ok: false, reason: 'settlement result was not successful' };
   }
-  if (providerEnvelopeHasContradiction(result.rawPayload)) {
-    return { ok: false, reason: 'raw provider envelope contradicts the successful settlement label' };
+  if (inspectProviderEnvelope(result.rawPayload).verdict !== 'clean') {
+    return { ok: false, reason: 'raw provider envelope is contradictory or was not fully inspected' };
   }
+  // The manifest names the obligation this node owes. A collection-shaped
+  // read under a resolved-operation contract owes durable OBSERVATION, not
+  // source exhaustion — the manifest attached 'source_observed' for it, and a
+  // provider with no completeness signal and no cursor can still discharge
+  // that. Any node still owing 'source_completeness' keeps the strict gate.
+  const observationSufficient = node.operationMode === 'collection_read'
+    && node.obligations.includes('source_observed')
+    && !node.obligations.includes('source_completeness');
   const records = recordsFromResult(result);
   const recordIdentities = records === null
-    ? (node.operationMode === 'point_read' ? [] : null)
+    ? (node.operationMode === 'point_read' || observationSufficient ? [] : null)
     : identitiesFromRecords(records);
   if (recordIdentities === null) {
     return { ok: false, reason: 'collection result exposes no durable record collection' };
@@ -227,8 +235,11 @@ function readFacts(
   const continuationOutstanding = result.handle.continuationRef !== null;
   const cursorRepeated = result.handle.continuationRepeated;
   if (node.operationMode === 'collection_read') {
-    if (result.handle.completeness !== 'complete') {
+    if (!observationSufficient && result.handle.completeness !== 'complete') {
       return { ok: false, reason: `collection result is ${result.handle.completeness}, not complete` };
+    }
+    if (observationSufficient && result.handle.completeness === 'partial') {
+      return { ok: false, reason: 'the provider itself reported this collection result as partial' };
     }
     if (continuationOutstanding) {
       return { ok: false, reason: 'collection result still has an outstanding continuation' };
@@ -240,8 +251,12 @@ function readFacts(
   return {
     ok: true,
     facts: {
-      kind: node.operationMode === 'point_read' ? 'observation' : 'collection',
-      obligation: node.operationMode === 'point_read' ? 'source_observed' : 'source_completeness',
+      kind: node.operationMode === 'point_read' || observationSufficient
+        ? 'observation'
+        : 'collection',
+      obligation: node.operationMode === 'point_read' || observationSufficient
+        ? 'source_observed'
+        : 'source_completeness',
       operationMode: node.operationMode,
       recordIdentities,
       aggregateDigest: digestOf(recordIdentities),

@@ -67,6 +67,37 @@ test('an explicitly complete source remains a collection even when arguments loo
   });
 });
 
+test('provider schema bounds and caller-supplied counts never refine complete-set evidence', () => {
+  const legacyCountHint = {
+    operation: {
+      id: 'read', effect: 'read', coverage: 'complete_set', dependsOn: [], dataFrom: [],
+      cardinality: { kind: 'once' },
+    },
+    universes: [],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        opaque: {
+          type: 'integer',
+          description: 'Maximum number of records to return.',
+        },
+      },
+    },
+    args: { opaque: 25 },
+    // Deliberately exercise the removed runtime surface. Extra object fields
+    // can still arrive from an older caller after an update; they grant no
+    // authority and are ignored.
+    goalMinimumCount: 5,
+  } as unknown as PreDispatchReadEvidenceInput;
+
+  assert.deepEqual(refinePreDispatchReadEvidence(legacyCountHint), {
+    status: 'authoritative',
+    mode: 'collection_read',
+    requiresExhaustion: true,
+    basis: 'expected_complete_set',
+  });
+});
+
 test('resolved-operation coverage cannot infer point or collection semantics from generic schema shape', () => {
   for (const input of [
     {
@@ -455,7 +486,7 @@ test('finite result rejects contradictory envelopes and a restated member set', 
     proof,
     requestedMembers: members,
     rawResult: { successful: false, data: { rows: [{ id: 'one' }, { id: 'two' }] } },
-  }), { status: 'unproven', reason: 'provider_result_contradiction' });
+  }), { status: 'unproven', reason: 'provider_result_contradiction_or_uninspected' });
   assert.deepEqual(proveFiniteReadResultCoverage({
     proof,
     requestedMembers: ['one', 'different'],

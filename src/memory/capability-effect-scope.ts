@@ -58,6 +58,10 @@ const WRITE_OPERATION_RE = /\b(?:accept|add|append|approve|archive|assign|book|c
 // than forcing rediscovery of the dependency and does not authorize either.
 const READ_DEPENDENCY_RE = /\b(?:latest|recent|current|existing|matching|unread|summary|report|digest|analysis|availability|available|conflicts?|free|slots?)\b|\b(?:from|based\s+on|using)\s+(?:(?:my|our|the)\s+)?(?:[a-z0-9_-]+\s+){0,2}(?:availability|data|emails?|events?|files?|messages?|records?|rows?)\b|\bof\s+(?:(?:my|our|the)\s+)?(?:[a-z0-9_-]+\s+){0,2}(?:data|emails?|events?|files?|messages?|records?|rows?)\b|\b(?:all|each|old|older|matching|unread)\s+(?:[a-z0-9_-]+\s+){0,2}(?:emails?|events?|files?|messages?|records?|rows?)\b|\b(?:emails?|events?|files?|messages?|records?|rows?)\s+(?:after|before|from|matching|with|without)\b/i;
 const CONVERSATIONAL_READ_QUESTION_RE = /^(?:what(?:['’]?s|\s+is|\s+are|\s+was|\s+were)\s+(?:on|in|inside|scheduled|happening|available|due)\b|(?:who|when|where)\b|how\s+many\b)/i;
+// Weak payload grammar on a direct external effect is not itself a source
+// read. A selection/reference cue keeps true read-before-write work mixed.
+const EXPLICIT_SOURCE_SELECTION_RE =
+  /\b(?:all|current|each|existing|latest|matching|old|older|recent|unread)\b|\b(?:based\s+on|from|using)\b|\bof\s+(?:my|our|the)\b/i;
 
 /** The effect family the accepted request clearly asks to perform. */
 export function requestedCapabilityEffectScope(text: string): RequestedCapabilityEffectScope {
@@ -72,12 +76,21 @@ export function requestedCapabilityEffectScope(text: string): RequestedCapabilit
   }
   if (intent !== 'action') return 'unknown';
 
-  const read = READ_OPERATION_RE.test(input) || READ_DEPENDENCY_RE.test(input);
+  const externalEffect = classifyExternalEffectRequest(input);
+  const explicitRead = READ_OPERATION_RE.test(input);
+  const implicitReadDependency = READ_DEPENDENCY_RE.test(input);
+  // A direct effect carrying a payload is one write role unless it explicitly
+  // selects existing source material. This is effect-topology based: it works
+  // for every external-effect family and does not special-case a destination.
+  const directEffectHasSourceSelection = externalEffect.requested
+    && EXPLICIT_SOURCE_SELECTION_RE.test(input);
+  const read = explicitRead || (implicitReadDependency
+    && (!externalEffect.requested || directEffectHasSourceSelection));
   // Communication nouns such as "email" and "message" are deliberately not
   // write verbs here. The shared external-effect classifier recognizes direct
   // "email Alice" / "message Bob" commands without turning "run the email
   // lookup workflow" into a write merely because its resource is email.
-  const write = classifyExternalEffectRequest(input).requested || WRITE_OPERATION_RE.test(input);
+  const write = externalEffect.requested || WRITE_OPERATION_RE.test(input);
   if (read && write) return 'mixed';
   if (write) return 'write';
   if (read) return 'read';

@@ -14,7 +14,11 @@ import type {
   SDKSystemMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import { BASE_DIR, PKG_DIR, getRuntimeEnv } from '../../config.js';
-import { actionTopologyRoleFor, deriveSdkProfile } from '../../tools/tool-registry.js';
+import {
+  actionTopologyRoleFor,
+  deriveSdkProfile,
+  terminalAuthoringResultIsProven,
+} from '../../tools/tool-registry.js';
 import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { scheduleReflection } from '../../memory/reflection.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
@@ -29,6 +33,7 @@ import type { ManagedMcpServer } from '../../types.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
 import {
   buildGatedToolPermission,
+  surfaceDeferredConversationalApproval,
   type ClaudeAgentApprovalBoundary,
 } from './claude-agent-approval.js';
 import { renderTranscriptTurns } from './session-transcript.js';
@@ -995,6 +1000,12 @@ function appendSdkTopLevelToolEvent(
         ...(type === 'tool_returned' ? {
           ok: !result?.isError,
           successfulBusinessResult: result?.successful === true && topologyRole === 'business',
+          ...(result?.successful === true
+            && topologyRole === 'control'
+            && metadata.effectiveTool
+            && terminalAuthoringResultIsProven(metadata.effectiveTool, result.output)
+            ? { successfulAuthoringResult: true }
+            : {}),
           ...(result?.invocationNonce ? { invocationNonce: result.invocationNonce } : {}),
           // Keep the canonical row independently useful to semantic readers.
           // The full payload still lives in tool_outputs; this matches the
@@ -2122,7 +2133,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // live 2026-07-01 'only SEO tools' incidents). Give startup a real budget;
   // per-call timeouts still come from the server config's own `timeout`.
   if (!env.MCP_TIMEOUT) env.MCP_TIMEOUT = '120000';
-  const configuredAllowed = options.allowedLocalMcpTools ?? defaultClaudeAgentSdkAllowedLocalTools();
+  const configuredAllowedBase = options.allowedLocalMcpTools ?? defaultClaudeAgentSdkAllowedLocalTools();
+  // run_tool_program is a control carrier, so an accepted action may retain it
+  // without exposing a second business surface. Its in-program business calls
+  // are forced through the same scoped work_call authority by the local MCP
+  // server. Keep the addition action-only so other profiles stay byte-identical.
+  const configuredAllowed = actionExpectedWork
+    ? [...new Set([...configuredAllowedBase, 'run_tool_program'])]
+    : configuredAllowedBase;
   const allowed = actionExpectedWork
     ? [...new Set([
         ...configuredAllowed.filter((name) => actionTopologyRoleFor(name) === 'control'),
@@ -2211,6 +2229,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const baseCanUseTool = agentic
     ? buildGatedToolPermission(options.sessionId as string, allowed, {
         approvalMode: options.approvalMode,
+        sourceUserSeq: options.sourceUserSeq,
         onApprovalBoundary: (boundary) => { approvalBoundary = boundary; },
       })
     : buildAllowOnlyToolsPermission(allowed);
@@ -2300,6 +2319,48 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         });
       });
     };
+    /**
+     * A refusal must still CLOSE the call it refused.
+     *
+     * The provider's tool_called event already opened the logical call by the
+     * time this permission callback runs, so returning `deny` without a
+     * settlement strands it `open` forever — and one open logical call holds the
+     * whole source `in_flight`, which blocks the terminal no matter how much
+     * work succeeded. Live 2026-08-12: a denied `composio_search_tools` (budget
+     * exhausted — a free, zero-crossing, read-only discovery call) withheld a
+     * completed Apify pull and a created sheet. The work_call refusal beneath
+     * this already settles for exactly this reason; every deny path owes the
+     * same close.
+     */
+    const settleRefusedPreDispatchCall = (tool: string, corrective: string): void => {
+      if (
+        !options.sessionId
+        || !Number.isSafeInteger(options.sourceUserSeq)
+        || (options.sourceUserSeq ?? 0) <= 0
+        || !providerCallId
+      ) return;
+      try {
+        withLogicalToolCall({
+          sessionId: options.sessionId,
+          sourceUserSeq: options.sourceUserSeq as number,
+          logicalToolCallId: providerCallId,
+          tool,
+          args: input,
+        }, () => {
+          settleToolAttempt({
+            sessionId: options.sessionId,
+            sourceUserSeq: options.sourceUserSeq,
+            lane: 'claude_sdk',
+            toolName: tool,
+            callId: providerCallId,
+            args: input,
+            businessCall: false,
+            result: corrective,
+            signals: { preDispatch: true, policyRefused: true },
+          });
+        });
+      } catch { /* a refusal must never become a second failure */ }
+    };
     const claudeParentDiscovery = isClaudeParentDiscoverySurface(toolName, input);
     let permissionSignature = '';
     try { permissionSignature = `${toolName}\0${JSON.stringify(input ?? {})}`; } catch { permissionSignature = `${toolName}\0${String(input)}`; }
@@ -2385,7 +2446,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           return {
             behavior: 'deny',
             interrupt: false,
-            message: 'This bounded repair phase permits only an exact provider read-back of the already-bound document/site id. Create, update, list, search, shell exploration, and unrelated tools are blocked.',
+            message: 'This bounded repair phase permits only an exact provider read-back of the already-bound artifact id. Create, update, list, search, shell exploration, and unrelated tools are blocked.',
           } as PermissionResult;
         }
       }
@@ -2622,10 +2683,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               if (lease) claudeDiscoveryClaims.set(providerCallId, lease);
             } catch (error) {
               if (error instanceof DiscoveryBudgetDeniedError) {
+                const corrective = `Tool call refused by harness: ${error.message}`;
+                settleRefusedPreDispatchCall(mcpToolTail(toolName) || toolName, corrective);
                 return {
                   behavior: 'deny',
                   interrupt: false,
-                  message: `Tool call refused by harness: ${error.message}`,
+                  message: corrective,
                 } as PermissionResult;
               }
               throw error;
@@ -2650,6 +2713,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                   sdkToolName: toolName,
                   input,
                   directOrchestrator: options.directOrchestrator === true,
+                  actionExpectedWork,
                   dispatchLease,
                 })
               : null;
@@ -2706,11 +2770,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // reachable through the generic dispatcher,
   // whose INNER call uses the existing schema validation and harness gates.
   const localUniverse = [...new Set(
-    (options.localMcpToolUniverse !== undefined
+    [
+      ...(options.localMcpToolUniverse !== undefined
       ? options.localMcpToolUniverse
       : actionExpectedWork
         ? configuredAllowed
-        : allowed)
+        : allowed),
+      ...(actionExpectedWork ? ['run_tool_program'] : []),
+    ]
       .map((name) => name.trim())
       .filter((name) => Boolean(name) && name !== 'call_tool' && name !== 'work_call'),
   )];
@@ -2774,7 +2841,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     const firstClassControls = requested.filter(
       (name) => actionTopologyRoleFor(name) === 'control',
     );
-    localMcpToolAllowlist = [...new Set([...firstClassControls, 'tool_search', 'work_call'])];
+    localMcpToolAllowlist = [...new Set([
+      ...firstClassControls,
+      'run_tool_program',
+      'tool_search',
+      'work_call',
+    ])];
     localMcpLoading = {
       deferredTools: localUniverse.filter((name) => !localMcpToolAllowlist!.includes(name)),
     };
@@ -2969,6 +3041,8 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           providerCallId: callId,
           sdkToolName: source.name,
           rawInput: source.input,
+          directOrchestrator: options.directOrchestrator === true,
+          actionExpectedWork,
         })
       : null;
     occurrence.calledEventId = claimedCanonical?.id
@@ -3364,6 +3438,8 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                 providerCallId: tr.callId,
                 sdkToolName: source.name,
                 rawInput: source.input,
+                directOrchestrator: options.directOrchestrator === true,
+                actionExpectedWork,
               })
             : null;
           const locallyCorrelatedCanonical = occurrence.preauthoredLocalCanonical
@@ -3540,7 +3616,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             });
           }
           if (resultLooksSuccessful && source && isTerminalAfterTool(source.name)) {
-            if (!terminalToolShouldHalt(source.name, tr.output)) continue;
+            if (!terminalToolShouldHalt(source.name, tr.output, { actionExpectedWork })) continue;
             // Do not interrupt inside the result loop. Parallel tool uses from
             // one assistant frame are returned in this same user frame; breaking
             // on the first ask dropped the remaining questions and their return
@@ -3713,6 +3789,25 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
 
   const exactApprovalBoundary = approvalBoundary as ClaudeAgentApprovalBoundary | null;
   if (exactApprovalBoundary) {
+    if (exactApprovalBoundary.conversational) {
+      const question = surfaceDeferredConversationalApproval(exactApprovalBoundary);
+      if (question) {
+        recordClaudeAgentSdkUsage(options, result, init, { firstByteMs }, assistantUsageFallback());
+        return {
+          text: question,
+          sessionId: result?.session_id ?? init?.session_id,
+          model: init?.model,
+          toolUses,
+          successfulToolUses,
+          toolCallLedger,
+          usage: result?.usage,
+          modelUsage: result?.modelUsage,
+          limitHit: false,
+          stoppedReason: 'pending-approval',
+          ...(resolvedArtifactRunScopeId ? { artifactRunScopeId: resolvedArtifactRunScopeId } : {}),
+        };
+      }
+    }
     throw new ClaudeAgentSdkApprovalBoundaryError(exactApprovalBoundary);
   }
 

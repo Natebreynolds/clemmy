@@ -85,6 +85,15 @@ export type ActionTopologyRole = 'control' | 'business';
  */
 export type ProjectToolEffect = 'read' | 'local_write';
 
+export interface TerminalAuthoringEvidenceContract {
+  /** Exact host-owned first line emitted only after the local authoring commit.
+   * A model/tool summary or ordinary isError:false MCP response cannot forge
+   * completion authority merely by naming the tool. */
+  receiptPrefix: string;
+}
+
+export type ActionControlContextRequirement = 'task_recovery' | 'alternate_action_owner';
+
 export interface ToolDecl {
   name: string;
   /** Effect class from the taxonomy (execute folded into write). Advisory in step 1. */
@@ -125,6 +134,17 @@ export interface ToolDecl {
    * is what actually reaches the world: provider dispatch, shell, browser,
    * code programs, local content artifacts (write_file/produce_document). */
   actionTopologyRole?: ActionTopologyRole;
+  /** Additional typed turn context required before an action turn may expose
+   * this control. Omitted controls are valid for fresh work. The declaration
+   * lives beside the tool rather than in a dispatcher operation allowlist, so
+   * future recovery controls fail closed by choosing this structural class. */
+  actionControlContext?: ActionControlContextRequirement;
+  /** A successful canonical Claude SDK return from this exact local tool is
+   * itself durable proof of the user-requested authoring deliverable. This is
+   * deliberately independent of `sdkLayer: 'authoring'`: that profile also
+   * contains lifecycle, approval, discovery, and bookkeeping controls which
+   * must never manufacture terminal work evidence. Omitted is fail-closed. */
+  terminalAuthoringEvidence?: TerminalAuthoringEvidenceContract;
   /** One-line summary (first sentence of the registered tool description, capped
    *  ~90 chars) — the catalog line the Codex lane reads for schema-on-demand. */
   description?: string;
@@ -139,8 +159,8 @@ export interface ToolDecl {
  */
 export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'agent_propose', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', description: 'Draft a reusable team-agent proposal for user review.' },
-  { name: 'agent_run_get', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Fetch the full event timeline of a single autonomy cycle by runId.' },
-  { name: 'agent_runs_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List recent autonomy cycles (daemon-source runs).' },
+  { name: 'agent_run_get', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Fetch the full event timeline of a single autonomy cycle by runId.' },
+  { name: 'agent_runs_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'List recent autonomy cycles (daemon-source runs).' },
   { name: 'answer_check_in', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Resolve an open check-in with an answer.' },
   { name: 'ask_user_question', sideEffect: 'read', tier: 'core', lanes: ['sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Ask the user a question when the answer would change what you do — scope, target, format, or a boundary only they can decide.' },
   // The background-task family is control-plane (task-lifecycle coordination,
@@ -148,9 +168,9 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   // made a plain status read on an act-authority turn a turn-killing 500
   // (live 2026-08-11, long-horizon-manifest origin: background_task_status →
   // ExpectedWorkBindingRequiredError).
-  { name: 'background_task_revise', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'read-only', loopClass: 'mutating', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', description: 'Version and course-correct an active durable background task on its existing session.' },
-  { name: 'background_task_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Inspect a durable background task by task id, run id, or session id.' },
-  { name: 'background_tasks_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List recent durable background tasks with status, latest activity, approvals, and result…' },
+  { name: 'background_task_revise', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'read-only', loopClass: 'mutating', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Version and course-correct an active durable background task on its existing session.' },
+  { name: 'background_task_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Inspect a durable background task by task id, run id, or session id.' },
+  { name: 'background_tasks_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'List recent durable background tasks with status, latest activity, approvals, and result…' },
   { name: 'browser_harness_run', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'], description: 'Run a Browser Harness Python snippet against the user browser through the browser-harness…' },
   { name: 'browser_harness_status', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Check Browser Harness availability and setup state.' },
   // Generic gated dispatcher for schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07,
@@ -179,7 +199,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'discover_work', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'], loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Scan handoffs, plans, goals, tasks, and inbox items to find prioritized work that should…' },
   { name: 'dispatch_background_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Hand an AGREED, multi-step task to the reliable background runner (fire-and-forget).' },
   { name: 'draft_plan', sideEffect: 'read', tier: 'core', lanes: [], actionTopologyRole: 'control', description: 'Draft a structured plan for multi-step work before executing it.' },
-  { name: 'execution_complete', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Mark a tracked execution complete after its criteria are verified. Args: id, summary.' },
+  { name: 'execution_complete', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'alternate_action_owner', description: 'Mark a tracked execution complete after its criteria are verified. Args: id, summary.' },
   // Creating an execution lane MINTS DURABLE MUTATION AUTHORITY: it is the
   // record that later external writes point at to prove they were wrapped. A
   // 'read' classification told every telemetry and guardrail consumer that
@@ -193,19 +213,19 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   //   loopClass 'mutating' — repeating it does not corrupt a provider, but it
   //     mints duplicate authority records, which is exactly the repetition the
   //     tight guardrail thresholds exist to catch.
-  { name: 'execution_create', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'full-extra', needsApproval: false, loopClass: 'mutating', actionTopologyRole: 'control', description: 'Create a tracked execution lane for multi-step or mutating external work.' },
-  { name: 'execution_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', actionTopologyRole: 'control', description: 'Fetch one execution by id with full context (objective, plan, next step, success criteria…' },
-  { name: 'execution_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', actionTopologyRole: 'control', description: 'List executions for inspection.' },
-  { name: 'execution_mark_blocked', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Mark an execution as blocked with a concrete blocker description.' },
-  { name: 'execution_update_step', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Advance an execution: record the next concrete step and an optional summary of what just…' },
-  { name: 'execution_reconcile_write', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Settle an ambiguous/orphaned external write from read-back evidence: absent unlocks one retry, present records it done.' },
-  { name: 'focus_activate', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Resume a previously parked focus.' },
+  { name: 'execution_create', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'full-extra', needsApproval: false, loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'alternate_action_owner', description: 'Create a tracked execution lane for multi-step or mutating external work.' },
+  { name: 'execution_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', actionTopologyRole: 'control', actionControlContext: 'alternate_action_owner', description: 'Fetch one execution by id with full context (objective, plan, next step, success criteria…' },
+  { name: 'execution_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', actionTopologyRole: 'control', actionControlContext: 'alternate_action_owner', description: 'List executions for inspection.' },
+  { name: 'execution_mark_blocked', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'alternate_action_owner', description: 'Mark an execution as blocked with a concrete blocker description.' },
+  { name: 'execution_update_step', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'alternate_action_owner', description: 'Advance an execution: record the next concrete step and an optional summary of what just…' },
+  { name: 'execution_reconcile_write', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'alternate_action_owner', description: 'Settle an ambiguous/orphaned external write from read-back evidence: absent unlocks one retry, present records it done.' },
+  { name: 'focus_activate', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Resume a previously parked focus.' },
   { name: 'focus_clear', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Mark a focus as done.' },
-  { name: 'focus_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['focus_set', 'focus_update', 'focus_touch', 'focus_park', 'focus_activate', 'focus_clear'], actionTopologyRole: 'control', description: 'Read the assistant\'s current attention pointer.' },
+  { name: 'focus_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['focus_set', 'focus_update', 'focus_touch', 'focus_park', 'focus_activate', 'focus_clear'], actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Read the assistant\'s current attention pointer.' },
   { name: 'focus_park', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Park the active focus — flips it from active to paused so it stays resumable but no longe…' },
   { name: 'focus_set', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Pin a NEW current focus.' },
   { name: 'artifact_claim_resolve', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Resolve an unresolved provider-create claim after read-only verification: bind the found resource id (evidence-gated) or release a provably-absent claim.' },
-  { name: 'focus_touch', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Bump the last-touched time + reset the idle-confirm window for an active focus.' },
+  { name: 'focus_touch', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Bump the last-touched time + reset the idle-confirm window for an active focus.' },
   { name: 'focus_update', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Evolve an existing focus and optionally patch its sparse shared workstate.' },
   { name: 'git_status', sideEffect: 'read', projectEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'Run a read-only git status in an allowed workspace directory.' },
   { name: 'goal_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List persistent goals, optionally filtered by owner or status.' },
@@ -248,10 +268,10 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'read_file', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['write_file', 'replace_file', 'run_shell_command'], description: 'Read a file from an allowed workspace path.' },
   { name: 'recall_tool_result', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Retrieve the full verbatim output of a prior tool call by its call_id.' },
   { name: 'request_approval', sideEffect: 'write', tier: 'core', lanes: [], blockedFor: ['worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Pause and ask the user to approve a high-risk action or one batch of same-shape external…' },
-  { name: 'resume_held_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Resume a task the user previously asked you to HOLD (see your Current Focus "Held" list),…' },
+  { name: 'resume_held_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Resume a task the user previously asked you to HOLD (see your Current Focus "Held" list),…' },
   { name: 'run_batch', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', blockedFor: ['worker'], actionTopologyRole: 'control', description: 'Deterministic batch executor for N same-shape tool calls: reason ONCE (bake every item\'s…' },
   { name: 'run_shell_command', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'write', loopClass: 'mutating', description: 'Run a shell command in an allowed workspace directory.' },
-  { name: 'run_tool_program', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'workflow-step', 'cli'], description: 'Run ONE short JavaScript program (the body of an async function — use `return` for the re…' },
+  { name: 'run_tool_program', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'workflow-step', 'cli'], actionTopologyRole: 'control', description: 'Run ONE short JavaScript program (the body of an async function — use `return` for the re…' },
   // actionTopologyRole 'control': run_worker is the fan-out COORDINATION
   // primitive — it spawns children whose business dispatches settle at their
   // own boundaries (same family as execution_create). Classifying it business
@@ -259,7 +279,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   // surface, absent from the carrier universe, and walled by the work-binding
   // gate (live 2026-08-11: '"run_worker" is not a deferred callable tool').
   { name: 'run_worker', sideEffect: 'write', tier: 'core', lanes: ['sdk-brain'], sdkLayer: 'full-extra', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', description: 'Spawn a stateless Worker on ONE item using a structured parent-planned job packet.' },
-  { name: 'session_history', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Read recent conversation history for a session.' },
+  { name: 'session_history', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Read recent conversation history for a session.' },
   { name: 'session_pause', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Save a structured handoff for a session so work can resume cleanly after context drift, a…' },
   { name: 'session_resume', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Summarize a session using its continuity brief and recent transcript so work can resume c…' },
   { name: 'set_model_role', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', actionTopologyRole: 'control', description: 'Route a model ROLE to a specific model, when the user asks in chat (e.g.' },
@@ -302,7 +322,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'update_agent', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', description: 'Update an existing team agent.' },
   { name: 'user_profile_read', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Read the user\'s current profile (name, role, timezone, working hours, communication prefe…' },
   { name: 'workflow_apply_contract_fixes', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Apply safe, machine-readable fixes from a workflow visual contract.' },
-  { name: 'workflow_create', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', description: 'Create a workflow.' },
+  { name: 'workflow_create', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', terminalAuthoringEvidence: { receiptPrefix: '[clementine:terminal-authoring:workflow-created:v1]' }, description: 'Create a workflow.' },
   { name: 'workflow_delete', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', description: 'Permanently delete a workflow definition file.' },
   { name: 'workflow_edit_step', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', actionTopologyRole: 'control', description: 'Make a TARGETED, reversible edit to ONE step\'s prompt in an existing workflow — the FAST,…' },
   { name: 'workflow_from_session', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', actionTopologyRole: 'control', description: 'Turn what you JUST did in this chat into a reusable, repeatable workflow.' },
@@ -438,6 +458,79 @@ export function deriveNeedsApproval(decl: ToolDecl): boolean {
 export function actionTopologyRoleFor(toolName: string): ActionTopologyRole {
   return TOOL_REGISTRY.find((declaration) => declaration.name === toolName)
     ?.actionTopologyRole ?? 'business';
+}
+
+/** Registry-owned context class for action controls. Unknown tools fail closed
+ * through actionTopologyRoleFor before this value is consulted. */
+export function actionControlContextFor(
+  toolName: string,
+): ActionControlContextRequirement | 'fresh' {
+  return TOOL_REGISTRY.find((declaration) => declaration.name === toolName)
+    ?.actionControlContext ?? 'fresh';
+}
+
+/** Shared Codex/Claude action-surface selector. The runtime supplies only typed
+ * task relation; registry metadata owns which controls require it. Alternate
+ * action owners are never admitted after the accepted source already has an
+ * owner, including on a continuation. */
+export function actionControlAdmittedForTaskState(
+  toolName: string,
+  taskState: 'fresh' | 'continuation',
+): boolean {
+  const requirement = actionControlContextFor(toolName);
+  if (requirement === 'task_recovery') return taskState === 'continuation';
+  if (requirement === 'alternate_action_owner') return false;
+  return true;
+}
+
+/** True only when the exact local built-in is registered and explicitly owns
+ * the control role. `actionTopologyRoleFor` deliberately maps unknown/foreign
+ * names to business; callers building a control-only carrier additionally need
+ * positive registry membership so a future unknown can never enter that lane. */
+export function isRegisteredActionControl(toolName: string): boolean {
+  return TOOL_REGISTRY.some((declaration) => (
+    declaration.name === toolName
+    && declaration.actionTopologyRole === 'control'
+  ));
+}
+
+/** Exact registry authority for host-derived authoring completion evidence.
+ * Unknown, foreign, carrier-shaped, and merely authoring-profile names all
+ * fail closed. Callers must first resolve a trusted local carrier to its
+ * canonical effective tool identity. */
+export function isTerminalAuthoringEvidenceTool(toolName: string): boolean {
+  return TOOL_REGISTRY.find((declaration) => declaration.name === toolName)
+    ?.terminalAuthoringEvidence !== undefined;
+}
+
+export function terminalAuthoringEvidenceContractFor(
+  toolName: string,
+): TerminalAuthoringEvidenceContract | null {
+  return TOOL_REGISTRY.find((declaration) => declaration.name === toolName)
+    ?.terminalAuthoringEvidence ?? null;
+}
+
+/** Stamp a host result only after the authoring implementation has committed
+ * its durable artifact. The receipt is deliberately the first line, so echoed
+ * user fields inside an error response cannot impersonate it. */
+export function withTerminalAuthoringEvidenceReceipt(toolName: string, result: string): string {
+  const contract = terminalAuthoringEvidenceContractFor(toolName);
+  if (!contract) throw new Error(`Tool ${toolName} has no terminal-authoring evidence contract.`);
+  return `${contract.receiptPrefix}\n${result}`;
+}
+
+/** Verify the exact host receipt at the canonical SDK return boundary. */
+export function terminalAuthoringResultIsProven(toolName: string, result: unknown): boolean {
+  const contract = terminalAuthoringEvidenceContractFor(toolName);
+  return contract !== null
+    && typeof result === 'string'
+    && result.startsWith(`${contract.receiptPrefix}\n`);
+}
+
+/** Conformance/test projection. Kept separate from the SDK authoring profile
+ * so expanding tool availability cannot silently expand terminal authority. */
+export function deriveTerminalAuthoringEvidenceNames(): Set<string> {
+  return names((declaration) => declaration.terminalAuthoringEvidence !== undefined);
 }
 
 /** B1 — tool-guardrail IDEMPOTENT_TOOLS (safe-to-retry reads → loose thresholds). */

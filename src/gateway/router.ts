@@ -64,6 +64,7 @@ import {
 } from '../runtime/harness/turn-outcome.js';
 import { deriveTitle } from '../memory/derive-title.js';
 import type { AssistantResponse, AssistantRouteDiagnostics, ToolActivity } from '../types.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 
 const logger = pino({ name: 'clementine-next.gateway' });
 
@@ -513,6 +514,11 @@ async function reviewLegacyGatewayCompletion(input: {
     deliveryConcern: concern,
     settlementAudit: assessment.settlementAudit,
     priorConsecutiveResumes: 0,
+    recoveryCapability: {
+      liveContinuation: false,
+      toolsAvailable: false,
+      externalStateInspection: false,
+    },
   }, {
     ...(input.terminalDeliveryJudgePort ? { port: input.terminalDeliveryJudgePort } : {}),
   });
@@ -756,7 +762,8 @@ function renderRunList(runs: RunRecord[]): string {
     const latest = latestEvent ? ` | ${latestEvent.message}` : '';
     const queued = run.queuedTaskId ? ` | task ${run.queuedTaskId}` : '';
     const approval = run.pendingApprovalId ? ` | approval ${run.pendingApprovalId}` : '';
-    return `- \`${run.id}\` | ${run.status} | ${run.title}${queued}${approval}${latest}`;
+    const input = run.pendingInput ? ` | input ${run.pendingInput.kind}` : '';
+    return `- \`${run.id}\` | ${run.status} | ${run.title}${queued}${approval}${input}${latest}`;
   }).join('\n');
 }
 
@@ -774,6 +781,7 @@ function renderRunStatus(run: RunRecord): string {
     `Updated: ${run.updatedAt}`,
     run.queuedTaskId ? `Background task: ${run.queuedTaskId}` : '',
     run.pendingApprovalId ? `Approval: ${run.pendingApprovalId}` : '',
+    run.pendingInput ? `Waiting on: ${run.pendingInput.nextAction}` : '',
     run.error ? `Error: ${run.error}` : '',
     run.outputPreview ? `Output: ${run.outputPreview}` : '',
     '',
@@ -801,11 +809,6 @@ function renderRunStatus(run: RunRecord): string {
  * kept advancing.)
  */
 function handleStopActive(request: GatewayRequest): GatewayResponse {
-  // Lazy import to avoid pulling the eventlog into router boot when
-  // no one types "stop". Harness eventlog opens a SQLite connection.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const approvalRegistry = require('../runtime/harness/approval-registry.js') as typeof import('../runtime/harness/approval-registry.js');
-
   const candidates: Array<{ kind: 'approval' | 'task'; label: string; stopFn: () => string }> = [];
 
   // 1) Pending approvals on this sessionId — sorted newest first
@@ -813,6 +816,21 @@ function handleStopActive(request: GatewayRequest): GatewayResponse {
   try {
     const pendingApprovals = approvalRegistry.listPending({ sessionId: request.sessionId, status: 'pending' });
     for (const row of pendingApprovals) {
+      const dependency = approvalRegistry.projectPendingApprovalUserDependency(row);
+      if (dependency.kind === 'input') {
+        const action = row.presentation!;
+        candidates.push({
+          kind: 'approval',
+          label: `prepared ${action.actionLabel} to ${action.target} — answer its exact question with no`,
+          stopFn: () => {
+            const result = approvalRegistry.resolve(row.approvalId, 'rejected', request.userId ?? 'panic-stop');
+            return result.ok
+              ? `Left the prepared ${action.actionLabel} to ${action.target} unsent. The waiting run will unwind.`
+              : `I couldn't leave the prepared ${action.actionLabel} unsent: ${result.reason}.`;
+          },
+        });
+        continue;
+      }
       candidates.push({
         kind: 'approval',
         label: `approval ${row.approvalId} — ${row.subject ?? row.tool ?? 'pending action'}`,

@@ -31,6 +31,7 @@ const { ToolCallsCounter, withHarnessRunContext } = await import('./brackets.js'
 const { activateDispatchLease } = await import('./dispatch-lease.js');
 const { settledReadRepeatReplayMarker } = await import('./settled-read-repeat.js');
 const { projectCanonicalTopLevelToolEvents } = await import('./tool-effect.js');
+const { withTerminalAuthoringEvidenceReceipt } = await import('../../tools/tool-registry.js');
 type RunHooksLike = import('./hooks.js').RunHooksLike;
 
 test('effectiveReflectionTool unwraps composio_execute_tool to its action slug', () => {
@@ -609,6 +610,117 @@ test('tool hooks preserve effective call_tool identity before an oversized argum
   assert.equal(returned[0].data.effectiveTool, 'workflow_run');
   assert.notEqual(called[0].data.arguments, argumentsJson, 'event preview is bounded');
   assert.throws(() => JSON.parse(String(called[0].data.arguments)), 'clipped JSON cannot be reparsed');
+});
+
+test('Codex hooks grant workflow-create evidence only to an exact paired admitted return', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+
+  const direct = {
+    toolCall: {
+      callId: 'authoring-direct-create',
+      arguments: JSON.stringify({ name: 'daily-digest' }),
+    },
+  };
+  stub.emit('agent_tool_start', ctx(sess.id), { name: 'orchestrator' }, { name: 'workflow_create' }, direct);
+  stub.emit(
+    'agent_tool_end',
+    ctx(sess.id),
+    { name: 'orchestrator' },
+    { name: 'workflow_create' },
+    withTerminalAuthoringEvidenceReceipt('workflow_create', 'Created workflow "daily-digest".'),
+    direct,
+  );
+
+  const carried = {
+    toolCall: {
+      callId: 'authoring-carried-create',
+      arguments: JSON.stringify({
+        name: 'workflow_create',
+        args_json: JSON.stringify({ name: 'weekly-digest' }),
+      }),
+    },
+  };
+  stub.emit('agent_tool_start', ctx(sess.id), { name: 'orchestrator' }, { name: 'call_tool' }, carried);
+  stub.emit(
+    'agent_tool_end',
+    ctx(sess.id),
+    { name: 'orchestrator' },
+    { name: 'call_tool' },
+    withTerminalAuthoringEvidenceReceipt('workflow_create', 'Created workflow "weekly-digest".'),
+    carried,
+  );
+
+  const calledById = new Map(
+    listEvents(sess.id, { types: ['tool_called'] })
+      .map((event) => [String(event.data.callId), event]),
+  );
+  const returnedById = new Map(
+    listEvents(sess.id, { types: ['tool_returned'] })
+      .map((event) => [String(event.data.callId), event]),
+  );
+  for (const callId of ['authoring-direct-create', 'authoring-carried-create']) {
+    const called = calledById.get(callId);
+    const returned = returnedById.get(callId);
+    assert.ok(called, `${callId}: admitted start exists`);
+    assert.ok(returned, `${callId}: paired return exists`);
+    assert.equal(returned.parentEventId, called.id, `${callId}: exact parent linkage`);
+    assert.equal(returned.data.successfulAuthoringResult, true, `${callId}: host receipt is trusted`);
+    assert.equal(returned.data.topologyRole, 'control');
+  }
+  assert.equal(returnedById.get('authoring-carried-create')!.data.effectiveTool, 'workflow_create');
+});
+
+test('Codex hooks reject orphan and error-like workflow-create returns as terminal evidence', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+
+  const orphan = {
+    toolCall: {
+      callId: 'authoring-orphan-end',
+      arguments: JSON.stringify({ name: 'orphan-digest' }),
+    },
+  };
+  stub.emit(
+    'agent_tool_end',
+    ctx(sess.id),
+    { name: 'orchestrator' },
+    { name: 'workflow_create' },
+    withTerminalAuthoringEvidenceReceipt('workflow_create', 'Created workflow "orphan-digest".'),
+    orphan,
+  );
+
+  const errored = {
+    toolCall: {
+      callId: 'authoring-error-return',
+      arguments: JSON.stringify({ name: 'failed-digest' }),
+    },
+  };
+  stub.emit('agent_tool_start', ctx(sess.id), { name: 'orchestrator' }, { name: 'workflow_create' }, errored);
+  stub.emit(
+    'agent_tool_end',
+    ctx(sess.id),
+    { name: 'orchestrator' },
+    { name: 'workflow_create' },
+    withTerminalAuthoringEvidenceReceipt('workflow_create', 'ERROR: workflow creation failed before commit.'),
+    errored,
+  );
+
+  const returnedById = new Map(
+    listEvents(sess.id, { types: ['tool_returned'] })
+      .map((event) => [String(event.data.callId), event]),
+  );
+  const orphanReturn = returnedById.get('authoring-orphan-end');
+  const errorReturn = returnedById.get('authoring-error-return');
+  assert.ok(orphanReturn);
+  assert.equal(orphanReturn.parentEventId, null, 'an unadmitted end has no authoritative parent');
+  assert.equal(orphanReturn.data.successfulAuthoringResult, undefined);
+  assert.ok(errorReturn?.parentEventId, 'the negative error fixture is genuinely paired');
+  assert.equal(errorReturn?.data.successfulAuthoringResult, undefined);
 });
 
 test('tool hooks admit a later occurrence that legitimately reuses a closed call id', () => {

@@ -18,7 +18,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
-import { rankCatalog } from '../agents/tool-catalog.js';
+import { catalogEntries, rankCatalog, type RankedCatalogEntry } from '../agents/tool-catalog.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
 
 const TOP_RESULTS = 8;
@@ -33,6 +33,55 @@ const DESCRIPTION = [
 interface ToolSearchMetadata {
   schema: unknown;
   description: string;
+}
+
+export type ToolSearchDispatchCarrier = 'call_tool' | 'work_call';
+
+export type ToolSearchCandidateSourceKind = 'authorized_external_mcp' | 'authorized_composio';
+
+/** Provider adapters stay behind the one visible broker. A candidate is
+ * capability context only: its host-selected carrier still performs every
+ * dispatch/approval check. `invocation` represents adapters whose public
+ * operation identity is wrapped by a stable business carrier (for example an
+ * action slug passed to a generic executor) without teaching that shape to the
+ * broker itself. */
+export interface ToolSearchBrokerCandidate {
+  name: string;
+  summary: string;
+  schema?: unknown;
+  carrier: ToolSearchDispatchCarrier;
+  score?: number;
+  guidance?: string;
+  invocation?: {
+    name: string;
+    fixedArgs?: Record<string, unknown>;
+    payloadField?: string;
+  };
+}
+
+export interface ToolSearchCandidateSource {
+  kind: ToolSearchCandidateSourceKind;
+  search(input: { query: string; limit: number }): Promise<ToolSearchBrokerCandidate[]>;
+}
+
+export type ToolSearchBrokerCoverage = 'builtins_only' | 'authorized_external_v1';
+
+/** Positive construction-time signal for the role governor. Partial provider
+ * coverage deliberately reports builtins_only so unresolved external roles
+ * retain the legacy compatibility route instead of being stranded. */
+export function toolSearchBrokerCoverage(
+  sources: readonly ToolSearchCandidateSource[] | undefined,
+): ToolSearchBrokerCoverage {
+  const kinds = new Set((sources ?? []).map((source) => source.kind));
+  return kinds.has('authorized_external_mcp') && kinds.has('authorized_composio')
+    ? 'authorized_external_v1'
+    : 'builtins_only';
+}
+
+function dispatchHint(carrier: ToolSearchDispatchCarrier): string {
+  return carrier === 'work_call'
+    ? 'Invoke the selected result as the inner name/args_json of work_call. On the first work_call, include the complete provider-neutral semantic proposal and dispatch this first requirement in that same call; later calls use proposal:null.'
+    : 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional/nullable fields you do not need.';
 }
 
 function queryExplicitlyNamesTool(query: string, toolName: string): boolean {
@@ -96,7 +145,14 @@ export function registerToolSearchTool(
     dispatchViaCallTool?: boolean;
     /** Action turns use the semantic carrier instead of advertising a second,
      * unbound business dispatcher. Omitted preserves the legacy call_tool hint. */
-    dispatchCarrier?: 'call_tool' | 'work_call';
+    dispatchCarrier?: ToolSearchDispatchCarrier;
+    /** A mixed action catalog keeps controls and business capabilities behind
+     * different carriers. The registry-derived resolver lets one search return
+     * the correct carrier per result without duplicating search schemas or
+     * teaching provider/task-specific operation lists. */
+    dispatchCarrierForName?: (name: string) => ToolSearchDispatchCarrier;
+    /** Scope-bound provider adapters searched behind this same visible door. */
+    candidateSources?: readonly ToolSearchCandidateSource[];
   } = {},
 ): void {
   server.tool(
@@ -108,6 +164,12 @@ export function registerToolSearchTool(
         .min(1)
         .max(400)
         .describe('What you want to do, in plain language. Ranked against every built-in tool.'),
+      role_key: z
+        .string()
+        .min(1)
+        .max(128)
+        .optional()
+        .describe('Opaque host-issued requirement role. Echoed for traceability; it does not affect ranking or grant authority.'),
       limit: z
         .number()
         .int()
@@ -116,31 +178,82 @@ export function registerToolSearchTool(
         .optional()
         .describe(`How many ranked results to return (default ${TOP_RESULTS}).`),
     },
-    async ({ query, limit }: { query: string; limit?: number }) => {
-      const ranked = await rankCatalog(query, { allowedNames: opts.allowedNames });
+    async ({ query, role_key, limit }: { query: string; role_key?: string; limit?: number }) => {
       // An exact tool name is an explicit selection, not another fuzzy search
-      // term. Resolve it against the complete policy-filtered ranking before
-      // applying the result limit, then keep it first even when lexical or
-      // semantic neighbors happen to score higher.
-      const exactNamedHit = ranked.find((result) => queryExplicitlyNamesTool(query, result.name));
-      const ordered = exactNamedHit
-        ? [exactNamedHit, ...ranked.filter((result) => result.name !== exactNamedHit.name)]
-        : ranked;
-      const topN = ordered.slice(0, Math.min(limit ?? TOP_RESULTS, 20));
+      // term. Resolve it against the policy-filtered catalog BEFORE semantic
+      // ranking so a selected name never pays a cold embedding/model detour.
+      // Once selected, neighboring guesses add no value: return only the exact
+      // capability and its schema. Natural-language discovery still ranks the
+      // whole allowed catalog below.
+      const requestedLimit = Math.min(limit ?? TOP_RESULTS, 20);
+      const exactEntry = catalogEntries({ allowedNames: opts.allowedNames })
+        .find((entry) => queryExplicitlyNamesTool(query, entry.name));
+      const exactKnownButDenied = !exactEntry && catalogEntries()
+        .some((entry) => queryExplicitlyNamesTool(query, entry.name));
+      const exactNamedHit: RankedCatalogEntry | undefined = exactEntry
+        ? { ...exactEntry, score: 1 }
+        : undefined;
+      // An exact registered built-in is already resolved and never pays for
+      // provider I/O. Provider adapters are consulted only for an unresolved
+      // name/role, preserving the fast path and avoiding broad discovery after
+      // an exact capability selection.
+      const sourceCandidates = exactNamedHit || exactKnownButDenied
+        ? []
+        : (await Promise.all((opts.candidateSources ?? []).map(async (source) => {
+            try {
+              const candidates = await source.search({ query, limit: requestedLimit });
+              return candidates
+                .filter((candidate) => candidate.name.trim() && candidate.summary.trim())
+                .slice(0, requestedLimit);
+            } catch {
+              return [];
+            }
+          }))).flat();
+      const exactSourceHit = sourceCandidates.find((candidate) =>
+        queryExplicitlyNamesTool(query, candidate.name));
+      const selectedExactly = exactSourceHit ?? exactNamedHit;
+      const rankedBuiltins = exactNamedHit
+        ? [exactNamedHit]
+        : await rankCatalog(query, { allowedNames: opts.allowedNames });
+      const combined = selectedExactly
+        ? [selectedExactly]
+        : [
+            ...sourceCandidates.map((candidate, index) => ({
+              ...candidate,
+              score: candidate.score ?? Math.max(0, 1 - (index / Math.max(1, sourceCandidates.length))),
+            })),
+            ...rankedBuiltins.map((entry) => ({
+              name: entry.name,
+              summary: entry.oneLiner,
+              score: entry.score,
+            })),
+          ].sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
+      const seen = new Set<string>();
+      const topN = combined.filter((candidate) => {
+        const key = candidate.name.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }).slice(0, requestedLimit);
       const metadataMap = await toolMetadataMap();
 
       // When the model supplied an exact tool name, it has already selected
       // the capability. Return only that schema instead of spending tokens on
       // two neighboring suggestions. Natural-language discovery still gets up
       // to three candidates.
-      const schemaNames = exactNamedHit
-        ? [exactNamedHit.name]
+      const schemaNames = selectedExactly
+        ? [selectedExactly.name]
         : topN.slice(0, TOP_SCHEMAS).map((r) => r.name);
       const schemas: Record<string, unknown> = {};
       for (const name of schemaNames) {
+        const sourced = sourceCandidates.find((candidate) => candidate.name === name);
+        if (sourced?.schema !== undefined) {
+          schemas[name] = relaxJsonSchemaForDeferred(sourced.schema);
+          continue;
+        }
         const metadata = metadataMap.get(name);
         if (metadata?.schema !== undefined) {
-          schemas[name] = (opts.dispatchViaCallTool || opts.dispatchCarrier)
+          schemas[name] = (opts.dispatchViaCallTool || opts.dispatchCarrier || opts.dispatchCarrierForName)
             ? relaxJsonSchemaForDeferred(metadata.schema)
             : metadata.schema;
         }
@@ -151,9 +264,11 @@ export function registerToolSearchTool(
       // broad discovery remains one-liners + schemas and does not load three
       // unrelated prompt blocks.
       const guidance: Record<string, string> = {};
-      if (exactNamedHit) {
-        const description = metadataMap.get(exactNamedHit.name)?.description;
-        if (description) guidance[exactNamedHit.name] = description;
+      if (selectedExactly) {
+        const sourceGuidance = sourceCandidates.find((candidate) => candidate.name === selectedExactly.name)
+          ?.guidance;
+        const description = sourceGuidance ?? metadataMap.get(selectedExactly.name)?.description;
+        if (description) guidance[selectedExactly.name] = description;
       }
 
       // Bound our OWN payload: the generic tool-result cap would otherwise slice
@@ -167,18 +282,41 @@ export function registerToolSearchTool(
       // was a second search followed by an intentional invalid `{}` call just
       // to obtain that schema. Compact JSON preserves the exact schema while
       // spending fewer prompt tokens and tool round-trips.
+      const exactSourceCarrier = exactSourceHit?.carrier;
+      const exactCarrier = exactSourceCarrier ?? (
+        exactNamedHit && opts.dispatchCarrierForName
+          ? opts.dispatchCarrierForName(exactNamedHit.name)
+          : null
+      );
+      const hint = (() => {
+        if (exactCarrier) return dispatchHint(exactCarrier);
+        if (opts.dispatchCarrierForName) {
+          return 'Each result includes its required carrier. Invoke control/recovery results with call_tool(name, args_json); invoke business results as the inner name/args_json of work_call. Never send a business result through call_tool.';
+        }
+        const fixedCarrier = opts.dispatchCarrier
+          ?? (opts.dispatchViaCallTool ? 'call_tool' : null);
+        if (fixedCarrier) return dispatchHint(fixedCarrier);
+        return opts.allowedNames
+          ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
+          : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.';
+      })();
       const render = (): string => JSON.stringify({
         query,
-        results: topN.map((r) => ({ name: r.name, summary: r.oneLiner })),
+        ...(role_key ? { role_key } : {}),
+        results: topN.map((r) => ({
+          name: r.name,
+          summary: 'summary' in r ? r.summary : r.oneLiner,
+          ...('carrier' in r && r.carrier
+            ? { carrier: r.carrier }
+            : opts.dispatchCarrierForName
+              ? { carrier: opts.dispatchCarrierForName(r.name) }
+              : {}),
+          ...('invocation' in r && r.invocation ? { invocation: r.invocation } : {}),
+        })),
         schemas,
         ...(Object.keys(guidance).length > 0 ? { guidance } : {}),
-        hint: (opts.dispatchCarrier ?? (opts.dispatchViaCallTool ? 'call_tool' : null)) === 'work_call'
-          ? 'Invoke the selected result as the inner name/args_json of work_call. On the first work_call, include the complete provider-neutral semantic proposal and dispatch this first requirement in that same call; later calls use proposal:null.'
-          : opts.dispatchViaCallTool
-            ? 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional/nullable fields you do not need.'
-          : opts.allowedNames
-            ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
-            : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',
+        brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
+        hint,
       });
       let text = render();
       const shownSchemaNames = [...schemaNames];
@@ -188,8 +326,8 @@ export function registerToolSearchTool(
       // because annotations exceed the result budget. The selected tool's
       // overall guidance remains present; strip JSON-Schema annotations while
       // retaining every property, type, enum, constraint, and required key.
-      if (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && exactNamedHit) {
-        const exactName = exactNamedHit.name;
+      if (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && selectedExactly) {
+        const exactName = selectedExactly.name;
         if (schemas[exactName]) {
           schemas[exactName] = stripSchemaAnnotations(schemas[exactName]);
           text = render();

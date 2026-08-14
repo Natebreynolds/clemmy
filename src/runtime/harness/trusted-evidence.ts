@@ -31,6 +31,10 @@ export interface TrustedSource {
   /** Runtime effect of the producing tool ('read' | 'compute' | ...), or null
    *  for a user message / legacy row with no effect metadata. */
   effect: string | null;
+  /** Semantic use of the evidence. A mutation-safety class is not source
+   * authority: compute output is a derivation until durable lineage proves
+   * otherwise, while a settled read may serve as an observed source. */
+  evidenceRole: 'source_read' | 'derivation' | 'committed_effect' | 'verification' | null;
   /** Provider-response text a field extractor runs against. Structured request
    * echoes are removed before this value can authorize a downstream field. */
   text: string;
@@ -65,7 +69,14 @@ export function gatherTrustedEvidence(
   for (const event of events) {
     if (event.type !== 'user_input_received' || event.data.synthetic === true) continue;
     const text = typeof event.data.text === 'string' ? event.data.text : '';
-    if (text.length > 0) sources.push({ id: `user:${event.seq}`, tool: null, effect: null, text, kind: 'user' });
+    if (text.length > 0) sources.push({
+      id: `user:${event.seq}`,
+      tool: null,
+      effect: null,
+      evidenceRole: 'source_read',
+      text,
+      kind: 'user',
+    });
   }
 
   // Search/recall rows are presentation state: a reused SDK call id keeps its
@@ -80,6 +91,11 @@ export function gatherTrustedEvidence(
         id: output.callId,
         tool,
         effect: output.effect,
+        evidenceRole: output.effect === 'read'
+          ? 'source_read'
+          : output.effect === 'compute'
+            ? 'derivation'
+            : null,
         text: trustedToolEvidenceText(output.output),
         kind: 'tool',
       });

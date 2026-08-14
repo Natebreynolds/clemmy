@@ -14,9 +14,12 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { after, beforeEach, test } from 'node:test';
-import type { Agent, Runner } from '@openai/agents';
+import { Agent, RunContext, RunState, type Runner } from '@openai/agents';
 import type { BoundaryJudgeRouting } from './debate-model.js';
-import type { TerminalDeliveryJudgePort } from './terminal-delivery-judge.js';
+import type {
+  TerminalDeliveryJudgePort,
+  TerminalDeliveryJudgeRequest,
+} from './terminal-delivery-judge.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-loop-delivery-one-gate-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -25,18 +28,23 @@ process.env.CLEMMY_VERIFY_DELIVERED = 'off';
 process.env.HARNESS_TOOL_BRACKETS = 'off';
 process.env.CLEMMY_UNIFIED_RECALL = 'off';
 process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'off';
+process.env.CLEMMY_CONFIRM_BEAT = 'on';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-loop-delivery-one-gate\n', 'utf8');
 
 const eventlog = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runConversation } = await import('./loop.js');
+const { runConversation, runConversationFromResume } = await import('./loop.js');
+const approvalRegistry = await import('./approval-registry.js');
 const identities = await import('./attempt-identity.js');
 const admission = await import('./expected-work-admission.js');
 const dispatch = await import('./dispatch-ledger.js');
 const settlement = await import('./attempt-settlement.js');
 const audit = await import('./accepted-source-settlement-audit.js');
+const delivery = await import('./delivery-committer.js');
 const resultHandles = await import('./result-handle.js');
+const terminalTools = await import('./terminal-tool.js');
+const { withTerminalAuthoringEvidenceReceipt } = await import('../../tools/tool-registry.js');
 
 const ASK = 'Read the source file, then write a local summary report.';
 const ORIGINAL_REPLY = 'The source was read and the summary report is complete.';
@@ -67,6 +75,29 @@ function completed(items: unknown[]) {
   } as never;
 }
 
+function approvalRunState(
+  agent: Agent<any, any>,
+  toolName: string,
+): string {
+  const state = new RunState(new RunContext({}), 'approve this', agent, null);
+  const json = state.toJSON() as Record<string, unknown>;
+  json.currentStep = {
+    type: 'next_step_interruption',
+    data: {
+      interruptions: [{
+        rawItem: {
+          type: 'function_call',
+          name: toolName,
+          callId: `${toolName}_call`,
+          arguments: '{}',
+        },
+        toolName,
+      }],
+    },
+  };
+  return JSON.stringify(json);
+}
+
 function proposal() {
   return {
     version: 1 as const,
@@ -82,6 +113,7 @@ function proposal() {
       {
         id: 'write-report',
         effect: 'local_write' as const,
+        coverage: null,
         dependsOn: ['read-source'],
         dataFrom: ['read-source'],
         cardinality: { kind: 'once' as const },
@@ -203,7 +235,41 @@ function stageUncontractedReadAttempt(
   return sourceUserSeq;
 }
 
-function terminalJudgePort(output: unknown): TerminalDeliveryJudgePort {
+function recordIrreversibleUncertainWrite(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn: number;
+}): void {
+  const data = {
+    sourceUserSeq: input.sourceUserSeq,
+    callId: `write_loop_irreversible_${input.sourceUserSeq}`,
+    canonicalCallId: `write_loop_irreversible_${input.sourceUserSeq}`,
+    preDispatch: true,
+    irreversible: true,
+    shapeKey: 'OUTLOOK_SEND_EMAIL',
+    toolName: 'composio_execute_tool',
+    targets: ['recipient@example.test'],
+  };
+  eventlog.appendEvent({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'system',
+    type: 'external_write',
+    data,
+  });
+  eventlog.appendEvent({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'system',
+    type: 'external_write_orphaned',
+    data,
+  });
+}
+
+function terminalJudgePort(
+  output: unknown,
+  inspect?: (request: TerminalDeliveryJudgeRequest) => void,
+): TerminalDeliveryJudgePort {
   return {
     async resolveRoute() {
       return {
@@ -215,7 +281,8 @@ function terminalJudgePort(output: unknown): TerminalDeliveryJudgePort {
         selfJudge: false,
       };
     },
-    async run() {
+    async run(request) {
+      inspect?.(request);
       return output;
     },
   };
@@ -257,6 +324,63 @@ async function runIncompleteAction(
   return { result, repairCalls, sessionId: session.id, sourceUserSeq };
 }
 
+async function runResumedIncompleteAction(direction: 'hold' | 'disclose') {
+  const agent = new Agent({ name: 'ResumeOneGatePin', instructions: 'test' });
+  const session = HarnessSession.create({
+    kind: 'chat', channel: 'desktop', title: 'approval-resume one-gate pin',
+  });
+  eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: ASK },
+  });
+  const toolName = 'approved_fixture_tool';
+  session.saveInterruptState(approvalRunState(agent, toolName));
+  const approval = approvalRegistry.register({
+    sessionId: session.id,
+    subject: 'run the exact approved fixture action',
+    tool: toolName,
+    args: {},
+  });
+  let repairCalls = 0;
+  let sourceUserSeq = 0;
+  const result = await runConversationFromResume({
+    agent,
+    sessionId: session.id,
+    approvalId: approval.approvalId,
+    decision: 'approve',
+    resolver: 'one-gate-pin',
+    maxSteps: 2,
+    makeRunner: makeRunnerStub,
+    runRunner: async (runner, _agent, items) => {
+      (runner as unknown as EventEmitter).emit('agent_tool_start');
+      sourceUserSeq = stageIncompleteAction(session.id, 'succeeded').sourceUserSeq;
+      if (direction === 'hold') {
+        const source = eventlog.listEvents(session.id, { types: ['user_input_received'] }).at(-1)!;
+        recordIrreversibleUncertainWrite({
+          sessionId: session.id,
+          sourceUserSeq,
+          turn: source.turn,
+        });
+      }
+      return completed(items);
+    },
+    terminalPresentationRepairPort: {
+      async render() {
+        repairCalls += 1;
+        return REPAIRED_REPLY;
+      },
+    },
+    terminalDeliveryJudgePort: {
+      async resolveRoute() { return null; },
+      async run() { throw new Error('unavailable judge must not run'); },
+    },
+  });
+  return { result, repairCalls, sessionId: session.id, sourceUserSeq };
+}
+
 beforeEach(() => {
   eventlog.resetEventLog();
   settlement._resetAttemptSettlementStateForTests();
@@ -284,6 +408,153 @@ test('loop calls terminal repair and holds when the source has no successful bus
   assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
 });
 
+test('the real Codex hook-to-loop terminal publishes one host-proven workflow creation', async () => {
+  const session = HarnessSession.create({
+    kind: 'chat', channel: 'desktop', title: 'loop authoring evidence pin',
+  });
+  const reply = 'Created the disabled manual-only daily digest workflow.';
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: session.id,
+    input: 'Create a disabled, unscheduled workflow named daily digest with one read-only step.',
+    maxSteps: 1,
+    judgeCompletion: false,
+    makeRunner: makeRunnerStub,
+    runRunner: async (runner, _agent, items) => {
+      const details = {
+        toolCall: {
+          callId: 'call_codex_workflow_create',
+          arguments: JSON.stringify({
+            name: 'daily digest',
+            description: 'Read the first five files.',
+            steps: [{ id: 'list-files', sideEffect: 'read' }],
+          }),
+        },
+      };
+      (runner as unknown as EventEmitter).emit(
+        'agent_tool_start',
+        { context: { sessionId: session.id, turn: 1 } },
+        { name: 'orchestrator' },
+        { name: 'workflow_create' },
+        details,
+      );
+      (runner as unknown as EventEmitter).emit(
+        'agent_tool_end',
+        { context: { sessionId: session.id, turn: 1 } },
+        { name: 'orchestrator' },
+        { name: 'workflow_create' },
+        withTerminalAuthoringEvidenceReceipt(
+          'workflow_create',
+          'Created workflow "daily digest".',
+        ),
+        details,
+      );
+      return {
+        ...completed(items),
+        finalOutput: {
+          summary: reply,
+          reply,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      } as never;
+    },
+    terminalDeliveryJudgePort: {
+      async resolveRoute() { return null; },
+      async run() { throw new Error('host-proven authoring must not need the judge'); },
+    },
+  });
+
+  const source = eventlog.listEvents(session.id, { types: ['user_input_received'] }).at(-1);
+  assert.ok(source);
+  const called = eventlog.listEvents(session.id, { types: ['tool_called'] });
+  const returned = eventlog.listEvents(session.id, { types: ['tool_returned'] });
+  assert.equal(called.length, 1);
+  assert.equal(returned.length, 1);
+  assert.equal(returned[0]!.parentEventId, called[0]!.id);
+  assert.equal(returned[0]!.data.successfulAuthoringResult, true);
+  const settlementAudit = audit.auditAcceptedSourceSettlementTruth({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(settlementAudit.status, 'clean', JSON.stringify(settlementAudit));
+  assert.equal(settlementAudit.facts.successfulSdkAuthoringResults, 1);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.publicPresentation?.status, 'done');
+  assert.match(result.publicPresentation?.text ?? '', /daily digest/);
+});
+
+test('loop takes the sole deterministic HOLD edge for an irreversible uncertain write', async () => {
+  const session = HarnessSession.create({
+    kind: 'chat', channel: 'desktop', title: 'loop irreversible hold pin',
+  });
+  const hold = 'The send may have crossed the provider boundary, so it needs a human check before any retry.';
+  let repairCalls = 0;
+  let sourceUserSeq = 0;
+  const previousMaxContinuations = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+  // Exercise the publish-time HOLD itself. The ordinary positive continuation
+  // budget first offers the running model a read-only reconciliation turn;
+  // zero is the production-supported exhausted-budget shape at this terminal.
+  process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
+  try {
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: session.id,
+      input: 'Read the source, send the result once, and write the local summary.',
+      maxSteps: 1,
+      judgeCompletion: false,
+      makeRunner: makeRunnerStub,
+      runRunner: async (runner, _agent, items) => {
+        (runner as unknown as EventEmitter).emit('agent_tool_start');
+        const staged = stageIncompleteAction(session.id, 'succeeded');
+        sourceUserSeq = staged.sourceUserSeq;
+        const source = eventlog.listEvents(session.id, { types: ['user_input_received'] }).at(-1)!;
+        recordIrreversibleUncertainWrite({
+          sessionId: session.id,
+          sourceUserSeq,
+          turn: source.turn,
+        });
+        return completed(items);
+      },
+      terminalPresentationRepairPort: {
+        async render() {
+          repairCalls += 1;
+          return hold;
+        },
+      },
+      terminalDeliveryJudgePort: {
+        async resolveRoute() { return null; },
+        async run() { throw new Error('unavailable judge must not run'); },
+      },
+    });
+
+    const settlementAudit = audit.auditAcceptedSourceSettlementTruth({
+      sessionId: session.id,
+      sourceUserSeq,
+    });
+    assert.equal(settlementAudit.status, 'uncertain_write', JSON.stringify(settlementAudit));
+    assert.equal(delivery.deliveryMustHoldForHuman(settlementAudit), true);
+    assert.equal(repairCalls, 1, 'the exact loop terminal must spend the sealed repair');
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(result.publicPresentation?.status, 'blocked');
+    assert.equal(result.publicPresentation?.text, hold);
+    const terminal = eventlog.listEvents(session.id, { types: ['conversation_completed'] }).at(-1);
+    assert.equal(terminal?.data.blockedReason, 'authoritative_terminal_verification_incomplete');
+    assert.equal(
+      terminal?.data.deliveryDisclosure,
+      undefined,
+      'the direct irreversible HOLD must not be mislabeled as a disclosure',
+    );
+  } finally {
+    if (previousMaxContinuations === undefined) {
+      delete process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+    } else {
+      process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = previousMaxContinuations;
+    }
+  }
+});
+
 test('loop calls terminal repair and takes the disclosure edge after real work succeeded', async () => {
   const { result, repairCalls, sessionId, sourceUserSeq } = await runIncompleteAction('succeeded');
   const settlementAudit = audit.auditAcceptedSourceSettlementTruth({ sessionId, sourceUserSeq });
@@ -309,16 +580,64 @@ test('loop calls terminal repair and takes the disclosure edge after real work s
   assert.equal(terminal?.data.deliveryDisclosure, 'state_machine_hold');
 });
 
+test('approval-resume loop asks the shared gate and takes HOLD for an irreversible uncertain write', async () => {
+  const { result, repairCalls, sessionId, sourceUserSeq } = await runResumedIncompleteAction('hold');
+  const settlementAudit = audit.auditAcceptedSourceSettlementTruth({ sessionId, sourceUserSeq });
+  assert.equal(settlementAudit.status, 'uncertain_write', JSON.stringify(settlementAudit));
+  assert.equal(delivery.deliveryMustHoldForHuman(settlementAudit), true);
+  assert.equal(repairCalls, 1, 'the approval-resume terminal called the sealed repair port');
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.publicPresentation?.status, 'blocked');
+  assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
+  const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(
+    terminal?.data.deliveryDisclosure,
+    undefined,
+    'the approval-resume HOLD is direct, not the disclosure fallback',
+  );
+  assert.equal(
+    terminal?.data.blockedReason,
+    'authoritative_terminal_verification_incomplete',
+  );
+});
+
+test('approval-resume loop asks the shared gate and takes DISCLOSE after real work succeeded', async () => {
+  const { result, repairCalls, sessionId, sourceUserSeq } = await runResumedIncompleteAction('disclose');
+  const settlementAudit = audit.auditAcceptedSourceSettlementTruth({ sessionId, sourceUserSeq });
+  assert.equal(settlementAudit.status, 'clean', JSON.stringify(settlementAudit));
+  assert.equal(settlementAudit.facts.successfulBusinessSettlements, 1, JSON.stringify(settlementAudit));
+  assert.equal(delivery.deliveryMustHoldForHuman(settlementAudit), false);
+  assert.equal(repairCalls, 1, 'the approval-resume terminal called the sealed repair port');
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.publicPresentation?.status, 'blocked');
+  assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
+  const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(
+    terminal?.data.deliveryDisclosure,
+    'state_machine_hold',
+    'DISCLOSE reached the committer before incomplete durable authority forced its documented fallback',
+  );
+});
+
 test('loop carries a different-family DELIVER verdict through the shared commit', async () => {
+  let judgeCalls = 0;
   const { result, repairCalls, sessionId } = await runIncompleteAction(
     'succeeded',
     terminalJudgePort({
       verb: 'deliver',
       reason: 'the successful read is useful when the missing write is disclosed',
       publicText: JUDGED_REPLY,
+    }, (request) => {
+      judgeCalls += 1;
+      assert.match(
+        request.prompt,
+        /Live continuation: UNAVAILABLE/,
+        'a maxSteps:1 run must not offer a recovery turn after its sole step is spent',
+      );
     }),
   );
 
+  assert.equal(judgeCalls, 1);
   assert.equal(repairCalls, 0, 'a decided terminal judge must own the words without a second repair model');
   assert.equal(result.status, 'awaiting_user_input');
   assert.equal(result.publicPresentation?.status, 'blocked');
@@ -328,9 +647,45 @@ test('loop carries a different-family DELIVER verdict through the shared commit'
   assert.equal(terminal?.data.terminalJudgeReason, 'the successful read is useful when the missing write is disclosed');
   assert.equal(terminal?.data.terminalJudgeFamily, 'claude');
   assert.equal(terminal?.data.deliveryDisclosure, 'state_machine_hold');
+  assert.equal(
+    eventlog.listEvents(sessionId, { types: ['heartbeat'] })
+      .some((event) => event.data.kind === 'terminal_delivery_resume'),
+    false,
+  );
 });
 
-test('loop honors one RESUME and publishes the brain answer after that continuation closes the gap', async () => {
+test('a final-step RESUME verdict cannot consume the loop terminal', async () => {
+  let judgeCalls = 0;
+  const { result, repairCalls, sessionId } = await runIncompleteAction(
+    'succeeded',
+    terminalJudgePort({
+      verb: 'resume',
+      reason: 'one more exact read could close the terminal gap',
+      recoveryInstruction: 'Read the retained source by exact path and bind that result to this accepted request.',
+      askIfRepeated: REPEATED_RESUME_ASK,
+    }, (request) => {
+      judgeCalls += 1;
+      assert.match(request.prompt, /Live continuation: UNAVAILABLE/);
+    }),
+  );
+
+  assert.equal(judgeCalls, 1);
+  assert.equal(repairCalls, 1, 'an impossible RESUME keeps the conservative authored fallback path');
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.publicPresentation?.status, 'blocked');
+  assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
+  const terminals = eventlog.listEvents(sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1, 'the final step must still commit exactly one public terminal');
+  assert.equal(terminals[0]?.data.terminalJudgeDisposition, undefined);
+  assert.equal(
+    eventlog.listEvents(sessionId, { types: ['heartbeat'] })
+      .some((event) => event.data.kind === 'terminal_delivery_resume'),
+    false,
+    'an unavailable recovery edge must not reopen the spent loop',
+  );
+});
+
+test('loop tells the judge a live agent can inspect external state, resumes, and publishes after the exact read settlement', async () => {
   const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'loop terminal resume pin' });
   let runnerCalls = 0;
   let judgeCalls = 0;
@@ -362,12 +717,24 @@ test('loop honors one RESUME and publishes the brain answer after that continuat
           judgeFamily: 'claude', brainFamily: 'codex', transport: 'claude_subscription', selfJudge: false,
         };
       },
-      async run() {
+      async run(request) {
         judgeCalls += 1;
+        const canRecover = [
+          'Live continuation: AVAILABLE',
+          'Tools during continuation: AVAILABLE',
+          'Read-only external-state inspection: AVAILABLE',
+        ].every((fact) => request.prompt.includes(fact));
+        if (!canRecover) {
+          return {
+            verb: 'ask',
+            reason: 'the judge was not told the running agent can inspect the provider',
+            publicText: 'Please inspect the provider state for me.',
+          };
+        }
         return {
           verb: 'resume',
-          reason: 'one local write can close the remaining contract',
-          recoveryInstruction: RESUME_INSTRUCTION,
+          reason: 'the live agent can close the evidence gap by inspection',
+          recoveryInstruction: 'Use the available read tool to inspect the exact retained provider target and bind that observation to this accepted request.',
           askIfRepeated: REPEATED_RESUME_ASK,
         };
       },
@@ -383,6 +750,166 @@ test('loop honors one RESUME and publishes the brain answer after that continuat
   );
   assert.equal(result.publicPresentation?.status, 'done');
   assert.equal(result.publicPresentation?.text, ORIGINAL_REPLY);
+});
+
+test('terminal RESUME stays inside the accepted turn and does not replay its conversational preflight', async () => {
+  const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'loop terminal preflight identity pin' });
+  const { _setOpennessJudgeForTests } = await import('./turn-openness.js');
+  let runnerCalls = 0;
+  let judgeCalls = 0;
+  let authorCalls = 0;
+  const painted: string[] = [];
+  _setOpennessJudgeForTests(async () => null);
+  try {
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: session.id,
+      input: 'Create a new Google Sheet containing one fixture row.',
+      maxSteps: 3,
+      judgeCompletion: false,
+      makeRunner: makeRunnerStub,
+      runRunner: async (runner, _agent, items) => {
+        runnerCalls += 1;
+        (runner as unknown as EventEmitter).emit('agent_tool_start');
+        stageUncontractedReadAttempt(
+          session.id,
+          runnerCalls === 1 ? 'failed' : 'succeeded',
+          runnerCalls,
+        );
+        return completed(items);
+      },
+      preflightConversationPort: {
+        async render(packet) {
+          authorCalls += 1;
+          assert.equal(packet.kind, 'proceed');
+          return 'I have the Sheet request and I’m starting it now.';
+        },
+      },
+      onConversationPreamble: async (text) => {
+        painted.push(text);
+        return { status: 'delivered' };
+      },
+      terminalPresentationRepairPort: {
+        async render() { throw new Error('a decided judge must not call terminal repair'); },
+      },
+      terminalDeliveryJudgePort: {
+        async resolveRoute() {
+          return {
+            model: {} as BoundaryJudgeRouting['model'], modelId: 'claude-haiku-4-5',
+            judgeFamily: 'claude', brainFamily: 'codex', transport: 'claude_subscription', selfJudge: false,
+          };
+        },
+        async run() {
+          judgeCalls += 1;
+          return {
+            verb: 'resume',
+            reason: 'one exact read can close the terminal evidence gap',
+            recoveryInstruction: 'Query the task status. If the Sheet is missing, create the new Google Sheet now and email the link.',
+            askIfRepeated: REPEATED_RESUME_ASK,
+          };
+        },
+      },
+    });
+
+    const runFailures = eventlog.listEvents(session.id, { types: ['run_failed'] });
+    assert.equal(
+      runFailures.length,
+      0,
+      JSON.stringify(runFailures.at(-1)?.data),
+    );
+    assert.equal(runnerCalls, 2, 'the recovery directive must reach the execution model');
+    assert.equal(judgeCalls, 1);
+    assert.equal(result.status, 'completed');
+    assert.equal(result.publicPresentation?.status, 'done');
+    assert.equal(authorCalls, 1, 'only the real accepted user input authors a conversational opening');
+    assert.deepEqual(painted, ['I have the Sheet request and I’m starting it now.']);
+    assert.equal(eventlog.listEvents(session.id, { types: ['conversation_preamble'] }).length, 1);
+    assert.equal(
+      eventlog.listEvents(session.id, { types: ['turn_preflight_decision'] })
+        .filter((event) => event.data.phase === 'align').length,
+      1,
+      'the internal RESUME directive must not mint a competing ALIGN identity',
+    );
+  } finally {
+    _setOpennessJudgeForTests(null);
+  }
+});
+
+test('a successful background-dispatch control receipt transfers the foreground without terminal re-judgment', async () => {
+  const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'loop background control receipt pin' });
+  const { _setOpennessJudgeForTests } = await import('./turn-openness.js');
+  let runnerCalls = 0;
+  let judgeCalls = 0;
+  _setOpennessJudgeForTests(async () => null);
+  try {
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: session.id,
+      input: 'Create a new Google Sheet containing one fixture row and email me the link.',
+      maxSteps: 3,
+      judgeCompletion: true,
+      makeRunner: makeRunnerStub,
+      runRunner: async (runner, _agent, items) => {
+        runnerCalls += 1;
+        (runner as unknown as EventEmitter).emit('agent_tool_start');
+        const source = eventlog.listEvents(session.id, { types: ['user_input_received'] }).at(-1)!;
+        eventlog.appendEvent({
+          sessionId: session.id,
+          turn: source.turn,
+          role: 'Clem',
+          type: 'tool_called',
+          data: {
+            sourceUserSeq: source.seq,
+            tool: 'dispatch_background_task',
+            effectiveTool: 'dispatch_background_task',
+            accounting: 'top_level',
+            effect: 'read',
+            callId: `dispatch-control-${source.seq}`,
+          },
+        });
+        return {
+          history: items,
+          lastResponseId: undefined,
+          finalOutput: terminalTools.formatControlReceiptFinalOutput(
+            'I handed the Sheet and email work to the durable background runner, and I’ll report back here when it finishes.',
+          ),
+        } as never;
+      },
+      preflightConversationPort: {
+        async render() { return 'I have the Sheet and email handoff in mind and I’m starting now.'; },
+      },
+      terminalDeliveryJudgePort: {
+        async resolveRoute() {
+          return {
+            model: {} as BoundaryJudgeRouting['model'], modelId: 'claude-haiku-4-5',
+            judgeFamily: 'claude', brainFamily: 'codex', transport: 'claude_subscription', selfJudge: false,
+          };
+        },
+        async run() {
+          judgeCalls += 1;
+          return {
+            verb: 'resume',
+            reason: 'the child has not yet produced its writes',
+            recoveryInstruction: 'Poll the child until it finishes.',
+            askIfRepeated: 'The child is still running. Should I poll it again?',
+          };
+        },
+      },
+    });
+
+    assert.equal(runnerCalls, 1, 'the successful dispatch already transferred execution ownership');
+    assert.equal(judgeCalls, 0, 'a control receipt is not an incomplete foreground completion candidate');
+    assert.equal(result.status, 'completed');
+    assert.equal(result.publicPresentation?.status, 'transferred');
+    assert.match(result.publicPresentation?.text ?? '', /durable background runner/i);
+    assert.equal(
+      eventlog.listEvents(session.id, { types: ['heartbeat'] })
+        .some((event) => event.data.kind === 'terminal_delivery_resume'),
+      false,
+    );
+  } finally {
+    _setOpennessJudgeForTests(null);
+  }
 });
 
 test('loop turns a second consecutive RESUME into the judge-authored ASK', async () => {

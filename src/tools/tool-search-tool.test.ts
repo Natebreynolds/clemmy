@@ -9,12 +9,13 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-toolsearch-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { ToolSearchCandidateSource } from './tool-search-tool.js';
 const { registerToolSearchTool } = await import('./tool-search-tool.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { getHotSet, _resetHotSetForTest } = await import('../agents/tool-hotset.js');
 const { deriveOrchestratorDiscoveryNames } = await import('./tool-registry.js');
 
-type Handler = (input: { query: string; limit?: number }) => Promise<{ content: Array<{ type: 'text'; text: string }> }>;
+type Handler = (input: { query: string; role_key?: string; limit?: number }) => Promise<{ content: Array<{ type: 'text'; text: string }> }>;
 
 interface Captured {
   name: string;
@@ -26,6 +27,7 @@ interface Captured {
 function captureToolSearch(
   allowedNames?: ReadonlySet<string>,
   dispatchViaCallTool = false,
+  candidateSources?: readonly ToolSearchCandidateSource[],
 ): Captured {
   let captured: Captured | undefined;
   const fakeServer = {
@@ -36,21 +38,24 @@ function captureToolSearch(
   registerToolSearchTool(fakeServer as unknown as McpServer, {
     allowedNames,
     dispatchViaCallTool,
+    ...(candidateSources ? { candidateSources } : {}),
   });
   assert.ok(captured, 'tool_search should register');
   return captured!;
 }
 
-async function runSearch(handler: Handler, query: string, sessionId?: string) {
+async function runSearch(handler: Handler, query: string, sessionId?: string, roleKey?: string) {
   const result = await (sessionId
-    ? (withToolOutputContext({ sessionId }, () => handler({ query })) as Promise<{ content: Array<{ type: 'text'; text: string }> }>)
-    : handler({ query }));
+    ? (withToolOutputContext({ sessionId }, () => handler({ query, ...(roleKey ? { role_key: roleKey } : {}) })) as Promise<{ content: Array<{ type: 'text'; text: string }> }>)
+    : handler({ query, ...(roleKey ? { role_key: roleKey } : {}) }));
   return JSON.parse(result.content[0].text) as {
     query: string;
-    results: Array<{ name: string; summary: string }>;
+    role_key?: string;
+    results: Array<{ name: string; summary: string; carrier?: string; invocation?: unknown }>;
     schemas: Record<string, unknown>;
     guidance?: Record<string, string>;
     hint: string;
+    brokerCoverage: string;
   };
 }
 
@@ -58,6 +63,14 @@ test('registers as read-only tool_search with a query param', () => {
   const t = captureToolSearch();
   assert.equal(t.name, 'tool_search');
   assert.ok('query' in t.schema, 'schema exposes a query field');
+  assert.ok('role_key' in t.schema, 'schema exposes the opaque requirement role');
+});
+
+test('echoes role_key without changing an exact-name result', async () => {
+  const t = captureToolSearch(new Set(['workspace_roots']));
+  const out = await runSearch(t.handler, 'workspace_roots', undefined, 'requirement-7');
+  assert.equal(out.role_key, 'requirement-7');
+  assert.deepEqual(out.results.map((result) => result.name), ['workspace_roots']);
 });
 
 test('returns ranked names + summaries and full schemas for the top hits', async () => {
@@ -203,4 +216,32 @@ test('schema-on-demand search tells Claude to dispatch a deferred result through
   const out = await runSearch(t.handler, 'list workspace roots');
   assert.match(out.hint, /call_tool\(name, args_json\)/);
   assert.ok(out.results.some((result) => result.name === 'workspace_roots'));
+});
+
+test('one federated broker returns an authorized provider candidate with exact schema and carrier', async () => {
+  const sources: ToolSearchCandidateSource[] = [
+    {
+      kind: 'authorized_external_mcp',
+      async search() {
+        return [{
+          name: 'crm__mass_read',
+          summary: 'Read a large CRM dataset with bounded pagination.',
+          schema: {
+            type: 'object',
+            properties: { query: { type: 'string' }, cursor: { type: 'string' } },
+            required: ['query'],
+          },
+          carrier: 'work_call',
+        }];
+      },
+    },
+    { kind: 'authorized_composio', async search() { return []; } },
+  ];
+  const t = captureToolSearch(new Set(['tool_search']), false, sources);
+  const out = await runSearch(t.handler, 'crm__mass_read exact schema');
+  assert.equal(out.brokerCoverage, 'authorized_external_v1');
+  assert.deepEqual(out.results.map((result) => result.name), ['crm__mass_read']);
+  assert.equal(out.results[0]?.carrier, 'work_call');
+  assert.deepEqual((out.schemas.crm__mass_read as { required?: string[] }).required, ['query']);
+  assert.match(out.hint, /work_call/);
 });

@@ -87,61 +87,93 @@ function normalizedEnvelopeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
-/** Contradictory provider envelopes (`successful:true` plus 404/error) are not
- * evidence. Traversal is provider-neutral and bounded. Request echoes and
- * returned business-record arrays are not themselves transport envelopes. */
-export function providerEnvelopeHasContradiction(value: unknown, depth = 0): boolean {
-  if (!value || typeof value !== 'object') return false;
-  // A top-level array is a business result set, not an envelope collection.
-  if (Array.isArray(value) && depth === 0) return false;
-  let visited = 0;
+export type ProviderEnvelopeInspection =
+  | { verdict: 'clean' }
+  | { verdict: 'contradicted'; reason: string }
+  | { verdict: 'uninspected'; reason: 'depth_limit' | 'node_limit' | 'entry_limit' };
 
-  const visit = (node: unknown, currentDepth: number, parentKey: string): boolean => {
-    if (!node || typeof node !== 'object') return false;
+/**
+ * Inspect transport/envelope structure without confusing a safety bound with
+ * a provider contradiction. `uninspected` grants no content evidence, but it
+ * also cannot reverse a clean top-level acknowledgement into a failed call.
+ */
+export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnvelopeInspection {
+  if (!value || typeof value !== 'object') return { verdict: 'clean' };
+  // A top-level array is a business result set, not an envelope collection.
+  if (Array.isArray(value) && depth === 0) return { verdict: 'clean' };
+  let visited = 0;
+  let uninspectedReason: Extract<ProviderEnvelopeInspection, { verdict: 'uninspected' }>['reason'] | null = null;
+
+  const markUninspected = (
+    reason: Extract<ProviderEnvelopeInspection, { verdict: 'uninspected' }>['reason'],
+  ): void => {
+    uninspectedReason ??= reason;
+  };
+
+  const visit = (node: unknown, currentDepth: number, parentKey: string): string | null => {
+    if (!node || typeof node !== 'object') return null;
     visited += 1;
-    if (currentDepth > CONTRADICTION_MAX_DEPTH || visited > CONTRADICTION_MAX_NODES) {
-      // If the host cannot inspect the whole bounded envelope, it cannot use
-      // that envelope as affirmative evidence.
-      return true;
+    if (currentDepth > CONTRADICTION_MAX_DEPTH) {
+      markUninspected('depth_limit');
+      return null;
+    }
+    if (visited > CONTRADICTION_MAX_NODES) {
+      markUninspected('node_limit');
+      return null;
     }
     if (Array.isArray(node)) {
-      if (node.length > CONTRADICTION_MAX_ENTRIES) return true;
-      return node.some((entry) => visit(entry, currentDepth + 1, parentKey));
+      if (node.length > CONTRADICTION_MAX_ENTRIES) markUninspected('entry_limit');
+      for (const entry of node.slice(0, CONTRADICTION_MAX_ENTRIES)) {
+        const contradiction = visit(entry, currentDepth + 1, parentKey);
+        if (contradiction) return contradiction;
+      }
+      return null;
     }
 
     const record = node as Record<string, unknown>;
     const entries = Object.entries(record);
-    if (entries.length > CONTRADICTION_MAX_ENTRIES) return true;
-    const normalizedKeys = entries.map(([key]) => normalizedEnvelopeKey(key));
+    if (entries.length > CONTRADICTION_MAX_ENTRIES) markUninspected('entry_limit');
+    const inspectedEntries = entries.slice(0, CONTRADICTION_MAX_ENTRIES);
+    const normalizedKeys = inspectedEntries.map(([key]) => normalizedEnvelopeKey(key));
     const businessEntity = normalizedKeys.some((key) => BUSINESS_IDENTITY_KEYS.has(key));
-    for (const [rawKey, child] of entries) {
+    for (const [rawKey, child] of inspectedEntries) {
       const key = normalizedEnvelopeKey(rawKey);
-      if (NEGATIVE_SUCCESS_KEYS.has(key) && structuredFalse(child)) return true;
-      if (FAILURE_FLAG_KEYS.has(key) && structuredTrue(child)) return true;
-      if (ERROR_FIELD_KEYS.has(key) && errorFieldIsFailure(child)) return true;
+      if (NEGATIVE_SUCCESS_KEYS.has(key) && structuredFalse(child)) return `negative_${key}`;
+      if (FAILURE_FLAG_KEYS.has(key) && structuredTrue(child)) return `failure_${key}`;
+      if (ERROR_FIELD_KEYS.has(key) && errorFieldIsFailure(child)) return `error_${key}`;
       if (STATUS_FIELD_KEYS.has(key)) {
         // `status` on an identified returned entity is domain data (a failed
         // job/order is still a successful read). Explicit HTTP/status-code
         // fields remain transport evidence.
         if (key === 'status' && businessEntity) continue;
-        if (statusCodeIsFailure(child)) return true;
-        if (typeof child === 'string' && FAILURE_STATUS_RE.test(child.trim())) return true;
+        if (statusCodeIsFailure(child)) return `failure_${key}`;
+        if (typeof child === 'string' && FAILURE_STATUS_RE.test(child.trim())) return `failure_${key}`;
       }
     }
 
-    for (const [rawKey, child] of entries) {
+    for (const [rawKey, child] of inspectedEntries) {
       if (!child || typeof child !== 'object') continue;
       const key = normalizedEnvelopeKey(rawKey);
       // Plain `payload` is also a common response carrier, so only skip keys
       // that are unmistakably request/input echoes.
       if (providerRequestEchoKey(rawKey) && key !== 'payload') continue;
       if (Array.isArray(child) && CONTRADICTION_RESULT_ARRAY_KEYS.has(key)) continue;
-      if (visit(child, currentDepth + 1, key)) return true;
+      const contradiction = visit(child, currentDepth + 1, key);
+      if (contradiction) return contradiction;
     }
-    return false;
+    return null;
   };
 
-  return visit(value, depth, '');
+  const contradiction = visit(value, depth, '');
+  if (contradiction) return { verdict: 'contradicted', reason: contradiction };
+  if (uninspectedReason) return { verdict: 'uninspected', reason: uninspectedReason };
+  return { verdict: 'clean' };
+}
+
+/** Compatibility predicate: only observed contradictory structure is a
+ * contradiction. Evidence-granting callers must require `clean` explicitly. */
+export function providerEnvelopeHasContradiction(value: unknown, depth = 0): boolean {
+  return inspectProviderEnvelope(value, depth).verdict === 'contradicted';
 }
 
 const COUNT_KEYS = new Set(['count', 'total', 'totalcount', 'rowcount', 'recordcount', 'resultcount']);

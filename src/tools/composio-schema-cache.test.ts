@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -611,6 +611,58 @@ resetToolSchemaCache();
   await ensureLiveComposioSchemaFingerprint(slug);
   if (loads !== 1) throw new Error('live fingerprint refresh repeated after the cache was restored');
   _setToolSchemaLoaderForTests(null);
+  _clearToolContractsForTests();
+  resetToolSchemaCache();
+}
+
+// SDK-absent live authority uses one exact, toolkit-constrained CLI metadata
+// search. The returned provider observation must flow through the ordinary
+// remember/fingerprint lease rather than remaining a validation-only hint.
+{
+  _clearToolContractsForTests();
+  resetToolSchemaCache();
+  _setToolSchemaLoaderForTests(null);
+  const oldCliPath = process.env.COMPOSIO_CLI_PATH;
+  const cli = path.join(TEST_CLEMENTINE_HOME, 'exact-schema-composio');
+  const argvLog = path.join(TEST_CLEMENTINE_HOME, 'exact-schema-argv.log');
+  writeFileSync(cli, [
+    '#!/bin/sh',
+    `printf '%s\\n' "$@" > "${argvLog}"`,
+    `printf '%s\\n' '{"matches":[{"tool_slug":"CHATCO_SEND_MESSAGE","inputParameters":{"type":"object","required":["body"],"properties":{"body":{"type":"string"}}}}]}'`,
+    'exit 0',
+    '',
+  ].join('\n'), 'utf8');
+  chmodSync(cli, 0o755);
+  process.env.COMPOSIO_CLI_PATH = cli;
+  const client = await import('../integrations/composio/client.js');
+  client.__test__.setComposioClient(null);
+  client.__test__.setComposioApiKeyOverride('');
+  try {
+    const schema = {
+      type: 'object',
+      required: ['body'],
+      properties: { body: { type: 'string' } },
+    };
+    if (await ensureLiveComposioSchemaFingerprint('CHATCO_SEND_MESSAGE') !== fingerprintSchema(schema)) {
+      throw new Error('SDK-absent exact CLI schema refresh did not mint live fingerprint authority');
+    }
+    const argv = readFileSync(argvLog, 'utf8').trim().split('\n');
+    if (JSON.stringify(argv) !== JSON.stringify([
+      'search',
+      'CHATCO_SEND_MESSAGE',
+      '--toolkits',
+      'chatco',
+      '--limit',
+      '1',
+    ])) {
+      throw new Error(`exact CLI schema refresh used an unexpected discovery surface: ${JSON.stringify(argv)}`);
+    }
+  } finally {
+    client.__test__.setComposioApiKeyOverride(null);
+    client.__test__.setComposioClient(null);
+    if (oldCliPath === undefined) delete process.env.COMPOSIO_CLI_PATH;
+    else process.env.COMPOSIO_CLI_PATH = oldCliPath;
+  }
   _clearToolContractsForTests();
   resetToolSchemaCache();
 }

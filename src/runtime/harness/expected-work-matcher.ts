@@ -35,6 +35,11 @@ export interface ObservedExpectedWorkOperationV1 {
   requirementId?: string;
   universeItemId?: string;
   effect: ExpectedWorkEffectV1 | 'unknown';
+  /** Host-classified reversibility of the observed call. Only an IRREVERSIBLE
+   * effect can make an off-plan observation a contract violation: redoing a
+   * reversible write is correctable, so extra reversible work is extra work,
+   * not a broken plan. Absent on legacy projections (treated as unknown). */
+  reversibility?: 'read_only' | 'reversible' | 'irreversible' | 'not_applicable' | 'unknown';
   outcome: 'succeeded' | 'failed';
   evidenceMode: OperationEvidenceMode;
   coverage: ObservedReadCoverageV1;
@@ -122,13 +127,47 @@ function instanceKey(requirementId: string, itemId?: string): string {
   return `${requirementId}\0${itemId ?? ''}`;
 }
 
-function deterministicImplicitRetrieve(contract: AcceptedTaskWorkContractV1): boolean {
+/**
+ * The deterministic retrieve route freezes exactly one once-cardinality read
+ * with resolved-operation coverage and no universes. Only this shape may bind
+ * its single observation implicitly, and only this shape may accept a local
+ * compute execution as the read's carrier: the contract demands "one grounded
+ * successful retrieval", not a particular transport.
+ */
+export function isDeterministicImplicitRetrieveContract(
+  contract: AcceptedTaskWorkContractV1,
+): boolean {
   if (contract.plannerSource !== 'deterministic' || contract.operations.length !== 1) return false;
   const operation = contract.operations[0]!;
   return operation.effect === 'read'
     && operation.coverage === 'resolved_operation'
     && operation.cardinality.kind === 'once'
     && contract.universes.length === 0;
+}
+
+/**
+ * Whether a redeemed local/compute payload carries any answer-bearing content
+ * beyond envelope bookkeeping. A bare success acknowledgement discharges
+ * nothing: an empty result cannot ground a retrieval.
+ */
+export function computeResultHasSubstance(value: unknown, depth = 0): boolean {
+  if (depth > 8 || value === null || value === undefined) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (typeof value === 'boolean') return true;
+  if (Array.isArray(value)) return true;
+  if (typeof value !== 'object') return false;
+  const ignored = new Set([
+    'success', 'successful', 'ok', 'status', 'statuscode', 'httpstatus',
+    'message', 'meta', 'metadata', 'request', 'requestargs', 'requestbody',
+    'requestparams', 'requestpayload',
+  ]);
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (ignored.has(normalized)) continue;
+    if (computeResultHasSubstance(child, depth + 1)) return true;
+  }
+  return false;
 }
 
 function coverageSatisfied(
@@ -153,9 +192,14 @@ function coverageSatisfied(
     return observed.evidenceMode === 'finite_read' && observed.coverage === 'complete';
   }
   if (expected.coverage === 'resolved_operation') {
-    return observed.evidenceMode === 'point_read'
-      ? observed.coverage === 'observed' || observed.coverage === 'complete'
-      : observed.coverage === 'complete';
+    // Resolved-operation coverage promises one grounded retrieval, not an
+    // exhaustive set. A point or collection read discharges it once durably
+    // observed; only finite reads keep the complete bar, because their proof
+    // IS the exact requested member set. complete_set/accepted_set above
+    // never accept mere observation.
+    return observed.evidenceMode === 'finite_read'
+      ? observed.coverage === 'complete'
+      : observed.coverage === 'observed' || observed.coverage === 'complete';
   }
   return false;
 }
@@ -310,7 +354,7 @@ export function matchExpectedWork(
 
   const universes = resolveUniverses(contract, history, gaps);
   const instances = new Map<string, RequirementInstance>();
-  const implicitRetrieve = deterministicImplicitRetrieve(contract);
+  const implicitRetrieve = isDeterministicImplicitRetrieveContract(contract);
 
   const validateObservation = (
     expected: ExpectedWorkOperationV1,
@@ -333,7 +377,17 @@ export function matchExpectedWork(
       });
       return false;
     }
-    if (observation.effect !== expected.effect) {
+    // The deterministic one-read route accepts a local compute execution as
+    // the read's carrier: the safety taxonomy conservatively labels a
+    // read-only CLI/shell invocation 'compute', and that label must not decide
+    // semantic discharge (live 2026-08-11: a proven read-only CLI answer was
+    // blocked as verification_required). Substance is still required below —
+    // an envelope-only payload projects coverage 'not_applicable', never
+    // 'observed'. Every other shape keeps exact effect equality.
+    const computeCarriesImplicitRead = implicitRetrieve
+      && expected.effect === 'read'
+      && observation.effect === 'compute';
+    if (observation.effect !== expected.effect && !computeCarriesImplicitRead) {
       addGap(gaps, {
         kind: 'effect_mismatch',
         requirementId: expected.id,
@@ -342,6 +396,19 @@ export function matchExpectedWork(
         detail: `observed ${observation.effect} cannot satisfy expected ${expected.effect}`,
       });
       return false;
+    }
+    if (computeCarriesImplicitRead) {
+      if (observation.coverage !== 'observed') {
+        addGap(gaps, {
+          kind: 'coverage_unproven',
+          requirementId: expected.id,
+          observedOperationId: observation.id,
+          ...(itemId ? { universeItemId: itemId } : {}),
+          detail: 'the local execution left no substantive redeemable result to ground the retrieval',
+        });
+        return false;
+      }
+      return true;
     }
     if (!coverageSatisfied(expected, observation)) {
       addGap(gaps, {
@@ -361,7 +428,8 @@ export function matchExpectedWork(
     if (expected.cardinality.kind === 'once') {
       let candidates = explicit;
       if (candidates.length === 0 && implicitRetrieve && expected.effect === 'read') {
-        const compatible = unbound.filter((observation) => observation.effect === 'read');
+        const compatible = unbound.filter((observation) =>
+          observation.effect === 'read' || observation.effect === 'compute');
         // Implicit binding exists only for the deterministic one-read route,
         // and even there it must be unique. Choosing the first successful or
         // evidenced call would let two distinct reads arbitrarily discharge
@@ -381,12 +449,32 @@ export function matchExpectedWork(
       }
       if (candidates.length !== 1) {
         for (const candidate of candidates) usedObservationIds.add(candidate.id);
-        addGap(gaps, {
-          kind: 'requirement_ambiguous',
-          requirementId: expected.id,
-          detail: 'more than one observed operation claims a once-cardinality requirement',
+        // TWO CLAIMS ON ONE `once` REQUIREMENT IS ONLY DANGEROUS WHEN REDOING IT
+        // IS UNFIXABLE. For an irreversible effect it may be a double send, so
+        // it stays a conflict. For a reversible one it usually means the model
+        // took two calls to do a single planned thing (create the sheet, then
+        // write its rows) — real, settled, evidenced work that the plan's
+        // cardinality simply did not anticipate. Refusing it blocked a turn
+        // whose sheet was already built and verified (live 2026-08-12). Take
+        // the single successful observation; the rest stay visible as extras.
+        const irreversibleClaim = candidates.some((candidate) =>
+          candidate.reversibility === 'irreversible' || candidate.reversibility === 'unknown');
+        const successful = candidates.filter((candidate) => candidate.outcome === 'succeeded');
+        if (irreversibleClaim || successful.length !== 1) {
+          addGap(gaps, {
+            kind: 'requirement_ambiguous',
+            requirementId: expected.id,
+            detail: 'more than one observed operation claims a once-cardinality requirement',
+          });
+          instances.set(instanceKey(expected.id), { operation: expected, basicSatisfied: false });
+          continue;
+        }
+        const settled = successful[0]!;
+        instances.set(instanceKey(expected.id), {
+          operation: expected,
+          observation: settled,
+          basicSatisfied: validateObservation(expected, settled),
         });
-        instances.set(instanceKey(expected.id), { operation: expected, basicSatisfied: false });
         continue;
       }
       const observation = candidates[0]!;
@@ -578,10 +666,31 @@ export function matchExpectedWork(
     .sort((left, right) => left.id.localeCompare(right.id));
   for (const observation of extras) {
     if (
-      observation.effect === 'local_write'
-      || observation.effect === 'external_write'
-      || observation.effect === 'admin'
-      || observation.effect === 'unknown'
+      (observation.effect === 'local_write'
+        || observation.effect === 'external_write'
+        || observation.effect === 'admin'
+        || observation.effect === 'unknown')
+      // Only work that actually SUCCEEDED conflicts with the closed contract.
+      // A refused/failed attempt (a pre-dispatch carrier rejection, a write
+      // whose crossing never happened) already changed nothing — the gates
+      // that stopped it did their job, and blocking a correct answer over its
+      // bookkeeping row punished the turn for being refused (routing-sweep
+      // fixture, 2026-08-12: an arg-validation call_tool refusal projected as
+      // a failed external_write and conflicted an otherwise complete
+      // retrieve). Real dispatched writes keep their crossing, project
+      // 'succeeded', and conflict exactly as before; write-truth audit
+      // separately owns uncertain writes.
+      && observation.outcome === 'succeeded'
+      // ...and only when redoing it could not be corrected. A reversible
+      // external write off the plan (a second sheet update, a re-created doc)
+      // is EXTRA WORK, not a broken contract: it is durably settled, evidenced,
+      // and fixable. Conflicting on it refused a turn that had scraped the
+      // data, created the sheet, written the rows, and verified them (live
+      // 2026-08-12). An irreversible off-plan effect stays a conflict — that
+      // is the case the closed contract exists to catch.
+      && observation.reversibility !== 'reversible'
+      && observation.reversibility !== 'read_only'
+      && observation.reversibility !== 'not_applicable'
     ) {
       addGap(gaps, {
         kind: 'unexpected_effectful_observation',

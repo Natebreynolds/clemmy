@@ -558,7 +558,68 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
     // execution pressure must not hide or discard the user's Resume/Skip
     // decision. Parked/backpressure checks remain for live executable work.
     if (!isCatchupFire) {
-      const activeRuns = countActiveRunsFor(workflowName);
+      const activeRuns = countActiveRunsFor(workflowName, entryName);
+      if (activeRuns.mutationBlocked > 0) {
+        result.deduped.push(workflowName);
+        recordOperationalEvent({
+          source: 'workflow',
+          type: 'workflow_trigger_deduped',
+          severity: 'warn',
+          actor: 'workflow-scheduler',
+          payload: {
+            workflowName,
+            schedule,
+            reason: 'mutation_awaiting_reconciliation',
+            mutationBlocked: activeRuns.mutationBlocked,
+          },
+        });
+        try {
+          recordProspectiveOutcome(
+            prospectiveId,
+            'blocked',
+            {
+              reason: 'mutation_awaiting_reconciliation',
+              mutationBlocked: activeRuns.mutationBlocked,
+              cueKey: prospectiveCueKey,
+            },
+            now,
+          );
+        } catch { /* best-effort control-plane receipt */ }
+        // Do not mark the occurrence handled. Reconciliation releases this
+        // same durable occurrence; a later tick must not synthesize a new one.
+        continue;
+      }
+      if (activeRuns.capabilityBlocked > 0) {
+        result.deduped.push(workflowName);
+        recordOperationalEvent({
+          source: 'workflow',
+          type: 'workflow_trigger_deduped',
+          severity: 'warn',
+          actor: 'workflow-scheduler',
+          payload: {
+            workflowName,
+            schedule,
+            reason: 'capability_awaiting_recovery',
+            capabilityBlocked: activeRuns.capabilityBlocked,
+          },
+        });
+        try {
+          recordProspectiveOutcome(
+            prospectiveId,
+            'blocked',
+            {
+              reason: 'capability_awaiting_recovery',
+              capabilityBlocked: activeRuns.capabilityBlocked,
+              cueKey: prospectiveCueKey,
+            },
+            now,
+          );
+        } catch { /* best-effort control-plane receipt */ }
+        // Keep this occurrence pending while the same proven-no-dispatch run
+        // heals. Once it finishes, ordinary stale-occurrence recovery presents
+        // the missed occurrence for Resume/Skip instead of burst-sending it.
+        continue;
+      }
       if (activeRuns.parked > 0) {
         result.deduped.push(workflowName);
         recordOperationalEvent({
@@ -769,28 +830,57 @@ const MAX_PENDING_PER_WORKFLOW = 3;
 const MAX_CATCHUP_HOLDS_PER_TICK = 20;
 export const _testOnly_maxCatchupHoldsPerTick = MAX_CATCHUP_HOLDS_PER_TICK;
 
-/** Walk WORKFLOW_RUNS_DIR once and split active work into executable
- *  queued/running/finalizing records versus approval-parked records. A parked
- *  run is not part of the concurrency queue, but it IS schedule backpressure. */
-function countActiveRunsFor(workflowName: string): { pending: number; parked: number } {
-  if (!existsSync(WORKFLOW_RUNS_DIR)) return { pending: 0, parked: 0 };
+/** Walk WORKFLOW_RUNS_DIR once and split active work into executable records,
+ * approval holds, recoverable capability pauses, and unresolved mutations.
+ * Held classes are outside the execution queue but remain schedule backpressure. */
+function countActiveRunsFor(workflowName: string, workflowSlug = workflowName): {
+  pending: number;
+  parked: number;
+  capabilityBlocked: number;
+  mutationBlocked: number;
+} {
+  if (!existsSync(WORKFLOW_RUNS_DIR)) {
+    return { pending: 0, parked: 0, capabilityBlocked: 0, mutationBlocked: 0 };
+  }
   let files: string[];
   try {
     files = readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json'));
   } catch {
-    return { pending: 0, parked: 0 };
+    return { pending: 0, parked: 0, capabilityBlocked: 0, mutationBlocked: 0 };
   }
   let pending = 0;
   let parked = 0;
+  let capabilityBlocked = 0;
+  let mutationBlocked = 0;
   for (const file of files) {
-    if (pending >= MAX_PENDING_PER_WORKFLOW + 1 && parked > 0) break;
     try {
       const raw = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as {
         workflow?: string;
+        workflowSlug?: unknown;
+        workflowDefinitionSnapshot?: { workflowSlug?: unknown };
         status?: string;
+        capabilityBlock?: { state?: unknown; provenNoDispatch?: unknown };
       };
-      if (raw.workflow !== workflowName) continue;
+      const projectedSlug = typeof raw.workflowSlug === 'string'
+        ? raw.workflowSlug.trim()
+        : '';
+      const snapshotSlug = typeof raw.workflowDefinitionSnapshot?.workflowSlug === 'string'
+        ? raw.workflowDefinitionSnapshot.workflowSlug.trim()
+        : '';
+      const recordedWorkflowSlug = projectedSlug || snapshotSlug || undefined;
+      if (recordedWorkflowSlug) {
+        if (recordedWorkflowSlug !== workflowSlug) continue;
+      } else if (raw.workflow !== workflowName && raw.workflow !== workflowSlug) continue;
+      const capabilityRetryInFlight = (
+        raw.status === 'running' || raw.status === 'finalizing'
+      ) && raw.capabilityBlock?.provenNoDispatch === true
+        && (
+          raw.capabilityBlock.state === 'retrying'
+          || raw.capabilityBlock.state === 'consumed'
+        );
       if (raw.status === 'parked') parked += 1;
+      else if (raw.status === 'blocked_capability' || capabilityRetryInFlight) capabilityBlocked += 1;
+      else if (raw.status === 'blocked_mutation') mutationBlocked += 1;
       else if (
         !raw.status
         || raw.status === 'queued'
@@ -801,7 +891,7 @@ function countActiveRunsFor(workflowName: string): { pending: number; parked: nu
       // Unreadable record — ignore. The reaper will sweep it eventually.
     }
   }
-  return { pending, parked };
+  return { pending, parked, capabilityBlocked, mutationBlocked };
 }
 
 /** Daily-bucketed system notification so the user knows their schedule
@@ -912,12 +1002,14 @@ function enqueueScheduledRun(
     idPrefix: 'sched',
     dedupe: false,
     triggerReceiptId: `workflow-schedule:v1:${workflowSlug}:${occurrenceAtMs}`,
+    // Persist the immutable catalog identity separately from the mutable
+    // display name. Exact-send authority and its receipt ledger bind this slug.
+    workflowSlug,
     ...(catchupFire
       ? {
           catchupFire: true,
           catchupOccurrenceAtMs: catchupAdmissionAtMs,
           holdForCatchupDecision: true,
-          workflowSlug,
           catchupFirstDueAtMs: catchupAdmissionAtMs,
           catchupMissedCount,
         }

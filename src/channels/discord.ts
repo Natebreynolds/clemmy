@@ -482,12 +482,14 @@ async function sendDiscordRestTyping(channelId: string): Promise<void> {
  * approval-resume path (tryHandleHarnessApprovalReply).
  */
 function buildDiscordRestTransport(channelId: string) {
+  let replyMessageId: string | null = null;
   return {
     async sendInitial(content: string) {
       const sent = await discordApiJson<DiscordRestSentMessage>(
         `/channels/${channelId}/messages`,
         { method: 'POST', body: { content } },
       );
+      replyMessageId = sent.id;
       return {
         edit: async (next: string, options?: { components?: unknown[] }) => {
           const body: Record<string, unknown> = { content: next.slice(0, 1900) };
@@ -517,15 +519,36 @@ function buildDiscordRestTransport(channelId: string) {
     async sendFollowup(content: string) {
       await sendDiscordRestChunks(channelId, content);
     },
+    async deliverConversationalApproval(input: {
+      approvalId: string;
+      deliveryKey: string;
+      content: string;
+    }) {
+      if (!replyMessageId) throw new Error('Discord consent placeholder message is unavailable');
+      approvalRegistry.bindConversationalApprovalTransportTarget({
+        approvalId: input.approvalId,
+        target: { provider: 'discord', channelId, messageId: replyMessageId },
+      });
+      await discordApiJson(`/channels/${channelId}/messages/${replyMessageId}`, {
+        method: 'PATCH',
+        body: { content: input.content.slice(0, 1900), components: [] },
+      });
+    },
   };
 }
 
 function buildDiscordMessageHarnessTransport(message: Message<boolean>): DiscordHarnessTransport {
+  let replyMessage: {
+    id: string;
+    edit(opts: { content: string; components?: unknown[] }): Promise<unknown>;
+  } | null = null;
   return {
     async sendInitial(content: string) {
       const reply = (await message.reply(content.slice(0, 1900))) as unknown as {
+        id: string;
         edit(opts: { content: string; components?: unknown[] }): Promise<unknown>;
       };
+      replyMessage = reply;
       return {
         edit: async (next: string, options?: { components?: unknown[] }) => {
           const editPayload: { content: string; components?: unknown[] } = {
@@ -543,6 +566,14 @@ function buildDiscordMessageHarnessTransport(message: Message<boolean>): Discord
     },
     async sendFollowup(content: string) {
       await message.reply(content.slice(0, 1900));
+    },
+    async deliverConversationalApproval(input) {
+      if (!replyMessage) throw new Error('Discord consent placeholder message is unavailable');
+      approvalRegistry.bindConversationalApprovalTransportTarget({
+        approvalId: input.approvalId,
+        target: { provider: 'discord', channelId: message.channelId, messageId: replyMessage.id },
+      });
+      await replyMessage.edit({ content: input.content.slice(0, 1900), components: [] });
     },
   };
 }
@@ -960,7 +991,8 @@ function relevantHarnessApprovalsForContext(input: {
   guildId?: string | null;
 }): approvalRegistry.PendingApprovalRow[] {
   const rows = approvalRegistry.listPending({ status: 'pending' })
-    .filter((row) => approvalRegistry.isActionable(row));
+    .filter((row) => approvalRegistry.isActionable(row))
+    .filter((row) => approvalRegistry.isFormalApprovalSurface(row));
   // Never pull another Discord channel's approval into this chat merely
   // because it is globally pending. But a DM keeps the non-Discord fallback
   // (restored in the fold after the workflow/background recovery review):
@@ -976,7 +1008,8 @@ function liveHarnessApprovalsForContext(input: {
   guildId?: string | null;
 }): approvalRegistry.PendingApprovalRow[] {
   const rows = approvalRegistry.listPending({ status: 'pending' })
-    .filter((row) => approvalRegistry.isActionable(row));
+    .filter((row) => approvalRegistry.isActionable(row))
+    .filter((row) => approvalRegistry.isFormalApprovalSurface(row));
   const currentChannelRows = rows.filter((row) => row.channelId === input.channelId);
   const globalWorkflowRows = rows.filter((row) => !isDiscordHarnessRow(row));
   const merged = [...currentChannelRows, ...globalWorkflowRows];
@@ -1138,17 +1171,9 @@ function buildCheckInActions(checkInId: string) {
   return [
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-approve:${checkInId}`)
-        .setLabel('Approve')
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
         .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-answer:${checkInId}`)
-        .setLabel('Answer / Edit')
+        .setLabel('Answer')
         .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-reject:${checkInId}`)
-        .setLabel('Reject')
-        .setStyle(ButtonStyle.Danger),
     ),
   ];
 }
@@ -1221,6 +1246,11 @@ function relevantApprovalsForContext(input: {
 }
 
 type NaturalApprovalAction = 'approve_one' | 'approve_all' | 'reject_one' | 'reject_all';
+
+function hasRecentOpenCheckIn(): boolean {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  return listOpenCheckIns().some((item) => Date.parse(item.askedAt) > cutoff);
+}
 
 function detectNaturalApprovalAction(text: string): NaturalApprovalAction | null {
   const normalized = text.toLowerCase().replace(/[.!?]+$/g, '').replace(/\s+/g, ' ').trim();
@@ -1567,6 +1597,8 @@ async function continueDiscordSessionFromButton(input: {
 export const __test__ = {
   claimDiscordInboundRequest,
   continueDiscordSessionFromButton,
+  handleDiscordCommand,
+  handleDiscordRestCommand,
   runGatewayPrompt,
   renderGatewayTail,
   renderApprovalCardContent,
@@ -1900,7 +1932,17 @@ async function handleDiscordCommand(
     return completeControl('Discord sessions listed.');
   }
 
-  if (await resolveNaturalApproval({
+  // The harness approval router runs immediately before this legacy command
+  // layer. If it declined a bare yes/no/go-ahead because this conversation has
+  // no approval card, the message is the user's answer to Clementine's normal
+  // conversational question (including structural preflight alignment). Do not
+  // let the legacy v0.2 resolver swallow it with "No pending approval"; leave it
+  // unhandled so the exact text becomes the next accepted harness turn.
+  const bareHarnessConversationAnswer = DISCORD_HARNESS_ENABLED
+    && relevantRuntimeApprovals.length === 0
+    && !hasRecentOpenCheckIn()
+    && detectNaturalApprovalAction(normalized) !== null;
+  if (!bareHarnessConversationAnswer && await resolveNaturalApproval({
     assistant,
     text: normalized,
     userId: message.author.id,
@@ -2121,7 +2163,13 @@ async function handleDiscordRestCommand(input: {
     return completeControl('Discord sessions listed.');
   }
 
-  if (await resolveNaturalApproval({
+  // REST/DM-poll twin of the gateway path above. A literal "Go ahead" with no
+  // real approval must reach runDiscordHarnessConversation as user input.
+  const bareHarnessConversationAnswer = DISCORD_HARNESS_ENABLED
+    && relevantRuntimeApprovals.length === 0
+    && !hasRecentOpenCheckIn()
+    && detectNaturalApprovalAction(normalized) !== null;
+  if (!bareHarnessConversationAnswer && await resolveNaturalApproval({
     assistant: input.assistant,
     text: normalized,
     userId: input.userId,
@@ -3425,6 +3473,8 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
         transport: gatewayTransport,
         allowGlobalApprovalFallback: message.channel.type === ChannelType.DM,
         durableRequest,
+        userId: message.author.id,
+        conversationKey: `discord:${message.channelId}`,
       })) {
         completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
         return;
@@ -3629,6 +3679,8 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
               transport: dmTransport,
               allowGlobalApprovalFallback: true,
               durableRequest,
+              userId: message.author.id,
+              conversationKey: `discord:${dm.id}`,
             });
           } catch (err) {
             // Mark seen so we don't re-poll a permanently-broken
@@ -3978,6 +4030,20 @@ export async function sendDiscordChannelMessage(
       await channel.send(chunk);
     }
   }
+}
+
+/** Re-project an ordinary consent question into the exact live placeholder
+ * selected before the first provider edit. Restart recovery uses this instead
+ * of posting a second visible question after an ambiguous transport receipt. */
+export async function editDiscordChannelMessage(
+  channelId: string,
+  messageId: string,
+  text: string,
+): Promise<void> {
+  await discordApiVoid(`/channels/${channelId}/messages/${messageId}`, {
+    method: 'PATCH',
+    body: { content: text.slice(0, 1900), components: [] },
+  });
 }
 
 export async function sendDiscordDirectMessage(

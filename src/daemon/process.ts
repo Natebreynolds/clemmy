@@ -97,7 +97,11 @@ export function readDaemonPid(): number | null {
 export function isDaemonRunning(): boolean {
   const pid = readDaemonPid();
   if (!pid) return false;
-  return processIsAlive(pid);
+  // `kill(pid, 0)` reports a zombie as alive even though it can never serve,
+  // accept work, or release its lease. Lease acquisition already applies the
+  // stricter ps-state check; status/start/stop must use the same definition or
+  // the launcher can claim "already running" forever while no port is bound.
+  return pidBlocksLeaseAcquisition(pid);
 }
 
 function syncDaemonDirectory(): void {

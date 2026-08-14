@@ -199,6 +199,7 @@ function buildAppHomeBlocks(): KnownBlock[] {
   // accuracy bug this fixes.
   const approvals = safe(() => approvalRegistry.listPending()
     .filter((a) => approvalRegistry.isActionable(a))
+    .filter((a) => approvalRegistry.isFormalApprovalSurface(a))
     .map((a) => ({
       approvalId: a.approvalId,
       presentation: presentApproval(a, approvalContextForRow(a)),
@@ -505,7 +506,9 @@ function workflowNameForApproval(row: approvalRegistry.PendingApprovalRow): stri
 }
 
 function pendingApprovalsForWorkflow(workflowName: string): approvalRegistry.PendingApprovalRow[] {
-  return approvalRegistry.listPending({ status: 'pending' }).filter((row) => workflowNameForApproval(row) === workflowName);
+  return approvalRegistry.listPending({ status: 'pending' })
+    .filter(approvalRegistry.isFormalApprovalSurface)
+    .filter((row) => workflowNameForApproval(row) === workflowName);
 }
 
 function approvalResultText(result: ApprovalResolutionResult): string {
@@ -723,6 +726,21 @@ export async function sendSlackChannelMessage(
   });
 }
 
+/** Re-project an ordinary consent question into the exact live placeholder
+ * durably selected before the first provider edit. */
+export async function editSlackChannelMessage(
+  channelId: string,
+  messageTs: string,
+  text: string,
+): Promise<void> {
+  await requireClient().chat.update({
+    channel: channelId,
+    ts: messageTs,
+    text: toSlackMrkdwn(text) || '…',
+    blocks: [],
+  });
+}
+
 export async function sendSlackDirectMessage(
   userId: string,
   text: string,
@@ -852,9 +870,7 @@ export function buildSlackActionsForNotification(metadata: Record<string, unknow
   const checkInId = typeof metadata.checkInId === 'string' ? metadata.checkInId : undefined;
   if (checkInId) {
     return [actionsBlock(`${SLACK_ACTION_PREFIX}:checkin:${checkInId}`, [
-      btn('Approve', `${SLACK_ACTION_PREFIX}:checkin-approve:${checkInId}`, checkInId, 'primary'),
-      btn('Answer / Edit', `${SLACK_ACTION_PREFIX}:checkin-answer:${checkInId}`, checkInId),
-      btn('Reject', `${SLACK_ACTION_PREFIX}:checkin-reject:${checkInId}`, checkInId, 'danger'),
+      btn('Answer', `${SLACK_ACTION_PREFIX}:checkin-answer:${checkInId}`, checkInId, 'primary'),
     ])];
   }
   return undefined;
@@ -1232,6 +1248,8 @@ async function dispatchInbound(opts: {
       allowGlobalApprovalFallback: !opts.threadTs, // DMs (no thread) allow the global fallback, like Discord DMs
       channel: 'slack',
       durableRequest,
+      userId: opts.userId,
+      conversationKey: `slack:${conversationId}`,
       onlyIfApprovalPending: Boolean(stopControl?.rejectRelevantApprovalFirst),
     });
     if (handled) {

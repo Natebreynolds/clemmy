@@ -21,6 +21,7 @@ const authority = await import('./accepted-task-authority.js');
 const preparation = await import('./accepted-task-terminal-preparation.js');
 const admission = await import('./expected-work-admission.js');
 const workManifest = await import('./work-manifest.js');
+const attempts = await import('./attempt-settlement.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -172,6 +173,87 @@ function acceptActivatedAction(text: string) {
   return { sessionId: session.id, sourceUserSeq: source.seq };
 }
 
+function recordCanonicalSdkReturn(input: {
+  task: ReturnType<typeof acceptActivatedAction>;
+  tool: string;
+  callId: string;
+  successfulBusinessResult?: true;
+  successfulAuthoringResult?: true;
+}): void {
+  const called = eventlog.appendEvent({
+    sessionId: input.task.sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: input.task.sourceUserSeq,
+      tool: input.tool,
+      callId: input.callId,
+      canonicalCallId: input.callId,
+      accounting: 'top_level',
+      topologyRole: input.successfulAuthoringResult ? 'control' : 'business',
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: input.task.sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      sourceUserSeq: input.task.sourceUserSeq,
+      tool: input.tool,
+      callId: input.callId,
+      canonicalCallId: input.callId,
+      accounting: 'top_level',
+      ok: true,
+      ...(input.successfulBusinessResult ? { successfulBusinessResult: true } : {}),
+      ...(input.successfulAuthoringResult ? { successfulAuthoringResult: true } : {}),
+    },
+  });
+}
+
+test('only the canonical successful SDK authoring return closes an uncontracted workflow-create action', () => {
+  const task = acceptActivatedAction('Create a daily digest workflow.');
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'sdk_tool_use_recorded',
+    data: { sourceUserSeq: task.sourceUserSeq, tools: ['workflow_create'] },
+  });
+  const summaryOnly = preparation.prepareAcceptedTaskTerminal(task);
+  assert.equal(summaryOnly.status, 'needs_verification', JSON.stringify(summaryOnly));
+
+  recordCanonicalSdkReturn({
+    task,
+    tool: 'workflow_create',
+    callId: 'toolu_workflow_create_success',
+    successfulAuthoringResult: true,
+  });
+  const returned = preparation.prepareAcceptedTaskTerminal(task);
+  assert.equal(returned.status, 'ready', JSON.stringify(returned));
+  assert.match(
+    returned.status === 'ready' ? returned.verdict.facts.join('; ') : '',
+    /durable work evidence/,
+  );
+});
+
+test('a successful-looking SDK control return without the host authoring verdict remains held', () => {
+  const task = acceptActivatedAction('Create a daily digest workflow.');
+  recordCanonicalSdkReturn({
+    task,
+    tool: 'workflow_create',
+    callId: 'toolu_workflow_create_unproven',
+  });
+  const prepared = preparation.prepareAcceptedTaskTerminal(task);
+  assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
+  assert.deepEqual(
+    prepared.status === 'needs_verification' ? prepared.missing : [],
+    ['work_contract_missing'],
+  );
+});
+
 // The fan-out lane's durable work manifest is completion authority for an
 // accepted action that never froze a work_call contract: refusing it replaced
 // a fully settled 12/12 completion with a canned blocked terminal (live
@@ -299,7 +381,7 @@ test('a worked turn without manifest or contract publishes on its durable work e
     turn: 1,
     role: 'user',
     type: 'user_input_received',
-    data: { text: 'what time is it in the office calendar?' },
+    data: { text: 'Write the current office calendar time to the local note now.' },
   });
   assert.ok(shadow.recordTurnGraphShadow({
     identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
@@ -338,7 +420,7 @@ test('a worked turn without manifest or contract publishes on its durable work e
     },
     contract: { toolName: 'write_file', args: { path: '/tmp/pin.txt', content: 'x' } },
     execution: { kind: 'provider_execution' },
-    result: { payload: { successful: true } },
+    result: { payload: { successful: true, data: { path: '/tmp/pin.txt', bytesWritten: 1 } } },
     outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
     recovery: { businessCall: true, mutating: true },
     observer: { lane: 'composio', turn: 1 },
@@ -357,17 +439,22 @@ test('a worked turn without manifest or contract publishes on its durable work e
   );
 });
 
-// The route classifier sends plain conversational asks down the act route
-// ("what time is it?" classifies act). An activated action that settled zero
-// mutating calls and owns no manifest was answered in conversation — blocking
-// it replaced ordinary replies with a canned verification refusal.
-test('an activated action with zero mutating settlements publishes the conversational terminal', () => {
-  const task = acceptActivatedAction('what time is it?');
+// A question about current state is retrieval, not an action whose lack of
+// mutations can be waved through as conversation. It must remain read work and
+// obtain accepted-source-local freshness evidence before publication.
+test('a current-state question is not activated as an action and waits for read evidence', () => {
+  const task = accept('what time is it?');
+  const activated = admission.activateActionExpectedWork(task);
+  assert.equal(activated.status, 'not_action', JSON.stringify(activated));
   const prepared = preparation.prepareAcceptedTaskTerminal(task);
-  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
-  assert.match(
-    prepared.status === 'ready' ? prepared.verdict.facts.join('; ') : '',
-    /conversational reply is the terminal/,
+  assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
+  assert.ok(
+    prepared.status === 'needs_verification'
+      && (
+        prepared.missing.includes('requirement_unobserved')
+        || prepared.missing.includes('freshness_current_state_read_missing')
+      ),
+    JSON.stringify(prepared),
   );
 });
 
@@ -420,4 +507,89 @@ test('an accepted action that bypassed durable activation fails closed at termin
     prepared.status === 'conflict' ? prepared.reason : '',
     /not durably activated before execution/,
   );
+});
+
+test('a retrieve answered through an unbound local CLI execution publishes done (live 2026-08-11)', () => {
+  // The exact incident shape: "How do I access Salesforce?" compiled to the
+  // deterministic retrieve route, the model answered through one read-only
+  // `sf` CLI call (an UNBOUND agents_runner local execution, classified
+  // 'compute' by the safety taxonomy), the answer was complete and the
+  // delivery verdict passed — and the terminal still blocked as
+  // verification_required, replacing the answer with fallback text.
+  const task = accept('How do I access Salesforce?');
+  const args = { command: 'sf org display user --json' };
+  const logicalToolCallId = `logical:terminal-preparation:${serial}:shell`;
+  assert.equal(dispatch.admitLogicalCall({
+    identity: { ...task, logicalToolCallId },
+    tool: 'run_shell_command',
+    args,
+  }).status, 'inserted');
+  const settled = attempts.settleToolAttempt({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    turn: task.turn,
+    lane: 'agents_runner',
+    toolName: 'run_shell_command',
+    callId: logicalToolCallId,
+    args,
+    mutating: false,
+    businessCall: true,
+    result: JSON.stringify({
+      status: 0,
+      result: {
+        instanceUrl: 'https://example.my.salesforce.com',
+        username: 'user@example.com',
+        connectedStatus: 'Connected',
+      },
+    }),
+  });
+  assert.equal(settled.outcome.kind, 'succeeded', JSON.stringify(settled.outcome));
+
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    proposedReply: 'Go to https://example.my.salesforce.com and sign in as user@example.com.',
+  });
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  assert.equal(prepared.status === 'ready' && prepared.verdict.status, 'done');
+  assert.equal(
+    eventlog.listEvents(task.sessionId, { types: ['resolution_finalized'] }).length,
+    1,
+    'the retrieve resolution finalizes instead of holding the turn open',
+  );
+  assert.equal(
+    eventlog.listEvents(task.sessionId, { types: ['obligation_manifest'] }).length,
+    1,
+  );
+});
+
+test('a retrieve answered by a provider collection read without a completeness signal publishes done (live 2026-08-12)', () => {
+  // The calendar incident: "What's on my calendar tomorrow?" compiled to the
+  // deterministic retrieve route; the Composio Outlook read dispatched,
+  // settled succeeded with 10 records, NO cursor and completeness 'unknown' —
+  // a bounded view has nothing more to say. The old completeness obligation
+  // demanded exhaustion proof the provider cannot express, and the terminal
+  // replaced a correct grounded answer with verification_required fallback.
+  const task = accept('Find all current alpha records.');
+  settleRead({
+    task,
+    tool: 'alpha_records_list_view',
+    args: { window: 'tomorrow' },
+    payload: {
+      successful: true,
+      data: { records: [{ id: 'evt-1' }, { id: 'evt-2' }] },
+      // Deliberately NO meta.complete and NO cursor: completeness stays
+      // 'unknown', which previously could never discharge the read.
+    },
+  });
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    proposedReply: 'You have two events tomorrow.',
+  });
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  assert.equal(prepared.status === 'ready' && prepared.verdict.status, 'done');
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['resolution_finalized'] }).length, 1);
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['evidence_receipt'] }).length, 1);
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['obligation_satisfied'] }).length, 1);
 });

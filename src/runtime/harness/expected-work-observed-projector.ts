@@ -8,8 +8,10 @@
  * manifest receipt redeems the same handle for terminal proof.
  */
 import type Database from 'better-sqlite3';
+import { generatedArtifactReadContentVerified } from './artifact-ledger.js';
 import type { AcceptedTaskWorkContractV1 } from './expected-work-contract.js';
 import {
+  computeResultHasSubstance,
   type ObservedExpectedWorkHistoryV1,
   type ObservedExpectedWorkOperationV1,
   type ObservedExpectedWorkUniverseV1,
@@ -26,7 +28,7 @@ import {
 } from './result-handle.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { proveFiniteReadResultCoverage } from './read-evidence-refinement.js';
-import { providerEnvelopeHasContradiction } from './provider-read-evidence.js';
+import { inspectProviderEnvelope } from './provider-read-evidence.js';
 import type { RuntimeToolEffect } from './tool-effect.js';
 import type { ObservedReversibility } from './resolution-ledger.js';
 
@@ -179,6 +181,24 @@ export function projectObservedExpectedWorkHistory(input: {
         ? 'partial'
         : 'not_applicable';
 
+      // A settled local compute execution can carry the deterministic
+      // retrieve route's one read (the safety taxonomy labels read-only
+      // CLI/shell work 'compute'). Coverage 'observed' asserts exactly what
+      // the host can prove: it executed the call itself and holds a
+      // substantive redeemable payload. An envelope-only acknowledgement
+      // stays 'not_applicable' and discharges nothing.
+      if (effect === 'compute' && exactSettlement) {
+        const redeemed = redeemSuccessfulSettlementResultForHost({
+          sessionId: input.contract.identity.sessionId,
+          sourceUserSeq: input.contract.identity.sourceUserSeq,
+          acceptedTaskId: input.contract.acceptedTaskId,
+          logicalToolCallId: row.logical_tool_call_id,
+        });
+        if (redeemed.status === 'ok' && computeResultHasSubstance(redeemed.value.rawPayload)) {
+          coverage = 'observed';
+        }
+      }
+
       if (effect === 'read' && exactSettlement) {
         const redeemed = redeemSuccessfulSettlementResultForHost({
           sessionId: input.contract.identity.sessionId,
@@ -187,13 +207,36 @@ export function projectObservedExpectedWorkHistory(input: {
           logicalToolCallId: row.logical_tool_call_id,
         });
         if (redeemed.status === 'ok') {
-          if (evidenceMode === 'point_read' && !providerEnvelopeHasContradiction(redeemed.value.rawPayload)) {
+          if (generatedArtifactReadContentVerified({
+            sessionId: input.contract.identity.sessionId,
+            sourceUserSeq: input.contract.identity.sourceUserSeq,
+            contractId: input.contract.contractId,
+            verificationLogicalToolCallId: row.logical_tool_call_id,
+          })) {
+            // The provider-reviewed generated-artifact contract compares the
+            // full exact destination (including header/cell/row order), which
+            // is stronger than generic collection exhaustion.
+            coverage = 'complete';
+          } else if (evidenceMode === 'point_read' && inspectProviderEnvelope(redeemed.value.rawPayload).verdict === 'clean') {
             coverage = 'observed';
           } else if (
             evidenceMode === 'collection_read'
             && redeemedReadIsExhausted(redeemed.value)
           ) {
             coverage = 'complete';
+          } else if (
+            // A clean collection read with no outstanding continuation and no
+            // provider-reported partiality is durably OBSERVED even when
+            // exhaustion is unprovable (completeness 'unknown' with no
+            // cursor). Whether observation suffices is the matcher's call:
+            // resolved-operation coverage accepts it; complete_set never does.
+            evidenceMode === 'collection_read'
+            && inspectProviderEnvelope(redeemed.value.rawPayload).verdict === 'clean'
+            && redeemed.value.handle.continuationRef === null
+            && !redeemed.value.handle.continuationRepeated
+            && redeemed.value.handle.completeness !== 'partial'
+          ) {
+            coverage = 'observed';
           } else if (
             evidenceMode === 'finite_read'
             && row.universe_id
@@ -237,6 +280,10 @@ export function projectObservedExpectedWorkHistory(input: {
           : {}),
         ...(row.universe_item_id ? { universeItemId: row.universe_item_id } : {}),
         effect,
+        // The host's own reversibility classification travels with the
+        // observation: only an irreversible effect can turn off-plan work into
+        // a contract violation.
+        reversibility: row.reversibility,
         outcome: exactSettlement ? 'succeeded' : 'failed',
         evidenceMode,
         coverage,

@@ -36,6 +36,7 @@ import {
 } from './dispatch-ledger.js';
 import { assertExpectedWorkLogicalAdmission } from './expected-work-admission.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
+import type { TrustedRuntimeEffectCarrier } from './tool-effect.js';
 
 export interface LogicalCallIdentity {
   acceptedTaskId: string;
@@ -165,6 +166,13 @@ export function authorizeResolvedLogicalCallContract(input: {
   if (refinement.status !== 'refined' && refinement.status !== 'replayed') {
     throw new LogicalCallPreDispatchAuthorityError(refinement.status, refinement.reason);
   }
+  // Refinement changes the identity this exact open call owns. Keep the
+  // already-proven ambient frame on the same canonical contract as its durable
+  // row so a provider adapter re-entering with those resolved bytes inherits
+  // the original logical id (and its frozen-work binding) instead of minting
+  // an unbound child. Foreign resolvers returned above without touching it.
+  frame.toolName = refinement.identity.toolName;
+  frame.argumentDigest = refinement.identity.argumentDigest;
   return refinement.identity;
 }
 
@@ -183,6 +191,8 @@ export function withLogicalToolCall<T>(
     tool: string;
     /** Complete host-visible arguments; values are digested, never persisted. */
     args?: unknown;
+    /** Host-only provenance for a trusted wrapper peeled to this exact call. */
+    trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
     /**
      * The host invocation id when one already exists (SDK call id, code-mode
      * child id, batch item id).  A nested carrier that supplies the SAME id
@@ -227,6 +237,7 @@ export function withLogicalToolCall<T>(
       logicalToolCallId: identity.logicalToolCallId,
       tool: input.tool,
       args: input.args,
+      trustedEffectCarrier: input.trustedEffectCarrier,
     });
     const admission = admitLogicalCall({
       identity: { ...identity, sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
@@ -250,15 +261,16 @@ export function withLogicalToolCall<T>(
   // changes: the child records its own contract instead of overwriting its
   // parent's. Splitting the identity without splitting the question keeps every
   // existing admission verdict exactly as it was.
-  const admissionIdentity = inherited && inherited.acceptedTaskId === acceptedTaskId
-    ? inherited.logicalToolCallId
-    : frame.logicalToolCallId;
   assertExpectedWorkLogicalAdmission({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
-    logicalToolCallId: admissionIdentity,
+    logicalToolCallId: frame.logicalToolCallId,
+    ...(inherited && inherited.acceptedTaskId === acceptedTaskId
+      ? { fallbackLogicalToolCallId: inherited.logicalToolCallId }
+      : {}),
     tool: input.tool,
     args: input.args,
+    trustedEffectCarrier: input.trustedEffectCarrier,
   });
   const admission = admitLogicalCall({
     identity: {
@@ -295,6 +307,8 @@ export async function withPhysicalDispatch<T>(
     turn?: number;
     relation?: DispatchRelation;
     retryOf?: string;
+    /** Host-only provenance for a wrapper peeled before this paid crossing. */
+    trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
   },
   work: (identity: PhysicalDispatchIdentity) => Promise<T>,
 ): Promise<T> {
@@ -325,6 +339,7 @@ export async function withPhysicalDispatch<T>(
     args: input.args,
     turn: input.turn,
     relation: input.relation,
+    trustedEffectCarrier: input.trustedEffectCarrier,
   });
   if (admission.status !== 'inserted') {
     throw new PhysicalDispatchPreDispatchError(

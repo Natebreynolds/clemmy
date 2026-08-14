@@ -30,7 +30,7 @@ import {
   type ExpectedWorkUniverseV1,
 } from './expected-work-contract.js';
 import {
-  providerEnvelopeHasContradiction,
+  inspectProviderEnvelope,
   providerRequestEchoKey,
 } from './provider-read-evidence.js';
 
@@ -142,7 +142,7 @@ export type FiniteReadResultCoverageDecision =
       status: 'unproven';
       reason:
         | 'requested_members_conflict'
-        | 'provider_result_contradiction'
+        | 'provider_result_contradiction_or_uninspected'
         | 'member_correspondence_missing'
         | 'member_correspondence_ambiguous'
         | 'result_structure_unreadable';
@@ -628,8 +628,8 @@ export function proveFiniteReadResultCoverage(
     ) {
       return { status: 'unproven', reason: 'requested_members_conflict' };
     }
-    if (providerEnvelopeHasContradiction(input.rawResult)) {
-      return { status: 'unproven', reason: 'provider_result_contradiction' };
+    if (inspectProviderEnvelope(input.rawResult).verdict !== 'clean') {
+      return { status: 'unproven', reason: 'provider_result_contradiction_or_uninspected' };
     }
     const inspected = matchingResultArrays(input.rawResult, members);
     if (inspected.unreadable) return { status: 'unproven', reason: 'result_structure_unreadable' };

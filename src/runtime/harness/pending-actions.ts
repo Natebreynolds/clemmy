@@ -1,4 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import Database from 'better-sqlite3';
 import {
   closeSync,
   existsSync,
@@ -15,9 +16,19 @@ import { BASE_DIR } from '../../config.js';
 // Deliberate ESM cycle (approval-registry imports this module): bindings are
 // only touched inside verifyApprovedCard at call time, never at module eval.
 import * as approvalRegistryForVerify from './approval-registry.js';
+import { getEvent, listEvents } from './eventlog.js';
 import type { ComposioCliDefaultAccountAuthority } from '../../integrations/composio/cli-default-account-authority.js';
 
 export const PENDING_ACTIONS_DIR = path.join(BASE_DIR, 'pending-actions');
+const PENDING_ACTION_TRANSITION_LOCK_DB_PATH = path.join(
+  BASE_DIR,
+  'pending-action-transition-locks.sqlite',
+);
+const PENDING_ACTION_TRANSITION_LOCK_TABLE = 'pending_action_transition_locks';
+const PENDING_ACTION_TRANSITION_LOCK_MAX_WAIT_MS = 250;
+const PENDING_ACTION_TRANSITION_LOCK_BASE_RETRY_MS = 5;
+const transitionRetrySignal = new Int32Array(new SharedArrayBuffer(4));
+const transitionLockCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 export const PENDING_ACTION_KINDS = [
   'external_send',
@@ -61,6 +72,17 @@ export type PendingActionApprovedBy = 'human' | 'policy';
 
 export type PendingActionApprovalEvidence =
   | { kind: 'card'; approvalId: string }
+  | {
+      kind: 'conversation';
+      approvalId: string;
+      promptEventId: string;
+      promptEventSeq: number;
+      responseSourceUserSeq: number;
+      sourceUserSeq: number;
+      responderUserId: string;
+      conversationKey: string;
+      originReplyTargetDigest: string;
+    }
   | { kind: 'workflow'; workflowRunId: string }
   | { kind: 'policy'; scope: string };
 
@@ -81,6 +103,10 @@ export interface PendingActionRecord {
   risk: string;
   rollback: string;
   sessionId: string | null;
+  /** Exact accepted source that prepared this immutable action. A replay of
+   * that same source reuses the durable record; a genuinely new user source
+   * may intentionally prepare the same bytes again. */
+  sourceUserSeq: number | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -98,6 +124,15 @@ export interface PendingActionRecord {
   history: PendingActionHistoryItem[];
 }
 
+/** Opaque, process-local authority carried only from the winning
+ * approved→executing claim to the exact provider boundary. */
+export interface PendingActionExecutionCapability {
+  pendingActionId: string;
+  payloadHash: string;
+  claimToken: string;
+  sourceUserSeq: number;
+}
+
 export interface QueuePendingActionInput {
   title: string;
   summary: string;
@@ -110,6 +145,7 @@ export interface QueuePendingActionInput {
   risk?: string | null;
   rollback?: string | null;
   sessionId?: string | null;
+  sourceUserSeq?: number | null;
   createdBy?: string | null;
 }
 
@@ -123,6 +159,22 @@ function recordPath(id: string): string {
 
 function recordLockPath(id: string): string {
   return path.join(PENDING_ACTIONS_DIR, `${id}.execution.lock`);
+}
+
+function transitionLockKey(id: string): string {
+  return `pending-action-transition:${id}`;
+}
+
+function sourceFreezeTransitionLockKey(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  toolName: string;
+  payloadHash: string;
+}): string {
+  const digest = createHash('sha256')
+    .update(stableStringify(input), 'utf8')
+    .digest('hex');
+  return `pending-action-source-freeze:${digest}`;
 }
 
 function newPendingActionId(): string {
@@ -156,6 +208,49 @@ function executionTokenMatches(expectedHash: string | null | undefined, token: s
   }
 }
 
+export function verifyPendingActionExecutionCapability(input: {
+  capability: PendingActionExecutionCapability | null | undefined;
+  sessionId: string | null | undefined;
+  toolName: string;
+  payload: unknown;
+}): boolean {
+  const capability = input.capability;
+  if (!capability || !input.sessionId) return false;
+  const record = getPendingAction(capability.pendingActionId);
+  const conversationEvidence = record?.approvalEvidence?.kind === 'conversation'
+    ? record.approvalEvidence
+    : null;
+  const response = conversationEvidence && record?.sessionId
+    ? listEvents(record.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === conversationEvidence.responseSourceUserSeq)
+    : null;
+  const sourceBound = conversationEvidence
+    ? Boolean(
+        capability.sourceUserSeq === conversationEvidence.responseSourceUserSeq
+        && response
+        && response.data.source === 'channel_send_consent'
+        && response.data.approvalId === conversationEvidence.approvalId
+        && response.data.decision === 'approve'
+        && response.data.userId === conversationEvidence.responderUserId
+        && response.data.conversationKey === conversationEvidence.conversationKey
+      )
+    : Number.isSafeInteger(capability.sourceUserSeq) && capability.sourceUserSeq >= 0;
+  return Boolean(
+    record
+    && record.status === 'executing'
+    && record.sessionId === input.sessionId
+    && record.toolName === input.toolName
+    && record.payloadHash === capability.payloadHash
+    && sourceBound
+    && pendingActionPayloadHash(
+      input.toolName,
+      input.payload,
+      record.executionAuthority ?? null,
+    ) === capability.payloadHash
+    && executionTokenMatches(record.executionClaimTokenHash, capability.claimToken),
+  );
+}
+
 function cleanLine(value: string | null | undefined, fallback: string, max = 1000): string {
   const cleaned = (value ?? '').replace(/\s+/g, ' ').trim();
   return (cleaned || fallback).slice(0, max);
@@ -177,14 +272,211 @@ type RecordLockResult<T> =
   | { acquired: true; value: T }
   | { acquired: false };
 
+interface PendingActionTransitionLockRow {
+  owner_pid: number;
+  owner_token: string;
+}
+
+function openPendingActionTransitionLockDb(): Database.Database {
+  mkdirSync(path.dirname(PENDING_ACTION_TRANSITION_LOCK_DB_PATH), { recursive: true });
+  const db = new Database(PENDING_ACTION_TRANSITION_LOCK_DB_PATH);
+  db.pragma('busy_timeout = 5000');
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ${PENDING_ACTION_TRANSITION_LOCK_TABLE} (
+      lock_key     TEXT PRIMARY KEY,
+      owner_pid    INTEGER NOT NULL,
+      owner_token  TEXT NOT NULL,
+      operation    TEXT NOT NULL,
+      acquired_at  INTEGER NOT NULL
+    )
+  `);
+  return db;
+}
+
+function transitionLockOwnerIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // Only ESRCH proves absence. EPERM and every unknown platform error remain
+    // live/uncertain so recovery can never steal an active owner.
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+function tryAcquirePendingActionTransitionLock(
+  db: Database.Database,
+  lockKey: string,
+  ownerToken: string,
+  operation: string,
+): boolean {
+  const now = Date.now();
+  const inserted = db.prepare(`
+    INSERT OR IGNORE INTO ${PENDING_ACTION_TRANSITION_LOCK_TABLE}
+      (lock_key, owner_pid, owner_token, operation, acquired_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(lockKey, process.pid, ownerToken, operation, now);
+  if (inserted.changes === 1) return true;
+
+  const owner = db.prepare(`
+    SELECT owner_pid, owner_token
+      FROM ${PENDING_ACTION_TRANSITION_LOCK_TABLE}
+     WHERE lock_key = ?
+  `).get(lockKey) as PendingActionTransitionLockRow | undefined;
+  if (!owner || transitionLockOwnerIsAlive(owner.owner_pid)) return false;
+
+  // Exact token CAS closes the check/reclaim race: two recovery processes may
+  // observe a dead PID, but only one can replace that precise dead ownership;
+  // neither can delete or overwrite a newer live owner.
+  const recovered = db.prepare(`
+    UPDATE ${PENDING_ACTION_TRANSITION_LOCK_TABLE}
+       SET owner_pid = ?, owner_token = ?, operation = ?, acquired_at = ?
+     WHERE lock_key = ? AND owner_token = ?
+  `).run(process.pid, ownerToken, operation, now, lockKey, owner.owner_token);
+  return recovered.changes === 1;
+}
+
+function schedulePendingActionTransitionLockCleanup(
+  lockKey: string,
+  ownerToken: string,
+  attempt = 0,
+): void {
+  const cleanupKey = `${lockKey}\0${ownerToken}`;
+  if (transitionLockCleanupTimers.has(cleanupKey)) return;
+  const delayMs = Math.min(30_000, 100 * (2 ** Math.min(attempt, 8)));
+  const timer = setTimeout(() => {
+    transitionLockCleanupTimers.delete(cleanupKey);
+    let db: Database.Database | null = null;
+    try {
+      db = openPendingActionTransitionLockDb();
+      db.prepare(`
+        DELETE FROM ${PENDING_ACTION_TRANSITION_LOCK_TABLE}
+         WHERE lock_key = ? AND owner_token = ?
+      `).run(lockKey, ownerToken);
+    } catch {
+      schedulePendingActionTransitionLockCleanup(lockKey, ownerToken, attempt + 1);
+    } finally {
+      try { db?.close(); } catch { /* the next token-specific retry remains safe */ }
+    }
+  }, delayMs);
+  timer.unref?.();
+  transitionLockCleanupTimers.set(cleanupKey, timer);
+}
+
+function withPendingActionTransitionLockKey<T>(
+  lockKey: string,
+  operation: string,
+  fn: () => T,
+): RecordLockResult<T> {
+  let db: Database.Database;
+  try {
+    db = openPendingActionTransitionLockDb();
+  } catch {
+    return { acquired: false };
+  }
+  const ownerToken = `${process.pid}:${randomBytes(24).toString('base64url')}`;
+  const startedAt = Date.now();
+  let acquired = false;
+  let retryMs = PENDING_ACTION_TRANSITION_LOCK_BASE_RETRY_MS;
+  try {
+    try {
+      while (!acquired) {
+        acquired = tryAcquirePendingActionTransitionLock(db, lockKey, ownerToken, operation);
+        if (acquired) break;
+        const elapsed = Date.now() - startedAt;
+        if (elapsed >= PENDING_ACTION_TRANSITION_LOCK_MAX_WAIT_MS) return { acquired: false };
+        const waitMs = Math.min(retryMs, PENDING_ACTION_TRANSITION_LOCK_MAX_WAIT_MS - elapsed);
+        Atomics.wait(transitionRetrySignal, 0, 0, waitMs);
+        retryMs = Math.min(40, retryMs * 2);
+      }
+    } catch {
+      return { acquired: false };
+    }
+    return { acquired: true, value: fn() };
+  } finally {
+    if (acquired) {
+      try {
+        db.prepare(`
+          DELETE FROM ${PENDING_ACTION_TRANSITION_LOCK_TABLE}
+           WHERE lock_key = ? AND owner_token = ?
+        `).run(lockKey, ownerToken);
+      } catch {
+        // The mutation already committed. Never mask that truth or leave the
+        // current live PID wedged forever; retry only this exact owner token.
+        schedulePendingActionTransitionLockCleanup(lockKey, ownerToken);
+      } finally {
+        try { db.close(); } catch {
+          schedulePendingActionTransitionLockCleanup(lockKey, ownerToken);
+        }
+      }
+    } else {
+      try { db.close(); } catch { /* no ownership was acquired */ }
+    }
+  }
+}
+
+function withPendingActionTransitionLock<T>(
+  id: string,
+  operation: string,
+  fn: () => T,
+): RecordLockResult<T> {
+  return withPendingActionTransitionLockKey(transitionLockKey(id), operation, fn);
+}
+
+function pendingActionTransitionLockIdentityForKeyForTest(lockKey: string): {
+  dbPath: string;
+  table: string;
+  lockKey: string;
+} {
+  const db = openPendingActionTransitionLockDb();
+  db.close();
+  return {
+    dbPath: PENDING_ACTION_TRANSITION_LOCK_DB_PATH,
+    table: PENDING_ACTION_TRANSITION_LOCK_TABLE,
+    lockKey,
+  };
+}
+
+/** Narrow fixture seam for deterministic dead/live-owner crash pins. */
+export function pendingActionTransitionLockIdentityForTest(id: string): {
+  dbPath: string;
+  table: string;
+  lockKey: string;
+} {
+  return pendingActionTransitionLockIdentityForKeyForTest(transitionLockKey(id));
+}
+
+/** Exact sibling seam for same-accepted-source freeze crash pins. */
+export function pendingActionSourceFreezeLockIdentityForTest(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  toolName: string;
+  payload: unknown;
+  executionAuthority?: ComposioCliDefaultAccountAuthority | null;
+}): { dbPath: string; table: string; lockKey: string } {
+  const payloadHash = pendingActionPayloadHash(
+    input.toolName,
+    input.payload,
+    input.executionAuthority ?? null,
+  );
+  return pendingActionTransitionLockIdentityForKeyForTest(sourceFreezeTransitionLockKey({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    toolName: input.toolName,
+    payloadHash,
+  }));
+}
+
 /**
  * A filesystem O_EXCL lock makes the approved→executing compare-and-swap safe
  * across daemon processes, not only concurrent promises in one process.
  *
- * The lock is intentionally never considered stale automatically. If a process
- * dies in the tiny synchronous claim section, the orphaned lock leaves the
- * action inert and requiring manual inspection; deleting it automatically
- * could replay an irreversible action whose dispatch boundary was uncertain.
+ * This provider-claim/result lock is intentionally never considered stale.
+ * Recoverable pre-provider bookkeeping uses the separate SQLite transition
+ * owner above; a dead execution owner remains uncertain and non-retryable.
  */
 function withRecordExecutionLock<T>(id: string, fn: () => T): RecordLockResult<T> {
   ensurePendingActionsDir();
@@ -225,7 +517,11 @@ function verifyApprovedCard(approvalId: string): CardConsentVerification {
     // silently fail-open (exactly how the first cut of this fix died in tests).
     const row = approvalRegistryForVerify.get(approvalId);
     if (!row) return 'refuted';
-    return row.status === 'resolved' && row.resolution === 'approved' ? 'verified' : 'refuted';
+    return row.status === 'resolved'
+      && row.resolution === 'approved'
+      && row.presentation === null
+      ? 'verified'
+      : 'refuted';
   } catch {
     return 'unavailable';
   }
@@ -236,10 +532,48 @@ function verifyApprovedCard(approvalId: string): CardConsentVerification {
  *  sends (GRANT INVARIANT I1), surfacing an honest "needs your approval card"
  *  instead of executing on a dangling string. Transient registry unavailability
  *  fails OPEN to the claim (a read hiccup must not rebrand a real approval). */
+function conversationEvidenceForRow(
+  row: approvalRegistryForVerify.PendingApprovalRow,
+): Extract<PendingActionApprovalEvidence, { kind: 'conversation' }> | null {
+  const presentation = row.presentation;
+  if (
+    row.status !== 'resolved'
+    || row.resolution !== 'approved'
+    || !presentation?.promptEventId
+    || !presentation.promptEventSeq
+    || !presentation.responseSourceUserSeq
+    || !presentation.responseUserId
+  ) return null;
+  return {
+    kind: 'conversation',
+    approvalId: row.approvalId,
+    promptEventId: presentation.promptEventId,
+    promptEventSeq: presentation.promptEventSeq,
+    responseSourceUserSeq: presentation.responseSourceUserSeq,
+    sourceUserSeq: presentation.sourceUserSeq,
+    responderUserId: presentation.responseUserId,
+    conversationKey: presentation.conversationKey,
+    originReplyTargetDigest: presentation.originReplyTargetDigest,
+  };
+}
+
 function inferCardConsent(approvalId: string): { by: PendingActionApprovedBy; evidence: PendingActionApprovalEvidence } {
-  return verifyApprovedCard(approvalId) === 'refuted'
-    ? { by: 'policy', evidence: { kind: 'policy', scope: `unverified-card:${approvalId}` } }
-    : { by: 'human', evidence: { kind: 'card', approvalId } };
+  let conversationalSurface = false;
+  try {
+    const row = approvalRegistryForVerify.get(approvalId);
+    conversationalSurface = Boolean(row?.presentation);
+    const conversation = row ? conversationEvidenceForRow(row) : null;
+    if (conversation) return { by: 'human', evidence: conversation };
+  } catch { /* the fail-closed fallback below owns unreadable state */ }
+  return verifyApprovedCard(approvalId) === 'verified'
+    ? { by: 'human', evidence: { kind: 'card', approvalId } }
+    : {
+        by: 'policy',
+        evidence: {
+          kind: 'policy',
+          scope: `${conversationalSurface ? 'unverified-human-decision' : 'unverified-card'}:${approvalId}`,
+        },
+      };
 }
 
 function safeReadRecord(file: string): PendingActionRecord | null {
@@ -268,6 +602,9 @@ function safeReadRecord(file: string): PendingActionRecord | null {
       }
     }
     parsed.executionAuthority = parsed.executionAuthority ?? null;
+    parsed.sourceUserSeq = Number.isSafeInteger(parsed.sourceUserSeq) && (parsed.sourceUserSeq ?? 0) > 0
+      ? parsed.sourceUserSeq
+      : null;
     return parsed;
   } catch {
     return null;
@@ -299,6 +636,9 @@ export function queuePendingAction(input: QueuePendingActionInput): PendingActio
     risk: cleanLine(input.risk, 'normal approval risk', 1000),
     rollback: cleanLine(input.rollback, 'no rollback noted', 1000),
     sessionId: input.sessionId?.trim() || null,
+    sourceUserSeq: Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
+      ? input.sourceUserSeq as number
+      : null,
     createdBy: cleanLine(input.createdBy, 'clementine', 120),
     createdAt: now,
     updatedAt: now,
@@ -403,6 +743,86 @@ export function findOpenPendingActionByPayload(
     )) ?? null;
 }
 
+/** Replay identity for a provider permission boundary. Unlike the generic
+ * open-action dedupe, this intentionally includes terminal rows: once the
+ * exact accepted source has sent/rejected/failed this payload, replaying that
+ * source must observe the old result instead of minting another send. A new
+ * accepted source is distinct authority even when its provider bytes match. */
+export function findPendingActionByPayloadAndSource(
+  toolName: string,
+  payload: unknown,
+  input: {
+    sessionId: string;
+    sourceUserSeq: number;
+    executionAuthority?: ComposioCliDefaultAccountAuthority | null;
+  },
+): PendingActionRecord | null {
+  const hash = pendingActionPayloadHash(
+    toolName,
+    payload,
+    input.executionAuthority ?? null,
+  );
+  ensurePendingActionsDir();
+  return readdirSync(PENDING_ACTIONS_DIR)
+    .filter((file) => file.endsWith('.json'))
+    .map((file) => safeReadRecord(path.join(PENDING_ACTIONS_DIR, file)))
+    .filter((record): record is PendingActionRecord => Boolean(record))
+    .filter((record) => (
+      record.sessionId === input.sessionId
+      && record.sourceUserSeq === input.sourceUserSeq
+      && record.toolName === toolName
+      && record.payloadHash === hash
+    ))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ?? null;
+}
+
+/** Cross-process atomic freeze for one exact accepted source/provider payload.
+ * This is intentionally separate from the execution lock: it serializes only
+ * the short find→write registration section and is always released. A crash
+ * before the atomic rename writes no record; a crash after it leaves the one
+ * complete record visible to the next caller. */
+export function getOrCreatePendingActionByPayloadAndSource(
+  input: QueuePendingActionInput & { sessionId: string; sourceUserSeq: number },
+): { record: PendingActionRecord; created: boolean } {
+  ensurePendingActionsDir();
+  const executionAuthority = input.executionAuthority ?? null;
+  const payloadHash = pendingActionPayloadHash(input.toolName, input.payload, executionAuthority);
+  const lockKey = sourceFreezeTransitionLockKey({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    toolName: input.toolName,
+    payloadHash,
+  });
+  const frozen = withPendingActionTransitionLockKey(lockKey, 'source_freeze', () => {
+    const existing = findPendingActionByPayloadAndSource(
+      input.toolName,
+      input.payload,
+      {
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        executionAuthority,
+      },
+    );
+    if (existing) return { record: existing, created: false };
+    return { record: queuePendingAction(input), created: true };
+  });
+  if (frozen.acquired) return frozen.value;
+  // The winner may have committed while our bounded wait elapsed. Reuse that
+  // exact source/payload if visible; otherwise fail closed and let the SDK
+  // retry instead of minting a duplicate without serialization.
+  const existing = findPendingActionByPayloadAndSource(
+    input.toolName,
+    input.payload,
+    {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      executionAuthority,
+    },
+  );
+  if (existing) return { record: existing, created: false };
+  throw new Error('pending action source freeze is active or uncertain');
+}
+
 function updatePendingAction(
   id: string,
   status: PendingActionStatus,
@@ -416,7 +836,7 @@ function updatePendingAction(
     executionClaimToken?: string;
   } = {},
 ): PendingActionRecord | null {
-  const locked = withRecordExecutionLock(id, () => {
+  const mutate = (): PendingActionRecord | null => {
     const record = getPendingAction(id);
     if (!record) return null;
     const evidence = opts.approvalEvidence;
@@ -427,6 +847,11 @@ function updatePendingAction(
       && Boolean(evidence)
       && (
         evidence?.kind === 'workflow'
+        || (
+          evidence?.kind === 'conversation'
+          && opts.approvalId === evidence.approvalId
+          && verifyConversationEvidence(evidence, record) === null
+        )
         || (
           evidence?.kind === 'card'
           && opts.approvalId === evidence.approvalId
@@ -465,10 +890,12 @@ function updatePendingAction(
       { at: now, status, note: opts.note, actor: opts.actor },
     ];
     return writeRecord(record);
-  });
-  // A live/stale lock means another executor owns (or may have owned) this
-  // transition. Returning current durable truth is safer than waiting and
-  // accidentally replaying an irreversible action.
+  };
+  const locked = status === 'executed' || status === 'failed'
+    ? withRecordExecutionLock(id, mutate)
+    : withPendingActionTransitionLock(id, `status:${status}`, mutate);
+  // Transition contention is bounded/retryable by the caller; strict
+  // execution-lock contention remains uncertain and never authorizes replay.
   return locked.acquired ? locked.value : getPendingAction(id);
 }
 
@@ -479,6 +906,7 @@ export type PendingActionExecutionClaimReason =
   | 'session_authority_mismatch'
   | 'payload_integrity_failed'
   | 'approval_authority_invalid'
+  | 'pre_provider_transition_in_progress'
   | 'claim_in_progress_or_uncertain';
 
 export interface PendingActionExecutionClaim {
@@ -536,15 +964,113 @@ function pinnedPendingActionView(args: Record<string, unknown> | null): Record<s
     : null;
 }
 
+function verifyConversationEvidence(
+  evidence: Extract<PendingActionApprovalEvidence, { kind: 'conversation' }>,
+  record: PendingActionRecord,
+): string | null {
+  let row: approvalRegistryForVerify.PendingApprovalRow | undefined;
+  try { row = approvalRegistryForVerify.get(evidence.approvalId); } catch {
+    return 'The conversational human decision ledger could not be read.';
+  }
+  const presentation = row?.presentation;
+  if (
+    !row
+    || row.status !== 'resolved'
+    || row.resolution !== 'approved'
+    || !record.sessionId
+    || row.sessionId !== record.sessionId
+    || !presentation
+    || presentation.promptEventId !== evidence.promptEventId
+    || presentation.promptEventSeq !== evidence.promptEventSeq
+    || presentation.responseSourceUserSeq !== evidence.responseSourceUserSeq
+    || presentation.sourceUserSeq !== evidence.sourceUserSeq
+    || presentation.responseUserId !== evidence.responderUserId
+    || presentation.audienceUserId !== evidence.responderUserId
+    || presentation.conversationKey !== evidence.conversationKey
+    || presentation.originReplyTargetDigest !== evidence.originReplyTargetDigest
+  ) return 'The conversational decision provenance does not match its durable approval row.';
+  const rowPendingActionId = row.args?.pendingActionId ?? row.args?.pending_action_id;
+  const pinned = pinnedPendingActionView(row.args);
+  const pinnedExecutionAuthority = pinned?.executionAuthority ?? null;
+  const recordExecutionAuthority = record.executionAuthority ?? null;
+  if (
+    rowPendingActionId !== record.id
+    || pinned?.id !== record.id
+    || pinned.toolName !== record.toolName
+    || pinned.payloadHash !== record.payloadHash
+    || pendingActionPayloadHash(
+      String(pinned.toolName),
+      pinned.payload,
+      pinnedExecutionAuthority as ComposioCliDefaultAccountAuthority | null,
+    ) !== pinned.payloadHash
+    || stableStringify(pinned.payload) !== stableStringify(record.payload)
+    || stableStringify(pinnedExecutionAuthority) !== stableStringify(recordExecutionAuthority)
+  ) return 'The conversational decision does not pin this exact pending action, payload, and execution authority.';
+  const prompt = getEvent(evidence.promptEventId);
+  if (
+    !prompt
+    || prompt.seq !== evidence.promptEventSeq
+    || prompt.sessionId !== row.sessionId
+    || prompt.type !== 'approval_requested'
+    || prompt.data.approvalId !== row.approvalId
+    || prompt.data.approvalPresentation !== 'conversation'
+    || prompt.data.question !== presentation.question
+  ) return 'The ordinary consent question is missing or does not name this exact approval.';
+  const source = listEvents(row.sessionId, {
+    sinceSeq: evidence.sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === evidence.sourceUserSeq);
+  if (
+    !source
+    || source.data.synthetic === true
+    || source.data.userId !== evidence.responderUserId
+    || source.data.conversationKey !== evidence.conversationKey
+    || source.data.originReplyTargetDigest !== evidence.originReplyTargetDigest
+  ) return 'The prepared send is not bound to the same accepted human and conversation that received the question.';
+  const response = listEvents(row.sessionId, {
+    sinceSeq: evidence.responseSourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === evidence.responseSourceUserSeq);
+  if (
+    !response
+    || response.data.source !== 'channel_send_consent'
+    || response.data.approvalId !== row.approvalId
+    || response.data.decision !== 'approve'
+    || response.data.userId !== evidence.responderUserId
+    || response.data.conversationKey !== evidence.conversationKey
+  ) return 'The approval reply source is missing or not the exact addressed human answer.';
+  return null;
+}
+
+/** Shared read-only verifier for graph semantic rehydration and execution.
+ * Both consumers must agree on the exact frozen payload and conversational
+ * provenance; model-visible ids/hashes alone never elevate authority. */
+export function verifyConversationalPendingActionAuthority(record: PendingActionRecord): boolean {
+  return record.approvedBy === 'human'
+    && record.approvalEvidence?.kind === 'conversation'
+    && ['approved', 'executing', 'executed', 'failed'].includes(record.status)
+    && verifyConversationEvidence(record.approvalEvidence, record) === null;
+}
+
 function verifyResolvedHumanCardAuthority(record: PendingActionRecord): string | null {
   if (
     record.approvedBy !== 'human'
-    || record.approvalEvidence?.kind !== 'card'
     || !record.approvalId
-    || record.approvalEvidence.approvalId !== record.approvalId
   ) {
-    return 'The action requires an exact human approval card, but its durable consent provenance is missing or inconsistent.';
+    return 'The action requires an exact human decision, but its durable consent provenance is missing or inconsistent.';
   }
+  if (record.approvalEvidence?.kind === 'conversation') {
+    if (record.approvalEvidence.approvalId !== record.approvalId) {
+      return 'The conversational decision names a different approval row.';
+    }
+    return verifyConversationEvidence(record.approvalEvidence, record);
+  }
+  if (
+    record.approvalEvidence?.kind !== 'card'
+    || record.approvalEvidence.approvalId !== record.approvalId
+  ) return 'The action requires a verified human card or conversational decision.';
   let row: approvalRegistryForVerify.PendingApprovalRow | undefined;
   try {
     row = approvalRegistryForVerify.get(record.approvalId);
@@ -602,12 +1128,13 @@ export function claimPendingActionExecution(
 ): PendingActionExecutionClaim {
   const clean = id.trim();
   if (!clean) return { claimed: false, reason: 'not_found', record: null };
-  const locked = withRecordExecutionLock(clean, () => {
-    const record = getPendingAction(clean);
-    if (!record) return { claimed: false, reason: 'not_found', record: null } satisfies PendingActionExecutionClaim;
-    if (record.status !== 'approved') {
-      return { claimed: false, reason: 'not_approved', record } satisfies PendingActionExecutionClaim;
-    }
+  const transition = withPendingActionTransitionLock(clean, 'approved_to_executing', () => {
+    const locked = withRecordExecutionLock(clean, () => {
+      const record = getPendingAction(clean);
+      if (!record) return { claimed: false, reason: 'not_found', record: null } satisfies PendingActionExecutionClaim;
+      if (record.status !== 'approved') {
+        return { claimed: false, reason: 'not_approved', record } satisfies PendingActionExecutionClaim;
+      }
     if (
       options.expectedSessionId !== undefined
       && (!record.sessionId || record.sessionId !== options.expectedSessionId)
@@ -669,18 +1196,32 @@ export function claimPendingActionExecution(
         actor: claimedBy,
       },
     ];
+      return {
+        claimed: true,
+        reason: 'claimed',
+        record: writeRecord(record),
+        claimToken,
+      } satisfies PendingActionExecutionClaim;
+    });
+    if (locked.acquired) return locked.value;
     return {
-      claimed: true,
-      reason: 'claimed',
-      record: writeRecord(record),
-      claimToken,
+      claimed: false,
+      reason: 'claim_in_progress_or_uncertain',
+      record: getPendingAction(clean),
     } satisfies PendingActionExecutionClaim;
   });
-  if (locked.acquired) return locked.value;
+  if (transition.acquired) return transition.value;
+  const record = getPendingAction(clean);
   return {
     claimed: false,
-    reason: 'claim_in_progress_or_uncertain',
-    record: getPendingAction(clean),
+    reason: !record
+      ? 'not_found'
+      : record.status === 'approved'
+        ? 'pre_provider_transition_in_progress'
+        : record.status === 'executing'
+          ? 'claim_in_progress_or_uncertain'
+          : 'not_approved',
+    record,
   };
 }
 
@@ -694,7 +1235,7 @@ export function linkPendingActionApproval(id: string, approvalId: string): Pendi
     current?.status === 'approval_requested'
     || (current?.status === 'approved' && current.approvedBy !== 'human')
   ) {
-    const locked = withRecordExecutionLock(id, () => {
+    const locked = withPendingActionTransitionLock(id, 'link_approval', () => {
       const record = getPendingAction(id);
       if (
         !record
@@ -738,7 +1279,7 @@ export function cancelPendingActionIfQueuedUnlinked(
 ): PendingActionRecord | null {
   const clean = id.trim();
   if (!clean) return null;
-  const locked = withRecordExecutionLock(clean, () => {
+  const locked = withPendingActionTransitionLock(clean, 'cancel_unlinked_duplicate', () => {
     const record = getPendingAction(clean);
     if (!record || record.status !== 'queued' || record.approvalId) return record;
     const now = new Date().toISOString();

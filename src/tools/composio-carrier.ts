@@ -214,14 +214,19 @@ export function composioCarrierDigest(canonical: CanonicalComposioInvocation): s
     .digest('hex');
 }
 
-/** Render the canonical form for the wire. The only place a string appears. */
+/** Render the normalized form for the provider wire. The digest above owns
+ * order-independent invocation identity; the wire must retain semantic object
+ * order because some reviewed provider operations (notably Sheet-from-JSON)
+ * use insertion order as column order. Sorting here changed a requested
+ * Name/Rating/Address sheet into Address/Name/Rating while keeping the same
+ * logical call. */
 export function serializeComposioCarrier(
   canonical: CanonicalComposioInvocation,
 ): SerializedComposioCarrier {
   const hasArgs = Object.keys(canonical.args).length > 0;
   return {
     tool_slug: canonical.toolSlug,
-    arguments: hasArgs ? JSON.stringify(canonicalizeValue(canonical.args)) : null,
+    arguments: hasArgs ? JSON.stringify(canonical.args) : null,
   };
 }
 

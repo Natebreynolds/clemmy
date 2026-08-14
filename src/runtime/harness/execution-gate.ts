@@ -32,11 +32,12 @@
  */
 
 import {
-  composioSlugIsReadOnly,
-  dataForSeoResearchActionIsReadOnly,
-  firecrawlResearchActionIsReadOnly,
-  isReadOnlyCallAction,
+  composioSlugEffectEvidence,
 } from '../../integrations/composio/slug-effect.js';
+import {
+  documentedComposioOperationSemantic,
+  type DocumentedComposioReversibility,
+} from '../../integrations/composio/operation-semantics.js';
 import {
   isClementineLocalToolNamespace as isClementineLocalMcpName,
   isPlainOrClementineLocalTool,
@@ -45,92 +46,6 @@ import {
   runtimeToolTail as mcpToolTail,
   stripMcpTransportPrefix as withoutMcpTransportPrefix,
 } from './runtime-tool-identity.js';
-
-/**
- * Verbs in a Composio tool_slug that indicate external state mutation.
- * Conservative: when a tool slug contains any of these as a path
- * segment, treat as a write. False positives are acceptable (creates
- * a slightly-unnecessary audit trail); false negatives are not
- * (lets an un-audited write slip past the gate).
- */
-const MUTATING_VERBS: ReadonlySet<string> = new Set([
-  'UPDATE',
-  'CREATE',
-  'INSERT',
-  'DELETE',
-  'REPLACE',
-  'APPEND',
-  'SEND',
-  'PATCH',
-  'POST',
-  'WRITE',
-  'REMOVE',
-  'PUBLISH',
-  'BATCH', // BATCH_UPDATE, BATCH_DELETE, etc — slug starts with BATCH
-  // Telephony / social publishes — irreversible external actions whose slugs
-  // (TWILIO_MAKE_OUTBOUND_CALL, *_DIAL, *_BROADCAST) carry no CREATE/SEND verb
-  // (2026-07-09 Hole B). Kept in sync with confirm-first IRREVERSIBLE_VERBS.
-  'CALL',
-  'DIAL',
-  'OUTBOUND',
-  'TWEET',
-  'BROADCAST',
-  'DM',
-]);
-
-// These tokens are both common API objects/transport nouns and mutations.
-// They are writes by default, but an affirmative read action may disambiguate
-// them (`GET_CALL`, `GET_POST`, `BATCH_GET`). Every other mutation token wins.
-const READ_COMPATIBLE_MUTATING_VERBS: ReadonlySet<string> = new Set([
-  'CALL',
-  'POST',
-  'BATCH',
-]);
-
-/**
- * Composio tool slugs that LOOK mutating by verb but aren't actually
- * user-data mutations. Today this is just DataForSEO's task creation
- * (queueing a SERP/backlinks job is read-only from the user's
- * perspective — it doesn't write to any persistent user store).
- */
-const DATAFORSEO_READ_JOB_FAMILY = /^DATAFORSEO_(?:DATAFORSEO_)?/;
-const FIRECRAWL_READ_JOB_FAMILY = /^FIRECRAWL_(?:FIRECRAWL_)?(BATCH_)?(SCRAPE|MAP|SEARCH|CRAWL)(?:_|$)/;
-
-const EXEMPT_COMPOSIO_SLUG_PATTERNS: RegExp[] = [
-  // These identify provider read-job *families*. Matching a family is not
-  // sufficient by itself: providerReadJobIsExempt below makes explicit
-  // mutations win, while preserving the provider's documented task jobs.
-  DATAFORSEO_READ_JOB_FAMILY,
-  // Firecrawl search/scrape/map/crawl are reads from external URLs,
-  // not writes to the user's data. BATCH_SCRAPE still only creates a
-  // provider-side read job.
-  FIRECRAWL_READ_JOB_FAMILY,
-];
-
-function providerReadJobIsExempt(
-  normalizedAction: string,
-): boolean {
-  if (DATAFORSEO_READ_JOB_FAMILY.test(normalizedAction)) {
-    // The shared provider classifier recognizes only structural SERP/LABS/
-    // BACKLINKS research shapes and their terminal TASK_POST transport. It owns
-    // the complete write vocabulary, so SET/ENABLE/ARCHIVE and future unfamiliar
-    // DataForSEO actions cannot exploit this gate's smaller legacy verb set.
-    return dataForSeoResearchActionIsReadOnly(normalizedAction);
-  }
-
-  if (FIRECRAWL_READ_JOB_FAMILY.test(normalizedAction)) {
-    // Use the same complete write vocabulary as approval, retries, and
-    // dispatch. The gate's smaller legacy set cannot safely own this seam.
-    return firecrawlResearchActionIsReadOnly(normalizedAction);
-  }
-
-  return false;
-}
-
-function isProviderReadJobFamily(normalizedAction: string): boolean {
-  return DATAFORSEO_READ_JOB_FAMILY.test(normalizedAction)
-    || FIRECRAWL_READ_JOB_FAMILY.test(normalizedAction);
-}
 
 /**
  * Internal harness tools that must NEVER trigger the gate — they're
@@ -218,24 +133,6 @@ const COMM_OBJECTS: ReadonlySet<string> = new Set([
 // no add-a-communication send verb.
 const DISPATCH_VERBS: ReadonlySet<string> = new Set(['CREATE', 'MAKE', 'RESPOND', 'POST']);
 
-/**
- * Provider-catalog actions whose published operation is read-only even though
- * the action name is noun-shaped and therefore carries no GET/LIST/SEARCH
- * evidence. Keep this exact and intentionally small: an unfamiliar external
- * action still fails closed, while known catalog reads do not acquire
- * execution ceremony merely because a vendor omitted a verb.
- *
- * Keys are punctuation-insensitive so the same catalog action matches the
- * Composio wrapper (`SLACK_CONVERSATIONS_HISTORY`), a dynamic tool
- * (`cx_slack_conversations_history`), and a native MCP namespace
- * (`mcp__slack__conversations_history`).
- */
-const DOCUMENTED_READ_ONLY_EXTERNAL_ACTIONS: ReadonlySet<string> = new Set([
-  'SLACKCONVERSATIONSHISTORY',
-  'TWITTERUSERTIMELINE',
-  'GOOGLEDRIVEDOWNLOADFILE',
-]);
-
 interface CanonicalExternalAction {
   /** Canonical provider action, not its transport wrapper. */
   action?: string;
@@ -252,6 +149,12 @@ export interface CanonicalExternalEffect {
   mutating: boolean;
   /** Whether the canonical action sends/publishes something irreversible. */
   irreversible: boolean;
+  /**
+   * Affirmative operation reversibility. `reversible` is emitted only when a
+   * documented semantic says the exact canonical operation can be corrected;
+   * it is never inferred merely because the action is not a send.
+   */
+  reversibility: DocumentedComposioReversibility | 'unknown';
   /** False for an external mutation whose effect vocabulary is not understood. */
   classificationKnown: boolean;
 }
@@ -349,11 +252,6 @@ function canonicalExternalAction(
   return { external: false };
 }
 
-function documentedReadOnlyExternalAction(action: string): boolean {
-  const key = action.toUpperCase().replace(/[^A-Z0-9]+/g, '');
-  return DOCUMENTED_READ_ONLY_EXTERNAL_ACTIONS.has(key);
-}
-
 /** One shared effect classifier after transport normalization. */
 function canonicalExternalActionWriteClassification(action: string | undefined): {
   mutating: boolean;
@@ -363,36 +261,17 @@ function canonicalExternalActionWriteClassification(action: string | undefined):
   // read. This is the safety boundary: malformed wrappers and newly introduced
   // mutation verbs cannot bypass execution wrapping.
   if (!action) return { mutating: true, classificationKnown: false };
-  const normalized = action
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .toUpperCase();
-  if (documentedReadOnlyExternalAction(normalized)) {
-    return { mutating: false, classificationKnown: true };
+  const documented = documentedComposioOperationSemantic(action);
+  if (documented) {
+    return { mutating: documented.effect === 'write', classificationKnown: true };
   }
-  const parts = normalized
-    .split(/[^A-Z0-9]+/)
-    .filter(Boolean);
-  const knownMutation = parts.some((part) => MUTATING_VERBS.has(part))
-    || isIrreversibleSendSlug(action);
-  const mutationParts = parts.filter((part) => MUTATING_VERBS.has(part));
-  if (providerReadJobIsExempt(normalized)) {
-    return { mutating: false, classificationKnown: true };
-  }
-  // A candidate in one of these provider families reached here only because
-  // its action contains non-read-job mutation vocabulary. Do not feed it back
-  // into the older broad Composio exemption below.
-  if (isProviderReadJobFamily(normalized)) {
-    return { mutating: true, classificationKnown: knownMutation };
-  }
-  // Outside the narrow provider read-job exception, affirmative mutation
-  // vocabulary always wins over a GET/LIST/etc token elsewhere in the name.
-  const decisiveMutation = mutationParts.some((part) => !READ_COMPATIBLE_MUTATING_VERBS.has(part))
-    || isIrreversibleSendSlug(action);
-  if (decisiveMutation) return { mutating: true, classificationKnown: true };
-  if (composioSlugIsReadOnly(normalized) || isReadOnlyCallAction(normalized)) {
-    return { mutating: false, classificationKnown: true };
-  }
-  return { mutating: true, classificationKnown: knownMutation };
+  const evidence = composioSlugEffectEvidence(action);
+  if (evidence === 'read') return { mutating: false, classificationKnown: true };
+  if (evidence === 'write') return { mutating: true, classificationKnown: true };
+  // A connected operation with no documented semantics and no recognized verb
+  // stays a conservative mutation, but remains explicitly UNKNOWN so approval
+  // and workspace consumers can fail closed.
+  return { mutating: true, classificationKnown: false };
 }
 
 function canonicalExternalActionIsWrite(action: string | undefined): boolean {
@@ -447,6 +326,7 @@ export function classifyCanonicalExternalEffect(
       external: false,
       mutating: false,
       irreversible: false,
+      reversibility: 'read_only',
       classificationKnown: true,
     };
   }
@@ -456,18 +336,32 @@ export function classifyCanonicalExternalEffect(
       external: false,
       mutating: false,
       irreversible: false,
+      reversibility: 'read_only',
       classificationKnown: true,
     };
   }
   const write = canonicalExternalActionWriteClassification(canonical.action);
-  const irreversible = canonical.action
-    ? isIrreversibleSendSlug(canonical.action)
-    : false;
+  const documented = canonical.action
+    ? documentedComposioOperationSemantic(canonical.action)
+    : null;
+  const irreversible = documented
+    ? documented.reversibility === 'irreversible'
+    : canonical.action
+      ? isIrreversibleSendSlug(canonical.action)
+      : false;
+  const reversibility: CanonicalExternalEffect['reversibility'] = documented
+    ? documented.reversibility
+    : irreversible
+      ? 'irreversible'
+      : write.classificationKnown && !write.mutating
+        ? 'read_only'
+        : 'unknown';
   return {
     ...(canonical.action ? { action: canonical.action } : {}),
     external: true,
     mutating: write.mutating,
     irreversible,
+    reversibility,
     classificationKnown: write.classificationKnown || irreversible,
   };
 }
@@ -545,4 +439,4 @@ export function isGateEnabled(): boolean {
 }
 
 /** Convenience export for tests + brackets integration. */
-export { MUTATING_VERBS, EXEMPT_TOOL_NAMES, EXEMPT_COMPOSIO_SLUG_PATTERNS };
+export { EXEMPT_TOOL_NAMES };

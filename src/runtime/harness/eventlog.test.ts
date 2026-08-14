@@ -119,7 +119,7 @@ test('latest schema upgrades an existing v4 approval table without losing rows',
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // v37: expected-work universe amendments (35 host evidence, 36 split-brain repair)
+    42, // v42: sealed clarification audience/resolution authority
   );
   resetEventLog();
 });
@@ -163,7 +163,7 @@ test('schema v6 migrates scoped guardrail rows and skips legacy orphans', () => 
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // v37: expected-work universe amendments (35 host evidence, 36 split-brain repair)
+    42, // v42: sealed clarification audience/resolution authority
   );
   resetEventLog();
 });
@@ -258,6 +258,8 @@ test('fresh schema creates artifact truth, discovery, and accepted-task authorit
     'tool_output_invocations',
     'discovery_governor_tasks',
     'discovery_governor_claims',
+    'discovery_governor_role_sets',
+    'discovery_governor_roles',
     'accepted_task_resolutions',
     'accepted_task_operations',
     'obligation_transitions',
@@ -298,7 +300,7 @@ test('fresh schema creates artifact truth, discovery, and accepted-task authorit
   );
   assert.equal(
     (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // v37: expected-work universe amendments (35 host evidence, 36 split-brain repair)
+    42, // v42: sealed clarification audience/resolution authority
   );
   resetEventLog();
 });
@@ -365,7 +367,7 @@ test('schema v12 upgrades a lazy artifact ledger in place and preserves its earl
   assert.equal(root.root_scope_id, 'root-first');
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // v37: expected-work universe amendments (35 host evidence, 36 split-brain repair)
+    42, // v42: sealed clarification audience/resolution authority
   );
   resetEventLog();
 });
@@ -401,7 +403,7 @@ test('schema v19 upgrades a live-like v18 database with invocation-scoped output
   assert.ok(tables.has('tool_output_invocations'));
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // migrations now end at v37
+    42, // migrations now end at v42
   );
   writeToolOutput({
     sessionId: 'sess-live-v18',
@@ -432,7 +434,7 @@ test('schema v21 upgrades a v20 database with durable discovery claims and casca
   const migrated = openEventLog();
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // migrations now end at v37
+    42, // migrations now end at v42
   );
   migrated.prepare(`
     INSERT INTO discovery_governor_tasks
@@ -545,7 +547,7 @@ test('schema v22 preserves complete legacy obligation evidence without inventing
   });
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // migrations now end at v37
+    42, // migrations now end at v42
   );
   migrated.close();
   resetEventLog();
@@ -594,7 +596,7 @@ test('schema v22 quarantines an incomplete obligation table instead of promoting
   }
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // migrations now end at v37
+    42, // migrations now end at v42
   );
   resetEventLog();
 });
@@ -625,7 +627,7 @@ test('schema v22 keeps sparse migration rehearsals sparse while installing stand
   ]);
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // migrations now end at v37
+    42, // migrations now end at v42
   );
   resetEventLog();
 });
@@ -837,7 +839,7 @@ test('schema v32 installs immutable action bindings and removes only rows whose 
   const migrated = openEventLog();
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // migrations now end at v37
+    42, // migrations now end at v42
   );
   assert.deepEqual(
     migrated.prepare('SELECT attempt_id, source_user_seq FROM run_attempts ORDER BY attempt_id').all(),
@@ -866,7 +868,7 @@ test('schema v33 installs normalized pre-dispatch write bindings and proof autho
   const db = openEventLog();
   assert.equal(
     (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    37, // migrations now end at v37
+    42, // migrations now end at v42
   );
   const tables = new Set(
     (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
@@ -882,6 +884,47 @@ test('schema v33 installs normalized pre-dispatch write bindings and proof autho
     'write_evidence_execution_snapshots',
     'write_evidence_proofs',
   ]) assert.ok(tables.has(table), `v33 installs ${table}`);
+  resetEventLog();
+});
+
+test('schema v40 installs generated-Sheet authority on fresh and v39 stores without an artifact ledger', () => {
+  const requiredTables = [
+    'run_artifacts',
+    'artifact_run_scopes',
+    'artifact_source_roots',
+    'expected_work_source_lineage_identities',
+    'expected_work_generated_artifact_contracts',
+    'artifact_content_verifications',
+  ];
+  const requiredTriggers = [
+    'trg_expected_work_source_lineage_identity_immutable',
+    'trg_expected_work_generated_artifact_contract_immutable',
+    'trg_artifact_content_contract_immutable',
+    'trg_artifact_content_verification_once',
+  ];
+  const assertInstalled = (db: ReturnType<typeof openEventLog>) => {
+    const tableRows = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
+    const triggerRows = db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'").all() as Array<{ name: string }>;
+    const tables = new Set(tableRows.map((row) => row.name));
+    const triggers = new Set(triggerRows.map((row) => row.name));
+    for (const table of requiredTables) assert.ok(tables.has(table), `v40 table ${table}`);
+    for (const trigger of requiredTriggers) assert.ok(triggers.has(trigger), `v40 trigger ${trigger}`);
+  };
+
+  resetEventLog();
+  assertInstalled(openEventLog());
+
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.prepare('DELETE FROM schema_version WHERE version >= 40').run();
+  for (const table of requiredTables) raw.exec(`DROP TABLE IF EXISTS ${table}`);
+  raw.close();
+  const migrated = openEventLog();
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    42,
+  );
+  assertInstalled(migrated);
   resetEventLog();
 });
 

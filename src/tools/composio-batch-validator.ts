@@ -264,6 +264,32 @@ export function validateComposioArgs(
  * `additionalProperties: false`. Types and formats remain Composio's job.
  * Fail-open on any malformed/unexpected schema shape.
  */
+function schemaProperties(schema: Record<string, unknown>): Record<string, unknown> | null {
+  return isRecordValue(schema.properties) ? schema.properties : null;
+}
+
+/**
+ * The caller's own arguments with each missing required field added as an
+ * explicit, self-describing placeholder. Values the caller already supplied
+ * are preserved untouched — this is their call, repaired, not a new one.
+ */
+function repairTemplateArgs(
+  args: Record<string, unknown>,
+  missing: readonly string[],
+  props: Record<string, unknown> | null,
+): Record<string, unknown> {
+  const repaired: Record<string, unknown> = { ...args };
+  for (const key of missing) {
+    const spec = props && isRecordValue(props[key]) ? props[key] as Record<string, unknown> : null;
+    const described = [
+      typeof spec?.type === 'string' ? String(spec.type) : null,
+      typeof spec?.description === 'string' ? String(spec.description).slice(0, 120) : null,
+    ].filter(Boolean).join(' — ');
+    repaired[key] = `<FILL: ${described || 'required by the action schema'}>`;
+  }
+  return repaired;
+}
+
 export function validateArgsAgainstSchema(
   toolSlug: string,
   args: Record<string, unknown>,
@@ -281,6 +307,17 @@ export function validateArgsAgainstSchema(
         reason: `Missing required field(s) per the action's schema: ${missing.join(', ')}. Required fields for ${toolSlug}: ${required.join(', ')}`,
         examples: [
           `This comes from ${toolSlug}'s real inputParameters schema — supply every required field.`,
+          // HAND BACK THE CORRECTED CALL, NOT JUST THE COMPLAINT. Naming the
+          // missing field was not enough: across three live failures the model
+          // read the exact field name and then switched to a different tool
+          // instead of filling it in (2026-08-12, APIFY actorId ×6). A
+          // ready-to-send template with the gap marked makes repairing the
+          // SAME call the cheapest next move.
+          `Repair this exact call — fill the ${missing.length === 1 ? 'marked value' : 'marked values'} and re-send it:\n`
+          + `${JSON.stringify({
+            tool_slug: toolSlug,
+            arguments: repairTemplateArgs(args, missing, schemaProperties(schema)),
+          }, null, 2)}`,
         ],
       };
     }

@@ -121,6 +121,136 @@ export function argsHaveSendTarget(rawArgs: unknown): boolean {
 }
 
 /**
+ * Authoring-time companion to argsHaveSendTarget for exact unattended sends.
+ *
+ * A saved scheduled workflow may carry a fixed recipient/channel as standing
+ * authority, but a template-controlled target is a different recipient on
+ * every run and therefore cannot inherit that authority. Keep this predicate
+ * provider-neutral by reusing the same target-key vocabulary as the live
+ * gateway. Only the value provenance differs: every value under the target
+ * field must be literal (no workflow template token anywhere in its subtree).
+ */
+function inspectStaticSendTargets(rawArgs: unknown): { valid: boolean; values: string[] } {
+  const isLiteral = (value: unknown, depth = 0): boolean => {
+    if (depth > 8) return false;
+    if (typeof value === 'string') return !value.includes('{{') && !value.includes('}}');
+    if (value === null || typeof value === 'number' || typeof value === 'boolean') return true;
+    if (Array.isArray(value)) return value.every((entry) => isLiteral(entry, depth + 1));
+    if (value && typeof value === 'object') {
+      return Object.entries(value as Record<string, unknown>)
+        .every(([key, entry]) => (
+          !key.includes('{{')
+          && !key.includes('}}')
+          && isLiteral(entry, depth + 1)
+        ));
+    }
+    return false;
+  };
+  const values = new Set<string>();
+  const addTargetValues = (value: unknown, depth = 0): void => {
+    if (depth > 8 || value === null || value === undefined) return;
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) values.add(trimmed);
+      return;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      values.add(String(value));
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) addTargetValues(entry, depth + 1);
+      return;
+    }
+    if (value && typeof value === 'object') {
+      for (const entry of Object.values(value as Record<string, unknown>)) {
+        addTargetValues(entry, depth + 1);
+      }
+    }
+  };
+  const inspectTargetFields = (
+    obj: Record<string, unknown>,
+    depth = 0,
+  ): { found: boolean; dynamic: boolean } => {
+    if (depth > 8) return { found: false, dynamic: true };
+    let found = false;
+    for (const [key, value] of Object.entries(obj)) {
+      // Some generic gateways carry the real provider args as JSON text. Parse
+      // that carrier at *any* nesting level: otherwise a fixed decoy target at
+      // the surface could conceal a template-controlled recipient below it.
+      if (normalizedArgKey(key) === 'arguments' && typeof value === 'string') {
+        try {
+          const inner = JSON.parse(value) as unknown;
+          if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
+            return { found, dynamic: true };
+          }
+          const nested = inspectTargetFields(inner as Record<string, unknown>, depth + 1);
+          if (nested.dynamic) return { found, dynamic: true };
+          found ||= nested.found;
+          continue;
+        } catch {
+          // An opaque/malformed carrier could hide a contradictory target.
+          return { found, dynamic: true };
+        }
+      }
+      const normalizedKey = normalizedArgKey(key);
+      if (
+        !SENDER_EMAIL_KEY_RE.test(normalizedKey)
+        && !SEND_TARGET_CONTEXT_KEY_RE.test(normalizedKey)
+        && TARGET_KEY_RE.test(normalizedKey)
+        && isMeaningfulPayloadValue(value)
+      ) {
+        if (!isLiteral(value)) return { found, dynamic: true };
+        found = true;
+        addTargetValues(value);
+      }
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+          const nested = inspectTargetFields(entry as Record<string, unknown>, depth + 1);
+          if (nested.dynamic) return { found, dynamic: true };
+          found ||= nested.found;
+        }
+      } else if (value && typeof value === 'object') {
+        const nested = inspectTargetFields(value as Record<string, unknown>, depth + 1);
+        if (nested.dynamic) return { found, dynamic: true };
+        found ||= nested.found;
+      }
+    }
+    return { found, dynamic: false };
+  };
+  if (!rawArgs || typeof rawArgs !== 'object' || Array.isArray(rawArgs)) {
+    return { valid: false, values: [] };
+  }
+  const obj = rawArgs as Record<string, unknown>;
+  const outer = inspectTargetFields(obj);
+  if (outer.dynamic) return { valid: false, values: [] };
+  return { valid: outer.found && values.size > 0, values: [...values].sort() };
+}
+
+export function argsHaveStaticSendTarget(rawArgs: unknown): boolean {
+  return inspectStaticSendTargets(rawArgs).valid;
+}
+
+/** Exact literal target values for host evidence. Unlike the older duplicate
+ * identity extractor this never mines body/content text for email-looking
+ * strings, so a message body cannot masquerade as or leak into its target. */
+export function extractStaticSendTargetValues(rawArgs: unknown): string[] {
+  const inspected = inspectStaticSendTargets(rawArgs);
+  return inspected.valid ? inspected.values : [];
+}
+
+/** Shared target-key classifier for exact-send evidence projection. The public
+ * evidence layer uses it to exclude recipient identifiers from payload digests
+ * even when a provider nests them beneath a content/message object. */
+export function isSendTargetArgumentKey(key: string): boolean {
+  const normalizedKey = normalizedArgKey(key);
+  return !SENDER_EMAIL_KEY_RE.test(normalizedKey)
+    && !SEND_TARGET_CONTEXT_KEY_RE.test(normalizedKey)
+    && TARGET_KEY_RE.test(normalizedKey);
+}
+
+/**
  * Whether an irreversible communication must name a recipient/channel in its
  * payload. Account-scoped social publishing is addressed by the authenticated
  * owner selected at the gateway, so caption/media args are complete without a

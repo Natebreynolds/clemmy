@@ -143,6 +143,7 @@ test('a Claude-self then Codex-independent chain executes only Codex once', asyn
         businessSettlements: 1,
         successfulBusinessSettlements: 1,
         successfulSdkBusinessResults: 0,
+        successfulSdkAuthoringResults: 0,
         unrecoveredBusinessFailures: 0,
         confirmedWrites: 0,
         uncertainWrites: 0,
@@ -152,6 +153,11 @@ test('a Claude-self then Codex-independent chain executes only Codex once', asyn
       },
     },
     priorConsecutiveResumes: 0,
+    recoveryCapability: {
+      liveContinuation: true,
+      toolsAvailable: true,
+      externalStateInspection: true,
+    },
   }, {
     port: {
       async resolveRoute() { return selected; },

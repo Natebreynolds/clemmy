@@ -1,4 +1,5 @@
 import { existsSync, readdirSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
@@ -62,6 +63,31 @@ export interface WorkflowRunReadinessCheck {
   plan: WorkflowExecutionPlan;
 }
 
+interface WorkflowResourceProbeRequest {
+  command: string;
+  args: readonly string[];
+  timeoutMs: number;
+}
+
+interface WorkflowResourceProbeResult {
+  status: number | null;
+  stdout?: string;
+  stderr?: string;
+  error?: Error;
+}
+
+type WorkflowResourceProbeRunner = (
+  request: WorkflowResourceProbeRequest,
+) => WorkflowResourceProbeResult;
+
+interface WorkflowRunReadinessOptions
+  extends Omit<WorkflowExecutionPlanOptions, 'workflowAllowedTools' | 'readiness'> {
+  targetStepId?: string;
+  /** Test seam for fresh, read-only account probes. Production uses spawnSync
+   *  with shell:false and a bounded timeout. */
+  resourceProbeRunner?: WorkflowResourceProbeRunner;
+}
+
 export function buildWorkflowReadinessInventory(workflowSlug?: string): WorkflowToolReadinessInventory {
   const cachedCliScan = readCachedScan();
   return {
@@ -95,10 +121,17 @@ export function buildWorkflowExecutionPlanWithReadiness(
 export function checkWorkflowRunReadiness(
   def: WorkflowDefinition,
   workflowSlug?: string,
-  options: Omit<WorkflowExecutionPlanOptions, 'workflowAllowedTools' | 'readiness'> & { targetStepId?: string } = {},
+  options: WorkflowRunReadinessOptions = {},
 ): WorkflowRunReadinessCheck {
-  const plan = buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, options);
-  const { blockers, warnings } = partitionWorkflowReadiness(plan.toolReadiness.items, options.targetStepId);
+  const { targetStepId, resourceProbeRunner, ...planOptions } = options;
+  const plan = buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, planOptions);
+  const capabilityReadiness = partitionWorkflowReadiness(plan.toolReadiness.items, targetStepId);
+  const resourceReadiness = requiredResourceReadiness(
+    def,
+    resourceProbeRunner ?? runWorkflowResourceProbe,
+  );
+  const blockers = [...capabilityReadiness.blockers, ...resourceReadiness.blockers];
+  const warnings = [...capabilityReadiness.warnings, ...resourceReadiness.warnings];
   return {
     ok: blockers.length === 0,
     blockers,
@@ -106,6 +139,161 @@ export function checkWorkflowRunReadiness(
     message: renderWorkflowRunReadinessMessage(def.name, blockers, warnings),
     plan,
   };
+}
+
+const RESOURCE_PROBE_TIMEOUT_MS = 8_000;
+const SAFE_ACCOUNT_SELECTOR = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}$/;
+const SALESFORCE_AUTH_MISSING = /namedorgnotfounderror|orgnotfounderror|noauthinfo(?:found)?error|no authorization information found|no authorization found|not authenticated|authorize (?:this|an|the) org|authentication (?:has )?(?:expired|is invalid|was revoked)|(?:access|refresh) token (?:has )?(?:expired|is invalid|was revoked)|invalid_grant/i;
+
+function requiredResourceReadiness(
+  def: WorkflowDefinition,
+  runner: WorkflowResourceProbeRunner,
+): { blockers: WorkflowToolReadinessItem[]; warnings: WorkflowToolReadinessItem[] } {
+  const blockers: WorkflowToolReadinessItem[] = [];
+  const warnings: WorkflowToolReadinessItem[] = [];
+  const stepIds = compactUniqueStrings((def.steps ?? []).map((step) => step.id));
+
+  for (const [fallbackId, resource] of Object.entries(def.resources ?? {})) {
+    if (resource.required !== true || resource.kind !== 'account') continue;
+    const cli = resource.cli?.trim().toLowerCase();
+    if (!cli) continue;
+    const resourceId = resource.id?.trim() || fallbackId;
+    if (cli !== 'sf') {
+      warnings.push(resourceProbeItem({
+        resourceId,
+        cli,
+        status: 'unknown',
+        reason: `Required account resource "${resourceId}" uses CLI "${cli}"; no authoritative read-only account probe is available for it yet.`,
+        detail: 'unsupported account CLI; execution will verify at runtime',
+        stepIds,
+      }));
+      continue;
+    }
+
+    const account = resource.account?.trim();
+    if (!account || !SAFE_ACCOUNT_SELECTOR.test(account)) {
+      warnings.push(resourceProbeItem({
+        resourceId,
+        cli,
+        status: 'unknown',
+        reason: `Required Salesforce account resource "${resourceId}" cannot be safely probed because its account selector is missing or invalid.`,
+        detail: 'account selector was not passed to the CLI',
+        stepIds,
+      }));
+      continue;
+    }
+
+    let probe: WorkflowResourceProbeResult;
+    try {
+      probe = runner({
+        command: 'sf',
+        args: ['org', 'display', '--target-org', account, '--json'],
+        timeoutMs: RESOURCE_PROBE_TIMEOUT_MS,
+      });
+    } catch (error) {
+      warnings.push(resourceProbeItem({
+        resourceId,
+        cli,
+        status: 'unknown',
+        reason: `Required Salesforce account "${account}" could not be confirmed before the run.`,
+        detail: conciseProbeDetail(error instanceof Error ? error.message : String(error)),
+        stepIds,
+      }));
+      continue;
+    }
+
+    const payload = parseJsonObject(probe.stdout) ?? parseJsonObject(probe.stderr);
+    if (
+      probe.status === 0
+      && payload?.status === 0
+      && payload.result !== null
+      && typeof payload.result === 'object'
+    ) continue;
+    const payloadMessage = payload
+      ? [payload.name, payload.message, payload.error]
+        .filter((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+        .join(': ')
+      : '';
+    const missing = Boolean(payload && SALESFORCE_AUTH_MISSING.test(payloadMessage));
+    const detail = conciseProbeDetail(
+      probe.error?.message
+        ?? (payloadMessage
+          || probe.stderr
+          || probe.stdout
+          || `sf exited ${String(probe.status)}`),
+    );
+    const item = resourceProbeItem({
+      resourceId,
+      cli,
+      status: missing ? 'missing' : 'unknown',
+      reason: missing
+        ? `Required Salesforce account "${account}" is signed out or missing.`
+        : `Required Salesforce account "${account}" could not be confirmed before the run.`,
+      detail,
+      stepIds,
+    });
+    if (missing) blockers.push(item);
+    else warnings.push(item);
+  }
+
+  return { blockers, warnings };
+}
+
+function resourceProbeItem(input: {
+  resourceId: string;
+  cli: string;
+  status: 'missing' | 'unknown';
+  reason: string;
+  detail: string;
+  stepIds: string[];
+}): WorkflowToolReadinessItem {
+  return {
+    kind: 'cli',
+    name: `${input.cli}:${input.resourceId}`,
+    status: input.status,
+    reason: input.reason,
+    stepIds: input.stepIds,
+    evidence: [{
+      kind: 'cli_command',
+      name: input.cli === 'sf' ? 'sf org display' : input.cli,
+      status: input.status,
+      detail: conciseProbeDetail(input.detail),
+    }],
+  };
+}
+
+function runWorkflowResourceProbe(request: WorkflowResourceProbeRequest): WorkflowResourceProbeResult {
+  const result = spawnSync(request.command, [...request.args], {
+    encoding: 'utf8',
+    shell: false,
+    timeout: request.timeoutMs,
+    maxBuffer: 1024 * 1024,
+    windowsHide: true,
+  });
+  return {
+    status: result.status,
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+    ...(result.error ? { error: result.error } : {}),
+  };
+}
+
+function parseJsonObject(raw: string | undefined): Record<string, unknown> | undefined {
+  const text = raw?.trim();
+  if (!text) return undefined;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function conciseProbeDetail(value: string): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  return compact.length > 300 ? `${compact.slice(0, 297)}...` : compact;
 }
 
 export function renderWorkflowVisualContract(

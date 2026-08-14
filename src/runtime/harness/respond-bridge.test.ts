@@ -26,6 +26,7 @@ const {
 } = await import('./respond-bridge.js');
 // eslint-disable-next-line import/first
 const {
+  appendConversationPreambleOnce,
   appendEvent,
   beginRunAttempt,
   createSession,
@@ -37,6 +38,13 @@ const {
   recordRunAttemptUserInput,
   resetEventLog,
 } = await import('./eventlog.js');
+// eslint-disable-next-line import/first
+const {
+  classifyTurnPreflight,
+  recordTurnPreflightDecision,
+} = await import('./turn-control.js');
+// eslint-disable-next-line import/first
+const { publishPreflightConversation } = await import('./preflight-conversation.js');
 // eslint-disable-next-line import/first
 const { turnGraphFromShadowEvent } = await import('../graph/turn-graph-shadow.js');
 // eslint-disable-next-line import/first
@@ -60,6 +68,10 @@ const { HarnessSession } = await import('./session.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 // eslint-disable-next-line import/first
 const { turnOutcomeId } = await import('./turn-outcome.js');
+// eslint-disable-next-line import/first
+const approvalRegistry = await import('./approval-registry.js');
+// eslint-disable-next-line import/first
+const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
 // eslint-disable-next-line import/first
 const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
 // eslint-disable-next-line import/first
@@ -1164,6 +1176,189 @@ test('Claude SDK brain overload (uncommitted) falls the turn over to the harness
   assert.equal(res.route?.routeKind, 'harness');
   assert.equal(res.route?.falloverFrom, 'claude_agent_sdk_brain');
   assert.equal(res.route?.surface, 'home');
+});
+
+test('request-scoped preamble delivery survives Claude→harness fallover and is awaited before work', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const order: string[] = [];
+  const onConversationPreamble = async (text: string) => {
+    order.push(`deliver:${text}`);
+    return { status: 'delivered' as const };
+  };
+  let claudeSawCallback = false;
+  let harnessSawSameCallback = false;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    claudeAgentBrain: (async (_surface, request) => {
+      claudeSawCallback = request.onConversationPreamble === onConversationPreamble;
+      throw new ClaudeSdkProviderOverloadError('API Error: 529 Overloaded', false);
+    }) as never,
+    runConversation: (async (options: {
+      sessionId: string;
+      onConversationPreamble?: typeof onConversationPreamble;
+    }) => {
+      harnessSawSameCallback = options.onConversationPreamble === onConversationPreamble;
+      const delivery = await options.onConversationPreamble?.('I remember the earlier attempt and I’m beginning now.');
+      assert.deepEqual(delivery, { status: 'delivered' });
+      order.push('tool:start');
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          reply: 'completed after fallover',
+          summary: 'completed after fallover',
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
+
+  const response = await respondPreferHarness('home', {
+    message: 'run the task',
+    sessionId: 'preamble-callback-fallover',
+    onConversationPreamble,
+  }, async (request) => ({ text: 'legacy', sessionId: request.sessionId }));
+
+  assert.equal(response.text, 'completed after fallover');
+  assert.equal(claudeSawCallback, true);
+  assert.equal(harnessSawSameCallback, true);
+  assert.deepEqual(order, [
+    'deliver:I remember the earlier attempt and I’m beginning now.',
+    'tool:start',
+  ]);
+});
+
+test('Claude→Codex same-source fallover reuses and repaints one durable preamble before work', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'preamble-durable-cross-lane-replay';
+  const runId = 'preamble-durable-cross-lane-run';
+  const objective = 'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.';
+  createSession({ id: sessionId, kind: 'chat', channel: 'discord' });
+  const acceptedAttempt = beginRunAttempt(sessionId, { runId });
+  const source = recordRunAttemptUserInput(acceptedAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: objective },
+  }, { armRunInFlight: true });
+  const decision = classifyTurnPreflight({
+    message: objective,
+    sessionId,
+    sessionKind: 'chat',
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(decision.phase, 'align');
+  recordTurnPreflightDecision(sessionId, decision, source.seq);
+
+  const durableText = 'I remember the earlier Ventura attempt and I’m continuing with the specified sheet and email handoff.';
+  const order: string[] = [];
+  let claudeAuthorCalls = 0;
+  let codexAuthorCalls = 0;
+  const onConversationPreamble = async (text: string) => {
+    order.push(`deliver:${text}`);
+    return { status: 'delivered' as const };
+  };
+  const preflightIdentity = {
+    sessionId,
+    turn: source.turn,
+    sourceUserSeq: source.seq,
+  };
+
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    claudeAgentBrain: (async (_surface, request) => {
+      assert.equal(request.sourceUserSeq, source.seq);
+      const authored = await publishPreflightConversation({
+        identity: preflightIdentity,
+        decision,
+        openness: null,
+        port: {
+          async render() {
+            claudeAuthorCalls += 1;
+            return durableText;
+          },
+        },
+        transport: 'claude_agent_sdk_brain',
+      });
+      assert.equal(authored.kind, 'proceed');
+      if (authored.kind !== 'proceed') assert.fail('settled Claude preflight must proceed');
+      const persisted = appendConversationPreambleOnce({
+        source,
+        text: authored.preamble,
+        intentKey: decision.intentKey,
+      });
+      assert.equal(persisted.inserted, true);
+      await request.onConversationPreamble?.(String(persisted.event.data.text));
+      throw new ClaudeSdkProviderOverloadError('API Error: 529 Overloaded', false);
+    }) as never,
+    runConversation: (async (options: {
+      sessionId: string;
+      sourceUserSeq?: number;
+      onConversationPreamble?: typeof onConversationPreamble;
+    }) => {
+      assert.equal(options.sourceUserSeq, source.seq, 'fallover retains the exact accepted source');
+      const replay = await publishPreflightConversation({
+        identity: preflightIdentity,
+        decision,
+        openness: null,
+        port: {
+          async render() {
+            codexAuthorCalls += 1;
+            return 'Codex should never author competing replay prose.';
+          },
+        },
+        transport: 'openai_agents_harness',
+      });
+      assert.equal(replay.kind, 'proceed');
+      if (replay.kind !== 'proceed') assert.fail('settled Codex replay must proceed');
+      const reused = appendConversationPreambleOnce({
+        source,
+        text: replay.preamble,
+        intentKey: decision.intentKey,
+      });
+      assert.equal(reused.inserted, false);
+      await options.onConversationPreamble?.(String(reused.event.data.text));
+      order.push('tool:start');
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          reply: 'completed after same-source fallover',
+          summary: 'completed after same-source fallover',
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
+
+  const response = await respondPreferHarness('home', {
+    message: objective,
+    sessionId,
+    sourceUserSeq: source.seq,
+    runId,
+    onConversationPreamble,
+  }, async (request) => ({ text: 'legacy', sessionId: request.sessionId }));
+
+  assert.equal(response.text, 'completed after same-source fallover');
+  assert.equal(claudeAuthorCalls, 1);
+  assert.equal(codexAuthorCalls, 0, 'fallover reuses the durable opening instead of re-authoring');
+  assert.deepEqual(order, [
+    `deliver:${durableText}`,
+    `deliver:${durableText}`,
+    'tool:start',
+  ]);
+  assert.equal(listEvents(sessionId, { types: ['conversation_preamble'] }).length, 1);
 });
 
 test('Claude SDK brain fallover forces a non-Claude harness model when one is configured', async () => {
@@ -2477,6 +2672,12 @@ test('respondViaHarness: cron surface creates an execution-kind session', async 
 });
 
 test('respondViaHarness: awaiting_approval maps to pending-approval stoppedReason', async () => {
+  createSession({ id: 'bridge-t6', kind: 'execution' });
+  const formal = approvalRegistry.register({
+    sessionId: 'bridge-t6',
+    subject: 'Publish the reviewed record',
+    tool: 'request_approval',
+  });
   _setBridgeImplsForTests({
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
@@ -2484,7 +2685,59 @@ test('respondViaHarness: awaiting_approval maps to pending-approval stoppedReaso
   });
   const res = await respondViaHarness('background', { message: 'do it', sessionId: 'bridge-t6' });
   assert.equal(res.stoppedReason, 'pending-approval');
+  assert.equal(res.pendingApprovalId, formal.approvalId);
   assert.match(res.text, /approval/i);
+});
+
+test('respondViaHarness: a conversational approval projects only its frozen ordinary question', async () => {
+  const sessionId = 'bridge-conversational-approval';
+  const channelId = 'discord-channel-bridge-consent';
+  const userId = 'discord-user-bridge-consent';
+  const originReplyTarget = { type: 'discord_channel' as const, channelId };
+  const question = 'The exact email to proof@example.com is ready. Do you want me to send it?';
+  createSession({
+    id: sessionId,
+    kind: 'chat',
+    channel: 'discord',
+    userId,
+    metadata: { channelId, userId },
+  });
+  const row = approvalRegistry.register({
+    sessionId,
+    channel: 'discord',
+    channelId,
+    subject: 'Send the reviewed email',
+    tool: 'request_approval',
+    presentation: {
+      version: 1,
+      kind: 'autonomous_send_consent',
+      question,
+      actionLabel: 'email',
+      target: 'proof@example.com',
+      subject: 'Reviewed sheet',
+      bodyPreview: 'The reviewed sheet is attached.',
+      resultUrl: 'https://docs.google.com/spreadsheets/d/proof/edit',
+      sourceUserSeq: 1,
+      originReplyTarget,
+      originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget),
+      conversationKey: `discord:${channelId}`,
+      audienceUserId: userId,
+    },
+  });
+  assert.equal(approvalRegistry.isFormalApprovalSurface(row), false);
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: fakeRun({
+      status: 'awaiting_approval',
+      lastDecision: { summary: 'Approval pending.', reply: 'Use the approval card.', done: false },
+    }),
+  });
+
+  const res = await respondViaHarness('background', { message: 'prepare it', sessionId });
+  assert.equal(res.text, question);
+  assert.equal(res.stoppedReason, 'awaiting-input');
+  assert.equal(res.pendingApprovalId, undefined);
 });
 
 test('respondViaHarness: limit_exceeded maps to max-turns-with-grace', async () => {

@@ -7,7 +7,8 @@
  * module deliberately does not infer anything from model prose, SDK tool-use
  * summaries, or transport mirrors. The Claude SDK's canonical top-level
  * `tool_returned` row is different: it is written by the host at the exact
- * result boundary and carries the host's successful-business verdict.
+ * result boundary and carries the host's successful-business verdict or the
+ * registry-authorized successful-authoring verdict.
  */
 import { listEvents, openEventLog, type EventRow } from './eventlog.js';
 import { resolveWriteEvidence } from './work-report.js';
@@ -47,6 +48,10 @@ export interface AcceptedSourceSettlementAudit {
      * return boundary. These tools do not traverse the logical-settlement
      * ledger, so omitting them makes a worked Claude turn look empty. */
     successfulSdkBusinessResults: number;
+    /** Successful user-deliverable authoring results observed at the same
+     * canonical host boundary. Registry metadata—not SDK profile membership
+     * or model tool-use summaries—defines this deliberately tiny class. */
+    successfulSdkAuthoringResults: number;
     unrecoveredBusinessFailures: number;
     confirmedWrites: number;
     uncertainWrites: number;
@@ -210,6 +215,13 @@ export function auditAcceptedSourceSettlementTruth(input: {
   sessionId: string;
   sourceUserSeq: number;
   requiresBusinessEvidence?: boolean;
+  /**
+   * Scheduled/workflow source steps declare every business read in the step as
+   * load-bearing.  In that lane, one successful query must not launder a
+   * sibling failed query into a clean aggregate.  Interactive chat keeps the
+   * historical exploratory-read recovery rule unless the caller opts in.
+   */
+  requireEveryBusinessReadToSettle?: boolean;
 }): AcceptedSourceSettlementAudit {
   const emptyFacts: AcceptedSourceSettlementAudit['facts'] = {
     openLogicalCalls: 0,
@@ -218,6 +230,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
     businessSettlements: 0,
     successfulBusinessSettlements: 0,
     successfulSdkBusinessResults: 0,
+    successfulSdkAuthoringResults: 0,
     unrecoveredBusinessFailures: 0,
     confirmedWrites: 0,
     uncertainWrites: 0,
@@ -276,6 +289,11 @@ export function auditAcceptedSourceSettlementTruth(input: {
       && event.data.accounting === 'top_level'
       && event.data.sourceUserSeq === input.sourceUserSeq
       && event.data.successfulBusinessResult === true).length;
+    const successfulSdkAuthoringResults = turnEvents.filter((event) =>
+      event.type === 'tool_returned'
+      && event.data.accounting === 'top_level'
+      && event.data.sourceUserSeq === input.sourceUserSeq
+      && event.data.successfulAuthoringResult === true).length;
     const reversibleWrites = reversibleWriteShapeIndex(turnEvents);
     const successful = settlements.filter(succeeded);
     const successfulIdentities = successful.map(recoveryIdentity);
@@ -323,7 +341,11 @@ export function auditAcceptedSourceSettlementTruth(input: {
       // actually completed OTHER business work. A source whose every business
       // call failed has no story but the failure, so it still blocks (that is
       // the case where chronology must never pass for recovery).
-      if (row.mutating === 0 && successful.length > 0) return false;
+      if (
+        row.mutating === 0
+        && successful.length > 0
+        && input.requireEveryBusinessReadToSettle !== true
+      ) return false;
       // A REPAIRED WRITE IS A RECOVERED WRITE. Recovery identity is the exact
       // argument digest, so fixing the arguments the provider rejected produces
       // a different identity and never registers as recovery — which is exactly
@@ -348,6 +370,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       businessSettlements: settlements.length,
       successfulBusinessSettlements: successful.length,
       successfulSdkBusinessResults,
+      successfulSdkAuthoringResults,
       unrecoveredBusinessFailures: unrecovered.length,
       confirmedWrites: writeEvidence.confirmed.length,
       uncertainWrites: writeEvidence.uncertain.length,
@@ -387,6 +410,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       input.requiresBusinessEvidence === true
       && facts.successfulBusinessSettlements === 0
       && facts.successfulSdkBusinessResults === 0
+      && facts.successfulSdkAuthoringResults === 0
       && facts.confirmedWrites === 0
     ) {
       return {

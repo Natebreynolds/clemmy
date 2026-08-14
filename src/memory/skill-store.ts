@@ -4,6 +4,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
+import { requestSemanticSegments } from '../assistant/request-segments.js';
 import {
   isValidLearningReceipt,
   type LearningReceipt,
@@ -502,6 +503,7 @@ const SKILL_QUERY_STOPWORDS = new Set([
 
 const SKILL_ARTIFACT_TERMS = new Set([
   'document', 'spreadsheet', 'presentation', 'website', 'pdf', 'image', 'email',
+  'report', 'proposal', 'workspace', 'dashboard',
 ]);
 
 /**
@@ -550,6 +552,10 @@ const SKILL_TOKEN_ALIASES: Record<string, string> = {
   site: 'website', sites: 'website', webpage: 'website', webpages: 'website', website: 'website', websites: 'website',
   pdfs: 'pdf', pics: 'image', picture: 'image', pictures: 'image', photo: 'image', photos: 'image', images: 'image',
   email: 'email', emails: 'email', mail: 'email',
+  dashboard: 'dashboard', dashboards: 'dashboard',
+  proposal: 'proposal', proposals: 'proposal',
+  report: 'report', reports: 'report',
+  workspace: 'workspace', workspaces: 'workspace',
 };
 
 function skillSearchTokens(value: string): string[] {
@@ -563,6 +569,65 @@ function skillSearchTokens(value: string): string[] {
       ?? (token.length > 4 && token.endsWith('s') && !token.endsWith('ss') ? token.slice(0, -1) : token))
     .filter((token) => token.length >= 3 || token === 'ui')
     .filter((token) => !SKILL_QUERY_STOPWORDS.has(token));
+}
+
+function firstSkillArtifact(value: string): string | null {
+  return skillSearchTokens(value).find((term) => SKILL_ARTIFACT_TERMS.has(term)) ?? null;
+}
+
+/**
+ * A skill may enter ambient context only when the request anchors to what the
+ * skill IS FOR, not merely to words appearing in its body/description.
+ *
+ * Provider-neutral anchors, strongest first:
+ *   - the exact skill name was requested;
+ *   - declared applicability (tool family/entity slot) matches;
+ *   - two identity terms from the skill name match;
+ *   - the primary artifact matches and an action verb agrees.
+ *
+ * The last form keeps natural requests such as "draft this email" working,
+ * while preventing an incidental email action inside a Workspace recipe from
+ * making that recipe relevant to an unrelated spreadsheet task.
+ */
+export function skillHasApplicabilityAnchor(query: string, skill: Skill): boolean {
+  const q = query.replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!q) return false;
+  const normalizedName = skillSearchTokens(skill.name).join(' ');
+  if (q.includes(skill.name.toLowerCase()) || Boolean(normalizedName && q.includes(normalizedName))) {
+    return true;
+  }
+
+  const queryTerms = new Set(skillSearchTokens(q));
+  const nameTerms = new Set(skillSearchTokens(`${skill.name} ${skill.frontmatter.name ?? ''}`));
+  const applicability = skill.frontmatter.applicability as {
+    toolFamilies?: unknown;
+    entitySlots?: unknown;
+  } | undefined;
+  const applicabilityTerms = new Set(skillSearchTokens([
+    ...(Array.isArray(applicability?.toolFamilies) ? applicability.toolFamilies : []),
+    ...(Array.isArray(applicability?.entitySlots) ? applicability.entitySlots : []),
+  ].filter((value): value is string => typeof value === 'string').join(' ')));
+  if ([...applicabilityTerms].some((term) => queryTerms.has(term))) return true;
+
+  const sharedNameIdentity = [...nameTerms].filter((term) => (
+    !SKILL_ARTIFACT_TERMS.has(term) && queryTerms.has(term)
+  ));
+  if (sharedNameIdentity.length >= 2) return true;
+
+  const primaryText = `${skill.name} ${skill.frontmatter.name ?? ''} ${skill.frontmatter.description ?? ''}`;
+  const queryArtifacts = skillSearchTokens(q).filter((term) => SKILL_ARTIFACT_TERMS.has(term));
+  const artifactBearingSegments = requestSemanticSegments(q)
+    .filter((segment) => skillSearchTokens(segment).some((term) => SKILL_ARTIFACT_TERMS.has(term)));
+  // In a compound artifact flow, one generic substep match is not enough to
+  // inject a whole procedure. A skill for the complete flow still enters via
+  // its name or declared applicability above.
+  if (artifactBearingSegments.length > 1) return false;
+  const queryArtifact = queryArtifacts[0] ?? null;
+  const primaryArtifact = firstSkillArtifact(primaryText);
+  if (!queryArtifact || !primaryArtifact || queryArtifact !== primaryArtifact) return false;
+  const queryVerbs = skillActionVerbs(q);
+  const skillVerbs = skillActionVerbs(primaryText);
+  return [...queryVerbs].some((verb) => skillVerbs.has(verb));
 }
 
 function boundedInt(raw: string | undefined, fallback: number, min: number, max: number): number {
@@ -617,6 +682,7 @@ export function findRelevantSkills(query: string, options?: RelevantSkillOptions
     const exactNameMatch = q.includes(skill.name.toLowerCase())
       || Boolean(normalizedName && q.includes(normalizedName));
     if (!skillEligibleForAutomaticRecall(skill) && !exactNameMatch) continue;
+    if (!skillHasApplicabilityAnchor(q, skill)) continue;
     const skillTerms = new Set([...nameTerms, ...descriptionTerms, ...applicabilityTerms]);
     const skillArtifactTerms = [...skillTerms].filter((term) => SKILL_ARTIFACT_TERMS.has(term));
     // An explicit artifact request must not surface a procedure for a different
@@ -687,7 +753,7 @@ export function renderRelevantSkillsForPrompt(query: string, options?: RelevantS
   if (matches.length === 0) return '';
 
   const header = 'Likely installed skill matches for this request:';
-  const footer = 'Load the best match with `skill_read("<name>")` before creating the deliverable. If these do not fit, call `skill_list()` to search the complete catalog.';
+  const footer = 'Candidates only, not a checklist: use `skill_read("<name>")` only when its declared purpose fits. If a specialized procedure is genuinely needed and none fits, use `skill_list()`; otherwise continue directly.';
   // Reserve both complete discovery instructions first. Skill summaries consume
   // only the remaining space, so hard clipping can never sever skill_list/read.
   const fixedChars = header.length + footer.length + 2;

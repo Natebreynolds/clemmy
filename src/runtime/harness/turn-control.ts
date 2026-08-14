@@ -28,6 +28,7 @@ import { evaluateToolCall, applyMode, mandateFor } from './tool-guardrail.js';
 import { checkRunTokenWindow, type RunTokenWindow, type RunTokenStatus } from './run-token-budget.js';
 import type { RuntimeToolEffect } from './tool-effect.js';
 import { getRuntimeEnv } from '../../config.js';
+import { presentationEventFromCompletionData } from './turn-outcome.js';
 
 // The SDK's PermissionResult shape (structural — avoids importing SDK types here).
 export interface ToolGateDeny {
@@ -277,6 +278,7 @@ const NOUN_SHAPED_REQUEST_RE =
   /\b(?:google\s+(?:docs?|documents?|sheets?)|website|web\s*site|calendar\s+event|email\s+draft|pull request)\b[^.!?\n]{0,100}\b(?:would\s+be|would\s+help|sounds?|please|for\s+me|i(?:'d|\s+would)\s+like)\b/i;
 
 export type TurnPreflightPhase = 'read' | 'align' | 'execute';
+export const PREFLIGHT_ALIGNMENT_SOURCE = 'preflight_alignment';
 type ConfirmedMutationEffect = Extract<RuntimeToolEffect, 'local_write' | 'external_write' | 'admin'>;
 type ConfirmedActionFamily = 'create' | 'update' | 'delete' | 'send' | 'publish' | 'schedule' | 'upload' | 'commit' | 'merge' | 'import' | 'export' | 'sync' | 'configure';
 
@@ -595,14 +597,22 @@ function alignedDecisionForIntent(
 }
 
 /** Acknowledgement authority exists only for the immediately preceding user
- * request and only when that request has a durable `align` decision. An old
- * completed turn or an older alignment cannot grant permanent execution. */
+ * request and only when that request structurally stopped on its durable
+ * `align` question. An advisory align row from a turn that went on to execute
+ * is not pending consent and can never turn a later bare "yes" into authority. */
 function pendingAlignmentForCurrentInput(
   sessionId: string,
   sourceUserSeq?: number,
 ): TurnPreflightDecision | null {
   try {
-    const rows = listEvents(sessionId, { types: ['user_input_received', 'turn_preflight_decision'] });
+    const rows = listEvents(sessionId, {
+      types: [
+        'user_input_received',
+        'turn_preflight_decision',
+        'awaiting_user_input',
+        'conversation_completed',
+      ],
+    });
     const users = rows.filter((row) => row.type === 'user_input_received');
     const currentIndex = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
       ? users.findIndex((row) => row.seq === sourceUserSeq)
@@ -610,9 +620,33 @@ function pendingAlignmentForCurrentInput(
     const previousUser = currentIndex > 0 ? users[currentIndex - 1] : undefined;
     if (!previousUser) return null;
     const decision = decisionForSource(sessionId, rows, previousUser.seq);
-    return decision?.phase === 'align' && typeof decision.intentKey === 'string' && decision.intentKey
-      ? decision
-      : null;
+    if (decision?.phase !== 'align' || typeof decision.intentKey !== 'string' || !decision.intentKey) {
+      return null;
+    }
+    const awaiting = rows.find((row) => row.type === 'awaiting_user_input'
+      && row.data.sourceUserSeq === previousUser.seq
+      && row.data.source === PREFLIGHT_ALIGNMENT_SOURCE
+      && row.data.intentKey === decision.intentKey);
+    if (!awaiting) return null;
+    const terminal = rows.find((row) => {
+      const currentUserSeq = users[currentIndex]?.seq ?? Number.POSITIVE_INFINITY;
+      if (
+        row.type !== 'conversation_completed'
+        || row.seq <= awaiting.seq
+        || row.seq >= currentUserSeq
+      ) return false;
+      try {
+        const presentation = presentationEventFromCompletionData(row.data);
+        return presentation?.identity.sourceUserSeq === previousUser.seq
+          && presentation.status === 'needs_input'
+          && presentation.kind === 'question'
+          && presentation.needs?.kind === 'input'
+          && presentation.text === awaiting.data.question;
+      } catch {
+        return false;
+      }
+    });
+    return terminal ? decision : null;
   } catch {
     return null;
   }
@@ -833,13 +867,10 @@ export function bindProvenStandardLine(fn: (request: string) => string): void {
  * the model.
  */
 export const CONFIRM_BEAT_TEXT =
-  '[confirm-first] This request is consequential. Open it the way a smart colleague would — informed, and honest about what is still open. Everything below describes WHAT the beat must accomplish; the words are yours, in your own voice — never a template.\n'
+  '[pre-execution alignment] This request is consequential. A separate openness pass has already decided whether a load-bearing value is missing; this execution path is reached only when that judgment is settled.\n'
   + 'Your context above already contains what you know: the capability resolution (which connections, tools, and proven procedures THIS ask can rely on) and your recalled memory. Use them — do not fetch more first.\n'
-  + 'Ground your opening in what you actually found: the specific real connections, tools, or remembered work you would use for this. Specific and true — no invented capabilities, no generic filler.\n'
-  + 'Then reason about what is genuinely OPEN — the load-bearing unknowns that change the result: exact scope (which people, accounts, rows), the time window, the format or destination, anything named but unbound. The assumptions you would otherwise silently make are exactly what to surface.\n'
-  + '- If one or two of those are truly open: ask about them, conversationally, as yourself. Do not call tools yet; wait for the answer, then do the whole thing without asking again.\n'
-  + '- If the request genuinely specifies everything load-bearing: state your reading briefly and PROCEED in this same turn — a fully-specified ask has earned execution, and a question you already know the answer to is noise.\n'
-  + 'Never produce a plan summary, a checklist, or a bulleted proposal — that is a plan card, not a conversation. If the work may run for several minutes, say you will pick it up in the background and report back here. Skip the beat entirely if the request is actually read-only.';
+  + 'A brief conversational reading may already have been shown to the user for this exact source. Do not repeat it, produce a plan card, or ask for generic permission to begin. Proceed with the requested work in this same turn.\n'
+  + 'If execution discovers a genuinely new load-bearing fact that the preflight context could not have known, use the ordinary clarification boundary once. Existing approval and external-write authority still govern irreversible actions; never widen them from this directive.';
 
 /** Directive for a fresh execution-shaped chat turn, or null. Pure over its
  *  inputs plus one point read (prior completed turns); never throws. */
@@ -908,18 +939,16 @@ export function recordTurnPreflightDecision(
   } catch { /* telemetry/anchoring state — a failed persist must never break the turn */ }
 }
 
-// NOTE (fold, 2026-07-17): the fail-closed `preflightGateVerdict` tool-boundary
-// gate that lived here was DEMOTED after adversarial workflow review
+// NOTE (fold, 2026-07-17): the old per-tool `preflightGateVerdict` boundary was
+// DEMOTED after adversarial workflow review
 // confirmed it failed in both directions — bypassable (delegating carriers
 // dispatch native-MCP writes past it, non-exact acknowledgements skip the
 // envelope, interpreter shell scripts classify as compute) while hard-denying
 // approved work (empty destination/action envelopes deny-all with no recovery,
-// and the align phase blocked even reads). Alignment is delivered as the
-// conversational [confirm-first] directive (confirmBeatDirective) with the
-// typed decision persisted for telemetry/objective anchoring; CONSENT
-// enforcement stays with the one existing authority — plan-scope /
-// isAutoApprovedByScope and the approval registry (guardrails inform, they
-// don't override).
+// and the align phase blocked even reads). The replacement is not another
+// per-tool consent gate: a typed chat `align` source now commits a model-authored
+// needs-input terminal before the ordinary tool-capable brain runs. Existing
+// plan-scope/approval authority still governs execution after that conversation.
 
 // ── one-release legacy alignment reader ─────────────────────────────────────
 // Clementine 3.6/3.7 briefly persisted `intentKey`-shaped preflight rows

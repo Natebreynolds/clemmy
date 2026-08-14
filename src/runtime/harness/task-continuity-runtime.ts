@@ -1,9 +1,12 @@
+import { createHash } from 'node:crypto';
 import {
   consumeTaskContinuityPacket,
   createTaskContinuityPacket,
   dismissTaskContinuityPacket,
   peekTaskContinuityPacket,
+  readConsumedTaskContinuityPacket,
   type TaskContinuityCapabilityEvidence,
+  type TaskContinuityFrozenResolution,
   type TaskContinuityPacket,
 } from '../../memory/task-continuity.js';
 import { peekConnectedToolkits } from '../../integrations/composio/client.js';
@@ -29,12 +32,23 @@ import {
   listEvents,
   type EventRow,
 } from './eventlog.js';
+import * as approvalRegistry from './approval-registry.js';
+import {
+  getPendingAction,
+  verifyConversationalPendingActionAuthority,
+} from './pending-actions.js';
+import { pendingActionIdFromArgs } from './pending-action-view.js';
 import type { PresentationEvent } from './turn-outcome.js';
 
-const RETRIEVAL_QUERY_MAX_CHARS = 1_600;
 const ANSWER_MAX_CHARS = 280;
 const ANSWER_MAX_WORDS = 24;
+/** Accepted channel ingress is provider-dependent (Discord is tiny, generic
+ * webhooks are not). Continuation authority therefore owns an explicit,
+ * lossless ceiling: oversized A is not projected or truncated, it simply
+ * cannot elevate B into A's effect contract. */
+export const MAX_CLARIFICATION_PARENT_CHARS = 64_000;
 const MAX_CONTINUITY_CANDIDATES = 10;
+export const CLARIFICATION_RESOLVER_VERSION = 'clarification-resolver-v2' as const;
 
 const NON_CLARIFICATION_SOURCES = new Set([
   'offer_background',
@@ -64,7 +78,82 @@ function realAcceptedSource(sessionId: string, sourceUserSeq: number): EventRow 
     || event.role !== 'user'
     || event.data.synthetic === true
   ) return null;
+  const source = normalized(event.data.source).toLowerCase();
+  // Approval/send consent has its own registry-bound resume protocol. A terse
+  // yes/no control from that lane must never also consume a generic
+  // clarification packet and acquire unrelated A/Q/B effect authority.
+  if (
+    source === 'channel_send_consent'
+    || (
+      source.startsWith('channel_')
+      && normalized(event.data.approvalId)
+      && normalized(event.data.decision)
+    )
+  ) return null;
   return event;
+}
+
+/** Read-only semantic projection for a registry-owned accepted control source.
+ *
+ * Approval/send consent has its own exact question/person/conversation claim
+ * protocol, so the generic A/Q/B resolver must reject it. The graph compiler
+ * still needs the already-authorized frozen action rather than the literal
+ * word "Yes". Keep that elevation behind one runtime verifier: every durable
+ * registry, responder, conversation, pending-action, and payload binding must
+ * reproduce from the exact accepted source or this returns null. */
+export function verifiedAcceptedControlSemanticInput(
+  source: EventRow,
+  identity: { sessionId: string; sourceUserSeq: number },
+): string | null {
+  if (
+    source.sessionId !== identity.sessionId
+    || source.seq !== identity.sourceUserSeq
+    || source.type !== 'user_input_received'
+    || source.role !== 'user'
+    || source.data.synthetic === true
+    || source.data.source !== 'channel_send_consent'
+    || source.data.decision !== 'approve'
+    || typeof source.data.approvalId !== 'string'
+    || !source.data.approvalId.trim()
+    || typeof source.data.userId !== 'string'
+    || !source.data.userId.trim()
+    || typeof source.data.conversationKey !== 'string'
+    || !source.data.conversationKey.trim()
+  ) return null;
+  try {
+    const row = approvalRegistry.get(source.data.approvalId);
+    const presentation = row?.presentation;
+    const pendingActionId = row ? pendingActionIdFromArgs(row.args) : null;
+    const pendingAction = pendingActionId ? getPendingAction(pendingActionId) : null;
+    const pinned = row?.args?.pendingAction;
+    if (
+      !row
+      || row.sessionId !== identity.sessionId
+      || row.status !== 'resolved'
+      || row.resolution !== 'approved'
+      || !presentation
+      || presentation.kind !== 'autonomous_send_consent'
+      || presentation.responseSourceUserSeq !== identity.sourceUserSeq
+      || presentation.responseUserId !== source.data.userId
+      || presentation.conversationKey !== source.data.conversationKey
+    ) return null;
+    if (pendingAction) {
+      if (
+        pendingAction.sessionId !== identity.sessionId
+        || pendingAction.approvalId !== row.approvalId
+        || !verifyConversationalPendingActionAuthority(pendingAction)
+        || !pinned
+        || typeof pinned !== 'object'
+        || Array.isArray(pinned)
+        || pendingAction.payloadHash !== (pinned as Record<string, unknown>).payloadHash
+      ) return null;
+      return `Send the exact previously prepared email to ${presentation.target} with subject ${presentation.subject ?? '(no subject)'} by executing frozen pending action ${pendingAction.id}. This is the irreversible external send the user just authorized.`;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function clarificationAwaitingEvent(input: {
@@ -86,6 +175,16 @@ function clarificationAwaitingEvent(input: {
       ? event.data.sourceUserSeq === input.sourceUserSeq
       : event.turn === input.terminalTurn;
   });
+  const distinctQuestions = new Set(candidates.map((event) => JSON.stringify({
+    question: normalizedKey(normalized(event.data.question)),
+    options: (Array.isArray(event.data.options) ? event.data.options : [])
+      .map((option) => normalizedKey(normalized(option)))
+      .filter(Boolean),
+  })));
+  // Several distinct open asks cannot be resolved by one short reply. The
+  // packet store normally has one row, so detect ambiguity while the typed
+  // awaiting events are still visible instead of silently selecting the last.
+  if (distinctQuestions.size > 1) return null;
   const event = candidates.at(-1);
   if (!event) return null;
   const eventSourceUserSeq = event.data.sourceUserSeq;
@@ -226,17 +325,33 @@ export function persistCommittedClarificationContinuity(input: {
     terminalTurn: presentation.identity.turn,
   });
   if (!awaiting) return null;
-  const question = normalized(awaiting.data.question) || presentation.text;
-  const options = (Array.isArray(awaiting.data.options) ? awaiting.data.options : [])
-    .map(normalized)
-    .filter(Boolean)
-    .slice(0, 8);
+  const question = normalized(awaiting.data.question);
+  const deliveredQuestion = normalized(presentation.text);
+  // The packet must describe the question the user actually saw. An internal
+  // Q1 followed by a delivered Q2 cannot let a reply to Q2 inherit Q1's task,
+  // options, recipient, or effect authority.
+  if (
+    !question
+    || !deliveredQuestion
+    || question.toLowerCase() !== deliveredQuestion.toLowerCase()
+  ) return null;
+  // PresentationEvent currently carries only the terminal question text. Until
+  // a future terminal contract binds rendered controls byte-for-byte, internal
+  // awaiting options are hidden implementation data and confer no ordinal or
+  // exact-option authority on the reply.
+  const options: string[] = [];
   const current = peekTaskContinuityPacket({ sessionId: source.sessionId });
+  // The schema normally makes this impossible. If storage was copied or its
+  // uniqueness invariant was damaged, never let a newly committed question
+  // silently pick one of several possible parent tasks.
+  if (current.status === 'ambiguous') return null;
   if (
     current.status === 'available'
     && current.packet.originatingSourceUserSeq === source.seq
     && current.packet.pause.kind === 'clarification'
     && normalizedKey(current.packet.pause.question) === normalizedKey(question)
+    && current.packet.pause.options.length === options.length
+    && current.packet.pause.options.every((option, index) => option === options[index])
   ) return current.packet;
   return createTaskContinuityPacket({
     sessionId: source.sessionId,
@@ -250,24 +365,14 @@ export function persistCommittedClarificationContinuity(input: {
   });
 }
 
-function optionOrdinal(answer: string): number | null {
-  const match = answer.match(/^(?:(?:(?:please\s+)?(?:use|pick|choose|take|go\s+with)|i\s+(?:think|prefer|would\s+choose)|let(?:'s| us)\s+(?:use|pick|choose))\s+)?(?:the\s+)?(?:(?:option|choice)\s*)?(first|second|third|fourth|fifth|sixth|seventh|eighth|[1-8])(?:\s+(?:one|option|choice))?(?:\s+please)?[.!]*$/i);
-  if (!match) return null;
-  const values: Record<string, number> = {
-    first: 0, second: 1, third: 2, fourth: 3,
-    fifth: 4, sixth: 5, seventh: 6, eighth: 7,
-  };
-  return /^\d$/.test(match[1]!) ? Number(match[1]) - 1 : values[match[1]!.toLowerCase()] ?? null;
-}
-
 export interface ClarificationAnswerClassification {
   disposition: ContinuationAnswerDisposition;
   selectedOption?: string;
   activeTaskInput?: string;
 }
 
-const EXPLICIT_DECLINE_RE = /^(?:no|nope|nah|actually no|no,? thanks|not now|never mind|nevermind|not that one|don['’]?t|do not|please don['’]?t|please do not|stop|cancel)[.!]*$/i;
-const EXPLICIT_AFFIRM_RE = /^(?:yes|yes,? please|yep|yeah|correct|exactly|that(?:'s| is) right|go ahead|continue|proceed|do it|sounds good|okay|ok|sure)[.!]*$/i;
+const EXPLICIT_DECLINE_RE = /^(?:no|nope|nah|actually no|no,? thanks|not now|never mind|nevermind|not that one|don['’]?t|do not|please don['’]?t|please do not|stop|cancel|leave it alone|keep it unchanged|draft only)[.!]*$/i;
+const EXPLICIT_AFFIRM_RE = /^(?:yes(?:,?\s+(?:please|correct|that(?:['’]s| is)\s+(?:all\s+)?correct))?|yep|yeah|correct|exactly|that(?:['’]s| is) right|go ahead|continue|proceed|do it|create it|sounds good|okay|ok|sure)[.!]*$/i;
 
 /** A deliberately narrow dual-clause form. The first sentence must explicitly
  * cancel/leave the prior work and the second must be introduced as separate
@@ -294,25 +399,53 @@ function declinedParentWithNewTask(
   return { disposition: 'declined_with_new_task', activeTaskInput };
 }
 
-function optionDisposition(option: string): ContinuationAnswerDisposition {
-  const key = normalizedKey(option);
-  if (
-    /^(?:no|nope|nah|not\b|don['’]?t\b|do not\b|never\b|stop\b|cancel\b|skip\b)/i.test(key)
-    || /^(?:leave|keep)\s+(?:it|this|that|them)\s+(?:alone|unchanged)\b/i.test(key)
-    || /\b(?:draft only|keep(?: it)? as (?:a )?draft|do not send|don['’]?t send|not now)\b/i.test(key)
-  ) return 'declined';
-  if (
-    /^(?:yes|yep|yeah|approve|approved|go ahead|proceed|continue|do it)\b/i.test(key)
-    || /^create\s+(?:it|this|that)\b/i.test(key)
-    || /\b(?:send now|publish now|deploy now|execute now)\b/i.test(key)
-  ) return 'affirmed';
-  return 'selected';
+type TypedLiteralKind = 'url' | 'email' | 'date' | 'time' | 'channel';
+
+function typedLiteralKind(value: string): TypedLiteralKind | null {
+  if (/^https?:\/\/\S+$/i.test(value)) return 'url';
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(value)) return 'email';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return 'date';
+  if (/^\d{1,2}:\d{2}(?:\s?[ap]m)?$/i.test(value)) return 'time';
+  if (/^#[\w.-]+$/.test(value)) return 'channel';
+  return null;
+}
+
+function questionRequestsTypedSlot(question: string, kind?: TypedLiteralKind): boolean {
+  const q = normalized(question);
+  const namesKind = kind === undefined
+    ? /\b(?:url|link|website|endpoint|email|e-mail|mailbox|recipient|address|date|day|time|channel|room)\b/i.test(q)
+    : kind === 'url'
+      ? /\b(?:url|link|website|endpoint)\b/i.test(q)
+      : kind === 'email'
+        ? /\b(?:email|e-mail|mailbox|recipient(?:\s+address)?|email\s+address)\b/i.test(q)
+        : kind === 'date'
+          ? /\b(?:date|day)\b/i.test(q)
+          : kind === 'time'
+            ? /\b(?:time|hour)\b/i.test(q)
+            : /\b(?:channel|room)\b/i.test(q);
+  if (!namesKind) return false;
+  return /^(?:which|what|where|when|who|whose|how)\b/i.test(q)
+    || /\b(?:provide|enter|supply|give|tell|specify|choose|select|name|share|type)\b/i.test(q)
+    || /\b(?:do|did|can|could|would)\s+you\s+(?:know|have)\b/i.test(q);
+}
+
+function literalAnswerFitsQuestion(answer: string, pause: TaskContinuityPacket['pause']): boolean {
+  const kind = typedLiteralKind(answer);
+  return kind !== null
+    && questionRequestsTypedSlot(pause.question, kind)
+    && !questionAcceptsConfirmation(pause);
 }
 
 function questionAcceptsConfirmation(pause: TaskContinuityPacket['pause']): boolean {
   const question = normalized(pause.question);
   if (!question || /\b(?:not|never|don['’]?t|do not)\b/i.test(question)) return false;
   if (/\b(?:which|what|where|when|who|whose|how many)\b/i.test(question)) return false;
+  if (questionRequestsTypedSlot(question)) return false;
+  // "Can you give/clarify/provide …?" asks for missing slot content. Its modal
+  // prefix does not make the unknown tenant/account/name a closed proposition.
+  if (/^(?:can|could|would|will|may)\s+you\s+(?:give|provide|supply|tell|name|specify|clarify|identify|choose|select|share|enter|type)\b/i.test(question)) {
+    return false;
+  }
   // Providers often render the same binary clarification conversationally as
   // “Want me to …?” rather than “Do you want me to …?”. Accept that ellipsis
   // only when it has no alternative branch, or when the alternative explicitly
@@ -327,11 +460,22 @@ function questionAcceptsConfirmation(pause: TaskContinuityPacket['pause']): bool
   if (/^(?:should|shall|may|can|could|would|will|do|does|did|is|are|was|were|has|have)\b/i.test(question)) {
     return true;
   }
-  if (/\b(?:confirm|approve|permission|go ahead|proceed|continue|ready)\b/i.test(question)) {
+  if (/\b(?:is|was|does|did)\s+(?:that|this|it)\s+(?:look\s+)?(?:correct|right)\?\s*$/i.test(question)) {
     return true;
   }
-  const dispositions = new Set(pause.options.map(optionDisposition));
-  return dispositions.has('affirmed') && dispositions.has('declined');
+  // Live providers often bundle two closed confirmations into one foreground
+  // ask. Admit only that structural form: a leading confirmation bundle, at
+  // least two numbered clauses, and an explicit yes/correction escape. Merely
+  // mentioning a "correct recipient" or "confirmation email" is a slot ask,
+  // not yes/no authority.
+  if (
+    /^two\s+(?:quick\s+)?confirmations?\s+before\s+i\b/i.test(question)
+    && /\(\s*1\s*\)[\s\S]+?\byes\?[\s\S]+?\(\s*2\s*\)/i.test(question)
+    && /\(\s*2\s*\)[\s\S]+?\bi(?:['’]ll|\s+will)\b[\s\S]+?unless\s+you\s+want\s+(?:a\s+)?different\s+one\b/i.test(question)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /** Classify B only relative to the exact durable clarification. This is
@@ -344,28 +488,6 @@ export function classifyClarificationAnswer(
   const answer = normalized(value);
   if (!answer || answer.length > ANSWER_MAX_CHARS) return null;
   if (answer.split(/\s+/).length > ANSWER_MAX_WORDS) return null;
-  const key = normalizedKey(answer);
-  const optionKeys = pause.options.map(normalizedKey);
-  const exactOptionIndex = optionKeys.indexOf(key);
-  if (exactOptionIndex >= 0) {
-    const selectedOption = pause.options[exactOptionIndex]!;
-    return { disposition: optionDisposition(selectedOption), selectedOption };
-  }
-  const unwrappedOption = key.replace(
-    /^(?:(?:please\s+)?(?:use|pick|choose|take|go\s+with)|i\s+(?:think|prefer|would\s+choose)|let(?:'s| us)\s+(?:use|pick|choose))\s+(?:the\s+)?/i,
-    '',
-  );
-  const unwrappedOptionIndex = optionKeys.indexOf(unwrappedOption);
-  if (unwrappedOptionIndex >= 0) {
-    const selectedOption = pause.options[unwrappedOptionIndex]!;
-    return { disposition: optionDisposition(selectedOption), selectedOption };
-  }
-  const ordinal = optionOrdinal(answer);
-  if (ordinal !== null) {
-    if (pause.options.length === 0 || ordinal >= pause.options.length) return null;
-    const selectedOption = pause.options[ordinal]!;
-    return { disposition: optionDisposition(selectedOption), selectedOption };
-  }
   // The explicit compound grammar only revokes the parent task's authority;
   // it never grants or inherits it. Exact durable adjacency plus an explicit
   // cancellation and independent fresh clause are sufficient, regardless of
@@ -380,10 +502,16 @@ export function classifyClarificationAnswer(
   // A control followed by another clause is a fresh conversational turn, not
   // a low-information answer ("No, but send it to Alice instead").
   if (/^(?:no|nope|nah|yes|yep|yeah|ok|okay|sure|continue|proceed|go ahead)\b/i.test(answer)) return null;
-  // A direct identifier or literal slot value is a safe answer to a bounded
-  // question even when the model offered no enumerated options.
-  if (/^(?:https?:\/\/\S+|[^\s@]+@[^\s@]+\.[^\s@]+|\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}(?:\s?[ap]m)?|#[\w.-]+)$/i.test(answer)) {
-    return { disposition: 'provided' };
+  // A literal is safe only when Q explicitly opens that TYPE of slot. An email
+  // or #channel pasted after "Should I delete it?" is a fresh turn, not an
+  // answer that may inherit destructive authority.
+  if (typedLiteralKind(answer)) {
+    return literalAnswerFitsQuestion(answer, pause)
+      ? { disposition: 'provided' }
+      : null;
+  }
+  if (/^(?:(?:the\s+)?(?:first|second|third|fourth|fifth|sixth|seventh|eighth)|[1-8])(?:\s+(?:one|option|choice))?[.!]*$/i.test(answer)) {
+    return null;
   }
   if (/\b(?:and|also|but|instead|unrelated|new task|while you(?:'re| are) at it)\b/i.test(answer)) return null;
   if (/[?;]/.test(answer)) return null;
@@ -417,15 +545,30 @@ export function isLowInformationClarificationAnswer(
   return classifyClarificationAnswer(value, pause) !== null;
 }
 
-function buildRetrievalQuery(parentInput: string, question: string, answer: string): string {
-  const parts = [parentInput, question, answer].map(normalized).filter(Boolean);
-  const seen = new Set<string>();
-  return parts.filter((part) => {
-    const key = part.toLowerCase();
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  }).join('\n').slice(0, RETRIEVAL_QUERY_MAX_CHARS).trim();
+/** Deterministic authority/routing capsule. Q and B are never truncated: Q can
+ * carry corrected provider, target, account, or recipient facts. A is likewise
+ * lossless: a consequential send/delete clause may occur anywhere, and no
+ * positional projection can safely decide which parent bytes grant semantics. */
+export function canonicalClarificationTaskInput(input: {
+  parentInput: string;
+  question: string;
+  answer: string;
+}): string | null {
+  const parentInput = normalized(input.parentInput);
+  if (!parentInput || parentInput.length > MAX_CLARIFICATION_PARENT_CHARS) return null;
+  return [
+    '[task-continuation:v2]',
+    '[parent-task]',
+    parentInput,
+    '[clarifying-question]',
+    normalized(input.question),
+    '[user-answer]',
+    normalized(input.answer),
+  ].join('\n').trim();
+}
+
+function buildRetrievalQuery(parentInput: string, question: string, answer: string): string | null {
+  return canonicalClarificationTaskInput({ parentInput, question, answer });
 }
 
 function retrievalQueryForClassification(
@@ -433,10 +576,147 @@ function retrievalQueryForClassification(
   question: string,
   answer: string,
   classification: ClarificationAnswerClassification,
-): string {
-  return classification.disposition === 'declined_with_new_task'
-    ? normalized(classification.activeTaskInput)
-    : buildRetrievalQuery(parentInput, question, answer);
+): string | null {
+  if (classification.disposition === 'declined_with_new_task') {
+    return normalized(classification.activeTaskInput) || null;
+  }
+  // A decline closes the old task and must not keep A's effect semantics in
+  // the frozen canonical hash. Every inheriting disposition uses exact A/Q/B.
+  if (classification.disposition === 'declined') return normalized(answer) || null;
+  return buildRetrievalQuery(parentInput, question, answer);
+}
+
+function frozenResolutionFor(input: {
+  parentInput: string;
+  question: string;
+  answer: string;
+  classification: ClarificationAnswerClassification;
+}): TaskContinuityFrozenResolution | null {
+  const semanticInput = retrievalQueryForClassification(
+    input.parentInput,
+    input.question,
+    input.answer,
+    input.classification,
+  );
+  if (!semanticInput) return null;
+  return {
+    resolverVersion: CLARIFICATION_RESOLVER_VERSION,
+    disposition: input.classification.disposition,
+    ...(input.classification.selectedOption
+      ? { selectedOption: input.classification.selectedOption }
+      : {}),
+    ...(input.classification.activeTaskInput
+      ? { activeTaskInput: input.classification.activeTaskInput }
+      : {}),
+    semanticInputHash: createHash('sha256').update(semanticInput, 'utf8').digest('hex'),
+  };
+}
+
+function clarificationContextFromPacket(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  answer: string;
+  packet: TaskContinuityPacket;
+  frozenResolution: TaskContinuityFrozenResolution;
+}): TaskContinuationContext | null {
+  if (
+    input.packet.sessionId !== input.sessionId
+    || input.packet.pause.kind !== 'clarification'
+  ) return null;
+  const parent = realAcceptedSource(input.sessionId, input.packet.originatingSourceUserSeq);
+  const parentInput = normalized(parent?.data.text);
+  if (!parentInput || parentInput.length > MAX_CLARIFICATION_PARENT_CHARS) return null;
+  const classification: ClarificationAnswerClassification = {
+    disposition: input.frozenResolution.disposition,
+    ...(input.frozenResolution.selectedOption
+      ? { selectedOption: input.frozenResolution.selectedOption }
+      : {}),
+    ...(input.frozenResolution.activeTaskInput
+      ? { activeTaskInput: input.frozenResolution.activeTaskInput }
+      : {}),
+  };
+  const frozenResolution = frozenResolutionFor({
+    parentInput,
+    question: input.packet.pause.question,
+    answer: input.answer,
+    classification,
+  });
+  if (
+    !frozenResolution
+    || input.frozenResolution.disposition !== frozenResolution.disposition
+    || input.frozenResolution.selectedOption !== frozenResolution.selectedOption
+    || input.frozenResolution.activeTaskInput !== frozenResolution.activeTaskInput
+    || input.frozenResolution.resolverVersion !== CLARIFICATION_RESOLVER_VERSION
+    || input.frozenResolution.semanticInputHash !== frozenResolution.semanticInputHash
+  ) return null;
+  const retrievalQuery = retrievalQueryForClassification(
+    parentInput,
+    input.packet.pause.question,
+    input.answer,
+    classification,
+  );
+  if (!retrievalQuery) return null;
+  return {
+    packetId: input.packet.packetId,
+    parentSourceUserSeq: input.packet.originatingSourceUserSeq,
+    consumingSourceUserSeq: input.sourceUserSeq,
+    parentInput,
+    question: input.packet.pause.question,
+    options: [...input.packet.pause.options],
+    answer: input.answer,
+    ...classification,
+    retrievalQuery,
+    capabilities: [...input.packet.capabilities],
+  };
+}
+
+/** Reconstruct a closed clarification edge without mutating packet state.
+ * Graph/replay validation uses this after the resolver's one logical consume. */
+export function rehydrateConsumedClarificationContext(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  answer: string;
+}): TaskContinuationContext | null {
+  const consumed = readConsumedTaskContinuityPacket({
+    sessionId: input.sessionId,
+    consumingSourceUserSeq: input.sourceUserSeq,
+  });
+  if (consumed.status !== 'consumed') return null;
+  return clarificationContextFromPacket({
+    ...input,
+    packet: consumed.packet,
+    frozenResolution: consumed.resolution,
+  });
+}
+
+/** A graph continuation is authoritative only when every semantic field is
+ * reproducible from the exact consumed packet and its A/Q/B source events.
+ * Capability rows are deliberately omitted from this comparison: the bridge
+ * narrows them against live connection/schema state after packet consumption. */
+export function verifyDurableClarificationContext(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  answer: string;
+  context: TaskContinuationContext;
+}): TaskContinuationContext | null {
+  const durable = rehydrateConsumedClarificationContext(input);
+  if (!durable) return null;
+  const candidate = input.context;
+  if (
+    candidate.packetId !== durable.packetId
+    || candidate.parentSourceUserSeq !== durable.parentSourceUserSeq
+    || candidate.consumingSourceUserSeq !== durable.consumingSourceUserSeq
+    || candidate.parentInput !== durable.parentInput
+    || candidate.question !== durable.question
+    || candidate.answer !== durable.answer
+    || candidate.disposition !== durable.disposition
+    || candidate.activeTaskInput !== durable.activeTaskInput
+    || candidate.selectedOption !== durable.selectedOption
+    || candidate.retrievalQuery !== durable.retrievalQuery
+    || candidate.options.length !== durable.options.length
+    || candidate.options.some((option, index) => option !== durable.options[index])
+  ) return null;
+  return durable;
 }
 
 function nextRealSourceIs(input: {
@@ -458,35 +738,16 @@ function consumeContinuationContext(input: {
 }): TaskContinuationContext | null {
   const lookup = peekTaskContinuityPacket({ sessionId: input.sessionId });
   if (lookup.status !== 'available') {
-    // consume() also rehydrates an exact same-source packet after a process
-    // crash; asking it when no open packet exists is intentionally cheap.
-    const replay = consumeTaskContinuityPacket({
+    const replay = readConsumedTaskContinuityPacket({
       sessionId: input.sessionId,
       consumingSourceUserSeq: input.sourceUserSeq,
     });
     if (replay.status !== 'consumed') return null;
-    const parent = realAcceptedSource(input.sessionId, replay.packet.originatingSourceUserSeq);
-    const parentInput = normalized(parent?.data.text);
-    if (!parentInput) return null;
-    const classification = classifyClarificationAnswer(input.answer, replay.packet.pause);
-    if (!classification) return null;
-    return {
-      packetId: replay.packet.packetId,
-      parentSourceUserSeq: replay.packet.originatingSourceUserSeq,
-      consumingSourceUserSeq: input.sourceUserSeq,
-      parentInput,
-      question: replay.packet.pause.question,
-      options: [...replay.packet.pause.options],
-      answer: input.answer,
-      ...classification,
-      retrievalQuery: retrievalQueryForClassification(
-        parentInput,
-        replay.packet.pause.question,
-        input.answer,
-        classification,
-      ),
-      capabilities: [...replay.packet.capabilities],
-    };
+    return clarificationContextFromPacket({
+      ...input,
+      packet: replay.packet,
+      frozenResolution: replay.resolution,
+    });
   }
   const packet = lookup.packet;
   if (packet.pause.kind !== 'clarification') {
@@ -504,31 +765,29 @@ function consumeContinuationContext(input: {
     }
     return null;
   }
+  const parentInput = normalized(realAcceptedSource(
+    input.sessionId,
+    packet.originatingSourceUserSeq,
+  )?.data.text);
+  if (!parentInput || parentInput.length > MAX_CLARIFICATION_PARENT_CHARS) return null;
+  const resolution = frozenResolutionFor({
+    parentInput,
+    question: packet.pause.question,
+    answer: input.answer,
+    classification,
+  });
+  if (!resolution) return null;
   const consumed = consumeTaskContinuityPacket({
     sessionId: input.sessionId,
     consumingSourceUserSeq: input.sourceUserSeq,
+    resolution,
   });
   if (consumed.status !== 'consumed') return null;
-  const parent = realAcceptedSource(input.sessionId, packet.originatingSourceUserSeq);
-  const parentInput = normalized(parent?.data.text);
-  if (!parentInput) return null;
-  return {
-    packetId: packet.packetId,
-    parentSourceUserSeq: packet.originatingSourceUserSeq,
-    consumingSourceUserSeq: input.sourceUserSeq,
-    parentInput,
-    question: packet.pause.question,
-    options: [...packet.pause.options],
-    answer: input.answer,
-    ...classification,
-    retrievalQuery: retrievalQueryForClassification(
-      parentInput,
-      packet.pause.question,
-      input.answer,
-      classification,
-    ),
-    capabilities: [...packet.capabilities],
-  };
+  return clarificationContextFromPacket({
+    ...input,
+    packet: consumed.packet,
+    frozenResolution: consumed.resolution,
+  });
 }
 
 function accountEvidenceStillFits(row: TaskContinuityCapabilityEvidence): boolean {
@@ -583,6 +842,7 @@ function inheritedCandidates(
   }));
   return {
     candidates,
+    requirements: [],
     matches: [],
     pinnedTools: [...new Set(evidence.flatMap((row) =>
       row.kind === 'composio' ? ['composio_execute_tool'] : [row.identifier]))],
@@ -599,11 +859,24 @@ function mergeCandidates(
     const key = `${candidate.kind}:${candidate.identifier}:${candidate.accountIdentity ?? ''}`;
     if (!candidates.has(key)) candidates.set(key, candidate);
   }
+  const requirements = new Map<string, TurnCapabilityCandidates['requirements'][number]>();
+  for (const requirement of [...first.requirements, ...second.requirements]) {
+    const current = requirements.get(requirement.roleKey);
+    if (!current || (!current.resolved && requirement.resolved)) {
+      requirements.set(requirement.roleKey, requirement);
+    }
+  }
   return {
     candidates: [...candidates.values()].slice(0, MAX_CONTINUITY_CANDIDATES),
+    requirements: [...requirements.values()],
     matches: [...first.matches, ...second.matches].slice(0, MAX_CONTINUITY_CANDIDATES),
     pinnedTools: [...new Set([...first.pinnedTools, ...second.pinnedTools])],
     semanticApplied: first.semanticApplied || second.semanticApplied,
+    roleScopedDiscovery: first.roleScopedDiscovery === true || second.roleScopedDiscovery === true
+      ? true
+      : first.roleScopedDiscovery === false || second.roleScopedDiscovery === false
+        ? false
+        : undefined,
   };
 }
 
@@ -650,7 +923,7 @@ export async function enrichAcceptedRequestWithTaskContinuity(
       ? context.activeTaskInput ?? context.retrievalQuery
       : context?.retrievalQuery ?? request.message;
   let resolved: TurnCapabilityCandidates = {
-    candidates: [], matches: [], pinnedTools: [], semanticApplied: false,
+    candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false,
   };
   // A decline is already a complete answer to the exact durable question. It
   // needs conversational context, not another semantic/capability search. Even

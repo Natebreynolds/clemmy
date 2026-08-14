@@ -121,14 +121,14 @@ const MATRIX: MatrixCase[] = [
     expectReconciliation: false,
   },
   {
-    label: 'returned unsupported (isError)',
+    label: 'returned generic failure (isError)',
     tool: 'alpha__unsupported_op',
     result: { content: [{ type: 'text', text: 'nope' }], isError: true },
-    expectKind: 'unsupported_capability',
-    expectAction: 'try_sibling_candidate',
+    expectKind: 'unknown',
+    expectAction: 'stop_and_explain',
     expectRetrySame: false,
-    expectEliminates: true,
-    expectEpochAfter: 1,
+    expectEliminates: false,
+    expectEpochAfter: 0,
     expectReconciliation: false,
   },
   {
@@ -386,7 +386,7 @@ test('elimination is task-local and never leaks to another task', () => {
   admitFixtureCall(first, 'c1', 'alpha__dead');
   settleToolAttempt({
     ...first, lane: 'native_mcp', toolName: 'alpha__dead', callId: 'c1', businessCall: true,
-    result: { content: [], isError: true },
+    result: { status: 501, content: [], isError: true },
   });
 
   assert.deepEqual(eliminatedCandidatesForTask(first.sessionId, first.sourceUserSeq), ['alpha__dead']);

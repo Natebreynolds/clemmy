@@ -48,6 +48,8 @@ const EXPECTED_WORK_REFUSAL_KINDS = new Set([
   'work_universe_unsealed',
   'work_source_witness_missing',
   'work_already_satisfied',
+  'work_evidence_incomplete',
+  'work_effect_already_executed',
   'work_authority_unavailable',
 ]);
 
@@ -122,6 +124,10 @@ export function registerClaudeActionWorkCall(
         toolName: 'work_call',
         rawInput: input,
         directOrchestrator,
+        // Registration above proved this exact accepted source is an active
+        // expected-work action. Workers inherit that authority even though
+        // they are not the direct conversational orchestrator.
+        actionExpectedWork: true,
         dispatchLease,
       });
       // The SDK permission seam owns the provider call id and records the exact

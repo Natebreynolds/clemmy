@@ -39,6 +39,7 @@ import {
   renderMissingSmokeInputs,
   renderReadinessHold,
   validateWorkflowStepGraph,
+  warmExactScheduledSendSchemaAuthorityForWrite,
   workflowUpdateNeedsVerification,
   workflowSlugFromName,
   workflowSmokeInputs,
@@ -119,6 +120,7 @@ import {
   workflowTerminalOutcomeNeedsAttention,
   type WorkflowTerminalOutcome,
 } from '../execution/workflow-terminal-outcome.js';
+import { withTerminalAuthoringEvidenceReceipt } from './tool-registry.js';
 
 /**
  * Parse the workflow_run `inputs` field, which the model passes as a JSON
@@ -653,7 +655,14 @@ export function bindChatDiscussedToolkits(
   return bindDiscussedToolkitsIntoSteps(steps, toolkitsDiscussedInChat(sessionId));
 }
 
-const ACTIVE_RUN_STATUSES = new Set(['queued', 'running', 'finalizing', 'parked']);
+const ACTIVE_RUN_STATUSES = new Set([
+  'queued',
+  'running',
+  'finalizing',
+  'parked',
+  'blocked_capability',
+  'blocked_mutation',
+]);
 
 function formatRunAge(iso?: string): string {
   if (!iso) return '';
@@ -669,7 +678,7 @@ function formatRunAge(iso?: string): string {
 
 /**
  * Render a compact overview of workflow runs for chat recall ("what's running?"):
- * every in-flight (queued/running/finalizing/parked) or needs-attention run, plus the few
+ * every in-flight (queued/running/finalizing/parked/dependency/mutation-review) or needs-attention run, plus the few
  * most-recent finished ones. Reads the run-record files directly — token-cheap.
  */
 export function renderWorkflowRunsOverview(limit = 15): string {
@@ -703,6 +712,8 @@ export function renderWorkflowRunsOverview(limit = 15): string {
         status: typeof r.status === 'string' ? r.status : 'unknown',
         createdAt: typeof r.createdAt === 'string' ? r.createdAt : undefined,
         needsAttention: r.needsAttention === true
+          || r.status === 'blocked_capability'
+          || r.status === 'blocked_mutation'
           || workflowTerminalOutcomeNeedsAttention(terminalOutcome),
         terminalOutcome,
       });
@@ -981,6 +992,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           appliedLines.push(`- ${proposal.workflowName}: no metadata changes needed.`);
           continue;
         }
+        await warmExactScheduledSendSchemaAuthorityForWrite(applied.def);
         const prep = prepareWorkflowUpdateForWrite(entry.data, applied.def);
         if (prep.status === 'invalid') {
           appliedLines.push(`- ${proposal.workflowName}: NOT applied — repaired definition still has blocking issue(s): ${prep.errors.join('; ')}`);
@@ -1040,6 +1052,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       let prepRepairs: string[] = [];
       let readinessHold = '';
       if (fixed.changes.length > 0) {
+        await warmExactScheduledSendSchemaAuthorityForWrite(fixed.def);
         const prep = prepareWorkflowUpdateForWrite(entry.data, fixed.def);
         if (prep.status === 'invalid') {
           return textResult(
@@ -1252,6 +1265,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       // a real creation test.
       const preWriteNeedsCreationTest = workflowNeedsCreationTest(def);
       if (preWriteNeedsCreationTest) def.enabled = false;
+      await warmExactScheduledSendSchemaAuthorityForWrite(def);
       // Author through the canonical core (bind → auto-repair + validate →
       // persist → gap-test). Auto-repair saves a runnable workflow in one shot
       // instead of bouncing the author into a token-burning re-author loop;
@@ -1279,46 +1293,50 @@ export function registerOrchestrationTools(server: McpServer): void {
           created.savedDef.enabled = false;
           writeWorkflowAndSyncTriggers(dirName, created.savedDef);
         }
-        return textResult(
+        return textResult(withTerminalAuthoringEvidenceReceipt(
+          'workflow_create',
           `${analysisReport}`
           + `Created workflow "${name}" (saved DISABLED pending readiness answers). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
           + `${appendDataSources(created.savedDef)}`
           + `${appendVisualContract(created.executionPlan)}`
           + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
           + `${renderReadinessHold(name)}${advisoryTail}`,
-        );
+        ));
       }
       if (needsCreationTest) {
         const testInputs = workflowSmokeInputs(created.savedDef, providedSmokeInputs);
         const missingSmokeInputs = missingWorkflowRunInputs(created.savedDef, testInputs);
         if (missingSmokeInputs.length > 0) {
-          return textResult(
+          return textResult(withTerminalAuthoringEvidenceReceipt(
+            'workflow_create',
             `${analysisReport}`
             + `Created workflow "${name}" (saved DISABLED pending verification). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
             + `${appendDataSources(created.savedDef)}`
             + `${appendVisualContract(created.executionPlan)}`
             + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
             + `${renderMissingSmokeInputs(name, missingSmokeInputs)}${advisoryTail}`,
-          );
+          ));
         }
         const queued = queueWorkflowCreationTest(name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
-        return textResult(
+        return textResult(withTerminalAuthoringEvidenceReceipt(
+          'workflow_create',
           `${analysisReport}`
           + `Created workflow "${name}" (saved DISABLED while I test it). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
           + `${appendDataSources(created.savedDef)}`
           + `${appendVisualContract(created.executionPlan)}`
           + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
           + `${queued.message}${advisoryTail}`,
-        );
+        ));
       }
-      return textResult(
+      return textResult(withTerminalAuthoringEvidenceReceipt(
+        'workflow_create',
         `${analysisReport}`
         + `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
         + `${appendDataSources(created.savedDef)}`
         + `${appendVisualContract(created.executionPlan)}`
         + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}`
         + `${advisoryTail}`,
-      );
+      ));
     },
   );
 
@@ -1777,6 +1795,10 @@ export function registerOrchestrationTools(server: McpServer): void {
       // enabling an older workflow with a dangling reference fixes it in
       // place instead of refusing.
       if (enabled) {
+        // Enable-time exact-send readiness is self-healing but bounded: refresh
+        // only structurally pinned slugs, then let canonical validation decide.
+        const enabledCandidate = { ...entry.data, enabled: true };
+        await warmExactScheduledSendSchemaAuthorityForWrite(enabledCandidate);
         const prep = prepareWorkflowEnableForWrite(entry.data);
         if (prep.status === 'invalid') {
           return textResult(
@@ -1975,6 +1997,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       // Auto-repair the fixable binding gaps before persisting so an edit
       // that left a dangling {{steps.X.output}} / forEach / {{input.X}}
       // saves runnable.
+      await warmExactScheduledSendSchemaAuthorityForWrite(next);
       const updatePrep = prepareWorkflowUpdateForWrite(entry.data, next, {
         modelPortability: portable_models ? 'portable' : 'preserve',
         codifyMechanicalSteps: Boolean(steps),
@@ -2094,12 +2117,25 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(`Workflow "${name}" not found.${names ? ` Saved workflows: ${names}.` : ''}`);
       }
       const before = entry.data;
-      const result = applyStepPromptEdit(before.name, step_id, find, replace, { description: `workflow_edit_step ${step_id}` });
+      // The entry owns the durable on-disk identity; frontmatter `name` is the
+      // human-facing label and may contain spaces or case. Every edit, backup,
+      // reload, persistence, and re-smoke stays on the entry slug. Only text
+      // returned to the user is translated back to the display name.
+      const workflowSlug = entry.name;
+      const displayName = before.name;
+      const displayMessage = (message: string): string => workflowSlug === displayName
+        ? message
+        : message.replaceAll(`"${workflowSlug}"`, `"${displayName}"`);
+      await warmExactScheduledSendSchemaAuthorityForWrite(before);
+      const result = applyStepPromptEdit(workflowSlug, step_id, find, replace, {
+        description: `workflow_edit_step ${step_id}`,
+      });
+      const resultMessage = displayMessage(result.message);
       if (!result.ok) {
         // Structured, NON-silent failure (change #4): the user AND the model see
         // the edit did not land and exactly what to do next — never a quiet no-op.
         return textResult(
-          `Edit NOT applied to "${before.name}" step "${step_id}".\n${result.message}`
+          `Edit NOT applied to "${displayName}" step "${step_id}".\n${resultMessage}`
             + (result.errors?.length ? `\n- ${result.errors.join('\n- ')}` : ''),
         );
       }
@@ -2107,30 +2143,34 @@ export function registerOrchestrationTools(server: McpServer): void {
       // edit changed what it executes, re-verify by running (saved disabled,
       // auto-enables on pass) instead of trusting the edited config. Schedule/copy
       // edits that don't change execution skip the test.
-      const updated = listWorkflowFiles().find((w) => w.data.name === before.name)?.data;
+      const updated = listWorkflowFiles().find((w) => w.name === workflowSlug)?.data;
       let reSmokeMsg = '';
       if (updated && before.enabled && workflowExecutionSurfaceChanged(before, updated)) {
-        let runTest = workflowNeedsCreationTest(updated);
+        const runTest = workflowNeedsCreationTest(updated);
         if (runTest) {
           const testInputs = workflowSmokeInputs(updated, {});
           const missingSmokeInputs = missingWorkflowRunInputs(updated, testInputs);
-          writeWorkflowAndSyncTriggers(before.name, { ...updated, enabled: false });
+          writeWorkflowAndSyncTriggers(workflowSlug, { ...updated, enabled: false });
           reSmokeMsg = missingSmokeInputs.length > 0
-            ? `\n\n${renderMissingSmokeInputs(before.name, missingSmokeInputs)}`
-            : `\n\n${queueWorkflowCreationTest(before.name, testInputs, { originSessionId: getToolOutputContext()?.sessionId }).message}`;
+            ? `\n\n${renderMissingSmokeInputs(workflowSlug, missingSmokeInputs)}`
+            : `\n\n${displayMessage(queueWorkflowCreationTest(
+                workflowSlug,
+                testInputs,
+                { originSessionId: getToolOutputContext()?.sessionId },
+              ).message)}`;
         }
       }
       addNotification({
-        id: `workflow-edit-step-${before.name}-${step_id}-${Date.now()}`,
+        id: `workflow-edit-step-${workflowSlug}-${step_id}-${Date.now()}`,
         kind: 'workflow',
-        title: `Workflow step edited: ${before.name}`,
+        title: `Workflow step edited: ${displayName}`,
         body: `Edited step "${step_id}".`,
         createdAt: new Date().toISOString(),
         read: false,
         silent: true,
-        metadata: { source: 'workflow_edit_step', workflowName: before.name, stepId: step_id },
+        metadata: { source: 'workflow_edit_step', workflowName: workflowSlug, stepId: step_id },
       });
-      return textResult(`${result.message}${reSmokeMsg}`);
+      return textResult(`${resultMessage}${reSmokeMsg}`);
     },
   );
 
@@ -2222,7 +2262,7 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_run_status',
-    'Check workflow runs. Pass run_id for one run\'s detail, OR omit it to LIST what is running right now — use the no-id form to answer "what workflows are running / how is my flow going". Lists in-flight (queued/running/parked) + needs-attention runs and the few most-recent finished ones.',
+    'Check workflow runs. Pass run_id for one run\'s detail, OR omit it to LIST what is running right now — use the no-id form to answer "what workflows are running / how is my flow going". Lists in-flight (queued/running/parked/mutation-review) + needs-attention runs and the few most-recent finished ones.',
     {
       run_id: z.string().optional().describe('A specific run id for its full record. Omit to list active + recent runs.'),
     },
@@ -2256,6 +2296,26 @@ export function registerOrchestrationTools(server: McpServer): void {
           const blockedLines = blockedSteps.map((b) => `  - ${String(b.stepId ?? '?')}: ${String(b.reason ?? '(no reason recorded)')}`);
           const failedItemLines = failedItems.map((f) => `  - ${f.stepId} · ${f.itemKey}: ${f.error.slice(0, 240)}`);
           const output = typeof record.output === 'string' ? record.output : '';
+          const mutationBlock = record.mutationBlock && typeof record.mutationBlock === 'object' && !Array.isArray(record.mutationBlock)
+            ? record.mutationBlock as Record<string, unknown>
+            : undefined;
+          const mutationNeedsAttention = record.status === 'blocked_mutation';
+          const capabilityNeedsAttention = record.status === 'blocked_capability';
+          const capabilityBlock = record.capabilityBlock && typeof record.capabilityBlock === 'object' && !Array.isArray(record.capabilityBlock)
+            ? record.capabilityBlock as Record<string, unknown>
+            : undefined;
+          const capabilityLine = capabilityNeedsAttention
+            ? [
+                `Dependency pause: step ${String(capabilityBlock?.stepId ?? '?')}, tool ${String(capabilityBlock?.tool ?? '?')}, reason ${String(capabilityBlock?.reason ?? '?')}.`,
+                `Provider dispatch was proven not to occur; completed work is preserved and this same run will retry after ${String(capabilityBlock?.retryAt ?? 'the dependency is restored')}.`,
+              ].join(' ')
+            : '';
+          const mutationLine = mutationNeedsAttention
+            ? [
+                `Mutation review: step ${String(mutationBlock?.stepId ?? '?')}, tool ${String(mutationBlock?.tool ?? '?')}, fingerprint ${String(mutationBlock?.fingerprint ?? '').slice(0, 12) || '?'}.`,
+                'The provider outcome may already have committed. No redispatch occurred; reconcile the exact receipt, then resume this same run only from its committed ledger replay (or cancel while leaving the external outcome explicitly unresolved).',
+              ].join(' ')
+            : '';
           const terminalOutcome = deriveWorkflowTerminalOutcome({
             status: record.status,
             finishedAt: record.finishedAt,
@@ -2268,13 +2328,15 @@ export function registerOrchestrationTools(server: McpServer): void {
           const lines = [
             `Run ${run_id}`,
             `Workflow: ${record.workflow ?? '(unknown)'}`,
-            `Status: ${record.status ?? '(unknown)'}${record.needsAttention ? ' · NEEDS ATTENTION' : ''}`,
+            `Status: ${record.status ?? '(unknown)'}${record.needsAttention || capabilityNeedsAttention || mutationNeedsAttention ? ' · NEEDS ATTENTION' : ''}`,
             terminalOutcome ? `Outcome: ${workflowTerminalOutcomeLabel(terminalOutcome)}` : '',
             record.createdAt ? `Created: ${record.createdAt}` : '',
             record.finishedAt ? `Finished: ${record.finishedAt}` : '',
             record.inputs && Object.keys(record.inputs).length > 0 ? `Inputs: ${JSON.stringify(record.inputs)}` : '',
             record.goalOutcome ? `Pinned goal: ${record.goalOutcome}${record.goalReason ? ` — ${record.goalReason}` : ''}` : '',
             record.error ? `Error: ${record.error}` : '',
+            capabilityLine,
+            mutationLine,
             blockedLines.length > 0 ? `Blocked steps:\n${blockedLines.join('\n')}` : '',
             failedItemLines.length > 0
               ? `Failed fan-out items:\n${failedItemLines.join('\n')}\nRetry: call workflow_rerun_failed_items with run_id="${run_id}"${new Set(failedItems.map((f) => f.stepId)).size > 1 ? ' and step_id set to one failed step' : ''}.`

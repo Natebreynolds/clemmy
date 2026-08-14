@@ -42,7 +42,7 @@ import {
 } from '../runtime/harness/attempt-identity.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { dispatchBatchItemTool, isMcpNamespacedTool } from './code-mode-tool.js';
-import { deriveOrchestratorDiscoveryNames } from './tool-registry.js';
+import { deriveOrchestratorDiscoveryNames, isRegisteredActionControl } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
 import { isHarnessRefusalText, textResult } from './shared.js';
@@ -77,7 +77,14 @@ const DESCRIPTION = [
   'Use this to reach a catalog-only tool without a round-trip: e.g. call_tool("workflow_schedule", "{\\"workflow_id\\":\\"...\\"}").',
   'APPROVAL: call_tool never prompts on its own — the target tool\'s own classification decides. A read runs immediately; a write/send/irreversible target gates for approval exactly as if you had called it directly.',
   'RESILIENT HTTP GET: common guessed names http_fetch, web_fetch, web_fetch_simple, and fetch_url are bounded read-only aliases for the real run_shell_command curl path when that tool is allowed on the active turn.',
-  'If the arguments do not match the tool\'s schema, call_tool returns the schema and an error and makes NO change — fix the args and call again. If you are unsure of the exact name or args, call tool_search first.',
+  'If the arguments do not match the tool\'s schema, call_tool returns the schema and an error and makes NO change — fix the args and call again without broad discovery. If the capability is unresolved, call tool_search once for that requirement; if its exact name/schema is already present, invoke it directly.',
+].join(' ');
+
+const CONTROL_ONLY_DESCRIPTION = [
+  'Invoke one deferred built-in control or recovery tool returned by tool_search. Pass its exact `name` and `args_json` JSON object string.',
+  'This carrier cannot invoke business/provider work or external MCP tools; business results belong inside `work_call`.',
+  'The selected control keeps its own schema, approval classification, capability admission, and settlement behavior exactly as if it were first-class.',
+  'If arguments fail validation, no inner dispatch occurs; use the exact schema returned by tool_search and retry once.',
 ].join(' ');
 
 /** Lazily-built, memoized name → Zod schema map for local runtime tools. Dynamic
@@ -341,6 +348,11 @@ export interface BuildCallToolOptions {
   ) => Promise<unknown>;
   /** Adapter attribution for a trusted refusal after inner resolution. */
   resolvedRefusalLane?: SettleToolAttemptInput['lane'];
+  /** Restrict this transport to registry-declared local controls. Action turns
+   * use it as a compact control escape hatch while work_call remains the sole
+   * carrier for business/provider operations. Unknown and MCP names fail
+   * closed; the default generic dispatcher is byte-compatible. */
+  controlOnlyBuiltins?: boolean;
 }
 
 export type BuiltinCapabilityAdmissionResult =
@@ -365,9 +377,11 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
   const deniedNames = options.deniedNames ?? new Set<string>();
   return tool({
     name: 'call_tool',
-    description: DESCRIPTION,
+    description: options.controlOnlyBuiltins ? CONTROL_ONLY_DESCRIPTION : DESCRIPTION,
     parameters: z.object({
-      name: z.string().min(1).describe('Exact tool name to invoke: a built-in from the catalog, OR a connected external MCP tool as <server>__<tool> (e.g. dataforseo__serp_organic_live_advanced).'),
+      name: z.string().min(1).describe(options.controlOnlyBuiltins
+        ? 'Exact registry-declared control/recovery tool name returned by tool_search.'
+        : 'Exact tool name to invoke: a built-in from the catalog, OR a connected external MCP tool as <server>__<tool> (e.g. dataforseo__serp_organic_live_advanced).'),
       args_json: z.string().describe('JSON object string of the target tool\'s arguments. Use "{}" for no args.'),
     }),
     // Preserve the SDK's model-visible corrective for ordinary invocation
@@ -452,6 +466,19 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         return refuse({
           error: 'not_reachable',
           detail: `"${requestedTarget}" is excluded from this turn's effective tool policy.`,
+        });
+      }
+
+      if (
+        options.controlOnlyBuiltins
+        && (
+          isMcpNamespacedTool(target)
+          || !isRegisteredActionControl(target)
+        )
+      ) {
+        return refuse({
+          error: 'not_reachable',
+          detail: `"${requestedTarget}" is not a registry-declared control on this turn. Invoke business/provider work through work_call.`,
         });
       }
 

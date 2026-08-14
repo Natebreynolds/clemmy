@@ -17,10 +17,15 @@ import {
   type ExpectedWorkUniverseSelectorV1,
 } from '../runtime/harness/expected-work-admission.js';
 import type { ExpectedWorkProposalV1 } from '../runtime/harness/expected-work-contract.js';
+import { openEventLog } from '../runtime/harness/eventlog.js';
 import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
+import { acceptedTaskIdFor } from '../runtime/harness/attempt-identity.js';
 import type { SettleToolAttemptInput } from '../runtime/harness/attempt-settlement.js';
+import { durableLogicalCallContract } from '../runtime/harness/logical-call-contract.js';
+import { expectedTaskFor } from '../runtime/harness/resolution-ledger.js';
 import { settleResolvedCarrierRefusal } from '../runtime/harness/resolved-carrier-refusal.js';
 import { redeemSuccessfulSettlementResultForHost } from '../runtime/harness/result-handle.js';
+import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
 import { buildCallTool, type BuildCallToolOptions } from './call-tool.js';
 
 const IdSchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9:._/-]*$/);
@@ -116,6 +121,135 @@ interface WorkCallFrame {
 
 const workCallStorage = new AsyncLocalStorage<WorkCallFrame>();
 
+function isHostReadOrCompute(toolName: string, args: unknown): boolean {
+  try {
+    const effect = classifyRuntimeToolEffect(toolName, args).effect;
+    return effect === 'read' || effect === 'compute';
+  } catch {
+    return false;
+  }
+}
+
+/** Only semantic plan disagreements are dispensable for a non-mutating host
+ * call. A stored binding collision and an already-settled instance are
+ * identity/once-ness facts, not proposal advice. */
+export function isReadComputeSemanticRefusal(
+  kind: ExpectedWorkAdmissionFailureKind,
+  reason: string,
+): boolean {
+  switch (kind) {
+    case 'work_contract_required':
+    case 'work_contract_invalid':
+    case 'work_requirement_unknown':
+    case 'work_effect_mismatch':
+    case 'work_dependency_pending':
+    case 'work_cardinality_mismatch':
+    case 'work_universe_unsealed':
+    case 'work_source_witness_missing':
+      return true;
+    case 'work_contract_conflict':
+      // Only the candidate proposal disagrees. A persisted binding collision
+      // (`logical call already owns a different work binding`) is durable
+      // once-ness/identity authority and must remain a refusal.
+      return reason === 'a different action topology is already frozen';
+    case 'work_binding_required':
+    case 'work_authority_unavailable':
+    case 'work_already_satisfied':
+    case 'work_evidence_incomplete':
+    case 'work_effect_already_executed':
+      return false;
+  }
+}
+
+/** Re-prove the substrate that semantic admission normally reaches only after
+ * proposal validation. This keeps a malformed/conflicting proposal from
+ * masking missing storage, a closed accepted task, or a poisoned logical id.
+ * Dispatch leases and provider authority remain downstream and fail closed. */
+export function unboundReadComputeAuthority(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  logicalToolCallId: string;
+  toolName: string;
+  args: unknown;
+}): { ok: true } | { ok: false; reason: string } {
+  try {
+    const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
+    const expected = expectedTaskFor(input.sessionId, input.sourceUserSeq);
+    if (
+      expected.status !== 'ok'
+      || expected.expectation.acceptedTaskId !== acceptedTaskId
+    ) {
+      return {
+        ok: false,
+        reason: expected.status === 'ok'
+          ? 'accepted task identity does not match its exact graph'
+          : expected.reason,
+      };
+    }
+    const contract = durableLogicalCallContract(acceptedTaskId, input.toolName, input.args);
+    if (!contract) return { ok: false, reason: 'resolved logical call contract is unsafe' };
+
+    const db = openEventLog();
+    const authority = db.prepare(`
+      SELECT accepted_task_id, expected_work_required, state
+        FROM accepted_task_authority
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(input.sessionId, input.sourceUserSeq) as {
+      accepted_task_id: string;
+      expected_work_required: number;
+      state: string;
+    } | undefined;
+    if (
+      !authority
+      || authority.accepted_task_id !== acceptedTaskId
+      || authority.expected_work_required !== 1
+      || authority.state !== 'armed'
+    ) {
+      return { ok: false, reason: 'action expected-work authority is not active and armed' };
+    }
+
+    const binding = db.prepare(`
+      SELECT 1 FROM expected_work_call_bindings
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+       LIMIT 1
+    `).get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId);
+    if (binding) {
+      return { ok: false, reason: 'logical call already owns a durable work binding' };
+    }
+
+    const logical = db.prepare(`
+      SELECT accepted_task_id, tool_name, argument_digest, state
+        FROM logical_tool_calls
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId) as {
+      accepted_task_id: string;
+      tool_name: string;
+      argument_digest: string;
+      state: string;
+    } | undefined;
+    if (
+      !logical
+      || logical.accepted_task_id !== acceptedTaskId
+      || logical.tool_name !== contract.toolName
+      || logical.argument_digest !== contract.argumentDigest
+      || logical.state !== 'open'
+    ) {
+      return { ok: false, reason: 'logical call is not the exact open normalized inner call' };
+    }
+    const crossings = db.prepare(`
+      SELECT COUNT(*) AS n FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId) as { n: number };
+    if (crossings.n !== 0) {
+      return { ok: false, reason: 'logical call already crossed a provider boundary' };
+    }
+    return { ok: true };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { ok: false, reason: reason.replace(/\s+/g, ' ').slice(0, 300) };
+  }
+}
+
 function normalizedProposal(input: WorkCallInput['proposal']): ExpectedWorkProposalV1 | null {
   if (!input) return null;
   return {
@@ -148,6 +282,10 @@ function repairLineFor(kind: ExpectedWorkAdmissionFailureKind): string {
       return 'Retry work_call with one corrected complete semantic proposal and the same intended inner call. The plan array (when present) lists the already-frozen requirements — reuse their ids and shapes exactly.';
     case 'work_already_satisfied':
       return 'This requirement is already complete — its stored result is included under `result`. Use it; do NOT re-run this requirement. Continue with the next `open` entry in `plan`.';
+    case 'work_evidence_incomplete':
+      return 'The exact read or compute already settled but did not prove the requested evidence complete. Its retained result is included; use it instead of replaying. To gather different evidence, change the non-mutating call. A safe retry does not itself prove coverage; `plan` remains open until the canonical evidence oracle discharges it.';
+    case 'work_effect_already_executed':
+      return 'The mutation crossed once but is not yet durably verified. Do NOT repeat it. Use the stored result when present, then verify/read back or reconcile the existing effect; `plan` remains open until proof exists.';
     case 'work_dependency_pending':
       return 'Complete the dependency named in `detail` first — `plan` shows each requirement\'s state. Dispatch the blocked requirement only after its dependency reads `satisfied`.';
     case 'work_universe_unsealed':
@@ -252,6 +390,24 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
           : {}),
       });
       if (admission.status === 'refused') {
+        // Proposal semantics cannot veto an objectively non-mutating host
+        // operation. The exact accepted/logical substrate is re-proved first;
+        // the inner dispatch still owns lease, capability, and provider gates.
+        if (
+          isHostReadOrCompute(resolved.targetName, resolved.targetArgs)
+          && isReadComputeSemanticRefusal(admission.kind, admission.reason)
+        ) {
+          const fallbackAuthority = unboundReadComputeAuthority({
+            sessionId: resolved.sessionId,
+            sourceUserSeq: resolved.sourceUserSeq as number,
+            logicalToolCallId: resolved.logicalToolCallId,
+            toolName: resolved.targetName,
+            args: resolved.targetArgs,
+          });
+          if (fallbackAuthority.ok) return dispatch();
+          frame.refusalKind = 'work_authority_unavailable';
+          return refuse(frame.refusalKind, fallbackAuthority.reason);
+        }
         frame.refusalKind = admission.kind;
         return refuse(admission.kind, admission.reason, admission.plan ? { plan: admission.plan } : undefined);
       }
@@ -283,6 +439,62 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
           { plan: admission.plan, ...(redeemedResult !== undefined ? { result: redeemedResult } : {}) },
         );
       }
+      if (admission.status === 'evidence_retained') {
+        // Exact non-mutating replay is pure latency/cost. Return the retained
+        // bytes while keeping the plan open; a differently identified read
+        // may still dispatch to gather better evidence.
+        frame.refusalKind = 'work_evidence_incomplete';
+        let redeemedResult: unknown;
+        try {
+          const redeemed = redeemSuccessfulSettlementResultForHost({
+            sessionId: resolved.sessionId,
+            sourceUserSeq: resolved.sourceUserSeq as number,
+            acceptedTaskId: admission.contract.acceptedTaskId,
+            logicalToolCallId: admission.priorLogicalToolCallId,
+          });
+          if (redeemed.status === 'ok') {
+            redeemedResult = {
+              records: redeemed.value.handle.projectedRecords,
+              recordCount: redeemed.value.handle.recordCount,
+              completeness: redeemed.value.handle.completeness,
+              tool: redeemed.value.toolName,
+            };
+          }
+        } catch { /* the no-replay decision remains authoritative */ }
+        return refuse(
+          'work_evidence_incomplete',
+          'the exact read or compute already settled without complete evidence — its retained result is included',
+          { plan: admission.plan, ...(redeemedResult !== undefined ? { result: redeemedResult } : {}) },
+        );
+      }
+      if (admission.status === 'effect_already_executed') {
+        // Once-ness is independent of verification. A successful mutation may
+        // not replay merely because the canonical discharge oracle (correctly)
+        // keeps its plan requirement open pending readback/reconciliation.
+        frame.refusalKind = 'work_effect_already_executed';
+        let redeemedResult: unknown;
+        try {
+          const redeemed = redeemSuccessfulSettlementResultForHost({
+            sessionId: resolved.sessionId,
+            sourceUserSeq: resolved.sourceUserSeq as number,
+            acceptedTaskId: admission.contract.acceptedTaskId,
+            logicalToolCallId: admission.priorLogicalToolCallId,
+          });
+          if (redeemed.status === 'ok') {
+            redeemedResult = {
+              records: redeemed.value.handle.projectedRecords,
+              recordCount: redeemed.value.handle.recordCount,
+              completeness: redeemed.value.handle.completeness,
+              tool: redeemed.value.toolName,
+            };
+          }
+        } catch { /* the once-only refusal remains authoritative */ }
+        return refuse(
+          'work_effect_already_executed',
+          'this mutation already executed once but is not durably verified — do not repeat it',
+          { plan: admission.plan, ...(redeemedResult !== undefined ? { result: redeemedResult } : {}) },
+        );
+      }
       return withExpectedWorkBinding(admission.binding, dispatch);
     },
   }) as unknown as {
@@ -302,7 +514,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       'For later calls set proposal to null and bind the exact requirement/item from the frozen contract.',
       `Count-only fanout ("one write per record from this read") — a VALID first-call proposal: ${JSON.stringify(WORK_CALL_COUNT_ONLY_EXAMPLE)}. The sealed universe sizes itself from the settled read; memberIdPointer is an RFC 6901 pointer to each record's id (empty string when the record itself is the id).`,
       'Content you compose yourself (drafts, summaries, messages) is NOT a compute operation — composition happens inside the consuming write\'s args. Propose compute ONLY for work a tool will perform; a compute requirement no tool call ever carries can never be proven and will block everything that depends on it.',
-      'Use tool_search first when the inner name/schema is unknown. Ask the user naturally if the intended work itself is ambiguous.',
+      'Invoke a runtime-resolved inner name/schema directly. When a requirement is unresolved, use tool_search once for that requirement; when only an exact schema is missing, describe that exact tool once instead of broad-searching. Ask the user naturally if the intended work itself is ambiguous.',
     ].join(' '),
     parameters: WorkCallInputSchema,
     errorFunction: (_context, error) => {

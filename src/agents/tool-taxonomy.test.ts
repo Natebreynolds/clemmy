@@ -453,6 +453,52 @@ test('decideToolApproval: cx_* googlesheets writes auto in yolo, ask in strict',
   assert.equal(strict.needsApproval, true);
 });
 
+test('decideToolApproval: the connected Ventura Sheet uses request authority; unknown mutation and email send still card', () => {
+  setScope('yolo');
+  const connection = 'ca_google_sheets_owner';
+  const sheet = decideToolApproval({
+    toolName: 'composio_execute_tool',
+    args: {
+      tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',
+      arguments: JSON.stringify({
+        title: 'Top 5 Ventura Restaurants',
+        sheet_name: 'Restaurants',
+        sheet_json: [
+          { name: 'Lure Fish House', rating: 4.6, address: '60 S California St, Ventura, CA' },
+        ],
+      }),
+      connected_account_id: connection,
+    },
+  });
+  assert.equal(sheet.needsApproval, false);
+  assert.equal(sheet.reason, 'yolo-policy');
+
+  const unknown = decideToolApproval({
+    toolName: 'composio_execute_tool',
+    args: {
+      tool_slug: 'ACME_TRANSFORM_BLOB',
+      arguments: JSON.stringify({ source: 'restaurants', destination: 'unknown' }),
+      connected_account_id: 'ca_acme_owner',
+    },
+  });
+  assert.equal(unknown.needsApproval, true);
+  assert.equal(unknown.reason, 'unknown');
+
+  const email = decideToolApproval({
+    toolName: 'composio_execute_tool',
+    args: {
+      tool_slug: 'OUTLOOK_SEND_EMAIL',
+      arguments: JSON.stringify({
+        to_recipients: [{ emailAddress: { address: 'nathan@example.ai' } }],
+        subject: 'Ventura restaurants',
+        body: 'Here is the Sheet link.',
+      }),
+      connected_account_id: 'ca_outlook_owner',
+    },
+  });
+  assert.equal(email.needsApproval, true);
+});
+
 test('decideToolApproval: cx_* read tools auto in every scope', () => {
   for (const scope of ['strict', 'workspace', 'yolo'] as const) {
     setScope(scope);

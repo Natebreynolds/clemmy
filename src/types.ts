@@ -301,6 +301,14 @@ export interface AssistantRequest {
    *  boundary. Raw executor/model output is never a user-facing stream.
    *  The final committed text is still returned in the response. */
   onChunk?: (delta: string) => Promise<void> | void;
+  /**
+   * Awaited request-scoped presentation port for one model-authored,
+   * nonterminal acknowledgement before execution. The brain must wait for a
+   * delivered result before exposing or invoking tools; a typed failure means
+   * the turn must fail closed. This callback grants no outcome, effect, or
+   * continuation authority.
+   */
+  onConversationPreamble?: ConversationPreambleDeliveryCallback;
   /** Fired per reasoning chunk (o-series models). Captured for
    *  observability in the run timeline; not intended for end-user
    *  display by default. */
@@ -328,6 +336,14 @@ export interface AssistantRequest {
    */
   acceptStructuredNoToolResult?: boolean;
 }
+
+export type ConversationPreambleDeliveryResult =
+  | { status: 'delivered' }
+  | { status: 'failed'; reason: 'transport_unavailable' | 'delivery_failed' };
+
+export type ConversationPreambleDeliveryCallback = (
+  text: string,
+) => Promise<ConversationPreambleDeliveryResult>;
 
 export interface AssistantResponse {
   text: string;

@@ -16,6 +16,8 @@ import {
   classifyShellExecutionOutcome,
   isPackageRunnerMaterializationFailure,
   recordShellExecutionOutcome,
+  SHELL_POLICY_DENIAL_PREFIX,
+  ShellPolicyDenialError,
   type ShellExecutionOutcome,
 } from '../runtime/shell-execution-outcome.js';
 import { isConvertibleExtension } from '../runtime/markitdown.js';
@@ -537,8 +539,6 @@ export function writeTargetsAuthorizationState(resolvedPath: string): boolean {
   return segments.includes('call-mutations') || segments.includes('.trigger-receipts');
 }
 
-const AUTHORIZATION_STATE_REFERENCE =
-  /(?:^|[/\\\s"'=])(?:pending-actions|call-mutations|\.trigger-receipts)(?:[/\\\s"'=]|$)|\bharness\.db\b|(?:^|[/\\])(?:state|audit)(?:[/\\]|$)/i;
 const AUTHORIZATION_STATE_MUTATION =
   /(?:^|[\s;&|])(?:rm|rmdir|unlink|trash|mv|cp|install|touch|mkdir|truncate|chmod|chown|chgrp|ln|dd)\b|(?:^|[^<])>{1,2}\s*|\|\s*tee\b|\b(?:writeFileSync|appendFileSync|createWriteStream|copyFileSync|renameSync|rmSync|unlinkSync|mkdirSync|writeFile|appendFile|createWriteStream)\s*\(|\bopen\s*\([^)]*,\s*['"][wax+][^'"]*['"]|\b(?:update|delete\s+from|insert\s+into|replace\s+into|drop\s+table|alter\s+table|create\s+table|truncate)\b/i;
 
@@ -550,18 +550,58 @@ export function shellMutatesAuthorizationState(rawCommand: unknown, cwdInput?: s
   const command = rawCommand.trim();
   if (!command || !AUTHORIZATION_STATE_MUTATION.test(command)) return false;
   const cwd = path.resolve(expandHome(cwdInput || BASE_DIR));
-  return writeTargetsAuthorizationState(cwd) || AUTHORIZATION_STATE_REFERENCE.test(command);
+  if (writeTargetsAuthorizationState(cwd)) return true;
+
+  const targets = new Set<string>(outputRedirectionTargets(command));
+  const tokens = tokenizeShell(command);
+  const pathOperandVerbs = new Set([
+    'rm', 'rmdir', 'unlink', 'trash', 'mv', 'cp', 'install', 'touch', 'mkdir',
+    'truncate', 'chmod', 'chown', 'chgrp', 'ln', 'tee',
+  ]);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const binary = path.basename(tokens[index] ?? '').toLowerCase();
+    if (pathOperandVerbs.has(binary)) {
+      for (const operand of tokens.slice(index + 1)) {
+        if (!operand.startsWith('-')) targets.add(operand);
+      }
+    }
+    if (binary === 'dd') {
+      for (const operand of tokens.slice(index + 1)) {
+        if (operand.startsWith('of=') && operand.length > 3) targets.add(operand.slice(3));
+      }
+    }
+    if (binary === 'sqlite3') {
+      const database = tokens.slice(index + 1).find((operand) => !operand.startsWith('-'));
+      if (database) targets.add(database);
+    }
+  }
+
+  // Common interpreter write APIs. Only literal paths are authority evidence;
+  // an unresolved expression cannot be used to deny an unrelated workspace.
+  const literalCommand = command.replace(/\\(["'])/g, '$1');
+  for (const match of literalCommand.matchAll(
+    /\b(?:writeFileSync|appendFileSync|createWriteStream|copyFileSync|renameSync|rmSync|unlinkSync|mkdirSync|writeFile|appendFile)\s*\(\s*['"]([^'"]+)['"]/g,
+  )) targets.add(match[1] ?? '');
+  for (const match of literalCommand.matchAll(
+    /\bopen\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"][wax+][^'"]*['"]/g,
+  )) targets.add(match[1] ?? '');
+
+  for (const target of targets) {
+    const resolved = resolveShellPathToken(target, cwd);
+    if (resolved && writeTargetsAuthorizationState(resolved)) return true;
+  }
+  return false;
 }
 
 function assertOwnStoresProtected(command: string, cwd: string): void {
   if (shellDestroysOwnStores(command)) {
-    throw new Error(
+    throw new ShellPolicyDenialError(
       "Command denied: it would delete or destroy Clementine's own data stores (memory, event log, audit ledger, secrets, workflow definitions, or their backups). "
       + 'These are protected from shell-level destruction. For storage hygiene use the built-in maintenance/self-heal paths, or ask the user to remove files manually.',
     );
   }
   if (shellMutatesAuthorizationState(command, cwd)) {
-    throw new Error(
+    throw new ShellPolicyDenialError(
       'Command denied: model-authored shell commands cannot mutate Clementine authorization state '
       + '(pending actions, approval/event data, audit authority, or exact-once mutation receipts). '
       + 'Use the purpose-built approval, pending-action, workflow, or settings tools instead. Read-only inspection remains available.',
@@ -612,7 +652,7 @@ export function assertCommandAllowed(command: string): void {
     /\bchown\s+-r\s+.*\s+(\/|\$home|~)/,
   ];
   if (denied.some((pattern) => pattern.test(normalized))) {
-    throw new Error('Command denied by Clementine safety policy.');
+    throw new ShellPolicyDenialError('Command denied by Clementine safety policy.');
   }
   // CREDENTIAL READS ARE REFUSED, NOT ASKED (owner rule, 2026-08-07: "in
   // autonomous mode I shouldn't have to approve anything"). Interrupting an
@@ -630,7 +670,7 @@ export function assertCommandAllowed(command: string): void {
   // pass. General: any shell command whose whole job is to wait.
   const sleepSeconds = longBlockingSleepSeconds(command);
   if (sleepSeconds !== null) {
-    throw new Error(
+    throw new ShellPolicyDenialError(
       `Refused: this command just waits ${sleepSeconds}s. Nothing was executed. `
       + 'Do NOT block on sleep — you cannot learn anything while sleeping, and the wait costs the run real time. '
       + 'A provider job you started is already being watched: its finished result is delivered to this conversation '
@@ -639,7 +679,7 @@ export function assertCommandAllowed(command: string): void {
     );
   }
   if (shellCommandTouchesSensitiveData(command)) {
-    throw new Error(
+    throw new ShellPolicyDenialError(
       'Refused: this reads credential material (API tokens, .env, auth/vault files). '
       + 'Nothing was executed and no approval is needed — Clementine never needs raw secrets to do work: '
       + 'the provider connections are already authenticated, so call the toolkit/connection directly '
@@ -1467,26 +1507,30 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     ].join('\n'),
     parameters: z.object(RUN_SHELL_COMMAND_PARAMS),
     needsApproval: needsApprovalForShellSmart(),
+    // The Agents SDK normally turns thrown tool errors into an ordinary text
+    // result. Preserve Clementine's own pre-dispatch policy class so the
+    // harness and MCP adapter can render one typed refusal on every lane.
+    errorFunction: (_context, error) => {
+      if (error instanceof ShellPolicyDenialError) {
+        return `${SHELL_POLICY_DENIAL_PREFIX} ${error.message}`;
+      }
+      const details = error instanceof Error ? error.toString() : String(error);
+      return `An error occurred while running the tool. Please try again. Error: ${details}`;
+    },
     execute: async (input, runContext, details) => {
       if (shellMutatesMemoryStore(input.command)) {
-        return formatToolOutput(
-          'run_shell_command',
-          runContext,
-          details,
-          'Refused: direct SQL mutation of the memory store (memory.db / consolidated_facts) bypasses the standing-instruction guards and audit trail. '
-            + 'Use the memory tools instead: memory_pin (pin/unpin), memory_forget (soft/hard delete, refuses pinned), memory_restore (reactivate), memory_remember (add/update). '
-            + 'Read-only inspection of the DB is fine; mutation must go through the tools.',
+        throw new ShellPolicyDenialError(
+          'Direct SQL mutation of the memory store (memory.db / consolidated_facts) bypasses the standing-instruction guards and audit trail. '
+          + 'Use the memory tools instead: memory_pin (pin/unpin), memory_forget (soft/hard delete, refuses pinned), memory_restore (reactivate), memory_remember (add/update). '
+          + 'Read-only inspection of the DB is fine; mutation must go through the tools.',
         );
       }
       const cwd = resolveAllowedCwd(input.cwd ?? undefined);
       if (shellWritesInstalledSkillSource(input.command, cwd)) {
-        return formatToolOutput(
-          'run_shell_command',
-          runContext,
-          details,
-          'Refused: this shell command appears to write into an installed skill source tree under ~/.clementine-next/skills. '
-            + 'Installed skills are treated as read-only package source during runs; write generated artifacts under output/, outputs/, runs/, artifacts/, reports/, or tmp/, '
-            + 'or update the skill through the skill install/update path.',
+        throw new ShellPolicyDenialError(
+          'This shell command appears to write into an installed skill source tree under ~/.clementine-next/skills. '
+          + 'Installed skills are treated as read-only package source during runs; write generated artifacts under output/, outputs/, runs/, artifacts/, reports/, or tmp/, '
+          + 'or update the skill through the skill install/update path.',
         );
       }
       const callId = callIdFromToolDetails(details);

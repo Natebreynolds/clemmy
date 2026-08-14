@@ -42,7 +42,9 @@ const {
   createSession,
   appendEvent,
   getToolOutput,
+  listEvents,
 } = await import('../runtime/harness/eventlog.js');
+const { ExternalWritePreDispatchError } = await import('../runtime/harness/external-write-admission.js');
 const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
 
@@ -252,6 +254,62 @@ test('a nominal local pre-dispatch error RESOLVES as the typed refusal once for 
       /SDK client was not constructed/,
     );
     assert.equal(dispatchAttempts, 1, `${toolSlug}: typed preflight resolves immediately and is never retried`);
+  }
+});
+
+test('a nominal physical-dispatch authority refusal survives the Composio carrier without retry', async () => {
+  const { PhysicalDispatchPreDispatchError } = await import('../runtime/harness/attempt-identity.js');
+  const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
+  const { runComposioExecuteForTestInSession } = await import('./composio-tools.js');
+  for (const toolSlug of ['APIFY_GET_DATASET_ITEMS', 'OUTLOOK_SEND_EMAIL']) {
+    const anchor = anchorAcceptedTask(`exercise ${toolSlug} physical authority refusal`);
+    let executorEntries = 0;
+    let authorityGateEntries = 0;
+    const out = await withAnchoredRunContext(anchor, () => runComposioExecuteForTestInSession(
+      toolSlug,
+      { q: 'ventura restaurants' },
+      (async () => {
+        executorEntries += 1;
+        return { successful: true, data: [] };
+      }) as never,
+      anchor.sessionId,
+      undefined,
+      () => {
+        authorityGateEntries += 1;
+        throw new PhysicalDispatchPreDispatchError('work_binding_required: exact frozen requirement binding is absent');
+      },
+    ));
+    assert.ok((out as unknown) instanceof ExternalWritePreDispatchResult);
+    assert.match(
+      (out as unknown as InstanceType<typeof ExternalWritePreDispatchResult>).output,
+      /^\[provider-dispatch:not-started:work-binding\]/,
+    );
+    assert.equal(authorityGateEntries, 1, `${toolSlug}: nominal refusal never consumes the retry loop`);
+    assert.equal(executorEntries, 0, `${toolSlug}: provider executor is never entered`);
+
+    const db = (await import('../runtime/harness/eventlog.js')).openEventLog();
+    const settlement = db.prepare(`
+      SELECT execution_kind, outcome_kind, physical_crossing_count,
+             host_crossing_count, result_handle_id, credited_progress
+        FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY settled_at DESC LIMIT 1
+    `).get(anchor.sessionId, anchor.sourceUserSeq) as {
+      execution_kind: string;
+      outcome_kind: string;
+      physical_crossing_count: number;
+      host_crossing_count: number;
+      result_handle_id: string | null;
+      credited_progress: number;
+    } | undefined;
+    assert.deepEqual(settlement, {
+      execution_kind: 'refused_pre_dispatch',
+      outcome_kind: 'policy_denial',
+      physical_crossing_count: 0,
+      host_crossing_count: 0,
+      result_handle_id: null,
+      credited_progress: 0,
+    });
   }
 });
 
@@ -617,6 +675,12 @@ test('composioDispatchErrorProvesNoCommit accepts only an in-process pre-dispatc
   );
   assert.equal(
     composioDispatchErrorProvesNoCommit(
+      new ExternalWritePreDispatchError('trusted local dispatch-boundary refusal'),
+    ),
+    true,
+  );
+  assert.equal(
+    composioDispatchErrorProvesNoCommit(
       new Error('[provider-dispatch:not-started:cli-auth] provider-returned marker'),
     ),
     false,
@@ -627,6 +691,78 @@ test('composioDispatchErrorProvesNoCommit accepts only an in-process pre-dispatc
     ),
     false,
   );
+});
+
+test('a trusted dispatch-boundary refusal settles pre-dispatch and never calls the provider thunk', async () => {
+  const { __test__: composioClientTest } = await import('../integrations/composio/client.js');
+  const schemaCache = await import('./composio-schema-cache.js');
+  const slug = 'SLACK_SEND_MESSAGE';
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object',
+    required: ['channel', 'markdown_text'],
+    properties: { channel: { type: 'string' }, markdown_text: { type: 'string' } },
+  }, Date.now());
+  composioClientTest.setConnectedAccountsLoader(async () => [{
+    id: 'ca_boundary_refusal', toolkit: { slug: 'slack' }, status: 'ACTIVE', data: {},
+  }]);
+  const anchor = anchorAcceptedTask('send one exact message');
+  let providerCrossings = 0;
+  try {
+    await assert.rejects(
+      withAnchoredRunContext(anchor, () => dispatchComposioTool(slug, {
+        channel: 'C_EXACT', markdown_text: 'exact body',
+      }, {
+        dispatchBoundary: async (_resolved, providerDispatch) => {
+          const crossProvider = async () => {
+            providerCrossings += 1;
+            return providerDispatch();
+          };
+          void crossProvider;
+          throw new ExternalWritePreDispatchError('schema changed before provider invocation');
+        },
+      })),
+      (error: unknown) => error instanceof ExternalWritePreDispatchError,
+    );
+    assert.equal(providerCrossings, 0);
+    // dispatchComposioTool is the logical-call owner here, not a brackets
+    // wrapper with an external-write reservation. Its canonical settlement is
+    // therefore the logical-call row; expecting a legacy
+    // `external_write_failed` event conflates the two ledgers. The nominal
+    // refusal must close the logical call as pre-dispatch with no physical (or
+    // host) crossing and no result authority.
+    const db = (await import('../runtime/harness/eventlog.js')).openEventLog();
+    const settlement = db.prepare(`
+      SELECT execution_kind, outcome_kind, physical_crossing_count,
+             host_crossing_count, result_handle_id, credited_progress
+        FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY settled_at DESC LIMIT 1
+    `).get(anchor.sessionId, anchor.sourceUserSeq) as {
+      execution_kind: string;
+      outcome_kind: string;
+      physical_crossing_count: number;
+      host_crossing_count: number;
+      result_handle_id: string | null;
+      credited_progress: number;
+    } | undefined;
+    assert.deepEqual(settlement, {
+      execution_kind: 'refused_pre_dispatch',
+      outcome_kind: 'policy_denial',
+      physical_crossing_count: 0,
+      host_crossing_count: 0,
+      result_handle_id: null,
+      credited_progress: 0,
+    });
+    const physical = db.prepare(`
+      SELECT COUNT(*) AS count
+        FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(anchor.sessionId, anchor.sourceUserSeq) as { count: number };
+    assert.equal(physical.count, 0);
+    assert.equal(listEvents(anchor.sessionId, { types: ['external_write_orphaned'] }).length, 0);
+  } finally {
+    composioClientTest.setConnectedAccountsLoader(null);
+  }
 });
 
 test('detectComposioFailure: a 5-digit API "Ok" status code (DataForSEO 20000) is NOT a failure', () => {

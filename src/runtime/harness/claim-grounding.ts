@@ -65,7 +65,20 @@ export function extractDeliverablePointers(text: string): DeliverablePointer[] {
     const hasSlash = normalized.includes('/');
     const documentish = /\.(html?|pdf|docx?|pptx?|xlsx?|csv|png|jpe?g|zip|pages|key)$/.test(normalized);
     if (!hasSlash && !documentish) continue;
-    const segments = normalized.split('/');
+    const segments = normalized.split('/').filter(Boolean);
+    // A slashed pair of short plain words is prose, not a path: "call/task
+    // records", "a yes/no decision", "24/7", "and/or" (live 2026-08-12: two
+    // such pairs inside a quoted draft were judged as undelivered file paths
+    // and bounced the user's own requested content into a verification
+    // summary). Real paths keep grounding through an extension, a ./ ~/ /
+    // marker, depth, or segment shapes prose pairs never have (dots, dashes,
+    // underscores).
+    const pathMarked = /^(?:~?\/|\.\/)/.test(raw);
+    const prosePair = !documentish
+      && !pathMarked
+      && segments.length === 2
+      && segments.every((segment) => /^[a-z0-9]{1,12}$/.test(segment));
+    if (prosePair) continue;
     const basename = segments[segments.length - 1] || normalized;
     out.set(normalized, { kind: 'path', raw, normalized, searchTerm: basename });
   }
@@ -101,6 +114,32 @@ export function ungroundedPointers(
     const forms = pointerEvidenceForms(pointer);
     return !texts.some((text) => forms.some((form) => text.includes(form)));
   });
+}
+
+/**
+ * Call ids of THIS run's own recall reads (`recall_tool_result` /
+ * `tool_output_query`). Bytes the model re-read this run are observed by
+ * definition — this judge exists to catch invented pointers, never quotes of
+ * content the run just had in context (live 2026-08-12: a reply quoting the
+ * user's own requested draft, freshly recalled, was bounced as ungrounded and
+ * replaced with a verification summary). Recall outputs remain
+ * presentation-only for AUTHORITY resolution; they count here as grounding
+ * evidence only.
+ */
+export function recallReadCallIdsForSource(
+  events: ReadonlyArray<{ type: string; data: Record<string, unknown> }>,
+  sourceUserSeq: number,
+): string[] {
+  const out: string[] = [];
+  for (const event of events) {
+    if (event.type !== 'tool_called') continue;
+    if (event.data.sourceUserSeq !== sourceUserSeq) continue;
+    const tool = event.data.tool;
+    if (tool !== 'recall_tool_result' && tool !== 'tool_output_query') continue;
+    const callId = event.data.callId;
+    if (typeof callId === 'string' && callId.trim()) out.push(callId.trim());
+  }
+  return [...new Set(out)];
 }
 
 /** The ONE advisory bounce, model-owned resolution. Null when everything the

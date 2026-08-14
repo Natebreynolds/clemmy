@@ -145,6 +145,46 @@ test('an invalid already-cancelled envelope is left unchanged without installing
   assert.equal(readFileSync(file, 'utf-8'), before);
 });
 
+test('cancelling an ambiguous mutation preserves unresolved external truth without claiming no effect', () => {
+  const runId = 'run-blocked-mutation-cancel';
+  const file = writeRun(runId, {
+    status: 'blocked_mutation',
+    stepOutputs: { prepared: 'durable prior completion' },
+    mutationBlock: {
+      stepId: 'send-update',
+      itemKey: 'channel:C123',
+      tool: 'slack_send_message',
+      fingerprint: 'b'.repeat(64),
+      blockedAt: '2026-08-13T16:00:00.000Z',
+      state: 'awaiting_reconciliation',
+      providerRedispatched: false,
+    },
+  });
+
+  const result = cancelWorkflowRunAtBoundary({
+    runId,
+    reason: 'Stop this workflow.',
+    source: 'test-dashboard',
+  });
+  assert.equal(result.status, 'cancelled');
+  assert.match(result.request.reason, /stopped this local run only/i);
+  assert.match(result.request.reason, /may already have committed/i);
+  assert.match(result.request.reason, /does not undo it/i);
+
+  const canonical = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, any>;
+  assert.equal(canonical.status, 'cancelled');
+  assert.equal(canonical.error, result.request.reason);
+  assert.equal(canonical.reportBack.detail, result.request.reason);
+  assert.deepEqual(canonical.stepOutputs, { prepared: 'durable prior completion' });
+  assert.equal(canonical.mutationBlock.stepId, 'send-update');
+  assert.equal(canonical.mutationBlock.itemKey, 'channel:C123');
+  assert.equal(canonical.mutationBlock.fingerprint, 'b'.repeat(64));
+  assert.equal(canonical.mutationBlock.providerRedispatched, false);
+  assert.equal(canonical.mutationBlock.state, 'cancelled_unreconciled');
+  assert.equal(canonical.mutationBlock.cancelledAt, result.request.requestedAt);
+  assert.doesNotMatch(canonical.error, /was not (performed|sent|written)/i);
+});
+
 // Break-scenario C: the lifecycle-cleanup predicate + boundary contract that
 // delete/disable rely on to stop in-flight runs (console-routes glue).
 const { isTerminalWorkflowRunStatus } = await import('./workflow-run-cancellation.js');
@@ -153,7 +193,7 @@ test('isTerminalWorkflowRunStatus: only genuinely-finished states are terminal',
   for (const s of ['completed', 'completed_with_errors', 'error', 'failed', 'cancelled', 'dry_run', 'creation_test']) {
     assert.equal(isTerminalWorkflowRunStatus(s), true, `${s} is terminal`);
   }
-  for (const s of ['running', 'queued', 'pending', 'parked', undefined, null, 'weird']) {
+  for (const s of ['running', 'queued', 'pending', 'parked', 'blocked_mutation', undefined, null, 'weird']) {
     assert.equal(isTerminalWorkflowRunStatus(s), false, `${String(s)} is NOT terminal — a lifecycle cleanup must cancel it`);
   }
 });

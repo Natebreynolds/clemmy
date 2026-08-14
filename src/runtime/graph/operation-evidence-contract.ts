@@ -109,7 +109,15 @@ export function operationEvidenceContract(input: {
   }
 
   const irreversible = input.reversibility === 'irreversible';
-  if (irreversible || includesAny(parts, SEND_TOKENS)) {
+  // A name token may refine a trusted effect, but it may never override it.
+  // In particular, POST/BROADCAST often names the resource being edited, and
+  // DELETE is irreversible without being a send. Send evidence is therefore
+  // available only inside the external-write + irreversible ceiling.
+  if (
+    input.effectKind === 'external_write'
+    && irreversible
+    && includesAny(parts, SEND_TOKENS)
+  ) {
     return { mode: 'send', requiresExhaustion: false, requiresStaleReconciliation: false };
   }
   if (includesAny(parts, DELETE_TOKENS)) {

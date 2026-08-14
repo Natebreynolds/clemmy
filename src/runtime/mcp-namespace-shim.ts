@@ -31,7 +31,7 @@ import {
 } from './harness/output-grounding-gate.js';
 import { looksLikeNativeMcpSend } from './harness/execution-gate.js';
 import { isConfirmFirstEnabled } from './harness/confirm-first-gate.js';
-import { appendEvent, listEvents } from './harness/eventlog.js';
+import { appendEvent, listEvents, writeToolOutput } from './harness/eventlog.js';
 import {
   settleToolAttempt,
   ToolAttemptSettlementAuthorityError,
@@ -52,6 +52,8 @@ import {
 } from './harness/external-write-admission.js';
 import { classifyShellNetworkMutation } from './harness/destination-gate.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
+import { getToolOutputContext } from './harness/tool-output-context.js';
+import { digestToolOutput } from './harness/tool-output-digest.js';
 import { toolOutputProvesExternalWriteAcknowledgement } from './harness/tool-evidence.js';
 import { classifyRuntimeToolEffect } from './harness/tool-effect.js';
 import {
@@ -376,6 +378,49 @@ function clipMcpResultForRecall(toolName: string, result: CallToolResultContent)
       })
       .join('\n');
     if (!combined) return result;
+    const outputContext = getToolOutputContext();
+    const exactCodeModeInvocation = Boolean(
+      harnessRunContextStorage.getStore()?.codeMode
+      && outputContext?.sessionId === sessionId
+      && outputContext.callId
+      && outputContext.toolName === toolName
+      && outputContext.settlementNonce,
+    );
+    if (exactCodeModeInvocation) {
+      // The MCP SDK surface is an array with optional metadata properties.
+      // Persist one ordinary serializable envelope so code mode receives the
+      // complete normalized result (including isError/structuredContent), not
+      // merely the concatenated text that presentation clipping operates on.
+      const metadata = result as unknown as Record<string, unknown>;
+      const envelope = {
+        content: Array.from(result),
+        ...(metadata.isError !== undefined ? { isError: metadata.isError } : {}),
+        ...(metadata.structuredContent !== undefined
+          ? { structuredContent: metadata.structuredContent }
+          : {}),
+        ...(metadata._meta !== undefined ? { _meta: metadata._meta } : {}),
+      };
+      writeToolOutput({
+        sessionId,
+        callId: outputContext!.callId!,
+        tool: toolName,
+        output: JSON.stringify(envelope),
+        invocationNonce: outputContext!.settlementNonce,
+      });
+      // Keep the transport value small while the program retrieves the exact
+      // nonce row above. This is presentation only and deliberately does not
+      // call formatRecallableToolText (which would overwrite the exact row).
+      if (combined.length <= 20_000) return result;
+      const compact = digestToolOutput(combined, {
+        maxChars: 20_000,
+        toolName,
+        callId: outputContext!.callId!,
+      });
+      const nonText = result.filter((block) => (block as { type?: string } | null)?.type !== 'text');
+      const clippedResult = [{ type: 'text', text: compact }, ...nonText] as CallToolResultContent;
+      copyMcpResultMetadata(result, clippedResult);
+      return clippedResult;
+    }
     mcpRecallSeq += 1;
     const callId = `mcp_${toolName}_${mcpRecallSeq}`;
     const clipped = formatRecallableToolText(combined, { sessionId, callId, toolName });
@@ -1243,8 +1288,17 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // plan scope — an enumerated send scope authorizes the send; without the
       // id it always fell through to policy and blocked a scoped send
       // (2026-07-09).
-      const decision = decideToolApproval({ toolName, args, sessionId: harnessRunContextStorage.getStore()?.sessionId });
-      if (decision.needsApproval) {
+      const activeRunContext = harnessRunContextStorage.getStore();
+      const pendingActionExecutionVerified = activeRunContext?.pendingActionExecution
+        ? (await import('./harness/pending-actions.js')).verifyPendingActionExecutionCapability({
+            capability: activeRunContext.pendingActionExecution,
+            sessionId: activeRunContext.sessionId,
+            toolName,
+            payload: args,
+          })
+        : false;
+      const decision = decideToolApproval({ toolName, args, sessionId: activeRunContext?.sessionId });
+      if (decision.needsApproval && !pendingActionExecutionVerified) {
         // T2.5 — Throw a structured BoundaryError instead of a bare
         // Error. The Codex runtime's MCP catch path used to receive a
         // plain Error and stringify it into the tool's output; the
@@ -1286,7 +1340,6 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // Blocks surface as soft tool errors the model recovers from. The
       // external_write ledger (emitted on success below) is SHARED with the
       // composio path so duplicate detection spans both surfaces.
-      const activeRunContext = harnessRunContextStorage.getStore();
       const integritySessionId = activeRunContext?.sessionId;
       // Gate as a send when the tool is send-kind (audit #1) OR its args describe
       // a network mutation (audit #6 — kernel exec_command/browser_curl etc.).
@@ -1654,6 +1707,16 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Credit the MCP proven path's outcome (success, or a structured failure
         // envelope) — the ONLY place native MCP results reach procedural memory.
         creditMcpOutcome(toolName, failure.failed, rawText || failure.summary);
+        // Settle from the exact normalized provider envelope, never its later
+        // presentation digest. This preserves structured success/error truth
+        // and lets code mode park the same envelope under its child nonce.
+        settleNativeMcpAttempt({
+          toolName,
+          args,
+          result: normalized.result,
+          mutating: nativeCallIsMutating(toolName, args),
+          callId: externalWriteCallId,
+        });
         // Cap + park a large raw result for recall BEFORE the fan-out nudge, so a
         // 200KB MCP dump can't flood the chat context window unrecoverably.
         const result = clipMcpResultForRecall(toolName, normalized.result);
@@ -1690,11 +1753,6 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
             },
           });
         }
-        // The shared settlement seam. This lane never passed through
-        // wrapToolForHarness, so it used to recover by its own rules — and a
-        // native MCP failure moved no budget at all. One call puts it on the
-        // same footing as every other lane.
-        settleNativeMcpAttempt({ toolName, args, result, mutating: nativeCallIsMutating(toolName, args), callId: externalWriteCallId });
         // Parity with shell/Composio: prepend a self-correcting header when the
         // result is a failure envelope (best-effort; success is byte-identical).
         const flagged = annotateMcpResultFailure(toolName, result);

@@ -94,6 +94,7 @@ const {
 } = await import('./durable-memory-receipt.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 type TerminalDeliveryJudgePort = import('./terminal-delivery-judge.js').TerminalDeliveryJudgePort;
+type TerminalDeliveryJudgeRequest = import('./terminal-delivery-judge.js').TerminalDeliveryJudgeRequest;
 const fixtureDispatchLedger = await import('./dispatch-ledger.js');
 const fixtureOutcomes = await import('./attempt-outcome.js');
 const fixtureSettlements = await import('./logical-call-settlement-store.js');
@@ -101,6 +102,7 @@ const fixtureIdentities = await import('./attempt-identity.js');
 const fixtureWorkManifest = await import('./work-manifest.js');
 const fixtureAttempts = await import('./attempt-settlement.js');
 const fixtureExpectedWork = await import('./expected-work-admission.js');
+const fixtureSettlementAudit = await import('./accepted-source-settlement-audit.js');
 const outputGrounding = await import('./output-grounding-gate.js');
 
 
@@ -212,6 +214,21 @@ function settleFixtureRead(sessionId: string): void {
     // An ACTIVATED action refuses unbound business dispatch outright
     // (work_binding_required) — settle the act fixture through the
     // work-manifest authority lane instead, exactly as live fan-out does.
+    // The refusal may land AFTER the logical call was admitted; close that
+    // row exactly as the live pre-dispatch refusal seam does, or the
+    // settlement audit honestly reports the turn in_flight forever.
+    try {
+      fixtureAttempts.settleAdmittedLogicalCallPreDispatchRefusal({
+        sessionId,
+        sourceUserSeq: source.seq,
+        logicalToolCallId: identity.logicalToolCallId,
+        toolName: 'fixture_mailbox_search',
+        args: { query: 'fixture' },
+        lane: 'composio',
+        turn: 1,
+        reason: 'fixture pivot to work-manifest authority',
+      });
+    } catch { /* the row may never have been admitted */ }
     fixtureWorkManifest.declareWorkManifest({
       sessionId,
       sourceUserSeq: source.seq,
@@ -251,6 +268,65 @@ function settleFixtureRead(sessionId: string): void {
     recovery: { businessCall: true, mutating: false },
     observer: { lane: 'composio', turn: 1 },
   });
+}
+
+/** One exact read-only provider lifecycle used by terminal recovery pins. The
+ * caller supplies the accepted source explicitly so an overlapping user event
+ * can never steal the evidence. */
+function settleExactTerminalInspectionRead(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  toolName: string;
+  args: Record<string, unknown>;
+  payload: unknown;
+}): string {
+  const source = listEvents(input.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === input.sourceUserSeq);
+  assert.ok(source, 'exact accepted source exists');
+  fixtureReadSerial += 1;
+  const logicalToolCallId = `logical:terminal-inspection:${input.sourceUserSeq}:${fixtureReadSerial}`;
+  const identity = {
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    turn: source.turn,
+    acceptedTaskId: fixtureIdentities.acceptedTaskIdFor(input.sessionId, input.sourceUserSeq),
+    logicalToolCallId,
+    physicalDispatchId: `dispatch:terminal-inspection:${input.sourceUserSeq}:${fixtureReadSerial}`,
+    ordinal: 0,
+  };
+  const begun = fixtureDispatchLedger.beginPhysicalDispatch({
+    identity,
+    tool: input.toolName,
+    args: input.args,
+  });
+  assert.equal(begun.status, 'inserted', JSON.stringify(begun));
+  const carrierSlug = typeof input.args.tool_slug === 'string'
+    ? input.args.tool_slug.trim().toLowerCase()
+    : input.toolName;
+  const carrierArgs = input.args.arguments ?? input.args;
+  const crossed = fixtureDispatchLedger.settlePhysicalDispatch({
+    identity: begun.identity,
+    tool: carrierSlug,
+    outcome: 'returned',
+  });
+  assert.equal(crossed.status, 'inserted', JSON.stringify(crossed));
+  const committed = fixtureSettlements.commitLogicalCallSettlement({
+    identity: {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      turn: source.turn,
+      acceptedTaskId: identity.acceptedTaskId,
+      logicalToolCallId,
+    },
+    contract: { toolName: carrierSlug, args: carrierArgs },
+    execution: { kind: 'provider_execution', physicalDispatchId: begun.identity.physicalDispatchId },
+    result: { payload: input.payload },
+    outcome: fixtureOutcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: false },
+    observer: { lane: 'composio', turn: source.turn },
+  });
+  assert.equal(committed.status, 'committed', JSON.stringify(committed));
+  return logicalToolCallId;
 }
 
 const { BoundaryError } = await import('../boundary-error.js');
@@ -476,7 +552,7 @@ const { _setCodeModeToolsForTests } = await import('../../tools/code-mode-tool.j
 
 test.after(() => {
   try {
-    rmSync(TMP_HOME, { recursive: true, force: true });
+    if (!process.env.CLEM_TEST_KEEP_HOME) rmSync(TMP_HOME, { recursive: true, force: true });
   } catch {
     /* best effort */
   }
@@ -495,8 +571,196 @@ function makeAgentStub(): import('@openai/agents').Agent<any, any> {
   return {} as import('@openai/agents').Agent<any, any>;
 }
 
+test('settled consequential turn authors one memory-aware preamble and executes in the same turn', async () => {
+  resetEventLog();
+  process.env.CLEMMY_CONFIRM_BEAT = 'on';
+  const { _setOpennessJudgeForTests } = await import('./turn-openness.js');
+  let authorStarted = false;
+  let judgeObservedConcurrentAuthor = false;
+  _setOpennessJudgeForTests(async () => {
+    judgeObservedConcurrentAuthor = authorStarted;
+    return null;
+  });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'structural preflight' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'system',
+    type: 'cross_session_prefix',
+    data: { text: 'VENTURA-CONTEXT: use the prior restaurant research and the same delivery convention.' },
+  });
+  let fullRunnerCalls = 0;
+  let authorCalls = 0;
+  const painted: string[] = [];
+  let filteredText = '';
+  try {
+    const result = await runTurn({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.',
+      makeRunner: makeRunnerStub,
+      runRunner: async (_runner, _agent, items, opts) => {
+        fullRunnerCalls += 1;
+        const filter = opts.callModelInputFilter as ((args: {
+          modelData: { input: AgentInputItem[]; instructions?: string };
+        }) => { input: AgentInputItem[]; instructions?: string });
+        filteredText = filter({ modelData: { input: items, instructions: 'base' } }).input
+          .map((item) => String((item as { content?: unknown }).content ?? ''))
+          .join('\n');
+        return {
+          history: [
+            ...items,
+            { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Started.' }] },
+          ] as AgentInputItem[],
+          finalOutput: 'Started.',
+        };
+      },
+      preflightConversationPort: {
+        async render(packet) {
+          authorCalls += 1;
+          authorStarted = true;
+          assert.equal(packet.kind, 'proceed');
+          assert.match(packet.conversationContext, /VENTURA-CONTEXT/);
+          return 'I have the prior Ventura context and the same sheet-to-email handoff in mind.';
+        },
+      },
+      onConversationPreamble: async (text) => {
+        painted.push(text);
+        assert.equal(fullRunnerCalls, 0, 'the opening is painted before the execution model runs');
+        return { status: 'delivered' };
+      },
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(fullRunnerCalls, 1);
+    assert.equal(authorCalls, 1);
+    assert.equal(
+      judgeObservedConcurrentAuthor,
+      true,
+      'the active-brain SETTLED author starts before the cross-family judge settles',
+    );
+    assert.deepEqual(painted, ['I have the prior Ventura context and the same sheet-to-email handoff in mind.']);
+    assert.match(filteredText, /VENTURA-CONTEXT/);
+    assert.match(filteredText, /pre-execution opening already delivered/);
+    assert.equal(listEvents(sess.id, { types: ['conversation_preamble'] }).length, 1);
+    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input', 'conversation_completed'] }).length, 0);
+  } finally {
+    _setOpennessJudgeForTests(null);
+  }
+});
+
+for (const judgeMode of ['settled', 'unavailable'] as const) {
+  test(`a concrete Salesforce org proceeds through the Codex caller when the openness judge is ${judgeMode}`, async () => {
+    resetEventLog();
+    process.env.CLEMMY_CONFIRM_BEAT = 'on';
+    const { _setOpennessJudgeForTests } = await import('./turn-openness.js');
+    let judgeCalls = 0;
+    _setOpennessJudgeForTests(async () => {
+      judgeCalls += 1;
+      if (judgeMode === 'unavailable') throw new Error('openness judge unavailable');
+      return null;
+    });
+    const sess = HarnessSession.create({ kind: 'chat', title: `Salesforce ${judgeMode}` });
+    const prompt = 'Import exactly 100 Contact rows from /tmp/rc-contacts.csv into Salesforce org clementine-sandbox using External_Id__c.';
+    let runnerCalls = 0;
+    let authorCalls = 0;
+    const painted: string[] = [];
+    try {
+      await runTurn({
+        agent: makeAgentStub(),
+        sessionId: sess.id,
+        input: prompt,
+        makeRunner: makeRunnerStub,
+        runRunner: async (_runner, _agent, items) => {
+          runnerCalls += 1;
+          return {
+            history: [
+              ...items,
+              { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Started.' }] },
+            ] as AgentInputItem[],
+            finalOutput: 'Started.',
+          };
+        },
+        preflightConversationPort: {
+          async render(packet) {
+            authorCalls += 1;
+            assert.equal(packet.kind, 'proceed');
+            assert.equal(packet.objective, prompt);
+            return 'I have the exact Salesforce org, import source, row bound, and merge key.';
+          },
+        },
+        onConversationPreamble: async (text) => {
+          painted.push(text);
+          assert.equal(runnerCalls, 0, 'the preamble is visible before execution');
+          return { status: 'delivered' };
+        },
+      });
+
+      assert.equal(judgeCalls, 1);
+      assert.equal(authorCalls, 1);
+      assert.equal(runnerCalls, 1, 'the accepted request reaches the tool-capable runner once');
+      assert.deepEqual(painted, ['I have the exact Salesforce org, import source, row bound, and merge key.']);
+      const decisions = listEvents(sess.id, { types: ['turn_preflight_decision'] });
+      assert.equal(decisions.length, 1);
+      assert.equal(
+        decisions[0]?.data.destinationInstanceUnstated,
+        true,
+        'the legacy request-text flag remains context, but is not an openness verdict',
+      );
+      assert.equal(listEvents(sess.id, { types: ['conversation_preamble'] }).length, 1);
+      assert.equal(
+        listEvents(sess.id, { types: ['awaiting_user_input'] })
+          .filter((event) => event.data.source === 'preflight_openness').length,
+        0,
+        'request text alone cannot publish an openness question or its terminal',
+      );
+      assert.equal(
+        listEvents(sess.id, { types: ['conversation_completed'] }).length,
+        0,
+        'the preflight path owns no terminal before or instead of execution',
+      );
+    } finally {
+      _setOpennessJudgeForTests(null);
+    }
+  });
+}
+
+test('genuinely open alignment commits one question and never enters the tool-capable runner', async () => {
+  resetEventLog();
+  process.env.CLEMMY_CONFIRM_BEAT = 'on';
+  const { _setOpennessJudgeForTests } = await import('./turn-openness.js');
+  _setOpennessJudgeForTests(async () => ({ open: ['which connected Google account owns the new sheet'] }));
+  const sess = HarnessSession.create({ kind: 'chat', title: 'outer structural preflight' });
+  let fullRunnerCalls = 0;
+  const modelText = 'Which connected Google account should own the new sheet?';
+  try {
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Create a Google Sheet with the top five Ventura restaurants, then email me the link.',
+      makeRunner: makeRunnerStub,
+      runRunner: async () => {
+        fullRunnerCalls += 1;
+        throw new Error('the tool-capable runner must not run while a load-bearing value is open');
+      },
+      preflightConversationPort: { async render() { return modelText; } },
+    });
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(result.publicPresentation?.text, modelText);
+    assert.equal(result.publicPresentation?.status, 'needs_input');
+    assert.equal(fullRunnerCalls, 0);
+    assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).length, 1);
+    const awaiting = listEvents(sess.id, { types: ['awaiting_user_input'] });
+    assert.equal(awaiting.length, 1);
+    assert.equal(awaiting[0]?.data.source, 'preflight_openness');
+    assert.equal(listEvents(sess.id, { types: ['conversation_preamble', 'tool_called', 'tool_returned'] }).length, 0);
+  } finally {
+    _setOpennessJudgeForTests(null);
+  }
+});
+
 function terminalDeliveryJudgeFixture(
-  run: () => unknown | Promise<unknown>,
+  run: (request: TerminalDeliveryJudgeRequest) => unknown | Promise<unknown>,
 ): TerminalDeliveryJudgePort {
   return {
     async resolveRoute() {
@@ -509,7 +773,53 @@ function terminalDeliveryJudgeFixture(
         selfJudge: false,
       };
     },
-    async run() { return run(); },
+    async run(request) { return run(request); },
+  };
+}
+
+function recoverableTerminalInspectionJudge(input: {
+  recoveryInstruction: string;
+  askIfRepeated: string;
+  deliveredText: string;
+}): {
+  port: TerminalDeliveryJudgePort;
+  calls(): number;
+  prompts(): readonly string[];
+} {
+  let calls = 0;
+  const prompts: string[] = [];
+  return {
+    port: terminalDeliveryJudgeFixture((request) => {
+      calls += 1;
+      prompts.push(request.prompt);
+      const canInspect = [
+        'Live continuation: AVAILABLE',
+        'Tools during continuation: AVAILABLE',
+        'Read-only external-state inspection: AVAILABLE',
+      ].every((fact) => request.prompt.includes(fact));
+      if (!canInspect) {
+        return {
+          verb: 'ask',
+          reason: 'the recovery carrier was not available to the judge',
+          publicText: 'Please inspect the external provider state and report back.',
+        };
+      }
+      if (/"successfulBusinessSettlements":[1-9]/.test(request.prompt)) {
+        return {
+          verb: 'deliver',
+          reason: 'the resumed exact read now verifies the relevant provider state',
+          publicText: input.deliveredText,
+        };
+      }
+      return {
+        verb: 'resume',
+        reason: 'the running agent can inspect the exact provider state read-only',
+        recoveryInstruction: input.recoveryInstruction,
+        askIfRepeated: input.askIfRepeated,
+      };
+    }),
+    calls: () => calls,
+    prompts: () => prompts,
   };
 }
 
@@ -3942,8 +4252,11 @@ test('effect self-reconciliation publishes the terminal judge\'s exact ASK inste
     terminalPresentationRepairPort: {
       async render() { throw new Error('a decided terminal judge must own the public words'); },
     },
-    terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => {
+    terminalDeliveryJudgePort: terminalDeliveryJudgeFixture((request) => {
       judgeCalls += 1;
+      assert.match(request.prompt, /Live continuation: AVAILABLE/);
+      assert.match(request.prompt, /Tools during continuation: AVAILABLE/);
+      assert.match(request.prompt, /Read-only external-state inspection: AVAILABLE/);
       return {
         verb: 'ask',
         reason: 'the exact external state requires human inspection',
@@ -4010,7 +4323,7 @@ test('self-reconciliation judge unavailability spends the sealed terminal repair
               cardinality: { kind: 'once' },
             },
             {
-              id: 'write-report', effect: 'local_write',
+              id: 'write-report', effect: 'local_write', coverage: null,
               dependsOn: ['read-source'], dataFrom: ['read-source'], cardinality: { kind: 'once' },
             },
           ],
@@ -4188,7 +4501,7 @@ test('self-reconciliation RESUME clears private mode and a repeated RESUME becom
   artifactLedger._resetArtifactLedgerForTests();
   const sess = HarnessSession.create({ kind: 'chat' });
   const savedCandidate = 'The report is ready.';
-  const repeatedAsk = 'The report still has no verified resource. Can you check whether Fixture Docs created it and share the exact document you see?';
+  const repeatedAsk = 'The retained report is still not visible through the current Fixture Docs connection. Which connected account should I use for one final read-only check?';
   let calls = 0;
   let judgeCalls = 0;
   const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
@@ -6081,22 +6394,18 @@ test('request-bound write evidence: stale execution receipts cannot certify a fr
 
 test('request-bound write evidence: exhausted verification never false-greens a stale PASS', async () => {
   resetEventLog();
-  const judgeQuestion = 'I could not verify a fresh Google Sheets receipt for this request. Can you check the target sheet and tell me whether the new write appears?';
+  const deliveredText = 'I inspected the exact target sheet and confirmed the requested values are present in Sheet1!E1:G5.';
   const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
   process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
   try {
     const sess = HarnessSession.create({ kind: 'chat' });
-    const runner = scriptedRunner([
-      {
-        finalOutput: {
-          summary: 'PASS using an old execution',
-          reply: 'PASS — prior receipt old-write-123 proves the new Sheet write completed.',
-          done: true,
-          nextAction: 'completed',
-          reason: null,
-        },
-      },
-    ]);
+    let runs = 0;
+    let sourceUserSeq = 0;
+    const judge = recoverableTerminalInspectionJudge({
+      recoveryInstruction: 'Read Sheet1!E1:G5 from the exact retained spreadsheet identifier and bind that read to this accepted request without repeating the write.',
+      askIfRepeated: 'I still cannot access the retained spreadsheet with the current connection. Which connected Google account should I use?',
+      deliveredText,
+    });
     const result = await runConversation({
       agent: makeAgentStub(),
       sessionId: sess.id,
@@ -6104,23 +6413,53 @@ test('request-bound write evidence: exhausted verification never false-greens a 
       judgeCompletion: true,
       judgeFn: async () => ({ done: true, reason: 'accepted stale claim' }),
       makeRunner: makeRunnerStub,
-      runRunner: runner,
+      runRunner: async (runner, _agent, items, opts) => {
+        runs += 1;
+        sourceUserSeq = (opts.context as { sourceUserSeq: number }).sourceUserSeq;
+        if (runs === 2) {
+          (runner as unknown as EventEmitter).emit('agent_tool_start');
+          settleExactTerminalInspectionRead({
+            sessionId: sess.id,
+            sourceUserSeq,
+            toolName: 'composio_execute_tool',
+            args: {
+              tool_slug: 'GOOGLESHEETS_BATCH_GET',
+              arguments: { spreadsheetId: 'sheet-request-bound', ranges: ['Sheet1!E1:G5'] },
+            },
+            payload: { successful: true, data: { range: 'Sheet1!E1:G5', values: [['name', 'rating', 'address']] } },
+          });
+        }
+        const finalOutput = runs === 1 ? {
+          summary: 'PASS using an old execution',
+          reply: 'PASS — prior receipt old-write-123 proves the new Sheet write completed.',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        } : {
+          summary: deliveredText,
+          reply: deliveredText,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        };
+        return { history: items, lastResponseId: undefined, finalOutput };
+      },
       terminalPresentationRepairPort: {
         async render() { throw new Error('the terminal judge must own the public words'); },
       },
-      terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => ({
-        verb: 'ask',
-        reason: 'this accepted request has no current durable write receipt',
-        publicText: judgeQuestion,
-      })),
+      terminalDeliveryJudgePort: judge.port,
     });
-    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(runs, 2, 'the terminal judge reopens the live loop once');
+    assert.equal(judge.calls(), 2, 'the exact read is assessed before truthful delivery');
+    assert.equal(result.status, 'completed', result.error ?? JSON.stringify(result.publicPresentation));
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
-    assert.equal(terminal.data.delivered, false);
-    assert.equal(terminal.data.summary, judgeQuestion);
-    assert.equal(terminal.data.reply, judgeQuestion);
-    assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
-    assert.doesNotMatch(String(terminal.data.reply), /^PASS\b/);
+    assert.equal(terminal.data.delivered, true);
+    assert.equal(terminal.data.reply, deliveredText);
+    assert.equal(terminal.data.terminalJudgeDisposition, 'deliver');
+    assert.equal(fixtureSettlementAudit.auditAcceptedSourceSettlementTruth({
+      sessionId: sess.id,
+      sourceUserSeq,
+    }).facts.successfulBusinessSettlements, 1);
     const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
     assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
   } finally {
@@ -6131,44 +6470,65 @@ test('request-bound write evidence: exhausted verification never false-greens a 
 
 test('request-bound write evidence: a direct communication command requires a current receipt', async () => {
   resetEventLog();
-  const judgeQuestion = 'I could not verify a current send receipt for that email. Can you check Sent mail for the prospect before the message is retried?';
+  const deliveredText = 'I inspected Sent mail read-only and confirmed the exact message to prospect@example.test is present once.';
   const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
   process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
   try {
     const sess = HarnessSession.create({ kind: 'chat' });
-    const runner = scriptedRunner([{
-      finalOutput: {
-        summary: 'email sent',
-        reply: 'Done — I emailed the prospect.',
-        done: true,
-        nextAction: 'completed',
-        reason: null,
-      },
-    }]);
+    let runs = 0;
+    let sourceUserSeq = 0;
+    const judge = recoverableTerminalInspectionJudge({
+      recoveryInstruction: 'Search Sent mail read-only for the exact recipient and subject from this accepted request; bind the observed message id without sending again.',
+      askIfRepeated: 'The connected mailbox cannot read Sent mail. Which connected mailbox should I inspect?',
+      deliveredText,
+    });
     const result = await runConversation({
       agent: makeAgentStub(),
       sessionId: sess.id,
-      input: 'Email the prospect.',
+      input: 'Email prospect@example.test.',
       judgeCompletion: true,
       judgeFn: async () => ({ done: true, reason: 'accepted unsupported claim' }),
       makeRunner: makeRunnerStub,
-      runRunner: runner,
+      runRunner: async (runner, _agent, items, opts) => {
+        runs += 1;
+        sourceUserSeq = (opts.context as { sourceUserSeq: number }).sourceUserSeq;
+        if (runs === 2) {
+          (runner as unknown as EventEmitter).emit('agent_tool_start');
+          settleExactTerminalInspectionRead({
+            sessionId: sess.id,
+            sourceUserSeq,
+            toolName: 'composio_execute_tool',
+            args: {
+              tool_slug: 'OUTLOOK_SEARCH_EMAILS',
+              arguments: { folder: 'sent', to: 'prospect@example.test', subject: 'Quarterly follow-up' },
+            },
+            payload: { successful: true, data: { messages: [{ id: 'sent-message-1', to: 'prospect@example.test' }] } },
+          });
+        }
+        const finalOutput = runs === 1 ? {
+          summary: 'email sent',
+          reply: 'Done — I emailed the prospect.',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        } : {
+          summary: deliveredText, reply: deliveredText, done: true, nextAction: 'completed', reason: null,
+        };
+        return { history: items, lastResponseId: undefined, finalOutput };
+      },
       terminalPresentationRepairPort: {
         async render() { throw new Error('the terminal judge must own the public words'); },
       },
-      terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => ({
-        verb: 'ask',
-        reason: 'the direct communication has no current durable send receipt',
-        publicText: judgeQuestion,
-      })),
+      terminalDeliveryJudgePort: judge.port,
     });
-    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(runs, 2);
+    assert.equal(judge.calls(), 2);
+    assert.equal(result.status, 'completed', result.error ?? JSON.stringify(result.publicPresentation));
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
-    assert.equal(terminal.data.delivered, false);
-    assert.equal(terminal.data.summary, judgeQuestion);
-    assert.equal(terminal.data.reply, judgeQuestion);
-    assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
-    assert.doesNotMatch(String(terminal.data.reply), /emailed the prospect/i);
+    assert.equal(terminal.data.delivered, true);
+    assert.equal(terminal.data.reply, deliveredText);
+    assert.equal(terminal.data.terminalJudgeDisposition, 'deliver');
+    assert.equal(fixtureSettlementAudit.auditAcceptedSourceSettlementTruth({ sessionId: sess.id, sourceUserSeq }).facts.successfulBusinessSettlements, 1);
     const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
     assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
   } finally {
@@ -6179,44 +6539,60 @@ test('request-bound write evidence: a direct communication command requires a cu
 
 test('request-bound write evidence: a direct invitation response cannot false-complete without a receipt', async () => {
   resetEventLog();
-  const judgeQuestion = 'I could not verify a current RSVP receipt for that invitation. Can you check the invitation response before it is retried?';
+  const deliveredText = 'I inspected the exact invitation read-only and confirmed its response status is accepted.';
   const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
   process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
   try {
     const sess = HarnessSession.create({ kind: 'chat' });
-    const runner = scriptedRunner([{
-      finalOutput: {
-        summary: 'invitation accepted',
-        reply: 'Done — I RSVP’d yes to the invitation.',
-        done: true,
-        nextAction: 'completed',
-        reason: null,
-      },
-    }]);
+    let runs = 0;
+    let sourceUserSeq = 0;
+    const judge = recoverableTerminalInspectionJudge({
+      recoveryInstruction: 'Read the exact retained invitation or event id and bind its current attendee response to this accepted request without responding again.',
+      askIfRepeated: 'The current calendar connection cannot read that invitation. Which connected calendar should I inspect?',
+      deliveredText,
+    });
     const result = await runConversation({
       agent: makeAgentStub(),
       sessionId: sess.id,
-      input: 'RSVP yes to the invitation.',
+      input: 'RSVP yes to invitation event-invite-1.',
       judgeCompletion: true,
       judgeFn: async () => ({ done: true, reason: 'accepted unsupported claim' }),
       makeRunner: makeRunnerStub,
-      runRunner: runner,
+      runRunner: async (runner, _agent, items, opts) => {
+        runs += 1;
+        sourceUserSeq = (opts.context as { sourceUserSeq: number }).sourceUserSeq;
+        if (runs === 2) {
+          (runner as unknown as EventEmitter).emit('agent_tool_start');
+          settleExactTerminalInspectionRead({
+            sessionId: sess.id,
+            sourceUserSeq,
+            toolName: 'composio_execute_tool',
+            args: { tool_slug: 'GOOGLECALENDAR_GET_EVENT', arguments: { event_id: 'event-invite-1' } },
+            payload: { successful: true, data: { id: 'event-invite-1', responseStatus: 'accepted' } },
+          });
+        }
+        const finalOutput = runs === 1 ? {
+          summary: 'invitation accepted',
+          reply: 'Done — I RSVP’d yes to the invitation.',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        } : { summary: deliveredText, reply: deliveredText, done: true, nextAction: 'completed', reason: null };
+        return { history: items, lastResponseId: undefined, finalOutput };
+      },
       terminalPresentationRepairPort: {
         async render() { throw new Error('the terminal judge must own the public words'); },
       },
-      terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => ({
-        verb: 'ask',
-        reason: 'the invitation response has no current durable receipt',
-        publicText: judgeQuestion,
-      })),
+      terminalDeliveryJudgePort: judge.port,
     });
-    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(runs, 2);
+    assert.equal(judge.calls(), 2);
+    assert.equal(result.status, 'completed', result.error ?? JSON.stringify(result.publicPresentation));
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
-    assert.equal(terminal.data.delivered, false);
-    assert.equal(terminal.data.summary, judgeQuestion);
-    assert.equal(terminal.data.reply, judgeQuestion);
-    assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
-    assert.doesNotMatch(String(terminal.data.reply), /RSVP.d yes/i);
+    assert.equal(terminal.data.delivered, true);
+    assert.equal(terminal.data.reply, deliveredText);
+    assert.equal(terminal.data.terminalJudgeDisposition, 'deliver');
+    assert.equal(fixtureSettlementAudit.auditAcceptedSourceSettlementTruth({ sessionId: sess.id, sourceUserSeq }).facts.successfulBusinessSettlements, 1);
     const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
     assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
   } finally {
@@ -6227,41 +6603,60 @@ test('request-bound write evidence: a direct invitation response cannot false-co
 
 test('request-bound write evidence: an overlapping request completion cannot certify this request', async () => {
   resetEventLog();
-  const judgeQuestion = 'I could not verify a fresh Google Sheets receipt for request A. Can you check request A\'s target sheet and tell me whether the new write appears?';
+  const deliveredText = 'I inspected request A\'s exact target sheet and confirmed its requested range is present; request B\'s certificate was not used.';
   const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
   process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
   try {
     const sess = HarnessSession.create({ kind: 'chat' });
-    const runRunner: RunRunnerFn = async (_runner, _agent, items, opts) => {
-      const foreignSource = appendEvent({
-        sessionId: sess.id,
-        turn: 2,
-        role: 'user',
-        type: 'user_input_received',
-        data: { text: 'Unrelated overlapping request B.' },
-      });
-      appendEvent({
-        sessionId: sess.id,
-        turn: 2,
-        role: 'tool',
-        type: 'tool_returned',
-        data: {
-          sourceUserSeq: foreignSource.seq,
-          tool: 'execution_complete',
-          callId: 'foreign-execution-complete',
-          preview: 'Execution exec-b completed. Request B has verified receipts.',
-        },
-      });
-      assert.notEqual(
-        foreignSource.seq,
-        (opts.context as { sourceUserSeq?: number }).sourceUserSeq,
-      );
-      const decision = {
+    let runs = 0;
+    let sourceUserSeq = 0;
+    const judge = recoverableTerminalInspectionJudge({
+      recoveryInstruction: 'Ignore request B\'s certificate; read request A\'s exact retained spreadsheet id and range read-only, then bind only that result to request A.',
+      askIfRepeated: 'Request A\'s spreadsheet is not visible to the current Google connection. Which connected Google account should I use?',
+      deliveredText,
+    });
+    const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+      runs += 1;
+      sourceUserSeq = (opts.context as { sourceUserSeq: number }).sourceUserSeq;
+      if (runs === 1) {
+        const foreignSource = appendEvent({
+          sessionId: sess.id,
+          turn: 2,
+          role: 'user',
+          type: 'user_input_received',
+          data: { text: 'Unrelated overlapping request B.' },
+        });
+        appendEvent({
+          sessionId: sess.id,
+          turn: 2,
+          role: 'tool',
+          type: 'tool_returned',
+          data: {
+            sourceUserSeq: foreignSource.seq,
+            tool: 'execution_complete',
+            callId: 'foreign-execution-complete',
+            preview: 'Execution exec-b completed. Request B has verified receipts.',
+          },
+        });
+        assert.notEqual(foreignSource.seq, sourceUserSeq);
+      } else {
+        (runner as unknown as EventEmitter).emit('agent_tool_start');
+        settleExactTerminalInspectionRead({
+          sessionId: sess.id,
+          sourceUserSeq,
+          toolName: 'composio_execute_tool',
+          args: { tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: { spreadsheetId: 'sheet-request-a', ranges: ['RequestA!A1:C5'] } },
+          payload: { successful: true, data: { range: 'RequestA!A1:C5', values: [['request-a']] } },
+        });
+      }
+      const decision = runs === 1 ? {
         summary: 'PASS using request B',
         reply: 'PASS — the execution certificate proves the requested write completed.',
         done: true,
         nextAction: 'completed',
         reason: null,
+      } : {
+        summary: deliveredText, reply: deliveredText, done: true, nextAction: 'completed', reason: null,
       };
       return { history: items, lastResponseId: undefined, finalOutput: decision };
     };
@@ -6277,20 +6672,17 @@ test('request-bound write evidence: an overlapping request completion cannot cer
       terminalPresentationRepairPort: {
         async render() { throw new Error('the terminal judge must own the public words'); },
       },
-      terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => ({
-        verb: 'ask',
-        reason: 'the only execution certificate belongs to a different accepted request',
-        publicText: judgeQuestion,
-      })),
+      terminalDeliveryJudgePort: judge.port,
     });
 
-    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(runs, 2);
+    assert.equal(judge.calls(), 2);
+    assert.equal(result.status, 'completed', result.error ?? JSON.stringify(result.publicPresentation));
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
-    assert.equal(terminal.data.delivered, false);
-    assert.equal(terminal.data.summary, judgeQuestion);
-    assert.equal(terminal.data.reply, judgeQuestion);
-    assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
-    assert.doesNotMatch(String(terminal.data.reply), /^PASS\b/);
+    assert.equal(terminal.data.delivered, true);
+    assert.equal(terminal.data.reply, deliveredText);
+    assert.equal(terminal.data.terminalJudgeDisposition, 'deliver');
+    assert.equal(fixtureSettlementAudit.auditAcceptedSourceSettlementTruth({ sessionId: sess.id, sourceUserSeq }).facts.successfulBusinessSettlements, 1);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
     else process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = prev;
@@ -6716,8 +7108,11 @@ test('terminal delivery judge reopens the live approval-resume loop once and the
           selfJudge: false,
         };
       },
-      async run() {
+      async run(request) {
         judgeCalls += 1;
+        assert.match(request.prompt, /Live continuation: AVAILABLE/);
+        assert.match(request.prompt, /Tools during continuation: AVAILABLE/);
+        assert.match(request.prompt, /Read-only external-state inspection: AVAILABLE/);
         return {
           verb: 'resume',
           reason: 'one provider verification can close the terminal gap',

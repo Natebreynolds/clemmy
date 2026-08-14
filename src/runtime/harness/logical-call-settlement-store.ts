@@ -140,6 +140,8 @@ interface LogicalAuthorityRow {
   logical_tool_call_id: string;
   tool_name: string;
   argument_digest: string;
+  /** The call's own admission digest, immutable across refinement. */
+  raw_argument_digest: string;
   state: 'open' | 'settled' | 'conflict';
   settlement_event_id: string | null;
   outcome_kind: string | null;
@@ -608,7 +610,8 @@ export function commitLogicalCallSettlement(
     const transaction = db.transaction((): LogicalCallSettlementResult => {
       const logical = db.prepare(`
         SELECT l.accepted_task_id, l.logical_tool_call_id, l.tool_name,
-               l.argument_digest, l.state, l.settlement_event_id, l.outcome_kind,
+               l.argument_digest, l.raw_argument_digest, l.state,
+               l.settlement_event_id, l.outcome_kind,
                r.state AS resolution_state,
                r.accepted_task_id AS resolution_accepted_task_id
           FROM logical_tool_calls l
@@ -661,12 +664,30 @@ export function commitLogicalCallSettlement(
       ) {
         return conflict(db, identity, 'logical call belongs to a different accepted task');
       }
+      // A refinement REWRITES argument_digest from the call's raw admission
+      // args to its provider-ready ones. Both digests describe the SAME call,
+      // so a lane settling under the pre-refinement identity is not presenting
+      // a different contract — and raw_argument_digest is immutable, so
+      // accepting it cannot admit a foreign one. The dispatch ledger already
+      // accepts either (logicalMatches, phase 'logical'); this seam accepted
+      // only the refined digest, so a refined call whose INNER dispatch failed
+      // was poisoned by its own outer wrapper settling it — killing the turn
+      // and the scheduled workflow behind it (live 2026-08-11, platform-49
+      // 23:00Z: composio_search_tools refined, inner ok:false, outer settled).
       if (
         logical.tool_name !== contract.toolName
-        || logical.argument_digest !== contract.argumentDigest
+        || (logical.argument_digest !== contract.argumentDigest
+          && logical.raw_argument_digest !== contract.argumentDigest)
       ) {
         return conflict(db, identity, 'logical call contract conflicts with its admission');
       }
+      // Either immutable identity may present the settlement, but the durable
+      // verdict has one canonical contract: the current logical row (effective
+      // after refinement, raw otherwise). Readers join this row back into the
+      // settlement, crossings use it, and result authority redeems against it.
+      // Canonicalizing here keeps commit, replay, mirror and handles coherent.
+      const canonicalToolName = logical.tool_name;
+      const canonicalArgumentDigest = logical.argument_digest;
 
       const crossingRows = readCrossings(db, identity);
       if (crossingRows.some((crossing) =>
@@ -753,8 +774,9 @@ export function commitLogicalCallSettlement(
               acceptedTaskId: identity.acceptedTaskId,
               logicalToolCallId: identity.logicalToolCallId,
               physicalDispatchId: lastCrossing.physical_dispatch_id,
-              toolName: contract.toolName,
+              toolName: canonicalToolName,
               args: input.contract.args,
+              canonicalArgumentDigest,
               ...(input.result.baseArgs === undefined ? {} : { baseArgs: input.result.baseArgs }),
               ...(input.result.continuationChainId
                 ? { continuationChainId: input.result.continuationChainId }
@@ -776,8 +798,8 @@ export function commitLogicalCallSettlement(
         resultHandleId = resultHandle.handle;
       }
       const semantic = semanticDigest({
-        toolName: contract.toolName,
-        argumentDigest: contract.argumentDigest,
+        toolName: canonicalToolName,
+        argumentDigest: canonicalArgumentDigest,
         executionKind: input.execution.kind,
         outcome: input.outcome,
         recovery,
@@ -806,7 +828,7 @@ export function commitLogicalCallSettlement(
           && crossingDigest(prior.crossings) === prior.physicalCrossingsDigest
           && prior.physicalCrossingCount === crossingCount
           && prior.hostCrossingCount === hostCrossingCount
-          && prior.crossings.length === crossingCount;
+          && prior.crossings.length === crossings.length;
         return exact
           ? { status: 'replayed', settlement: prior }
           : conflict(db, identity, 'logical settlement replay conflicts with durable authority');
@@ -867,8 +889,8 @@ export function commitLogicalCallSettlement(
           logicalToolCallId: identity.logicalToolCallId,
           lane: input.observer.lane,
           ...(observerCallId ? { callId: observerCallId } : {}),
-          tool: contract.toolName,
-          argumentDigest: contract.argumentDigest,
+          tool: canonicalToolName,
+          argumentDigest: canonicalArgumentDigest,
           semanticDigest: semantic,
           executionKind: input.execution.kind,
           kind: input.outcome.kind,
@@ -1005,12 +1027,23 @@ export function commitLogicalCallSettlement(
         && (!progressDigest || progressClaimed)
       ) {
         const expected = expectedTaskFor(identity.sessionId, identity.sourceUserSeq);
-        if (expected.status !== 'ok' || !expected.expectation.workNodeId) {
-          throw new Error(
-            expected.status === 'ok'
-              ? 'successful business call has no accepted work node'
-              : `successful business call has ${expected.status} task authority`,
-          );
+        if (expected.status !== 'ok') {
+          throw new Error(`successful business call has ${expected.status} task authority`);
+        }
+        if (!expected.expectation.workNodeId) {
+          // A conversational graph legitimately owns NO work node — and the
+          // model may still make a business call on such a turn (a greeting
+          // followed by an opportunistic read; a typed-conversation control
+          // beside a probe). There is no node to attribute an operation to,
+          // and throwing here killed the WHOLE settlement — durable evidence
+          // and all — for a turn the effect gates had already admitted. The
+          // settlement row and its result handle remain the durable record;
+          // only the graph-node attribution is skipped. A non-conversational
+          // graph missing its work node is still a real authority defect and
+          // keeps the throw.
+          if (expected.expectation.workKind !== 'conversation') {
+            throw new Error('successful business call has no accepted work node');
+          }
         }
         const effective = unwrapRuntimeEffectiveToolIdentity(
           input.contract.toolName,
@@ -1019,7 +1052,9 @@ export function commitLogicalCallSettlement(
         const operationArgs = isTrustedComposioGateway(input.contract.toolName)
           ? normalizeCallableArguments(input.contract.args, contract.toolName).args
           : effective.args;
-        const operation = recordResolvedOperationInTransaction(db, {
+        const operation = !expected.expectation.workNodeId
+          ? { status: 'skipped_conversational' as const }
+          : recordResolvedOperationInTransaction(db, {
           sessionId: identity.sessionId,
           sourceUserSeq: identity.sourceUserSeq,
           turn: input.observer.turn,
@@ -1029,7 +1064,7 @@ export function commitLogicalCallSettlement(
               ? `:item:${sha256(workBinding.universe_item_id).slice(0, 16)}`
               : ''}`
             : identity.logicalToolCallId,
-          resolvedTool: contract.toolName,
+          resolvedTool: canonicalToolName,
           args: operationArgs,
           logicalToolCallId: identity.logicalToolCallId,
           ...(crossings.at(-1)
@@ -1039,7 +1074,7 @@ export function commitLogicalCallSettlement(
           dispatchState: crossings.length > 0 ? 'dispatched' : 'not_started',
         });
         if (operation.status === 'inserted') operationMirror = operation.event;
-        else if (operation.status !== 'existing') {
+        else if (operation.status !== 'existing' && operation.status !== 'skipped_conversational') {
           throw new Error(`successful operation could not become authority: ${operation.reason}`);
         }
       }

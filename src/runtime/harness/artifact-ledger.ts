@@ -2,11 +2,20 @@ import { createHash, randomUUID } from 'node:crypto';
 import { getSession, listEvents, openEventLog, resolveToolOutputForAuthority } from './eventlog.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import {
-  providerEnvelopeHasContradiction,
+  inspectProviderEnvelope,
   projectProviderResult,
   pruneProviderRequestEchoes,
 } from './provider-read-evidence.js';
 import type { ShellExecutionOutcome } from '../shell-execution-outcome.js';
+import { documentedComposioOperationSemantic } from '../../integrations/composio/operation-semantics.js';
+import {
+  authorizeGoogleSheetsSheetFromJsonReadbackRequest,
+  extractGoogleSheetsSheetFromJsonTarget,
+  verifyGoogleSheetsSheetFromJsonReadback,
+  type GoogleSheetsSheetFromJsonContract,
+  type GoogleSheetsSheetTarget,
+} from './sheet-from-json-content-contract.js';
+import { loadExpectedWorkContract } from './expected-work-contract.js';
 
 /**
  * Durable artifact transactions for create-style tool calls.
@@ -405,7 +414,7 @@ export function artifactVerificationIntentForTool(
   // echoes that same id, so it is independent proof that the newly bound root
   // is readable. Broad list/search operations never enter this branch.
   if (
-    /^(?:CX_)?GOOGLE_?SHEETS?_(?:BATCH_GET|VALUES_(?:BATCH_)?GET|GET_SPREADSHEET(?:_BY_ID)?|SPREADSHEETS_GET)$/.test(normalized)
+    /^(?:CX_)?GOOGLE_?SHEETS?_(?:BATCH_GET|GET_VALUES|VALUES_(?:BATCH_)?GET|GET_SPREADSHEET(?:_BY_ID)?|SPREADSHEETS_GET)$/.test(normalized)
   ) {
     const resourceId = stringField(args, [
       'spreadsheet_id', 'spreadsheetId', 'spreadsheetid', 'id',
@@ -453,15 +462,15 @@ export function artifactIntentForTool(toolName: string, rawArgs: unknown): Artif
   const { shape, args } = innerToolCall(toolName, rawArgs);
   const upper = shape.toUpperCase();
 
-  // Composio's one-call Sheets constructor creates a brand-new spreadsheet
-  // even though its slug says SHEET_FROM_JSON rather than CREATE. Treat it as
-  // the same root artifact as CREATE_GOOGLE_SHEET1 so a lost provider response
-  // cannot cause a duplicate spreadsheet on retry.
-  if (/^(?:CX_)?GOOGLE_?SHEETS?_SHEET_FROM_JSON$/.test(normalizedShape(shape))) {
+  // Documented noun-shaped constructors share their operation semantics with
+  // effect/approval classification. A lost provider response must not cause a
+  // duplicate root artifact merely because the action name omits CREATE.
+  const documented = documentedComposioOperationSemantic(shape);
+  if (documented?.rootArtifact) {
     return {
-      kind: 'resource',
-      provider: 'googlesheets',
-      slotKey: explicitSlot(args, 'resource'),
+      kind: documented.rootArtifact.kind,
+      provider: documented.rootArtifact.provider,
+      slotKey: explicitSlot(args, documented.rootArtifact.kind),
       title: stringField(args, ['title', 'name']),
       createShape: upper,
     };
@@ -946,32 +955,58 @@ export function claimArtifactSlot(
   intent: ArtifactIntent,
   sourceCallId?: string,
   runScopeId = sessionId,
+  contentContract?: unknown,
 ): ArtifactClaim {
   ensureSchema();
   const db = openEventLog();
   const now = new Date().toISOString();
   const id = randomUUID();
-  const result = db.prepare(`
-    INSERT OR IGNORE INTO run_artifacts
-      (id, session_id, run_scope_id, slot_key, kind, provider, title, create_shape, status,
-       resource_id, uri, source_call_id, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?)
-  `).run(
-    id,
-    sessionId,
-    runScopeId,
-    intent.slotKey,
-    intent.kind,
-    intent.provider,
-    intent.title ?? null,
-    intent.createShape,
-    sourceCallId ?? null,
-    now,
-    now,
-  );
-  const artifact = getRunArtifact(sessionId, intent.slotKey, runScopeId);
-  if (!artifact) throw new Error('artifact claim was not readable after insert');
-  return { acquired: result.changes === 1, artifact };
+  const contractJson = contentContract === undefined ? null : JSON.stringify(contentContract);
+  if (
+    contentContract !== undefined
+    && (
+      contractJson === undefined
+      || contractJson === null
+      || Buffer.byteLength(contractJson, 'utf8') > 1_000_000
+      || !sourceCallId
+    )
+  ) throw new Error('artifact content verification contract is not bounded or lacks exact call identity');
+  const claim = db.transaction((): ArtifactClaim => {
+    const result = db.prepare(`
+      INSERT OR IGNORE INTO run_artifacts
+        (id, session_id, run_scope_id, slot_key, kind, provider, title, create_shape, status,
+         resource_id, uri, source_call_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?)
+    `).run(
+      id,
+      sessionId,
+      runScopeId,
+      intent.slotKey,
+      intent.kind,
+      intent.provider,
+      intent.title ?? null,
+      intent.createShape,
+      sourceCallId ?? null,
+      now,
+      now,
+    );
+    const row = db.prepare(`
+      SELECT * FROM run_artifacts
+       WHERE session_id = ? AND run_scope_id = ? AND slot_key = ?
+    `).get(sessionId, runScopeId, intent.slotKey) as ArtifactRow | undefined;
+    if (!row) throw new Error('artifact claim was not readable after insert');
+    if (result.changes === 1 && contractJson !== null && sourceCallId) {
+      db.prepare(`
+        INSERT INTO artifact_content_verifications
+          (artifact_id, session_id, run_scope_id, create_logical_tool_call_id,
+           contract_json, content_verified_at, verification_logical_call_id,
+           verification_fingerprint, created_at)
+        VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?)
+      `).run(row.id, sessionId, runScopeId, sourceCallId, contractJson, now);
+    }
+    return { acquired: result.changes === 1, artifact: fromRow(row) };
+  });
+  return claim.immediate();
 }
 
 export function bindArtifactSlot(
@@ -1181,8 +1216,8 @@ export function resolveUncertainArtifactClaim(
   }
   let parsed: unknown = authority.record.output;
   try { parsed = JSON.parse(authority.record.output); } catch { /* a CLI read may return plain provider text */ }
-  if (providerEnvelopeHasContradiction(parsed)) {
-    return { ok: false, reason: 'verification output contains a provider failure/contradiction' };
+  if (inspectProviderEnvelope(parsed).verdict !== 'clean') {
+    return { ok: false, reason: 'verification output is contradictory or was not fully inspected' };
   }
   const providerResult = pruneProviderRequestEchoes(parsed);
   const evidenceText = typeof providerResult === 'string'
@@ -1458,7 +1493,7 @@ function readbackResource(intent: ArtifactVerificationIntent, output: unknown): 
 function readbackOutputLooksSuccessful(output: unknown, explicitOk: boolean): boolean {
   if (!explicitOk || !toolOutputLooksSuccessful(output, explicitOk)) return false;
   const structured = jsonRecordFromOutput(output);
-  if (structured && providerEnvelopeHasContradiction(structured)) return false;
+  if (structured && inspectProviderEnvelope(structured).verdict !== 'clean') return false;
   if (typeof output === 'string') {
     const firstLine = output.trim().split(/\r?\n/, 1)[0] ?? '';
     if (RAW_READBACK_FAILURE_RE.test(firstLine)) return false;
@@ -1565,6 +1600,427 @@ export function verifyArtifactBindingFromToolResult(
   return getRunArtifact(sessionId, row.slot_key, runScopeId);
 }
 
+export type GeneratedArtifactReadbackAdmission =
+  | {
+      status: 'authorized';
+      artifactId: string;
+      runScopeId: string;
+      createLogicalToolCallId: string;
+      contentContract: unknown;
+      resourceId: string;
+    }
+  | { status: 'unavailable'; reason: string };
+
+/**
+ * Connect a downstream exact-ID read to the one generated artifact created by
+ * its declared predecessor. The locator is host-owned: it comes from the
+ * settled create result persisted in run_artifacts, never from model prose or
+ * a title/list lookup. Ambiguity fails closed.
+ */
+export function authorizeGeneratedArtifactReadback(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  contractId: string;
+  createLogicalToolCallId: string;
+  verificationRequirementId: string;
+  readToolName: string;
+  readArgs: unknown;
+}): GeneratedArtifactReadbackAdmission {
+  const read = artifactVerificationIntentForTool(input.readToolName, input.readArgs);
+  if (!read) return { status: 'unavailable', reason: 'read is not an exact artifact-id getter' };
+  try {
+    ensureSchema();
+    if (!declaredGeneratedArtifactVerificationEdge({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      contractId: input.contractId,
+      createLogicalToolCallId: input.createLogicalToolCallId,
+      verificationRequirementId: input.verificationRequirementId,
+    })) {
+      return { status: 'unavailable', reason: 'read is not the declared verification successor of this create' };
+    }
+    const rows = openEventLog().prepare(`
+      SELECT a.id AS artifact_id, a.run_scope_id, a.source_call_id,
+             a.kind, a.provider, a.resource_id, c.contract_json
+        FROM artifact_source_roots root
+        JOIN run_artifacts a
+          ON a.session_id = root.session_id
+         AND a.run_scope_id = root.root_scope_id
+        JOIN artifact_content_verifications c ON c.artifact_id = a.id
+       WHERE root.session_id = ? AND root.source_user_seq = ?
+         AND a.source_call_id = ? AND a.status = 'bound'
+         AND a.resource_id IS NOT NULL
+    `).all(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.createLogicalToolCallId,
+    ) as Array<{
+      artifact_id: string;
+      run_scope_id: string;
+      source_call_id: string;
+      kind: ArtifactKind;
+      provider: string;
+      resource_id: string;
+      contract_json: string;
+    }>;
+    const matches = rows.filter((row) =>
+      row.kind === read.kind
+      && row.provider === read.provider
+      && row.resource_id === read.resourceId);
+    if (rows.length !== 1 || matches.length !== 1) {
+      return {
+        status: 'unavailable',
+        reason: rows.length === 0
+          ? 'declared create predecessor owns no generated artifact contract'
+          : 'generated artifact target is ambiguous or does not match the exact read id',
+      };
+    }
+    const row = matches[0]!;
+    let contentContract: unknown;
+    try { contentContract = JSON.parse(row.contract_json) as unknown; } catch {
+      return { status: 'unavailable', reason: 'generated artifact content contract is unreadable' };
+    }
+    const contract = contentContract as GoogleSheetsSheetFromJsonContract;
+    if (contract.kind !== 'googlesheets_sheet_from_json_content_v1') {
+      return { status: 'unavailable', reason: 'generated artifact content contract is unsupported' };
+    }
+    const request = authorizeGoogleSheetsSheetFromJsonReadbackRequest(
+      contract,
+      {
+        provider: 'googlesheets',
+        spreadsheetId: row.resource_id,
+        spreadsheetUrl: null,
+      },
+      input.readToolName,
+      input.readArgs,
+    );
+    if (!request.authorized) {
+      return { status: 'unavailable', reason: `exact generated readback refused: ${request.reason}` };
+    }
+    return {
+      status: 'authorized',
+      artifactId: row.artifact_id,
+      runScopeId: row.run_scope_id,
+      createLogicalToolCallId: row.source_call_id,
+      contentContract,
+      resourceId: row.resource_id,
+    };
+  } catch (error) {
+    return {
+      status: 'unavailable',
+      reason: String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 300),
+    };
+  }
+}
+
+function declaredGeneratedArtifactVerificationEdge(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  contractId: string;
+  createLogicalToolCallId: string;
+  verificationRequirementId?: string;
+  verificationLogicalToolCallId?: string;
+}): boolean {
+  const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+  if (loaded.status !== 'ok' || loaded.contract.contractId !== input.contractId) return false;
+  try {
+    const db = openEventLog();
+    const create = db.prepare(`
+      SELECT contract_id, requirement_id, effect_kind
+        FROM expected_work_call_bindings
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.createLogicalToolCallId,
+    ) as { contract_id: string; requirement_id: string; effect_kind: string } | undefined;
+    if (!create || create.contract_id !== input.contractId || create.effect_kind !== 'external_write') return false;
+
+    let verificationRequirementId = input.verificationRequirementId;
+    if (input.verificationLogicalToolCallId) {
+      const verification = db.prepare(`
+        SELECT contract_id, requirement_id, effect_kind
+          FROM expected_work_call_bindings
+         WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+      `).get(
+        input.sessionId,
+        input.sourceUserSeq,
+        input.verificationLogicalToolCallId,
+      ) as { contract_id: string; requirement_id: string; effect_kind: string } | undefined;
+      if (
+        !verification
+        || verification.contract_id !== input.contractId
+        || verification.effect_kind !== 'read'
+        || (verificationRequirementId && verification.requirement_id !== verificationRequirementId)
+      ) return false;
+      verificationRequirementId = verification.requirement_id;
+    }
+    if (!verificationRequirementId) return false;
+
+    const createOperation = loaded.contract.operations.find((operation) => operation.id === create.requirement_id);
+    const verificationOperation = loaded.contract.operations.find(
+      (operation) => operation.id === verificationRequirementId,
+    );
+    return Boolean(
+      createOperation
+      && verificationOperation
+      && createOperation.effect === 'external_write'
+      && createOperation.cardinality.kind === 'once'
+      && verificationOperation.effect === 'read'
+      && verificationOperation.cardinality.kind === 'once'
+      && verificationOperation.dependsOn.includes(createOperation.id)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Persist the content verdict only after the exact read has returned. The
+ * helper replays the frozen constructor contract against the provider's raw
+ * read bytes; same-id readability without exact cell equality is not enough. */
+export function verifyGeneratedArtifactContentFromToolResult(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  verificationLogicalToolCallId: string;
+  readToolName: string;
+  readArgs: unknown;
+  readResult: unknown;
+}): boolean {
+  try {
+    ensureSchema();
+    const readIntent = artifactVerificationIntentForTool(input.readToolName, input.readArgs);
+    if (!readIntent) return false;
+    const db = openEventLog();
+    const rows = db.prepare(`
+      SELECT a.id AS artifact_id, a.resource_id, a.uri, c.contract_json,
+             c.create_logical_tool_call_id, vb.contract_id,
+             vb.requirement_id AS verification_requirement_id
+        FROM artifact_source_roots root
+        JOIN run_artifacts a
+          ON a.session_id = root.session_id
+         AND a.run_scope_id = root.root_scope_id
+        JOIN artifact_content_verifications c ON c.artifact_id = a.id
+        JOIN expected_work_call_bindings vb
+          ON vb.session_id = root.session_id
+         AND vb.source_user_seq = root.source_user_seq
+         AND vb.logical_tool_call_id = ?
+       WHERE root.session_id = ? AND root.source_user_seq = ?
+         AND a.status = 'bound' AND a.kind = ? AND a.provider = ?
+         AND a.resource_id = ?
+         AND vb.effect_kind = 'read'
+    `).all(
+      input.verificationLogicalToolCallId,
+      input.sessionId,
+      input.sourceUserSeq,
+      readIntent.kind,
+      readIntent.provider,
+      readIntent.resourceId,
+    ) as Array<{
+      artifact_id: string;
+      resource_id: string;
+      uri: string | null;
+      contract_json: string;
+      create_logical_tool_call_id: string;
+      contract_id: string;
+      verification_requirement_id: string;
+    }>;
+    if (rows.length !== 1) return false;
+    const row = rows[0]!;
+    if (!declaredGeneratedArtifactVerificationEdge({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      contractId: row.contract_id,
+      createLogicalToolCallId: row.create_logical_tool_call_id,
+      verificationRequirementId: row.verification_requirement_id,
+      verificationLogicalToolCallId: input.verificationLogicalToolCallId,
+    })) return false;
+    let contract: GoogleSheetsSheetFromJsonContract;
+    try { contract = JSON.parse(row.contract_json) as GoogleSheetsSheetFromJsonContract; } catch { return false; }
+    if (contract.kind !== 'googlesheets_sheet_from_json_content_v1') return false;
+    const target: GoogleSheetsSheetTarget = {
+      provider: 'googlesheets',
+      spreadsheetId: row.resource_id,
+      spreadsheetUrl: row.uri,
+    };
+    const verdict = verifyGoogleSheetsSheetFromJsonReadback(
+      contract,
+      target,
+      input.readToolName,
+      input.readArgs,
+      input.readResult,
+    );
+    if (!verdict.verified) return false;
+    const fingerprint = createHash('sha256')
+      .update(JSON.stringify({
+        artifactId: row.artifact_id,
+        verificationLogicalToolCallId: input.verificationLogicalToolCallId,
+        readToolName: input.readToolName,
+        readArgs: input.readArgs,
+        readResult: input.readResult,
+      }))
+      .digest('hex');
+    db.prepare(`
+      UPDATE artifact_content_verifications
+         SET content_verified_at = COALESCE(content_verified_at, ?),
+             verification_logical_call_id = COALESCE(verification_logical_call_id, ?),
+             verification_fingerprint = COALESCE(verification_fingerprint, ?)
+       WHERE artifact_id = ?
+         AND (verification_logical_call_id IS NULL OR verification_logical_call_id = ?)
+    `).run(
+      new Date().toISOString(),
+      input.verificationLogicalToolCallId,
+      fingerprint,
+      row.artifact_id,
+      input.verificationLogicalToolCallId,
+    );
+    const persisted = db.prepare(`
+      SELECT verification_logical_call_id, verification_fingerprint
+        FROM artifact_content_verifications WHERE artifact_id = ?
+    `).get(row.artifact_id) as {
+      verification_logical_call_id: string | null;
+      verification_fingerprint: string | null;
+    } | undefined;
+    return persisted?.verification_logical_call_id === input.verificationLogicalToolCallId
+      && persisted.verification_fingerprint === fingerprint;
+  } catch {
+    return false;
+  }
+}
+
+export function generatedArtifactContentVerificationForTests(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  createLogicalToolCallId: string;
+}): {
+  artifactId: string;
+  createLogicalToolCallId: string;
+  contentVerifiedAt: string | null;
+  verificationLogicalToolCallId: string | null;
+  verificationFingerprint: string | null;
+} | null {
+  try {
+    ensureSchema();
+    const row = openEventLog().prepare(`
+      SELECT c.artifact_id, c.create_logical_tool_call_id,
+             c.content_verified_at, c.verification_logical_call_id,
+             c.verification_fingerprint
+        FROM artifact_source_roots root
+        JOIN artifact_content_verifications c
+          ON c.session_id = root.session_id
+         AND c.run_scope_id = root.root_scope_id
+       WHERE root.session_id = ? AND root.source_user_seq = ?
+         AND c.create_logical_tool_call_id = ?
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.createLogicalToolCallId,
+    ) as {
+      artifact_id: string;
+      create_logical_tool_call_id: string;
+      content_verified_at: string | null;
+      verification_logical_call_id: string | null;
+      verification_fingerprint: string | null;
+    } | undefined;
+    return row ? {
+      artifactId: row.artifact_id,
+      createLogicalToolCallId: row.create_logical_tool_call_id,
+      contentVerifiedAt: row.content_verified_at,
+      verificationLogicalToolCallId: row.verification_logical_call_id,
+      verificationFingerprint: row.verification_fingerprint,
+    } : null;
+  } catch {
+    return null;
+  }
+}
+
+function exactGeneratedArtifactContentProof(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  contractId: string;
+  createLogicalToolCallIds?: readonly string[];
+  verificationLogicalToolCallIds?: readonly string[];
+}): boolean {
+  const creates = input.createLogicalToolCallIds ?? [];
+  const verifications = input.verificationLogicalToolCallIds ?? [];
+  if (creates.length === 0 && verifications.length === 0) return false;
+  try {
+    ensureSchema();
+    const rows = openEventLog().prepare(`
+      SELECT c.create_logical_tool_call_id, c.verification_logical_call_id,
+             vb.contract_id, vb.effect_kind, vb.requirement_id AS verification_requirement_id,
+             s.outcome_kind, s.continues_requirement
+        FROM artifact_source_roots root
+        JOIN run_artifacts a
+          ON a.session_id = root.session_id
+         AND a.run_scope_id = root.root_scope_id
+        JOIN artifact_content_verifications c ON c.artifact_id = a.id
+        JOIN expected_work_call_bindings vb
+          ON vb.session_id = c.session_id
+         AND vb.source_user_seq = root.source_user_seq
+         AND vb.logical_tool_call_id = c.verification_logical_call_id
+        JOIN logical_call_settlements s
+          ON s.session_id = vb.session_id
+         AND s.source_user_seq = vb.source_user_seq
+         AND s.logical_tool_call_id = vb.logical_tool_call_id
+       WHERE root.session_id = ? AND root.source_user_seq = ?
+         AND c.content_verified_at IS NOT NULL
+         AND c.verification_logical_call_id IS NOT NULL
+         AND c.verification_fingerprint IS NOT NULL
+         AND a.status = 'bound' AND a.resource_id IS NOT NULL
+    `).all(input.sessionId, input.sourceUserSeq) as Array<{
+      create_logical_tool_call_id: string;
+      verification_logical_call_id: string;
+      contract_id: string;
+      effect_kind: string;
+      outcome_kind: string;
+      continues_requirement: number;
+      verification_requirement_id: string;
+    }>;
+    const matches = rows.filter((row) =>
+      row.contract_id === input.contractId
+      && row.effect_kind === 'read'
+      && (row.outcome_kind === 'succeeded' || row.outcome_kind === 'empty_result')
+      && row.continues_requirement === 0
+      && (creates.length === 0 || creates.includes(row.create_logical_tool_call_id))
+      && (verifications.length === 0 || verifications.includes(row.verification_logical_call_id))
+      && declaredGeneratedArtifactVerificationEdge({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        contractId: input.contractId,
+        createLogicalToolCallId: row.create_logical_tool_call_id,
+        verificationRequirementId: row.verification_requirement_id,
+        verificationLogicalToolCallId: row.verification_logical_call_id,
+      }));
+    return matches.length === 1;
+  } catch {
+    return false;
+  }
+}
+
+export function generatedArtifactWriteContentVerified(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  contractId: string;
+  createLogicalToolCallId: string;
+}): boolean {
+  return exactGeneratedArtifactContentProof({
+    ...input,
+    createLogicalToolCallIds: [input.createLogicalToolCallId],
+  });
+}
+
+export function generatedArtifactReadContentVerified(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  contractId: string;
+  verificationLogicalToolCallId: string;
+}): boolean {
+  return exactGeneratedArtifactContentProof({
+    ...input,
+    verificationLogicalToolCallIds: [input.verificationLogicalToolCallId],
+  });
+}
+
 /** Extract only stable artifact identifiers from a successful create result. */
 export function extractArtifactResource(intent: ArtifactIntent, output: unknown): ArtifactResource | null {
   const parsed = parseLooseResult(output);
@@ -1586,6 +2042,22 @@ export function extractArtifactResource(intent: ArtifactIntent, output: unknown)
       : walkForKey(parsed, new Set(['siteid', 'site_id']));
     const uri = walkForKey(parsed, new Set(['url', 'uri', 'ssl_url', 'sslurl', 'deploy_url']));
     return resourceId || uri ? { resourceId, uri, title: commonTitle ?? intent.title } : null;
+  }
+  // Reviewed Google Sheets root constructors return `spreadsheetId` (or a
+  // canonical spreadsheet URL). They also commonly include ambient account,
+  // owner, drive-file, and request metadata with generic `id` fields. Never
+  // let the generic resource fallback bind one of those unrelated ids to the
+  // artifact slot: exact-ID readback would then target the wrong object and
+  // the successfully created Sheet could become permanently unverifiable.
+  if (intent.kind === 'resource' && intent.provider === 'googlesheets') {
+    const target = extractGoogleSheetsSheetFromJsonTarget(output);
+    if (!target) return null;
+    return {
+      resourceId: target.spreadsheetId,
+      uri: target.spreadsheetUrl
+        ?? `https://docs.google.com/spreadsheets/d/${target.spreadsheetId}/edit`,
+      title: intent.title ?? commonTitle,
+    };
   }
   // Generic kinds (the effect-anchored classifier): any stable id-shaped key or
   // canonical URL in the provider result proves the create landed — the same

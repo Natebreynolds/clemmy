@@ -59,6 +59,7 @@ interface ProviderState {
     scan: number;
     sourceMutation: number;
     orphan: number;
+    send: number;
   };
   invocations: ProviderInvocation[];
 }
@@ -81,6 +82,7 @@ function initialProviderState(): ProviderState {
       scan: 0,
       sourceMutation: 0,
       orphan: 0,
+      send: 0,
     },
     invocations: [],
   };
@@ -182,6 +184,25 @@ if (slug === 'ORPHANPROOF_APPEND_RECORD') {
   process.exit(41);
 }
 
+if (slug === 'EXACTPROOF_SEND_MESSAGE') {
+  const channel = args.channel;
+  const markdownText = args.markdown_text;
+  if (typeof channel !== 'string' || !channel || typeof markdownText !== 'string' || !markdownText) {
+    persist();
+    console.log(JSON.stringify({ successful: false, error: 'exact channel and markdown_text are required' }));
+    process.exit(0);
+  }
+  state.counters.send += 1;
+  persist();
+  // A real provider need not echo message content. The host receipt binds the
+  // frozen provider-ready args independently from this acknowledgement.
+  console.log(JSON.stringify({
+    successful: true,
+    data: { receipt_id: 'exact-provider-receipt-' + state.counters.send },
+  }));
+  process.exit(0);
+}
+
 persist();
 console.error('unknown provider shim tool: ' + slug);
 process.exit(3);
@@ -194,6 +215,8 @@ process.env.COMPOSIO_BACKEND = 'cli';
 process.env.COMPOSIO_CLI_PATH = PROVIDER_SHIM_FILE;
 process.env.CLEMMY_WATCHER_JUDGE = 'off';
 process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
+process.env.CLEMMY_FAILURE_LEARNING = 'off';
+process.env.WORKFLOW_SELF_HEAL = 'off';
 process.env.WORKFLOW_USE_HARNESS = 'off';
 process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
 process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
@@ -213,14 +236,24 @@ const {
   requeueWorkflowFromRun,
   readWorkflowTriggerReceiptAcceptance,
 } = await import('../tools/workflow-run-queue.js');
+const { processWorkflowSchedules } = await import('./workflow-scheduler.js');
 const {
   processWorkflowRuns,
+  reapCapabilityBlockedRuns,
+  reapMutationBlockedRuns,
   resumeCapabilityBlockedWorkflowRun,
+  resumeMutationBlockedWorkflowRun,
+  _setBeforeWorkflowCallGatewayForTests,
+  _setBeforeWorkflowGraphFinalizationForTests,
 } = await import('./workflow-runner.js');
-const { readWorkflowEvents } = await import('./workflow-events.js');
+const {
+  appendWorkflowEventDurably,
+  readWorkflowEvents,
+} = await import('./workflow-events.js');
 const {
   executeWorkflowCallMutation,
   inspectWorkflowCallMutation,
+  workflowCallExpectedArgsDigest,
   workflowCallMutationFingerprint,
   workflowCallMutationSlotHasLedger,
   WorkflowCallMutationAmbiguousError,
@@ -233,12 +266,25 @@ const {
   revokeComposioCliDefaultAccountAuthority,
 } = await import('../integrations/composio/cli-default-account-authority.js');
 const { resetComposioClient } = await import('../integrations/composio/client.js');
+const { executeComposioCliTool } = await import('../integrations/composio/cli.js');
+const {
+  _clearToolSchemaCacheForTest,
+  _setToolSchemaLoaderForTests,
+  liveComposioSchemaFingerprint,
+  rememberToolSchema,
+  resetToolSchemaCache,
+} = await import('../tools/composio-schema-cache.js');
 
 type RunRecord = {
   id: string;
   workflow: string;
+  workflowSlug?: string;
   status?: string;
+  error?: string;
   terminalOutcome?: string;
+  needsAttention?: boolean;
+  stepOutputs?: Record<string, string>;
+  blockedSteps?: Array<{ stepId?: string; reason?: string }>;
   reportBack?: {
     version?: number;
     outcome?: string;
@@ -252,6 +298,15 @@ type RunRecord = {
     reason?: string;
     provenNoDispatch?: boolean;
     state?: string;
+  };
+  mutationBlock?: {
+    workflowSlug?: string;
+    stepId?: string;
+    itemKey?: string;
+    tool?: string;
+    fingerprint?: string;
+    state?: string;
+    providerRedispatched?: boolean;
   };
 };
 
@@ -401,12 +456,17 @@ function mutationInput(
   stepId: string,
   tool: string,
   args: Record<string, unknown>,
+  schemaFingerprint?: string,
 ) {
   return {
     workflowSlug,
     runId,
     stepId,
     tool,
+    ...(schemaFingerprint ? {
+      schemaFingerprint,
+      expectedArgsDigest: workflowCallExpectedArgsDigest(args),
+    } : {}),
     account: {},
     args,
   };
@@ -430,12 +490,16 @@ function assertCommittedMutationPhases(input: ReturnType<typeof mutationInput>):
 }
 
 test.after(async () => {
-  for (const toolkit of ['destproof', 'sourceproof', 'orphanproof']) {
+  _setBeforeWorkflowCallGatewayForTests(null);
+  _setBeforeWorkflowGraphFinalizationForTests(null);
+  _setToolSchemaLoaderForTests(null);
+  resetToolSchemaCache();
+  for (const toolkit of ['destproof', 'sourceproof', 'orphanproof', 'exactproof']) {
     try { await revokeComposioCliDefaultAccountAuthority(toolkit); } catch { /* best effort */ }
   }
   try { resetComposioClient(); } catch { /* best effort */ }
   try { closeEventLog(); } catch { /* best effort */ }
-  try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+  try { if (!process.env.CLEM_TEST_KEEP_HOME) rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
 test('racing schedule admission creates one run, one append, verified readback, checkpoint, report, and terminal', async () => {
@@ -511,7 +575,13 @@ test('racing schedule admission creates one run, one append, verified readback, 
   const after = readProviderState();
   assert.equal(after.counters.append - before.counters.append, 1, 'exactly one destination append');
   assert.equal(after.counters.update - before.counters.update, 0);
-  assert.equal(after.counters.readback - before.counters.readback, 2, 'verification plus checkpoint readback');
+  // At least one INDEPENDENT provider readback verified the append. The
+  // checkpoint's own verification may be served from the verify step's
+  // durable result handle (same tool, same exact args, clean envelope) —
+  // read-reuse is designed behavior, so the pin asserts verification
+  // happened without freezing the provider call count.
+  const readbacks = after.counters.readback - before.counters.readback;
+  assert.ok(readbacks >= 1 && readbacks <= 2, `verification readback ran (${readbacks})`);
   assert.deepEqual(after.destination[NEW_ITEM_ID], { id: NEW_ITEM_ID, value: 'new-item-value' });
   assert.equal(Object.hasOwn(after.destination, String(Number(NEW_ITEM_ID))), false, 'numeric normalization never creates a second identity');
   assert.deepEqual([...readSeenItemKeys(workflowSlug, 'checkpoint_verified_item')], [NEW_ITEM_ID]);
@@ -790,11 +860,15 @@ test('provider commit with a lost response becomes ambiguous and is never blindl
     triggerReceiptId: 'workflow-schedule:v1:platform49-orphan-runtime:1785000360000',
   });
   assert.equal(queued.status, 'queued', queued.message);
-  const failed = await drainUntil(queued.id!, (run) => run.status === 'error');
-  assert.equal(failed.terminalOutcome, 'failed');
-  assert.equal(failed.reportBack?.version, 1);
-  assert.equal(failed.reportBack?.outcome, 'failed');
-  assert.equal(terminalJournalCount(workflowSlug, queued.id!), 1);
+  const blocked = await drainUntil(queued.id!, (run) => run.status === 'blocked_mutation');
+  assert.equal(blocked.terminalOutcome, undefined);
+  assert.equal(blocked.reportBack, undefined);
+  assert.equal(blocked.mutationBlock?.workflowSlug, workflowSlug);
+  assert.equal(blocked.mutationBlock?.stepId, 'append_uncertain');
+  assert.equal(blocked.mutationBlock?.tool, 'ORPHANPROOF_APPEND_RECORD');
+  assert.equal(blocked.mutationBlock?.state, 'awaiting_reconciliation');
+  assert.equal(blocked.mutationBlock?.providerRedispatched, false);
+  assert.equal(terminalJournalCount(workflowSlug, queued.id!), 0);
 
   const afterFailure = readProviderState();
   assert.equal(afterFailure.counters.orphan - before.counters.orphan, 1, 'provider boundary crossed once');
@@ -817,6 +891,8 @@ test('provider commit with a lost response becomes ambiguous and is never blindl
     (error: unknown) => error instanceof WorkflowCallMutationAmbiguousError,
   );
   assert.equal(blindRedispatches, 0, 'the ambiguous started boundary refuses before provider invocation');
+  assert.equal(resumeMutationBlockedWorkflowRun(queued.id!), false, 'an uncommitted started slot stays parked');
+  assert.equal(reapMutationBlockedRuns(), 0, 'the ledger-only reaper does not invent reconciliation');
 
   const runCountBeforeRequeue = runFiles().length;
   const requeue = requeueWorkflowFromRun(queued.id!);
@@ -827,10 +903,487 @@ test('provider commit with a lost response becomes ambiguous and is never blindl
   await processWorkflowRuns({ respond: async () => ({ text: 'must not run' }) } as never);
   const afterReplayTick = readProviderState();
   assert.equal(afterReplayTick.counters.orphan, afterFailure.counters.orphan);
-  assert.equal(terminalJournalCount(workflowSlug, queued.id!), 1);
+  assert.equal(terminalJournalCount(workflowSlug, queued.id!), 0);
   assert.equal(
-    workflowNotifications(queued.id!).filter((item) => item.id === `workflow-${queued.id}-error`).length,
+    workflowNotifications(queued.id!).filter((item) => item.id === `workflow-${queued.id}-mutation-review-append_uncertain`).length,
     1,
-    'one terminal error notification',
+    'one needs-review notification without a false terminal',
   );
+
+  // Positive reconciliation: an out-of-band verifier has durably committed
+  // the exact same-run slot. The ledger-only reaper may now readmit it, and the
+  // production call node replays without invoking the uncertain provider.
+  const reconciledWorkflowSlug = 'platform49-reconciled-runtime';
+  writeWorkflow(reconciledWorkflowSlug, {
+    name: reconciledWorkflowSlug,
+    description: 'Resume only from a committed same-run mutation receipt.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'append_reconciled',
+      prompt: 'Replay the already reconciled mutation.',
+      sideEffect: 'write',
+      call: {
+        tool: 'ORPHANPROOF_APPEND_RECORD',
+        args: { item_id: orphanId, value: 'may-have-landed' },
+      },
+    }],
+  });
+  const reconciled = queueWorkflowRun(reconciledWorkflowSlug, {}, { source: 'manual' });
+  assert.equal(reconciled.status, 'queued', reconciled.message);
+  const reconciledInput = mutationInput(
+    reconciledWorkflowSlug,
+    reconciled.id!,
+    'append_reconciled',
+    'ORPHANPROOF_APPEND_RECORD',
+    { item_id: orphanId, value: 'may-have-landed' },
+  );
+  await executeWorkflowCallMutation(reconciledInput, async () => ({
+    successful: true,
+    data: { receipt_id: 'out-of-band-reconciled-receipt' },
+  }));
+  const reconciledFingerprint = workflowCallMutationFingerprint(reconciledInput);
+  const reconciledPath = path.join(WORKFLOW_RUNS_DIR, `${reconciled.id}.json`);
+  const reconciledRecord = readRun(reconciled.id!);
+  writeFileSync(reconciledPath, JSON.stringify({
+    ...reconciledRecord,
+    status: 'blocked_mutation',
+    mutationBlock: {
+      workflowSlug: reconciledWorkflowSlug,
+      stepId: 'append_reconciled',
+      tool: 'ORPHANPROOF_APPEND_RECORD',
+      fingerprint: reconciledFingerprint,
+      blockedAt: new Date().toISOString(),
+      state: 'awaiting_reconciliation',
+      providerRedispatched: false,
+    },
+  }, null, 2), 'utf-8');
+  const beforeLedgerResume = readProviderState();
+  assert.equal(reapMutationBlockedRuns(), 1);
+  assert.equal(readRun(reconciled.id!).status, 'running');
+  await drainUntil(reconciled.id!, (run) => run.status === 'completed');
+  assert.equal(
+    readProviderState().counters.orphan,
+    beforeLedgerResume.counters.orphan,
+    'committed same-run reconciliation replays with zero provider redispatch',
+  );
+  assertOneSuccessfulTerminal(reconciledWorkflowSlug, reconciled.id!);
+});
+
+test('an exact scheduled direct send crosses once and terminal truth redeems only host commit evidence', async () => {
+  const workflowSlug = 'platform49-exact-scheduled-send-runtime';
+  const displayName = 'Platform 49 Exact Scheduled Send Display Name';
+  const destination = 'fixed-exact-channel';
+  const exactBody = 'provider-neutral exact scheduled payload';
+  const tool = 'EXACTPROOF_SEND_MESSAGE';
+  rememberToolSchema(tool, {
+    type: 'object',
+    required: ['channel', 'markdown_text'],
+    properties: {
+      channel: { type: 'string' },
+      markdown_text: { type: 'string' },
+    },
+  }, Date.now());
+  await grantComposioCliDefaultAccountAuthority({
+    toolkit: 'exactproof',
+    label: 'sanitized exact-send provider',
+    grantedBy: 'test',
+  });
+  writeWorkflow(workflowSlug, {
+    // Deliberately differs from the catalog/directory slug. The mutation ledger
+    // and terminal redemption must use workflowSlug, never this display text.
+    name: displayName,
+    description: 'Render one deterministic update and send it to one fixed destination.',
+    enabled: true,
+    allowSends: true,
+    trigger: { manual: true, schedule: '0 9 * * 1-5', timezone: 'UTC' },
+    steps: [
+      {
+        id: 'render_message',
+        prompt: '',
+        sideEffect: 'read',
+        deterministic: {
+          runner: 'render-message.mjs',
+          source: `
+process.stdin.resume();
+process.stdin.on('end', () => process.stdout.write(JSON.stringify({ summary: ${JSON.stringify(exactBody)} })));
+`,
+        },
+        output: {
+          type: 'object',
+          required_keys: ['summary'],
+          non_empty: ['summary'],
+        },
+      },
+      {
+        id: 'deliver_message',
+        prompt: '',
+        dependsOn: ['render_message'],
+        sideEffect: 'send',
+        call: {
+          tool,
+          args: {
+            channel: destination,
+            markdown_text: '{{steps.render_message.output.summary}}',
+          },
+        },
+        output: {
+          type: 'object',
+          required_keys: ['providerResult', 'callEvidence'],
+          non_empty: [
+            'providerResult.kind',
+            'providerResult.resultId',
+            'providerResult.digest',
+            'callEvidence.evidenceId',
+            'callEvidence.mutationReceiptId',
+            'callEvidence.canonicalTool',
+            'callEvidence.kind',
+            'callEvidence.status',
+            'callEvidence.dispatchSchemaFingerprint',
+            'callEvidence.expectedArgsDigest',
+            'callEvidence.providerReadyArgsDigest',
+            'callEvidence.providerResultDigest',
+            'callEvidence.payloadDigest',
+            'callEvidence.target.digest',
+          ],
+        },
+      },
+    ],
+  });
+
+  const before = readProviderState();
+  const runFilesBeforeSchedule = new Set(runFiles());
+  const schedulerResult = await processWorkflowSchedules(new Date('2026-08-13T09:00:00.000Z'));
+  assert.equal(
+    schedulerResult.fired.includes(displayName),
+    true,
+    'the real scheduler admits the display-named definition through its catalog slug',
+  );
+  const scheduledFiles = runFiles().filter((file) => {
+    if (runFilesBeforeSchedule.has(file)) return false;
+    return readRun(file.replace(/\.json$/, '')).workflow === displayName;
+  });
+  assert.equal(scheduledFiles.length, 1, 'one admitted occurrence belongs to the exact display-named workflow');
+  const queuedRunId = scheduledFiles[0]!.replace(/\.json$/, '');
+  const queuedRecord = readRun(queuedRunId);
+  assert.equal(queuedRecord.workflow, displayName);
+  assert.equal(queuedRecord.workflowSlug, workflowSlug, 'scheduled admission persists immutable catalog identity');
+  await drainUntil(queuedRunId, (run) => run.status === 'completed');
+  const completed = assertOneSuccessfulTerminal(workflowSlug, queuedRunId);
+
+  const after = readProviderState();
+  assert.equal(after.counters.send - before.counters.send, 1, 'the production call-node crosses the fake provider once');
+  const sendInvocation = after.invocations.filter((invocation) => invocation.slug === tool).at(-1);
+  assert.deepEqual(sendInvocation?.args, { channel: destination, markdown_text: exactBody });
+
+  const deliverOutput = JSON.parse(completed.stepOutputs?.deliver_message ?? 'null') as {
+    providerResult?: unknown;
+    callEvidence?: Record<string, unknown>;
+  } | null;
+  const providerProjection = deliverOutput?.providerResult as {
+    protocolVersion?: number; kind?: string; resultId?: string; digest?: string;
+  } | undefined;
+  assert.equal(providerProjection?.protocolVersion, 1);
+  assert.equal(providerProjection?.kind, 'workflow_call_provider_result');
+  assert.equal(deliverOutput?.callEvidence?.kind, 'workflow_call_commit');
+  assert.equal(deliverOutput?.callEvidence?.status, 'committed');
+  assert.match(String(deliverOutput?.callEvidence?.evidenceId ?? ''), /^workflow-call-evidence:v1:[a-f0-9]{64}$/);
+  assert.equal(providerProjection?.digest, deliverOutput?.callEvidence?.providerResultDigest);
+  assert.equal(providerProjection?.resultId, `workflow-call-result:v1:${providerProjection?.digest}`);
+  const publicEvidence = JSON.stringify(deliverOutput);
+  assert.equal(publicEvidence.includes('exact-provider-receipt-'), false, 'raw provider receipt remains ledger-only');
+  assert.equal(publicEvidence.includes(destination), false, 'public host evidence contains only the target digest');
+  assert.equal(publicEvidence.includes(exactBody), false, 'public host evidence contains only the payload digest');
+  assertCommittedMutationPhases(mutationInput(
+    workflowSlug,
+    queuedRunId,
+    'deliver_message',
+    tool,
+    { channel: destination, markdown_text: exactBody },
+    liveComposioSchemaFingerprint(tool),
+  ));
+
+  // Simulate a daemon crash after the provider result + durable commit but
+  // before the step completion journal existed. The real production call node
+  // must replay that slot and project evidence without a second crossing.
+  const beforeCrashReplay = readProviderState();
+  const crashReplay = queueWorkflowRun(workflowSlug, {}, {
+    source: 'schedule',
+    workflowSlug,
+    triggerReceiptId: 'workflow-schedule:v1:platform49-exact-scheduled-send-runtime:1785000540000',
+  });
+  assert.equal(crashReplay.status, 'queued', crashReplay.message);
+  const crashArgs = { channel: destination, markdown_text: exactBody };
+  const crashMutation = mutationInput(
+    workflowSlug,
+    crashReplay.id!,
+    'deliver_message',
+    tool,
+    crashArgs,
+    liveComposioSchemaFingerprint(tool),
+  );
+  await executeWorkflowCallMutation(
+    crashMutation,
+    () => executeComposioCliTool(tool, crashArgs),
+  );
+  assert.equal(readProviderState().counters.send - beforeCrashReplay.counters.send, 1);
+  const realDateNow = Date.now;
+  Date.now = () => realDateNow() + (31 * 60_000);
+  _clearToolSchemaCacheForTest();
+  try {
+    await drainUntil(crashReplay.id!, (run) => run.status === 'completed');
+  } finally {
+    Date.now = realDateNow;
+  }
+  assertOneSuccessfulTerminal(workflowSlug, crashReplay.id!);
+  assert.equal(
+    readProviderState().counters.send - beforeCrashReplay.counters.send,
+    1,
+    'same-run crash replay projects the committed result with zero duplicate provider sends',
+  );
+  rememberToolSchema(tool, {
+    type: 'object',
+    required: ['channel', 'markdown_text'],
+    properties: {
+      channel: { type: 'string' },
+      markdown_text: { type: 'string' },
+    },
+  }, Date.now());
+
+  // A second real run crosses once, then a deterministic pre-terminal race
+  // replaces only the journal projection with forged evidence. Output-contract
+  // verification already passed on the genuine envelope, so this can be caught
+  // only by the production terminal redemption hook re-reading the ledger.
+  const beforeTamper = readProviderState();
+  const tampered = queueWorkflowRun(workflowSlug, {}, {
+    source: 'schedule',
+    workflowSlug,
+    triggerReceiptId: 'workflow-schedule:v1:platform49-exact-scheduled-send-runtime:1785000480000',
+  });
+  assert.equal(tampered.status, 'queued', tampered.message);
+  _setBeforeWorkflowGraphFinalizationForTests(({ workflowName, runId }) => {
+    if (workflowName !== workflowSlug || runId !== tampered.id) return;
+    const genuine = readWorkflowEvents(workflowName, runId)
+      .filter((event) => event.kind === 'step_completed' && event.stepId === 'deliver_message')
+      .at(-1)?.output as { providerResult?: unknown; callEvidence?: unknown } | undefined;
+    assert.ok(genuine?.callEvidence, 'production call node emitted genuine host evidence before tamper');
+    appendWorkflowEventDurably(workflowName, runId, {
+      kind: 'step_completed',
+      stepId: 'deliver_message',
+      output: {
+        providerResult: {
+          protocolVersion: 1,
+          kind: 'workflow_call_provider_result',
+          resultId: `workflow-call-result:v1:${'0'.repeat(64)}`,
+          digest: '0'.repeat(64),
+        },
+        callEvidence: genuine!.callEvidence,
+      },
+    });
+  });
+  try {
+    await drainUntil(tampered.id!, (run) => run.status === 'completed');
+  } finally {
+    _setBeforeWorkflowGraphFinalizationForTests(null);
+  }
+  const repaired = readRun(tampered.id!);
+  assert.equal(readProviderState().counters.send - beforeTamper.counters.send, 1, 'terminal tamper never causes a duplicate provider crossing');
+  assert.notEqual(repaired.needsAttention, true, 'successful canonical repair must not require attention');
+  assert.equal(repaired.reportBack?.outcome, 'done');
+  const repairedOutput = JSON.parse(repaired.stepOutputs?.deliver_message ?? 'null') as {
+    providerResult?: { digest?: string; resultId?: string };
+    callEvidence?: { providerResultDigest?: string };
+  };
+  assert.notEqual(repairedOutput.providerResult?.digest, '0'.repeat(64));
+  assert.equal(repairedOutput.providerResult?.digest, repairedOutput.callEvidence?.providerResultDigest);
+  assert.equal(
+    repairedOutput.providerResult?.resultId,
+    `workflow-call-result:v1:${repairedOutput.providerResult?.digest}`,
+  );
+  assert.equal(JSON.stringify(repairedOutput).includes('exact-provider-receipt-'), false);
+  assert.ok(repairedOutput.callEvidence, 'canonical committed envelope replaces forged journal bytes');
+  assert.ok(readWorkflowEvents(workflowSlug, tampered.id!).some((event) => (
+    event.kind === 'step_advisory'
+    && event.stepId === 'deliver_message'
+    && event.meta?.reason === 'exact_send_projection_repaired_from_committed_ledger'
+    && event.meta?.providerRedispatched === false
+  )), 'terminal repair is auditable and explicitly records zero redispatch');
+
+  // An expired exact-schema lease plus a transient metadata outage is a
+  // proven-pre-dispatch dependency pause, not a terminal failure. The same
+  // accepted occurrence retries after one exact-slug refresh; its already
+  // durable render is reused and the provider is crossed only after healing.
+  const schemaOutage = queueWorkflowRun(workflowSlug, {}, {
+    source: 'schedule',
+    workflowSlug,
+    triggerReceiptId: 'workflow-schedule:v1:platform49-exact-scheduled-send-runtime:1785000600000',
+  });
+  assert.equal(schemaOutage.status, 'queued', schemaOutage.message);
+  appendWorkflowEventDurably(workflowSlug, schemaOutage.id!, {
+    kind: 'step_completed',
+    stepId: 'render_message',
+    output: { summary: exactBody },
+  });
+  const beforeSchemaOutage = readProviderState();
+  const realDateNowForSchemaOutage = Date.now;
+  Date.now = () => realDateNowForSchemaOutage() + (31 * 60_000);
+  _clearToolSchemaCacheForTest();
+  _setToolSchemaLoaderForTests(async (requested) => {
+    assert.equal(requested, tool, 'recovery probes only the pinned exact slug');
+    return null;
+  });
+  try {
+    const parked = await drainUntil(schemaOutage.id!, (run) => run.status === 'blocked_capability');
+    assert.equal(parked.capabilityBlock?.reason, 'exact_schema_refresh_unavailable');
+    assert.equal(parked.capabilityBlock?.provenNoDispatch, true);
+    assert.equal(parked.terminalOutcome, undefined);
+    assert.equal(parked.reportBack, undefined);
+    assert.equal(terminalJournalCount(workflowSlug, schemaOutage.id!), 0);
+    assert.equal(
+      readWorkflowEvents(workflowSlug, schemaOutage.id!).some((event) => (
+        event.kind === 'step_started' && event.stepId === 'deliver_message'
+      )),
+      false,
+      'schema preflight parks before the exact send lifecycle begins',
+    );
+    assert.equal(workflowCallMutationSlotHasLedger({
+      workflowSlug,
+      runId: schemaOutage.id!,
+      stepId: 'deliver_message',
+    }), false, 'proven-pre-dispatch schema park owns no mutation intent or receipt');
+    assert.equal(
+      readProviderState().counters.send - beforeSchemaOutage.counters.send,
+      0,
+      'metadata outage never crosses the provider',
+    );
+    assert.equal(
+      readWorkflowEvents(workflowSlug, schemaOutage.id!).filter((event) => (
+        event.kind === 'step_completed' && event.stepId === 'render_message'
+      )).length,
+      1,
+      'prior deterministic completion is preserved while parked',
+    );
+
+    _setToolSchemaLoaderForTests(async (requested) => {
+      assert.equal(requested, tool, 'self-heal remains one exact-slug metadata lookup');
+      return {
+        inputParameters: {
+          type: 'object',
+          required: ['channel', 'markdown_text'],
+          properties: {
+            channel: { type: 'string' },
+            markdown_text: { type: 'string' },
+          },
+        },
+        providerObservedAt: Date.now(),
+      };
+    });
+    assert.equal(reapCapabilityBlockedRuns(Date.now() + 3_600_000), 1);
+    assert.equal(readRun(schemaOutage.id!).status, 'running', 'the accepted occurrence keeps its run id');
+    await drainUntil(schemaOutage.id!, (run) => run.status === 'completed');
+    assertOneSuccessfulTerminal(workflowSlug, schemaOutage.id!);
+    assert.equal(
+      readProviderState().counters.send - beforeSchemaOutage.counters.send,
+      1,
+      'healed same-run retry crosses exactly once',
+    );
+    assert.equal(
+      readWorkflowEvents(workflowSlug, schemaOutage.id!).filter((event) => (
+        event.kind === 'step_completed' && event.stepId === 'render_message'
+      )).length,
+      1,
+      'same-run recovery does not repeat completed upstream work',
+    );
+  } finally {
+    Date.now = realDateNowForSchemaOutage;
+    _setToolSchemaLoaderForTests(null);
+    rememberToolSchema(tool, {
+      type: 'object',
+      required: ['channel', 'markdown_text'],
+      properties: {
+        channel: { type: 'string' },
+        markdown_text: { type: 'string' },
+      },
+    }, Date.now());
+  }
+
+  // The same scheduled definition may be manually runnable for diagnostics,
+  // but schedule consent never authorizes its SEND on a manual occurrence.
+  const beforeManual = readProviderState();
+  const manual = queueWorkflowRun(workflowSlug, {}, { source: 'manual' });
+  assert.equal(manual.status, 'queued', manual.message);
+  await drainUntil(manual.id!, (run) => run.status === 'error');
+  const manualRun = readRun(manual.id!);
+  assert.match(manualRun.error ?? '', /no accepted schedule occurrence|run_source_not_schedule/i);
+  assert.equal(
+    readProviderState().counters.send - beforeManual.counters.send,
+    0,
+    'manual occurrence is refused before provider I/O',
+  );
+
+  // A provider-boundary schema change after the runner captured its exact
+  // fingerprint remains a nonterminal dependency pause. Repeat the mismatch
+  // across an automatic same-run retry to prove it never becomes an
+  // uncertain write and never calls the physical provider.
+  rememberToolSchema(tool, {
+    type: 'object',
+    required: ['channel', 'markdown_text'],
+    properties: {
+      channel: { type: 'string' },
+      markdown_text: { type: 'string' },
+    },
+  }, Date.now());
+  const schemaMismatch = queueWorkflowRun(workflowSlug, {}, {
+    source: 'schedule',
+    workflowSlug,
+    triggerReceiptId: 'workflow-schedule:v1:platform49-exact-scheduled-send-runtime:1785000660000',
+  });
+  assert.equal(schemaMismatch.status, 'queued', schemaMismatch.message);
+  appendWorkflowEventDurably(workflowSlug, schemaMismatch.id!, {
+    kind: 'step_completed',
+    stepId: 'render_message',
+    output: { summary: exactBody },
+  });
+  let schemaRevision = 0;
+  _setBeforeWorkflowCallGatewayForTests(({ workflowName, runId, stepId, tool: requestedTool }) => {
+    if (workflowName !== workflowSlug || runId !== schemaMismatch.id || stepId !== 'deliver_message') return;
+    schemaRevision += 1;
+    assert.equal(requestedTool, tool);
+    rememberToolSchema(tool, {
+      type: 'object',
+      required: ['channel', 'markdown_text'],
+      properties: {
+        channel: { type: 'string' },
+        markdown_text: { type: 'string' },
+        [`provider_revision_${schemaRevision}`]: { type: 'string' },
+      },
+    }, Date.now());
+  });
+  const beforeSchemaMismatch = readProviderState();
+  try {
+    const firstPark = await drainUntil(schemaMismatch.id!, (run) => run.status === 'blocked_capability');
+    assert.equal(firstPark.capabilityBlock?.reason, 'exact_schema_boundary_mismatch');
+    assert.equal(firstPark.capabilityBlock?.provenNoDispatch, true);
+    assert.equal(firstPark.terminalOutcome, undefined);
+    assert.equal(workflowCallMutationSlotHasLedger({
+      workflowSlug,
+      runId: schemaMismatch.id!,
+      stepId: 'deliver_message',
+    }), false, 'boundary mismatch occurs before mutation intent/started');
+    assert.equal(reapCapabilityBlockedRuns(Date.now() + 3_600_000), 1);
+    const secondPark = await drainUntil(schemaMismatch.id!, (run) => (
+      run.status === 'blocked_capability' && run.capabilityBlock?.reason === 'exact_schema_boundary_mismatch'
+    ));
+    assert.equal(secondPark.capabilityBlock?.state, 'blocked');
+    assert.equal(secondPark.terminalOutcome, undefined);
+    assert.equal(secondPark.reportBack, undefined);
+    assert.equal(terminalJournalCount(workflowSlug, schemaMismatch.id!), 0);
+    assert.equal(
+      readProviderState().counters.send - beforeSchemaMismatch.counters.send,
+      0,
+      'persistent boundary mismatch remains parked with zero physical crossings',
+    );
+  } finally {
+    _setBeforeWorkflowCallGatewayForTests(null);
+  }
 });

@@ -240,6 +240,18 @@ test('a worked-around read failure does not block a source that completed other 
     `a differently-shaped retry is recovery in substance: ${JSON.stringify(audit)}`,
   );
   assert.equal(audit.facts.unrecoveredBusinessFailures, 0);
+
+  const declaredRequiredReads = auditAcceptedSourceSettlementTruth({
+    sessionId,
+    sourceUserSeq: source.seq,
+    requireEveryBusinessReadToSettle: true,
+  });
+  assert.equal(
+    declaredRequiredReads.status,
+    'unrecovered_failure',
+    'a declared workflow source step cannot let successful sibling queries launder a failed required query',
+  );
+  assert.equal(declaredRequiredReads.facts.unrecoveredBusinessFailures, 1);
 });
 
 // ── A reversible ambiguous write is a disclosure, not a veto ────────────────

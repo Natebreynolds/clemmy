@@ -18,10 +18,24 @@ export interface RetryDecision {
   reason: string;
   attempt: number;
   maxAttempts: number;
+  /** Set when the attempt ran long enough that the remote side may still be
+   * working. The caller surfaces this to the model instead of repeating the
+   * call: the honest next step is to CHECK, not to fire again. */
+  remoteMayStillBeRunning?: boolean;
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
 const BACKOFF_DELAYS_MS = [1000, 2000, 4000, 8000, 16000]; // exponential backoff
+/**
+ * A timeout that consumed this much wall clock is not an infrastructure blip:
+ * the call waited its full budget on work the remote side accepted. Repeating
+ * it identically buys the same budget and the same ceiling — and when the
+ * remote work was a job start, a second call starts a SECOND job (live
+ * 2026-08-12: two 60s sync actor waits, four actor runs charged, ~2 minutes
+ * spent before the model learned anything). Provider-neutral: this is
+ * arithmetic about elapsed time, not knowledge of any vendor's endpoints.
+ */
+const LONG_ATTEMPT_TIMEOUT_MS = 20_000;
 
 /**
  * Decide whether to retry a failed tool call.
@@ -35,10 +49,35 @@ export function shouldRetryToolCall(
   error: unknown,
   attempt: number = 1,
   recentErrors: string[] = [],
+  /** Wall clock this attempt consumed, when the caller measured it. */
+  elapsedMs?: number,
 ): RetryDecision {
   const maxAttempts = DEFAULT_MAX_ATTEMPTS;
   const isTransient = isTransientStepError(error);
   const errorMsg = error instanceof Error ? error.message : String(error ?? '');
+
+  // A long attempt that ended in a TIMEOUT is not a blip. The remote side
+  // accepted the work and may still be doing it, so an identical repeat is
+  // both a second full wait and a possible duplicate of whatever it started.
+  // Hand the decision back to the model with that fact attached.
+  if (
+    isTransient
+    && Number.isFinite(elapsedMs)
+    && (elapsedMs ?? 0) >= LONG_ATTEMPT_TIMEOUT_MS
+    && classifyTransientError(errorMsg) === 'timeout'
+  ) {
+    return {
+      shouldRetry: false,
+      isTransient: true,
+      delayMs: 0,
+      reason: `Timed out after ${Math.round((elapsedMs ?? 0) / 1000)}s — the remote operation may still be running. `
+        + 'Do not repeat this identical call: check the status of what it started, or use an '
+        + 'asynchronous start plus a status poll instead of a synchronous wait.',
+      attempt,
+      maxAttempts,
+      remoteMayStillBeRunning: true,
+    };
+  }
 
   // Terminal errors: never retry
   const isTerminal = isTerminalError(error, errorMsg);

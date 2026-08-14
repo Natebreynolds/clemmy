@@ -47,6 +47,13 @@ export interface CodeModeResult {
   rpcCalls: number;
   logs: string[];
   partial?: CodeModePartial;
+  /** Durable call ids of the child tool calls this program dispatched. The
+   * program's RETURN is a derived value with no lifecycle of its own; these
+   * ids are the run's actual evidence identities (a `codemode-result-*` stash
+   * handle can never be reconciliation authority — live 2026-08-12, an Apify
+   * verification loop ran 10 minutes because the model only knew the stash
+   * handle). */
+  toolCallIds?: string[];
   /** Total bytes of the tool-call RESULTS dispatched during the run — i.e. the
    *  intermediate payloads that stayed in the sandbox and would otherwise have
    *  entered the model's context as N discrete tool_returned events. The

@@ -20,6 +20,10 @@ const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
 const { readWorkflowRunOriginRecords } = await import('./workflow-run-queue.js');
 const { exactOriginDeliveryTargetDigest } = await import('../runtime/exact-origin-delivery.js');
+const {
+  _setToolSchemaLoaderForTests,
+  resetToolSchemaCache,
+} = await import('./composio-schema-cache.js');
 
 type ToolResult = { content: Array<{ type: 'text'; text: string }> };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
@@ -71,6 +75,12 @@ function workflowApplyContractFixes(): ToolHandler {
 function workflowSetEnabled(): ToolHandler {
   const handler = handlers.get('workflow_set_enabled');
   assert.ok(handler, 'workflow_set_enabled registered');
+  return handler;
+}
+
+function workflowEditStep(): ToolHandler {
+  const handler = handlers.get('workflow_edit_step');
+  assert.ok(handler, 'workflow_edit_step registered');
   return handler;
 }
 
@@ -148,7 +158,45 @@ test.after(() => {
 beforeEach(() => {
   resetState();
   _setWorkflowDispatchEventAppenderForTests();
+  _setToolSchemaLoaderForTests(null);
+  resetToolSchemaCache();
 });
+
+function exactSendOutputContract() {
+  return {
+    type: 'object',
+    required_keys: ['providerResult', 'callEvidence'],
+    non_empty: [
+      'providerResult.kind',
+      'providerResult.resultId',
+      'providerResult.digest',
+      'callEvidence.evidenceId',
+      'callEvidence.mutationReceiptId',
+      'callEvidence.canonicalTool',
+      'callEvidence.kind',
+      'callEvidence.status',
+      'callEvidence.dispatchSchemaFingerprint',
+      'callEvidence.expectedArgsDigest',
+      'callEvidence.providerReadyArgsDigest',
+      'callEvidence.providerResultDigest',
+      'callEvidence.payloadDigest',
+      'callEvidence.target.digest',
+    ],
+  };
+}
+
+function literalExactSendStep(tool: string) {
+  return {
+    id: 'deliver',
+    prompt: '',
+    sideEffect: 'send',
+    call: {
+      tool,
+      args: { channel: 'fixed-test-channel', markdown_text: 'fixed exact update' },
+    },
+    output: exactSendOutputContract(),
+  };
+}
 
 test('workflow_run rejects missing required legacy template inputs without queueing', async () => {
   writeAuditWorkflow();
@@ -206,6 +254,134 @@ test('workflow_create accepts an inputs SCHEMA as a JSON string and persists it'
   const entry = readWorkflow('audit-wf');
   assert.ok(entry, 'workflow persisted');
   assert.deepEqual(entry!.data.inputs, { url: { type: 'string', description: 'Site to audit' } });
+});
+
+test('workflow_create and workflow_update warm only each enabled exact send slug before validation', async () => {
+  const createTool = 'WARMCREATE_SEND_MESSAGE';
+  const updateTool = 'WARMUPDATE_SEND_MESSAGE';
+  const loads: string[] = [];
+  _setToolSchemaLoaderForTests(async (slug) => {
+    loads.push(slug);
+    return {
+      inputParameters: {
+        type: 'object',
+        required: ['channel', 'markdown_text'],
+        properties: {
+          channel: { type: 'string' },
+          markdown_text: { type: 'string' },
+        },
+      },
+      providerObservedAt: Date.now(),
+    };
+  });
+  try {
+    const created = await workflowCreate()({
+      name: 'warm exact create',
+      description: 'Deliver one literal update.',
+      trigger_schedule: '0 9 * * 1-5',
+      trigger_timezone: 'UTC',
+      allowSends: true,
+      steps: [literalExactSendStep(createTool)],
+    });
+    assert.match(resultText(created), /Created workflow "warm exact create"/);
+    assert.equal(readWorkflow('warm-exact-create')?.data.enabled, true);
+
+    writeWorkflow('warm-exact-update', {
+      name: 'Warm Exact Update',
+      description: 'Original description.',
+      enabled: true,
+      allowSends: true,
+      trigger: { schedule: '0 10 * * 1-5', timezone: 'UTC' },
+      steps: [literalExactSendStep(updateTool)],
+    });
+    const updated = await workflowUpdate()({
+      name: 'Warm Exact Update',
+      description: 'Updated description only.',
+    });
+    assert.match(resultText(updated), /Workflow "Warm Exact Update" updated/);
+    assert.equal(readWorkflow('warm-exact-update')?.data.enabled, true);
+    assert.deepEqual(loads, [createTool, updateTool], 'no discovery or unrelated schema lookup is performed');
+  } finally {
+    _setToolSchemaLoaderForTests(null);
+    resetToolSchemaCache();
+  }
+});
+
+test('workflow_edit_step edits a disabled display-named workflow only at its canonical slug', async () => {
+  const slug = 'release-disabled-digest';
+  const displayName = 'Release Disabled Digest';
+  writeWorkflow(slug, {
+    name: displayName,
+    description: 'Read local files without changing them.',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [{
+      id: 'list-files',
+      prompt: 'List the first five files without changing them.',
+      sideEffect: 'read',
+    }],
+  });
+
+  const result = await workflowEditStep()({
+    name: displayName,
+    step_id: 'list-files',
+    find: 'first five',
+    replace: 'first ten',
+  });
+  const text = resultText(result);
+  assert.match(text, /Updated "Release Disabled Digest" step "list-files"/);
+  assert.doesNotMatch(text, /release-disabled-digest/);
+  assert.match(readWorkflow(slug)!.data.steps[0]!.prompt ?? '', /first ten files/);
+  assert.equal(readWorkflow(slug)!.data.enabled, false);
+  assert.equal(existsSync(path.join(WORKFLOWS_DIR, displayName)), false, 'display prose never becomes a directory identity');
+  assert.deepEqual(readdirSync(WORKFLOWS_DIR), [slug]);
+  assert.equal(workflowRunFiles().length, 0, 'a disabled edit does not schedule a re-smoke');
+});
+
+test('workflow_edit_step re-smokes an enabled display-named workflow under the same canonical slug', async () => {
+  const slug = 'release-enabled-digest';
+  const displayName = 'Release Enabled Digest';
+  writeWorkflow(slug, {
+    name: displayName,
+    description: 'Read provider records without changing them.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'fetch-records',
+      prompt: 'Fetch the first five records with Apify without changing them.',
+      allowedTools: ['composio_apify_*'],
+      sideEffect: 'read',
+    }],
+  });
+
+  const result = await workflowEditStep()({
+    name: displayName,
+    step_id: 'fetch-records',
+    find: 'first five',
+    replace: 'first ten',
+  });
+  const text = resultText(result);
+  assert.match(text, /Updated "Release Enabled Digest" step "fetch-records"/);
+  assert.match(text, /Saved "Release Enabled Digest" as DISABLED and started a creation test/);
+  assert.doesNotMatch(text, /release-enabled-digest/);
+
+  const saved = readWorkflow(slug)!.data;
+  assert.match(saved.steps[0]!.prompt ?? '', /first ten records/);
+  assert.equal(saved.enabled, false, 'the exact edited definition is parked for verification');
+  assert.equal(existsSync(path.join(WORKFLOWS_DIR, displayName)), false, 're-smoke persistence must not create a display-name directory');
+  assert.deepEqual(readdirSync(WORKFLOWS_DIR), [slug]);
+
+  const runFiles = workflowRunFiles();
+  assert.equal(runFiles.length, 1);
+  const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles[0]!), 'utf8')) as {
+    workflow: string;
+    status: string;
+    workflowDefinitionSnapshot?: { definition?: { name?: string; enabled?: boolean } };
+  };
+  assert.equal(run.workflow, slug, 'queue identity is the canonical workflow slug');
+  assert.equal(run.status, 'creation_test');
+  assert.equal(run.workflowDefinitionSnapshot?.definition?.name, displayName);
+  assert.equal(run.workflowDefinitionSnapshot?.definition?.enabled, false);
 });
 
 test('workflow_create/update tool schemas accept contracts and explain structured-call output paths', () => {
@@ -1329,14 +1505,18 @@ test('renderWorkflowRunsOverview lists in-flight + needs-attention runs, and rec
   writeRunRecord({ id: 'r-queued', workflow: 'daily-brief', status: 'queued', createdAt: new Date().toISOString() });
   writeRunRecord({ id: 'r-attn', workflow: 'enrich', status: 'completed', needsAttention: true, createdAt: new Date().toISOString() });
   writeRunRecord({ id: 'r-report-block', workflow: 'publish-site', status: 'completed', needsAttention: false, reportBack: { outcome: 'blocked' }, createdAt: new Date().toISOString() });
+  writeRunRecord({ id: 'r-capability', workflow: 'salesforce-refresh', status: 'blocked_capability', createdAt: new Date().toISOString() });
+  writeRunRecord({ id: 'r-mutation', workflow: 'team-update', status: 'blocked_mutation', createdAt: new Date().toISOString() });
   writeRunRecord({ id: 'r-done', workflow: 'old-flow', status: 'completed', createdAt: new Date(Date.now() - 3_600_000).toISOString() });
 
   const out = renderWorkflowRunsOverview();
-  assert.match(out, /4 active runs/);
+  assert.match(out, /6 active runs/);
   assert.match(out, /sf-to-airtable · running · run r-run/);
   assert.match(out, /daily-brief · queued/);
   assert.match(out, /enrich · outcome Blocked · NEEDS ATTENTION/);
   assert.match(out, /publish-site · outcome Blocked · NEEDS ATTENTION/);
+  assert.match(out, /salesforce-refresh · blocked_capability · NEEDS ATTENTION/);
+  assert.match(out, /team-update · blocked_mutation · NEEDS ATTENTION/);
   assert.match(out, /Recently finished:/);
   assert.match(out, /old-flow · outcome Succeeded · run r-done/);
 });

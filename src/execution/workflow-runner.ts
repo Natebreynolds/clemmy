@@ -4,6 +4,7 @@ import path from 'node:path';
 import { augmentPath } from '../runtime/spawn-env.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
 import { describeWorkflowStepAction } from '../runtime/approval-summary.js';
 import {
   interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript, DEFAULT_MAX_OUTPUT_BYTES,
@@ -149,10 +150,12 @@ import {
 import {
   readWorkflowRunOriginRecords,
   readWorkflowRunOriginSessionIds,
+  readWorkflowTriggerReceiptAcceptance,
   reconcileAwaitingCompiledWorkflowRunBindings,
   requeueWorkflowFromRun,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
 } from '../tools/workflow-run-queue.js';
+import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 import {
   compiledWorkflowRunContractHash,
   isReservedProjectWorkflowRunRecord,
@@ -244,12 +247,26 @@ import {
   withWorkflowRunRecordLock,
   writeWorkflowRunRecordDurablyUnlocked,
 } from './workflow-run-record.js';
+import type { WorkflowAwaitingInputState } from './workflow-awaiting-input.js';
+import { reconcileAwaitingInputWorkflowRunProjections } from './workflow-awaiting-input-projection.js';
 import {
   assessWorkflowRunMutationRequeue,
   executeWorkflowCallMutation,
+  readCommittedWorkflowCallMutationOutput,
+  redeemExactScheduledSendStepOutput,
   replayWorkflowCallMutationSlot,
+  workflowCallExpectedArgsDigest,
   workflowCallMutationSlotHasLedger,
+  workflowCallMutationSlotHasCommittedReplayAuthority,
+  workflowCallMutationSlotHasCommittedResult,
+  WorkflowCallMutationAmbiguousError,
 } from './workflow-call-receipts.js';
+import {
+  exactScheduledSendCallEligibility,
+  exactScheduledSendCandidateToolSlugs,
+  exactScheduledSendDefinitionEligibility,
+  structuredCallSideEffectClass,
+} from './workflow-validator.js';
 import {
   recallWorkflowPatterns,
   recordSuccessfulWorkflowPattern,
@@ -297,6 +314,12 @@ let beforeWorkflowGraphFinalizationForTests: ((input: {
   workflowName: string;
   runId: string;
 }) => void | Promise<void>) | null = null;
+let beforeWorkflowCallGatewayForTests: ((input: {
+  workflowName: string;
+  runId: string;
+  stepId: string;
+  tool: string;
+}) => void | Promise<void>) | null = null;
 let afterStepArtifactPersistForTests: ((input: {
   workflowName: string;
   runId: string;
@@ -331,6 +354,16 @@ export function _setBeforeWorkflowGraphFinalizationForTests(
   fn: ((input: { workflowName: string; runId: string }) => void | Promise<void>) | null,
 ): void {
   beforeWorkflowGraphFinalizationForTests = fn;
+}
+
+/** Deterministic provider-boundary seam. Production leaves this null. Tests
+ * use it to change an exact action's metadata after the runner captured its
+ * live fingerprint but before the gateway resolves, proving mismatch parks
+ * pre-dispatch instead of minting uncertain-write state. */
+export function _setBeforeWorkflowCallGatewayForTests(
+  fn: ((input: { workflowName: string; runId: string; stepId: string; tool: string }) => void | Promise<void>) | null,
+): void {
+  beforeWorkflowCallGatewayForTests = fn;
 }
 
 /** Deterministic crash-window seam. Production leaves this null. A test can
@@ -751,6 +784,9 @@ export interface QueuedRunRecord {
   stepOutputs?: Record<string, unknown>;
   output?: string;
   error?: string;
+  /** Typed, redacted failure evidence for deterministic runner exits. Public
+   * prose is rendered from this envelope and does not pass through a model. */
+  failure?: DeterministicWorkflowStepFailure;
   /**
    * Single-step "try this" hint set by the dashboard's TRY button. When
    * present, the runner skips every other step and the synthesis pass;
@@ -836,6 +872,12 @@ export interface QueuedRunRecord {
    * steps remain in events.jsonl and the same run is retried with backoff.
    */
   capabilityBlock?: WorkflowCapabilityBlockState;
+  /** A provider call crossed the durable started boundary but no receipt proved
+   * success or failure. This same run is held until read-only reconciliation
+   * establishes a committed replay; it is never timer- or answer-resumed. */
+  mutationBlock?: WorkflowMutationAmbiguityBlockState;
+  /** Exact conversational dependency owned by one workflow step. */
+  awaitingInput?: WorkflowAwaitingInputState;
   /**
    * Report-back backstop (north star: REPORTS BACK WITHOUT FAIL). Set
    * once the terminal (completed/error) user notification has been
@@ -952,6 +994,159 @@ function readRunRecordForScan(filePath: string): QueuedRunRecord | null {
 function isUnattendedScheduledRun(runId: string): boolean {
   const rec = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
   return rec?.source === 'schedule' || rec?.source === 'cron';
+}
+
+type ExactScheduleOccurrenceAuthority =
+  | { ok: true; occurrenceAtMs: number }
+  | { ok: false; reason: 'run_record_unavailable' | 'run_source_not_schedule' | 'schedule_receipt_invalid' | 'schedule_receipt_unaccepted' };
+
+/** Exact unattended sends inherit authority only from the immutable occurrence
+ * accepted by the scheduler. A definition that also supports manual/webhook
+ * runs cannot lend its schedule consent to those other admission sources. */
+function exactScheduleOccurrenceAuthority(
+  workflowSlug: string,
+  runId: string,
+): ExactScheduleOccurrenceAuthority {
+  const rec = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+  // `workflow` is presentation/display identity and may differ from the
+  // catalog directory slug. Exact authority comes only from the immutable
+  // admission slug that the scheduler persisted; never infer/normalize it.
+  if (!rec || rec.id !== runId || rec.workflowSlug !== workflowSlug) {
+    return { ok: false, reason: 'run_record_unavailable' };
+  }
+  if (rec.source !== 'schedule') return { ok: false, reason: 'run_source_not_schedule' };
+  const receiptId = rec.triggerReceiptId;
+  const prefix = `workflow-schedule:v1:${workflowSlug}:`;
+  if (typeof receiptId !== 'string' || !receiptId.startsWith(prefix)) {
+    return { ok: false, reason: 'schedule_receipt_invalid' };
+  }
+  const occurrence = receiptId.slice(prefix.length);
+  const occurrenceAtMs = Number(occurrence);
+  if (!/^\d+$/.test(occurrence) || !Number.isSafeInteger(occurrenceAtMs) || occurrenceAtMs < 0) {
+    return { ok: false, reason: 'schedule_receipt_invalid' };
+  }
+  try {
+    if (readWorkflowTriggerReceiptAcceptance(receiptId) !== runId) {
+      return { ok: false, reason: 'schedule_receipt_unaccepted' };
+    }
+  } catch {
+    return { ok: false, reason: 'schedule_receipt_unaccepted' };
+  }
+  return { ok: true, occurrenceAtMs };
+}
+
+/** One bounded exact-identifier metadata refresh per structural candidate.
+ * The returned live fingerprints still must be rechecked at dispatch. */
+async function warmExactScheduledSendSchemaAuthority(workflow: WorkflowDefinition): Promise<void> {
+  for (const tool of exactScheduledSendCandidateToolSlugs(workflow)) {
+    try { await ensureLiveComposioSchemaFingerprint(tool); }
+    catch { /* canonical validator below reports typed fail-closed authority */ }
+  }
+}
+
+function exactSchemaToolkitLabel(tool: string): string {
+  return tool.trim().split('_')[0]?.toLowerCase() || 'provider';
+}
+
+function exactSchemaCapabilityError(
+  step: Pick<WorkflowStepInput, 'id' | 'call'>,
+  reason: Extract<WorkflowCapabilityBlockReason, `exact_schema_${string}`>,
+  detail: string,
+): WorkflowCapabilityBlockedError {
+  const tool = step.call?.tool?.trim() ?? '';
+  return new WorkflowCapabilityBlockedError({
+    stepId: step.id,
+    tool,
+    toolkit: exactSchemaToolkitLabel(tool),
+    reason,
+    message: `${detail} The exact action metadata will be refreshed by identifier on this same run; no provider dispatch occurred.`,
+  });
+}
+
+function isExactSchemaCapabilityReason(
+  reason: WorkflowCapabilityBlockReason,
+): reason is Extract<WorkflowCapabilityBlockReason, `exact_schema_${string}`> {
+  return reason === 'exact_schema_refresh_unavailable'
+    || reason === 'exact_schema_boundary_mismatch';
+}
+
+/** Authenticate the one-shot proof that lets an exact scheduled SEND recover
+ * from a schema refusal that happened before `step_started`. The mutable run
+ * projection alone is never enough: bind it back to the admitted definition,
+ * accepted schedule occurrence, exact tool, and empty mutation/physical
+ * ledgers. Any uncertainty falls back to the ordinary interrupted-write halt. */
+function exactSchemaCapabilityResumeProofStepId(input: {
+  workflow: WorkflowDefinition;
+  workflowSlug: string;
+  runId: string;
+  block: WorkflowCapabilityBlockState;
+  expectedState: 'blocked' | 'retrying';
+}): string | undefined {
+  const { workflow, workflowSlug, runId, block, expectedState } = input;
+  if (
+    block.state !== expectedState
+    || block.provenNoDispatch !== true
+    || !isExactSchemaCapabilityReason(block.reason)
+    || !workflowCapabilityBlockIsRecoverable(block.reason)
+    || !Number.isSafeInteger(block.retryCount)
+    || block.retryCount < 1
+  ) return undefined;
+  const step = workflow.steps.find((candidate) => candidate.id === block.stepId);
+  if (
+    !step?.call?.tool
+    || step.call.tool !== block.tool
+    || block.toolkit !== exactSchemaToolkitLabel(step.call.tool)
+    || !exactScheduledSendDefinitionEligibility(workflow, step).eligible
+    || !exactScheduleOccurrenceAuthority(workflowSlug, runId).ok
+    || stepExternalWriteAlreadyClaimed(runId, step.id)
+    || workflowStepHasPhysicalDispatch(runId, step.id)
+  ) return undefined;
+  try {
+    if (workflowCallMutationSlotHasLedger({ workflowSlug, runId, stepId: step.id })) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  return step.id;
+}
+
+function unavailableExactSchemaAuthority(
+  workflow: WorkflowDefinition,
+  committedReplayStepIds: ReadonlySet<string>,
+): WorkflowCapabilityBlockedError | null {
+  for (const step of workflow.steps) {
+    if (committedReplayStepIds.has(step.id)) continue;
+    if (!exactScheduledSendDefinitionEligibility(workflow, step).eligible) continue;
+    const live = exactScheduledSendCallEligibility(workflow, step);
+    if (live.eligible) continue;
+    return exactSchemaCapabilityError(
+      step,
+      'exact_schema_refresh_unavailable',
+      `Exact provider schema authority is unavailable (${live.reason}).`,
+    );
+  }
+  return null;
+}
+
+function exactScheduledSendCommittedReplayStepIds(
+  workflow: WorkflowDefinition,
+  workflowSlug: string,
+  runId: string,
+): ReadonlySet<string> {
+  const eligible = new Set<string>();
+  if (!exactScheduleOccurrenceAuthority(workflowSlug, runId).ok) return eligible;
+  for (const step of workflow.steps) {
+    if (!step.call || !exactScheduledSendDefinitionEligibility(workflow, step).eligible) continue;
+    try {
+      if (workflowCallMutationSlotHasCommittedReplayAuthority({
+        workflowSlug,
+        runId,
+        stepId: step.id,
+      }, step.call.tool)) eligible.add(step.id);
+    } catch { /* corrupt/ambiguous durable state never relaxes preflight */ }
+  }
+  return eligible;
 }
 
 const TERMINAL_RUN_RECORD_STATUSES = new Set(['completed', 'completed_with_errors', 'error', 'failed', 'cancelled']);
@@ -1167,6 +1362,12 @@ function writeRunRecord(
       ...businessRecord
     } = record;
     let nextRecord: QueuedRunRecord = { ...(current ?? {} as QueuedRunRecord), ...businessRecord };
+    // An answered clarification is retained only while the same run is being
+    // resumed. A later approval/capability park or terminal publication must
+    // never expose that stale question as the run's current dependency.
+    if (nextRecord.status !== 'running' && nextRecord.status !== 'awaiting_input') {
+      delete nextRecord.awaitingInput;
+    }
     // Capability retry authority is a monotonic per-retry checkpoint. A
     // terminal projection is commonly assembled from the run snapshot that
     // entered this drain pass; after the authority has been consumed, that
@@ -1365,29 +1566,89 @@ export class ParkRunSignal extends Error {
   }
 }
 
-const RECOVERABLE_CAPABILITY_BLOCK_REASONS: ReadonlySet<ComposioGatewayBlockReason> = new Set([
+/** Typed control flow for an ordinary clarifying question. It is deliberately
+ * distinct from ParkRunSignal: no approval exists and the answer is free-form. */
+export class WorkflowAwaitingInputSignal extends Error {
+  readonly state: WorkflowAwaitingInputState;
+
+  constructor(state: WorkflowAwaitingInputState) {
+    super(state.question);
+    this.name = 'WorkflowAwaitingInputSignal';
+    this.state = state;
+  }
+}
+
+function workflowInputState(input: {
+  runId: string;
+  stepId: string;
+  sessionId: string;
+  sessionIdSuffix: string;
+  question: string;
+  questionId?: string;
+  askedAt?: string;
+}): WorkflowAwaitingInputState {
+  const question = input.question.trim() || `What do you need me to clarify for workflow step "${input.stepId}"?`;
+  return {
+    questionId: input.questionId ?? `workflow-input:${input.runId}:${input.stepId}:${randomUUID().slice(0, 12)}`,
+    question,
+    stepId: input.stepId,
+    sessionId: input.sessionId,
+    sessionIdSuffix: input.sessionIdSuffix,
+    askedAt: input.askedAt ?? new Date().toISOString(),
+  };
+}
+
+function workflowMessageWithAnsweredInput(
+  message: string,
+  stepId: string,
+  sessionIdSuffix: string,
+  resumeInput: WorkflowAwaitingInputState | undefined,
+): string {
+  if (
+    !resumeInput?.answer
+    || resumeInput.stepId !== stepId
+    || resumeInput.sessionIdSuffix !== sessionIdSuffix
+  ) return message;
+  return [
+    message,
+    '',
+    '=== USER ANSWER TO YOUR PENDING QUESTION ===',
+    resumeInput.answer,
+    '=== END USER ANSWER ===',
+    '',
+    'Continue this same workflow step from the preserved context. Do not ask the same question again unless the answer is genuinely insufficient.',
+  ].join('\n');
+}
+
+export type WorkflowCapabilityBlockReason = ComposioGatewayBlockReason
+  | 'exact_schema_refresh_unavailable'
+  | 'exact_schema_boundary_mismatch';
+
+const RECOVERABLE_CAPABILITY_BLOCK_REASONS: ReadonlySet<WorkflowCapabilityBlockReason> = new Set([
   'not-connected',
   'identity-absent',
   'ambiguous-account',
   'suppressed',
+  'exact_schema_refresh_unavailable',
+  'exact_schema_boundary_mismatch',
 ]);
 
 /** A typed, proven-pre-dispatch capability interruption. This is control flow,
  * not a failed task: processOneRunFile checkpoints it and releases the worker
  * slot, then the capability reaper retries the SAME run from its durable step
  * history after the user reconnects or disambiguates the account. */
-export class WorkflowCapabilityBlockedError extends Error {
+export class WorkflowCapabilityBlockedError extends ExternalWritePreDispatchError {
   readonly stepId: string;
   readonly tool: string;
   readonly toolkit: string;
-  readonly reason: ComposioGatewayBlockReason;
+  readonly reason: WorkflowCapabilityBlockReason;
   readonly provenNoDispatch = true;
 
   constructor(input: {
     stepId: string;
     tool: string;
     toolkit: string;
-    reason: ComposioGatewayBlockReason;
+    reason: WorkflowCapabilityBlockReason;
     message: string;
   }) {
     super(input.message);
@@ -1399,7 +1660,7 @@ export class WorkflowCapabilityBlockedError extends Error {
   }
 }
 
-export function workflowCapabilityBlockIsRecoverable(reason: ComposioGatewayBlockReason): boolean {
+export function workflowCapabilityBlockIsRecoverable(reason: WorkflowCapabilityBlockReason): boolean {
   return RECOVERABLE_CAPABILITY_BLOCK_REASONS.has(reason);
 }
 
@@ -1407,7 +1668,7 @@ export interface WorkflowCapabilityBlockState {
   stepId: string;
   tool: string;
   toolkit: string;
-  reason: ComposioGatewayBlockReason;
+  reason: WorkflowCapabilityBlockReason;
   message: string;
   blockedAt: string;
   retryAt: string;
@@ -1416,6 +1677,19 @@ export interface WorkflowCapabilityBlockState {
   state: 'blocked' | 'retrying' | 'consumed';
   resumedAt?: string;
   resumeAuthorityConsumedAt?: string;
+}
+
+export interface WorkflowMutationAmbiguityBlockState {
+  /** Exact catalog/ledger identity. Never reconstruct this from display text. */
+  workflowSlug: string;
+  stepId: string;
+  itemKey?: string;
+  tool: string;
+  fingerprint: string;
+  blockedAt: string;
+  state: 'awaiting_reconciliation' | 'cancelled_unreconciled';
+  cancelledAt?: string;
+  providerRedispatched: false;
 }
 
 
@@ -1863,13 +2137,63 @@ async function executeWorkflowCallNode(
   }
   const call = step.call!;
   const args = renderCallArgs(call.args, ctx.inputs, ctx.stepOutputs, item, resolveWorkflowStepProjectContext(step, ctx.workflow));
-  const durableReplay = replayWorkflowCallMutationSlot({
+  const mutationSlot = {
     workflowSlug: ctx.workflowSlug,
     runId: ctx.runId,
     stepId: step.id,
     ...(mutationItemKey ? { itemKey: mutationItemKey } : {}),
-  });
-  if (durableReplay.replayed) return durableReplay.result;
+  };
+  const autonomousStructuredSend = !step.requiresApproval
+    && structuredCallSideEffectClass(step) === 'send';
+  const exactScheduledSendDefinition = exactScheduledSendDefinitionEligibility(ctx.workflow, step);
+  if (autonomousStructuredSend && !exactScheduledSendDefinition.eligible) {
+    throw new Error(
+      `Autonomous structured SEND step "${step.id}" lost exact scheduled-send authority `
+      + `before dispatch (${exactScheduledSendDefinition.reason}); provider call refused.`,
+    );
+  }
+  const exactScheduledSend = autonomousStructuredSend && exactScheduledSendDefinition.eligible;
+  if (exactScheduledSend) {
+    const occurrence = exactScheduleOccurrenceAuthority(ctx.workflowSlug, ctx.runId);
+    if (!occurrence.ok) {
+      throw new Error(
+        `Autonomous structured SEND step "${step.id}" has no accepted schedule occurrence `
+        + `(${occurrence.reason}); provider call refused.`,
+      );
+    }
+  }
+  const withExactCommitEvidence = (result: unknown): unknown => {
+    if (!exactScheduledSend) return result;
+    // The durable ledger is authoritative; `result` is intentionally ignored
+    // after successful dispatch/replay and re-read from its checked commit.
+    void result;
+    return readCommittedWorkflowCallMutationOutput(mutationSlot, call.tool, args);
+  };
+  const durableReplay = replayWorkflowCallMutationSlot(mutationSlot);
+  if (durableReplay.replayed) return withExactCommitEvidence(durableReplay.result);
+  let exactSchemaFingerprint: string | undefined;
+  if (exactScheduledSend) {
+    try {
+      exactSchemaFingerprint = await ensureLiveComposioSchemaFingerprint(call.tool);
+    } catch (error) {
+      throw exactSchemaCapabilityError(
+        step,
+        'exact_schema_refresh_unavailable',
+        `Exact provider schema refresh failed${error instanceof Error && error.message ? `: ${error.message}` : '.'}`,
+      );
+    }
+  }
+  if (exactScheduledSend) {
+    const liveAuthority = exactScheduledSendCallEligibility(ctx.workflow, step);
+    if (!exactSchemaFingerprint || !liveAuthority.eligible) {
+      throw exactSchemaCapabilityError(
+        step,
+        'exact_schema_refresh_unavailable',
+        `Autonomous structured SEND could not refresh exact provider schema authority `
+        + `(${liveAuthority.eligible ? 'live_schema_authority_unavailable' : liveAuthority.reason}).`,
+      );
+    }
+  }
   const {
     composioDispatchErrorProvesNoCommit,
     composioFailureProvesNoCommit,
@@ -1893,6 +2217,14 @@ async function executeWorkflowCallNode(
       }, work))
       : work()
   );
+  if (beforeWorkflowCallGatewayForTests) {
+    await beforeWorkflowCallGatewayForTests({
+      workflowName: ctx.workflowSlug,
+      runId: ctx.runId,
+      stepId: step.id,
+      tool: call.tool,
+    });
+  }
   const outcome = await dispatchWithIdentity(() => dispatchComposioTool(call.tool, args, {
     sessionId: callSessionId,
     ...(mutatesExternally
@@ -1906,12 +2238,27 @@ async function executeWorkflowCallNode(
           // composio's default entity; it must still record intent/started/
           // receipt (the ledger fingerprints a null account as the provider
           // default), not be permanently refused with no account to connect.
+          if (exactScheduledSend && (
+            resolved.toolSlug !== call.tool
+            || !resolved.schemaFingerprint
+            || resolved.schemaFingerprint !== exactSchemaFingerprint
+          )) {
+            throw exactSchemaCapabilityError(
+              step,
+              'exact_schema_boundary_mismatch',
+              `Exact scheduled SEND resolved a different tool/schema at the provider boundary.`,
+            );
+          }
           return executeWorkflowCallMutation({
             workflowSlug: ctx.workflowSlug,
             runId: ctx.runId,
             stepId: step.id,
             ...(mutationItemKey ? { itemKey: mutationItemKey } : {}),
             tool: resolved.toolSlug,
+            ...(exactScheduledSend ? {
+              schemaFingerprint: resolved.schemaFingerprint!,
+              expectedArgsDigest: workflowCallExpectedArgsDigest(args),
+            } : {}),
             account: {
               ...(resolved.connectionId ? { connectionId: resolved.connectionId } : {}),
               ...(resolved.identity ? { identity: resolved.identity } : {}),
@@ -1953,7 +2300,96 @@ async function executeWorkflowCallNode(
     }
     throw new Error(`composio dispatch blocked (${outcome.reason}): ${outcome.message}`);
   }
-  return outcome.result;
+  return withExactCommitEvidence(outcome.result);
+}
+
+/** Redeem every exact scheduled-send projection against the immutable call
+ * ledger before a terminal goal can see it. The expected args are re-rendered
+ * from the pinned definition and durable upstream outputs, so neither a stale
+ * step output nor a provider/model envelope can claim a different body. */
+function redeemExactScheduledSendOutputs(
+  workflow: WorkflowDefinition,
+  workflowSlug: string,
+  runId: string,
+  inputs: Record<string, string>,
+  stepOutputs: Record<string, unknown>,
+): {
+  problems: Array<{ stepId: string; reason: string }>;
+  repairedStepIds: string[];
+} {
+  const problems: Array<{ stepId: string; reason: string }> = [];
+  const repairedStepIds: string[] = [];
+  const blockUntrustedProjection = (stepId: string, reason: string): void => {
+    stepOutputs[stepId] = {
+      blocked: true,
+      reason: `Exact scheduled-send output is unavailable pending ledger reconciliation: ${reason}`,
+    };
+  };
+  for (const step of workflow.steps) {
+    if (!step.call) continue;
+    const autonomousStructuredSend = !step.requiresApproval
+      && structuredCallSideEffectClass(step) === 'send';
+    if (!autonomousStructuredSend) continue;
+    if (!(step.id in stepOutputs)) continue;
+    const authority = exactScheduledSendDefinitionEligibility(workflow, step);
+    if (!authority.eligible) {
+      problems.push({
+        stepId: step.id,
+        reason: `exact scheduled-send authority was unavailable at terminal (${authority.reason})`,
+      });
+      blockUntrustedProjection(step.id, authority.reason);
+      continue;
+    }
+    const occurrence = exactScheduleOccurrenceAuthority(workflowSlug, runId);
+    if (!occurrence.ok) {
+      problems.push({
+        stepId: step.id,
+        reason: `accepted schedule occurrence was unavailable at terminal (${occurrence.reason})`,
+      });
+      blockUntrustedProjection(step.id, occurrence.reason);
+      continue;
+    }
+    try {
+      const renderedArgs = renderCallArgs(
+        step.call.args,
+        inputs,
+        stepOutputs,
+        undefined,
+        resolveWorkflowStepProjectContext(step, workflow),
+      );
+      const redeemed = redeemExactScheduledSendStepOutput({
+        workflowSlug,
+        runId,
+        stepId: step.id,
+      }, step.call.tool, renderedArgs, stepOutputs[step.id]);
+      if (redeemed.ok) {
+        // Replace mutable journal bytes with the canonical ledger projection
+        // before any contract, judge, or presentation path consumes them.
+        stepOutputs[step.id] = redeemed.output;
+        if (redeemed.repairedProjection) {
+          repairedStepIds.push(step.id);
+          try {
+            appendWorkflowEvent(workflowSlug, runId, {
+              kind: 'step_advisory',
+              stepId: step.id,
+              meta: {
+                reason: 'exact_send_projection_repaired_from_committed_ledger',
+                providerRedispatched: false,
+              },
+            });
+          } catch { /* immutable ledger repair remains authoritative */ }
+        }
+      } else {
+        problems.push({ stepId: step.id, reason: redeemed.reason });
+        blockUntrustedProjection(step.id, redeemed.reason);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'terminal exact-send redemption failed';
+      problems.push({ stepId: step.id, reason });
+      blockUntrustedProjection(step.id, reason);
+    }
+  }
+  return { problems, repairedStepIds };
 }
 
 interface DeterministicStepPayload {
@@ -1964,6 +2400,222 @@ interface DeterministicStepPayload {
   inputs: Record<string, string>;
   stepOutputs: Record<string, unknown>;
   project?: WorkflowStepProjectContext;
+  /** Host-owned temporal anchor for date-sensitive workflow code. */
+  occurrenceAt?: string;
+}
+
+function deterministicOccurrenceAt(runId: string, workflowSlug: string): string | undefined {
+  try {
+    const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+    const epochMsToIso = (value: unknown): string | undefined => {
+      if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return undefined;
+      const instant = new Date(value);
+      return Number.isFinite(instant.getTime()) ? instant.toISOString() : undefined;
+    };
+    const catchupOccurrence = epochMsToIso(record?.catchupOccurrenceAtMs);
+    const scheduleReceipt = record?.source === 'schedule' && typeof record.triggerReceiptId === 'string'
+      ? /^workflow-schedule:v1:([^:]+):(\d+)$/.exec(record.triggerReceiptId)
+      : null;
+    const scheduledOccurrence = scheduleReceipt?.[1] === workflowSlug
+      ? epochMsToIso(Number(scheduleReceipt[2]))
+      : undefined;
+    const candidate = catchupOccurrence ?? scheduledOccurrence ?? record?.createdAt;
+    if (!candidate || !Number.isFinite(Date.parse(candidate))) return undefined;
+    return new Date(candidate).toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
+export interface DeterministicSourceFailureProjection {
+  kind: 'deterministic_source_failure';
+  /** Bounded diagnostic label only. It never grants retry/repair authority. */
+  code: string;
+  failedRead: string;
+  providerErrorId?: string;
+}
+
+export interface DeterministicWorkflowStepFailure {
+  version: 1;
+  kind: 'deterministic_runner';
+  outcome: 'nonzero_exit';
+  runner: string;
+  stepId: string;
+  exitCode: number | null;
+  signal: string | null;
+  summary: string;
+  /** Redacted, bounded unstructured child output kept as diagnostic evidence.
+   * A selected structured source is reduced to summary + sourceFailure. */
+  stdout?: string;
+  stderr?: string;
+  structuredFailureSource?: 'stdout' | 'stderr';
+  /** Host-selected adapter metadata. Raw JSON fields never cross this boundary. */
+  sourceFailure?: DeterministicSourceFailureProjection;
+}
+
+export class DeterministicWorkflowStepError extends Error {
+  readonly failure: DeterministicWorkflowStepFailure;
+
+  constructor(failure: DeterministicWorkflowStepFailure) {
+    super(renderDeterministicWorkflowStepFailure(failure));
+    this.name = 'DeterministicWorkflowStepError';
+    this.failure = failure;
+  }
+}
+
+const MAX_DETERMINISTIC_FAILURE_OUTPUT_CHARS = 4_000;
+const DETERMINISTIC_SOURCE_FAILURE_PACKET_KEYS = new Set([
+  'found',
+  'kind',
+  'code',
+  'failedRead',
+  'error',
+  'providerErrorId',
+]);
+const DETERMINISTIC_SOURCE_FAILURE_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
+const MAX_DETERMINISTIC_SOURCE_FAILED_READ_CHARS = 160;
+const DETERMINISTIC_SOURCE_FAILED_READ_RE = /^[a-z][a-z0-9-]*(?::[A-Za-z0-9][A-Za-z0-9_-]*)*$/;
+const DETERMINISTIC_PROVIDER_ERROR_ID_RE = /^[A-Za-z][A-Za-z0-9_]{0,79}$/;
+
+interface StructuredFailureDiagnostic {
+  summary: string;
+  sourceFailure?: DeterministicSourceFailureProjection;
+}
+
+function boundedProcessDiagnostic(value: string): string {
+  const text = redactProcessOutput(value.trim());
+  if (text.length <= MAX_DETERMINISTIC_FAILURE_OUTPUT_CHARS) return text;
+  return `${text.slice(0, MAX_DETERMINISTIC_FAILURE_OUTPUT_CHARS - 1).trimEnd()}…`;
+}
+
+function deterministicSourceFailureProjection(
+  record: Record<string, unknown>,
+): DeterministicSourceFailureProjection | undefined {
+  if (
+    record.found !== false
+    || record.kind !== 'deterministic_source_failure'
+    || typeof record.code !== 'string'
+    || !DETERMINISTIC_SOURCE_FAILURE_CODE_RE.test(record.code)
+    || typeof record.failedRead !== 'string'
+    || record.failedRead.length > MAX_DETERMINISTIC_SOURCE_FAILED_READ_CHARS
+    || !DETERMINISTIC_SOURCE_FAILED_READ_RE.test(record.failedRead)
+    || typeof record.error !== 'string'
+    || record.error.trim().length === 0
+    || Object.keys(record).some((key) => !DETERMINISTIC_SOURCE_FAILURE_PACKET_KEYS.has(key))
+  ) return undefined;
+  if (
+    record.providerErrorId !== undefined
+    && (
+      typeof record.providerErrorId !== 'string'
+      || !DETERMINISTIC_PROVIDER_ERROR_ID_RE.test(record.providerErrorId)
+    )
+  ) return undefined;
+  return {
+    kind: 'deterministic_source_failure',
+    code: record.code,
+    failedRead: record.failedRead,
+    ...(typeof record.providerErrorId === 'string'
+      ? { providerErrorId: record.providerErrorId }
+      : {}),
+  };
+}
+
+function structuredFailureDiagnostic(
+  value: string,
+  allowSourceFailureProjection = false,
+): StructuredFailureDiagnostic | null {
+  const fullCandidate = value.trim();
+  const candidates = [value.trim(), ...value.split(/\r?\n/).map((line) => line.trim()).reverse()]
+    .filter(Boolean);
+  for (const candidate of candidates) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(candidate); } catch { continue; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    const record = parsed as Record<string, unknown>;
+    const explicitlyFailed = record.ok === false
+      || record.success === false
+      || record.found === false
+      || (typeof record.status === 'number' && record.status !== 0);
+    if (!explicitlyFailed) continue;
+    const summary = [record.error, record.message, record.reason]
+      .find((item): item is string => typeof item === 'string' && item.trim().length > 0);
+    if (!summary) {
+      // The envelope is still recognized as failed; do not retain arbitrary
+      // fields merely because it omitted a usable public reason.
+      return { summary: 'The runner exited without emitting a structured failure reason.' };
+    }
+    // Typed metadata requires the adapter's promised single JSON document.
+    // A JSON-looking line embedded in arbitrary process output is diagnostic
+    // text only and can never mint host recovery authority.
+    const sourceFailure = allowSourceFailureProjection && candidate === fullCandidate
+      ? deterministicSourceFailureProjection(record)
+      : undefined;
+    return {
+      summary: boundedProcessDiagnostic(summary),
+      ...(sourceFailure ? { sourceFailure } : {}),
+    };
+  }
+  return null;
+}
+
+function warningOnlyDiagnostic(value: string): boolean {
+  const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return lines.length > 0 && lines.every((line) => /^(?:[›>\-]\s*)?warning\b/i.test(line));
+}
+
+function deterministicFailureFromOutcome(input: {
+  runner: string;
+  stepId: string;
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+}): DeterministicWorkflowStepFailure {
+  const stdout = boundedProcessDiagnostic(input.stdout);
+  const stderr = boundedProcessDiagnostic(input.stderr);
+  // Parse the complete already-redacted process outputs. Bounding before parse
+  // could turn a valid large envelope into an unrecognized raw excerpt.
+  const stdoutFailure = structuredFailureDiagnostic(redactProcessOutput(input.stdout.trim()), true);
+  const stderrFailure = structuredFailureDiagnostic(redactProcessOutput(input.stderr.trim()));
+  const structuredFailureSource = stdoutFailure ? 'stdout' as const : stderrFailure ? 'stderr' as const : undefined;
+  const summary = stdoutFailure?.summary
+    ?? stderrFailure?.summary
+    ?? (stderr && !warningOnlyDiagnostic(stderr) ? stderr : '')
+    ?? '';
+  // Only stdout is an adapter-owned result channel. Provider-controlled stderr
+  // may explain a failure, but can never contribute typed recovery metadata.
+  const sourceFailure = stdoutFailure?.sourceFailure;
+  return {
+    version: 1,
+    kind: 'deterministic_runner',
+    outcome: 'nonzero_exit',
+    runner: input.runner,
+    stepId: input.stepId,
+    exitCode: input.code,
+    signal: input.signal,
+    summary: summary || 'The runner exited without emitting a structured failure reason.',
+    // Every recognized structured envelope is represented by its bounded
+    // summary. Never persist arbitrary JSON fields from a secondary envelope.
+    ...(stdout && !stdoutFailure ? { stdout } : {}),
+    ...(stderr && !stderrFailure ? { stderr } : {}),
+    ...(structuredFailureSource ? { structuredFailureSource } : {}),
+    ...(sourceFailure ? { sourceFailure } : {}),
+  };
+}
+
+export function renderDeterministicWorkflowStepFailure(failure: DeterministicWorkflowStepFailure): string {
+  const exit = failure.signal ?? (failure.exitCode === null ? 'unknown exit' : `exit ${failure.exitCode}`);
+  const lines = [
+    `Deterministic runner "${failure.runner}" failed (${exit}) at step "${failure.stepId}".`,
+    `Reported reason: ${failure.summary}`,
+  ];
+  if (failure.stderr && failure.stderr !== failure.summary) {
+    lines.push(`stderr diagnostic: ${failure.stderr}`);
+  }
+  if (failure.stdout && failure.stdout !== failure.summary && failure.structuredFailureSource !== 'stdout') {
+    lines.push(`stdout diagnostic: ${failure.stdout}`);
+  }
+  return lines.join('\n');
 }
 
 function redactProcessOutput(text: string): string {
@@ -2065,7 +2717,14 @@ async function runDeterministicWorkflowStep(
     throw new Error(`deterministic runner output exceeded ${DEFAULT_MAX_OUTPUT_BYTES} bytes (emit a single JSON document to stdout)`);
   }
   if (outcome.code !== 0) {
-    throw new Error(`deterministic runner failed (${outcome.signal ?? `exit ${outcome.code}`}): ${cleanStderr || cleanStdout || 'no output'}`);
+    throw new DeterministicWorkflowStepError(deterministicFailureFromOutcome({
+      runner,
+      stepId: payload.stepId,
+      code: outcome.code,
+      signal: outcome.signal,
+      stdout: cleanStdout,
+      stderr: cleanStderr,
+    }));
   }
   logger.info({
     workflow: payload.workflow,
@@ -2174,7 +2833,11 @@ async function runWithConcurrency<T, R>(
           // A park is a control signal, not an item failure to fan past. Stop
           // assigning new work; completed siblings are already durable in
           // events.jsonl and resume will skip them.
-          if (err instanceof ParkRunSignal || err instanceof WorkflowCapabilityBlockedError) halted = true;
+          if (
+            err instanceof ParkRunSignal
+            || err instanceof WorkflowAwaitingInputSignal
+            || err instanceof WorkflowCapabilityBlockedError
+          ) halted = true;
         }
       }
     })());
@@ -2236,6 +2899,8 @@ interface StepExecutionContext {
   /** Exact deterministic-code bundle admitted with this run. Older queued
    * records omit it and retain their legacy behavior. */
   admittedCodeRevision?: string;
+  /** Answer captured while this exact run was parked on a step question. */
+  awaitingInput?: WorkflowAwaitingInputState;
   /** Probe-based loopUntil attempts validate their external exit condition
    * before publishing completion. The plain-step finalizer captures the exact
    * output/meta here; the loop publishes it only after the probe passes. */
@@ -2884,6 +3549,7 @@ export const workflowRunnerInternalsForTest = {
   isWorkflowRunCancelled,
   sampleStepAttemptMetrics,
   hydrateCompletedOutputArtifacts,
+  deterministicOccurrenceAt,
   runStepVerifiedAttempt,
   boundedStepOutputsForRunRecord,
   graphContextForInvocation,
@@ -2937,6 +3603,8 @@ async function runStepViaHarness(
   // The exact definition admitted for this run. Queued/restarted runs must not
   // resolve model pins from a newer workflow file after admission.
   admittedWorkflow?: WorkflowDefinition,
+  // Exact answer that re-admitted this SAME paused step, if any.
+  resumeInput?: WorkflowAwaitingInputState,
 ): Promise<HarnessStepResult> {
   // T-WF-1 — configure the codex OAuth bridge BEFORE the SDK runner
   // touches the model. Discord + chat-dock paths do this at every
@@ -3118,12 +3786,13 @@ async function runStepViaHarness(
           runId: workflowRunId,
         })
       : null;
-    const message = (
+    const initialMessage = (
       graphOrCompiledStep
       || useWorkflowStepAgent()
     ) && renderedContextBlock
       ? `${proseMessage}\n\n${renderedContextBlock}`
       : proseMessage;
+    const message = workflowMessageWithAnsweredInput(initialMessage, step.id, sessionIdSuffix, resumeInput);
     const sourceUserEvent = recordRunAttemptUserInput(stepAttempt, {
       turn: 1,
       role: 'user',
@@ -3498,6 +4167,33 @@ async function runStepViaHarness(
       || (lastCompletion?.data?.summary as string | undefined)
       || '';
 
+    // A clarification is control flow even when the model emitted a partial
+    // workflow_step_result first. That partial may help the resumed session,
+    // but it is never authority to mark the step or run complete.
+    if (result.status === 'awaiting_user_input') {
+      const awaitingEvents = listHarnessEvents(realSessionId, { types: ['awaiting_user_input'] })
+        .filter((event) => event.seq > sourceUserEvent.seq);
+      const latestQuestion = awaitingEvents[awaitingEvents.length - 1];
+      const question = (
+        typeof latestQuestion?.data?.question === 'string'
+          ? latestQuestion.data.question
+          : prose
+      ).trim() || `What do you need me to clarify for workflow step "${step.id}"?`;
+      // Clear any process-local partial so a later resumed call cannot consume
+      // it as the answer's completed result. Durable conversation/tool history
+      // remains attached to the stable child session.
+      takeStepResult(realSessionId);
+      throw new WorkflowAwaitingInputSignal(workflowInputState({
+        runId: workflowRunId,
+        stepId: step.id,
+        sessionId: realSessionId,
+        sessionIdSuffix,
+        question,
+        questionId: `workflow-input:${workflowRunId}:${step.id}:${sourceUserEvent.seq}`,
+        askedAt: latestQuestion?.createdAt,
+      }));
+    }
+
     // The explicit structured result the step emitted via workflow_step_result
     // (captured full, unclipped, keyed by session). Taken once.
     const captured = takeStepResult(realSessionId);
@@ -3589,7 +4285,11 @@ async function runStepViaHarness(
     stepAttemptStatus = 'completed';
     return { output: guardStepOutput(prose), hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId, lane: 'harness', route };
   } catch (err) {
-    if (err instanceof ParkRunSignal || err instanceof WorkflowCapabilityBlockedError) {
+    if (
+      err instanceof ParkRunSignal
+      || err instanceof WorkflowAwaitingInputSignal
+      || err instanceof WorkflowCapabilityBlockedError
+    ) {
       stepAttemptStatus = 'interrupted';
     } else if (
       err instanceof WorkflowRunCancelledError
@@ -4102,6 +4802,7 @@ async function executeStepVerified(
     // is a decision, not a soft failure an optional step may gap past.
     if (
       err instanceof ParkRunSignal
+      || err instanceof WorkflowAwaitingInputSignal
       || err instanceof WorkflowCapabilityBlockedError
       || err instanceof WorkflowRunCancelledError
       || err instanceof WorkflowStepNotApprovedError
@@ -4194,6 +4895,7 @@ async function executeStepVerifiedInner(
     } catch (err) {
       if (
         err instanceof ParkRunSignal
+        || err instanceof WorkflowAwaitingInputSignal
         || err instanceof WorkflowCapabilityBlockedError
         || err instanceof WorkflowRunCancelledError
       ) throw err;
@@ -4241,6 +4943,7 @@ async function runStepVerifiedAttempt(
       backoffBaseMs: RETRY_BACKOFF_BASE_MS,
       isRetryable: (err) =>
         !(err instanceof ParkRunSignal) &&
+        !(err instanceof WorkflowAwaitingInputSignal) &&
         !(err instanceof WorkflowRunCancelledError) &&
         (isTransientStepError(err) || isWorkflowStepStructuralResultError(err)) &&
         // Bug #8: never transient-retry a step whose send already fired — a retry
@@ -4295,6 +4998,7 @@ async function runStepVerifiedAttempt(
           inputs: ctx.inputs,
           stepOutputs: { ...ctx.stepOutputs, [step.id]: output },
           project: resolveWorkflowStepProjectContext(step, ctx.workflow),
+          occurrenceAt: deterministicOccurrenceAt(ctx.runId, ctx.workflowSlug),
         });
         const verdict = verifyStepOutput(step.loopUntil!.until, probeOutput);
         if (!verdict.ok) {
@@ -4969,13 +5673,18 @@ export async function executeStep(
         inputs: ctx.inputs,
         stepOutputs: ctx.stepOutputs,
         project: resolveWorkflowStepProjectContext(step, ctx.workflow),
+        occurrenceAt: deterministicOccurrenceAt(ctx.runId, ctx.workflowSlug),
       });
     } catch (err) {
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
         kind: 'step_failed',
         stepId: step.id,
         error: err instanceof Error ? err.message : String(err),
-        meta: { mode: 'deterministic', runner: step.deterministic.runner },
+        meta: {
+          mode: 'deterministic',
+          runner: step.deterministic.runner,
+          ...(err instanceof DeterministicWorkflowStepError ? { failure: err.failure } : {}),
+        },
       });
       throw err;
     }
@@ -5010,7 +5719,15 @@ export async function executeStep(
         kind: 'step_failed',
         stepId: step.id,
         error: err instanceof Error ? err.message : String(err),
-        meta: { mode: 'call', tool: step.call.tool },
+        meta: {
+          mode: 'call',
+          tool: step.call.tool,
+          ...(err instanceof WorkflowCallMutationAmbiguousError ? {
+            reason: 'parked_on_mutation_ambiguity',
+            mutationFingerprint: err.fingerprint,
+            providerRedispatched: false,
+          } : {}),
+        },
       });
       throw err;
     }
@@ -5203,6 +5920,7 @@ export async function executeStep(
                   true, // approval parks propagate through runWithConcurrency
                   true, // isItemInvocation: object/scalar item contract yes; aggregate array contract no
                   ctx.workflow,
+                  ctx.awaitingInput,
                 );
                 output = r.output;
                 itemSessionId = r.sessionId;
@@ -5212,13 +5930,20 @@ export async function executeStep(
                 // FORK collapse (staged): forEach item through the gated harness loop
                 // (default-OFF `workflow` surface → byte-identical to legacy until
                 // CLEMMY_HARNESS_WORKFLOW=on + a real workflow run validates chaining).
+                const legacySessionId = `workflow:${ctx.runId}:${step.id}:${key}`;
+                const legacySuffix = `${ctx.runId}:${step.id}:${key}`;
                 const response = await respondPreferHarness('workflow', {
-                  sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
+                  sessionId: legacySessionId,
                   channel: 'workflow',
                   runId: `workflow-step:${ctx.runId}:${step.id}:${key}`,
                   shouldCancel: () => isWorkflowRunCancelled(ctx.runId),
                   maxRunTokens: 0, // Stage 4: workflow budget = run-level advisory only
-                  message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
+                  message: workflowMessageWithAnsweredInput(
+                    `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
+                    step.id,
+                    legacySuffix,
+                    ctx.awaitingInput,
+                  ),
                   // ONE model resolution for every run/lane: explicit step.model →
                   // intent-routed worker → codex-safe brain. Resolving here (not raw
                   // getWorkerModel()) keeps this legacy lane identical to the harness
@@ -5227,6 +5952,15 @@ export async function executeStep(
                   model: resolveWorkflowStepModel(step, ctx.workflow).model ?? defaultForRole('brain'),
                   maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
                 }, (r) => ctx.assistant.respond(r));
+                if (response.stoppedReason === 'awaiting-input') {
+                  throw new WorkflowAwaitingInputSignal(workflowInputState({
+                    runId: ctx.runId,
+                    stepId: step.id,
+                    sessionId: legacySessionId,
+                    sessionIdSuffix: legacySuffix,
+                    question: response.text,
+                  }));
+                }
                 output = response.text;
                 itemRoute = routeDiagnosticsFromResponse(response);
               }
@@ -5239,6 +5973,7 @@ export async function executeStep(
               backoffBaseMs: RETRY_BACKOFF_BASE_MS,
               isRetryable: (err) =>
                 !(err instanceof ParkRunSignal)
+                && !(err instanceof WorkflowAwaitingInputSignal)
                 && !(err instanceof WorkflowRunCancelledError)
                 && (isTransientStepError(err) || isWorkflowStepStructuralResultError(err))
                 // double-act guard: never re-run an item that already wrote externally.
@@ -5300,6 +6035,21 @@ export async function executeStep(
           ? result.reason.parkedSteps
           : []);
       if (parkedSteps.length > 0) throw new ParkRunSignal(parkedSteps);
+      const awaitingInput = settled.find((result) =>
+        result && !result.ok && result.reason instanceof WorkflowAwaitingInputSignal);
+      if (
+        awaitingInput
+        && !awaitingInput.ok
+        && awaitingInput.reason instanceof WorkflowAwaitingInputSignal
+      ) {
+        appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+          kind: 'step_failed',
+          stepId: step.id,
+          error: awaitingInput.error,
+          meta: { reason: 'parked_on_input', questionId: awaitingInput.reason.state.questionId },
+        });
+        throw awaitingInput.reason;
+      }
       const capabilityBlock = settled.find((result) =>
         result && !result.ok && result.reason instanceof WorkflowCapabilityBlockedError);
       if (capabilityBlock && !capabilityBlock.ok) throw capabilityBlock.reason;
@@ -5451,6 +6201,7 @@ export async function executeStep(
         true, // canPark: plain step unwinds cleanly to processOneRunFile
         false,
         ctx.workflow,
+        ctx.awaitingInput,
       );
       output = result.output;
       stepSessionId = result.sessionId;
@@ -5472,6 +6223,8 @@ export async function executeStep(
         error: err instanceof Error ? err.message : String(err),
         ...(err instanceof ParkRunSignal
           ? { meta: { reason: 'parked_on_approval' } }
+          : err instanceof WorkflowAwaitingInputSignal
+            ? { meta: { reason: 'parked_on_input', questionId: err.state.questionId } }
           : err instanceof WorkflowCapabilityBlockedError
             ? {
               meta: {
@@ -5490,13 +6243,20 @@ export async function executeStep(
     // FORK collapse (staged): plain step through the gated harness loop
     // (default-OFF `workflow` surface → byte-identical to legacy until
     // CLEMMY_HARNESS_WORKFLOW=on + a real workflow run validates chaining).
+    const legacySessionId = `workflow:${ctx.runId}:${step.id}`;
+    const legacySuffix = `${ctx.runId}:${step.id}`;
     const response = await respondPreferHarness('workflow', {
-      sessionId: `workflow:${ctx.runId}:${step.id}`,
+      sessionId: legacySessionId,
       channel: 'workflow',
       runId: `workflow-step:${ctx.runId}:${step.id}`,
       shouldCancel: () => isWorkflowRunCancelled(ctx.runId),
       maxRunTokens: 0, // Stage 4: workflow budget = run-level advisory only
-      message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${promptedWithPatterns}`,
+      message: workflowMessageWithAnsweredInput(
+        `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${promptedWithPatterns}`,
+        step.id,
+        legacySuffix,
+        ctx.awaitingInput,
+      ),
       // ONE model resolution for every run/lane: explicit step.model →
       // intent-routed worker → codex-safe brain. Resolving here (not raw
       // MODELS.primary) keeps this legacy lane identical to the harness lane so a
@@ -5506,6 +6266,22 @@ export async function executeStep(
       model: resolveWorkflowStepModel(step).model ?? defaultForRole('brain'),
       maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
     }, (r) => ctx.assistant.respond(r));
+    if (response.stoppedReason === 'awaiting-input') {
+      const state = workflowInputState({
+        runId: ctx.runId,
+        stepId: step.id,
+        sessionId: legacySessionId,
+        sessionIdSuffix: legacySuffix,
+        question: response.text,
+      });
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_failed',
+        stepId: step.id,
+        error: state.question,
+        meta: { reason: 'parked_on_input', questionId: state.questionId },
+      });
+      throw new WorkflowAwaitingInputSignal(state);
+    }
     output = response.text;
     stepRoute = routeDiagnosticsFromResponse(response);
   }
@@ -5827,17 +6603,21 @@ export function planBlockedDependencySkips(
 export interface BatchSettlement {
   completions: Array<{ stepId: string; output: unknown }>;
   parkedSteps: ParkedStepRef[];
+  mutationAmbiguities: WorkflowCallMutationAmbiguousError[];
   capabilityBlocks: WorkflowCapabilityBlockedError[];
   failures: Array<{ stepId: string; message: string }>;
   /** continue = all fulfilled; park = at least one sibling waiting on approval;
+   * mutation_ambiguity = a possibly-committed call awaiting reconciliation;
    * capability = a proven-pre-dispatch capability interruption; fail = ordinary
-   * failures only. Approval park outranks capability, which outranks failure. */
-  action: 'continue' | 'park' | 'capability' | 'fail';
+   * failures only. Mutation ambiguity outranks every resumable lane because it
+   * can never be redispatched until the ledger is reconciled. */
+  action: 'continue' | 'mutation_ambiguity' | 'park' | 'capability' | 'fail';
 }
 
 /** T1.3: merge a parallel batch's settled results into one decision. The rule
- *  that matters: a parked sibling is work awaiting a HUMAN decision, so a park
- *  outranks an unrelated sibling's failure — the run parks (failure recorded as
+ *  that matters: an ambiguous mutation is held for reconciliation before any
+ *  lane can resume; otherwise a parked sibling awaiting a HUMAN outranks an
+ *  unrelated sibling's failure — the run parks (failure recorded as
  *  an advisory) instead of going terminal and cancelling the user's pending
  *  approval card. The failed step never emitted step_completed, so the pass
  *  after the park resolves re-runs it; a repeat failure with no park then fails
@@ -5849,6 +6629,7 @@ export function decideBatchSettlement(
 ): BatchSettlement {
   const completions: BatchSettlement['completions'] = [];
   const parkedSteps: ParkedStepRef[] = [];
+  const mutationAmbiguities: WorkflowCallMutationAmbiguousError[] = [];
   const capabilityBlocks: WorkflowCapabilityBlockedError[] = [];
   const failures: BatchSettlement['failures'] = [];
   settled.forEach((result, i) => {
@@ -5856,6 +6637,8 @@ export function decideBatchSettlement(
       completions.push({ stepId: result.value.step.id, output: result.value.output });
     } else if (result.reason instanceof ParkRunSignal) {
       parkedSteps.push(...result.reason.parkedSteps);
+    } else if (result.reason instanceof WorkflowCallMutationAmbiguousError) {
+      mutationAmbiguities.push(result.reason);
     } else if (result.reason instanceof WorkflowCapabilityBlockedError) {
       capabilityBlocks.push(result.reason);
     } else {
@@ -5865,14 +6648,16 @@ export function decideBatchSettlement(
       });
     }
   });
-  const action = parkedSteps.length > 0
-    ? 'park'
-    : capabilityBlocks.length > 0
-      ? 'capability'
-      : failures.length > 0
-        ? 'fail'
-        : 'continue';
-  return { completions, parkedSteps, capabilityBlocks, failures, action };
+  const action = mutationAmbiguities.length > 0
+    ? 'mutation_ambiguity'
+    : parkedSteps.length > 0
+      ? 'park'
+      : capabilityBlocks.length > 0
+        ? 'capability'
+        : failures.length > 0
+          ? 'fail'
+          : 'continue';
+  return { completions, parkedSteps, mutationAmbiguities, capabilityBlocks, failures, action };
 }
 
 function stringifyForPrompt(value: unknown): string {
@@ -6180,7 +6965,7 @@ export function isPhantomStepCompletion(step: WorkflowStepInput, toolUses: strin
   return realTools.length === 0;
 }
 
-function settlementGuardedStepOutput(input: {
+export function settlementGuardedStepOutput(input: {
   step: WorkflowStepInput;
   sessionId: string;
   sourceUserSeq: number;
@@ -6203,6 +6988,14 @@ function settlementGuardedStepOutput(input: {
     // step owes it once the runtime observed a real tool invocation; SDK
     // summaries alone never satisfy the audit.
     requiresBusinessEvidence: stepSideEffectClass(input.step) !== 'read' || businessTools.length > 0,
+    // A model-driven workflow step is a declared unit, not exploratory chat.
+    // If it issued multiple business reads, every one must settle successfully
+    // before its aggregate output can feed a downstream write/send. This stays
+    // strict even when the step also performs a local write (for example, a
+    // morning baseline): that local persistence does not make failed source
+    // reads optional. Deterministic and structured-call steps do not enter this
+    // model-output guard and retain their existing execution semantics.
+    requireEveryBusinessReadToSettle: true,
   });
   if (audit.status === 'clean') return input.output;
   return {
@@ -6386,6 +7179,25 @@ export function stepExternalWriteAlreadyClaimed(runId: string, stepId: string): 
     ).length > 0;
   } catch {
     return false;
+  }
+}
+
+/** Fail-closed durable crossing check for the one no-lifecycle-event recovery
+ * case. Exact schema preflight can park before `step_started`; its same-run
+ * proof may bypass the legacy crash heuristic only while this exact step owns
+ * no physical-dispatch row at all. */
+function workflowStepHasPhysicalDispatch(runId: string, stepId: string): boolean {
+  try {
+    const sessionId = `workflow:${runId}:${stepId}`;
+    return Boolean(openEventLog().prepare(`
+      SELECT 1
+        FROM physical_dispatches
+       WHERE session_id = ?
+       LIMIT 1
+    `).get(sessionId));
+  } catch {
+    // Unreadable crossing truth can never mint retry authority.
+    return true;
   }
 }
 
@@ -6641,6 +7453,7 @@ export function shouldHaltResumeForSideEffect(
       && !resume.failedSteps?.has(step.id)
       && step.requiresApproval !== true
       && stepSideEffectClass(step) !== 'read'
+      && !evidence.provenNoDispatchStepIds?.has(step.id)
       && !evidence.durableMutationProtocolStepIds?.has(step.id));
     if (uncertain) {
       const cls = stepSideEffectClass(uncertain) as 'write' | 'send';
@@ -7142,6 +7955,7 @@ async function executeWorkflow(
   mutationContractSnapshot?: unknown,
   capabilityResume?: WorkflowCapabilityBlockState,
   admittedCodeRevision?: string,
+  awaitingInput?: WorkflowAwaitingInputState,
 ): Promise<{
   finalOutput: string;
   publicTerminalStepId: string | null;
@@ -7149,6 +7963,7 @@ async function executeWorkflow(
   qualityAdvisories: WorkflowQualityAdvisory[];
   executionSteps: WorkflowStepInput[];
   graphFingerprint: string | null;
+  exactSendRedemptionProblems: Array<{ stepId: string; reason: string }>;
 }> {
   const compiledProjectRuntime = workflow.steps.some(isCompiledProjectRuntimeWorkflowStep);
   if (
@@ -7293,9 +8108,27 @@ async function executeWorkflow(
     crashResume
     && capabilityResume?.state === 'retrying'
     && capabilityResume.provenNoDispatch === true
-    && resume.inFlightStepIds.has(capabilityResume.stepId)
   ) {
-    provenNoDispatchStepIds.add(capabilityResume.stepId);
+    if (
+      !isExactSchemaCapabilityReason(capabilityResume.reason)
+      && resume.inFlightStepIds.has(capabilityResume.stepId)
+    ) {
+      // Preserve the existing capability-resume behavior for an ordinary
+      // gateway block that already has a durable step_started lifecycle.
+      provenNoDispatchStepIds.add(capabilityResume.stepId);
+    } else {
+      // Exact-schema preflight may refuse before step_started. Only the
+      // authenticated empty-ledger proof can exempt that one ready-frontier
+      // step; a concurrent/unrelated mutation remains guarded below.
+      const exactProofStepId = exactSchemaCapabilityResumeProofStepId({
+        workflow,
+        workflowSlug,
+        runId,
+        block: capabilityResume,
+        expectedState: 'retrying',
+      });
+      if (exactProofStepId) provenNoDispatchStepIds.add(exactProofStepId);
+    }
   }
   const resumeHalt = shouldHaltResumeForSideEffect(
     executionWorkflow,
@@ -7373,7 +8206,7 @@ async function executeWorkflow(
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
       const output = await executeStepVerified(step, {
-        workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision,
+        workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision, awaitingInput,
       });
       throwIfWorkflowRunCancelled(runId);
       stepOutputs[step.id] = output;
@@ -7504,8 +8337,10 @@ async function executeWorkflow(
       const concurrencyCap = Math.max(1, RUNNER_CONCURRENCY);
       const epoch = {
         parkedSteps: [] as ConstructorParameters<typeof ParkRunSignal>[0],
+        awaitingInputs: [] as WorkflowAwaitingInputSignal[],
+        mutationAmbiguities: [] as WorkflowCallMutationAmbiguousError[],
         capabilityBlocks: [] as WorkflowCapabilityBlockedError[],
-        failures: [] as Array<{ stepId: string; message: string }>,
+        failures: [] as Array<{ stepId: string; message: string; error: unknown }>,
         abort: { aborted: false },
         cancellation: undefined as unknown,
         // A steer applies to exactly ONE scheduler wave — the first wave that
@@ -7580,7 +8415,7 @@ async function executeWorkflow(
                 ? (epoch.steerWave = context.wave, epoch.steer)
                 : undefined;
               const output = await executeStepVerified(step, {
-                workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision,
+                workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision, awaitingInput,
                 ...(steerForStep ? { watcherSteer: steerForStep } : {}),
               });
               stepOutputs[step.id] = output;
@@ -7592,8 +8427,18 @@ async function executeWorkflow(
                 // exactly the old "batch finishes, then the run parks".
                 return { status: 'paused', reason: 'approval_parked' };
               }
+              if (error instanceof WorkflowAwaitingInputSignal) {
+                epoch.awaitingInputs.push(error);
+                epoch.abort.aborted = true;
+                return { status: 'paused', reason: 'input_parked' };
+              }
               if (error instanceof WorkflowCapabilityBlockedError) {
                 epoch.capabilityBlocks.push(error);
+                epoch.abort.aborted = true;
+                return { status: 'blocked', reason: error.message };
+              }
+              if (error instanceof WorkflowCallMutationAmbiguousError) {
+                epoch.mutationAmbiguities.push(error);
                 epoch.abort.aborted = true;
                 return { status: 'blocked', reason: error.message };
               }
@@ -7603,7 +8448,7 @@ async function executeWorkflow(
                 return { status: 'failed', reason: 'run cancelled', settlementClass: 'cancelled' };
               }
               const message = error instanceof Error ? error.message : String(error);
-              epoch.failures.push({ stepId: step.id, message });
+              epoch.failures.push({ stepId: step.id, message, error });
               epoch.abort.aborted = true;
               return { status: 'failed', reason: message, settlementClass: 'node' };
             }
@@ -7628,6 +8473,17 @@ async function executeWorkflow(
       // ── epoch settlement, in the exact old priority order ─────────────────
       if (epoch.cancellation) throw epoch.cancellation;
       throwIfWorkflowRunCancelled(runId);
+      if (epoch.mutationAmbiguities.length > 0) {
+        for (const failure of epoch.failures) {
+          appendWorkflowEvent(workflowSlug, runId, {
+            kind: 'step_advisory',
+            stepId: failure.stepId,
+            error: failure.message,
+            meta: { reason: 'batch_sibling_failed_while_mutation_ambiguous' },
+          });
+        }
+        throw epoch.mutationAmbiguities[0];
+      }
       if (epoch.parkedSteps.length > 0) {
         for (const failure of epoch.failures) {
           appendWorkflowEvent(workflowSlug, runId, {
@@ -7643,6 +8499,17 @@ async function executeWorkflow(
         }
         throw new ParkRunSignal(epoch.parkedSteps);
       }
+      if (epoch.awaitingInputs.length > 0) {
+        for (const failure of epoch.failures) {
+          appendWorkflowEvent(workflowSlug, runId, {
+            kind: 'step_advisory',
+            stepId: failure.stepId,
+            error: failure.message,
+            meta: { reason: 'batch_sibling_failed_while_awaiting_input' },
+          });
+        }
+        throw epoch.awaitingInputs[0];
+      }
       if (epoch.capabilityBlocks.length > 0) {
         for (const failure of epoch.failures) {
           appendWorkflowEvent(workflowSlug, runId, {
@@ -7656,7 +8523,11 @@ async function executeWorkflow(
       }
       if (epoch.failures.length > 0) {
         const messages = epoch.failures.map((e) => e.message);
-        throw new Error(messages.length === 1 ? messages[0] : `Workflow batch failed: ${messages.join('; ')}`);
+        // Preserve a sole typed failure across the graph scheduler boundary.
+        // Re-wrapping it as `new Error(message)` deletes the structured
+        // provider/runner evidence that terminal reporting relies on.
+        if (epoch.failures.length === 1) throw epoch.failures[0].error;
+        throw new Error(`Workflow batch failed: ${messages.join('; ')}`);
       }
       if (result.status === 'stalled') {
         throw new Error(`Workflow dependency graph is blocked or cyclic: ${result.stalledDetail ?? 'no step can proceed'}`);
@@ -7675,6 +8546,18 @@ async function executeWorkflow(
   // the per-step loop is done.
   clearWorkflowRunCurrentStep(runId);
   clearWorkflowRunItemProgress(runId);
+
+  // Crash-resume loads mutable completed-step journal bytes. Redeem exact
+  // sends before synthesis or any terminal consumer can observe those bytes;
+  // a valid committed ledger repairs locally, while ledger uncertainty turns
+  // the step into an explicit block without touching the provider.
+  const executionExactSendRedemption = redeemExactScheduledSendOutputs(
+    workflow,
+    workflowSlug,
+    runId,
+    inputs,
+    stepOutputs,
+  );
 
   // Synthesis step (optional final pass over all step outputs). Skipped
   // when TRY is running a single step in isolation — the step's own
@@ -7746,12 +8629,14 @@ async function executeWorkflow(
           true, // canPark: synthesis runs outside any batch/forEach
           false,
           executionWorkflow,
+          awaitingInput,
         ),
         {
           budget: transientRetryFloor(),
           backoffBaseMs: RETRY_BACKOFF_BASE_MS,
           isRetryable: (err) =>
             !(err instanceof ParkRunSignal) &&
+            !(err instanceof WorkflowAwaitingInputSignal) &&
             !(err instanceof WorkflowRunCancelledError) &&
             (isTransientStepError(err) || isWorkflowStepStructuralResultError(err)),
           onRetry: ({ attempt, budget: b, delayMs, err }) => {
@@ -7769,7 +8654,11 @@ async function executeWorkflow(
     try {
       synthesisOutput = (await synthesisAttempt(synthesisStep)).output;
     } catch (err) {
-      if (err instanceof ParkRunSignal || err instanceof WorkflowRunCancelledError) throw err;
+      if (
+        err instanceof ParkRunSignal
+        || err instanceof WorkflowAwaitingInputSignal
+        || err instanceof WorkflowRunCancelledError
+      ) throw err;
       let lastErr: unknown = err;
       // Step-boundary brain fallover, mirroring executeStepVerified. Synthesis
       // is read-only, so there is no external-write guard to respect.
@@ -7788,7 +8677,11 @@ async function executeWorkflow(
             lastErr = null;
             break;
           } catch (nextErr) {
-            if (nextErr instanceof ParkRunSignal || nextErr instanceof WorkflowRunCancelledError) throw nextErr;
+            if (
+              nextErr instanceof ParkRunSignal
+              || nextErr instanceof WorkflowAwaitingInputSignal
+              || nextErr instanceof WorkflowRunCancelledError
+            ) throw nextErr;
             lastErr = nextErr;
             if (!isTransientStepError(nextErr) && !isUnparseableToolCallError(nextErr)) break;
           }
@@ -7850,6 +8743,7 @@ async function executeWorkflow(
     qualityAdvisories,
     executionSteps: steps,
     graphFingerprint: liveExecutionPlan.graphFingerprint,
+    exactSendRedemptionProblems: executionExactSendRedemption.problems,
   };
 }
 
@@ -7895,6 +8789,17 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
   if (workflowDrainInFlight) return;
   workflowDrainInFlight = true;
   try {
+    // `awaiting_input` records are intentionally non-drainable. Their canonical
+    // record doubles as a durable presentation outbox, so repair its cards,
+    // shared activity state, and exact-origin question before considering any
+    // executable work. This is idempotent and never re-admits the run.
+    const inputProjection = reconcileAwaitingInputWorkflowRunProjections();
+    if (inputProjection.failed.length > 0) {
+      logger.warn(
+        { failures: inputProjection.failed },
+        'Workflow clarification projection remains pending; canonical pause will retry next tick',
+      );
+    }
     // Finish both halves of the project queue's two-phase install before the
     // runs-directory existence check. A graph admission can predate that
     // directory entirely, and readiness recovery must not require the user to
@@ -7955,7 +8860,32 @@ function readmitCapabilityBlockedRun(
   resumedAt: string,
   source: 'automatic-retry' | 'manual-resume',
 ): boolean {
-  if (run.status !== 'blocked_capability' || !run.capabilityBlock) return false;
+  if (
+    run.status !== 'blocked_capability'
+    || !run.capabilityBlock
+    || run.capabilityBlock.state !== 'blocked'
+    || run.capabilityBlock.provenNoDispatch !== true
+  ) return false;
+  const admitted = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
+  if (admitted.status !== 'valid') return false;
+  const workflowSlug = admitted.snapshot.workflowSlug;
+  // `workflowSlug` on the run record is a convenience projection used by
+  // scheduled admissions. Manual/chat records may omit it; when present it
+  // must agree with the authenticated immutable definition snapshot.
+  if (
+    run.workflowSlug !== undefined
+    && (typeof run.workflowSlug !== 'string' || run.workflowSlug.trim() !== workflowSlug)
+  ) return false;
+  if (
+    isExactSchemaCapabilityReason(run.capabilityBlock.reason)
+    && exactSchemaCapabilityResumeProofStepId({
+      workflow: admitted.snapshot.definition,
+      workflowSlug,
+      runId: run.id,
+      block: run.capabilityBlock,
+      expectedState: 'blocked',
+    }) !== run.capabilityBlock.stepId
+  ) return false;
   const resumedRecord = writeRunRecord(filePath, {
     ...run,
     status: 'running',
@@ -7967,7 +8897,7 @@ function readmitCapabilityBlockedRun(
   }).record;
   if (isTerminalRunRecord(resumedRecord) || resumedRecord.status !== 'running') return false;
   try {
-    appendWorkflowEvent(run.workflow, run.id, {
+    appendWorkflowEvent(workflowSlug, run.id, {
       kind: 'run_resumed',
       meta: {
         reason: 'capability_retry',
@@ -7987,6 +8917,7 @@ function readmitCapabilityBlockedRun(
       message: `Capability retry ${run.capabilityBlock.retryCount}: resuming ${run.capabilityBlock.stepId}.`,
       data: {
         workflow: run.workflow,
+        workflowSlug,
         stepId: run.capabilityBlock.stepId,
         toolkit: run.capabilityBlock.toolkit,
         source,
@@ -7996,6 +8927,7 @@ function readmitCapabilityBlockedRun(
   logger.info(
     {
       workflow: run.workflow,
+      workflowSlug,
       runId: run.id,
       stepId: run.capabilityBlock.stepId,
       toolkit: run.capabilityBlock.toolkit,
@@ -8043,6 +8975,113 @@ export function resumeCapabilityBlockedWorkflowRun(runId: string): boolean {
     : false;
 }
 
+function readmitMutationBlockedRun(
+  filePath: string,
+  run: QueuedRunRecord,
+  source: 'ledger-reaper' | 'manual-review',
+): boolean {
+  const block = run.mutationBlock;
+  if (
+    run.status !== 'blocked_mutation'
+    || !block
+    || block.state !== 'awaiting_reconciliation'
+    || block.providerRedispatched !== false
+  ) return false;
+  const admitted = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
+  if (admitted.status !== 'valid' || admitted.snapshot.workflowSlug !== block.workflowSlug) {
+    return false;
+  }
+
+  // This check only reads/finalizes the immutable intent/receipt/commit
+  // journal. It never probes or calls the provider. A still-started or corrupt
+  // slot remains parked; only a committed result that the same run can replay
+  // is readmitted.
+  try {
+    if (!workflowCallMutationSlotHasCommittedResult({
+      workflowSlug: block.workflowSlug,
+      runId: run.id,
+      stepId: block.stepId,
+      ...(block.itemKey !== undefined ? { itemKey: block.itemKey } : {}),
+    }, block.tool, block.fingerprint)) return false;
+  } catch {
+    return false;
+  }
+
+  const resumedAt = new Date().toISOString();
+  const resumedRecord = writeRunRecord(filePath, {
+    ...run,
+    status: 'running',
+    mutationBlock: undefined,
+  }).record;
+  if (isTerminalRunRecord(resumedRecord) || resumedRecord.status !== 'running') return false;
+  try {
+    appendWorkflowEvent(block.workflowSlug, run.id, {
+      kind: 'run_resumed',
+      meta: {
+        reason: 'committed_mutation_replay_ready',
+        source,
+        stepId: block.stepId,
+        ...(block.itemKey !== undefined ? { itemKey: block.itemKey } : {}),
+        tool: block.tool,
+        mutationFingerprint: block.fingerprint,
+        reconciledAt: resumedAt,
+        providerRedispatched: false,
+      },
+    });
+  } catch { /* the run record is authoritative */ }
+  try {
+    addRunEvent(run.id, {
+      type: 'run_resumed',
+      status: 'running',
+      message: `Committed mutation receipt reconciled for ${block.stepId}. Resuming the same run by replay.`,
+      data: {
+        workflow: run.workflow,
+        stepId: block.stepId,
+        tool: block.tool,
+        source,
+        providerRedispatched: false,
+      },
+    });
+  } catch { /* Activity is best-effort */ }
+  logger.info(
+    {
+      workflow: run.workflow,
+      workflowSlug: block.workflowSlug,
+      runId: run.id,
+      stepId: block.stepId,
+      mutationFingerprint: block.fingerprint,
+      source,
+      providerRedispatched: false,
+    },
+    'Mutation-blocked workflow re-admitted from committed ledger replay only',
+  );
+  return true;
+}
+
+/** Read-only/ledger-only reconciliation scan. It never queries the provider
+ * and never retries a started mutation. A durable committed receipt readmits
+ * the same run, whose call node replays that receipt with zero redispatch. */
+export function reapMutationBlockedRuns(): number {
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return 0;
+  let resumed = 0;
+  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
+    const filePath = path.join(WORKFLOW_RUNS_DIR, file);
+    const run = readRunRecordForScan(filePath);
+    if (!run || run.status !== 'blocked_mutation') continue;
+    if (readmitMutationBlockedRun(filePath, run, 'ledger-reaper')) resumed += 1;
+  }
+  return resumed;
+}
+
+/** Operator affordance after an out-of-band reconciliation has durably
+ * committed this exact slot. False means it remains ambiguous and parked. */
+export function resumeMutationBlockedWorkflowRun(runId: string): boolean {
+  if (!/^[A-Za-z0-9_.:-]+$/.test(runId)) return false;
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const run = readRunRecord(filePath);
+  return run ? readmitMutationBlockedRun(filePath, run, 'manual-review') : false;
+}
+
 /**
  * P0 event-driven approval parking — the resolution scan. Runs on the
  * workflow-run lane tick (and on boot). For each run checkpointed as
@@ -8058,6 +9097,10 @@ export function reapResolvedParkedRuns(): void {
   // Capability parks are independent of the human-approval parking
   // kill-switch and share this daemon tick only as a scheduling convenience.
   reapCapabilityBlockedRuns();
+  // Ambiguous mutations have a separate, stricter resume authority: only a
+  // committed immutable receipt can readmit the same run, never a timer or
+  // provider redispatch. Run this even when human approval parking is off.
+  reapMutationBlockedRuns();
   if (!parkingEnabled()) return;
   if (!existsSync(WORKFLOW_RUNS_DIR)) return;
   let approvalsById: Map<string, approvalRegistry.PendingApprovalRow>;
@@ -8336,6 +9379,7 @@ export function _testOnly_isLegacyScheduledCatchupSafeToHold(
     && run.mutationContractSnapshot === undefined
     && run.parked === undefined
     && run.capabilityBlock === undefined
+    && run.mutationBlock === undefined
     && run.workflowGraphFinalizingFingerprint === undefined
     && run.reportBack === undefined
   );
@@ -9606,6 +10650,157 @@ export function resolveWorkflowDefinitionForRun(
   };
 }
 
+/** Persist a proven-pre-dispatch dependency pause without terminalizing the
+ * accepted occurrence. This helper is intentionally usable both before the
+ * main execution heartbeat (exact-schema preflight) and from the execution
+ * catch (gateway/auth/boundary refusal), so every such refusal has the same
+ * durable same-run recovery semantics. */
+function parkWorkflowCapabilityBlockedRun(input: {
+  filePath: string;
+  run: QueuedRunRecord;
+  workflow: WorkflowCatalogEntry;
+  error: WorkflowCapabilityBlockedError;
+}): void {
+  const { filePath, run, workflow, error } = input;
+  const blockedAtMs = Date.now();
+  const retryCount = (run.capabilityBlock?.retryCount ?? 0) + 1;
+  const blockedAt = new Date(blockedAtMs).toISOString();
+  const retryAt = new Date(blockedAtMs + workflowCapabilityRetryDelayMs(retryCount)).toISOString();
+  const capabilityBlock: WorkflowCapabilityBlockState = {
+    stepId: error.stepId,
+    tool: error.tool,
+    toolkit: error.toolkit,
+    reason: error.reason,
+    message: error.message,
+    blockedAt,
+    retryAt,
+    retryCount,
+    provenNoDispatch: true,
+    state: 'blocked',
+  };
+  const blockedRecord = writeRunRecord(filePath, {
+    ...run,
+    // Persist the admitted catalog identity for current records. Resume still
+    // derives authority from the immutable snapshot so older manual/chat
+    // blocks that lack this convenience projection remain recoverable.
+    workflowSlug: workflow.name,
+    status: 'blocked_capability',
+    startedAt: run.startedAt ?? blockedAt,
+    capabilityBlock,
+  }).record;
+  if (blockedRecord.status === 'cancelled') {
+    stopAfterCancellationWonWrite(filePath, blockedRecord);
+    return;
+  }
+  if (isTerminalRunRecord(blockedRecord)) return;
+  appendWorkflowEvent(workflow.name, run.id, {
+    kind: 'run_paused',
+    error: error.message,
+    meta: {
+      reason: 'capability_blocked',
+      stepId: error.stepId,
+      tool: error.tool,
+      toolkit: error.toolkit,
+      capabilityReason: error.reason,
+      retryAt,
+      retryCount,
+      provenNoDispatch: true,
+    },
+  });
+  const exactSchemaBlock = error.reason === 'exact_schema_refresh_unavailable'
+    || error.reason === 'exact_schema_boundary_mismatch';
+  const detail = [
+    exactSchemaBlock
+      ? `I paused "${workflow.data.name}" at step "${error.stepId}" because the exact action schema could not be proven at the provider boundary.`
+      : `I paused "${workflow.data.name}" at step "${error.stepId}" because ${error.toolkit} is not currently usable.`,
+    error.message,
+    `Everything completed before this step is preserved. No ${error.tool} dispatch occurred, so this same run can safely resume.`,
+    exactSchemaBlock
+      ? `I will retry the same exact-slug metadata refresh automatically after ${retryAt}; no broader discovery or business action is performed during recovery.`
+      : `I will retry automatically after ${retryAt}; reconnect or disambiguate ${error.toolkit} first. You can also resume the run immediately after fixing it.`,
+  ].join('\n\n');
+  try {
+    addNotification({
+      id: `workflow-${run.id}-capability-${error.toolkit.toLowerCase()}`,
+      kind: 'workflow',
+      title: exactSchemaBlock
+        ? 'Workflow paused — exact action metadata unavailable'
+        : `Workflow paused — connect ${error.toolkit}`,
+      body: detail,
+      createdAt: blockedAt,
+      read: false,
+      metadata: {
+        workflow: workflow.data.name,
+        runId: run.id,
+        status: 'blocked_capability',
+        stepId: error.stepId,
+        tool: error.tool,
+        toolkit: error.toolkit,
+        reason: error.reason,
+        retryAt,
+        retryCount,
+        provenNoDispatch: true,
+      },
+    });
+  } catch { /* durable run state remains visible */ }
+  // Preflight schema refusal occurs before the ordinary activity start. The
+  // upsert is also safe for an already-running workflow caught at the gateway.
+  try {
+    startWorkflowActivityRun(run, workflow.data.name, `Running workflow "${workflow.data.name}"`);
+    finishRun(run.id, {
+      status: 'awaiting_input',
+      message: exactSchemaBlock
+        ? `Waiting for exact action metadata at step ${error.stepId}; completed work is preserved.`
+        : `Waiting for ${error.toolkit} connection at step ${error.stepId}; completed work is preserved.`,
+      outputPreview: detail,
+      pendingInput: {
+        kind: 'capability_dependency',
+        dependencyId: `workflow:${run.id}:${error.stepId}:${error.tool}`,
+        source: {
+          kind: 'workflow_step',
+          workflow: workflow.data.name,
+          runId: run.id,
+          stepId: error.stepId,
+        },
+        operation: {
+          stepId: error.stepId,
+          tool: error.tool,
+          toolkit: error.toolkit,
+          reason: error.reason,
+        },
+        nextAction: `${error.message} Resume this run after the dependency is available; its completed work stays preserved.`,
+        retryAt,
+        provenNoDispatch: true,
+      },
+    });
+  } catch { /* Activity is best-effort */ }
+  for (const originSessionId of workflowRunOriginSessionIds(run)) {
+    deliverOutcome(
+      { status: 'needs_input', detail },
+      {
+        originSessionId,
+        sourceLabel: 'workflow run',
+        sourceId: `${run.id}#capability-${error.toolkit.toLowerCase()}`,
+        title: workflow.data.name,
+        statusHint: `workflow_run_status run_id="${run.id}"`,
+        proactiveTurn: true,
+      },
+    );
+  }
+  logger.info(
+    {
+      workflow: workflow.data.name,
+      runId: run.id,
+      stepId: error.stepId,
+      toolkit: error.toolkit,
+      reason: error.reason,
+      retryAt,
+      retryCount,
+    },
+    'Workflow paused on recoverable capability block — bounded-pool slot released',
+  );
+}
+
 async function processOneRunFile(
   file: string,
   filePath: string,
@@ -9766,6 +10961,34 @@ async function processOneRunFile(
           activationBlockedReason = 'the workflow code changed while its creation test was running';
         }
       }
+      let activationDefinition: WorkflowDefinition | undefined;
+      if (result.pass && activationCompatible) {
+        const latest = readWorkflow(workflow.name)?.data ?? workflow.data;
+        const enabledCandidate = { ...latest, enabled: true };
+        if (enabledCandidate.steps.some((step) => (
+          Boolean(step.call)
+          && step.requiresApproval !== true
+          && structuredCallSideEffectClass(step) === 'send'
+        ))) {
+          await warmExactScheduledSendSchemaAuthority(enabledCandidate);
+          const activationPrep = prepareWorkflowForWrite(enabledCandidate);
+          if (!activationPrep.ok) {
+            result = {
+              pass: false,
+              steps: [
+                ...result.steps,
+                {
+                  stepId: '(enable)',
+                  status: 'error',
+                  detail: activationPrep.errors.join('; ').slice(0, 500),
+                },
+              ],
+            };
+          } else {
+            activationDefinition = activationPrep.def;
+          }
+        }
+      }
       const creationReady = result.pass && activationCompatible;
       let autoRetestRunId: string | null = null;
       if (shouldAutoRetestStaleCreationTest({
@@ -9825,7 +11048,10 @@ async function processOneRunFile(
               && workflowCodeRevisionMatchesSnapshot(catalogSnapshot, latest.data)
             )
           ) {
-            writeWorkflowAndSyncTriggers(workflow.name, { ...(latest?.data ?? workflow.data), enabled: true });
+            writeWorkflowAndSyncTriggers(
+              workflow.name,
+              activationDefinition ?? { ...(latest?.data ?? workflow.data), enabled: true },
+            );
           }
         } catch { /* best-effort */ }
         try { clearWorkflowFailures(workflow.name); } catch { /* best-effort */ }
@@ -9904,9 +11130,25 @@ async function processOneRunFile(
     }
 
     if (!run.targetStepId) {
+      // Stale exact-send schema authority repairs itself with one exact-slug
+      // metadata lookup before canonical preparation/validation. No business
+      // action occurs here; preparation still refuses if renewal fails.
+      await warmExactScheduledSendSchemaAuthority(workflow.data);
+      const committedReplayStepIds = exactScheduledSendCommittedReplayStepIds(
+        workflow.data,
+        workflow.name,
+        run.id,
+      );
+      const exactSchemaBlock = unavailableExactSchemaAuthority(workflow.data, committedReplayStepIds);
+      if (exactSchemaBlock) {
+        parkWorkflowCapabilityBlockedRun({ filePath, run, workflow, error: exactSchemaBlock });
+        return;
+      }
       const prep = definitionResolution.definitionSource === 'compiled_snapshot'
         ? { ok: true as const, def: workflow.data, repairs: [] as string[] }
-        : prepareWorkflowForWrite(workflow.data);
+        : prepareWorkflowForWrite(workflow.data, {
+          exactSendCommittedReplayStepIds: committedReplayStepIds,
+        });
       if (prep.ok && prep.repairs.length > 0) {
         let repairAuthorized = false;
         let graphRebased = false;
@@ -9945,7 +11187,14 @@ async function processOneRunFile(
         if (!repairAuthorized) return;
         logger.info({ workflow: workflow.data.name, runId: run.id, repairs: prep.repairs }, 'workflow pre-run auto-repair applied');
       }
-      const preflight = preflightWorkflow(workflow.data, run.inputs ?? {});
+      const replayStepIdsAfterRepair = exactScheduledSendCommittedReplayStepIds(
+        workflow.data,
+        workflow.name,
+        run.id,
+      );
+      const preflight = preflightWorkflow(workflow.data, run.inputs ?? {}, {
+        exactSendCommittedReplayStepIds: replayStepIdsAfterRepair,
+      });
       if (!preflight.ok) {
         const message = `Workflow "${workflow.data.name}" needs edits before it can run. ${preflight.summary}`;
         const report = { workflowName: workflow.data.name, outcome: 'blocked' as const, detail: message };
@@ -10167,12 +11416,13 @@ async function processOneRunFile(
         });
       }
       const {
-        finalOutput,
+        finalOutput: executionFinalOutput,
         publicTerminalStepId,
         forEachFailures,
         qualityAdvisories,
         executionSteps,
         graphFingerprint,
+        exactSendRedemptionProblems: executionExactSendRedemptionProblems,
       } = await executeWorkflow(
         workflow.data,
         workflow.name,
@@ -10187,6 +11437,7 @@ async function processOneRunFile(
         runningRecord.mutationContractSnapshot,
         capabilityResumeAuthority,
         definitionResolution.snapshot?.codeRevision,
+        runningRecord.awaitingInput,
       );
       if (beforeWorkflowGraphFinalizationForTests) {
         await beforeWorkflowGraphFinalizationForTests({
@@ -10225,6 +11476,27 @@ async function processOneRunFile(
         run.id,
       );
       const rawStepOutputs = Object.fromEntries(resume.completedSteps);
+      // Redeem/replace exact-send journal output before any contract, judge,
+      // run-record, or user-facing projection sees it. A stale/tampered mutable
+      // envelope is restored from a valid immutable commit locally; only ledger
+      // uncertainty routes to review, and neither path re-dispatches.
+      const terminalExactSendRedemption = redeemExactScheduledSendOutputs(
+        executionWorkflowData,
+        workflow.name,
+        run.id,
+        inputs,
+        rawStepOutputs,
+      );
+      // The terminal re-read is authoritative. If the earlier pre-synthesis
+      // read encountered a transient projection/read issue, a valid immutable
+      // commit repairs it here and clears that issue. Only uncertainty that is
+      // still present at this final ledger boundary may block publication.
+      const exactSendRedemptionProblems = terminalExactSendRedemption.problems;
+      const finalOutput = executionExactSendRedemptionProblems.length > 0
+        || exactSendRedemptionProblems.length > 0
+        || terminalExactSendRedemption.repairedStepIds.length > 0
+        ? formatStepOutputs(executionSteps, rawStepOutputs, { workflowName: workflow.name, runId: run.id })
+        : executionFinalOutput;
       const stepOutputs = stringifyOutputs(rawStepOutputs);
       const isCompiledProjectRun = definitionResolution.definitionSource === 'compiled_snapshot';
       const compiledTerminalStep = isCompiledProjectRun
@@ -10258,6 +11530,13 @@ async function processOneRunFile(
         publicStepOutputs,
         publicExecutionSteps.map((step) => step.id),
       );
+      for (const evidenceProblem of exactSendRedemptionProblems) {
+        blockedSteps.push({
+          stepId: evidenceProblem.stepId,
+          kind: 'blocked',
+          reason: `Exact scheduled-send evidence could not be redeemed: ${evidenceProblem.reason}`,
+        });
+      }
       // Run-level settlement truth must join the ordinary needs-attention path
       // before the report, activity mirror, notification, and learning decision
       // are built. Downgrading inside writeRunRecord changed only the persisted
@@ -10342,7 +11621,7 @@ async function processOneRunFile(
       const declaredRunGoal = workflowRunGoal(workflow.data);
       const legacyRunGoal = declaredRunGoal ? null : deriveLegacyWorkflowRunGoal(workflow.data, inputs);
       let targetVerdict: WorkflowTargetVerdict | null = null;
-      if (!isCompiledProjectRun && !declaredRunGoal) {
+      if (!isCompiledProjectRun && !declaredRunGoal && blockedSteps.length === 0) {
         try {
           targetVerdict = await judgeWorkflowTarget({
             workflow: workflow.data,
@@ -11048,32 +12327,28 @@ async function processOneRunFile(
       // lane. A routine no-op never wakes the chat.
       logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: publicForEachFailures.length, blockedSteps: blockedSteps.length, advisories: publicQualityAdvisories.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
-      // Recoverable capability parking: the shared Composio gateway proved the
-      // requested action never crossed the dispatch boundary. Preserve every
-      // completed step, release the worker slot, tell the user exactly what to
-      // connect/fix, and retry this SAME run with quiet exponential backoff.
-      if (error instanceof WorkflowCapabilityBlockedError) {
-        const blockedAtMs = Date.now();
-        const retryCount = (run.capabilityBlock?.retryCount ?? 0) + 1;
-        const blockedAt = new Date(blockedAtMs).toISOString();
-        const retryAt = new Date(blockedAtMs + workflowCapabilityRetryDelayMs(retryCount)).toISOString();
-        const capabilityBlock: WorkflowCapabilityBlockState = {
+      // A provider mutation crossed the durable STARTED boundary but no
+      // success/failure receipt settled it. This is neither a terminal failure
+      // nor a safe retry: preserve completed steps, release the worker, and
+      // hold this same run for read-only ledger/provider reconciliation. No
+      // timer, user answer, approval, or capability reaper can readmit it.
+      if (error instanceof WorkflowCallMutationAmbiguousError) {
+        const blockedAt = new Date().toISOString();
+        const mutationBlock: WorkflowMutationAmbiguityBlockState = {
+          workflowSlug: error.workflowSlug,
           stepId: error.stepId,
+          ...(error.itemKey !== undefined ? { itemKey: error.itemKey } : {}),
           tool: error.tool,
-          toolkit: error.toolkit,
-          reason: error.reason,
-          message: error.message,
+          fingerprint: error.fingerprint,
           blockedAt,
-          retryAt,
-          retryCount,
-          provenNoDispatch: true,
-          state: 'blocked',
+          state: 'awaiting_reconciliation',
+          providerRedispatched: false,
         };
         const blockedRecord = writeRunRecord(filePath, {
           ...run,
-          status: 'blocked_capability',
+          status: 'blocked_mutation',
           startedAt: run.startedAt ?? blockedAt,
-          capabilityBlock,
+          mutationBlock,
         }).record;
         if (blockedRecord.status === 'cancelled') {
           stopAfterCancellationWonWrite(filePath, blockedRecord);
@@ -11084,49 +12359,43 @@ async function processOneRunFile(
           kind: 'run_paused',
           error: error.message,
           meta: {
-            reason: 'capability_blocked',
+            reason: 'mutation_outcome_ambiguous',
             stepId: error.stepId,
             tool: error.tool,
-            toolkit: error.toolkit,
-            capabilityReason: error.reason,
-            retryAt,
-            retryCount,
-            provenNoDispatch: true,
+            mutationFingerprint: error.fingerprint,
+            providerRedispatched: false,
           },
         });
         const detail = [
-          `I paused "${workflow.data.name}" at step "${error.stepId}" because ${error.toolkit} is not currently usable.`,
-          error.message,
-          `Everything completed before this step is preserved. No ${error.tool} dispatch occurred, so this same run can safely resume.`,
-          `I will retry automatically after ${retryAt}; reconnect or disambiguate ${error.toolkit} first. You can also resume the run immediately after fixing it.`,
+          `I paused "${workflow.data.name}" at step "${error.stepId}" because the provider outcome is not yet provable.`,
+          'The call may already have committed, so I did not send it again. Everything completed before this step is preserved.',
+          `Reconcile mutation ${error.fingerprint.slice(0, 12)} against the destination/provider receipt. Resume this same run only after its immutable ledger has a committed replay.`,
         ].join('\n\n');
         try {
           addNotification({
-            id: `workflow-${run.id}-capability-${error.toolkit.toLowerCase()}`,
+            id: `workflow-${run.id}-mutation-review-${error.stepId}`,
             kind: 'workflow',
-            title: `Workflow paused — connect ${error.toolkit}`,
+            title: `Workflow paused — reconcile provider outcome`,
             body: detail,
             createdAt: blockedAt,
             read: false,
             metadata: {
               workflow: workflow.data.name,
               runId: run.id,
-              status: 'blocked_capability',
+              status: 'blocked_mutation',
               stepId: error.stepId,
               tool: error.tool,
-              toolkit: error.toolkit,
-              reason: error.reason,
-              retryAt,
-              retryCount,
-              provenNoDispatch: true,
+              mutationFingerprint: error.fingerprint,
+              providerRedispatched: false,
             },
           });
         } catch { /* durable run state remains visible */ }
         try {
           finishRun(run.id, {
-            status: 'awaiting_approval',
-            message: `Waiting for ${error.toolkit} connection at step ${error.stepId}; completed work is preserved.`,
+            status: 'awaiting_input',
+            message: `Waiting for mutation reconciliation at step ${error.stepId}; completed work is preserved.`,
             outputPreview: detail,
+            needsAttention: true,
           });
         } catch { /* Activity is best-effort */ }
         for (const originSessionId of workflowRunOriginSessionIds(run)) {
@@ -11135,25 +12404,61 @@ async function processOneRunFile(
             {
               originSessionId,
               sourceLabel: 'workflow run',
-              sourceId: `${run.id}#capability-${error.toolkit.toLowerCase()}`,
+              sourceId: `${run.id}#mutation-review-${error.stepId}`,
               title: workflow.data.name,
               statusHint: `workflow_run_status run_id="${run.id}"`,
               proactiveTurn: true,
             },
           );
         }
-        logger.info(
+        logger.warn(
           {
             workflow: workflow.data.name,
             runId: run.id,
             stepId: error.stepId,
-            toolkit: error.toolkit,
-            reason: error.reason,
-            retryAt,
-            retryCount,
+            tool: error.tool,
+            mutationFingerprint: error.fingerprint,
+            providerRedispatched: false,
           },
-          'Workflow paused on recoverable capability block — bounded-pool slot released',
+          'Workflow paused on ambiguous structured mutation — bounded-pool slot released',
         );
+        return;
+      }
+      // Ordinary clarification parking. The model asked a real question; no
+      // approval exists and no terminal outcome is published. Persist the exact
+      // question identity, release the worker slot, and re-enter the origin
+      // conversation. The user's answer CAS-requeues this same run/step.
+      if (error instanceof WorkflowAwaitingInputSignal) {
+        const pausedRecord = writeRunRecord(filePath, {
+          ...run,
+          status: 'awaiting_input',
+          startedAt: run.startedAt ?? error.state.askedAt,
+          awaitingInput: error.state,
+        }).record;
+        if (pausedRecord.status === 'cancelled') {
+          stopAfterCancellationWonWrite(filePath, pausedRecord);
+          return;
+        }
+        if (isTerminalRunRecord(pausedRecord)) return;
+        const inputProjection = reconcileAwaitingInputWorkflowRunProjections({ runId: run.id });
+        if (inputProjection.failed.length > 0) {
+          logger.warn(
+            { workflow: workflow.data.name, runId: run.id, failures: inputProjection.failed },
+            'Workflow clarification persisted; one or more projections will retry from the canonical pause',
+          );
+        }
+        logger.info(
+          { workflow: workflow.data.name, runId: run.id, stepId: error.state.stepId, questionId: error.state.questionId },
+          'Workflow paused on conversational input — bounded-pool slot released',
+        );
+        return;
+      }
+      // Recoverable capability parking: the shared Composio gateway proved the
+      // requested action never crossed the dispatch boundary. Preserve every
+      // completed step, release the worker slot, tell the user exactly what to
+      // connect/fix, and retry this SAME run with quiet exponential backoff.
+      if (error instanceof WorkflowCapabilityBlockedError) {
+        parkWorkflowCapabilityBlockedRun({ filePath, run, workflow, error });
         return;
       }
       // P0 parking: the run paused on a human approval. Checkpoint the
@@ -11269,7 +12574,12 @@ async function processOneRunFile(
         );
         return;
       }
-      let message = error instanceof Error ? error.message : String(error);
+      const structuredFailure = error instanceof DeterministicWorkflowStepError
+        ? error.failure
+        : undefined;
+      let message = structuredFailure
+        ? renderDeterministicWorkflowStepFailure(structuredFailure)
+        : error instanceof Error ? error.message : String(error);
       let cancelled = error instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id);
       const requestedCancellation = cancelled;
       // Preview the post-failure count without mutating the advisory ledger.
@@ -11335,6 +12645,7 @@ async function processOneRunFile(
       const suppressGlobalTerminal = originObserverState !== 'none';
       if (
         !cancelled
+        && !structuredFailure
         && definitionResolution.definitionSource !== 'compiled_snapshot'
         && !suppressGlobalTerminal
       ) {
@@ -11351,6 +12662,7 @@ async function processOneRunFile(
         ...(cancelled ? {} : {
           needsAttention: true,
           blockedSteps: [{ stepId: '(run)', reason: message }],
+          ...(structuredFailure ? { failure: structuredFailure } : {}),
           ...(healFixId ? { proposedFixId: healFixId } : {}),
         }),
       }, requestedReport);
@@ -11380,7 +12692,11 @@ async function processOneRunFile(
         recordWorkflowOutcome(workflow.name, false, message);
       }
       logger[cancelled ? 'info' : 'error']({ err: error, file }, cancelled ? 'Workflow run cancelled' : 'Workflow run failed');
-      appendWorkflowEvent(workflow.name, run.id, { kind: cancelled ? 'run_cancelled' : 'run_failed', error: message });
+      appendWorkflowEvent(workflow.name, run.id, {
+        kind: cancelled ? 'run_cancelled' : 'run_failed',
+        error: message,
+        ...(structuredFailure ? { meta: { failure: structuredFailure } } : {}),
+      });
       addNotification({
         // Stable id (terminal state fires once per run): addNotification
         // id-dedup makes this at-most-once and shares the cancelled id with the
@@ -11396,6 +12712,12 @@ async function processOneRunFile(
           workflow: run.workflow,
           runId: run.id,
           status: cancelled ? 'cancelled' : 'error',
+          ...(structuredFailure ? {
+            failureKind: structuredFailure.kind,
+            failureOutcome: structuredFailure.outcome,
+            failureRunner: structuredFailure.runner,
+            failureStepId: structuredFailure.stepId,
+          } : {}),
           ...(healFixId ? { proposedFixId: healFixId, needsAttention: true } : {}),
         },
       });
@@ -11429,6 +12751,13 @@ async function processOneRunFile(
  * left dangling.
  */
 export function reconcilePendingWorkflowRuns(): void {
+  const inputProjection = reconcileAwaitingInputWorkflowRunProjections();
+  if (inputProjection.failed.length > 0) {
+    logger.warn(
+      { failures: inputProjection.failed },
+      'Boot left workflow clarification projections pending for the next workflow tick',
+    );
+  }
   const pending = listPendingRuns();
   if (pending.length === 0) return;
   logger.info(

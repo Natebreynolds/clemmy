@@ -7,7 +7,7 @@
  * cycle or trusting stored projections.
  */
 import {
-  providerEnvelopeHasContradiction,
+  inspectProviderEnvelope,
   providerRequestEchoKey,
 } from './provider-read-evidence.js';
 
@@ -30,7 +30,8 @@ export interface RawResultHandleFacts {
 
 const CURSOR_KEYS = [
   'next_cursor', 'nextCursor', 'cursor', 'next_page_token', 'nextPageToken',
-  'page_token', 'pageToken', 'next_link', 'nextLink', 'continuation', 'next',
+  'page_token', 'pageToken', 'next_link', 'nextLink', 'next_records_url',
+  'nextRecordsUrl', 'nextrecordsurl', 'continuation', 'next',
 ];
 /** `value` is included because it is a live provider shape. */
 const RECORD_CONTAINERS = [
@@ -51,6 +52,7 @@ const EXPLICIT_COMPLETE_KEYS = new Set([
 const CURSOR_VALUE_KEYS = new Set([
   'cursor', 'nextcursor', 'nextpagetoken', 'pagetoken', 'nexttoken',
   'continuation', 'continuationtoken', 'nextlink', 'odatanextlink',
+  'nextrecordsurl',
 ]);
 const TOTAL_KEYS = new Set([
   'total', 'totalcount', 'totalrecords', 'totalitems', 'odatacount',
@@ -133,6 +135,15 @@ function nonnegativeNumber(value: unknown): number | undefined {
   return Number.isFinite(numeric) && numeric >= 0 ? numeric : undefined;
 }
 
+function nonnegativeSafeInteger(value: unknown): number | undefined {
+  const numeric = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && /^\d+$/.test(value.trim())
+      ? Number(value.trim())
+      : Number.NaN;
+  return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : undefined;
+}
+
 function cursorValue(value: unknown): string | null {
   if (typeof value === 'string' && value.length > 0) return value;
   const record = asRecord(value);
@@ -155,6 +166,7 @@ function inspectPagination(
   let sawTerminal = false;
   let explicitComplete = false;
   let explicitIncomplete = false;
+  let malformedPagination = false;
   let cursor: string | null = null;
 
   const markCursor = (value: unknown): void => {
@@ -182,6 +194,38 @@ function inspectPagination(
     const entries = Object.entries(record);
     if (entries.length > PAGINATION_MAX_ENTRIES) sawPartial = true;
     const normalized = new Map(entries.map(([key, child]) => [normalizedStructuralKey(key), child]));
+
+    // Salesforce REST/CLI query pages use `{ totalSize, done, records }`
+    // rather than the more common `hasMore`/`complete` vocabulary. `done`
+    // is also a routine BUSINESS field, so it is pagination authority only
+    // when the SAME object owns both a recognized records array and a valid
+    // nonnegative totalSize. This is deliberately structural/provider-neutral:
+    // wrappers may nest the page under `result`, but a record inside the
+    // collection can never promote its own `done` field into exhaustion.
+    const recognizedRecordCounts = entries
+      .filter(([rawKey, child]) => (
+        Array.isArray(child)
+        && RECORD_CONTAINERS.some(
+          (candidate) => normalizedStructuralKey(candidate) === normalizedStructuralKey(rawKey),
+        )
+      ))
+      .map(([, child]) => (child as unknown[]).length);
+    const ownsRecognizedRecords = recognizedRecordCounts.length > 0;
+    if (ownsRecognizedRecords && normalized.has('totalsize') && normalized.has('done')) {
+      const totalSize = nonnegativeSafeInteger(normalized.get('totalsize'));
+      const done = booleanSignal(normalized.get('done'));
+      if (
+        totalSize === undefined
+        || done === undefined
+        || recognizedRecordCounts.some((count) => count > totalSize)
+      ) {
+        malformedPagination = true;
+      } else if (done === true) {
+        explicitComplete = true;
+      } else {
+        explicitIncomplete = true;
+      }
+    }
 
     // OData defines continuation by the optional @odata.nextLink member. A
     // response carrying @odata.context is an OData envelope, so absence (or a
@@ -261,6 +305,7 @@ function inspectPagination(
 
   visit(envelope, 0, '');
   if (sawPartial || explicitIncomplete) return { completeness: 'partial', cursor };
+  if (malformedPagination) return { completeness: 'unknown', cursor: null };
   if (explicitComplete || sawTerminal) return { completeness: 'complete', cursor: null };
   return { completeness: 'unknown', cursor: null };
 }
@@ -426,8 +471,8 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
     const status = statusOf(envelope);
     const successful = envelope.successful ?? envelope.success ?? envelope.ok;
     const isError = typeof envelope.isError === 'boolean' ? envelope.isError : undefined;
-    const errorish = providerEnvelopeHasContradiction(envelope)
-      || Boolean(envelope.error)
+    const inspection = inspectProviderEnvelope(envelope);
+    const errorish = inspection.verdict === 'contradicted'
       || (typeof status === 'number' && status >= 400);
     const success = isError === true
       ? false
@@ -443,7 +488,9 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
       recordPath: found?.path ?? null,
       recordCount: found?.records.length ?? 0,
       envelopeMeta: meta.value,
-      completeness: !success || meta.malformed ? 'unknown' : pagination.completeness,
+      completeness: !success || meta.malformed || inspection.verdict !== 'clean'
+        ? 'unknown'
+        : pagination.completeness,
       projectedRecords: boundedProjection(found?.records ?? []),
       statusCode: status,
       cursor: pagination.cursor,

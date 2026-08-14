@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { transcribeAudio, hasOpenAiKey } from '../runtime/transcribe.js';
+import { getBuildInfo } from '../runtime/build-info.js';
 import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whisper-runtime.js';
 import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
@@ -109,6 +110,7 @@ import {
   prepareWorkflowVerification,
   renderMissingSmokeInputs,
   validateWorkflowStepGraph,
+  warmExactScheduledSendSchemaAuthorityForWrite,
   workflowReadinessGapPayload,
   workflowModelPortabilityFromUnknown,
   workflowSlugFromName,
@@ -499,7 +501,11 @@ import {
   resumeWorkflowCatchupRun,
   skipWorkflowCatchupRun,
 } from '../execution/workflow-catchup-decision.js';
-import { resolveWorkflowDefinitionForRun, resumeCapabilityBlockedWorkflowRun } from '../execution/workflow-runner.js';
+import {
+  resolveWorkflowDefinitionForRun,
+  resumeCapabilityBlockedWorkflowRun,
+  resumeMutationBlockedWorkflowRun,
+} from '../execution/workflow-runner.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -1732,7 +1738,7 @@ function boardActionForStatus(sourceKind: BoardCard['sourceKind'], status: strin
       nextSafeAction: 'Pick up where it left off — finished work stays done.',
     };
   }
-  if (sourceKind === 'background' && status === 'awaiting_input') {
+  if ((sourceKind === 'background' || sourceKind === 'run') && status === 'awaiting_input') {
     return {
       primaryAction: 'none',
       continueMode: 'none',
@@ -2277,6 +2283,7 @@ function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRe
     error: stringField(raw.error),
     targetStepId: stringField(raw.targetStepId),
     needsAttention: raw.needsAttention === true
+      || raw.status === 'blocked_mutation'
       || workflowTerminalOutcomeNeedsAttention(terminalOutcome),
     ...(terminalOutcome ? { terminalOutcome } : {}),
     ...(recoveryIntent ? { recoveryIntent } : {}),
@@ -2312,6 +2319,28 @@ function projectWorkflowCapabilityBlock(value: unknown): Record<string, unknown>
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function projectWorkflowMutationBlock(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, maxChars] of [
+    ['stepId', 160],
+    ['itemKey', 200],
+    ['tool', 200],
+    ['fingerprint', 64],
+    ['blockedAt', 80],
+    ['cancelledAt', 80],
+    ['state', 40],
+  ] as const) {
+    const field = stringField(row[key]);
+    if (field) out[key] = field.slice(0, maxChars);
+  }
+  // This negative crossing fact is host-owned and actionable: the consumer
+  // may offer review/cancel, but never a blind retry.
+  if (row.providerRedispatched === false) out.providerRedispatched = false;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** Whitelisted Workflow Studio run-history projection. Never return the raw
  * queue record: it can contain compiled definitions, prompts, inputs, step
  * outputs, and other execution-only context. */
@@ -2319,6 +2348,7 @@ function projectWorkflowRunRecord(raw: Record<string, unknown>): Record<string, 
   const summary = normalizeWorkflowRunRecord(raw);
   if (!summary) return null;
   const capabilityBlock = projectWorkflowCapabilityBlock(raw.capabilityBlock);
+  const mutationBlock = projectWorkflowMutationBlock(raw.mutationBlock);
   return {
     id: summary.id,
     workflow: summary.workflow,
@@ -2332,6 +2362,7 @@ function projectWorkflowRunRecord(raw: Record<string, unknown>): Record<string, 
     error: summary.error ? summary.error.slice(0, 2_000) : null,
     ...(summary.terminalOutcome ? { terminalOutcome: summary.terminalOutcome } : {}),
     ...(capabilityBlock ? { capabilityBlock } : {}),
+    ...(mutationBlock ? { mutationBlock } : {}),
   };
 }
 
@@ -4825,6 +4856,7 @@ export function registerConsoleRoutes(
           description: entry.data.description,
           project: entry.data.project ?? null,
           enabled: entry.data.enabled,
+          allowSends: entry.data.allowSends ?? false,
           triggerSchedule: entry.data.trigger.schedule ?? null,
           stepCount: entry.data.steps.length,
           trigger: entry.data.trigger,
@@ -4891,7 +4923,7 @@ export function registerConsoleRoutes(
           workflowName: entry.data.name,
           workflowSlug: entry.name,
           runId: run.runId,
-          status: 'running',
+          status: run.runStatus ?? 'running',
           lastEventAt: run.lastEventAt ?? null,
           inFlightStepId: run.inFlightStepId ?? null,
         });
@@ -4902,6 +4934,8 @@ export function registerConsoleRoutes(
           && run.status !== 'running'
           && run.status !== 'finalizing'
           && run.status !== 'parked'
+          && run.status !== 'blocked_capability'
+          && run.status !== 'blocked_mutation'
         ) continue;
         if (activeByRunId.has(run.id)) continue;
         const entry = workflowByIdentity.get(run.workflow)!;
@@ -5107,6 +5141,7 @@ export function registerConsoleRoutes(
         description: entry.data.description,
         project: entry.data.project ?? null,
         enabled: entry.data.enabled,
+        allowSends: entry.data.allowSends ?? false,
         trigger: entry.data.trigger,
         models: entry.data.models ?? null,
         steps: entry.data.steps,
@@ -5143,7 +5178,7 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.post('/api/console/workflows', (req, res) => {
+  app.post('/api/console/workflows', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = req.body ?? {};
     const name = typeof body.name === 'string' ? body.name.trim() : '';
@@ -5165,12 +5200,18 @@ export function registerConsoleRoutes(
     const inputs = normalizeWorkflowInputs(body.inputs);
     const resources = normalizeWorkflowResources(body.resources);
     const goal = workflowGoalFromDashboardBody(body.goal);
+    const allowSends = typeof body.allowSends === 'boolean'
+      ? body.allowSends
+      : typeof body.allow_sends === 'boolean'
+        ? body.allow_sends
+        : undefined;
 
     const def: WorkflowDefinition = {
       name,
       description,
       project,
       enabled: body.enabled !== false,
+      ...(allowSends !== undefined ? { allowSends } : {}),
       trigger: triggerResult.trigger,
       steps,
       resources: resources && Object.keys(resources).length > 0 ? resources : undefined,
@@ -5182,6 +5223,7 @@ export function registerConsoleRoutes(
     // binding gaps, then refuse only if an ENABLED workflow still can't flow
     // (so the dashboard isn't a back door around validation). Save disabled to
     // draft. A disabled workflow is still repaired so it saves runnable.
+    await warmExactScheduledSendSchemaAuthorityForWrite(def);
     const createPrep = prepareWorkflowCreateForWrite(def, {
       modelPortability: workflowModelPortabilityFromUnknown(body),
     });
@@ -5230,7 +5272,7 @@ export function registerConsoleRoutes(
     });
   });
 
-  app.patch('/api/console/workflows/:name', (req, res) => {
+  app.patch('/api/console/workflows/:name', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
     const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
@@ -5248,6 +5290,8 @@ export function registerConsoleRoutes(
     }
     if (Array.isArray(body.steps)) next.steps = normalizeWorkflowSteps(mergeWorkflowStepsForPatch(entry.data.steps, body.steps));
     if (typeof body.enabled === 'boolean') next.enabled = body.enabled;
+    if (typeof body.allowSends === 'boolean') next.allowSends = body.allowSends;
+    else if (typeof body.allow_sends === 'boolean') next.allowSends = body.allow_sends;
     // Workflow-level model pins (owner ask, 2026-07-24): brain/worker set from
     // the workflow drawer. Empty strings clear a pin; both empty clears the block.
     if (body.models !== undefined) {
@@ -5296,6 +5340,7 @@ export function registerConsoleRoutes(
     // before an enabled workflow is persisted (the set-enabled route already
     // does; this closes the parallel hole where PATCH enables without
     // re-validation).
+    await warmExactScheduledSendSchemaAuthorityForWrite(next);
     const patchPrep = prepareWorkflowUpdateForWrite(entry.data, next, {
       modelPortability: workflowModelPortabilityFromUnknown(body),
       codifyMechanicalSteps: Array.isArray(body.steps),
@@ -5350,7 +5395,7 @@ export function registerConsoleRoutes(
     res.json({ updated: true, name: patchPrep.def.name, repairs: patchPrep.repairs });
   });
 
-  app.post('/api/console/workflows/:name/contract-fixes', (req, res) => {
+  app.post('/api/console/workflows/:name/contract-fixes', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
     const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
@@ -5369,6 +5414,7 @@ export function registerConsoleRoutes(
     let prepRepairs: string[] = [];
     let persisted = false;
     if (fixed.changes.length > 0) {
+      await warmExactScheduledSendSchemaAuthorityForWrite(fixed.def);
       const prep = prepareWorkflowUpdateForWrite(entry.data, fixed.def);
       if (prep.status === 'invalid') {
         res.status(400).json({
@@ -5560,6 +5606,7 @@ export function registerConsoleRoutes(
       if (touched === 0 && !scriptContent) skipped.push(`Selected deterministic step(s) already use runner "${parsedRunner.runner}".`);
     }
 
+    await warmExactScheduledSendSchemaAuthorityForWrite(next);
     const prep = prepareWorkflowUpdateForWrite(entry.data, next);
     if (prep.status === 'invalid') {
       res.status(400).json({ error: 'workflow failed validation after contract action', errors: prep.errors, changes, skipped });
@@ -5618,7 +5665,7 @@ export function registerConsoleRoutes(
     res.json({ deleted: true, ...(cancelledRuns > 0 ? { cancelledRuns } : {}) });
   });
 
-  app.post('/api/console/workflows/:name/set-enabled', (req, res) => {
+  app.post('/api/console/workflows/:name/set-enabled', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
     const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
@@ -5629,6 +5676,8 @@ export function registerConsoleRoutes(
     // allowed). Auto-repair the fixable binding gaps so enabling an older
     // workflow fixes it in place instead of refusing.
     if (body.enabled) {
+      const enabledCandidate = { ...entry.data, enabled: true };
+      await warmExactScheduledSendSchemaAuthorityForWrite(enabledCandidate);
       const prep = prepareWorkflowEnableForWrite(entry.data);
       if (prep.status === 'invalid') {
         res.status(400).json({ error: 'workflow failed validation', errors: prep.errors });
@@ -6216,6 +6265,56 @@ export function registerConsoleRoutes(
         return;
       }
       res.json({ ok: true, runId, status: 'running', alreadyResumed: false });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/workflows/:name/runs/:runId/resume-mutation', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const runId = req.params.runId;
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) {
+      res.status(404).json({ error: 'workflow run not found' });
+      return;
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (refuseReservedProjectCatalogMutation(res, raw, 'mutation reconciliation resume')) return;
+      const entry = listWorkflows().find((candidate) => candidate.data.name === target || candidate.name === target);
+      if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+      if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+        res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      if (raw.status === 'running' && raw.mutationBlock === undefined) {
+        res.json({ ok: true, runId, status: 'running', alreadyResumed: true, providerRedispatched: false });
+        return;
+      }
+      if (raw.status !== 'blocked_mutation') {
+        res.status(409).json({
+          error: 'workflow run is not waiting on mutation reconciliation',
+          status: raw.status ?? null,
+        });
+        return;
+      }
+      if (!resumeMutationBlockedWorkflowRun(runId)) {
+        // A ledger-only daemon scan may win the race. Otherwise the exact slot
+        // remains started/ambiguous and cannot be readmitted or sent again.
+        const latest = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+        if (latest.status === 'running' && latest.mutationBlock === undefined) {
+          res.json({ ok: true, runId, status: 'running', alreadyResumed: true, providerRedispatched: false });
+          return;
+        }
+        res.status(409).json({
+          error: 'mutation is not backed by a committed replay; the same run remains parked',
+          status: latest.status ?? null,
+          providerRedispatched: false,
+        });
+        return;
+      }
+      res.json({ ok: true, runId, status: 'running', alreadyResumed: false, providerRedispatched: false });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -7771,7 +7870,14 @@ export function registerConsoleRoutes(
           if (pkg.name === 'clemmy' && pkg.version) { version = pkg.version; break; }
         } catch { /* try next */ }
       }
-      res.json({ version: version ?? 'unknown', startedAt: new Date(process.uptime() * 1000 * -1 + Date.now()).toISOString() });
+      const buildInfo = getBuildInfo();
+      res.json({
+        ...buildInfo,
+        // Preserve the legacy package walk as a compatibility fallback while
+        // exposing the exact runtime identity used by launch/proof checks.
+        version: buildInfo.version === 'unknown' ? version ?? 'unknown' : buildInfo.version,
+        startedAt: new Date(process.uptime() * 1000 * -1 + Date.now()).toISOString(),
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -7802,7 +7908,8 @@ export function registerConsoleRoutes(
   app.get('/api/console/active-work', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const pendingApprovals = approvalRegistry.listPending({ status: 'pending' });
+      const pendingApprovals = approvalRegistry.listPending({ status: 'pending' })
+        .filter(approvalRegistry.isFormalApprovalSurface);
       const sessionsWithPendingApprovals = new Set(pendingApprovals.map((approval) => approval.sessionId));
       const activeNonChatSessions = listVisibleActiveWorkHarnessSessions(sessionsWithPendingApprovals);
       const activeBackgroundTasks = listBackgroundTasks().filter(
@@ -10489,8 +10596,8 @@ export function registerConsoleRoutes(
   app.get('/api/console/approvals/list', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const { listPending, isApprovalStaleForHeader } = await import('../runtime/harness/approval-registry.js');
-      const harnessRows = listPending({ status: 'pending' });
+      const { listPending, isApprovalStaleForHeader, isFormalApprovalSurface } = await import('../runtime/harness/approval-registry.js');
+      const harnessRows = listPending({ status: 'pending' }).filter(isFormalApprovalSurface);
       const runtimeRows = assistant.getRuntime().listPendingApprovals();
       const backgroundTaskByApprovalId = new Map(
         listBackgroundTasks()
@@ -10894,7 +11001,8 @@ export function registerConsoleRoutes(
       const coveredApprovalIds = new Set<string>();
       const workflowByDisplayName = new Map(listWorkflows().map((entry) => [entry.data.name, entry]));
       const workflowBySlug = new Map(listWorkflows().map((entry) => [entry.name, entry]));
-      const pendingHarnessApprovals = approvalRegistry.listPending({ status: 'pending' });
+      const pendingHarnessApprovals = approvalRegistry.listPending({ status: 'pending' })
+        .filter(approvalRegistry.isFormalApprovalSurface);
       const pendingHarnessApprovalBySession = new Map<string, (typeof pendingHarnessApprovals)[number]>();
       for (const approval of pendingHarnessApprovals) {
         if (!pendingHarnessApprovalBySession.has(approval.sessionId)) {
@@ -11187,14 +11295,14 @@ export function registerConsoleRoutes(
         if (canonicalHarnessSessionIds.has(run.sessionId)) continue;
         const needsAttention = run.needsAttention === true;
         if (run.pendingApprovalId) coveredApprovalIds.add(run.pendingApprovalId);
-        const terminal = !['queued', 'received', 'running', 'awaiting_approval'].includes(run.status);
+        const terminal = !['queued', 'received', 'running', 'awaiting_approval', 'awaiting_input'].includes(run.status);
         const superseded = needsAttention && terminal && run.source === 'workflow'
           && latestRunIdByTitle.get(run.title) !== run.id;
         const column: BoardColumnId =
           needsAttention ? (superseded ? 'done' : 'needs_you')
             : run.status === 'queued' || run.status === 'received' ? 'queued'
               : run.status === 'running' ? 'running'
-              : run.status === 'awaiting_approval' ? 'needs_you'
+              : run.status === 'awaiting_approval' || run.status === 'awaiting_input' ? 'needs_you'
                 : 'done';
         const live = column === 'queued' || column === 'running' || column === 'needs_you';
         const workflowName = run.source === 'workflow' ? run.title.replace(/^Workflow:\s*/, '').trim() : '';
@@ -11222,7 +11330,7 @@ export function registerConsoleRoutes(
           primaryAction: action.primaryAction,
           continueMode: action.continueMode,
           approvalId: run.pendingApprovalId,
-          nextSafeAction: action.nextSafeAction,
+          nextSafeAction: run.pendingInput?.nextAction ?? action.nextSafeAction,
           artifactSummary: workflowRecovery?.artifactSummary,
           failureSummary: workflowRecovery?.failureSummary ?? (needsAttention ? {
             failedItems: 0,
@@ -11233,6 +11341,7 @@ export function registerConsoleRoutes(
             error: run.error,
             source: run.source,
             pendingApprovalId: run.pendingApprovalId,
+            pendingInput: run.pendingInput,
             needsAttention: needsAttention || undefined,
             workflowName: workflowEntry?.data.name,
             runId: workflowEntry ? run.id : undefined,
@@ -11294,11 +11403,13 @@ export function registerConsoleRoutes(
       //    run under per-step `workflow:<suffix>` sessions we can't address).
       for (const pending of listPendingRuns()) {
         let reservedProjectRoot = false;
+        let pendingMutationBlock: Record<string, unknown> | undefined;
         const pendingRecordPath = workflowRunRecordPathForConsole(pending.runId);
         if (pendingRecordPath && fs.existsSync(pendingRecordPath)) {
           try {
             const raw = JSON.parse(fs.readFileSync(pendingRecordPath, 'utf-8')) as Record<string, unknown>;
             reservedProjectRoot = isReservedProjectWorkflowRunRecord(raw);
+            pendingMutationBlock = projectWorkflowMutationBlock(raw.mutationBlock);
           } catch {
             // A malformed queue record gets only the ordinary minimal card; no
             // catalog recovery projection is derived from unreadable bytes.
@@ -11317,7 +11428,10 @@ export function registerConsoleRoutes(
               nextSafeAction: 'Open the durable project card to review progress.',
             }
           : workflowRunRecovery(pending.workflowName, pending.runId);
-        const column: BoardColumnId = pending.inFlightStepId ? 'running' : 'queued';
+        const mutationBlocked = pending.runStatus === 'blocked_mutation';
+        const column: BoardColumnId = mutationBlocked
+          ? 'needs_you'
+          : pending.inFlightStepId ? 'running' : 'queued';
         // A parked run is waiting on a human (approval consumption), not
         // working — carrying the real state through lets the board say
         // "Waiting for your approval" instead of a false "Working" pill.
@@ -11327,20 +11441,33 @@ export function registerConsoleRoutes(
           sourceKind: 'workflow',
           title: workflowEntry?.data.name ?? pending.workflowName,
           column,
-          status: parked ? 'parked' : pending.inFlightStepId ? `step: ${pending.inFlightStepId}` : 'queued',
-          progressHint: parked
+          status: mutationBlocked
+            ? 'blocked_mutation'
+            : parked ? 'parked' : pending.inFlightStepId ? `step: ${pending.inFlightStepId}` : 'queued',
+          progressHint: mutationBlocked
+            ? `Provider outcome needs reconciliation for step ${String(pendingMutationBlock?.stepId ?? pending.inFlightStepId ?? 'unknown')}; the call was not sent again`
+            : parked
             ? `Waiting for your approval on step ${pending.inFlightStepId ?? 'the gated step'}`
             : pending.inFlightStepId ? `Running step ${pending.inFlightStepId}` : 'Queued',
           sessionId: null,
           ageMs: ageMs(pending.lastEventAt),
           updatedAt: pending.lastEventAt ?? new Date(now).toISOString(),
-          actions: recovery.failureSummary?.retryable ? ['retry_failed_items', 'cancel'] : ['cancel'],
-          primaryAction: recovery.primaryAction,
-          continueMode: recovery.continueMode,
-          nextSafeAction: recovery.nextSafeAction,
+          actions: mutationBlocked
+            ? ['cancel']
+            : recovery.failureSummary?.retryable ? ['retry_failed_items', 'cancel'] : ['cancel'],
+          primaryAction: mutationBlocked ? 'none' : recovery.primaryAction,
+          continueMode: mutationBlocked ? 'none' : recovery.continueMode,
+          nextSafeAction: mutationBlocked
+            ? 'Reconcile the exact provider outcome. This same run resumes only from a committed ledger replay; never retry the send blindly.'
+            : recovery.nextSafeAction,
           artifactSummary: recovery.artifactSummary,
           failureSummary: recovery.failureSummary,
-          raw: { workflowName: workflowEntry?.data.name ?? pending.workflowName, workflowSlug: pending.workflowName, runId: pending.runId },
+          raw: {
+            workflowName: workflowEntry?.data.name ?? pending.workflowName,
+            workflowSlug: pending.workflowName,
+            runId: pending.runId,
+            ...(pendingMutationBlock ? { mutationBlock: pendingMutationBlock } : {}),
+          },
         });
       }
 
@@ -11768,7 +11895,7 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const run = getRun(req.params.id);
     if (!run) { res.status(404).json({ ok: false, reason: 'run not found' }); return; }
-    if (['queued', 'received', 'running', 'awaiting_approval'].includes(run.status)) {
+    if (['queued', 'received', 'running', 'awaiting_approval', 'awaiting_input'].includes(run.status)) {
       res.status(409).json({ ok: false, reason: 'this run is still live — cancel it instead' });
       return;
     }
@@ -12207,8 +12334,8 @@ export function registerConsoleRoutes(
   app.post('/api/console/approvals/cancel-stale', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const { listPending, resolve: resolveApprovalRow } = await import('../runtime/harness/approval-registry.js');
-      const rows = listPending({ status: 'pending' });
+      const { listPending, resolve: resolveApprovalRow, isFormalApprovalSurface } = await import('../runtime/harness/approval-registry.js');
+      const rows = listPending({ status: 'pending' }).filter(isFormalApprovalSurface);
       const cutoff = Date.now() - 60 * 60_000;
       const stale = rows.filter((r) => {
         const t = Date.parse(r.requestedAt);
@@ -12258,6 +12385,12 @@ export function registerConsoleRoutes(
     const existing = approvalRegistry.get(id);
     if (!existing) {
       res.status(404).json({ error: 'approval not found' });
+      return;
+    }
+    if (!approvalRegistry.isFormalApprovalSurface(existing)) {
+      res.status(409).json({
+        error: 'This protected send is an ordinary conversation question, not a formal approval card. Answer it in the exact original conversation.',
+      });
       return;
     }
     if (existing.status !== 'pending') {
@@ -12526,7 +12659,8 @@ export function registerConsoleRoutes(
       const memory = readMemoryIndexStatus();
       const runs = listRuns(50);
       const approvals = assistant.getRuntime().listPendingApprovals();
-      const harnessApprovals = approvalRegistry.listPending({ status: 'pending' });
+      const harnessApprovals = approvalRegistry.listPending({ status: 'pending' })
+        .filter(approvalRegistry.isFormalApprovalSurface);
       const planProposals = listPlanProposals({ status: 'pending', limit: 20 });
       const checkInProposals = listProposals({ status: 'pending', limit: 20 });
       const openCheckIns = listOpenCheckIns();
@@ -14734,7 +14868,8 @@ export function registerConsoleRoutes(
     // still-alive Agent SDK query; Workspace buttons are standalone continuations
     // owned by their deterministic runtime.
     const registryApprovalPending = !isPausedOnApproval
-      && approvalRegistry.listPending({ sessionId, status: 'pending' }).length > 0;
+      && approvalRegistry.listPending({ sessionId, status: 'pending' })
+        .some(approvalRegistry.isFormalApprovalSurface);
     // Approvals parked in a background task THIS chat spawned live in the
     // task's OWN run session, so the session-scoped registry check above never
     // sees them. Live 2026-08-04 (desktop): the user typed "Approved" six
@@ -14779,7 +14914,8 @@ export function registerConsoleRoutes(
     const acceptedApprovalId = intent
       ? (() => {
           const actionable = approvalRegistry.listPending({ sessionId, status: 'pending' })
-            .filter((row) => approvalRegistry.isActionable(row));
+            .filter((row) => approvalRegistry.isActionable(row))
+            .filter(approvalRegistry.isFormalApprovalSurface);
           const selection = selectAddressedApproval(actionable, intent.approvalId);
           return selection.kind === 'selected' ? selection.row.approvalId : undefined;
         })()
@@ -15231,7 +15367,8 @@ export function registerConsoleRoutes(
         let addressedApprovalId = intent?.approvalId;
         if (intent) {
           const actionable = approvalRegistry.listPending({ sessionId, status: 'pending' })
-            .filter((row) => approvalRegistry.isActionable(row));
+            .filter((row) => approvalRegistry.isActionable(row))
+            .filter(approvalRegistry.isFormalApprovalSurface);
           const selection = selectAddressedApproval(actionable, intent.approvalId);
           const choiceLines = actionable
             .slice(0, 12)

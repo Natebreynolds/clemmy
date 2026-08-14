@@ -16,6 +16,7 @@ import {
   isMcpNamespacedTool,
   codeModeMandateDirective,
   codeModeDescription,
+  CODE_MODE_WORK_FIRST_CALL_EXAMPLE,
   normalizeCodeModeToolResult,
   parseShellToolOutput,
   runCodeModeForSession,
@@ -24,6 +25,7 @@ import {
   _setExternalMcpToolsForTests,
   listCodeModeTools,
 } from './code-mode-tool.js';
+import { WorkCallInputSchema } from './work-call.js';
 
 test('READ_ONLY_TOOLS excludes every mutating tool (the Phase-1 boundary)', () => {
   for (const writeTool of ['composio_execute_tool', 'write_file', 'run_shell_command', 'request_approval', 'execution_create', 'memory_remember']) {
@@ -261,6 +263,14 @@ test('codeModeDescription names the direct Composio response envelope', () => {
   assert.match(description, /no `\{ ok, result \}` transport wrapper/i);
   assert.match(description, /r\.successful === true/);
   assert.match(description, /never `r\.result\.successful`/);
+});
+
+test('action-scoped code mode teaches a schema-valid first call and explicit later binding', () => {
+  assert.equal(WorkCallInputSchema.safeParse(CODE_MODE_WORK_FIRST_CALL_EXAMPLE).success, true);
+  const actionDescription = codeModeDescription({ actionExpectedWork: true });
+  assert.match(actionDescription, /every business call.*clem\.work/i);
+  assert.match(actionDescription, /proposal must be null/i);
+  assert.doesNotMatch(codeModeDescription(), /ACTION WORK.*clem\.work/);
 });
 
 test('parseShellToolOutput: exit_code/stdout/stderr wrapper becomes a structured shell result', () => {
@@ -753,4 +763,49 @@ test('nested code-mode context never inherits the model-lane recall budget; per-
       assert.equal(nested.sourceUserSeq, 42, 'attempt authority still inherited');
     },
   );
+});
+
+test('a program result carries its child call ids, and a parked handle records provenance (live 2026-08-12)', async () => {
+  // A code-mode return is a DERIVED value with no lifecycle; the child call
+  // ids are the run's only evidence identities. Without them the Apify
+  // verification loop ran ten minutes: reconciliation refused the parked
+  // `codemode-result-*` handle, told the model to "run one fresh read", and
+  // the fresh read minted another unusable handle.
+  const prevWrites = process.env.CLEMMY_CODE_MODE_WRITES;
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.CLEMMY_CODE_MODE_WRITES = 'on';
+  process.env.HARNESS_TOOL_BRACKETS = 'off';
+  const bigPayload = JSON.stringify({ records: Array.from({ length: 900 }, (_, i) => ({ id: `r-${i}`, note: 'x'.repeat(40) })) });
+  _setCodeModeToolsForTests(new Map<string, { name: string; invoke: () => Promise<unknown> }>([
+    ['composio_execute_tool', {
+      name: 'composio_execute_tool',
+      invoke: async () => bigPayload,
+    }],
+  ]));
+  const { createSession, listEvents: listLogEvents } = await import('../runtime/harness/eventlog.js');
+  const sessionId = `sess-codemode-provenance-${Date.now()}`;
+  createSession({ id: sessionId, kind: 'chat' });
+  try {
+    const result = await runCodeModeForSession(
+      `const res = await clem.composio_execute_tool({ tool_slug: 'APIFY_RUN_ACTOR', arguments: '{}' });
+       return res;`,
+      sessionId,
+    );
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.toolCallIds?.length, 1, 'the child call id is exposed');
+    assert.match(result.toolCallIds![0]!, /^codemode-/);
+
+    // The oversized return parked a handle whose provenance names the child.
+    const value = result.value as { resultHandle?: string } | string;
+    if (typeof value === 'object' && value?.resultHandle) {
+      const parked = listLogEvents(sessionId, { types: ['codemode_result_parked'] })
+        .find((event) => event.data.handle === value.resultHandle);
+      assert.ok(parked, 'parked provenance recorded');
+      assert.deepEqual(parked!.data.childCallIds, result.toolCallIds);
+    }
+  } finally {
+    _setCodeModeToolsForTests(null);
+    if (prevWrites === undefined) delete process.env.CLEMMY_CODE_MODE_WRITES; else process.env.CLEMMY_CODE_MODE_WRITES = prevWrites;
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+  }
 });

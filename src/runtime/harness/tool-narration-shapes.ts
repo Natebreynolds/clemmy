@@ -35,8 +35,19 @@ export function looksLikeToolCallShape(text: string): boolean {
     || /"function"\s*:\s*\{\s*"name"\s*:/i.test(t)
     // Native Anthropic tool XML emitted as text.
     || /<\/?(?:antml:)?(?:function_calls\b|invoke\s+name\s*=|parameter\s+name\s*=)/i.test(t)
+    // A harness directive addressed to the MODEL, echoed into the reply. Tool
+    // results that steer the next turn carry this exact marker; a user-facing
+    // sentence never does, so this can be refused with zero ambiguity (live
+    // 2026-08-12: a fan-out admission was pasted into Discord verbatim,
+    // "do NOT process items yourself this turn" and all).
+    || HARNESS_DIRECTIVE_MARKER_RE.test(t)
   );
 }
+
+/** Marker wrapping model-facing steering inside an otherwise factual tool
+ *  result. Never appears in text meant for a person. */
+export const HARNESS_DIRECTIVE_MARKER = '[harness-directive]';
+const HARNESS_DIRECTIVE_MARKER_RE = /\[harness-directive\]/i;
 
 /** Streaming variant: catches the shapes that can appear MID-stream (no trailing `]`/`}` yet)
  *  so the raw protocol never reaches the bubble as it streams. Superset-safe with the above. */

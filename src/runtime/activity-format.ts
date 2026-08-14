@@ -312,6 +312,7 @@ export function friendlyStatusLabel(status: string | undefined): string {
     case 'awaiting_approval':
     case 'parked':
       return 'Waiting for your approval';
+    case 'awaiting_input':
     case 'awaiting_user_input':
       return 'Waiting for your input';
     case 'stalled':
@@ -341,6 +342,7 @@ export function isLive(status: string | undefined): boolean {
     || status === 'queued'
     || status === 'awaiting_approval'
     || status === 'parked'
+    || status === 'awaiting_input'
     || status === 'awaiting_user_input';
 }
 
@@ -394,7 +396,7 @@ export function userFacingRunState(run: ActivityRunLike, nowMs = Date.now()): Us
   if (run.needsAttention === true) return 'needs_attention';
   if (status === 'completed' || latestType === 'run_completed' || latestType === 'completed' || latestType === 'conversation_completed') return 'completed';
   if (status === 'awaiting_approval' || status === 'parked' || status === 'paused' || latestType === 'approval_requested' || latestType === 'approval_required') return 'waiting_for_approval';
-  if (status === 'awaiting_user_input' || latestType === 'awaiting_user_input') return 'waiting_for_input';
+  if (status === 'awaiting_input' || status === 'awaiting_user_input' || latestType === 'awaiting_user_input' || latestType === 'input_required') return 'waiting_for_input';
   if (status === 'queued' || latestType === 'queued_background') return 'queued';
 
   if (status === 'running' || status === 'received' || status === 'active') {

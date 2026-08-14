@@ -262,6 +262,9 @@ test('RESUME reopens the existing SDK continuation once and publishes when that 
   assert.equal(sdkCalls, 2, 'one initial SDK run plus exactly one judge-authorized continuation');
   assert.equal(judge.resolveCalls(), 1);
   assert.equal(judge.runCalls(), 1);
+  assert.match(judge.requests()[0]?.prompt ?? '', /Live continuation: AVAILABLE/);
+  assert.match(judge.requests()[0]?.prompt ?? '', /Tools during continuation: AVAILABLE/);
+  assert.match(judge.requests()[0]?.prompt ?? '', /Read-only external-state inspection: AVAILABLE/);
   assert.match(sdkPrompts[1] ?? '', new RegExp(recoveryInstruction.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.equal(response.stoppedReason, 'success');
   assert.equal(response.text, RECOVERED_TEXT);
@@ -271,6 +274,55 @@ test('RESUME reopens the existing SDK continuation once and publishes when that 
   assert.equal(event.data.terminalJudgeDisposition, 'resume');
   assert.equal(event.data.terminalJudgeFamily, 'codex');
   assert.equal(event.data.terminalJudgeResumeCount, 1);
+});
+
+test('an exhausted SDK continuation budget cannot advertise or honor terminal RESUME', async () => {
+  const sessionId = 'claude-terminal-judge-resume-budget-exhausted';
+  const previousBudget = process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS;
+  process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS = '0';
+  const judge = judgeFixture([{
+    verb: 'resume',
+    reason: 'one more model turn could retry the closeout',
+    recoveryInstruction: 'Inspect the retained state and close the exact remaining gap.',
+    askIfRepeated: 'The closeout is still unresolved. Which next step would you like me to take?',
+  }]);
+  let sdkCalls = 0;
+  setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(judge.port);
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    sdkCalls += 1;
+    return concernOnlySdkResult(sessionId);
+  });
+
+  try {
+    const response = await respondViaClaudeAgentSdkBrain('home', {
+      message: 'Tell me one short spreadsheet joke.',
+      sessionId,
+      allowedToolNames: [],
+    });
+
+    assert.equal(sdkCalls, 1, 'the exhausted production continuation budget forbids another SDK query');
+    assert.equal(judge.runCalls(), 1, 'the independent judge still evaluates the terminal candidate once');
+    assert.match(judge.requests()[0]?.prompt ?? '', /Live continuation: UNAVAILABLE/);
+    assert.match(judge.requests()[0]?.prompt ?? '', /Tools during continuation: UNAVAILABLE/);
+    assert.match(judge.requests()[0]?.prompt ?? '', /Read-only external-state inspection: UNAVAILABLE/);
+    assert.equal(response.stoppedReason, 'unverified');
+    assert.doesNotMatch(response.text, /invoke|parameter/i, 'the unavailable edge cannot leak tool protocol');
+    const { event, presentation } = terminalFor(sessionId);
+    assert.equal(presentation.status, 'blocked');
+    assert.equal(event.data.terminalJudgeDisposition, undefined);
+    assert.equal(
+      eventlog.listEvents(sessionId, { types: ['heartbeat'] })
+        .some((row) => row.data.kind === 'terminal_delivery_resume'),
+      false,
+      'no control edge is emitted when the live carrier cannot continue',
+    );
+  } finally {
+    if (previousBudget === undefined) {
+      delete process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS;
+    } else {
+      process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS = previousBudget;
+    }
+  }
 });
 
 test('a second consecutive RESUME becomes the judge-authored ASK without a second continuation', async () => {

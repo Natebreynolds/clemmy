@@ -24,7 +24,14 @@ const {
   tryHandleHarnessApprovalReply,
   UnboundDurableApprovalReplyError,
 } = await import('./discord-harness.js');
-const { appendEvent, createSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const {
+  appendConversationPreambleOnce,
+  appendEvent,
+  createSession,
+  listEvents,
+} = await import('../runtime/harness/eventlog.js');
+const { projectHarnessEventForPublic } = await import('../runtime/harness/public-presentation.js');
+const { _setLocalProviderForTest } = await import('../memory/embeddings.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { bindInboundSource, claimInbound, completeInbound, getInbound } = await import('./inbox-store.js');
@@ -148,6 +155,160 @@ test('accepted channel requests persist their typed progress presentation for ap
   }
 });
 
+test('exact-source preamble is nonterminal, foreign-safe, preserves tool status, and yields to final', () => {
+  const session = createSession({ kind: 'chat', channel: 'discord' });
+  const current = appendEvent({
+    sessionId: session.id,
+    turn: 5,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'current request' },
+  });
+  const foreign = appendEvent({
+    sessionId: session.id,
+    turn: 5,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'overlapping foreign request' },
+  });
+  const currentPreamble = projectHarnessEventForPublic(appendConversationPreambleOnce({
+    source: current,
+    text: 'I remember the earlier attempt and I’m beginning the current request.',
+  }).event);
+  const foreignPreamble = projectHarnessEventForPublic(appendConversationPreambleOnce({
+    source: foreign,
+    text: 'This belongs to the overlapping request.',
+  }).event);
+  assert.ok(currentPreamble);
+  assert.ok(foreignPreamble);
+
+  const state = {
+    summary: '',
+    status: 'starting',
+    done: false,
+    progressPresentation: 'compact' as const,
+    toolsCalled: [] as string[],
+    toolCount: 0,
+  };
+  assert.equal(
+    __test__.applyEventToAcceptedChannelState(foreignPreamble, current, state, () => false),
+    false,
+  );
+  assert.equal(state.summary, '');
+  assert.equal(
+    __test__.applyEventToAcceptedChannelState(currentPreamble, current, state, () => false),
+    true,
+  );
+  assert.equal(state.summary, 'I remember the earlier attempt and I’m beginning the current request.');
+  assert.equal(state.done, false);
+  assert.equal(__test__.acceptedChannelOutcome(current), null, 'a preamble is not an accepted outcome');
+
+  __test__.applyEventToAcceptedChannelState({
+    ...currentPreamble,
+    id: 'current-tool-call',
+    type: 'tool_called',
+    role: 'tool',
+    data: { tool: 'call_tool', accounting: 'top_level', progress: 'using call_tool' },
+  }, current, state, () => false);
+  assert.equal(state.status, 'using call_tool');
+  assert.equal(state.toolCount, 1);
+  __test__.applyEventToAcceptedChannelState(currentPreamble, current, state, () => false);
+  assert.equal(state.status, 'using call_tool', 'late/replayed preamble cannot erase useful tool status');
+  assert.equal(state.done, false);
+
+  const terminal = __test__.commitDiscordAnswerForTest({
+    source: current,
+    text: 'The current request is complete.',
+    reason: 'test_complete',
+  });
+  const publicTerminal = projectHarnessEventForPublic(terminal.event);
+  assert.ok(publicTerminal);
+  assert.equal(
+    __test__.applyEventToAcceptedChannelState(publicTerminal, current, state, () => false),
+    true,
+  );
+  assert.equal(state.summary, 'The current request is complete.');
+  assert.equal(state.done, true);
+});
+
+test('preamble delivery edits immediately before work and has quiet/fallback/fail-closed results', async () => {
+  const state = {
+    summary: '',
+    status: 'starting',
+    done: false,
+    progressPresentation: 'compact' as const,
+    toolsCalled: [] as string[],
+    toolCount: 0,
+  };
+  const order: string[] = [];
+  const delivered = __test__.createChannelConversationPreambleDelivery({
+    progressPresentation: 'compact',
+    state,
+    handle: { async edit(content: string) { order.push(`edit:${content}`); } },
+    transport: {
+      async sendInitial() { throw new Error('unused'); },
+      async sendError() {},
+    },
+    isFinalized: () => false,
+  });
+  assert.deepEqual(await delivered('I have the details and I’m starting now.'), { status: 'delivered' });
+  order.push('tool:start');
+  assert.deepEqual(order, [
+    'edit:_starting_\n\nI have the details and I’m starting now.',
+    'tool:start',
+  ]);
+
+  let quietPaints = 0;
+  const quiet = __test__.createChannelConversationPreambleDelivery({
+    progressPresentation: 'quiet',
+    state: { ...state, summary: '' },
+    handle: { async edit() { quietPaints += 1; } },
+    transport: {
+      async sendInitial() { throw new Error('unused'); },
+      async sendError() {},
+      async sendFollowup() { quietPaints += 1; },
+    },
+    isFinalized: () => false,
+  });
+  assert.deepEqual(await quiet('I will keep the presentation quiet.'), { status: 'delivered' });
+  assert.equal(quietPaints, 0);
+
+  const fallbackOrder: string[] = [];
+  const fallback = __test__.createChannelConversationPreambleDelivery({
+    progressPresentation: 'compact',
+    state: { ...state, summary: '' },
+    handle: { async edit() { fallbackOrder.push('edit'); throw new Error('expired'); } },
+    transport: {
+      async sendInitial() { throw new Error('unused'); },
+      async sendError() {},
+      async sendFollowup(content: string) { fallbackOrder.push(`followup:${content}`); },
+    },
+    isFinalized: () => false,
+  });
+  assert.deepEqual(await fallback('Fallback preamble.'), { status: 'delivered' });
+  assert.deepEqual(fallbackOrder, ['edit', 'followup:Fallback preamble.']);
+
+  const failed = __test__.createChannelConversationPreambleDelivery({
+    progressPresentation: 'compact',
+    state: { ...state, summary: '' },
+    handle: { async edit() { throw new Error('edit failed'); } },
+    transport: {
+      async sendInitial() { throw new Error('unused'); },
+      async sendError() {},
+      async sendFollowup() { throw new Error('followup failed'); },
+    },
+    isFinalized: () => false,
+  });
+  assert.deepEqual(await failed('Undeliverable preamble.'), {
+    status: 'failed',
+    reason: 'delivery_failed',
+  });
+  assert.deepEqual(await failed('{"summary":"x","reply":"x","done":true,"nextAction":"completed"}'), {
+    status: 'failed',
+    reason: 'delivery_failed',
+  });
+});
+
 test('accepted Slack source freezes the active thread even if session metadata was rebound', () => {
   const session = createSession({
     kind: 'chat',
@@ -215,6 +376,203 @@ function typedTerminalStatus(sessionId: string): string | undefined {
   const terminal = terminalEvents(sessionId)[0];
   return (terminal?.data.turnOutcome as { status?: string } | undefined)?.status;
 }
+
+test('cross-session seed reaches the eight-hour-old rephrased Ventura attempt as an ignorable historical candidate', async (t) => {
+  const channelId = 'chan-semantic-prior-work-seed';
+  const userId = 'user-semantic-prior-work-seed';
+  const priorObjective = 'Find me the top 5 restaurants in Ventura ca using Apify mcp please and just send me a quick email about them';
+  const currentObjective = 'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.';
+  _setLocalProviderForTest({
+    name: 'local',
+    model: 'deterministic-discord-prior-work-test',
+    dim: 3,
+    async embed(texts: string[]) {
+      return texts.map(() => Float32Array.from([1, 0, 0]));
+    },
+  });
+  t.after(() => _setLocalProviderForTest(undefined));
+  const prior = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId,
+    title: 'prior Ventura attempt',
+    metadata: { channelId, userId },
+  });
+  const source = appendEvent({
+    sessionId: prior.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: priorObjective },
+  });
+  const outcomeId = `turn:${source.seq}`;
+  const identity = { sessionId: prior.id, turn: 1, sourceUserSeq: source.seq };
+  appendEvent({
+    sessionId: prior.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'conversation_completed',
+    data: {
+      logicalTerminalVersion: 1,
+      terminalKey: outcomeId,
+      sourceUserSeq: source.seq,
+      presentation: {
+        version: 1,
+        id: `${outcomeId}:presentation`,
+        outcomeId,
+        audience: 'user',
+        phase: 'final',
+        identity,
+        status: 'failed',
+        kind: 'error',
+        text: 'PRIOR-VENTURA-FAILURE',
+        resumable: false,
+      },
+      turnOutcome: { version: 2, id: outcomeId, status: 'failed', resumable: false },
+      reply: 'PRIOR-VENTURA-FAILURE',
+    },
+  });
+
+  const unrelated = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId,
+    title: 'nearby unrelated attempt',
+    metadata: { channelId, userId },
+  });
+  appendEvent({
+    sessionId: unrelated.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Summarize the quarterly launch notes.' },
+  });
+  appendEvent({
+    sessionId: unrelated.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'conversation_completed',
+    data: { reply: 'UNRELATED-RAW-CONTINUATION' },
+  });
+
+  const current = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId,
+    title: 'fresh Ventura attempt',
+    metadata: { channelId, userId },
+  });
+  await __test__.seedCrossSessionPrefixForTest({
+    newSessionId: current.id,
+    channelId,
+    userId,
+    now: Date.now() + (8 * 60 * 60 * 1_000),
+    newMessage: currentObjective,
+    priorWorkObjective: currentObjective,
+  });
+
+  const prefix = listEvents(current.id, { types: ['cross_session_prefix'] }).at(-1);
+  assert.ok(prefix);
+  const priorWork = prefix.data.priorWork as {
+    match: string;
+    count: number;
+    items: Array<{ sourceSessionId: string; sourceUserSeq: number; status: string }>;
+  };
+  assert.equal(priorWork.match, 'historical_candidates');
+  assert.equal(priorWork.count, 1);
+  assert.deepEqual(priorWork.items, [{
+    sourceSessionId: prior.id,
+    sourceUserSeq: source.seq,
+    objective: priorObjective,
+    matchKind: 'semantic',
+    matchScore: 1,
+    statusSource: 'typed_terminal',
+    status: 'failed',
+    evidenceRefs: [],
+  }]);
+  const text = String(prefix.data.text);
+  const [historicalBlock = '', continuationBlock = ''] = text.split('[CONTINUATION CONTEXT');
+  assert.match(historicalBlock, /POSSIBLY RELEVANT PRIOR WORK/i);
+  assert.match(historicalBlock, /PRIOR-VENTURA-FAILURE/);
+  assert.match(historicalBlock, /no current ownership/i);
+  assert.match(historicalBlock, /may ignore/i);
+  assert.doesNotMatch(historicalBlock, /UNRELATED-RAW-CONTINUATION/);
+  assert.equal(continuationBlock, '', 'eight-hour-old history is a candidate, never authoritative continuation');
+  assert.doesNotMatch(JSON.stringify(prefix.data.priorWork), /intentKey|approvalId|resumable|normalized_exact/);
+});
+
+test('historical candidate query is same-user/channel, fourteen-day, and twenty-four-source bounded', () => {
+  const channelId = 'chan-prior-work-query-bounds';
+  const userId = 'user-prior-work-query-bounds';
+  const current = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId,
+    metadata: { channelId, userId },
+  });
+  const matching = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId,
+    metadata: { channelId, userId },
+  });
+  const sourceSeqs: number[] = [];
+  for (let index = 0; index < 26; index += 1) {
+    sourceSeqs.push(appendEvent({
+      sessionId: matching.id,
+      turn: index + 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: `bounded historical source ${index}` },
+    }).seq);
+  }
+  const wrongUser = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId: 'different-user',
+    metadata: { channelId, userId: 'different-user' },
+  });
+  const wrongUserSource = appendEvent({
+    sessionId: wrongUser.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'wrong user must stay out' },
+  });
+  const wrongChannel = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId,
+    metadata: { channelId: 'different-channel', userId },
+  });
+  const wrongChannelSource = appendEvent({
+    sessionId: wrongChannel.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'wrong channel must stay out' },
+  });
+
+  const sources = __test__.historicalPriorWorkSourcesForTest({
+    newSessionId: current.id,
+    channelId,
+    userId,
+    channel: 'discord',
+    now: Date.now(),
+  });
+
+  assert.equal(sources.length, 24);
+  assert.deepEqual(sources.map((candidate: { sourceUserSeq: number }) => candidate.sourceUserSeq), sourceSeqs.slice(-24).reverse());
+  assert.ok(!sources.some((candidate: { sourceUserSeq: number }) => candidate.sourceUserSeq === wrongUserSource.seq));
+  assert.ok(!sources.some((candidate: { sourceUserSeq: number }) => candidate.sourceUserSeq === wrongChannelSource.seq));
+  assert.deepEqual(__test__.historicalPriorWorkSourcesForTest({
+    newSessionId: current.id,
+    channelId,
+    userId,
+    channel: 'discord',
+    now: Date.now() + (15 * 24 * 60 * 60 * 1_000),
+  }), [], 'sources older than fourteen days are not candidates');
+});
 
 test('provider replied means dispatch ACK delivered while the exact logical edge remains pending', () => {
   const session = createSession({ kind: 'chat', channel: 'discord' });
@@ -390,7 +748,13 @@ test('missing approval owns one provider receipt, source, and needs-input termin
 
 test('unprovable approval session fails closed before source, terminal, mutation, or model dispatch', async () => {
   const channelId = 'chan-unbound-durable-approval';
-  const prompt = 'approve apr-missing';
+  // An EXPLICIT card id is what makes a message approval control. (A bare
+  // verb with nothing pending is ordinary conversation and is declined to the
+  // normal turn — live 2026-08-12: "go ahead" answering Clem's own question
+  // was swallowed by "no pending approval is waiting".) `apr-missing` never
+  // parsed as an id — the pattern is exactly four characters — so this
+  // fixture now names a well-formed id that simply does not exist.
+  const prompt = 'approve apr-mi55';
   const provider = durableProviderRequest(channelId, prompt);
   const delivery = recordingTransport();
 

@@ -23,13 +23,18 @@ test.after(() => {
   else process.env.CLEMENTINE_HOME = PRIOR_HOME;
 });
 
-function accepted(sessionId: string, text: string, kind: 'chat' | 'execution' = 'chat') {
+function accepted(
+  sessionId: string,
+  text: string,
+  kind: 'chat' | 'execution' = 'chat',
+  data: Record<string, unknown> = {},
+) {
   if (!eventlog.getSession(sessionId)) eventlog.createSession({ id: sessionId, kind });
   const attempt = eventlog.beginRunAttempt(sessionId);
   return eventlog.recordRunAttemptUserInput(attempt, {
     turn: 1,
     role: 'user',
-    data: { text },
+    data: { text, ...data },
   });
 }
 
@@ -108,7 +113,7 @@ test('typed clarification terminal creates a bounded exact-source packet only af
   assert.equal(packet.status, 'available');
   if (packet.status === 'available') {
     assert.equal(packet.packet.originatingSourceUserSeq, source.seq);
-    assert.deepEqual(packet.packet.pause.options, ['Work calendar', 'Personal calendar']);
+    assert.deepEqual(packet.packet.pause.options, [], 'hidden awaiting options are not durable answer authority');
     assert.deepEqual(packet.packet.capabilities.map((row) => row.identifier), ['calendar_list_events']);
     assert.ok(packet.packet.capabilities.every((row) => row.resourceRefs.length === 0));
   }
@@ -200,12 +205,44 @@ test('a modern exact-source awaiting event survives a different internal loop tu
   }
 });
 
+test('an internal awaiting question that differs from the delivered terminal cannot mint lineage', () => {
+  const sessionId = 'continuity-visible-question-mismatch';
+  const source = accepted(sessionId, 'Send the private summary.');
+  eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      sourceUserSeq: source.seq,
+      purpose: 'clarification',
+      question: 'Should I send Alice the private summary?',
+      options: ['Send to Alice', 'Do not send'],
+    },
+  });
+  const delivered = 'Should I send Bob the public summary?';
+  const identity = { sessionId, turn: 1, sourceUserSeq: source.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: delivered },
+  });
+  assert.deepEqual(
+    continuity.peekTaskContinuityPacket({ sessionId }),
+    { status: 'none' },
+    'Yes to visible Q2 must never inherit hidden Q1 recipient/effect authority',
+  );
+});
+
 test('clarification answer classification is conversational but question-shaped and fail-closed', () => {
   const binary = { kind: 'clarification' as const, question: 'Should I send it?', options: ['Yes', 'No'] };
   assert.deepEqual(runtime.classifyClarificationAnswer('Yes, please.', binary), { disposition: 'affirmed' });
   assert.deepEqual(runtime.classifyClarificationAnswer('No.', binary), {
     disposition: 'declined',
-    selectedOption: 'No',
   });
   assert.deepEqual(
     runtime.classifyClarificationAnswer(
@@ -233,11 +270,9 @@ test('clarification answer classification is conversational but question-shaped 
   };
   assert.deepEqual(runtime.classifyClarificationAnswer('Create it', conversationalBinary), {
     disposition: 'affirmed',
-    selectedOption: 'Create it',
   });
   assert.deepEqual(runtime.classifyClarificationAnswer('Leave it alone', conversationalBinary), {
     disposition: 'declined',
-    selectedOption: 'Leave it alone',
   });
   assert.deepEqual(
     runtime.classifyClarificationAnswer(
@@ -268,10 +303,7 @@ test('clarification answer classification is conversational but question-shaped 
       `${answer} cannot fill a named slot`,
     );
   }
-  assert.deepEqual(runtime.classifyClarificationAnswer('first', choices), {
-    disposition: 'selected',
-    selectedOption: 'Work calendar',
-  });
+  assert.equal(runtime.classifyClarificationAnswer('first', choices), null);
   assert.equal(
     runtime.classifyClarificationAnswer('first', { ...choices, options: [] }),
     null,
@@ -284,10 +316,50 @@ test('clarification answer classification is conversational but question-shaped 
     kind: 'clarification',
     question: 'Send it now or keep it as a draft?',
     options: ['Send now', 'Draft only'],
-  }), { disposition: 'declined', selectedOption: 'Draft only' });
+  }), { disposition: 'declined' });
   assert.deepEqual(runtime.classifyClarificationAnswer('Production', {
     kind: 'clarification',
     question: 'Which environment should I use?',
+    options: [],
+  }), { disposition: 'provided' });
+
+  const liveConfirmation = {
+    kind: 'clarification' as const,
+    question: 'Two quick confirmations before I run it: (1) "amplify" = Apify (the Google Maps scraper you\'ve used before) — yes? (2) The address came through as "nathan@scorpion..co"; I\'ll send to your Scorpion mailbox nathan.reynolds@scorpion.co unless you want a different one.',
+    options: [] as string[],
+  };
+  for (const answer of [
+    'Yes that’s all correct',
+    "Yes that's all correct",
+    'yes, correct',
+  ]) {
+    assert.deepEqual(
+      runtime.classifyClarificationAnswer(answer, liveConfirmation),
+      { disposition: 'affirmed' },
+      `the exact live confirmation variant must close the durable question: ${answer}`,
+    );
+  }
+  for (const [answer, question] of [
+    ['Yes', 'Please provide the correct recipient email.'],
+    ['Yes', 'Can you provide the correct recipient email?'],
+    ['#general', 'Should I delete the old channel?'],
+    ['attacker@example.com', 'Should I send the approved report now?'],
+    ['Yes', 'Can you give me production tenant name?'],
+    ['Yes', 'Can you clarify account scope?'],
+  ] as const) {
+    assert.equal(
+      runtime.classifyClarificationAnswer(answer, {
+        kind: 'clarification',
+        question,
+        options: [],
+      }),
+      null,
+      `an unresolved slot or destructive confirmation cannot consume this literal: ${question} / ${answer}`,
+    );
+  }
+  assert.deepEqual(runtime.classifyClarificationAnswer('owner@example.com', {
+    kind: 'clarification',
+    question: 'Which recipient email should I use?',
     options: [],
   }), { disposition: 'provided' });
 });
@@ -305,32 +377,77 @@ test('approval, mixed, and bundled awaits cannot mint a generic clarification pa
   }
 });
 
-test('a conversational ordinal answer resumes private task context while preserving literal user text', async () => {
+test('multiple distinct open clarification questions fail ambiguous instead of selecting the last', () => {
+  const sessionId = 'continuity-multiple-open-questions';
+  const source = accepted(sessionId, 'Prepare and send the report.');
+  eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      sourceUserSeq: source.seq,
+      purpose: 'clarification',
+      question: 'Which account should I use?',
+    },
+  });
+  commitClarification({
+    sessionId,
+    sourceSeq: source.seq,
+    question: 'Which recipient should receive it?',
+    purpose: 'clarification',
+  });
+  assert.deepEqual(
+    continuity.peekTaskContinuityPacket({ sessionId }),
+    { status: 'none' },
+    'one short answer must not acquire either of two open task slots',
+  );
+});
+
+test('a public slot answer resumes private task context while hidden option ordinals do not', async () => {
   const sessionId = 'continuity-answer';
   const source = accepted(sessionId, 'List tomorrow’s calendar events.');
   commitClarification({
     sessionId,
     sourceSeq: source.seq,
-    question: 'Work or personal calendar?',
+    question: 'Which connected calendar should I use?',
     options: ['Work calendar', 'Personal calendar'],
     withResolvedCapability: true,
   });
-  const answer = accepted(sessionId, 'I think the first one.');
+  const answer = accepted(sessionId, 'Use the work calendar.');
   const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
     sessionId,
     sourceUserSeq: answer.seq,
-    message: 'I think the first one.',
+    message: 'Use the work calendar.',
   }, answer.seq);
-  assert.equal(enriched.message, 'I think the first one.');
+  assert.equal(enriched.message, 'Use the work calendar.');
   assert.equal(enriched.displayMessage, undefined);
-  assert.equal(enriched.taskContinuation?.answer, 'I think the first one.');
-  assert.equal(enriched.taskContinuation?.disposition, 'selected');
-  assert.equal(enriched.taskContinuation?.selectedOption, 'Work calendar');
+  assert.equal(enriched.taskContinuation?.answer, 'Use the work calendar.');
+  assert.equal(enriched.taskContinuation?.disposition, 'provided');
+  assert.equal(enriched.taskContinuation?.selectedOption, undefined);
   assert.match(enriched.semanticTaskInput ?? '', /List tomorrow’s calendar events/);
-  assert.match(enriched.semanticTaskInput ?? '', /Work or personal calendar/);
-  assert.ok((enriched.semanticTaskInput?.length ?? 0) <= 1_600);
+  assert.match(enriched.semanticTaskInput ?? '', /Which connected calendar should I use/);
   assert.ok(enriched.turnCandidates?.candidates.some((row) => row.identifier === 'calendar_list_events'));
   assert.equal(discoveryGovernor.getTaskState({ sessionId, sourceUserSeq: answer.seq })?.policy.knownCapability, true);
+});
+
+test('an ordinal matching only hidden awaiting options cannot consume the parent action', async () => {
+  const sessionId = 'continuity-hidden-option-ordinal';
+  const source = accepted(sessionId, 'Deploy the release.');
+  commitClarification({
+    sessionId,
+    sourceSeq: source.seq,
+    question: 'Which environment should I use?',
+    options: ['Staging', 'Production'],
+  });
+  const answer = accepted(sessionId, 'second');
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId,
+    sourceUserSeq: answer.seq,
+    message: 'second',
+  }, answer.seq);
+  assert.equal(enriched.taskContinuation, undefined);
+  assert.equal(enriched.semanticTaskInput, undefined);
 });
 
 test('a decline keeps conversational context but inherits no capability authority', async () => {
@@ -508,19 +625,126 @@ test('fresh-topic B dismisses A without inheriting semantic context or convergen
   assert.deepEqual(continuity.peekTaskContinuityPacket({ sessionId }), { status: 'none' });
 });
 
+test('send-consent controls cannot also consume a generic clarification packet', async () => {
+  const sessionId = 'continuity-consent-isolation';
+  const channelData = {
+    source: 'channel:discord',
+    userId: 'discord-user-1',
+    conversationKey: 'discord:shared-channel-1',
+  };
+  const source = accepted(sessionId, 'Prepare the client email.', 'chat', channelData);
+  commitClarification({
+    sessionId,
+    sourceSeq: source.seq,
+    question: 'Should I include the private appendix?',
+    purpose: 'clarification',
+  });
+  const answerText = 'Yes';
+  const answer = accepted(sessionId, answerText, 'chat', {
+    source: 'channel_send_consent',
+    userId: 'discord-user-1',
+    conversationKey: 'discord:shared-channel-1',
+    approvalId: 'send-consent-1',
+    decision: 'approve',
+  });
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId,
+    sourceUserSeq: answer.seq,
+    message: answerText,
+  }, answer.seq);
+  assert.equal(enriched.taskContinuation, undefined);
+  assert.equal(
+    continuity.peekTaskContinuityPacket({ sessionId }).status,
+    'available',
+    'approval-specific routing leaves the generic clarification edge untouched',
+  );
+});
+
+test('the exact live A/Q/B confirmation closes one question and rehydrates its lineage across restart', async () => {
+  const sessionId = 'continuity-live-compound-confirmation';
+  const parent = 'Pull the top five restaurants in Ventura, California using amplify put them in a new Google sheet with their name rating address and the most recent review if possible and then go ahead and email me a link nathan@scorpion..co';
+  const question = 'Two quick confirmations before I run it: (1) "amplify" = Apify (the Google Maps scraper you\'ve used before) — yes? (2) The address came through as "nathan@scorpion..co"; I\'ll send to your Scorpion mailbox nathan.reynolds@scorpion.co unless you want a different one.';
+  const source = accepted(sessionId, parent);
+  commitClarification({
+    sessionId,
+    sourceSeq: source.seq,
+    question,
+    purpose: 'clarification',
+  });
+  const answerText = 'Yes that’s all correct';
+  const answer = accepted(sessionId, answerText);
+  const request = { sessionId, sourceUserSeq: answer.seq, message: answerText };
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity(request, answer.seq);
+
+  assert.equal(enriched.taskContinuation?.parentSourceUserSeq, source.seq);
+  assert.equal(enriched.taskContinuation?.consumingSourceUserSeq, answer.seq);
+  assert.equal(enriched.taskContinuation?.disposition, 'affirmed');
+  assert.equal(enriched.taskContinuation?.parentInput, parent);
+  assert.equal(enriched.taskContinuation?.question, question);
+  assert.match(enriched.semanticTaskInput ?? '', /Apify/);
+  assert.match(enriched.semanticTaskInput ?? '', /nathan\.reynolds@scorpion\.co/);
+  assert.deepEqual(continuity.peekTaskContinuityPacket({ sessionId }), { status: 'none' });
+
+  eventlog.closeEventLog();
+  const replay = await runtime.enrichAcceptedRequestWithTaskContinuity(request, answer.seq);
+  assert.equal(replay.taskContinuation?.packetId, enriched.taskContinuation?.packetId);
+  assert.equal(replay.taskContinuation?.parentSourceUserSeq, source.seq);
+  assert.equal(replay.semanticTaskInput, enriched.semanticTaskInput);
+  assert.deepEqual(
+    runtime.verifyDurableClarificationContext({
+      sessionId,
+      sourceUserSeq: answer.seq,
+      answer: answerText,
+      context: replay.taskContinuation!,
+    })?.packetId,
+    enriched.taskContinuation?.packetId,
+  );
+});
+
+test('an oversized accepted parent fails closed without truncating or consuming its authority', async () => {
+  const sessionId = 'continuity-parent-explicit-bound';
+  const parent = `Prepare the report. ${'context '.repeat(8_200)} Send the private report externally.`;
+  assert.ok(parent.length > runtime.MAX_CLARIFICATION_PARENT_CHARS);
+  assert.equal(runtime.canonicalClarificationTaskInput({
+    parentInput: parent,
+    question: 'Should I send it?',
+    answer: 'Yes',
+  }), null);
+  const source = accepted(sessionId, parent);
+  commitClarification({
+    sessionId,
+    sourceSeq: source.seq,
+    question: 'Should I send it?',
+    purpose: 'clarification',
+  });
+  const answer = accepted(sessionId, 'Yes');
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId,
+    sourceUserSeq: answer.seq,
+    message: 'Yes',
+  }, answer.seq);
+  assert.equal(enriched.taskContinuation, undefined);
+  assert.equal(enriched.semanticTaskInput, undefined);
+  assert.equal(
+    continuity.peekTaskContinuityPacket({ sessionId }).status,
+    'available',
+    'oversized A is quarantined for a fresh ask instead of projected into B',
+  );
+});
+
 test('the exact consumer rehydrates after daemon reopen, but a later source cannot', async () => {
   const sessionId = 'continuity-restart';
   const source = accepted(sessionId, 'List tomorrow’s calendar events.');
   commitClarification({ sessionId, sourceSeq: source.seq, options: ['Work', 'Personal'] });
-  const answer = accepted(sessionId, '1');
-  const request = { sessionId, sourceUserSeq: answer.seq, message: '1' };
+  const answer = accepted(sessionId, 'Use the work calendar.');
+  const request = { sessionId, sourceUserSeq: answer.seq, message: 'Use the work calendar.' };
   const first = await runtime.enrichAcceptedRequestWithTaskContinuity(request, answer.seq);
   assert.equal(first.taskContinuation?.parentSourceUserSeq, source.seq);
 
   eventlog.closeEventLog();
   const replay = await runtime.enrichAcceptedRequestWithTaskContinuity(request, answer.seq);
   assert.equal(replay.taskContinuation?.packetId, first.taskContinuation?.packetId);
-  assert.equal(replay.message, '1');
+  assert.equal(replay.message, 'Use the work calendar.');
 
   const later = accepted(sessionId, 'Continue.');
   const refused = await runtime.enrichAcceptedRequestWithTaskContinuity({

@@ -1,6 +1,13 @@
 import { createFocus, getActiveFocus, listFocuses } from '../../memory/focus.js';
 import { getSession, listEvents, type EventRow } from './eventlog.js';
-import { projectCanonicalTopLevelToolEvents } from './tool-effect.js';
+import { listRunArtifacts, type RunArtifact } from './artifact-ledger.js';
+import {
+  actionTopologyRoleForRuntimeCall,
+  canonicalRuntimeEffectiveToolName,
+  classifyRuntimeToolEffect,
+  projectCanonicalTopLevelToolEvents,
+  unwrapRuntimeEffectiveToolIdentity,
+} from './tool-effect.js';
 
 const MIN_RESOURCE_HITS = 2;
 const MIN_THREAD_TOOL_CALLS = 4;
@@ -212,16 +219,82 @@ function collectHitsFromValue(value: unknown, hits: ResourceHit[], depth = 0): v
   }
 }
 
-function bestResource(events: EventRow[]): ResourceHit | null {
+function toolArguments(data: Record<string, unknown>): unknown {
+  return data.arguments ?? data.args ?? data.input ?? {};
+}
+
+/** Resource extraction is authority-bearing: a URL merely transported inside
+ * a control packet is historical context, not proof that this turn operated
+ * on it. Accept only provider-backed business calls whose effective action is
+ * itself Google Sheets/Docs-shaped. */
+function resourceKindForTrustedBusinessCall(
+  toolName: string,
+  args: unknown,
+): ResourceHit['kind'] | null {
+  if (actionTopologyRoleForRuntimeCall(toolName, args) !== 'business') return null;
+  const effectSource = classifyRuntimeToolEffect(toolName, args).source;
+  if (effectSource !== 'composio' && effectSource !== 'native_mcp') return null;
+  const effective = unwrapRuntimeEffectiveToolIdentity(toolName, args);
+  const identity = canonicalRuntimeEffectiveToolName(effective.toolName) ?? effective.toolName ?? '';
+  const shape = identity
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_');
+  if (/(?:GOOGLE_?SHEETS?|GOOGLESHEETS|SPREADSHEETS?)/.test(shape)) return 'sheet';
+  if (/(?:GOOGLE_?DOCS?|GOOGLEDOCS)/.test(shape)) return 'doc';
+  return null;
+}
+
+function canonicalLogicalCallId(event: EventRow): string {
+  for (const key of ['canonicalCallId', 'logicalCallId', 'callId', 'call_id']) {
+    const value = event.data[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return event.id;
+}
+
+function verifiedArtifactHits(artifact: RunArtifact): ResourceHit[] {
+  if (artifact.status !== 'bound' || !artifact.bindingVerifiedAt) return [];
+  const hits: ResourceHit[] = [];
+  if (artifact.uri) pushGoogleUrlHits(artifact.uri, hits);
+  if (hits.length > 0 || !artifact.resourceId) return hits;
+  const provider = artifact.provider.toLowerCase();
+  if (artifact.kind === 'google_doc' || /google\s*docs?/.test(provider)) {
+    hits.push({ kind: 'doc', ref: `https://docs.google.com/document/d/${artifact.resourceId}` });
+  } else if (/google\s*sheets?|googlesheets/.test(provider)) {
+    hits.push({ kind: 'sheet', ref: `https://docs.google.com/spreadsheets/d/${artifact.resourceId}` });
+  }
+  return hits;
+}
+
+function bestResource(events: EventRow[], sessionId: string): ResourceHit | null {
   const counts = new Map<string, { kind: string; count: number }>();
-  for (const event of projectCanonicalTopLevelToolEvents(events)) {
-    const hits: ResourceHit[] = [];
-    collectHitsFromValue(event.data, hits);
+  const countedEvidence = new Set<string>();
+  const countHits = (evidenceId: string, hits: ResourceHit[], expectedKind?: string): void => {
     for (const hit of hits) {
+      if (expectedKind && hit.kind !== expectedKind) continue;
+      const key = `${evidenceId}\0${hit.ref}`;
+      if (countedEvidence.has(key)) continue;
+      countedEvidence.add(key);
       const existing = counts.get(hit.ref);
       if (existing) existing.count += 1;
       else counts.set(hit.ref, { kind: hit.kind, count: 1 });
     }
+  };
+
+  for (const event of projectCanonicalTopLevelToolEvents(events, 'tool_called')) {
+    const toolName = typeof event.data.tool === 'string' ? event.data.tool : '';
+    if (!toolName) continue;
+    const rawArgs = toolArguments(event.data);
+    const expectedKind = resourceKindForTrustedBusinessCall(toolName, rawArgs);
+    if (!expectedKind) continue;
+    const effective = unwrapRuntimeEffectiveToolIdentity(toolName, rawArgs);
+    const hits: ResourceHit[] = [];
+    collectHitsFromValue(effective.args, hits);
+    countHits(`call:${canonicalLogicalCallId(event)}`, hits, expectedKind);
+  }
+  for (const artifact of listRunArtifacts(sessionId)) {
+    countHits(`artifact:${artifact.id}`, verifiedArtifactHits(artifact));
   }
 
   let best: { ref: string; kind: string; count: number } | null = null;
@@ -254,7 +327,7 @@ export function maybeAutoFocusSession(options: MaybeAutoFocusOptions): AutoFocus
   const events = listEvents(options.sessionId, { limit: MAX_EVENT_SCAN, desc: true });
   const toolCalls = projectCanonicalTopLevelToolEvents(events, 'tool_called').length;
   const userInputs = events.filter((event) => event.type === 'user_input_received').length;
-  const resource = bestResource(events);
+  const resource = bestResource(events, options.sessionId);
   const qualifiesForThreadFocus =
     (toolCalls >= MIN_THREAD_TOOL_CALLS && userInputs >= MIN_THREAD_USER_INPUTS)
     || toolCalls >= MIN_SINGLE_TURN_THREAD_TOOL_CALLS

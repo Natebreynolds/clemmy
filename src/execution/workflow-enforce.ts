@@ -1,5 +1,10 @@
 import type { WorkflowDefinition, WorkflowInputDef, WorkflowStepInput } from '../memory/workflow-store.js';
-import { stepLooksMultiItemWithoutForEach, validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow-validator.js';
+import {
+  stepLooksMultiItemWithoutForEach,
+  validateWorkflowDefinition,
+  type WorkflowFrontmatter,
+  type WorkflowStepShape,
+} from './workflow-validator.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { composioSlugEffectEvidence } from '../integrations/composio/slug-effect.js';
@@ -38,6 +43,7 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
     description: def.description,
     enabled: def.enabled,
     trigger: def.trigger,
+    allowSends: def.allowSends,
     inputs: def.inputs as WorkflowFrontmatter['inputs'],
     synthesis: def.synthesis,
     goal: def.goal,
@@ -59,9 +65,10 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
       requiresApproval: s.requiresApproval,
       sideEffect: s.sideEffect,
       inputs: s.inputs as Record<string, unknown> | undefined,
-      output: s.output as Record<string, unknown> | undefined,
+      output: s.output as WorkflowStepShape['output'],
       loopUntil: s.loopUntil,
       loopSafe: s.loopSafe,
+      optional: s.optional,
     })),
   };
 }
@@ -378,7 +385,10 @@ function executionSurfaceProjection(def: WorkflowDefinition): string {
     allowedTools: def.allowedTools ?? null,
     inputs: def.inputs ?? null,
     synthesis: def.synthesis ?? null,
-    allowSends: (def as { allowSends?: boolean }).allowSends !== false,
+    // Preserve tri-state: undefined remains the legacy model-step default,
+    // while explicit true mints standing consent for the narrow exact direct
+    // structured-send class and is therefore execution-relevant.
+    allowSends: def.allowSends ?? null,
     // The pinned run goal changes what a run must PROVE (validation +
     // re-pursuit), so editing it is an execution-surface change → re-smoke.
     goal: def.goal ?? null,
@@ -747,7 +757,13 @@ export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowA
  * workflow validates; otherwise {ok:false, errors} so the caller can
  * refuse and surface the fixes. Validation is unconditional (no flag).
  */
-export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteCheck {
+export function checkWorkflowForWrite(
+  def: WorkflowDefinition,
+  opts: {
+    allowDisabledExactSendDraft?: boolean;
+    exactSendCommittedReplayStepIds?: ReadonlySet<string>;
+  } = {},
+): WorkflowWriteCheck {
   // Surface the user's proven tool-choices so the validator can warn on a step
   // that should bind one but doesn't. Best-effort — a store read error never
   // blocks a write (the binding check simply no-ops without choices).
@@ -768,7 +784,12 @@ export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteChe
   } catch {
     knownToolNames = undefined;
   }
-  const result = validateWorkflowDefinition(toFrontmatter(def), { rememberedToolChoices, knownToolNames });
+  const result = validateWorkflowDefinition(toFrontmatter(def), {
+    rememberedToolChoices,
+    knownToolNames,
+    allowDisabledExactSendDraft: opts.allowDisabledExactSendDraft,
+    exactSendCommittedReplayStepIds: opts.exactSendCommittedReplayStepIds,
+  });
   const errors = [...result.errors, ...checkSendGate(def), ...checkLoopUntilAuthoring(def), ...checkGoalAuthoring(def), ...checkDependencyBinding(def)];
   // Runnability constraints are non-blocking (demoted to warnings per graceful degradation design)
   const runnabilityWarnings = checkRunnabilityConstraints(def);
@@ -798,8 +819,14 @@ export interface WorkflowWritePrep extends WorkflowWriteCheck {
  * / dashboard / schedule instead of bouncing the author into a re-author
  * loop over a fix the engine could make itself.
  */
-export function prepareWorkflowForWrite(def: WorkflowDefinition): WorkflowWritePrep {
+export function prepareWorkflowForWrite(
+  def: WorkflowDefinition,
+  opts: {
+    allowDisabledExactSendDraft?: boolean;
+    exactSendCommittedReplayStepIds?: ReadonlySet<string>;
+  } = {},
+): WorkflowWritePrep {
   const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
-  const check = checkWorkflowForWrite(repaired);
+  const check = checkWorkflowForWrite(repaired, opts);
   return { def: repaired, ok: check.ok, errors: check.errors, warnings: check.warnings, repairs };
 }

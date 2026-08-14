@@ -7,10 +7,12 @@
  * the natural commands where the object itself carries the external semantics:
  * "RSVP yes", "buy the tickets", "approve the PR", and similar requests.
  *
- * Keep this module pure and dependency-free. Intent routing, turn stakes, and
- * completion evidence all consume the same result so adding a consequential
- * verb cannot silently update only one safety layer.
+ * Keep this module pure. Intent routing, turn stakes, and completion evidence
+ * all consume the same result so adding a consequential verb cannot silently
+ * update only one safety layer.
  */
+
+import { requestSemanticSegments } from './request-segments.js';
 
 export type ExternalEffectKind =
   | 'communication'
@@ -91,6 +93,13 @@ const EXTERNAL_EFFECT_RULES: readonly ExternalEffectRule[] = [
       + `(?:(?:my|our|the|this|that|your)\\s+)?\\S+`,
       'i',
     ),
+  },
+  {
+    kind: 'communication',
+    // Recipient-first delivery is the same external topology as a delivery
+    // with a trailing recipient. Recognize its grammar without coupling the
+    // classifier to a particular payload or provider vocabulary.
+    pattern: /^send\s+(?:me|us|him|her|them)\s+(?!(?:to|toward|towards)\b)(?:(?:an?|the|this|that|these|those)\s+\S+|\S+)/i,
   },
   {
     kind: 'communication',
@@ -276,7 +285,18 @@ function stripDirectRequestPrefixes(rawClause: string): string {
 export function classifyExternalEffectRequest(text: string): ExternalEffectClassification {
   const kinds = new Set<ExternalEffectKind>();
   const classificationText = text.replace(TECHNICAL_CALL_INVOCATION_RE, 'invoke technical callable');
-  for (const rawClause of classificationText.split(CLAUSE_BOUNDARY_RE)) {
+  const explicitClauses = classificationText
+    .split(CLAUSE_BOUNDARY_RE)
+    .filter((clause) => clause.trim().length > 0);
+  // Preserve the effect taxonomy's conservative clause boundaries.  Only when
+  // they found no boundary do we accept the provider-neutral dictation repair
+  // from request segmentation (direct read -> result artifact/delivery).  This
+  // reaches an unpunctuated read -> result mutation -> delivery request without
+  // treating an arbitrary discussion containing an action verb as authority.
+  const semanticClauses = explicitClauses.length === 1
+    ? requestSemanticSegments(classificationText)
+    : explicitClauses;
+  for (const rawClause of semanticClauses) {
     if (!rawClause.trim() || APPROVAL_DEFERRAL_RE.test(rawClause)) continue;
     const clause = stripDirectRequestPrefixes(rawClause);
     for (const rule of EXTERNAL_EFFECT_RULES) {

@@ -1389,3 +1389,39 @@ test('a remembered call renders SHAPE-first — the callable template is never t
     else process.env.TOOL_CHOICE_CONTEXT_INJECT = previous;
   }
 });
+
+test('an active choice is never rendered as its own known-failed fallback', async () => {
+  // Live 2026-08-12: the recall told the model "Active choice:
+  // APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS" and, two lines later, "do NOT
+  // re-try composio:APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS — auto-invalidated
+  // after 3 failures". Reading both, it abandoned a working capability after
+  // one argument error instead of repairing the call.
+  const { formatChoiceRecall } = await import('../tools/tool-choice-tools.js');
+  const intent = 'apify.contradiction.run_actor';
+  rememberToolChoice({
+    intent,
+    choice: {
+      kind: 'composio',
+      identifier: 'APIFY_RUN_ACTOR',
+      testedAt: '2026-08-12T14:31:27.271Z',
+    },
+    fallbacks: [
+      { kind: 'composio', identifier: 'APIFY_RUN_ACTOR', reason: 'auto-invalidated after 3 failures', failedAt: '2026-07-24T18:28:36.567Z' },
+      { kind: 'composio', identifier: 'SOME_OTHER_ACTION', reason: 'toolkit not connected', failedAt: '2026-07-24T18:28:36.567Z' },
+    ],
+  });
+
+  const rendered = formatChoiceRecall(intent);
+  assert.match(rendered, /Active choice: kind=composio, identifier=APIFY_RUN_ACTOR/);
+  // The genuinely-failed sibling still warns.
+  assert.match(rendered, /SOME_OTHER_ACTION/);
+  // The active choice never appears as a thing not to re-try.
+  const warnLine = rendered.split('\n').find((line) => /do NOT re-try/.test(line));
+  assert.ok(warnLine, 'other fallbacks still render');
+  const warned = rendered
+    .split('\n')
+    .filter((line) => line.trim().startsWith('- '))
+    .join('\n');
+  assert.doesNotMatch(warned, /APIFY_RUN_ACTOR\b/, 'the active choice is not in the do-not-retry list');
+  assert.match(rendered, /an argument error is a repair, not a reason to switch tools/);
+});

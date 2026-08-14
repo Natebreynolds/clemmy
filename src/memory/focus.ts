@@ -642,15 +642,14 @@ export function updateLinkedFocusAction(
   return updated;
 }
 
-export function touchFocus(id: number, relatedSessionId?: string): FocusRow | null {
+export function touchFocus(id: number, _relatedSessionId?: string): FocusRow | null {
   const db = openMemoryDb();
   const now = nowIso();
   const info = db.prepare(`
     UPDATE current_focus
-    SET related_session_id=COALESCE(?, related_session_id),
-        last_touched_at=?, confirm_after=?
+    SET last_touched_at=?, confirm_after=?
     WHERE id=? AND status='active'
-  `).run(relatedSessionId?.trim() || null, now, confirmAfterFromNow(), id);
+  `).run(now, confirmAfterFromNow(), id);
   if (info.changes > 0) emitChange('touch');
   return getFocusById(id);
 }

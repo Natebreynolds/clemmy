@@ -45,6 +45,10 @@ function emailSet(value: unknown): string[] {
 function trustedRecipientSources(sessionId: string): RecipientIntegritySource[] {
   const sources: RecipientIntegritySource[] = [];
   for (const source of gatherTrustedEvidence(sessionId)) {
+    // A compute carrier is mutation-safe, but without typed source lineage its
+    // stdout cannot establish a roster for an irreversible multi-recipient
+    // send. User input and observed source reads remain authoritative.
+    if (source.evidenceRole !== 'source_read') continue;
     const recipients = emailSet(source.text);
     if (recipients.length > 0) sources.push({ id: source.id, tool: source.tool, recipients });
   }

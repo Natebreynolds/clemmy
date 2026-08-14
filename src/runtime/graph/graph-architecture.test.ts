@@ -36,7 +36,13 @@ const IMPORT_EXCEPTIONS: Record<string, string[]> = {
   // The shadow recorder is the OBSERVATION seam: it reads the event log and
   // policy snapshot by design. It predates the executor and is deleted in a
   // later G5b slice once all callers execute rather than observe.
-  'turn-graph-shadow.ts': ['../harness/eventlog.js', '../../agents/proactivity-policy.js', './turn-graph-compiler.js', 'node:perf_hooks'],
+  'turn-graph-shadow.ts': [
+    '../harness/eventlog.js',
+    '../harness/task-continuity-runtime.js',
+    '../../agents/proactivity-policy.js',
+    './turn-graph-compiler.js',
+    'node:perf_hooks',
+  ],
   // The chat spine intentionally bridges compiler + executor; its policy
   // snapshot type is a type-only concern but snapshotTurnGraphPolicy is a
   // value import from the compiler (a sibling).

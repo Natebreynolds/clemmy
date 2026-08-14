@@ -26,11 +26,19 @@ const {
   resolveTurnOpenness,
   renderTurnOpennessForContext,
   turnOpennessEnabled,
+  turnOpennessBrainFamily,
+  selectIndependentTurnOpennessJudgeRoute,
   _setOpennessJudgeForTests,
+  _setOpennessJudgePortForTests,
 } = await import('./turn-openness.js');
 
 after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
-afterEach(() => { _setOpennessJudgeForTests(null); delete process.env.CLEMMY_TURN_OPENNESS; });
+afterEach(() => {
+  _setOpennessJudgeForTests(null);
+  _setOpennessJudgePortForTests(null);
+  delete process.env.CLEMMY_TURN_OPENNESS;
+  delete process.env.CLEMMY_TURN_OPENNESS_TIMEOUT_MS;
+});
 
 test('a settled request produces NOTHING — no block, no prompt tax', () => {
   assert.equal(parseOpennessVerdict('SETTLED: the request names the list and the format'), null);
@@ -54,9 +62,44 @@ test('garbage, prose, and empty verdicts all fail OPEN (silence, never an error)
   }
 });
 
-test('a judge that throws or hangs never breaks the turn', async () => {
+test('a judge that throws never breaks the turn', async () => {
   _setOpennessJudgeForTests(async () => { throw new Error('judge exploded'); });
-  assert.equal(await resolveTurnOpenness({ message: 'do the thing' }), null);
+  assert.equal(await resolveTurnOpenness({ message: 'do the thing', brainFamily: 'codex' }), null);
+});
+
+test('the public openness ceiling includes alternate-port and setup time', async () => {
+  process.env.CLEMMY_TURN_OPENNESS_TIMEOUT_MS = '500';
+  _setOpennessJudgeForTests(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    return { open: ['late dimension that must not tax the turn'] };
+  });
+  const startedAt = Date.now();
+  assert.equal(await resolveTurnOpenness({ message: 'do the thing', brainFamily: 'codex' }), null);
+  const elapsedMs = Date.now() - startedAt;
+  assert.ok(elapsedMs >= 450, `deadline returned too early: ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 800, `setup/alternate-port work escaped the public ceiling: ${elapsedMs}ms`);
+});
+
+test('a hung production judge fails open at the configured wall-clock ceiling', async () => {
+  process.env.CLEMMY_TURN_OPENNESS_TIMEOUT_MS = '500';
+  const independentRoute = {
+    model: {} as any,
+    modelId: 'claude-haiku-4-5',
+    judgeFamily: 'claude' as const,
+    brainFamily: 'codex' as const,
+    transport: 'claude_subscription' as const,
+    selfJudge: false,
+  };
+  _setOpennessJudgePortForTests({
+    async resolveRoutes() { return [independentRoute]; },
+    async run() { return await new Promise<never>(() => {}); },
+  });
+
+  const startedAt = Date.now();
+  assert.equal(await resolveTurnOpenness({ message: 'do the thing', brainFamily: 'codex' }), null);
+  const elapsedMs = Date.now() - startedAt;
+  assert.ok(elapsedMs >= 450, `deadline returned too early: ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 1_500, `hung judge delayed the turn for ${elapsedMs}ms`);
 });
 
 test('the kill-switch stops the pass entirely without touching the judge', async () => {
@@ -64,7 +107,7 @@ test('the kill-switch stops the pass entirely without touching the judge', async
   let called = false;
   _setOpennessJudgeForTests(async () => { called = true; return { open: ['x'] }; });
   assert.equal(turnOpennessEnabled(), false);
-  assert.equal(await resolveTurnOpenness({ message: 'do the thing' }), null);
+  assert.equal(await resolveTurnOpenness({ message: 'do the thing', brainFamily: 'codex' }), null);
   assert.equal(called, false, 'a disabled pass must not spend a model call');
 });
 
@@ -79,6 +122,7 @@ test('THE LIVE FIXTURE: the run that started with no conversation surfaces its o
   });
   const openness = await resolveTurnOpenness({
     message: 'we started pulling the data for arizona criminal defense firms but still havnt gotten them into a new airtable base can we finalize that',
+    brainFamily: 'codex',
     capabilityBlock: '✓ proven: create records — composio:AIRTABLE_CREATE_MULTIPLE_RECORDS [connection active]',
   });
   const rendered = renderTurnOpennessForContext(openness);
@@ -131,16 +175,15 @@ test('the real classifier agrees: a list carrier reads, a create carrier writes'
   assert.equal(turnOpennessWarranted([{ kind: 'composio', identifier: 'AIRTABLE_CREATE_MULTIPLE_RECORDS' }]), true);
 });
 
-test('THE LIVE FAILURE: an unstated account is surfaced up front, and survives a dead judge', async () => {
-  // "pull 5 stale accounts in salesforce and help me draft some emails", two
-  // Outlook accounts connected. The run read the playbook, queried Salesforce,
-  // enriched every account — and every draft failed at the last step with "you
-  // have 2 outlook accounts connected, so I need to know WHICH account to use".
-  // The preflight had typed destinationInstanceUnstated before a single tool
-  // ran. No model call was ever needed to know this.
+test('a runtime-proven deterministic openness floor survives a dead judge', async () => {
+  // This exercises the primitive for a future caller that has positively read
+  // multiple live account identities. Request-text classification alone does
+  // not supply this fact; current callers leave that judgment to the independent
+  // openness pass and the provider gateway fails closed on actual ambiguity.
   _setOpennessJudgeForTests(async () => { throw new Error('judge unavailable'); });
   const openness = await resolveTurnOpenness({
     message: 'can you pull 5 stale accounts for me in salesfroce and help me draft some emails',
+    brainFamily: 'claude',
     deterministicOpen: ['which emails account/instance to use — you have more than one and none was named'],
   });
   assert.ok(openness, 'a certain unknown must not depend on a judge being alive');
@@ -152,10 +195,96 @@ test('certain unknowns lead, and duplicates across the two sources collapse', as
   _setOpennessJudgeForTests(async () => ({ open: ['Which Emails Account/Instance To Use — you have more than one and none was named', 'the tone'] }));
   const openness = await resolveTurnOpenness({
     message: 'draft some emails',
+    brainFamily: 'claude',
     deterministicOpen: ['which emails account/instance to use — you have more than one and none was named'],
   });
   assert.equal(openness?.open.length, 2, 'the same dimension from both sources is one dimension');
   assert.match(openness!.open[0]!, /^which emails account/, 'the certain one leads');
+});
+
+test('the caller-boundary helper derives the actual brain family from the selected model', () => {
+  assert.equal(turnOpennessBrainFamily('gpt-5.6-sol'), 'codex');
+  assert.equal(turnOpennessBrainFamily('claude-sonnet-5'), 'claude');
+  assert.equal(turnOpennessBrainFamily('glm-5.2'), 'byo');
+});
+
+test('production topology selects a different family from the ACTUAL brain and executes exactly once', async () => {
+  let calls = 0;
+  const sameActualFamily = {
+    model: {} as any,
+    modelId: 'claude-haiku-4-5',
+    judgeFamily: 'claude' as const,
+    // Deliberately stale/misleading route metadata: actual input below wins.
+    brainFamily: 'codex' as const,
+    transport: 'claude_subscription' as const,
+    selfJudge: false,
+  };
+  const independentFromActualFamily = {
+    model: {} as any,
+    modelId: 'gpt-5.4-mini',
+    judgeFamily: 'codex' as const,
+    brainFamily: 'codex' as const,
+    transport: 'codex_responses' as const,
+    selfJudge: false,
+  };
+  assert.equal(
+    selectIndependentTurnOpennessJudgeRoute(
+      [sameActualFamily, independentFromActualFamily],
+      'claude',
+    ),
+    independentFromActualFamily,
+  );
+  _setOpennessJudgePortForTests({
+    async resolveRoutes() { return [sameActualFamily, independentFromActualFamily]; },
+    async run(request) {
+      calls += 1;
+      assert.equal(request.route, independentFromActualFamily);
+      assert.deepEqual(request.tools, []);
+      assert.equal(request.maxTurns, 1);
+      return 'SETTLED: all result-changing values are specified';
+    },
+  });
+  assert.equal(await resolveTurnOpenness({
+    message: 'Create the specified sheet and email its link.',
+    brainFamily: 'claude',
+  }), null);
+  assert.equal(calls, 1, 'one openness verdict means exactly one model call');
+});
+
+test('a route marked self-judge is refused even when its cached brain label is stale', () => {
+  const staleSelfRoute = {
+    model: {} as any,
+    modelId: 'gpt-5.4-mini',
+    judgeFamily: 'codex' as const,
+    brainFamily: 'codex' as const,
+    transport: 'codex_responses' as const,
+    selfJudge: true,
+  };
+  assert.equal(
+    selectIndependentTurnOpennessJudgeRoute([staleSelfRoute], 'claude'),
+    null,
+  );
+});
+
+test('no different-family judge route fails open without executing a model', async () => {
+  let calls = 0;
+  const sameFamily = {
+    model: {} as any,
+    modelId: 'gpt-5.4-mini',
+    judgeFamily: 'codex' as const,
+    brainFamily: 'claude' as const,
+    transport: 'codex_responses' as const,
+    selfJudge: false,
+  };
+  _setOpennessJudgePortForTests({
+    async resolveRoutes() { return [sameFamily]; },
+    async run() { calls += 1; return 'OPEN: something'; },
+  });
+  assert.equal(await resolveTurnOpenness({
+    message: 'Do the specified task.',
+    brainFamily: 'codex',
+  }), null);
+  assert.equal(calls, 0);
 });
 
 test('a CONSEQUENTIAL turn with zero proven capabilities still runs the pass', async () => {

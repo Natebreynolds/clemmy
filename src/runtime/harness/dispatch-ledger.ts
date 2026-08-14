@@ -24,6 +24,12 @@ import {
   type DurableLogicalCallContract,
 } from './logical-call-contract.js';
 import { reserveWriteEvidenceDispatchInTransaction } from './write-evidence-lifecycle.js';
+import { approvedMandateAdmitsCall } from './expected-work-admission.js';
+import {
+  classifyRuntimeToolEffect,
+  inspectTrustedRuntimeEffectCarrier,
+  type TrustedRuntimeEffectCarrier,
+} from './tool-effect.js';
 
 export const DISPATCH_STARTED_EVENT = 'provider_dispatch_started' as const;
 export const DISPATCH_SETTLED_EVENT = 'provider_dispatch_settled' as const;
@@ -559,6 +565,8 @@ export function beginPhysicalDispatch(input: {
   args?: unknown;
   turn?: number;
   relation?: DispatchRelation;
+  /** Host-only provenance for a trusted wrapper peeled before this crossing. */
+  trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
   /** 'host' when the crossing is the host invoking a tool in-process. NULL
    *  (the default) keeps its historical meaning: it left the machine. */
   executionSite?: 'host';
@@ -576,7 +584,13 @@ export function beginPhysicalDispatch(input: {
         expected,
         input.identity,
         contract,
-        'physical',
+        // Provider I/O is authorized only by the current refined contract.
+        // A host crossing is different: it records execution that already
+        // occurred in-process, and its outer wrapper may still hold the call's
+        // immutable raw contract. Logical admission accepts either digest of
+        // that same call and returns the current canonical digest written to
+        // the crossing below. This does not widen provider authority.
+        input.executionSite === 'host' ? 'logical' : 'physical',
       );
       if (logicalAdmission.status !== 'inserted' && logicalAdmission.status !== 'replayed') {
         return logicalAdmission;
@@ -613,7 +627,41 @@ export function beginPhysicalDispatch(input: {
           tool,
           digest,
         );
-        if (!binding) {
+        // A READ OR COMPUTE IS NEVER GATED HERE EITHER. This backstop exists so
+        // a bypassing adapter cannot make an unproposed PAID EFFECT; a status
+        // read duplicates nothing. Refusing it broke the only recovery path an
+        // uncertain write has (live 2026-08-12 — see the twin comment in
+        // expected-work-admission.ts). The mandate below is matched on the RAW
+        // carrier call: the approval card stored exactly what the user saw,
+        // before logical canonicalization.
+        const trustedCarrier = inspectTrustedRuntimeEffectCarrier(input.trustedEffectCarrier);
+        // Provenance is useful only when it describes THESE exact canonical
+        // bytes. This prevents a host wiring mistake from reusing a read
+        // carrier to bless another provider call. The wrapper and bare provider
+        // forms intentionally share one durable contract, while the row below
+        // continues to store the bare tool/digest supplied at the dispatch edge.
+        const trustedContract = trustedCarrier
+          ? durableLogicalCallContract(
+            expected.acceptedTaskId,
+            trustedCarrier.toolName,
+            trustedCarrier.args,
+          )
+          : null;
+        const trustedDecision = trustedCarrier
+          && trustedContract?.toolName === tool
+          && trustedContract.argumentDigest === digest
+          ? trustedCarrier.decision
+          : null;
+        const dispatchEffect = trustedDecision?.effect
+          ?? classifyRuntimeToolEffect(input.tool, input.args).effect;
+        const gentleRead = dispatchEffect === 'read' || dispatchEffect === 'compute';
+        if (!binding && !gentleRead && !approvedMandateAdmitsCall(
+          db,
+          input.identity.sessionId,
+          input.identity.sourceUserSeq,
+          input.tool,
+          input.args,
+        )) {
           return {
             status: 'missing',
             reason: 'work_binding_required: active action dispatch has no exact frozen requirement binding',

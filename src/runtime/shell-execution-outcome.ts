@@ -9,6 +9,23 @@
  */
 import { classifyShellProviderFailure } from './shell-provider-outcome-adapters.js';
 
+/**
+ * Nominal proof that Clementine's own shell policy refused a command before a
+ * child process was started.  This class deliberately lives beside the typed
+ * execution outcome so every adapter can preserve it without importing the
+ * computer-tool implementation (and creating a runtime cycle).
+ */
+export class ShellPolicyDenialError extends Error {
+  override readonly name = 'ShellPolicyDenialError';
+}
+
+export const SHELL_POLICY_DENIAL_PREFIX = 'Tool call refused by harness: shell_policy_denial:';
+
+/** Exact marker minted only by the local shell tool's error adapter. */
+export function isShellPolicyDenialResult(value: unknown): value is string {
+  return typeof value === 'string' && value.startsWith(SHELL_POLICY_DENIAL_PREFIX);
+}
+
 export type ShellExecutionPhase =
   | 'resolve'
   | 'materialize'

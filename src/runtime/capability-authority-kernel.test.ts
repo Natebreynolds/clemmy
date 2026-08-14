@@ -262,7 +262,7 @@ test('D7: every attempt outcome maps to exactly one recovery, from structure not
   const { classifyAttemptOutcome, recoveryDirectiveFor } = await import('./harness/attempt-outcome.js');
 
   const cases: Array<[string, Parameters<typeof classifyAttemptOutcome>[0], string]> = [
-    ['native envelope failure', { envelopeSuccessful: false }, 'unsupported_capability'],
+    ['generic native envelope failure', { envelopeSuccessful: false }, 'unknown'],
     ['empty but successful', { envelopeSuccessful: true, emptyResult: true }, 'empty_result'],
     ['thrown timeout on a read', { errorName: 'TimeoutError' }, 'transient'],
     ['thrown timeout on a write', { errorName: 'TimeoutError', mutating: true }, 'uncertain_write'],

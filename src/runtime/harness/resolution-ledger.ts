@@ -24,6 +24,7 @@ import {
 } from './eventlog.js';
 import { acceptedTaskIdFor } from './attempt-identity.js';
 import {
+  actionTopologyRoleForRuntimeCall,
   canonicalRuntimeEffectiveToolName,
   classifyRuntimeToolEffect,
   unwrapRuntimeEffectiveToolIdentity,
@@ -31,6 +32,7 @@ import {
 } from './tool-effect.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import {
+  isDeterministicImplicitRetrieveContract,
   matchExpectedWork,
   type ExpectedWorkMatchResult,
 } from './expected-work-matcher.js';
@@ -322,6 +324,112 @@ function physicalDispatchBelongs(
 }
 
 /**
+ * Recover the effect already frozen by the host before provider execution.
+ *
+ * Settlement deliberately records the peeled provider action (rather than its
+ * dynamic or MCP carrier). Reclassifying that bare spelling here loses the
+ * carrier provenance which admitted the call: a provider action can look like
+ * a local write even though the immutable expected-work binding admitted an
+ * external write. Only an exact three-way identity match (binding, logical
+ * call, accepted task) may project the frozen effect. An unbound observation
+ * keeps the existing classifier.
+ */
+interface FrozenOperationAuthority {
+  effect: Exclude<RuntimeToolEffect, 'unknown'>;
+  reversibility: ObservedReversibility;
+  source: 'expected_work_binding' | 'write_evidence_binding';
+}
+
+function frozenOperationAuthority(
+  db: ReturnType<typeof openEventLog>,
+  expected: AcceptedTaskExpectation,
+  logicalToolCallId: string,
+  resolvedTool: string,
+): FrozenOperationAuthority | null {
+  const row = db.prepare(`
+    SELECT b.tool_name AS binding_tool_name,
+           b.argument_digest AS binding_argument_digest,
+           b.effect_kind AS effect_kind,
+           l.tool_name AS logical_tool_name,
+           l.argument_digest AS logical_argument_digest,
+           w.effect_kind AS write_effect_kind,
+           w.reversibility AS write_reversibility,
+           w.tool_name AS write_tool_name,
+           w.argument_digest AS write_argument_digest
+      FROM expected_work_call_bindings b
+      JOIN logical_tool_calls l
+        ON l.session_id = b.session_id
+       AND l.source_user_seq = b.source_user_seq
+       AND l.logical_tool_call_id = b.logical_tool_call_id
+      LEFT JOIN write_evidence_bindings w
+        ON w.session_id = b.session_id
+       AND w.source_user_seq = b.source_user_seq
+       AND w.accepted_task_id = b.accepted_task_id
+       AND w.logical_tool_call_id = b.logical_tool_call_id
+     WHERE b.session_id = ? AND b.source_user_seq = ?
+       AND b.accepted_task_id = ? AND b.logical_tool_call_id = ?
+       AND l.accepted_task_id = b.accepted_task_id
+     LIMIT 1
+  `).get(
+    expected.identity.sessionId,
+    expected.identity.sourceUserSeq,
+    expected.acceptedTaskId,
+    logicalToolCallId,
+  ) as {
+    binding_tool_name: string;
+    binding_argument_digest: string;
+    effect_kind: string;
+    logical_tool_name: string;
+    logical_argument_digest: string;
+    write_effect_kind: string | null;
+    write_reversibility: string | null;
+    write_tool_name: string | null;
+    write_argument_digest: string | null;
+  } | undefined;
+  if (
+    !row
+    || row.binding_tool_name !== resolvedTool
+    || row.logical_tool_name !== resolvedTool
+    || row.binding_argument_digest !== row.logical_argument_digest
+  ) return null;
+  let effect: Exclude<RuntimeToolEffect, 'unknown'>;
+  switch (row.effect_kind) {
+    case 'read':
+    case 'compute':
+    case 'local_write':
+    case 'external_write':
+    case 'admin':
+      effect = row.effect_kind;
+      break;
+    default:
+      return null;
+  }
+  if (
+    row.write_effect_kind === effect
+    && row.write_tool_name === resolvedTool
+    && row.write_argument_digest === row.binding_argument_digest
+    && (row.write_reversibility === 'reversible' || row.write_reversibility === 'irreversible')
+  ) {
+    return {
+      effect,
+      reversibility: row.write_reversibility,
+      source: 'write_evidence_binding',
+    };
+  }
+  return {
+    effect,
+    reversibility: effect === 'read'
+      ? 'read_only'
+      : effect === 'compute'
+        ? 'not_applicable'
+        : effect === 'local_write'
+          ? 'reversible'
+          : 'unknown',
+    source: 'expected_work_binding',
+  };
+}
+
+/**
  * Record one host-observed business operation.
  *
  * The caller names a capability and supplies its ephemeral arguments; the host
@@ -354,10 +462,20 @@ export function recordResolvedOperationInTransaction(
   if (!resolvedTool) return { status: 'conflict', reason: 'resolved tool identity is unsafe' };
   const runtime = classifyRuntimeToolEffect(input.resolvedTool, input.args);
   const taxonomy = classifyTool(resolvedTool, { args: effective.args });
-  const effectKind = runtime.effect === 'unknown'
+  const inferredEffect = runtime.effect === 'unknown'
     ? effectForToolKind(taxonomy) ?? 'unknown'
     : runtime.effect;
-  const reversibility = reversibilityFor(taxonomy, effectKind);
+  const frozen = frozenOperationAuthority(
+    db,
+    expected,
+    input.logicalToolCallId,
+    resolvedTool,
+  );
+  const effectKind = frozen?.effect ?? inferredEffect;
+  const reversibility = frozen?.reversibility ?? reversibilityFor(taxonomy, effectKind);
+  const effectSource = frozen
+    ? frozen.source
+    : runtime.effect === 'unknown' ? 'taxonomy' : runtime.source;
   const shape = argumentShape(effective.args);
   const resolution = ensureOpenResolution(db, expected);
   if (resolution.state !== 'open') {
@@ -432,7 +550,7 @@ export function recordResolvedOperationInTransaction(
       ...(input.physicalDispatchId ? { physicalDispatchId: input.physicalDispatchId } : {}),
       effectKind,
       reversibility,
-      effectSource: runtime.effect === 'unknown' ? 'taxonomy' : runtime.source,
+      effectSource,
       argumentKeys: shape.keys,
       argumentDigest: shape.digest,
       ...(input.physicalDispatchId
@@ -460,7 +578,7 @@ export function recordResolvedOperationInTransaction(
     resolvedTool,
     effectKind,
     reversibility,
-    runtime.effect === 'unknown' ? 'taxonomy' : runtime.source,
+    effectSource,
     JSON.stringify(shape.keys),
     shape.digest,
     input.physicalDispatchId ?? null,
@@ -479,7 +597,7 @@ export function recordResolvedOperationInTransaction(
       ...(input.physicalDispatchId ? { physicalDispatchId: input.physicalDispatchId } : {}),
       effectKind,
       reversibility,
-      effectSource: runtime.effect === 'unknown' ? 'taxonomy' : runtime.source,
+      effectSource,
       argumentKeys: shape.keys,
       argumentDigest: shape.digest,
       ...(input.physicalDispatchId
@@ -651,6 +769,55 @@ function hasUnsettledToolWorkInTransaction(
   return row.logical_n > 0 || row.dispatch_n > 0;
 }
 
+/**
+ * True when every settled call this source owns is control-role bookkeeping
+ * (status probes, output queries, asks). One settled non-control call — a
+ * business read, a continued page, a discovery probe of a business
+ * capability — means real tool activity happened and the zero-work terminal
+ * door must stay closed. Wrapped carriers whose inner identity cannot be
+ * re-derived from the stored name classify as business, which fails closed.
+ */
+function sourceSettledOnlyControlCallsInTransaction(
+  db: ReturnType<typeof openEventLog>,
+  sessionId: string,
+  sourceUserSeq: number,
+): boolean {
+  const rows = db.prepare(`
+    SELECT l.tool_name AS tool_name
+      FROM logical_call_settlements s
+      JOIN logical_tool_calls l
+        ON l.session_id = s.session_id
+       AND l.source_user_seq = s.source_user_seq
+       AND l.logical_tool_call_id = s.logical_tool_call_id
+     WHERE s.session_id = ? AND s.source_user_seq = ?
+  `).all(sessionId, sourceUserSeq) as Array<{ tool_name: string }>;
+  return rows.every((row) => actionTopologyRoleForRuntimeCall(row.tool_name, undefined) === 'control');
+}
+
+/**
+ * The zero-work terminal door for the deterministic retrieve contract.
+ *
+ * The once-read is AT-MOST-once: the contract bounds what work may count, it
+ * never mandates work occur. A turn that recorded no business operation and
+ * settled nothing beyond control-role bookkeeping did no work — the reply is
+ * the terminal. One settled non-control call (a continued page, a discovery
+ * probe of a business capability) keeps the door closed: real tool activity
+ * must still discharge or hold.
+ */
+function zeroWorkRetrieveTerminalInTransaction(input: {
+  db: ReturnType<typeof openEventLog>;
+  contract: Extract<ReturnType<typeof loadExpectedWorkContract>, { status: 'ok' }>['contract'];
+  match: ExpectedWorkMatchResult;
+  operationCount: number;
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  return input.match.status === 'incomplete'
+    && input.operationCount === 0
+    && isDeterministicImplicitRetrieveContract(input.contract)
+    && sourceSettledOnlyControlCallsInTransaction(input.db, input.sessionId, input.sourceUserSeq);
+}
+
 export type ExpectedWorkResolutionFinalization =
   | {
       status: 'finalized' | 'replayed';
@@ -766,13 +933,24 @@ export function finalizeResolutionAgainstExpectedWork(input: {
       const digest = operationsDigest(operations);
       const adjudicated = deterministicExpectedWorkMatch({ contract: loaded.contract });
       if (adjudicated.status !== 'ok') return adjudicated;
+      // Freshness honesty for the zero-read case is owned by terminal
+      // preparation, which gates BEFORE this close so a held turn remains
+      // repairable.
+      const zeroWorkTerminal = zeroWorkRetrieveTerminalInTransaction({
+        db,
+        contract: loaded.contract,
+        match: adjudicated.match,
+        operationCount: operations.length,
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+      });
 
       if (resolution.state === 'finalized') {
         if (
           resolution.operation_count !== operations.length
           || resolution.operations_digest !== digest
           || resolution.expectations_satisfied !== 1
-          || adjudicated.match.status !== 'complete'
+          || (adjudicated.match.status !== 'complete' && !zeroWorkTerminal)
         ) {
           return {
             status: 'conflict',
@@ -796,7 +974,7 @@ export function finalizeResolutionAgainstExpectedWork(input: {
       if (hasUnsettledToolWorkInTransaction(db, expected)) {
         return { status: 'not_ready', reason: 'accepted task still has unsettled logical or physical work' };
       }
-      if (adjudicated.match.status === 'incomplete') {
+      if (adjudicated.match.status === 'incomplete' && !zeroWorkTerminal) {
         return { status: 'incomplete', match: adjudicated.match };
       }
       if (adjudicated.match.status === 'conflict') {
@@ -817,7 +995,7 @@ export function finalizeResolutionAgainstExpectedWork(input: {
           operationCount: operations.length,
           operationsDigest: digest,
           expectationsSatisfied: true,
-          expectedWorkMatch: 'complete',
+          expectedWorkMatch: zeroWorkTerminal ? 'zero_work' : 'complete',
         },
       });
       const updated = db.prepare(`
@@ -1015,7 +1193,15 @@ export function frozenResolutionFor(
       if (adjudicated.status !== 'ok') {
         return { status: 'ambiguous', reason: adjudicated.reason };
       }
-      recomputedSatisfied = adjudicated.match.status === 'complete';
+      recomputedSatisfied = adjudicated.match.status === 'complete'
+        || zeroWorkRetrieveTerminalInTransaction({
+          db,
+          contract: contract.contract,
+          match: adjudicated.match,
+          operationCount: operations.length,
+          sessionId,
+          sourceUserSeq,
+        });
     } else {
       recomputedSatisfied = expectationSatisfied(expectedState.expectation, operations);
     }

@@ -193,6 +193,45 @@ function validId(value: unknown, label: string, errors: string[]): value is stri
   return true;
 }
 
+/**
+ * Meaning-preserving repair of the two proposal shapes a planner reliably
+ * writes, both of which state their intent unambiguously:
+ *
+ *   - `coverage` on a non-read. Coverage is READ vocabulary ("how much of the
+ *     source did you see"); on a write it says nothing. Drop it.
+ *   - `dataFrom` naming an operation absent from `dependsOn`. Deriving data
+ *     from X IS depending on X — the two lists cannot honestly disagree, so
+ *     take the union. For a READ, which originates data rather than deriving
+ *     it, the same entries become pure ordering dependencies.
+ *
+ * Refusing these cost entire runs: a fan-out worker spent its whole budget
+ * re-proposing against `coverage is only valid for reads` and `dataFrom X
+ * must also be a dependency`, never made a single business call, and reported
+ * it could not verify anything (live 2026-08-12). Every downstream invariant
+ * is unchanged — dataFrom ⊆ dependsOn and reads-derive-nothing now hold by
+ * construction instead of by rejection. Anything genuinely ambiguous (a bad
+ * effect, a malformed cardinality, a coverage/cardinality contradiction) is
+ * still refused with its exact reason.
+ */
+function normalizeProposedOperation(raw: Record<string, unknown>): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...raw };
+  if (next.effect !== 'read' && Object.prototype.hasOwnProperty.call(next, 'coverage')) {
+    delete next.coverage;
+  }
+  const asIds = (value: unknown): string[] | null => (Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    : null);
+  const dataFrom = asIds(next.dataFrom);
+  if (!dataFrom || dataFrom.length === 0) return next;
+  const dependsOn = asIds(next.dependsOn);
+  // A malformed dependsOn must still surface its own error, not be replaced.
+  if (next.dependsOn !== undefined && dependsOn === null) return next;
+  const union = [...new Set([...(dependsOn ?? []), ...dataFrom])];
+  next.dependsOn = union;
+  if (next.effect === 'read') next.dataFrom = [];
+  return next;
+}
+
 function stringList(value: unknown, label: string, errors: string[]): string[] | null {
   if (!Array.isArray(value)) {
     errors.push(`${label} must be an array`);
@@ -262,12 +301,13 @@ export function validateExpectedWorkProposal(value: unknown): ExpectedWorkPropos
   }
 
   const operations: ExpectedWorkOperationV1[] = [];
-  for (const [index, raw] of rawOperations.entries()) {
+  for (const [index, rawProposed] of rawOperations.entries()) {
     const label = `operation[${index}]`;
-    if (!plainRecord(raw)) {
+    if (!plainRecord(rawProposed)) {
       errors.push(`${label} must be an object`);
       continue;
     }
+    const raw = normalizeProposedOperation(rawProposed);
     exactKeys(raw, ['id', 'effect', 'coverage', 'dependsOn', 'dataFrom', 'cardinality'], label, errors);
     const idOk = validId(raw.id, `${label}.id`, errors);
     const effectOk = raw.effect === 'read'
@@ -655,7 +695,16 @@ function validateActionProposalForGraph(
   const errors: string[] = [];
   if (graph.classification.route !== 'act') errors.push('explicit action contracts require an action graph');
   if (proposal.operations.length === 0) errors.push('an action contract cannot contain zero operations');
-  if (!proposal.operations.some((operation) => operation.effect !== 'read')) {
+  // `tool_intent` is an admitted planning uncertainty, not an affirmative
+  // mutation. Its model-owned proposal may legitimately resolve the unknown
+  // topology to a read. A typed action (including every direct external
+  // effect), however, cannot be weakened to observation-only work.
+  const affirmativeAction = graph.classification.messageIntent === 'action'
+    || graph.classification.externalEffectRequested;
+  if (
+    affirmativeAction
+    && !proposal.operations.some((operation) => operation.effect !== 'read')
+  ) {
     errors.push('an action graph cannot be weakened to read-only work');
   }
   if (proposal.operations.some((operation) => operation.coverage === 'resolved_operation')) {

@@ -8,7 +8,7 @@
  * canonical base-call arguments. Knowing a reference is not authority to use
  * it from another task or call.
  */
-import { providerEnvelopeHasContradiction } from './provider-read-evidence.js';
+import { inspectProviderEnvelope } from './provider-read-evidence.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
@@ -59,6 +59,13 @@ export interface ResultHandleAuthority {
   /** Exact tool and arguments recorded for this physical crossing. */
   toolName: string;
   args?: unknown;
+  /**
+   * Canonical digest already authorized by the durable logical and physical
+   * rows. This is needed when an outer carrier settles with its immutable raw
+   * arguments after a trusted inner refinement. The persistence seam verifies
+   * the override against both owners before accepting it.
+   */
+  canonicalArgumentDigest?: string;
   /** Stable initial arguments for the pagination chain. Defaults to `args`. */
   baseArgs?: unknown;
 }
@@ -241,6 +248,17 @@ function authoritativeScope(authority: ResultHandleAuthority): DurableScope {
   if (!call || !base || call.toolName !== base.toolName) {
     throw new ResultHandleAuthorityError('invalid_scope', 'tool or base-call contract is not canonicalizable');
   }
+  const canonicalArgumentDigest = authority.canonicalArgumentDigest?.trim();
+  if (
+    canonicalArgumentDigest !== undefined
+    && !/^[a-f0-9]{64}$/.test(canonicalArgumentDigest)
+  ) {
+    throw new ResultHandleAuthorityError(
+      'invalid_scope',
+      'canonical argument digest is malformed',
+    );
+  }
+  const argumentDigest = canonicalArgumentDigest ?? call.argumentDigest;
   const continuationChainId = authority.continuationChainId?.trim()
     || authority.logicalToolCallId.trim();
   if (continuationChainId.length > 256) {
@@ -255,8 +273,10 @@ function authoritativeScope(authority: ResultHandleAuthority): DurableScope {
     physicalDispatchId: authority.physicalDispatchId,
     continuationChainId,
     toolName: call.toolName,
-    argumentDigest: call.argumentDigest,
-    baseArgumentDigest: base.argumentDigest,
+    argumentDigest,
+    baseArgumentDigest: authority.baseArgs === undefined
+      ? argumentDigest
+      : base.argumentDigest,
     salt: [
       authority.sessionId,
       authority.sourceUserSeq,
@@ -343,8 +363,17 @@ function persistResultHandleInTransaction(
   scope: DurableScope,
   options: { skipRawStore: boolean; requireRaw: boolean },
 ): DurableResultRow {
-  const inspected = deriveResultHandleFactsFromRaw(result);
   let encoded = encodeRaw(result, options.skipRawStore);
+  // Durable projections must describe the exact bytes redemption will later
+  // re-derive, not an SDK object that only happens to stringify to those
+  // bytes. Provider wrappers routinely carry class instances, `undefined`,
+  // and `toJSON` hooks; inspecting that pre-serialization shape can freeze a
+  // different envelope/meta projection than JSON.parse(raw_payload_json),
+  // making an otherwise sound settlement permanently irredeemable.
+  const replayableResult = encoded.rawJson === null
+    ? result
+    : JSON.parse(encoded.rawJson) as unknown;
+  const inspected = deriveResultHandleFactsFromRaw(replayableResult);
   const cursorBytes = inspected.cursor === null ? null : Buffer.from(inspected.cursor, 'utf8');
   if (cursorBytes && cursorBytes.byteLength > RESULT_CURSOR_MAX_BYTES) {
     encoded = {
@@ -473,10 +502,50 @@ export function persistAuthoritativeResultHandleInTransaction(
   result: unknown,
   authority: ResultHandleAuthority,
 ): ResultHandle {
+  const scope = authoritativeScope(authority);
+  if (authority.canonicalArgumentDigest !== undefined) {
+    const owner = db.prepare(`
+      SELECT l.accepted_task_id, l.tool_name,
+             l.argument_digest AS logical_argument_digest,
+             p.tool_name AS dispatch_tool_name,
+             p.argument_digest AS dispatch_argument_digest
+        FROM logical_tool_calls l
+        JOIN physical_dispatches p
+          ON p.session_id = l.session_id
+         AND p.source_user_seq = l.source_user_seq
+         AND p.logical_tool_call_id = l.logical_tool_call_id
+       WHERE l.session_id = ? AND l.source_user_seq = ?
+         AND l.logical_tool_call_id = ? AND p.physical_dispatch_id = ?
+    `).get(
+      authority.sessionId,
+      authority.sourceUserSeq,
+      authority.logicalToolCallId,
+      authority.physicalDispatchId,
+    ) as {
+      accepted_task_id: string;
+      tool_name: string;
+      logical_argument_digest: string;
+      dispatch_tool_name: string;
+      dispatch_argument_digest: string;
+    } | undefined;
+    if (
+      !owner
+      || owner.accepted_task_id !== authority.acceptedTaskId
+      || owner.tool_name !== scope.toolName
+      || owner.dispatch_tool_name !== scope.toolName
+      || owner.logical_argument_digest !== scope.argumentDigest
+      || owner.dispatch_argument_digest !== scope.argumentDigest
+    ) {
+      throw new ResultHandleAuthorityError(
+        'authority_mismatch',
+        'canonical argument digest is not owned by the exact logical and physical call',
+      );
+    }
+  }
   return rowToHandle(persistResultHandleInTransaction(
     db,
     result,
-    authoritativeScope(authority),
+    scope,
     { skipRawStore: false, requireRaw: true },
   ));
 }
@@ -901,7 +970,7 @@ export function redeemSuccessfulSettlementResultForHost(input: {
  * more, or that hands back a continuation, is believed.
  */
 export function redeemedReadIsExhausted(value: SuccessfulSettlementResultEvidence): boolean {
-  if (providerEnvelopeHasContradiction(value.rawPayload)) return false;
+  if (inspectProviderEnvelope(value.rawPayload).verdict !== 'clean') return false;
   if (value.handle.continuationRef !== null || value.handle.continuationRepeated) return false;
   return value.handle.completeness === 'complete'
     || (value.executionSite === 'host' && value.handle.completeness === 'unknown');

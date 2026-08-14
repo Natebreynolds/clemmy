@@ -69,7 +69,7 @@ import {
   requestKill,
   type EventRow,
 } from './eventlog.js';
-import { listPending } from './approval-registry.js';
+import { listPending, projectPendingApprovalUserDependency } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
 import { ClaudeSdkCapacityExhaustedError, ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
@@ -1644,6 +1644,7 @@ export async function respondViaHarness(
         request.acceptStructuredNoToolResult === true
         && Array.isArray(request.allowedToolNames)
         && request.allowedToolNames.length === 0,
+      onConversationPreamble: request.onConversationPreamble,
       reuseRecordedUserInput: true,
       falloverModelIds: fallover.falloverModelIds,
       rebuildAgentForBrain: fallover.rebuildAgentForBrain,
@@ -1817,13 +1818,22 @@ export async function respondViaHarness(
       case 'awaiting_approval': {
         const pending = listPending({ sessionId, status: 'pending' });
         const first = pending[0];
+        const dependency = first ? projectPendingApprovalUserDependency(first) : null;
+        if (dependency?.kind === 'input') {
+          return withRouteDiagnostics({
+            text: dependency.question,
+            sessionId,
+            stoppedReason: 'awaiting-input',
+            turnsUsed: result.lastTurn,
+          }, routeForHarness(surface, request, opts.modelOverride));
+        }
         return withRouteDiagnostics({
           text: replyText
             || (first
               ? `Paused for approval \`${first.approvalId}\`: ${first.subject}. Approve or reject it and I'll continue.`
               : 'Paused for an approval. Approve or reject it and I\'ll continue.'),
           sessionId,
-          pendingApprovalId: first?.approvalId,
+          pendingApprovalId: dependency?.kind === 'approval' ? dependency.approvalId : undefined,
           stoppedReason: 'pending-approval',
           turnsUsed: result.lastTurn,
         }, routeForHarness(surface, request, opts.modelOverride));

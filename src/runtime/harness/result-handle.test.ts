@@ -450,6 +450,24 @@ test('nested structured provider failures contradict an outer successful label',
   }), false, 'business record fields are content, not provider envelope status');
 });
 
+test('neutral provider error sentinels stay aligned with the shared envelope verdict', () => {
+  for (const error of [null, false, '', [], {}, 'none', 'ok', 'success']) {
+    const payload = {
+      successful: true,
+      error,
+      result: { totalSize: 1, done: true, records: [{ Id: '001-a' }] },
+    };
+    assert.equal(
+      providerEvidence.inspectProviderEnvelope(payload).verdict,
+      'clean',
+      JSON.stringify(error),
+    );
+    const facts = results.deriveResultHandleFactsFromRaw(payload);
+    assert.equal(facts.success, true, JSON.stringify(error));
+    assert.equal(facts.completeness, 'complete', JSON.stringify(error));
+  }
+});
+
 test('raw fact derivation treats string and nested HTTP failure statuses as failed', () => {
   const rootStatus = results.deriveResultHandleFactsFromRaw({
     successful: true,
@@ -486,6 +504,9 @@ test('a returned business entity may truthfully have a failed domain status', ()
 // 2026-08-11, scorpion-facebook-trends). Canonicalization is stringify's job.
 test('SDK-shaped payloads (undefined props, class instances) persist and redeem', () => {
   class SdkEnvelope { constructor(readonly page: string, readonly likes: number) {} }
+  class EphemeralSdkMetadata {
+    toJSON(): undefined { return undefined; }
+  }
   const task = accept('sdk shapes');
   const authority = returnedCall({
     task,
@@ -495,20 +516,40 @@ test('SDK-shaped payloads (undefined props, class instances) persist and redeem'
   });
   const payload = {
     successful: true,
+    logId: 'sdk-shape-log',
     data: {
       items: [
         { id: 'post-1', text: 'trend', missing: undefined, envelope: new SdkEnvelope('scorpion.co', 42) },
       ],
     },
-    meta: { complete: true },
+    // The live Composio/Apify wrapper has SDK-only metadata that is visible
+    // on the provider object but not part of its retained JSON bytes. Facts
+    // must be frozen from those bytes or settlement redemption disagrees.
+    meta: new EphemeralSdkMetadata(),
   };
   const handle = results.toResultHandle(payload, { authority });
   assert.ok(handle.rawLocation, 'the payload is stored, not rejected');
   const row = eventlog.openEventLog().prepare(
-    'SELECT rejection_reason, raw_payload_json FROM durable_result_handles WHERE handle_id = ?',
-  ).get(handle.handle) as { rejection_reason: string | null; raw_payload_json: string | null };
+    `SELECT rejection_reason, raw_payload_json, envelope_meta_json
+       FROM durable_result_handles WHERE handle_id = ?`,
+  ).get(handle.handle) as {
+    rejection_reason: string | null;
+    raw_payload_json: string | null;
+    envelope_meta_json: string | null;
+  };
   assert.equal(row.rejection_reason, null);
   const stored = JSON.parse(row.raw_payload_json!);
   assert.equal(stored.data.items[0].envelope.page, 'scorpion.co', 'class instances flatten to their data');
   assert.ok(!('missing' in stored.data.items[0]), 'undefined properties drop, never poison');
+  assert.ok(!('meta' in stored), 'SDK-only metadata is absent from the authoritative retained bytes');
+  assert.deepEqual(
+    JSON.parse(row.envelope_meta_json!),
+    { successful: true, logId: 'sdk-shape-log' },
+    'the frozen projection is derived from the exact retained bytes',
+  );
+  assert.deepEqual(
+    results.redeemRawResult(handle.rawLocation!, authority),
+    { status: 'ok', value: stored },
+    'the retained SDK-shaped result redeems to its one canonical JSON value',
+  );
 });

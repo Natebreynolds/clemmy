@@ -11,6 +11,7 @@ import { AUDIT_MIRRORED_EVENT_TYPES, appendAuditRecord } from '../audit-ledger.j
 import {
   projectHarnessEventForPublic,
   publicAsyncWorkDispatchedData,
+  publicConversationPreambleData,
 } from './public-presentation.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
@@ -26,6 +27,7 @@ import {
   normalizeExactOriginDeliveryTarget,
   sameExactOriginDeliveryTarget,
 } from '../exact-origin-delivery.js';
+import { HARNESS_SCHEMA_VERSION } from './schema-version.js';
 
 /**
  * Event log — the spine of the 0.3 harness.
@@ -78,6 +80,10 @@ export const EVENT_TYPES = [
   'handoff',
   'awaiting_user_input',
   'user_input_received',
+  // One model-authored conversational acknowledgement shown before execution.
+  // This is presentation only: no terminal status, outcome, need, approval, or
+  // effect authority is carried by this event.
+  'conversation_preamble',
   // Mid-run steering (2026-08-07): a user message that arrived while the
   // session had an active attempt — delivered to the model at the next
   // tool-result boundary instead of superseding the running work.
@@ -296,6 +302,11 @@ export const EVENT_TYPES = [
   // code-mode mandate's DELETE-WHEN-VALIDATED note waits on.
   'codemode_progress',
   'codemode_program_summary',
+  // Provenance for a parked oversized program return: the child call ids that
+  // produced it. The handle itself is recall-only and never evidence
+  // authority; gates that refuse it read this record to name the real
+  // evidence ids instead of looping the model (live 2026-08-12).
+  'codemode_result_parked',
   // NON-halting record that, in YOLO, an approval-shaped ask_user_question was
   // auto-resolved (standing approval) and the run proceeded instead of pausing.
   // Distinct from awaiting_user_input precisely so it does NOT halt the loop.
@@ -3710,7 +3721,374 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     },
   },
+  {
+    // v28's receipt-authority trigger admitted only provider executions. The
+    // host's own returned execution carries the same redeemable evidence — a
+    // 'host'-site crossing and a byte-bound result handle — and a local read
+    // satisfying the deterministic retrieve route could mint no receipt at
+    // all (live 2026-08-12). Shipped migrations are immutable, so the widened
+    // trigger ships as its own version: drop and recreate with the host door.
+    version: 38,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('evidence_receipts') || !tables.has('physical_dispatches')) return;
+      db.exec(`
+        DROP TRIGGER IF EXISTS trg_evidence_receipt_exact_authority;
+        CREATE TRIGGER trg_evidence_receipt_exact_authority
+        BEFORE INSERT ON evidence_receipts
+        WHEN NOT EXISTS (
+          SELECT 1
+            FROM accepted_task_authority a
+            JOIN logical_call_settlements s
+              ON s.session_id = a.session_id
+             AND s.source_user_seq = a.source_user_seq
+             AND s.logical_tool_call_id = NEW.logical_tool_call_id
+            JOIN logical_tool_calls l
+              ON l.session_id = s.session_id
+             AND l.source_user_seq = s.source_user_seq
+             AND l.logical_tool_call_id = s.logical_tool_call_id
+            JOIN durable_result_handles h
+              ON h.handle_id = s.result_handle_id
+            JOIN physical_dispatches p
+              ON p.session_id = h.session_id
+             AND p.source_user_seq = h.source_user_seq
+             AND p.logical_tool_call_id = h.logical_tool_call_id
+             AND p.physical_dispatch_id = h.physical_dispatch_id
+            JOIN events e
+              ON e.id = NEW.receipt_event_id
+           WHERE a.session_id = NEW.session_id
+             AND a.source_user_seq = NEW.source_user_seq
+             AND a.accepted_task_id = NEW.accepted_task_id
+             AND a.manifest_id = NEW.manifest_id
+             AND a.state = 'manifested_verifying'
+             AND l.accepted_task_id = NEW.accepted_task_id
+             AND l.state = 'settled'
+             AND (
+               s.execution_kind = 'provider_execution'
+               OR (s.execution_kind = 'local_execution' AND p.execution_site = 'host')
+             )
+             AND s.outcome_kind IN ('succeeded','empty_result')
+             AND s.result_handle_id = NEW.result_handle_id
+             AND h.scope_kind = 'authoritative'
+             AND h.session_id = NEW.session_id
+             AND h.source_user_seq = NEW.source_user_seq
+             AND h.accepted_task_id = NEW.accepted_task_id
+             AND h.logical_tool_call_id = NEW.logical_tool_call_id
+             AND h.physical_dispatch_id = NEW.physical_dispatch_id
+             AND h.tool_name = NEW.tool_name
+             AND h.raw_payload_sha256 = NEW.raw_payload_sha256
+             AND h.raw_byte_count = NEW.raw_byte_count
+             AND h.success = 1
+             AND e.session_id = NEW.session_id
+             AND e.type = 'evidence_receipt'
+             AND json_extract(e.data_json, '$.receiptId') = NEW.receipt_id
+             AND json_extract(e.data_json, '$.sourceUserSeq') = NEW.source_user_seq
+             AND json_extract(e.data_json, '$.acceptedTaskId') = NEW.accepted_task_id
+             AND json_extract(e.data_json, '$.manifestId') = NEW.manifest_id
+             AND json_extract(e.data_json, '$.nodeId') = NEW.node_id
+             AND json_extract(e.data_json, '$.obligation') = NEW.obligation
+             AND json_extract(e.data_json, '$.logicalToolCallId') = NEW.logical_tool_call_id
+             AND json_extract(e.data_json, '$.physicalDispatchId') = NEW.physical_dispatch_id
+             AND json_extract(e.data_json, '$.resultHandleId') = NEW.result_handle_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'evidence receipt requires exact manifested settlement authority');
+        END;
+      `);
+    },
+  },
+  {
+    /**
+     * Provider-neutral requirement identities for broad discovery.
+     *
+     * A task-wide broad-search row made two different unresolved requirements
+     * fight for one slot, while keying by query/provider wording would let one
+     * requirement buy unlimited synonymous slots. The capability resolver now
+     * supplies opaque role keys for the exact accepted request. Persist that
+     * closed membership before the model runs; claims may then reuse the
+     * existing `subject` column as the per-role key without trusting model text.
+     *
+     * The set row distinguishes a deliberately empty/all-resolved projection
+     * from a legacy task that has not adopted role-scoped discovery. Requirement
+     * text is represented only by a digest. Resolution can tighten from open to
+     * resolved, but role identity and source membership are immutable.
+     */
+    version: 39,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('discovery_governor_tasks')) return;
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS discovery_governor_role_sets (
+          session_id         TEXT NOT NULL,
+          source_user_seq    INTEGER NOT NULL CHECK (source_user_seq > 0),
+          projection_digest  TEXT NOT NULL CHECK (length(projection_digest) = 64),
+          role_count         INTEGER NOT NULL CHECK (role_count >= 0),
+          unresolved_count   INTEGER NOT NULL CHECK (
+                               unresolved_count >= 0 AND unresolved_count <= role_count
+                             ),
+          initialized_at     TEXT NOT NULL,
+          updated_at         TEXT NOT NULL,
+          PRIMARY KEY (session_id, source_user_seq),
+          FOREIGN KEY (session_id, source_user_seq)
+            REFERENCES discovery_governor_tasks(session_id, source_user_seq)
+            ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS discovery_governor_roles (
+          session_id          TEXT NOT NULL,
+          source_user_seq     INTEGER NOT NULL CHECK (source_user_seq > 0),
+          role_key            TEXT NOT NULL CHECK (length(role_key) BETWEEN 1 AND 128),
+          requirement_index   INTEGER NOT NULL CHECK (requirement_index >= 0),
+          requirement_digest  TEXT NOT NULL CHECK (length(requirement_digest) = 64),
+          resolved            INTEGER NOT NULL CHECK (resolved IN (0, 1)),
+          registered_at       TEXT NOT NULL,
+          resolved_at         TEXT,
+          PRIMARY KEY (session_id, source_user_seq, role_key),
+          UNIQUE (session_id, source_user_seq, requirement_index),
+          FOREIGN KEY (session_id, source_user_seq)
+            REFERENCES discovery_governor_role_sets(session_id, source_user_seq)
+            ON DELETE CASCADE,
+          CHECK (
+            (resolved = 0 AND resolved_at IS NULL)
+            OR (resolved = 1 AND resolved_at IS NOT NULL)
+          )
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_discovery_governor_roles_open
+          ON discovery_governor_roles(session_id, source_user_seq, resolved, requirement_index);
+
+        CREATE TRIGGER IF NOT EXISTS trg_discovery_governor_role_identity_immutable
+        BEFORE UPDATE ON discovery_governor_roles
+        WHEN OLD.session_id IS NOT NEW.session_id
+          OR OLD.source_user_seq IS NOT NEW.source_user_seq
+          OR OLD.role_key IS NOT NEW.role_key
+          OR OLD.requirement_index IS NOT NEW.requirement_index
+          OR OLD.requirement_digest IS NOT NEW.requirement_digest
+          OR OLD.registered_at IS NOT NEW.registered_at
+          OR NEW.resolved < OLD.resolved
+          OR (OLD.resolved = 1 AND OLD.resolved_at IS NOT NEW.resolved_at)
+        BEGIN
+          SELECT RAISE(ABORT, 'discovery requirement role identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_discovery_governor_role_set_identity_immutable
+        BEFORE UPDATE ON discovery_governor_role_sets
+        WHEN OLD.session_id IS NOT NEW.session_id
+          OR OLD.source_user_seq IS NOT NEW.source_user_seq
+          OR OLD.projection_digest IS NOT NEW.projection_digest
+          OR OLD.role_count IS NOT NEW.role_count
+          OR OLD.initialized_at IS NOT NEW.initialized_at
+          OR NEW.unresolved_count > OLD.unresolved_count
+        BEGIN
+          SELECT RAISE(ABORT, 'discovery requirement role set is immutable or monotonic');
+        END;
+      `);
+    },
+  },
+  {
+    /** Immutable generated-Sheet source/content/readback authority. */
+    version: 40,
+    sql: '',
+    backfill: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS run_artifacts (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          run_scope_id TEXT NOT NULL, slot_key TEXT NOT NULL, kind TEXT NOT NULL,
+          provider TEXT NOT NULL, title TEXT, create_shape TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('pending','bound','uncertain')),
+          resource_id TEXT, uri TEXT, source_call_id TEXT,
+          external_write_event_id TEXT, external_write_action_key TEXT,
+          external_write_tool_name TEXT, binding_verified_at TEXT,
+          verification_call_id TEXT, verification_shape TEXT,
+          verification_fingerprint TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          UNIQUE(session_id, run_scope_id, slot_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_artifacts_session
+          ON run_artifacts(session_id, run_scope_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_run_artifacts_resource
+          ON run_artifacts(provider, resource_id);
+        CREATE TABLE IF NOT EXISTS artifact_run_scopes (
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          attempt_scope_id TEXT NOT NULL, root_scope_id TEXT NOT NULL,
+          source_user_seq INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL,
+          created_at TEXT NOT NULL, PRIMARY KEY(session_id, attempt_scope_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifact_run_scopes_user
+          ON artifact_run_scopes(session_id, source_user_seq DESC, created_at DESC);
+        CREATE TABLE IF NOT EXISTS artifact_source_roots (
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          source_user_seq INTEGER NOT NULL, root_scope_id TEXT NOT NULL,
+          created_at TEXT NOT NULL, PRIMARY KEY(session_id, source_user_seq)
+        );
+        CREATE TABLE IF NOT EXISTS expected_work_source_lineage_identities (
+          session_id           TEXT NOT NULL,
+          source_user_seq      INTEGER NOT NULL,
+          logical_tool_call_id TEXT NOT NULL,
+          profile_id           TEXT NOT NULL,
+          profile_digest       TEXT NOT NULL CHECK (profile_digest GLOB 'sha256:*'),
+          created_at           TEXT NOT NULL,
+          PRIMARY KEY (session_id, source_user_seq, logical_tool_call_id),
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES expected_work_call_bindings(session_id, source_user_seq, logical_tool_call_id)
+            ON DELETE CASCADE
+        );
+        CREATE TRIGGER IF NOT EXISTS trg_expected_work_source_lineage_identity_immutable
+        BEFORE UPDATE ON expected_work_source_lineage_identities
+        BEGIN SELECT RAISE(ABORT, 'expected-work source lineage identity is immutable'); END;
+
+        CREATE TABLE IF NOT EXISTS expected_work_generated_artifact_contracts (
+          session_id           TEXT NOT NULL,
+          source_user_seq      INTEGER NOT NULL,
+          logical_tool_call_id TEXT NOT NULL,
+          contract_json        TEXT NOT NULL CHECK (json_valid(contract_json)),
+          created_at           TEXT NOT NULL,
+          PRIMARY KEY (session_id, source_user_seq, logical_tool_call_id),
+          FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+            REFERENCES expected_work_call_bindings(session_id, source_user_seq, logical_tool_call_id)
+            ON DELETE CASCADE
+        );
+        CREATE TRIGGER IF NOT EXISTS trg_expected_work_generated_artifact_contract_immutable
+        BEFORE UPDATE ON expected_work_generated_artifact_contracts
+        BEGIN SELECT RAISE(ABORT, 'expected-work generated artifact contract is immutable'); END;
+
+        CREATE TABLE IF NOT EXISTS artifact_content_verifications (
+          artifact_id                  TEXT PRIMARY KEY REFERENCES run_artifacts(id) ON DELETE CASCADE,
+          session_id                   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          run_scope_id                 TEXT NOT NULL,
+          create_logical_tool_call_id  TEXT NOT NULL,
+          contract_json                TEXT NOT NULL CHECK (json_valid(contract_json)),
+          content_verified_at          TEXT,
+          verification_logical_call_id TEXT,
+          verification_fingerprint     TEXT,
+          created_at                   TEXT NOT NULL,
+          CHECK ((content_verified_at IS NULL AND verification_logical_call_id IS NULL
+                    AND verification_fingerprint IS NULL)
+              OR (content_verified_at IS NOT NULL AND verification_logical_call_id IS NOT NULL
+                    AND verification_fingerprint IS NOT NULL))
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifact_content_source
+          ON artifact_content_verifications(session_id, run_scope_id, create_logical_tool_call_id);
+        CREATE TRIGGER IF NOT EXISTS trg_artifact_content_contract_immutable
+        BEFORE UPDATE OF artifact_id, session_id, run_scope_id,
+                         create_logical_tool_call_id, contract_json
+        ON artifact_content_verifications
+        BEGIN SELECT RAISE(ABORT, 'artifact content contract is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_artifact_content_verification_once
+        BEFORE UPDATE OF content_verified_at, verification_logical_call_id, verification_fingerprint
+        ON artifact_content_verifications
+        WHEN OLD.content_verified_at IS NOT NULL AND (
+          OLD.content_verified_at IS NOT NEW.content_verified_at
+          OR OLD.verification_logical_call_id IS NOT NEW.verification_logical_call_id
+          OR OLD.verification_fingerprint IS NOT NEW.verification_fingerprint)
+        BEGIN SELECT RAISE(ABORT, 'artifact content verification is immutable'); END;
+      `);
+    },
+  },
+  {
+    /**
+     * Human decisions for autonomous irreversible sends still use the exact
+     * approval ledger, but their user surface is an ordinary question rather
+     * than a formal approval card. Keep that presentation contract beside the
+     * frozen row (not inside execution args) so restart/replay cannot infer it
+     * from a later policy setting and exact payload authority stays unchanged.
+     */
+    version: 41,
+    sql: '',
+    backfill: (db) => {
+      const table = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_approvals'`,
+      ).get();
+      if (!table) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(pending_approvals)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!columns.has('presentation_json')) {
+        db.exec('ALTER TABLE pending_approvals ADD COLUMN presentation_json TEXT');
+      }
+      // Schema-rehearsal fixtures may contain an intentionally sparse legacy
+      // table. Add the column for forward reads, but build the optimization
+      // only when both historical key columns exist.
+      if (columns.has('session_id') && columns.has('status')) {
+        db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_pending_approvals_conversational_surface
+            ON pending_approvals(session_id, status)
+            WHERE presentation_json IS NOT NULL;
+        `);
+      }
+    },
+  },
+  {
+    /**
+     * Freeze clarification-continuation audience and answer interpretation.
+     * The task_continuity_packets table is lazy and may not exist yet; add the
+     * columns only when present. Existing rows intentionally remain NULL and
+     * fail closed rather than being reinterpreted under a newer resolver.
+     */
+    version: 42,
+    sql: '',
+    backfill: (db) => {
+      const table = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_continuity_packets'`,
+      ).get();
+      if (!table) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(task_continuity_packets)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      for (const [name, type] of [
+        ['origin_audience_hash', 'TEXT'],
+        ['consumer_audience_hash', 'TEXT'],
+        ['resolver_version', 'TEXT'],
+        ['resolution_disposition', 'TEXT'],
+        ['resolution_selected_option', 'TEXT'],
+        ['resolution_active_task_input', 'TEXT'],
+        ['resolution_semantic_input_hash', 'TEXT'],
+      ] as const) {
+        if (!columns.has(name)) {
+          db.exec(`ALTER TABLE task_continuity_packets ADD COLUMN ${name} ${type}`);
+        }
+      }
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS task_continuity_origin_audience_immutable
+        BEFORE UPDATE OF origin_audience_hash, consumer_audience_hash ON task_continuity_packets
+        FOR EACH ROW
+        WHEN OLD.consumer_audience_hash IS NOT NULL
+          OR OLD.origin_audience_hash IS NOT NEW.origin_audience_hash
+        BEGIN
+          SELECT RAISE(ABORT, 'task continuity origin audience is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS task_continuity_resolution_immutable
+        BEFORE UPDATE OF resolver_version, resolution_disposition,
+                         resolution_selected_option, resolution_active_task_input,
+                         resolution_semantic_input_hash
+          ON task_continuity_packets
+        FOR EACH ROW
+        WHEN OLD.consumed_at IS NOT NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'task continuity frozen resolution is immutable');
+        END;
+      `);
+    },
+  },
 ];
+
+const newestMigrationVersion = MIGRATIONS[MIGRATIONS.length - 1]?.version ?? 0;
+if (newestMigrationVersion !== HARNESS_SCHEMA_VERSION) {
+  throw new Error(
+    `HARNESS_SCHEMA_VERSION=${HARNESS_SCHEMA_VERSION} does not match newest migration ${newestMigrationVersion}`,
+  );
+}
 
 function runMigrations(db: Database.Database): void {
   db.exec(`
@@ -4098,6 +4476,9 @@ export function insertInternalEventInTransaction(
   if (!EVENT_TYPE_SET.has(input.type)) throw new Error(`unknown event type: ${input.type}`);
   if (input.type === 'conversation_completed') {
     throw new Error('conversation_completed must use the terminal ownership writer');
+  }
+  if (input.type === 'conversation_preamble') {
+    throw new Error('conversation_preamble must use the exact-source CAS writer');
   }
   const id = randomUUID();
   const now = nowIso();
@@ -5063,6 +5444,9 @@ export function appendEvent(input: AppendEventInput): EventRow {
   if (!EVENT_TYPE_SET.has(input.type)) {
     throw new Error(`unknown event type: ${input.type}`);
   }
+  if (input.type === 'conversation_preamble') {
+    throw new Error('conversation_preamble must use the exact-source CAS writer');
+  }
   const db = openEventLog();
   const id = randomUUID();
   const now = nowIso();
@@ -5304,6 +5688,105 @@ export function appendEvent(input: AppendEventInput): EventRow {
     }
   }
   return publishPersistedEvent(event);
+}
+
+export interface AppendConversationPreambleOnceInput {
+  /** Exact persisted human source. The writer re-reads and validates every
+   * field; a session-global "latest input" is never accepted as ownership. */
+  source: Pick<EventRow, 'id' | 'seq' | 'sessionId' | 'turn'>;
+  text: string;
+  intentKey?: string;
+}
+
+export interface AppendConversationPreambleOnceResult {
+  event: EventRow;
+  inserted: boolean;
+}
+
+/**
+ * Append the one nonterminal conversational preamble for an exact real input.
+ *
+ * The IMMEDIATE transaction is the CAS: concurrent processes serialize before
+ * reading the existing row. The winner inserts and publishes once; exact
+ * retries reuse the durable row without re-broadcasting it. A second writer
+ * proposing different prose or identity fails closed instead of repainting a
+ * turn with two competing acknowledgements.
+ */
+export function appendConversationPreambleOnce(
+  input: AppendConversationPreambleOnceInput,
+): AppendConversationPreambleOnceResult {
+  const candidate = publicConversationPreambleData({
+    version: 1,
+    kind: 'pre_execution',
+    sourceUserSeq: input.source.seq,
+    text: input.text,
+    ...(input.intentKey !== undefined ? { intentKey: input.intentKey } : {}),
+  });
+  if (!candidate) throw new Error('conversation preamble is not safe public text');
+
+  const db = openEventLog();
+  const tx = db.transaction((): AppendConversationPreambleOnceResult => {
+    const rawSource = db.prepare('SELECT * FROM events WHERE seq = ?').get(input.source.seq) as RawEventRow | undefined;
+    if (!rawSource) throw new Error(`conversation preamble source event ${input.source.seq} is missing`);
+    const source = rowToEvent(rawSource);
+    if (
+      source.id !== input.source.id
+      || source.sessionId !== input.source.sessionId
+      || source.turn !== input.source.turn
+      || source.type !== 'user_input_received'
+      || source.role !== 'user'
+      || source.data.synthetic === true
+    ) {
+      throw new Error('conversation preamble requires the exact real user source, turn, and parent');
+    }
+
+    const existingRows = db.prepare(
+      `SELECT * FROM events
+        WHERE session_id = ?
+          AND type = 'conversation_preamble'
+          AND json_extract(data_json, '$.sourceUserSeq') = ?
+        ORDER BY seq ASC`,
+    ).all(source.sessionId, source.seq) as RawEventRow[];
+    if (existingRows.length > 1) {
+      throw new Error('conversation preamble CAS found multiple durable owners');
+    }
+    if (existingRows.length === 1) {
+      const existing = rowToEvent(existingRows[0]);
+      const existingData = publicConversationPreambleData(existing.data);
+      if (
+        existing.turn !== source.turn
+        || existing.role !== 'Clem'
+        || existing.parentEventId !== source.id
+        || !existingData
+        || !isDeepStrictEqual(existingData, candidate)
+      ) {
+        throw new Error('conversation preamble CAS conflicts with the durable owner');
+      }
+      return { event: existing, inserted: false };
+    }
+
+    const id = randomUUID();
+    const now = nowIso();
+    db.prepare(
+      `INSERT INTO events
+         (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+       VALUES (?, ?, ?, 'Clem', 'conversation_preamble', ?, ?, ?)`,
+    ).run(
+      id,
+      source.sessionId,
+      source.turn,
+      source.id,
+      JSON.stringify(candidate),
+      now,
+    );
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, source.sessionId);
+    const inserted = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    return { event: rowToEvent(inserted), inserted: true };
+  });
+  const result = tx.immediate();
+  return result.inserted
+    ? { event: publishPersistedEvent(result.event), inserted: true }
+    : result;
 }
 
 function rawTurnGraphEventForSource(

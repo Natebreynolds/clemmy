@@ -22,16 +22,68 @@ import {
 } from './attempt-outcome.js';
 import { callableContractIdentity, normalizeCallableArguments } from './callable-contract.js';
 import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
+import { loadExpectedWorkContract } from './expected-work-contract.js';
+import { isDeterministicImplicitRetrieveContract } from './expected-work-matcher.js';
 import { toResultHandle } from './result-handle.js';
 import { deriveResultHandleFactsFromRaw } from './result-facts.js';
+import { inspectProviderEnvelope } from './provider-read-evidence.js';
+import {
+  isShellPolicyDenialResult,
+  type ShellExecutionOutcome,
+} from '../shell-execution-outcome.js';
 import {
   commitLogicalCallSettlement,
   type LogicalCallSettlementResult,
 } from './logical-call-settlement-store.js';
 import { beginPhysicalDispatch, settlePhysicalDispatch } from './dispatch-ledger.js';
-import { actionTopologyRoleForRuntimeCall } from './tool-effect.js';
+import { actionTopologyRoleForRuntimeCall, classifyRuntimeToolEffect } from './tool-effect.js';
+import { TruncatedToolOutputResult } from './tool-output-format.js';
 
 export { normalizeCallableArguments, toResultHandle };
+
+/** Translate the host's typed shell truth into the shared outcome vocabulary.
+ * No stdout/stderr wording participates in this decision. */
+export function attemptSignalsFromShellExecutionOutcome(
+  shell: ShellExecutionOutcome | undefined,
+): AttemptSignals {
+  if (!shell) return {};
+  if (shell.errorKind === 'timeout') {
+    return {
+      errorName: 'TimeoutError',
+      mutating: shell.externalMutation,
+      ...(shell.externalMutation ? { acknowledged: false } : {}),
+    };
+  }
+  if (
+    shell.dispatch === 'not_started'
+    && shell.effect === 'none'
+    && (shell.errorKind === 'command_not_found' || shell.errorKind === 'package_materialization_failed')
+  ) {
+    return {
+      preDispatch: true,
+      errorName: shell.errorKind === 'command_not_found'
+        ? 'ShellCommandNotFoundError'
+        : 'ShellPackageMaterializationError',
+      executionFailed: true,
+      mutating: shell.externalMutation,
+    };
+  }
+  if (shell.errorKind !== undefined || (shell.exitCode !== undefined && shell.exitCode !== 0)) {
+    return {
+      executionFailed: true,
+      mutating: shell.externalMutation,
+      ...(shell.externalMutation ? { acknowledged: false } : {}),
+    };
+  }
+  if (shell.exitCode === 0) {
+    return {
+      hostExecuted: true,
+      mutating: shell.externalMutation,
+      ...(shell.externalMutation ? { acknowledged: true } : {}),
+    };
+  }
+  return {};
+}
 
 export const ATTEMPT_SETTLED_EVENT_NAME = 'tool_attempt_settled' as const;
 
@@ -91,6 +143,69 @@ export interface SettledToolAttempt {
   /** True when this physical attempt was already settled and this call was a
    *  duplicate that changed nothing. */
   duplicate: boolean;
+}
+
+/**
+ * Close a logical call the host admitted but then refused before execution.
+ *
+ * This seam takes the exact durable logical id instead of consulting ambient
+ * AsyncLocalStorage. That distinction matters for nested orchestrators: while a
+ * child is being admitted, the ambient identity may still belong to its parent.
+ * Settling through the ordinary lane helper in that window would close the
+ * parent and strand the child OPEN. The caller must already have admitted the
+ * child; the settlement store independently proves that row is exact, open, and
+ * has zero physical crossings.
+ */
+export function settleAdmittedLogicalCallPreDispatchRefusal(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  logicalToolCallId: string;
+  toolName: string;
+  args?: unknown;
+  lane: SettleToolAttemptInput['lane'];
+  turn?: number;
+  mutating?: boolean;
+  reason: string;
+}): SettledToolAttempt {
+  const classified = classifyAttemptOutcome({ preDispatch: true, policyRefused: true });
+  const outcome: AttemptOutcome = {
+    ...classified,
+    detail: `work_binding:${input.reason.replace(/\s+/g, ' ').trim().slice(0, 120) || 'refused'}`,
+  };
+  const committed = commitLogicalCallSettlement({
+    identity: {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: acceptedTaskIdFor(input.sessionId, input.sourceUserSeq),
+      logicalToolCallId: input.logicalToolCallId,
+    },
+    contract: { toolName: input.toolName, args: input.args },
+    execution: { kind: 'refused_pre_dispatch' },
+    outcome,
+    recovery: {
+      businessCall: false,
+      mutating: input.mutating === true,
+    },
+    observer: {
+      lane: input.lane,
+      callId: input.logicalToolCallId,
+      ...(Number.isSafeInteger(input.turn) && (input.turn ?? 0) > 0
+        ? { turn: input.turn as number }
+        : {}),
+    },
+  });
+  if (committed.status !== 'committed' && committed.status !== 'replayed') {
+    throw new ToolAttemptSettlementAuthorityError(committed.status, committed.reason);
+  }
+  return {
+    outcome: committed.settlement.outcome,
+    openedDiscoveryEpoch: committed.settlement.recovery.openedDiscoveryEpoch,
+    creditedProgress: committed.settlement.recovery.creditedProgress,
+    ...(committed.settlement.resultHandleId
+      ? { resultHandleId: committed.settlement.resultHandleId }
+      : {}),
+    duplicate: committed.status === 'replayed',
+  };
 }
 
 export type ToolAttemptSettlementAuthorityStatus = Exclude<
@@ -316,6 +431,10 @@ function signalsFromThrown(thrown: unknown): AttemptSignals {
     // The CLASS is nominal evidence; the message is not.
     signals.errorName = String((asRecord?.name ?? (thrown as Error).name ?? '')).trim() || undefined;
   }
+  if (signals.errorName === 'ShellPolicyDenialError') {
+    signals.preDispatch = true;
+    signals.policyRefused = true;
+  }
   const status = numericStatus(
     asRecord?.status ?? asRecord?.statusCode ?? asRecord?.status_code ?? asRecord?.httpStatus,
   );
@@ -331,7 +450,9 @@ function signalsFromThrown(thrown: unknown): AttemptSignals {
   return signals;
 }
 
-/** Reason token of a carrier-serialized provider refusal. */
+/** Reason token of a `[provider-dispatch:not-started:<reason>]` refusal, in
+ * any of the shapes a carrier boundary leaves it: the raw string, or a
+ * one-level wrapper ({output|text|preview|result: string}). */
 function providerNotStartedReason(result: unknown, toolName?: string): string | null {
   const candidates: unknown[] = [result];
   if (result && typeof result === 'object' && !Array.isArray(result)) {
@@ -350,6 +471,18 @@ function providerNotStartedReason(result: unknown, toolName?: string): string | 
     }
   }
   return null;
+}
+
+/** Corrective failure prose built by the tool-error layers: "⚠️ <tool>
+ * FAILED…". Same one-level wrapper tolerance as the not-started marker. */
+function correctiveFailureProse(result: unknown): boolean {
+  const candidates: unknown[] = [result];
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const wrapper = result as Record<string, unknown>;
+    candidates.push(wrapper.output, wrapper.text, wrapper.preview, wrapper.result);
+  }
+  return candidates.some((candidate) =>
+    typeof candidate === 'string' && /^\s*⚠️\s*\S[^\n]{0,120}\bFAILED\b/.test(candidate));
 }
 
 function hasTaskIdentity(input: SettleToolAttemptInput): input is SettleToolAttemptInput & {
@@ -379,6 +512,23 @@ function hasTaskIdentity(input: SettleToolAttemptInput): input is SettleToolAtte
  * losing its settlement. The id is derived from the logical call, so a replayed
  * settlement re-admits the same row rather than minting a second crossing.
  */
+/**
+ * Whether this accepted source's frozen contract is the deterministic
+ * one-read retrieve shape, whose single observation binds implicitly. Fail-soft
+ * by design: this only widens EVIDENCE recording, never authority, so an
+ * unreadable contract simply keeps the historical no-crossing behaviour.
+ */
+function settlesDeterministicImplicitRetrieve(identity: SettlementAuthorityIdentity): boolean {
+  try {
+    const loaded = loadExpectedWorkContract(identity.sessionId, identity.sourceUserSeq);
+    return loaded.status === 'ok'
+      && loaded.contract.acceptedTaskId === identity.acceptedTaskId
+      && isDeterministicImplicitRetrieveContract(loaded.contract);
+  } catch {
+    return false;
+  }
+}
+
 function recordHostExecutionCrossing(
   identity: SettlementAuthorityIdentity,
   call: { tool: string; args?: unknown; turn?: number },
@@ -450,12 +600,35 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     // A lane's own nominal knowledge outranks anything extracted here.
     ...(input.signals ?? {}),
   };
-  // A carrier-serialized not-started marker is typed pre-dispatch truth.
+  if (input.toolName === 'run_shell_command' && isShellPolicyDenialResult(input.result)) {
+    extracted.preDispatch = true;
+    extracted.policyRefused = true;
+  }
+  // A `[provider-dispatch:not-started:*]` result is a TYPED pre-dispatch
+  // refusal. The composio lane returns it as a class instance that its own
+  // bracket recognizes, but the identity dies at carrier serialization
+  // boundaries (work_call children receive `{output: "…"}`), and the bare
+  // string then classified as a SUCCEEDED host execution — which minted a
+  // host crossing and a durable result handle for a call that never
+  // dispatched, and told the model its failed Apify probe had "succeeded"
+  // (live 2026-08-12, seq 44256). The marker is the identity; honor it on
+  // every lane.
   const notStartedReason = providerNotStartedReason(input.result, input.toolName);
   if (notStartedReason) {
     extracted.preDispatch = true;
     if (notStartedReason === 'invalid-args') extracted.argumentValidationFailed = true;
     else extracted.policyRefused = true;
+  }
+  // Corrective failure guidance ("⚠️ <tool> FAILED…") is built FOR THE MODEL
+  // after a failure; crossing a carrier boundary as a bare string it
+  // classified as a successful host execution and minted evidence for a call
+  // that failed (live 2026-08-12, seq 44386: a dispatch-ledger refusal echo
+  // settled succeeded with a durable handle). The prefix is the marker.
+  if (extracted.executionFailed === undefined && correctiveFailureProse(input.result)) {
+    extracted.executionFailed = true;
+  }
+  if (input.result instanceof TruncatedToolOutputResult) {
+    extracted.outputTruncated = true;
   }
   if (input.mutating && extracted.acknowledged === undefined) {
     // A mutation that threw was never acknowledged — and a mutation whose
@@ -467,20 +640,15 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   }
 
   let outcome = classifyAttemptOutcome(extracted);
-  if (outcome.kind === 'succeeded' && !deriveResultHandleFactsFromRaw(input.result).success) {
-    // TWO CLASSIFIERS, ONE SEAM. The dispatch failure detector deliberately
-    // lets an authoritative `successful:true` win over nested error fields
-    // (the DataForSEO 5-digit-status history), while the redeemability
-    // inspector deliberately refuses to mint proof from a contradicted
-    // envelope. Both are right; a success that cannot be redeemed is the
-    // taxonomy's own `ignored_requirement` — looks like success, dropped
-    // something — and must SETTLE as that, never crash the dispatch path
-    // ("successful provider result did not produce redeemable result
-    // authority" threw here live, 2026-08-11).
+  if (
+    outcome.kind === 'succeeded'
+    && inspectProviderEnvelope(input.result).verdict === 'contradicted'
+  ) {
     outcome = classifyAttemptOutcome({
       ...extracted,
       envelopeSuccessful: undefined,
-      droppedRequiredParameter: true,
+      providerReportedError: undefined,
+      providerEnvelopeContradicted: true,
     });
   }
   if (!hasTaskIdentity(input)) {
@@ -542,23 +710,43 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // could tell it: it invoked the tool and holds the exact bytes that came
   // back. Record that as the crossing it is, marked as never having left the
   // process, and let the identical downstream evidence path do the rest.
+  const returnedLocalResult = executionKind === 'local_execution'
+    && input.thrown === undefined
+    && Object.prototype.hasOwnProperty.call(input, 'result');
+
+  // Classify what happened independently of whether this call was admitted as
+  // evidence for a frozen requirement. Binding controls authority minting; it
+  // cannot turn a returned host execution into an unknown outcome.
+  if (returnedLocalResult && outcome.kind === 'unknown' && extracted.executionFailed !== true) {
+    outcome = classifyAttemptOutcome({ ...extracted, hostExecuted: true });
+  }
+
   if (
     executionKind === 'local_execution'
     && businessCall
-    // Scoped to work that is BOUND to a frozen requirement. Such a call has
-    // already been normalized to its exact inner contract by admission, so the
+    // Scoped to work with a contract to discharge. A BOUND call has already
+    // been normalized to its exact inner contract by admission, so the
     // crossing, the logical call and the durable result all describe the same
-    // identity. An unbound local business call still records no crossing —
-    // its evidence has no contract to discharge, and a wrapped carrier's outer
-    // name would not match the inner identity a result handle is bound to.
-    && binding !== undefined
-    && input.thrown === undefined
-    && Object.prototype.hasOwnProperty.call(input, 'result')
+    // identity. An UNBOUND local business call qualifies only under the
+    // deterministic one-read retrieve contract: that route binds implicitly
+    // (no expected_work_call_bindings row ever exists), and without the
+    // crossing its single requirement was unprovable by construction — the
+    // host executed the read itself, minted no dispatch, no handle, no
+    // observed operation, and the terminal blocked a correct answer as
+    // verification_required (live 2026-08-11). The crossing recorder settles
+    // against the ledger-stored normalized name, so a wrapped carrier's outer
+    // name cannot desynchronize the result handle's identity.
+    && (binding !== undefined
+      || (settlesDeterministicImplicitRetrieve(identity)
+        // The implicit-retrieve door carries exactly ONE READ. Only calls the
+        // taxonomy sees as read/compute may mint host evidence through it — a
+        // write-shaped carrier's local return (e.g. a pre-dispatch refusal
+        // string) must never gain a crossing and masquerade as dispatched
+        // work (routing-sweep fixture, 2026-08-12).
+        && ['read', 'compute'].includes(classifyRuntimeToolEffect(input.toolName, input.args).effect)))
+    && returnedLocalResult
     && deriveResultHandleFactsFromRaw(input.result).success
   ) {
-    if (outcome.kind === 'unknown') {
-      outcome = classifyAttemptOutcome({ ...extracted, hostExecuted: true });
-    }
     if (outcome.kind === 'succeeded' || outcome.kind === 'empty_result') {
       recordHostExecutionCrossing(identity, {
         tool: input.toolName,

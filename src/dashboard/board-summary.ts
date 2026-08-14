@@ -150,7 +150,7 @@ export function assembleBoardSummary(sources: BoardSummarySources, now: number =
       needsAttention ? 'needs_you'
         : run.status === 'queued' || run.status === 'received' ? 'queued'
           : run.status === 'running' ? 'running'
-            : run.status === 'awaiting_approval' ? 'needs_you'
+            : run.status === 'awaiting_approval' || run.status === 'awaiting_input' ? 'needs_you'
               : 'done';
     const toolCount = run.events.reduce((n, ev) => (ev.type === 'tool_started' ? n + 1 : n), 0);
     place({
@@ -254,7 +254,8 @@ export function buildBoardSummary(opts: { now?: number } = {}): BoardSummary {
     runs: safe(() => listRuns(80)),
     executions: safe(() => new ExecutionStore().list(80)),
     pendingWorkflowRuns: safe(() => listPendingRuns()),
-    approvals: safe(() => approvalRegistry.listPending({ status: 'pending' })),
+    approvals: safe(() => approvalRegistry.listPending({ status: 'pending' })
+      .filter(approvalRegistry.isFormalApprovalSurface)),
     workflowDisplayName,
   }, now);
 }

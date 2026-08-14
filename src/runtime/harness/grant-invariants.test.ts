@@ -29,6 +29,8 @@ const { shouldRunObjectiveJudge } = await import('./objective-judge.js');
 const { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
 const { appendEvent, createSession, resetEventLog } = await import('./eventlog.js');
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+const expectedWork = await import('./expected-work-admission.js');
+const identities = await import('./attempt-identity.js');
 
 /** The settlement spine refuses dispatch without an accepted source AND a
  *  persisted turn graph — every fixture that drives a wrapped tool anchors
@@ -135,6 +137,134 @@ test('EXHIBIT C replay: a certified (human-approved) batch item passes the execu
     // Certified batch item (the human-approved, byte-pinned plan) → dispatches.
     const granted = String(await send(true));
     assert.ok(granted.startsWith('sent'), 'a human yes cannot be vetoed by session bookkeeping — Exhibit C is impossible');
+  } finally {
+    process.env.CLEMMY_EXECUTION_GATE = prevGate;
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+  }
+});
+
+test('an exact work_call external-write binding carries execution authority, but no mismatch does', async () => {
+  const prevGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.CLEMMY_EXECUTION_GATE = 'on';
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'Create one row in the approved sheet.');
+  const activated = expectedWork.activateActionExpectedWork({
+    sessionId: sess.id,
+    sourceUserSeq: anchor.seq,
+  });
+  assert.ok(activated.status === 'activated' || activated.status === 'replayed');
+  const args = {
+    tool_slug: 'GOOGLESHEETS_VALUES_UPDATE',
+    arguments: JSON.stringify({ spreadsheet_id: 'sheet-1', range: 'A1', values: [['done']] }),
+  };
+  const proposal = {
+    version: 1 as const,
+    operations: [{
+      id: 'write_row',
+      effect: 'external_write' as const,
+      dependsOn: [],
+      dataFrom: [],
+      cardinality: { kind: 'once' as const },
+    }],
+    universes: [],
+  };
+  let dispatched = 0;
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async () => { dispatched += 1; return 'updated'; },
+  }) as unknown as {
+    invoke: (context: unknown, input: string, details: { toolCall: { callId: string } }) => Promise<unknown>;
+  };
+  const exactLogicalId = 'bound-work-call-write';
+  let exactBinding: import('./expected-work-admission.js').ExpectedWorkCallBinding | undefined;
+  try {
+    const exact = await withHarnessRunContext(
+      {
+        sessionId: sess.id,
+        sourceUserSeq: anchor.seq,
+        turn: anchor.turn,
+        counter: new ToolCallsCounter(50),
+      },
+      () => identities.withLogicalToolCall(
+        {
+          sessionId: sess.id,
+          sourceUserSeq: anchor.seq,
+          logicalToolCallId: exactLogicalId,
+          tool: 'composio_execute_tool',
+          args,
+        },
+        async () => {
+          const admission = expectedWork.admitExpectedWorkInvocation({
+            sessionId: sess.id,
+            sourceUserSeq: anchor.seq,
+            logicalToolCallId: exactLogicalId,
+            proposal,
+            requirementId: 'write_row',
+            universeItemId: null,
+            universeSelector: null,
+            tool: 'composio_execute_tool',
+            args,
+          });
+          assert.ok(admission.status === 'bound' || admission.status === 'replayed', JSON.stringify(admission));
+          if (admission.status !== 'bound' && admission.status !== 'replayed') return '';
+          exactBinding = admission.binding;
+          return expectedWork.withExpectedWorkBinding(
+            admission.binding,
+            () => wrapped.invoke(
+              { context: { sessionId: sess.id } },
+              JSON.stringify(args),
+              { toolCall: { callId: exactLogicalId } },
+            ),
+          );
+        },
+      ),
+    );
+    assert.equal(String(exact), 'updated');
+    assert.equal(dispatched, 1, 'the exact bound write crossed once');
+    assert.ok(exactBinding, 'the exact work_call admission returned its host binding');
+
+    const unboundSession = createSession({ kind: 'chat' });
+    const unboundAnchor = anchorAcceptedTask(
+      unboundSession.id,
+      'Create one row without a frozen work_call binding.',
+    );
+    const unbound = await withHarnessRunContext(
+      {
+        sessionId: unboundSession.id,
+        sourceUserSeq: unboundAnchor.seq,
+        turn: unboundAnchor.turn,
+        counter: new ToolCallsCounter(50),
+      },
+      () => wrapped.invoke(
+        { context: { sessionId: unboundSession.id } },
+        JSON.stringify(args),
+        { toolCall: { callId: 'unbound-execution-wrap-write' } },
+      ),
+    );
+    assert.match(String(unbound), /EXECUTION_WRAP_REQUIRED/);
+    assert.equal(dispatched, 1, 'an unbound write did not cross');
+
+    const mismatched = await withHarnessRunContext(
+      {
+        sessionId: unboundSession.id,
+        sourceUserSeq: unboundAnchor.seq,
+        turn: unboundAnchor.turn,
+        counter: new ToolCallsCounter(50),
+      },
+      () => expectedWork.withExpectedWorkBinding(
+        exactBinding!,
+        () => wrapped.invoke(
+          { context: { sessionId: unboundSession.id } },
+          JSON.stringify(args),
+          { toolCall: { callId: 'mismatched-execution-wrap-write' } },
+        ),
+      ),
+    );
+    assert.match(String(mismatched), /EXECUTION_WRAP_REQUIRED/);
+    assert.equal(dispatched, 1, 'a binding from another accepted source did not cross');
   } finally {
     process.env.CLEMMY_EXECUTION_GATE = prevGate;
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;

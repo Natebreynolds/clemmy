@@ -1,6 +1,8 @@
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { appendEvent } from './eventlog.js';
 import { classifyAttemptOutcome, type AttemptSignals } from './attempt-outcome.js';
+import { withLogicalToolCall } from './attempt-identity.js';
+import { settleToolAttempt, type SettleToolAttemptInput } from './attempt-settlement.js';
 import {
   discoveryGovernor,
   type DiscoveryAttemptOutcome,
@@ -9,7 +11,7 @@ import {
 } from './discovery-governor.js';
 
 /**
- * One tool, one key.
+ * One exact tool, one key; one unresolved requirement, one broad key.
  *
  * The same schema lookup arrives spelled a dozen ways — quoted, prefixed with
  * `select:`, carrying the `mcp__` transport, or buried in a sentence. Keying the
@@ -35,9 +37,9 @@ export function canonicalExactSubject(raw: string): string {
 export interface DiscoveryCallClassification {
   category: DiscoveryCategory;
   /**
-   * Which TOOL a schema refresh is about. Empty for a broad search: query text
-   * is not a stable identity, and keying a budget on wording would sell a fresh
-   * slot for a synonym.
+   * Which TOOL a schema refresh is about, or the opaque runtime-owned
+   * requirement role for broad discovery. Query/provider text is never used as
+   * identity. Legacy tasks without a role projection retain an empty subject.
    */
   subject: string;
   surface:
@@ -69,6 +71,9 @@ export interface AdmitDiscoveryBoundaryInput {
   toolName: string;
   input: unknown;
   callId: string;
+  /** Optional lane provenance. Omission is inferred conservatively from the
+   * host-visible carrier and never affects admission authority. */
+  lane?: SettleToolAttemptInput['lane'];
 }
 
 const BUILTIN_TOOL_NAMES = TOOL_REGISTRY.map((entry) => entry.name);
@@ -89,6 +94,26 @@ function objectInput(input: unknown): Record<string, unknown> {
     }
   }
   return {};
+}
+
+const NATIVE_ROLE_PREFIX_RE = /^\s*\[role:([^\]\r\n]{1,128})\]\s*/i;
+
+function explicitRoleKey(args: Record<string, unknown>): string {
+  const value = [args.role_key, args.roleKey, args.requirement_role]
+    .find((candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0);
+  return value?.trim().slice(0, 128) ?? '';
+}
+
+/** Anthropic's built-in ToolSearch schema cannot be widened with role_key.
+ * Its query therefore carries the same opaque key as a prefix. The prefix is
+ * removed for exact-vs-broad classification; it never becomes query identity. */
+function queryAndRole(args: Record<string, unknown>): { query: string; roleKey: string } {
+  const raw = typeof args.query === 'string' ? args.query : '';
+  const marker = raw.match(NATIVE_ROLE_PREFIX_RE);
+  return {
+    query: marker ? raw.slice(marker[0].length) : raw,
+    roleKey: explicitRoleKey(args) || marker?.[1]?.trim().slice(0, 128) || '',
+  };
 }
 
 /**
@@ -147,21 +172,20 @@ export function classifyDiscoveryCall(
 ): DiscoveryCallClassification | null {
   const name = canonicalDiscoveryToolName(toolName);
   const args = objectInput(input);
-
-  const queryOf = (): string => (typeof args.query === 'string' ? args.query : '');
+  const scoped = queryAndRole(args);
 
   if (name === 'toolsearch' || name === 'tool_search') {
-    const query = queryOf();
+    const query = scoped.query;
     const exact = explicitlyNamesBuiltinTool(query) || exactToolIdentifierQuery(query);
     return {
       category: exact ? 'exact_schema_refresh' : 'broad_discovery',
-      subject: exact ? canonicalExactSubject(query) : '',
+      subject: exact ? canonicalExactSubject(query) : scoped.roleKey,
       surface: 'tool_search',
     };
   }
 
   if (name === 'composio_search_tools') {
-    const query = queryOf();
+    const query = typeof args.query === 'string' ? args.query : '';
     const exact = exactProviderActionQuery(query);
     return {
       category: exact ? 'exact_schema_refresh' : 'broad_discovery',
@@ -284,10 +308,75 @@ export class DiscoveryBudgetDeniedError extends Error {
     public readonly reason: string,
   ) {
     const corrective = category === 'broad_discovery'
-      ? 'Use the capability or prior search result already resolved for this task; do not issue another broad search.'
+      ? reason === 'role_required'
+        ? 'Use the exact unresolved role_key shown in the current capability card; a broad search without runtime-owned requirement membership is unavailable.'
+        : reason === 'role_resolved'
+          ? 'This requirement already has a resolved capability. Execute that path; do not issue broad discovery for it.'
+          : reason === 'role_not_unresolved'
+            ? 'That role is not an unresolved requirement of this accepted task. Use a listed unresolved role_key or the already-resolved path.'
+            : 'Use the capability or prior search result already resolved for this task; do not issue another broad search.'
       : 'Use the schema already returned for this task, correct the call from its validation error, or report the specific blocker; do not re-fetch schema again.';
     super(`discovery budget denied (${reason}) on ${surface}. ${corrective}`);
     this.name = 'DiscoveryBudgetDeniedError';
+  }
+}
+
+function inferredDenialLane(
+  input: AdmitDiscoveryBoundaryInput,
+  classification: DiscoveryCallClassification,
+): SettleToolAttemptInput['lane'] {
+  if (input.lane) return input.lane;
+  if (
+    classification.surface === 'code_mode_list_tools'
+    || classification.surface === 'code_mode_describe'
+  ) return 'code_mode';
+  if (canonicalDiscoveryToolName(input.toolName) === 'toolsearch') return 'claude_sdk';
+  return 'agents_runner';
+}
+
+/** A refusal is still one logical tool call. Settle it at the central boundary
+ * because provider wrappers return this typed error as a corrective before
+ * their ordinary post-dispatch settlement edge. Creating/reusing the logical
+ * frame here also covers Claude's permission callback and host code-mode
+ * helpers, neither of which dispatches after this refusal. */
+function terminalizeDiscoveryDenial(
+  input: AdmitDiscoveryBoundaryInput,
+  classification: DiscoveryCallClassification,
+  denial: DiscoveryBudgetDeniedError,
+): void {
+  if (!validTaskIdentity(input.sessionId, input.sourceUserSeq)) return;
+  try {
+    withLogicalToolCall({
+      sessionId: input.sessionId.trim(),
+      sourceUserSeq: input.sourceUserSeq as number,
+      logicalToolCallId: input.callId,
+      tool: input.toolName,
+      args: input.input,
+    }, () => {
+      settleToolAttempt({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        turn: input.turn,
+        lane: inferredDenialLane(input, classification),
+        toolName: input.toolName,
+        callId: input.callId,
+        args: input.input,
+        mutating: false,
+        businessCall: false,
+        result: {
+          ok: false,
+          error: 'discovery_budget_denied',
+          category: denial.category,
+          surface: denial.surface,
+          reason: denial.reason,
+        },
+        signals: { preDispatch: true, policyRefused: true },
+      });
+    });
+  } catch {
+    // The discovery refusal remains fail-closed if its terminal proof cannot be
+    // written. A prior refined/settled carrier may already own this id; never
+    // replace the original policy denial with bookkeeping prose.
   }
 }
 
@@ -314,25 +403,30 @@ export function admitDiscoveryBoundary(
       callId: input.callId,
     });
   } catch (error) {
-    throw new DiscoveryBudgetDeniedError(
+    const denial = new DiscoveryBudgetDeniedError(
       classification.category,
       classification.surface,
       `governor_unavailable:${error instanceof Error ? error.name : 'unknown'}`,
     );
+    terminalizeDiscoveryDenial(input, classification, denial);
+    throw denial;
   }
   emitDecisionTelemetry(decision, classification.surface, {
     turn: input.turn,
     attemptId: input.attemptId,
   });
   if (!decision.admitted) {
-    throw new DiscoveryBudgetDeniedError(
+    const denial = new DiscoveryBudgetDeniedError(
       classification.category,
       classification.surface,
       decision.reason,
     );
+    terminalizeDiscoveryDenial(input, classification, denial);
+    throw denial;
   }
   return {
     ...classification,
+    subject: decision.subject,
     sessionId: decision.key.sessionId,
     sourceUserSeq: decision.key.sourceUserSeq,
     callId: decision.callId,

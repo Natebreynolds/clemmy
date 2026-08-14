@@ -50,6 +50,10 @@ const { declareWorkManifest } = await import('../runtime/harness/work-manifest.j
 const { listNotifications } = await import('../runtime/notifications.js');
 const { saveUserMcpServers } = await import('../runtime/mcp-config.js');
 const { getLocalToolCatalog } = await import('../tools/local-runtime-tools.js');
+const {
+  _setToolSchemaLoaderForTests,
+  resetToolSchemaCache,
+} = await import('../tools/composio-schema-cache.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -87,6 +91,38 @@ async function boot(authorized = { v: true }) {
   });
   const port = (server.address() as AddressInfo).port;
   return { url: `http://127.0.0.1:${port}`, close: () => new Promise<void>((r) => server.close(() => r())) };
+}
+
+function dashboardExactSendStep(tool: string) {
+  return {
+    id: 'deliver',
+    prompt: '',
+    sideEffect: 'send',
+    call: {
+      tool,
+      args: { channel: 'fixed-dashboard-channel', markdown_text: 'fixed dashboard update' },
+    },
+    output: {
+      type: 'object',
+      required_keys: ['providerResult', 'callEvidence'],
+      non_empty: [
+        'providerResult.kind',
+        'providerResult.resultId',
+        'providerResult.digest',
+        'callEvidence.evidenceId',
+        'callEvidence.mutationReceiptId',
+        'callEvidence.canonicalTool',
+        'callEvidence.kind',
+        'callEvidence.status',
+        'callEvidence.dispatchSchemaFingerprint',
+        'callEvidence.expectedArgsDigest',
+        'callEvidence.providerReadyArgsDigest',
+        'callEvidence.providerResultDigest',
+        'callEvidence.payloadDigest',
+        'callEvidence.target.digest',
+      ],
+    },
+  };
 }
 
 function workflowRunRecords(workflowName: string): Array<Record<string, unknown>> {
@@ -1194,6 +1230,49 @@ test('GET /api/console/workflows exposes needs-attention last-run status', async
   }
 });
 
+test('GET /api/console/workflows/home preserves blocked dependency status instead of showing a false running state', async () => {
+  const workflowSlug = 'workflow-home-blocked-capability';
+  const workflowName = 'Workflow Home Blocked Capability';
+  const runId = 'workflow-home-blocked-capability-run';
+  writeWorkflow(workflowSlug, {
+    name: workflowName,
+    description: 'Pins Workflow Home dependency visibility.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'read', prompt: 'Read one value.', sideEffect: 'read' }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    workflowSlug,
+    status: 'blocked_capability',
+    createdAt: '2026-08-13T16:00:00.000Z',
+    startedAt: '2026-08-13T16:00:01.000Z',
+    capabilityBlock: {
+      stepId: 'read',
+      tool: 'EXACTPROOF_READ',
+      toolkit: 'exactproof',
+      reason: 'exact_schema_refresh_unavailable',
+      provenNoDispatch: true,
+      state: 'blocked',
+    },
+  }), 'utf-8');
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/workflows/home`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      activeRuns?: Array<{ runId?: string; status?: string }>;
+    };
+    const active = body.activeRuns?.find((run) => run.runId === runId);
+    assert.equal(active?.status, 'blocked_capability');
+  } finally {
+    await h.close();
+  }
+});
+
 test('GET /api/console/workflows exposes workflow lifecycle proof states', async () => {
   const liveName = 'Proof Live Flow';
   writeWorkflow('proof-live-flow', {
@@ -1589,6 +1668,71 @@ test('POST /api/console/workflows accepts nested event/webhook triggers and sync
     assert.equal(fired[0].status, 'queued');
   } finally {
     await h.close();
+  }
+});
+
+test('dashboard enabled create and update warm only their exact direct-send schema slugs', async () => {
+  const createTool = 'DASHCREATE_SEND_MESSAGE';
+  const updateTool = 'DASHUPDATE_SEND_MESSAGE';
+  const loads: string[] = [];
+  resetToolSchemaCache();
+  _setToolSchemaLoaderForTests(async (slug) => {
+    loads.push(slug);
+    return {
+      inputParameters: {
+        type: 'object',
+        required: ['channel', 'markdown_text'],
+        properties: {
+          channel: { type: 'string' },
+          markdown_text: { type: 'string' },
+        },
+      },
+      providerObservedAt: Date.now(),
+    };
+  });
+  const h = await boot();
+  try {
+    const create = await fetch(`${h.url}/api/console/workflows`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Dashboard Exact Create',
+        description: 'Deliver one fixed exact update.',
+        enabled: true,
+        allowSends: true,
+        triggerSchedule: '0 9 * * 1-5',
+        timezone: 'UTC',
+        steps: [dashboardExactSendStep(createTool)],
+      }),
+    });
+    assert.equal(create.status, 200, await create.text());
+    assert.equal(readWorkflow('dashboard-exact-create')?.data.allowSends, true);
+    assert.equal(readWorkflow('dashboard-exact-create')?.data.enabled, true);
+
+    writeWorkflow('dashboard-exact-update', {
+      name: 'Dashboard Exact Update',
+      description: 'Original description.',
+      enabled: true,
+      allowSends: true,
+      trigger: { schedule: '0 10 * * 1-5', timezone: 'UTC' },
+      steps: [dashboardExactSendStep(updateTool)],
+    });
+    const patch = await fetch(`${h.url}/api/console/workflows/${encodeURIComponent('Dashboard Exact Update')}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: 'Updated description only.' }),
+    });
+    assert.equal(patch.status, 200, await patch.text());
+    assert.equal(readWorkflow('dashboard-exact-update')?.data.enabled, true);
+    assert.deepEqual(loads, [createTool, updateTool], 'metadata warming performs no discovery or unrelated lookup');
+
+    const detail = await fetch(`${h.url}/api/console/workflows/${encodeURIComponent('Dashboard Exact Update')}`);
+    assert.equal(detail.status, 200);
+    assert.equal((await detail.json() as { allowSends?: boolean }).allowSends, true);
+  } finally {
+    await h.close();
+    _setToolSchemaLoaderForTests(null);
+    resetToolSchemaCache();
   }
 });
 

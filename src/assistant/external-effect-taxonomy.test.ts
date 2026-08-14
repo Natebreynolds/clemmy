@@ -115,13 +115,13 @@ const ADVERSARIAL_CASES: readonly AdversarialCase[] = [
   },
   {
     text: "Don't close issue 123.",
-    messageIntent: 'tool_intent',
+    messageIntent: 'conversation',
     mutating: false,
     turnIntent: 'qa',
   },
   {
     text: 'Ask me before you buy anything.',
-    messageIntent: 'tool_intent',
+    messageIntent: 'conversation',
     mutating: false,
     turnIntent: 'qa',
   },

@@ -43,6 +43,8 @@ import {
   operationEvidenceContract,
   type OperationEvidenceMode,
 } from '../graph/operation-evidence-contract.js';
+import { loadExpectedWorkContract } from './expected-work-contract.js';
+import { isDeterministicImplicitRetrieveContract } from './expected-work-matcher.js';
 
 export const OBLIGATION_MANIFEST_VERSION = 1 as const;
 
@@ -174,6 +176,18 @@ export function compileObligationManifest(input: {
   }
   const graphNodes = new Map(durableGraph.nodes.map((node) => [node.id, node]));
   const hasSourceRead = ledgerFacts.some((operation) => refinedEffect(operation) === 'read');
+  // The deterministic retrieve contract promised resolved-operation coverage:
+  // one grounded retrieval, not an exhaustive set. Its read owes durable
+  // observation, not source exhaustion — a proof many providers cannot even
+  // express (no completeness signal, no cursor). Exhaustion remains owed by
+  // every other read shape, including complete_set action contracts.
+  let observationSufficientNodeId: string | null = null;
+  try {
+    const frozen = loadExpectedWorkContract(identity.sessionId, identity.sourceUserSeq);
+    if (frozen.status === 'ok' && isDeterministicImplicitRetrieveContract(frozen.contract)) {
+      observationSufficientNodeId = frozen.contract.operations[0]!.id;
+    }
+  } catch { /* an unreadable contract keeps the strict historical obligation */ }
 
   const nodes: ObligationManifestNode[] = [];
   for (const operation of ledgerFacts) {
@@ -188,6 +202,23 @@ export function compileObligationManifest(input: {
     }
     const effectKind = refinedEffect(operation);
     if (effectKind === 'none') continue;
+    // An effectful operation with NO physical dispatch never crossed any
+    // boundary — a pre-dispatch refusal of a write-shaped carrier leaves this
+    // exact row (outer settlement succeeded, dispatch not_started). Nothing
+    // was committed, so nothing owes commit/readback proof; write-truth
+    // separately records the refusal. Attaching write obligations here made a
+    // correct retrieve answer unverifiable: "no production evidence issuer
+    // exists for manifest effect external_write" (routing-sweep fixture,
+    // 2026-08-12). A write that DID cross keeps every obligation.
+    if (
+      (effectKind === 'external_write' || effectKind === 'local_write')
+      && !operation.physicalDispatchId
+      // Only rows EXPLICITLY recorded as never-dispatched are skipped — the
+      // refused-carrier shape stamps 'not_started'. Work recorded without
+      // dispatch bookkeeping at all (legacy/manifest lanes leave it null)
+      // keeps every obligation: an unproven write must still block.
+      && operation.dispatchState === 'not_started'
+    ) continue;
     const nodeId = `${operation.nodeId}/${operation.operationId}`;
     const evidenceContract = operationEvidenceContract({
       resolvedTool: operation.resolvedTool,
@@ -202,6 +233,8 @@ export function compileObligationManifest(input: {
       operationMode: evidenceContract.mode,
       hasSourceRead,
       requiresStaleReconciliation: evidenceContract.requiresStaleReconciliation,
+      observationSufficient: observationSufficientNodeId !== null
+        && operation.nodeId === observationSufficientNodeId,
     }).map((entry: NodeObligation) => entry.obligation);
     if (obligations.length === 0) continue;
     nodes.push({

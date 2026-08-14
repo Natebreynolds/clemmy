@@ -62,7 +62,10 @@ function acceptTask(label: string): Task {
     turn: 1,
     role: 'user',
     type: 'user_input_received',
-    data: { text: `${label}: do the alpha work` },
+    // The boundary under test settles business work. Give it an explicit
+    // action graph; the former vague "do the alpha work" fixture now routes as
+    // direct conversation and correctly owns no work node.
+    data: { text: `${label}: run the alpha operation now` },
   });
   assert.ok(recordTurnGraphShadow({
     identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },

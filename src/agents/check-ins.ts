@@ -166,10 +166,11 @@ export interface CreateCheckInInput {
 }
 
 /**
- * Open a new check-in. Writes the record and queues a notification of
- * kind 'approval' (the closest existing notification kind for "user
- * action needed") with metadata.checkInId so downstream UIs can route
- * it to a "Questions for you" panel.
+ * Open a new check-in. Writes the record and queues a normal execution
+ * notification with metadata.checkInId so downstream UIs can route it to a
+ * "Questions for you" panel. A question is not an approval: projecting it as
+ * kind `approval` made Discord attach approval-card chrome to an ordinary
+ * answer slot (live 2026-08-13).
  */
 export function createCheckIn(input: CreateCheckInInput): CheckInRecord {
   const question = input.question.trim();
@@ -191,7 +192,7 @@ export function createCheckIn(input: CreateCheckInInput): CheckInRecord {
 
   addNotification({
     id: `${Date.now()}-checkin-${record.id}`,
-    kind: 'approval',
+    kind: 'execution',
     title: `Question from ${input.agentSlug}: ${question.slice(0, 80)}`,
     body: input.contextSummary
       ? `${question}\n\nContext: ${input.contextSummary}`

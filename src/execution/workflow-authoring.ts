@@ -20,6 +20,8 @@ import {
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { codifyMechanicalSteps } from './workflow-codify.js';
+import { exactScheduledSendCandidateToolSlugs } from './workflow-validator.js';
+import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 export {
   deleteWorkflowAndSyncTriggers,
   syncWorkflowTriggersBestEffort,
@@ -128,6 +130,22 @@ export function prepareWorkflowVerification(def: WorkflowDefinition, provided: R
 
 export function workflowUpdateNeedsVerification(before: WorkflowDefinition, after: WorkflowDefinition): boolean {
   return before.enabled === true && workflowExecutionSurfaceChanged(before, after);
+}
+
+/** Renew only the exact direct-send schema identifiers proven by the static
+ * definition. This is authoring readiness, never send authority by itself:
+ * the canonical validator immediately rechecks the live fingerprint and every
+ * static exact-call condition before an enabled create/update may persist. */
+export async function warmExactScheduledSendSchemaAuthorityForWrite(
+  def: WorkflowDefinition,
+): Promise<string[]> {
+  if (def.enabled !== true) return [];
+  const tools = exactScheduledSendCandidateToolSlugs(def);
+  for (const tool of tools) {
+    try { await ensureLiveComposioSchemaFingerprint(tool); }
+    catch { /* prepareWorkflow* below reports typed fail-closed validation */ }
+  }
+  return tools;
 }
 
 function optionalString(value: unknown): string | undefined {
@@ -397,7 +415,9 @@ export function prepareWorkflowCreateForWrite(
 ): WorkflowPreparedWrite {
   const portability = normalizeWorkflowModelPortability(def, opts.modelPortability);
   const compiled = compileWorkflowForWrite(portability.def);
-  const prep = prepareWorkflowForWrite(compiled.def);
+  const prep = prepareWorkflowForWrite(compiled.def, {
+    allowDisabledExactSendDraft: compiled.def.enabled === false,
+  });
   const extra = { ...portability, codifyNotes: compiled.codifyNotes };
   if (compiled.def.enabled && !prep.ok) return preparedFromWrite(prep, 'invalid', prep.def, [], extra);
   const gaps = analyzeWorkflowGaps(prep.def);
@@ -412,7 +432,9 @@ export function prepareWorkflowUpdateForWrite(
 ): WorkflowPreparedWrite {
   const portability = normalizeWorkflowModelPortability(next, opts.modelPortability);
   const compiled = compileWorkflowForWrite(portability.def, opts.codifyMechanicalSteps === true);
-  const prep = prepareWorkflowForWrite(compiled.def);
+  const prep = prepareWorkflowForWrite(compiled.def, {
+    allowDisabledExactSendDraft: compiled.def.enabled === false && (opts.allowInvalidDisabled ?? true),
+  });
   const extra = { ...portability, codifyNotes: compiled.codifyNotes };
   const allowInvalidDisabled = opts.allowInvalidDisabled ?? true;
   if ((!allowInvalidDisabled || prep.def.enabled) && !prep.ok) return preparedFromWrite(prep, 'invalid', prep.def, [], extra);

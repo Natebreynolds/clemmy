@@ -7,6 +7,7 @@
  * a staged `done` may be published.
  */
 import { loadExpectedWorkContract } from './expected-work-contract.js';
+import { isDeterministicImplicitRetrieveContract } from './expected-work-matcher.js';
 import { actionExpectedWorkState } from './expected-work-admission.js';
 import {
   expectedTaskFor,
@@ -173,11 +174,9 @@ function conversationalActClassification(input: {
 
 /**
  * Whether durable work evidence exists for this exact accepted source:
- * settled logical calls, admitted physical dispatches, or external-write
- * records from this turn. Until the write-evidence issuer exists, this is
- * what separates a real worked turn (publishes, as it always has) from a
- * ZERO-evidence done claim (fails closed). An unreadable store never counts
- * as evidence.
+ * successful business settlements, confirmed external writes, or a successful
+ * Claude SDK result at the canonical host return boundary. An unreadable store
+ * never counts as evidence.
  */
 function sourceHasWorkEvidence(input: {
   sessionId: string;
@@ -202,17 +201,24 @@ function sourceHasWorkEvidence(input: {
     if (settled !== undefined) return true;
     // A CONFIRMED external write is equally durable work evidence: the
     // artifact/effect lanes settle through write-evidence records rather than
-    // logical settlements. The same resolution the settlement audit trusts
-    // decides here.
+    // logical settlements, and refusing their completed turns held a verified
+    // answer behind work_contract_missing (routing-sweep fixture, 2026-08-12).
+    // The same resolution the settlement audit trusts decides here.
     const sourceEvents = turnEventsForWorkEvidence(input.sessionId, input.sourceUserSeq);
     if (resolveWriteEvidence(sourceEvents).confirmed.length > 0) return true;
-    // The Claude SDK lane records its tool activity as sdk_tool_use_recorded.
-    // Any recorded tool use keeps that lane's completion-judge authority;
-    // only a zero-tool claim stays held.
+    // Claude-native business tools and the deliberately tiny authoring class
+    // do not all traverse the logical-settlement ledger. Trust only the host's
+    // verdict on the exact canonical return. `sdk_tool_use_recorded` is a later
+    // model-facing summary: it includes failed, refused, read-only, lifecycle,
+    // and approval-staging calls and therefore has no completion authority.
     return sourceEvents.some((event) => {
-      if (event.type !== 'sdk_tool_use_recorded') return false;
-      const tools = (event.data as { tools?: unknown }).tools;
-      return Array.isArray(tools) && tools.some((tool) => typeof tool === 'string' && tool.trim());
+      if (event.type !== 'tool_returned') return false;
+      return event.data.accounting === 'top_level'
+        && event.data.sourceUserSeq === input.sourceUserSeq
+        && (
+          event.data.successfulBusinessResult === true
+          || event.data.successfulAuthoringResult === true
+        );
     });
   } catch {
     return false;
@@ -225,6 +231,47 @@ function turnEventsForWorkEvidence(sessionId: string, sourceUserSeq: number) {
     event.seq > sourceUserSeq && event.type === 'user_input_received');
   return events.filter((event) =>
     event.seq >= sourceUserSeq && (!nextSource || event.seq < nextSource.seq));
+}
+
+type AcceptedSourceFreshnessRequirement = 'none' | 'current_state';
+
+function acceptedSourceFreshnessRequirement(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): AcceptedSourceFreshnessRequirement {
+  try {
+    const expected = expectedTaskFor(input.sessionId, input.sourceUserSeq);
+    if (expected.status !== 'ok' || expected.graph.classification.route !== 'retrieve') return 'none';
+    const source = listEvents(input.sessionId, {
+      sinceSeq: input.sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    })[0];
+    if (!source || source.seq !== input.sourceUserSeq) return 'none';
+    const text = typeof source.data.text === 'string' ? source.data.text : '';
+    return /\b(?:today|tonight|now|currently|current|latest|newest|most\s+recent|right\s+now|up[ -]to[ -]date|what\s+(?:time|day|date)|time\s+is\s+it|this\s+(?:morning|afternoon|evening|week|month|quarter|year))\b/i.test(text)
+      ? 'current_state'
+      : 'none';
+  } catch {
+    return 'none';
+  }
+}
+
+function sourceHasFreshReadEvidence(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  try {
+    return openEventLog().prepare(`
+      SELECT 1 FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ?
+         AND business_call = 1 AND continues_requirement = 0 AND mutating = 0
+         AND outcome_kind IN ('succeeded', 'empty_result')
+       LIMIT 1
+    `).get(input.sessionId, input.sourceUserSeq) !== undefined;
+  } catch {
+    return false;
+  }
 }
 
 function verdictResult(
@@ -276,7 +323,17 @@ export function prepareAcceptedTaskTerminal(input: {
       return { status: 'conflict', reason: legacyManifest.reason };
     }
     const action = actionExpectedWorkState(input);
-    if (action.status === 'not_action') return { status: 'unstaged' };
+    if (action.status === 'not_action') {
+      const freshness = acceptedSourceFreshnessRequirement(input);
+      if (freshness === 'current_state' && !sourceHasFreshReadEvidence(input)) {
+        return {
+          status: 'needs_verification',
+          reason: 'the current-state answer has no successful read settlement owned by this accepted source',
+          missing: ['freshness_current_state_read_missing'],
+        };
+      }
+      return { status: 'unstaged' };
+    }
     if (action.status === 'missing') {
       const authority = loadAcceptedTaskAuthority(input.sessionId, input.sourceUserSeq);
       if (authority.status === 'legacy') return { status: 'unstaged' };
@@ -403,6 +460,23 @@ export function prepareAcceptedTaskTerminal(input: {
     return { status: 'conflict', reason: `expected-work contract is ${contract.status}: ${contract.reason}` };
   }
 
+  // Current-state honesty precedes finalization. A zero-read answer to a
+  // "current/latest"-shaped ask must hold while the resolution is still OPEN:
+  // finalizing a zero-operation resolution first would leave a later fresh
+  // read nowhere to land (replay conflicts with the closed digest), turning a
+  // repairable hold into a dead end. Carriers that performed any successful
+  // non-mutating business call pass straight through.
+  if (
+    isDeterministicImplicitRetrieveContract(contract.contract)
+    && acceptedSourceFreshnessRequirement(input) === 'current_state'
+    && !sourceHasFreshReadEvidence(input)
+  ) {
+    return {
+      status: 'needs_verification',
+      reason: 'the current-state answer has no successful read settlement owned by this accepted source',
+      missing: ['freshness_current_state_read_missing'],
+    };
+  }
   const finalized = finalizeResolutionAgainstExpectedWork(input);
   if (finalized.status === 'incomplete') {
     return {

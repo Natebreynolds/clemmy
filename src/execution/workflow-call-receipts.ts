@@ -15,6 +15,10 @@ import {
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
+import {
+  extractStaticSendTargetValues,
+  isSendTargetArgumentKey,
+} from '../runtime/harness/grounding-gate.js';
 
 /**
  * Correctness-critical receipt store for structured workflow mutations.
@@ -47,6 +51,13 @@ export interface WorkflowCallMutationInput {
   stepId: string;
   itemKey?: string;
   tool: string;
+  /** Provider-observed schema fingerprint bound at the dispatch boundary.
+   * Optional for legacy/general mutations; mandatory when minting exact-send
+   * commit evidence. */
+  schemaFingerprint?: string;
+  /** Digest of the host-rendered authored args before gateway normalization.
+   * This binds durable upstream outputs without storing the payload twice. */
+  expectedArgsDigest?: string;
   account?: {
     connectionId?: string;
     identity?: string;
@@ -71,6 +82,8 @@ interface MutationSlot {
 
 interface NormalizedMutationCall {
   tool: string;
+  schemaFingerprint?: string;
+  expectedArgsDigest?: string;
   account: {
     connectionId: string | null;
     identity: string | null;
@@ -133,8 +146,66 @@ export interface WorkflowCallMutationState {
   failureSummary?: string;
 }
 
+/** Host-owned proof projected from the immutable exact-call ledger. It carries
+ * no model/provider-authored authority: every digest is recomputed from the
+ * frozen provider-ready intent, the host-rendered expected args, and the
+ * committed provider result whose receipt hash was checked by this module. */
+export interface WorkflowCallCommitEvidenceV1 {
+  protocolVersion: 1;
+  kind: 'workflow_call_commit';
+  evidenceId: string;
+  mutationReceiptId: string;
+  canonicalTool: string;
+  dispatchSchemaFingerprint: string;
+  status: 'committed';
+  /** Full host-rendered call arguments before the provider gateway. Recomputed
+   * from the pinned definition plus durable upstream step outputs on redeem. */
+  expectedArgsDigest: string;
+  /** Full normalized provider-ready arguments frozen before dispatch. */
+  providerReadyArgsDigest: string;
+  /** Exact committed provider result. Raw provider bytes remain only in the
+   * immutable receipt ledger; every workflow/public surface gets this digest. */
+  providerResultDigest: string;
+  /** Send-content-only projection from common provider-neutral payload fields. */
+  payloadDigest: string;
+  payloadCharacters: number;
+  target: {
+    digest: string;
+    total: number;
+  };
+}
+
+export interface ExactScheduledSendStepOutput {
+  providerResult?: unknown;
+  callEvidence?: unknown;
+}
+
+/** Public commitment to the immutable provider receipt. This deliberately
+ * carries no provider-authored fields: responses commonly echo message bodies,
+ * recipient ids, account metadata, and arbitrarily large nested envelopes. */
+export interface WorkflowCallProviderResultProjectionV1 {
+  protocolVersion: 1;
+  kind: 'workflow_call_provider_result';
+  resultId: string;
+  digest: string;
+}
+
+export class WorkflowCallCommitEvidenceError extends Error {
+  readonly code = 'WORKFLOW_CALL_COMMIT_EVIDENCE_INVALID';
+
+  constructor(message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = 'WorkflowCallCommitEvidenceError';
+  }
+}
+
 export class WorkflowCallMutationAmbiguousError extends Error {
   readonly code = 'WORKFLOW_CALL_MUTATION_AMBIGUOUS';
+  readonly workflowSlug: string;
+  readonly runId: string;
+  readonly stepId: string;
+  readonly itemKey?: string;
+  readonly tool: string;
   readonly fingerprint: string;
 
   constructor(input: WorkflowCallMutationInput, fingerprint: string, detail?: string) {
@@ -145,10 +216,16 @@ export class WorkflowCallMutationAmbiguousError extends Error {
       + `started against ${owner}, but no durable success receipt was recorded. The call was `
       + `NOT dispatched again because the prior attempt may already have committed externally. `
       + (detail ? `Last observed failure: ${detail}. ` : '')
-      + `Review the destination, then start a new run only after confirming a retry is safe `
-      + `(mutation ${fingerprint.slice(0, 12)}).`,
+      + `Reconcile exact mutation ${fingerprint.slice(0, 12)}, then resume this same run only `
+      + `after its immutable ledger proves a committed replay. You may instead cancel the local `
+      + `run, but that does not resolve or undo the external outcome.`,
     );
     this.name = 'WorkflowCallMutationAmbiguousError';
+    this.workflowSlug = input.workflowSlug;
+    this.runId = input.runId;
+    this.stepId = input.stepId;
+    this.itemKey = input.itemKey;
+    this.tool = input.tool;
     this.fingerprint = fingerprint;
   }
 }
@@ -229,10 +306,108 @@ function stableJson(value: JsonValue): string {
   return JSON.stringify(sortJson(value));
 }
 
+function canonicalJsonDigest(value: unknown, label: string): string {
+  const encoded = value === undefined
+    ? normalizeJson({ kind: 'undefined' }, label)
+    : normalizeJson({ kind: 'json', value }, label);
+  return createHash('sha256').update(stableJson(encoded)).digest('hex');
+}
+
+export function workflowCallExpectedArgsDigest(args: Record<string, unknown>): string {
+  return canonicalJsonDigest(args, 'host-rendered call arguments');
+}
+
+const WORKFLOW_CALL_PAYLOAD_KEYS = new Set([
+  'attachments',
+  'blocks',
+  'body',
+  'caption',
+  'content',
+  'fields',
+  'html',
+  'markdown_text',
+  'message',
+  'row',
+  'rows',
+  'row_data',
+  'subject',
+  'text',
+  'value',
+  'values',
+]);
+
+function normalizedEvidenceArgKey(key: string): string {
+  return key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[-\s]+/g, '_').toLowerCase();
+}
+
+function workflowCallPayloadProjection(args: JsonValue): {
+  values: Record<string, JsonValue>;
+  characters: number;
+} {
+  const values: Record<string, JsonValue> = {};
+  let characters = 0;
+  const countCharacters = (value: JsonValue): void => {
+    if (typeof value === 'string') {
+      characters += value.length;
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) countCharacters(entry);
+      return;
+    }
+    if (value && typeof value === 'object') {
+      for (const entry of Object.values(value)) countCharacters(entry);
+    }
+  };
+  const withoutTargetFields = (value: JsonValue, depth = 0): JsonValue => {
+    if (depth > 12 || !value || typeof value !== 'object') return value;
+    if (Array.isArray(value)) {
+      return value.map((entry) => withoutTargetFields(entry, depth + 1));
+    }
+    const sanitized: Record<string, JsonValue> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (isSendTargetArgumentKey(key)) continue;
+      sanitized[key] = withoutTargetFields(entry, depth + 1);
+    }
+    return sanitized;
+  };
+  const visit = (value: JsonValue, pathSegments: string[], depth = 0): void => {
+    if (depth > 12 || !value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const [index, entry] of value.entries()) visit(entry, [...pathSegments, String(index)], depth + 1);
+      return;
+    }
+    for (const [rawKey, entry] of Object.entries(value)) {
+      // Recipient identifiers are bound independently by target.digest. Never
+      // copy them into the payload projection, including when they are nested
+      // beneath a recognized message/content subtree.
+      if (isSendTargetArgumentKey(rawKey)) continue;
+      const key = normalizedEvidenceArgKey(rawKey);
+      const nextPath = [...pathSegments, rawKey];
+      if (WORKFLOW_CALL_PAYLOAD_KEYS.has(key)) {
+        const payloadValue = withoutTargetFields(entry);
+        values[nextPath.join('.')] = payloadValue;
+        countCharacters(payloadValue);
+      } else {
+        visit(entry, nextPath, depth + 1);
+      }
+    }
+  };
+  visit(args, []);
+  return { values, characters };
+}
+
 function normalizedAccount(account: WorkflowCallMutationInput['account']): NormalizedMutationCall['account'] {
   const connectionId = account?.connectionId?.trim() || null;
   const identity = account?.identity?.trim().toLowerCase() || null;
   return { connectionId, identity };
+}
+
+function validProviderSchemaFingerprint(value: string | undefined): value is string {
+  // tool-contract-store deliberately uses a 128-bit (32 hex character)
+  // content fingerprint for provider schemas. Keep this distinct from the
+  // mutation/argument digests below, which are full 256-bit digests.
+  return typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
 }
 
 function normalizedInput(input: WorkflowCallMutationInput): { slot: MutationSlot; call: NormalizedMutationCall } {
@@ -243,10 +418,24 @@ function normalizedInput(input: WorkflowCallMutationInput): { slot: MutationSlot
       'Cannot durably record a structured workflow mutation with a blank workflow, run, step, or tool; dispatch refused.',
     );
   }
+  const schemaFingerprint = input.schemaFingerprint?.trim();
+  if (schemaFingerprint !== undefined && !validProviderSchemaFingerprint(schemaFingerprint)) {
+    throw new WorkflowCallMutationLedgerError(
+      'Cannot durably record a structured workflow mutation with an invalid provider schema fingerprint; dispatch refused.',
+    );
+  }
+  const expectedArgsDigest = input.expectedArgsDigest?.trim();
+  if (expectedArgsDigest !== undefined && !/^[a-f0-9]{64}$/.test(expectedArgsDigest)) {
+    throw new WorkflowCallMutationLedgerError(
+      'Cannot durably record a structured workflow mutation with an invalid expected-arguments digest; dispatch refused.',
+    );
+  }
   return {
     slot,
     call: {
       tool,
+      ...(schemaFingerprint ? { schemaFingerprint } : {}),
+      ...(expectedArgsDigest ? { expectedArgsDigest } : {}),
       account: normalizedAccount(input.account),
       args: normalizeJson(input.args, 'arguments'),
     },
@@ -277,8 +466,23 @@ function normalizedMutationFingerprint(normalized: { slot: MutationSlot; call: N
     .digest('hex');
 }
 
+function normalizedRunIdentity(input: Pick<WorkflowCallMutationSlotInput, 'workflowSlug' | 'runId'>): {
+  workflowSlug: string;
+  runId: string;
+} {
+  const workflowSlug = input.workflowSlug.trim();
+  const runId = input.runId.trim();
+  if (!workflowSlug || !runId) {
+    throw new WorkflowCallMutationLedgerError(
+      'Cannot inspect a structured workflow mutation with a blank workflow or run.',
+    );
+  }
+  return { workflowSlug, runId };
+}
+
 function runMutationDir(input: Pick<WorkflowCallMutationSlotInput, 'workflowSlug' | 'runId'>): string {
-  return path.join(WORKFLOWS_DIR, input.workflowSlug, 'runs', input.runId, 'call-mutations');
+  const normalized = normalizedRunIdentity(input);
+  return path.join(WORKFLOWS_DIR, normalized.workflowSlug, 'runs', normalized.runId, 'call-mutations');
 }
 
 function operationDir(input: WorkflowCallMutationInput, fingerprint: string): string {
@@ -537,6 +741,8 @@ function readRecord(file: string, expectedPhase: MutationRecord['phase']): Mutat
         !call
         || typeof call.tool !== 'string'
         || !call.tool.trim()
+        || (call.schemaFingerprint !== undefined && !validProviderSchemaFingerprint(call.schemaFingerprint))
+        || (call.expectedArgsDigest !== undefined && !/^[a-f0-9]{64}$/.test(call.expectedArgsDigest))
         || !call.account
         || (call.account.connectionId !== null && typeof call.account.connectionId !== 'string')
         || (call.account.identity !== null && typeof call.account.identity !== 'string')
@@ -824,6 +1030,202 @@ function slotIntentRecords(input: WorkflowCallMutationSlotInput): IntentRecord[]
   return runIntentRecords(input).filter((intent) => slotsEqual(intent.slot, slot));
 }
 
+function exactInputFromIntent(intent: IntentRecord): WorkflowCallMutationInput {
+  return {
+    workflowSlug: intent.slot.workflowSlug,
+    runId: intent.slot.runId,
+    stepId: intent.slot.stepId,
+    ...(intent.slot.itemKey ? { itemKey: intent.slot.itemKey } : {}),
+    tool: intent.call.tool,
+    ...(intent.call.schemaFingerprint ? { schemaFingerprint: intent.call.schemaFingerprint } : {}),
+    ...(intent.call.expectedArgsDigest ? { expectedArgsDigest: intent.call.expectedArgsDigest } : {}),
+    account: {
+      ...(intent.call.account.connectionId ? { connectionId: intent.call.account.connectionId } : {}),
+      ...(intent.call.account.identity ? { identity: intent.call.account.identity } : {}),
+    },
+    args: intent.call.args as Record<string, unknown>,
+  };
+}
+
+function committedEvidenceFromIntent(
+  intent: IntentRecord,
+  expectedTool: string,
+  expectedArgs: Record<string, unknown>,
+): { result: unknown; evidence: WorkflowCallCommitEvidenceV1 } {
+  if (!expectedTool.trim() || intent.call.tool !== expectedTool.trim()) {
+    throw new WorkflowCallCommitEvidenceError(
+      `Structured workflow call evidence tool mismatch (${intent.call.tool} != ${expectedTool || '(blank)'}).`,
+    );
+  }
+  if (!validProviderSchemaFingerprint(intent.call.schemaFingerprint)) {
+    throw new WorkflowCallCommitEvidenceError(
+      'Structured workflow call evidence requires the provider-observed dispatch schema fingerprint.',
+    );
+  }
+  const dispatchSchemaFingerprint = intent.call.schemaFingerprint;
+  const renderedArgsDigest = workflowCallExpectedArgsDigest(expectedArgs);
+  if (!intent.call.expectedArgsDigest || intent.call.expectedArgsDigest !== renderedArgsDigest) {
+    throw new WorkflowCallCommitEvidenceError(
+      'Structured workflow call evidence no longer matches the frozen host-rendered arguments/upstream outputs.',
+    );
+  }
+  const expectedArgsDigest = intent.call.expectedArgsDigest;
+  const exactInput = exactInputFromIntent(intent);
+  let state = inspectExactState(exactInput, intent.fingerprint);
+  if (state.status === 'received') {
+    // Crash after the immutable provider receipt but before the local commit:
+    // finish the host-only phase and re-read. This never re-enters dispatch.
+    const receipt = readRecord(
+      phasePath(operationDir(exactInput, intent.fingerprint), 'receipt'),
+      'receipt',
+    ) as ReceiptRecord;
+    persistCommit(exactInput, intent.fingerprint, intent.slot, receipt);
+    state = inspectExactState(exactInput, intent.fingerprint);
+  }
+  if (state.status !== 'committed') {
+    throw new WorkflowCallCommitEvidenceError(
+      `Structured workflow call evidence requires a committed mutation; found ${state.status}.`,
+    );
+  }
+  const targets = extractStaticSendTargetValues(intent.call.args);
+  if (targets.length === 0) {
+    throw new WorkflowCallCommitEvidenceError(
+      'Structured workflow call evidence requires a literal provider-ready target.',
+    );
+  }
+  const payload = workflowCallPayloadProjection(intent.call.args);
+  const targetDigest = canonicalJsonDigest(targets, 'call target evidence');
+  const evidenceWithoutId = {
+    protocolVersion: 1 as const,
+    kind: 'workflow_call_commit' as const,
+    mutationReceiptId: `workflow-call:v1:${intent.fingerprint}`,
+    canonicalTool: intent.call.tool,
+    dispatchSchemaFingerprint,
+    status: 'committed' as const,
+    expectedArgsDigest,
+    providerReadyArgsDigest: canonicalJsonDigest(intent.call.args, 'provider-ready call arguments'),
+    providerResultDigest: canonicalJsonDigest(state.result, 'committed provider result'),
+    payloadDigest: canonicalJsonDigest(payload.values, 'provider-ready payload projection'),
+    payloadCharacters: payload.characters,
+    target: {
+      digest: targetDigest,
+      total: targets.length,
+    },
+  };
+  const evidenceId = `workflow-call-evidence:v1:${canonicalJsonDigest(evidenceWithoutId, 'call commit evidence')}`;
+  return {
+    result: state.result,
+    evidence: { ...evidenceWithoutId, evidenceId },
+  };
+}
+
+/** Project the one committed exact-call slot into bounded host evidence. The
+ * ledger's intent and receipt/commit phases are re-read and cryptographically
+ * checked on every call, including crash replay. */
+export function readCommittedWorkflowCallMutationEvidence(
+  input: WorkflowCallMutationSlotInput,
+  expectedTool: string,
+  expectedArgs: Record<string, unknown>,
+): { evidence: WorkflowCallCommitEvidenceV1 } {
+  const intents = slotIntentRecords(input);
+  if (intents.length !== 1) {
+    throw new WorkflowCallCommitEvidenceError(
+      `Structured workflow call evidence requires exactly one durable intent; found ${intents.length}.`,
+    );
+  }
+  const { evidence } = committedEvidenceFromIntent(intents[0], expectedTool, expectedArgs);
+  // The raw provider response is an immutable-ledger implementation detail.
+  // Callers may redeem the host commitment, but no exported/public projection
+  // gets an accessor that can accidentally republish provider-authored bytes.
+  return { evidence };
+}
+
+export interface WorkflowCallCommitOutputV1 {
+  providerResult: WorkflowCallProviderResultProjectionV1;
+  callEvidence: WorkflowCallCommitEvidenceV1;
+}
+
+/** Stable, bounded output envelope for the exact scheduled-send class. Raw
+ * provider fields stay in the immutable receipt ledger. `providerResult` is a
+ * content address only, while callEvidence is host-produced and redeemable. */
+export function readCommittedWorkflowCallMutationOutput(
+  input: WorkflowCallMutationSlotInput,
+  expectedTool: string,
+  expectedArgs: Record<string, unknown>,
+): WorkflowCallCommitOutputV1 {
+  const committed = readCommittedWorkflowCallMutationEvidence(input, expectedTool, expectedArgs);
+  const digest = committed.evidence.providerResultDigest;
+  return {
+    providerResult: {
+      protocolVersion: 1,
+      kind: 'workflow_call_provider_result',
+      resultId: `workflow-call-result:v1:${digest}`,
+      digest,
+    },
+    callEvidence: committed.evidence,
+  };
+}
+
+/** Terminal redemption: recompute the entire projection from the immutable
+ * ledger and the host-rendered args, then require byte-equivalent evidence.
+ * A model/provider envelope cannot forge or widen this proof. */
+export function redeemWorkflowCallMutationEvidence(
+  input: WorkflowCallMutationSlotInput,
+  expectedTool: string,
+  expectedArgs: Record<string, unknown>,
+  candidate: unknown,
+): { ok: true; evidence: WorkflowCallCommitEvidenceV1 } | { ok: false; reason: string } {
+  try {
+    const current = readCommittedWorkflowCallMutationEvidence(input, expectedTool, expectedArgs).evidence;
+    const candidateDigest = canonicalJsonDigest(candidate, 'candidate call commit evidence');
+    const currentDigest = canonicalJsonDigest(current, 'current call commit evidence');
+    if (candidateDigest !== currentDigest) {
+      return { ok: false, reason: 'host call evidence does not match its committed mutation ledger' };
+    }
+    return { ok: true, evidence: current };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof WorkflowCallCommitEvidenceError
+        ? error.message
+        : 'host call evidence could not be redeemed from its committed mutation ledger',
+    };
+  }
+}
+
+export function redeemExactScheduledSendStepOutput(
+  input: WorkflowCallMutationSlotInput,
+  expectedTool: string,
+  expectedArgs: Record<string, unknown>,
+  output: unknown,
+):
+  | { ok: true; evidence: WorkflowCallCommitEvidenceV1; output: WorkflowCallCommitOutputV1; repairedProjection: boolean }
+  | { ok: false; reason: string } {
+  try {
+    const current = readCommittedWorkflowCallMutationOutput(input, expectedTool, expectedArgs);
+    if (canonicalJsonDigest(output, 'candidate exact-send output') !== canonicalJsonDigest(current, 'committed exact-send output')) {
+      // Mutable journal bytes are not authority. When immutable intent +
+      // receipt + commit are internally consistent, self-heal by returning the
+      // canonical envelope; no provider call is made and no evidence rule is
+      // weakened. Only an unreadable/ambiguous/conflicting ledger blocks below.
+      return {
+        ok: true,
+        evidence: current.callEvidence,
+        output: current,
+        repairedProjection: true,
+      };
+    }
+    return { ok: true, evidence: current.callEvidence, output: current, repairedProjection: false };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof WorkflowCallCommitEvidenceError
+        ? error.message
+        : 'exact-send output could not be redeemed from its committed mutation ledger',
+    };
+  }
+}
+
 export interface WorkflowRunMutationRequeueAssessment {
   safeToFreshRun: boolean;
   blocking: Array<{
@@ -843,18 +1245,7 @@ export function assessWorkflowRunMutationRequeue(
 ): WorkflowRunMutationRequeueAssessment {
   const blocking: WorkflowRunMutationRequeueAssessment['blocking'] = [];
   for (const intent of runIntentRecords(input)) {
-    const exactInput: WorkflowCallMutationInput = {
-      workflowSlug: intent.slot.workflowSlug,
-      runId: intent.slot.runId,
-      stepId: intent.slot.stepId,
-      ...(intent.slot.itemKey ? { itemKey: intent.slot.itemKey } : {}),
-      tool: intent.call.tool,
-      account: {
-        ...(intent.call.account.connectionId ? { connectionId: intent.call.account.connectionId } : {}),
-        ...(intent.call.account.identity ? { identity: intent.call.account.identity } : {}),
-      },
-      args: intent.call.args as Record<string, unknown>,
-    };
+    const exactInput = exactInputFromIntent(intent);
     const state = inspectExactState(exactInput, intent.fingerprint);
     if (state.status === 'ambiguous' || state.status === 'received' || state.status === 'committed') {
       blocking.push({
@@ -883,6 +1274,65 @@ export function workflowCallMutationSlotHasLedger(input: WorkflowCallMutationSlo
   return slotIntentRecords(input).length > 0;
 }
 
+/** Runner preflight proof for crash replay when live provider metadata is
+ * temporarily unavailable. This grants no dispatch: it accepts only one exact
+ * durable intent already carrying the provider-observed schema + host-rendered
+ * args digest, and only a checked receipt/commit. The call node later re-renders
+ * current upstream outputs and must redeem the full envelope before use. */
+export function workflowCallMutationSlotHasCommittedReplayAuthority(
+  input: WorkflowCallMutationSlotInput,
+  expectedTool: string,
+): boolean {
+  const intents = slotIntentRecords(input);
+  if (intents.length !== 1) return false;
+  const intent = intents[0];
+  if (
+    intent.call.tool !== expectedTool.trim()
+    || !validProviderSchemaFingerprint(intent.call.schemaFingerprint)
+    || !intent.call.expectedArgsDigest
+    || !/^[a-f0-9]{64}$/.test(intent.call.expectedArgsDigest)
+  ) return false;
+  const exactInput = exactInputFromIntent(intent);
+  let state = inspectExactState(exactInput, intent.fingerprint);
+  if (state.status === 'received') {
+    const receipt = readRecord(
+      phasePath(operationDir(exactInput, intent.fingerprint), 'receipt'),
+      'receipt',
+    ) as ReceiptRecord;
+    persistCommit(exactInput, intent.fingerprint, intent.slot, receipt);
+    state = inspectExactState(exactInput, intent.fingerprint);
+  }
+  return state.status === 'committed';
+}
+
+/** Same-run reconciliation authority for any structured mutation. Unlike the
+ * exact scheduled-send preflight helper above, this mints no new dispatch
+ * authority and needs no live schema lease: it accepts only the exact durable
+ * fingerprint that already crossed STARTED and now has a checked receipt /
+ * commit. The call node can therefore replay it without provider I/O. */
+export function workflowCallMutationSlotHasCommittedResult(
+  input: WorkflowCallMutationSlotInput,
+  expectedTool: string,
+  expectedFingerprint: string,
+): boolean {
+  if (!/^[a-f0-9]{64}$/.test(expectedFingerprint)) return false;
+  const intents = slotIntentRecords(input);
+  if (intents.length !== 1) return false;
+  const intent = intents[0];
+  if (intent.call.tool !== expectedTool.trim() || intent.fingerprint !== expectedFingerprint) return false;
+  const exactInput = exactInputFromIntent(intent);
+  let state = inspectExactState(exactInput, intent.fingerprint);
+  if (state.status === 'received') {
+    const receipt = readRecord(
+      phasePath(operationDir(exactInput, intent.fingerprint), 'receipt'),
+      'receipt',
+    ) as ReceiptRecord;
+    persistCommit(exactInput, intent.fingerprint, intent.slot, receipt);
+    state = inspectExactState(exactInput, intent.fingerprint);
+  }
+  return state.status === 'committed';
+}
+
 /** Replay terminal exact-call truth before mutable gateway preflight. Account
  * disconnects, schema drift, or constraint changes after a committed mutation
  * must not turn a durable success into a recovery failure. */
@@ -897,18 +1347,7 @@ export function replayWorkflowCallMutationSlot(
     );
   }
   const intent = intents[0];
-  const exactInput: WorkflowCallMutationInput = {
-    workflowSlug: intent.slot.workflowSlug,
-    runId: intent.slot.runId,
-    stepId: intent.slot.stepId,
-    ...(intent.slot.itemKey ? { itemKey: intent.slot.itemKey } : {}),
-    tool: intent.call.tool,
-    account: {
-      ...(intent.call.account.connectionId ? { connectionId: intent.call.account.connectionId } : {}),
-      ...(intent.call.account.identity ? { identity: intent.call.account.identity } : {}),
-    },
-    args: intent.call.args as Record<string, unknown>,
-  };
+  const exactInput = exactInputFromIntent(intent);
   const state = inspectExactState(exactInput, intent.fingerprint);
   if (state.status === 'committed') return { replayed: true, result: state.result };
   if (state.status === 'received') {

@@ -18,6 +18,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { resetMemoryDb } = await import('./db.js');
+const { focusSummaryIsHistoricalForRequest } = await import('../runtime/harness/focus-projection.js');
 const {
   createFocus,
   getActiveFocus,
@@ -118,6 +119,28 @@ test('touchFocus: extends confirm_after only when active', () => {
   } finally {
     delete process.env.CLEMMY_FOCUS_CONFIRM_MS;
   }
+});
+
+test('touchFocus from a fresh action session preserves historical ownership', () => {
+  resetMemoryDb();
+  const ownerSessionId = 'historical-action-session';
+  const freshSessionId = 'fresh-action-session';
+  const focus = createFocus({
+    resourceRef: 'https://docs.google.com/spreadsheets/d/historical_google_sheet_00000002',
+    title: 'Historical sheet work',
+    summary: 'Rows written during the historical request.',
+    resourceKind: 'sheet',
+    relatedSessionId: ownerSessionId,
+  });
+
+  const touched = touchFocus(focus.id, freshSessionId)!;
+
+  assert.equal(touched.related_session_id, ownerSessionId, 'touch is liveness only, not an ownership transition');
+  assert.equal(
+    focusSummaryIsHistoricalForRequest(touched, 'Update the sheet with a fresh row now.', freshSessionId),
+    true,
+    'the prior summary stays historical for a newly accepted action request',
+  );
 });
 
 test('park + activate: round-trip preserves history', () => {

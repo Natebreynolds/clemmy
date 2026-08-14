@@ -16,7 +16,7 @@ const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
 
 test.after(() => {
   eventlog.closeEventLog();
-  rmSync(TMP_HOME, { recursive: true, force: true });
+  if (!process.env.CLEM_TEST_KEEP_HOME) rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
 /**
@@ -197,18 +197,18 @@ test('scenario 11: a cold user with no learned memory gets a full discovery budg
   assert.equal(governor.admit({ ...key, category: 'broad_discovery', callId: 'cold-1' }).admitted, true);
 });
 
-test('scenario 12: a warm receipt orders the work but never withholds recovery', () => {
+test('scenario 12: a warm receipt orders the work but never withholds bounded discovery', () => {
   const key = acceptedTask('warm');
   const governor = new DiscoveryGovernor();
   governor.initializeTask({ ...key, knownCapability: true });
 
-  // Try the remembered path first — that is what the receipt is for.
-  const premature = governor.admit({ ...key, category: 'broad_discovery', callId: 'warm-search-1' });
-  assert.equal(premature.admitted, false);
-  assert.equal(premature.reason, 'known_capability');
+  // The receipt ranks the remembered path, but a task-global bit cannot prove
+  // that every capability in a multi-system request is covered.
+  const first = governor.admit({ ...key, category: 'broad_discovery', callId: 'warm-search-1' });
+  assert.equal(first.admitted, true);
+  assert.equal(first.reason, 'novel_discovery_admitted');
 
-  // The remembered path fails. A warm user must not end up worse off than a
-  // cold one, which is exactly what a permanent knownCapability denial did.
+  // The attempted path fails. Observed evidence opens one new bounded epoch.
   const evidence = governor.recordEvidence({
     ...key, kind: 'candidate_unsupported', detail: 'STALE_REMEMBERED_SLUG',
   });
@@ -278,12 +278,24 @@ test('a real failed dispatch reopens the epoch — the recovery path is CONNECTE
 
   const key = acceptedTask('wired');
   const governor = new DiscoveryGovernor();
-  // A warm task: memory named a capability, so the first search is suppressed.
+  // A warm task: memory ranks a capability but never removes its bounded search.
   governor.initializeTask({ ...key, knownCapability: true });
   assert.equal(
     governor.admit({ ...key, category: 'broad_discovery', callId: 'wired-search-1' }).admitted,
-    false,
+    true,
   );
+
+  // An act-routed source arms the expected-work wall; the dispatch rides the
+  // same mandate live traffic uses — a resolved-approved card for the exact
+  // call — so the failed PROVIDER result (not a wall refusal) is what travels.
+  const approvals = await import('./harness/approval-registry.js');
+  const card = approvals.register({
+    sessionId: key.sessionId,
+    subject: 'Run SOME_LIST_RECORDS',
+    tool: 'SOME_LIST_RECORDS',
+    args: {},
+  });
+  approvals.resolve(card.approvalId, 'approved', 'fixture-user');
 
   // Drive the ACTUAL dispatch entry point with a failed provider result, so the
   // evidence has to travel the whole way — execute -> attempt settlement ->
@@ -295,7 +307,10 @@ test('a real failed dispatch reopens the epoch — the recovery path is CONNECTE
     () => runComposioExecuteForTestInSession(
       'SOME_LIST_RECORDS',
       {},
-      (async () => ({ successful: false, error: 'unsupported operation', data: {} })) as never,
+      // A bare `successful:false` is deliberately inert now (it proves the
+      // attempt failed, not that the capability is absent). The epoch reopens
+      // on NARROW rejection evidence — an explicit pre-effect status.
+      (async () => ({ successful: false, status: 405, error: 'unsupported operation', data: {} })) as never,
       key.sessionId,
     ),
   );

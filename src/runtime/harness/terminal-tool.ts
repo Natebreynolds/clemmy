@@ -44,7 +44,17 @@ export function formatAutoResolvedAskUserQuestionOutput(message: string): string
 
 /** `ask_user_question` is non-terminal only when YOLO explicitly resolved an
  * approval-shaped ask. The tool result is the shared contract on both SDKs. */
-export function terminalToolShouldHalt(rawName: string, output: string): boolean {
+export interface TerminalToolHaltContext {
+  /** Durable accepted-task authority says this foreground turn still owes
+   * business work. Never derive this bit from prompt prose. */
+  actionExpectedWork?: boolean;
+}
+
+export function terminalToolShouldHalt(
+  rawName: string,
+  output: string,
+  context: TerminalToolHaltContext = {},
+): boolean {
   const bare = bareTerminalToolName(rawName);
   if (bare === 'ask_user_question') {
     return !output.startsWith(`${ASK_USER_QUESTION_AUTO_RESOLVED_PREFIX}\n`);
@@ -53,7 +63,14 @@ export function terminalToolShouldHalt(rawName: string, output: string): boolean
   // SUCCEEDED. A refused or failed dispatch/revise/status is an ordinary typed
   // tool failure that belongs back inside the model loop — halting there would
   // strand the user with no answer and nothing running.
-  if (BACKGROUND_CONTROL_TOOLS.has(bare)) return !controlReceiptFailed(output);
+  if (BACKGROUND_CONTROL_TOOLS.has(bare)) {
+    if (controlReceiptFailed(output)) return false;
+    // A status receipt answers a status/review request, but it is only
+    // reconciliation evidence inside an accepted action. Halting an act turn
+    // here stranded the requested work after a stale background-task match.
+    if (bare === 'background_task_status' && context.actionExpectedWork === true) return false;
+    return true;
+  }
   return true;
 }
 

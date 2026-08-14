@@ -11,6 +11,7 @@ import {
   type PendingActionRecord,
 } from './pending-actions.js';
 import { isDirectionSeekingQuestion } from './objective-judge.js';
+import { autonomousSendConsentPresentation } from './autonomous-send-consent.js';
 
 export interface QueuedApprovalTransition {
   eventSeq: number;
@@ -263,6 +264,19 @@ function materializeQueuedApproval(
     const existingExactRow = linked
       ? exactPendingApprovalRow(sessionId, record)
       : null;
+    const acceptedSource = listEvents(sessionId, {
+      types: ['user_input_received'],
+      sinceSeq: sourceUserSeq - 1,
+      limit: 1,
+    }).find((event) => event.seq === sourceUserSeq);
+    const presentation = acceptedSource
+      ? autonomousSendConsentPresentation(
+          'request_approval',
+          args,
+          pendingActionApprovalView(record),
+          { source: acceptedSource },
+        )
+      : null;
     const registered = existingExactRow
       ? { row: existingExactRow, created: false }
       : approvalRegistry.registerResumable({
@@ -273,6 +287,7 @@ function materializeQueuedApproval(
         tool: 'request_approval',
         args,
         resumeKey: `pending-action-approval-v1:${sessionId}:${record.id}:${record.payloadHash}`,
+        presentation,
       });
     const linkedRecord = getPendingAction(record.id);
     if (
@@ -295,13 +310,16 @@ function materializeQueuedApproval(
       && event.data.approvalId === registered.row.approvalId);
     if (!hasRequestedEvent) {
       try {
-        addNotification({
+        const conversational = registered.row.presentation;
+        if (!conversational) addNotification({
           id: `approval-${registered.row.approvalId}`,
           kind: 'approval',
           title: 'Approval pending',
           body: record.title,
           createdAt: new Date().toISOString(),
           read: false,
+          // The live origin chat owns delivery of a conversational consent
+          // question. Do not fan the hidden ledger row out as a second card.
           metadata: {
             approvalId: registered.row.approvalId,
             tool: 'request_approval',
@@ -313,7 +331,7 @@ function materializeQueuedApproval(
         // The registry row and event are the durable card; delivery fan-out is best-effort.
       }
       try {
-        appendEvent({
+        const approvalEvent = appendEvent({
           sessionId,
           turn,
           role: 'Clem',
@@ -327,8 +345,19 @@ function materializeQueuedApproval(
             approvalId: registered.row.approvalId,
             sourceUserSeq,
             source: 'pending_action_graph_transition',
+            ...(registered.row.presentation ? {
+              approvalPresentation: 'conversation',
+              question: registered.row.presentation.question,
+            } : {}),
           },
         });
+        if (registered.row.presentation) {
+          approvalRegistry.bindConversationalApprovalPrompt({
+            approvalId: registered.row.approvalId,
+            promptEventId: approvalEvent.id,
+            promptEventSeq: approvalEvent.seq,
+          });
+        }
       } catch { /* registry row + verified action link remain authoritative */ }
     }
     if (!hasParkedEvent) {

@@ -23,6 +23,7 @@ import {
   workflowExecutionSurfaceChanged,
 } from './workflow-enforce.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
+import { rememberToolSchema, resetToolSchemaCache } from '../tools/composio-schema-cache.js';
 
 function wf(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
   return {
@@ -75,6 +76,121 @@ test('checkWorkflowForWrite: enabled send workflow with allowSends=false is reje
   const result = checkWorkflowForWrite(offending);
   assert.equal(result.ok, false, 'ungated send is rejected with allowSends=false');
   assert.match(result.errors.join(' '), /requiresApproval|approval/i);
+});
+
+test('checkWorkflowForWrite: exact scheduled call authority sees the typed allowSends policy', () => {
+  resetToolSchemaCache();
+  rememberToolSchema('MESSAGING_SEND_MESSAGE', {
+    type: 'object',
+    required: ['destination', 'body'],
+    properties: {
+      destination: { type: 'string' },
+      body: { type: 'string' },
+    },
+  }, Date.now());
+  const exact = wf({
+    allowSends: true,
+    trigger: { schedule: '0 9 * * 1-5', timezone: 'UTC' },
+    steps: [
+      {
+        id: 'render',
+        prompt: '',
+        deterministic: { runner: 'render.mjs' },
+        sideEffect: 'write',
+        output: { type: 'object', required_keys: ['summary'], non_empty: ['summary'] },
+      },
+      {
+        id: 'deliver',
+        prompt: '',
+        dependsOn: ['render'],
+        sideEffect: 'send',
+        call: {
+          tool: 'MESSAGING_SEND_MESSAGE',
+          args: { destination: 'fixed-room', body: '{{steps.render.output.summary}}' },
+        },
+        output: {
+          type: 'object',
+          required_keys: ['providerResult', 'callEvidence'],
+          non_empty: [
+            'providerResult.kind',
+            'providerResult.resultId',
+            'providerResult.digest',
+            'callEvidence.evidenceId',
+            'callEvidence.mutationReceiptId',
+            'callEvidence.canonicalTool',
+            'callEvidence.kind',
+            'callEvidence.status',
+            'callEvidence.dispatchSchemaFingerprint',
+            'callEvidence.expectedArgsDigest',
+            'callEvidence.providerReadyArgsDigest',
+            'callEvidence.providerResultDigest',
+            'callEvidence.payloadDigest',
+            'callEvidence.target.digest',
+          ],
+        },
+      },
+    ],
+  });
+  try {
+    const autonomous = checkWorkflowForWrite(exact);
+    assert.equal(autonomous.ok, true, autonomous.errors.join('\n'));
+
+    const strict = checkWorkflowForWrite({ ...exact, allowSends: false });
+    assert.equal(strict.ok, false);
+    assert.match(strict.errors.join(' '), /autonomous_sends_disabled/);
+  } finally {
+    resetToolSchemaCache();
+  }
+});
+
+test('checkWorkflowForWrite: an inert exact-send draft installs before provider auth but enable remains fail closed', () => {
+  resetToolSchemaCache();
+  const draft = wf({
+    enabled: false,
+    allowSends: true,
+    trigger: { schedule: '0 9 * * 1-5', timezone: 'UTC' },
+    steps: [{
+      id: 'deliver',
+      prompt: '',
+      sideEffect: 'send',
+      call: {
+        tool: 'DRAFTONLY_SEND_MESSAGE',
+        args: { destination: 'fixed-room', body: 'fixed draft body' },
+      },
+      output: {
+        type: 'object',
+        required_keys: ['providerResult', 'callEvidence'],
+        non_empty: [
+          'providerResult.kind',
+          'providerResult.resultId',
+          'providerResult.digest',
+          'callEvidence.evidenceId',
+          'callEvidence.mutationReceiptId',
+          'callEvidence.canonicalTool',
+          'callEvidence.kind',
+          'callEvidence.status',
+          'callEvidence.dispatchSchemaFingerprint',
+          'callEvidence.expectedArgsDigest',
+          'callEvidence.providerReadyArgsDigest',
+          'callEvidence.providerResultDigest',
+          'callEvidence.payloadDigest',
+          'callEvidence.target.digest',
+        ],
+      },
+    }],
+  });
+  try {
+    const strictSave = checkWorkflowForWrite(draft);
+    assert.equal(strictSave.ok, false, 'generic validation cannot mint a disabled-draft bypass');
+    const installed = checkWorkflowForWrite(draft, { allowDisabledExactSendDraft: true });
+    assert.equal(installed.ok, true, installed.errors.join('\n'));
+
+    const enableAttempt = checkWorkflowForWrite({ ...draft, enabled: true });
+    assert.equal(enableAttempt.ok, false);
+    assert.match(enableAttempt.errors.join(' '), /direct_send_tool_unverified/);
+  } finally {
+    resetToolSchemaCache();
+  }
 });
 
 test('checkWorkflowForWrite: user-only notification workflow is allowed without approval gate', () => {

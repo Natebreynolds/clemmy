@@ -20,6 +20,7 @@ const {
   setClaudeAgentSdkBrainPostTurnHooksForTest,
   setClaudeAgentSdkBrainJudgeForTest,
   setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest,
+  setClaudeAgentSdkBrainPreflightConversationPortForTest,
   setClaudeAgentSdkBrainSearchFactsHybridForTest,
   setClaudeAgentSdkBrainUnifiedPrimerForTest,
   looksLikeToolNarration,
@@ -82,6 +83,7 @@ const {
   workflowChatDispatchQueueRequestDigest,
 } = await import('../../execution/workflow-origin-group.js');
 const { workflowOriginReplyTargetForSource } = await import('../workflow-origin-authority.js');
+const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
 const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
 const { acceptedTaskIdFor } = await import('./attempt-identity.js');
 const { beginPhysicalDispatch, settlePhysicalDispatch } = await import('./dispatch-ledger.js');
@@ -196,6 +198,7 @@ beforeEach(() => {
   setClaudeAgentSdkBrainPostTurnHooksForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
   setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(UNAVAILABLE_TERMINAL_DELIVERY_JUDGE);
+  setClaudeAgentSdkBrainPreflightConversationPortForTest(null);
   setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
   setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => ({
     objective: query, hits: [], perStore: {}, answerability: 'insufficient',
@@ -225,6 +228,7 @@ after(() => {
   setClaudeAgentSdkBrainPostTurnHooksForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
   setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(null);
+  setClaudeAgentSdkBrainPreflightConversationPortForTest(null);
   setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
   setClaudeAgentSdkBrainUnifiedPrimerForTest(null);
   closeProspectiveIntentionsDbForTest();
@@ -1671,6 +1675,14 @@ test('renderClaudeAgentBrainSystemAppend carries Clementine context and the read
   assert.doesNotMatch(prompt, /tool_called event|tool_returned event|\[clipped:/);
 });
 
+test('full Claude action prompt uses accepted work authority without manufacturing an execution owner', () => {
+  const prompt = renderClaudeAgentBrainSystemAppend('home', { message: 'Update the Sheet.', sessionId: 'brain-work-authority' }, 'full');
+  assert.match(prompt, /accepted external work through work_call/i);
+  assert.match(prompt, /host-frozen binding/i);
+  assert.doesNotMatch(prompt, /execution_create FIRST/i);
+  assert.doesNotMatch(prompt, /before (?:a|any) MUTATING external write[^\n]*execution_create/i);
+});
+
 test('Claude brain keeps the installed catalog out of the stable prompt and injects only relevant skills per turn', async () => {
   const install = (name: string, description: string): void => {
     const dir = path.join(TMP_HOME, 'skills', name);
@@ -1815,11 +1827,12 @@ test('CONVERGE guard: an answer carries forward without forcing exploratory work
   delete process.env.CLEMMY_BRAIN_CONVERGE;
 });
 
-test('Claude turn context injects ONE alignment beat on a fresh execution-shaped chat request', async () => {
+test('Claude turn context carries settled pre-execution guidance without a blanket stop', async () => {
   // The v3.6 freeze removed the beat as "ceremonial" expecting the graph lane
   // to own alignment; the graph lane never landed, so v3.7/v3.8 executed
   // consequential asks with zero conversation (live 2026-08-05, the owner's
   // scrape-and-sheet request). The beat is restored and this pin holds it.
+  _setOpennessJudgeForTests(async () => null);
   const sid = createSession({ kind: 'chat' }).id;
   const request = appendEvent({
     sessionId: sid,
@@ -1832,7 +1845,8 @@ test('Claude turn context injects ONE alignment beat on a fresh execution-shaped
     message: 'Send the approved outreach emails to the named recipients.',
     sessionId: sid,
   }, { sourceUserSeq: request.seq });
-  assert.match(context, /\[confirm-first\]/, 'a consequential send earns the conversational beat');
+  assert.match(context, /\[pre-execution alignment\]/, 'a consequential send carries the settled execution guidance');
+  assert.match(context, /Proceed with the requested work in this same turn/);
   assert.equal(listEvents(sid, { types: ['turn_preflight_decision'] }).length, 1, 'the typed decision persists');
 
   // A plain lookup stays silent — the beat must never tax reads.
@@ -1841,7 +1855,203 @@ test('Claude turn context injects ONE alignment beat on a fresh execution-shaped
     message: 'whats on my calendar tomorrow',
     sessionId: readSid,
   });
-  assert.doesNotMatch(readContext, /\[confirm-first\]/);
+  assert.doesNotMatch(readContext, /\[pre-execution alignment\]/);
+});
+
+test('Claude settled alignment paints prior-aware prose and reaches the tool-capable SDK in the same turn', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  process.env.CLEMMY_CONFIRM_BEAT = 'on';
+  let authorStarted = false;
+  let judgeObservedConcurrentAuthor = false;
+  _setOpennessJudgeForTests(async () => {
+    judgeObservedConcurrentAuthor = authorStarted;
+    return null;
+  });
+  const sid = 'claude-structural-preflight';
+  const original = 'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.';
+  createSession({ id: sid, kind: 'chat', channel: 'desktop' });
+  appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'system',
+    type: 'cross_session_prefix',
+    data: { text: 'VENTURA-CONTEXT: continue the restaurant research from the prior session.' },
+  });
+  let sdkRuns = 0;
+  const captured: Array<{ artifactObjective?: string; nativeMcpScopeInput?: string; turnContext?: string }> = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    sdkRuns += 1;
+    captured.push(options);
+    return {
+      text: 'Execution reached the test boundary. What should I inspect next?',
+      sessionId: 'sdk',
+      model: 'claude-sonnet-test',
+      toolUses: [],
+      stoppedReason: 'awaiting-input',
+    };
+  });
+  let authorCalls = 0;
+  setClaudeAgentSdkBrainPreflightConversationPortForTest({
+    async render(packet) {
+      authorCalls += 1;
+      authorStarted = true;
+      assert.equal(packet.kind, 'proceed');
+      assert.match(packet.conversationContext, /VENTURA-CONTEXT/);
+      return 'I have the prior Ventura research and the sheet-to-email handoff in mind.';
+    },
+  });
+  const painted: string[] = [];
+
+  const aligned = await respondViaClaudeAgentSdkBrain('home', {
+    message: original,
+    sessionId: sid,
+    runId: 'claude-align',
+    onConversationPreamble: async (text) => {
+      painted.push(text);
+      assert.equal(sdkRuns, 0, 'the opening is delivered before the SDK execution begins');
+      return { status: 'delivered' };
+    },
+  });
+  assert.equal(aligned.stoppedReason, 'awaiting-input');
+  assert.equal(authorCalls, 1);
+  assert.equal(
+    judgeObservedConcurrentAuthor,
+    true,
+    'the Claude voice author starts before the Codex-family openness judge settles',
+  );
+  assert.equal(sdkRuns, 1, 'SETTLED reaches the ordinary Claude SDK brain in the same accepted turn');
+  assert.deepEqual(painted, ['I have the prior Ventura research and the sheet-to-email handoff in mind.']);
+  assert.match(captured[0]?.turnContext ?? '', /VENTURA-CONTEXT/);
+  assert.match(captured[0]?.turnContext ?? '', /pre-execution opening already delivered/);
+  assert.equal(listEvents(sid, { types: ['conversation_preamble'] }).length, 1);
+  const awaiting = listEvents(sid, { types: ['awaiting_user_input'] });
+  assert.equal(awaiting.length, 1);
+  assert.notEqual(awaiting[0]?.data.source, 'preflight_openness');
+  assert.equal(listEvents(sid, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(
+    captured[0]?.artifactObjective,
+    original,
+    JSON.stringify(listEvents(sid, { types: ['user_input_received', 'turn_preflight_decision', 'awaiting_user_input', 'conversation_completed'] })
+      .map((event) => ({ seq: event.seq, type: event.type, data: event.data }))),
+  );
+  assert.equal(captured[0]?.nativeMcpScopeInput, original);
+});
+
+for (const judgeMode of ['settled', 'unavailable'] as const) {
+  test(`a concrete Salesforce org proceeds through the Claude caller when the openness judge is ${judgeMode}`, async () => {
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+    process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+    process.env.CLEMMY_TOOL_JIT = 'off';
+    process.env.CLEMMY_CONFIRM_BEAT = 'on';
+    let judgeCalls = 0;
+    _setOpennessJudgeForTests(async () => {
+      judgeCalls += 1;
+      if (judgeMode === 'unavailable') throw new Error('openness judge unavailable');
+      return null;
+    });
+    const sid = `claude-salesforce-${judgeMode}`;
+    const prompt = 'Import exactly 100 Contact rows from /tmp/rc-contacts.csv into Salesforce org clementine-sandbox using External_Id__c.';
+    createSession({ id: sid, kind: 'chat', channel: 'desktop' });
+    let sdkRuns = 0;
+    setClaudeAgentSdkBrainRunForTest(async () => {
+      sdkRuns += 1;
+      return {
+        text: 'Execution reached the test boundary.',
+        sessionId: 'sdk',
+        model: 'claude-sonnet-test',
+        toolUses: [],
+        stoppedReason: 'awaiting-input',
+      };
+    });
+    let authorCalls = 0;
+    setClaudeAgentSdkBrainPreflightConversationPortForTest({
+      async render(packet) {
+        authorCalls += 1;
+        assert.equal(packet.kind, 'proceed');
+        assert.equal(packet.objective, prompt);
+        return 'I have the exact Salesforce org, import source, row bound, and merge key.';
+      },
+    });
+    const painted: string[] = [];
+
+    await respondViaClaudeAgentSdkBrain('home', {
+      message: prompt,
+      sessionId: sid,
+      runId: `claude-salesforce-${judgeMode}`,
+      onConversationPreamble: async (text) => {
+        painted.push(text);
+        assert.equal(sdkRuns, 0, 'the preamble is visible before SDK execution');
+        return { status: 'delivered' };
+      },
+    });
+
+    assert.equal(judgeCalls, 1);
+    assert.equal(authorCalls, 1);
+    assert.equal(sdkRuns, 1, 'the accepted request reaches the Claude SDK once');
+    assert.deepEqual(painted, ['I have the exact Salesforce org, import source, row bound, and merge key.']);
+    const decisions = listEvents(sid, { types: ['turn_preflight_decision'] });
+    assert.equal(decisions.length, 1);
+    assert.equal(
+      decisions[0]?.data.destinationInstanceUnstated,
+      true,
+      'the legacy request-text flag remains context, but is not an openness verdict',
+    );
+    assert.equal(listEvents(sid, { types: ['conversation_preamble'] }).length, 1);
+    assert.equal(
+      listEvents(sid, { types: ['awaiting_user_input'] })
+        .filter((event) => event.data.source === 'preflight_openness').length,
+      0,
+      'request text alone cannot publish an openness question or its terminal',
+    );
+    assert.equal(
+      listEvents(sid, { types: ['conversation_completed'] }).length,
+      1,
+      'only the ordinary SDK result owns a terminal; preflight owns none',
+    );
+  });
+}
+
+test('Claude align terminal cleanup cannot erase an overlapping attempt B restart marker', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  process.env.CLEMMY_CONFIRM_BEAT = 'on';
+  _setOpennessJudgeForTests(async () => ({ open: ['which Google account should own the sheet'] }));
+  const { HarnessSession } = await import('./session.js');
+  const sid = 'claude-align-overlap-marker';
+  createSession({ id: sid, kind: 'chat', channel: 'desktop' });
+  let secondAttemptId = '';
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    throw new Error('the tool-capable SDK must not run during align');
+  });
+  setClaudeAgentSdkBrainPreflightConversationPortForTest({
+    async render() {
+      const second = beginRunAttempt(sid, { runId: 'align-overlap-b' });
+      secondAttemptId = second.attemptId;
+      recordRunAttemptUserInput(second, {
+        turn: 2,
+        role: 'user',
+        data: { text: 'Turn B arrived while Turn A was authoring its question.' },
+      }, { armRunInFlight: true });
+      return 'I have the sheet and email handoff in mind. Should I go ahead?';
+    },
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Create a Google Sheet, then email me the link.',
+    sessionId: sid,
+    runId: 'align-overlap-a',
+  });
+
+  assert.equal(response.stoppedReason, 'awaiting-input');
+  assert.ok(secondAttemptId);
+  assert.notEqual(
+    HarnessSession.load(sid)?.runInFlightSince(),
+    null,
+    'Turn A terminal cleanup must preserve the coarse marker owned by active Turn B',
+  );
 });
 
 test('Claude SDK dispatch receives non-coercive convergence state on a clarification answer', async () => {
@@ -2691,7 +2901,7 @@ test('ordinary manual continue rotates attempt scopes without minting artifact l
   delete process.env.CLEMMY_CLAUDE_SDK_AUTO_CONTINUE;
 });
 
-test('an in-flight legacy go-ahead preserves the multi-document objective for SDK scope and artifact identity', async () => {
+test('a structurally paused go-ahead preserves the multi-document objective for SDK scope and artifact identity', async () => {
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   process.env.CLEMMY_TOOL_JIT = 'off';
   const sid = 'brain-confirmed-objective';
@@ -2725,6 +2935,30 @@ test('an in-flight legacy go-ahead preserves the multi-document objective for SD
       sourceUserSeq: legacyRequest.seq,
     },
   });
+  const question = 'I have the two-document request. Should I go ahead?';
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question,
+      purpose: 'clarification',
+      source: 'preflight_alignment',
+      sourceUserSeq: legacyRequest.seq,
+      intentKey: 'legacy-confirmed-objective',
+    },
+  });
+  const legacyIdentity = { sessionId: sid, turn: 1, sourceUserSeq: legacyRequest.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(legacyIdentity),
+    identity: legacyIdentity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: question },
+  }, { legacyReason: 'awaiting_user_input' });
   await respondViaClaudeAgentSdkBrain('home', { message: 'Go ahead.', sessionId: sid, runId: 'confirm-execute' });
 
   assert.equal(captured.length, 1);
@@ -3283,6 +3517,92 @@ test('artifact completion performs one exact-ID read-back before reporting succe
   assert.equal(calls, 2, 'one create query plus one bounded verification query');
   assert.equal(response.stoppedReason, 'success');
   assert.match(response.text, /Created the firm brief/);
+  assert.equal(artifactLedger.listUnverifiedRunArtifacts(sessionId).length, 0);
+  assert.ok(artifactLedger.listRunArtifacts(sessionId)[0]?.bindingVerifiedAt);
+});
+
+test('Google Sheet completion performs one bounded exact-ID read-back but keeps content-unproved synthetic work unverified', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  const sessionId = 'brain-sheet-artifact-verified';
+  const spreadsheetId = 'sheet_ventura_verified_123456';
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls += 1;
+    const scope = artifactLedger.resolveArtifactRunScopeId(
+      sessionId,
+      options.artifactRunScopeId ?? options.trackerScopeId as string,
+      options.sourceUserSeq,
+    );
+    if (calls === 1) {
+      const intent = artifactLedger.artifactIntentForTool('composio_execute_tool', {
+        tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',
+        arguments: JSON.stringify({
+          title: 'Top 5 Ventura Restaurants',
+          sheet_name: 'Restaurants',
+          sheet_json: [{ name: 'Lure Fish House', rating: 4.6, address: 'Ventura, CA' }],
+        }),
+      });
+      assert.ok(intent);
+      artifactLedger.claimArtifactSlot(sessionId, intent!, 'toolu_create_sheet', scope);
+      artifactLedger.bindArtifactSlot(sessionId, intent!.slotKey, {
+        resourceId: spreadsheetId,
+        uri: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+        title: 'Top 5 Ventura Restaurants',
+      }, 'toolu_create_sheet', scope);
+      return {
+        text: `Created the Ventura restaurant sheet: https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+        sessionId: 'sdk', model: 'm',
+        toolUses: ['mcp__clementine-local__work_call'],
+        artifactRunScopeId: scope,
+      };
+    }
+    assert.match(options.prompt, new RegExp(`spreadsheet_id=${spreadsheetId}`));
+    assert.doesNotMatch(options.prompt, /SHEET_FROM_JSON/);
+    assert.deepEqual(
+      options.artifactVerificationOnly,
+      [{ kind: 'resource', resourceId: spreadsheetId }],
+      'the repair permission boundary is frozen to the exact created spreadsheet id',
+    );
+    artifactLedger.verifyArtifactBindingFromToolResult(
+      sessionId,
+      scope,
+      'composio_execute_tool',
+      {
+        tool_slug: 'GOOGLESHEETS_BATCH_GET',
+        arguments: JSON.stringify({ spreadsheet_id: spreadsheetId, ranges: ['Restaurants!A1:C6'] }),
+      },
+      {
+        successful: true,
+        data: {
+          spreadsheetId,
+          spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+          valueRanges: [{ range: 'Restaurants!A1:C6', values: [['name', 'rating', 'address']] }],
+        },
+      },
+      'toolu_verify_sheet',
+      true,
+    );
+    return {
+      text: 'Provider read-back succeeded.', sessionId: 'sdk', model: 'm',
+      toolUses: ['mcp__clementine-local__work_call'],
+      artifactRunScopeId: scope,
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('background', {
+    message: 'Create a Google Sheet with the top five Ventura restaurants.',
+    sessionId,
+  });
+
+  assert.equal(calls, 2, 'one create query plus one bounded exact-ID Sheet verification query');
+  assert.equal(
+    response.stoppedReason,
+    'unverified',
+    `exact-id readability cannot upgrade a synthetic Sheet lacking frozen source/content lineage: ${JSON.stringify(response)}`,
+  );
+  assert.match(response.text, /Created the Ventura restaurant sheet/);
   assert.equal(artifactLedger.listUnverifiedRunArtifacts(sessionId).length, 0);
   assert.ok(artifactLedger.listRunArtifacts(sessionId)[0]?.bindingVerifiedAt);
 });
@@ -4301,6 +4621,111 @@ test('Claude brain materializes one exact queued-action card without another mod
   assert.equal(
     listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)?.data.reason,
     'awaiting_approval',
+  );
+});
+
+test('Claude brain projects one autonomous queued send as its ordinary exact-action question', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  const sessionId = 'brain-conversational-queued-send';
+  const channelId = 'discord-channel-conversational-send';
+  const userId = 'discord-user-conversational-send';
+  const conversationKey = `discord:${channelId}`;
+  const originReplyTarget = {
+    type: 'discord_channel' as const,
+    channelId,
+  };
+  createSession({
+    id: sessionId,
+    kind: 'chat',
+    channel: 'discord',
+    userId,
+    title: 'Prepare and send the sheet',
+    metadata: { source: 'discord', channelId, userId },
+  });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Create the sheet, then email it to proof@example.com.',
+      source: 'channel:discord',
+      userId,
+      conversationKey,
+      originReplyTarget,
+      originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget),
+    },
+  });
+
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    assert.equal(options.sourceUserSeq, source.seq);
+    const record = pendingActions.queuePendingAction({
+      title: 'Send the reviewed sheet',
+      summary: 'Send one exact request-owned email after human consent.',
+      kind: 'external_send',
+      toolName: 'outlook__OUTLOOK_SEND_EMAIL',
+      payload: {
+        to: 'proof@example.com',
+        subject: 'Reviewed sheet',
+        body: 'The sheet is ready: https://docs.google.com/spreadsheets/d/proof/edit',
+      },
+      targetSummary: 'proof@example.com',
+      sessionId,
+      sourceUserSeq: source.seq,
+    });
+    appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'Clem',
+      type: 'autonomy_note',
+      data: {
+        kind: 'pending_action_queued',
+        pendingActionId: record.id,
+        actionKind: record.kind,
+        approvalRequired: true,
+        approvalIntent: 'request_now',
+        autoMaterialize: true,
+        sourceUserSeq: source.seq,
+        payloadHash: record.payloadHash,
+      },
+    });
+    return {
+      text: 'The sheet is ready. Should I send the email?',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: ['mcp__clementine-local__pending_action_queue'],
+      successfulToolUses: ['pending_action_queue'],
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Create the sheet, then email it to proof@example.com.',
+    sessionId,
+    sourceUserSeq: source.seq,
+    channel: 'discord',
+    userId,
+  });
+
+  const [row] = approvalRegistry.listPending({ sessionId, status: 'pending' });
+  assert.ok(row?.presentation, 'the graph row freezes the conversational surface');
+  assert.equal(approvalRegistry.isFormalApprovalSurface(row), false);
+  assert.equal(response.text, row.presentation.question);
+  assert.equal(response.stoppedReason, 'awaiting-input');
+  assert.equal(response.pendingApprovalId, undefined);
+  const completed = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(completed?.data.reason, 'awaiting_user_input');
+  assert.equal(completed?.data.awaitingUser, true);
+  const presentation = completed?.data.presentation as Record<string, unknown> | undefined;
+  assert.equal(presentation?.status, 'needs_input');
+  assert.equal(presentation?.kind, 'question');
+  assert.equal(presentation?.text, row.presentation.question);
+  assert.equal(presentation?.approvalId, undefined);
+  assert.equal(
+    listEvents(sessionId, { types: ['awaiting_user_input'] }).length,
+    0,
+    'the hidden consent prompt remains the sole exact reply-binding event',
   );
 });
 

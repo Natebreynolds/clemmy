@@ -117,6 +117,12 @@ function normalizeCancellationRequest(
   };
 }
 
+function unresolvedMutationCancellationReason(reason: string): string {
+  const requestedReason = reason.trim().slice(0, 180) || 'Workflow run cancelled.';
+  const unresolvedTruth = 'Cancellation stopped this local run only. The earlier external mutation remains unresolved and may already have committed; cancellation does not undo it or prove it did not happen. Verify the destination or provider receipt before retrying.';
+  return `${requestedReason} ${unresolvedTruth}`.slice(0, 500);
+}
+
 function installCancellationReceiptUnlocked(
   runId: string,
   reason: string,
@@ -234,6 +240,12 @@ export function cancelWorkflowRunAtBoundary(input: {
     }
 
     const wasCancelled = currentStatus === 'cancelled';
+    const hasUnresolvedMutation = current.status === 'blocked_mutation';
+    const existingMutationBlock = current.mutationBlock !== null
+      && typeof current.mutationBlock === 'object'
+      && !Array.isArray(current.mutationBlock)
+      ? current.mutationBlock as Record<string, unknown>
+      : {};
     const workflowName = typeof current.workflow === 'string' ? current.workflow : 'Workflow';
     const existingReport = current.reportBack as {
       version?: unknown;
@@ -263,7 +275,9 @@ export function cancelWorkflowRunAtBoundary(input: {
             : typeof current.error === 'string' && current.error
               ? current.error
               : 'Workflow run cancelled.')
-        : input.reason;
+        : hasUnresolvedMutation
+          ? unresolvedMutationCancellationReason(input.reason)
+          : input.reason;
       request = installCancellationReceiptUnlocked(
         input.runId,
         adoptedReason,
@@ -285,6 +299,13 @@ export function cancelWorkflowRunAtBoundary(input: {
       error: request.reason,
       terminalOutcome: 'cancelled',
     };
+    if (hasUnresolvedMutation) {
+      next.mutationBlock = {
+        ...existingMutationBlock,
+        state: 'cancelled_unreconciled',
+        cancelledAt: request.requestedAt,
+      };
+    }
     delete next.parked;
     const reportBack = {
       version: 1 as const,

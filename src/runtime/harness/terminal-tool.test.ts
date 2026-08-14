@@ -5,7 +5,6 @@ import {
   terminalToolShouldHalt,
   ASK_USER_QUESTION_AUTO_RESOLVED_PREFIX,
   formatAutoResolvedAskUserQuestionOutput,
-  terminalToolShouldHalt,
 } from './terminal-tool.js';
 
 test('ask_user_question is non-terminal only with the exact auto-resolved prefix', () => {
@@ -70,6 +69,25 @@ test('a successful durable control receipt settles the foreground request on eve
   );
 });
 
+test('background status terminality is relative to durable foreground action authority', () => {
+  const receipt = '{"ok":true,"taskId":"bg-stale","status":"awaiting_input"}';
+  assert.equal(
+    terminalToolShouldHalt('background_task_status', receipt),
+    true,
+    'a status/review request is answered by one successful status receipt',
+  );
+  assert.equal(
+    terminalToolShouldHalt('background_task_status', receipt, { actionExpectedWork: true }),
+    false,
+    'inside an accepted action, status is reconciliation evidence rather than completion',
+  );
+  assert.equal(
+    terminalToolShouldHalt('background_task_revise', receipt, { actionExpectedWork: true }),
+    true,
+    'the exception is deliberately status-only',
+  );
+});
+
 // Stage 8 (status fast path): the Codex lane consumes the same control
 // receipts the Claude lane already does — the 58-status-call incident WAS on
 // Codex (live 2026-08-10: "How's it going?" → good answer produced → harness
@@ -106,6 +124,19 @@ test('the orchestrator halt hook ends the turn on a successful background contro
     },
   ] as never);
   assert.equal(notHalted.isFinalOutput, false, 'a failed control read returns to the model loop');
+
+  const actionStatus = await userChoiceToolUseBehavior({}, [
+    {
+      type: 'function_output',
+      tool: { name: 'background_task_status' },
+      output: 'Task bg-stale is awaiting input.',
+    },
+  ] as never, { actionExpectedWork: true });
+  assert.equal(
+    actionStatus.isFinalOutput,
+    false,
+    'Codex keeps an accepted action alive after reconciling stale background status',
+  );
 });
 
 // The alignment-beat refusal must never halt the turn as a "successful"

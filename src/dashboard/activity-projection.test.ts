@@ -89,6 +89,15 @@ test('durable run records project to shared snapshots with truth rules and priva
       privateEvidence: 'NEVER-IN-A-SNAPSHOT',
     },
   }), 'utf-8');
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'act-mutation.json'), JSON.stringify({
+    id: 'act-mutation', workflow: 'Team Update', status: 'blocked_mutation',
+    createdAt: '2026-08-04T10:01:30.000Z',
+    mutationBlock: {
+      state: 'awaiting_reconciliation', stepId: 'send_update',
+      fingerprint: 'a'.repeat(64), providerRedispatched: false,
+      privateProviderResponse: 'NEVER-IN-A-SNAPSHOT',
+    },
+  }), 'utf-8');
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'act-done.json'), JSON.stringify({
     id: 'act-done', workflow: 'Weekly Report', status: 'completed',
     createdAt: '2026-08-04T09:00:00.000Z', finishedAt: '2026-08-04T09:05:00.000Z',
@@ -119,6 +128,12 @@ test('durable run records project to shared snapshots with truth rules and priva
     const blocked = byKey.get('workflow:act-blocked')!;
     assert.equal(blocked.lifecycle, 'blocked');
     assert.match(String(blocked.detail), /Reconnect Salesforce/);
+
+    const mutationBlocked = byKey.get('workflow:act-mutation')!;
+    assert.equal(mutationBlocked.lifecycle, 'blocked');
+    assert.equal(mutationBlocked.needsAttention, true);
+    assert.match(String(mutationBlocked.detail), /send_update/);
+    assert.match(String(mutationBlocked.detail), /not sent again/i);
 
     const done = byKey.get('workflow:act-done')!;
     assert.equal(done.lifecycle, 'completed');
@@ -276,4 +291,23 @@ test('the projector never invents identity and unknown statuses stay honest', ()
   )!;
   assert.equal(odd.lifecycle, 'accepted', 'an unknown status was mapped to running or completed');
   assert.equal(odd.terminal, undefined);
+});
+
+test('a canonical workflow clarification projects as awaiting_input and needs attention', () => {
+  const paused = projectWorkflowRunActivity({
+    id: 'workflow-input-pause',
+    workflow: 'Account Scope Workflow',
+    status: 'awaiting_input',
+    createdAt: '2026-08-11T18:00:00.000Z',
+    awaitingInput: {
+      questionId: 'workflow-input:workflow-input-pause:choose_scope:q1',
+      question: 'Should I use enterprise accounts or every account?',
+      stepId: 'choose_scope',
+    },
+  }, '2026-08-11T18:01:00.000Z')!;
+
+  assert.equal(paused.lifecycle, 'awaiting_input',
+    'canonical awaiting_input fell through to the generic accepted lifecycle');
+  assert.equal(paused.needsAttention, true);
+  assert.equal(paused.terminal, undefined, 'a clarification pause became terminal');
 });

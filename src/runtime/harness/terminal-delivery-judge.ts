@@ -17,6 +17,15 @@ import { extractJsonCandidate } from './json-repair.js';
 
 export type TerminalDeliveryJudgeVerb = 'resume' | 'ask' | 'deliver';
 
+export interface TerminalDeliveryRecoveryCapability {
+  /** The caller still owns a live continuation edge after this verdict. */
+  liveContinuation: boolean;
+  /** That continuation can invoke the task's available tools. */
+  toolsAvailable: boolean;
+  /** It can attempt a read-only inspection of the relevant external state. */
+  externalStateInspection: boolean;
+}
+
 export interface TerminalDeliveryJudgeInput {
   /** The exact accepted task, composed by the caller. */
   objective: string;
@@ -31,6 +40,9 @@ export interface TerminalDeliveryJudgeInput {
   settlementAudit: AcceptedSourceSettlementAudit;
   /** Consecutive RESUME verdicts already honored for this terminal gap. */
   priorConsecutiveResumes: 0 | 1;
+  /** What the caller can actually do if the judge selects RESUME. The judge
+   * itself remains tool-less; these facts describe the running agent. */
+  recoveryCapability: TerminalDeliveryRecoveryCapability;
 }
 
 interface ParsedTerminalDeliveryJudgeBase {
@@ -91,6 +103,7 @@ export type TerminalDeliveryJudgeUnavailableCause =
   | 'timeout'
   | 'judge_error'
   | 'invalid_verdict'
+  | 'resume_unavailable'
   | 'irreversible_floor_conflict';
 
 /** Intentionally has no public/recovery text. An unavailable judge cannot add
@@ -196,6 +209,7 @@ function auditFactsForPrompt(audit: AcceptedSourceSettlementAudit): string {
     businessSettlements: facts.businessSettlements,
     successfulBusinessSettlements: facts.successfulBusinessSettlements,
     successfulSdkBusinessResults: facts.successfulSdkBusinessResults,
+    successfulSdkAuthoringResults: facts.successfulSdkAuthoringResults,
     unrecoveredBusinessFailures: facts.unrecoveredBusinessFailures,
     confirmedWrites: facts.confirmedWrites,
     uncertainWrites: facts.uncertainWrites,
@@ -204,7 +218,7 @@ function auditFactsForPrompt(audit: AcceptedSourceSettlementAudit): string {
 }
 
 export const TERMINAL_DELIVERY_JUDGE_SYSTEM_PROMPT = [
-  'You are an independent terminal-delivery judge. You have no tools and may choose exactly one next verb: RESUME, ASK, or DELIVER.',
+  'You are an independent terminal-delivery judge. You have no tools, but the running agent may still have a live tool-capable continuation. Use the RECOVERY CAPABILITY facts below and choose exactly one next verb: RESUME, ASK, or DELIVER.',
   '',
   'RESUME only when one specific gap can be repaired now by the running agent without new user information or authorization. Supply a concrete recoveryInstruction for the agent and a complete, user-facing askIfRepeated that should be shown if this recovery misses once.',
   'ASK when progress cannot safely continue without the user or a human inspection. publicText must directly ask for the exact information, authorization, or inspection needed.',
@@ -212,6 +226,7 @@ export const TERMINAL_DELIVERY_JUDGE_SYSTEM_PROMPT = [
   '',
   'Never invent work, evidence, links, receipts, or user authority. Preserve concrete useful results from the authored terminal text. Public text must not mention this judge, an internal gate, a parser, or hidden audit mechanics.',
   'If IRREVERSIBLE UNCERTAINTY is marked YES, ASK is the only valid verb: the user or a human must inspect the external state. Never RESUME or DELIVER that ambiguity.',
+  'Otherwise, when live continuation, tools, and external-state inspection are all AVAILABLE, never ASK the user to inspect a provider, spreadsheet, mailbox, sent folder, calendar, or other external state that the running agent can inspect itself. Choose RESUME and give one specific read-only recovery instruction that checks the exact target and binds the observed result to this accepted objective.',
   '',
   'Return exactly one JSON object and no other text, using exactly one applicable shape:',
   '{"verb":"resume","reason":"<short diagnosis>","recoveryInstruction":"<specific internal instruction>","askIfRepeated":"<complete user-facing question>"}',
@@ -242,6 +257,11 @@ export function buildTerminalDeliveryJudgePrompt(input: TerminalDeliveryJudgeInp
     `reason: ${clip(input.settlementAudit.reason, CONCERN_MAX_CHARS)}`,
     `facts: ${auditFactsForPrompt(input.settlementAudit)}`,
     `IRREVERSIBLE UNCERTAINTY: ${irreversibleFloor ? 'YES — ASK is mandatory' : 'NO'}`,
+    '',
+    '=== RECOVERY CAPABILITY (running agent, not this judge) ===',
+    `Live continuation: ${input.recoveryCapability.liveContinuation ? 'AVAILABLE' : 'UNAVAILABLE'}`,
+    `Tools during continuation: ${input.recoveryCapability.toolsAvailable ? 'AVAILABLE' : 'UNAVAILABLE'}`,
+    `Read-only external-state inspection: ${input.recoveryCapability.externalStateInspection ? 'AVAILABLE' : 'UNAVAILABLE'}`,
     '',
     `Consecutive RESUME verdicts already honored: ${input.priorConsecutiveResumes}`,
     'Choose the next verb and return the one JSON object.',
@@ -360,6 +380,9 @@ export async function evaluateTerminalDelivery(
 
   const judge = judgeIdentity(route);
   if (parsed.verb === 'resume') {
+    // The second consecutive RESUME is no longer a control edge: it is the
+    // judge-authored two-strike ASK. Convert it before checking continuation
+    // capability because this branch does not run another model/tool turn.
     if (input.priorConsecutiveResumes >= 1) {
       return {
         status: 'decided',
@@ -370,6 +393,17 @@ export async function evaluateTerminalDelivery(
         escalatedFromResume: true,
         judge,
       };
+    }
+    // A first RESUME is a real control edge, not advisory prose. Prompt
+    // compliance is not authority: refuse it unless the caller still owns a
+    // tool-capable, read-only continuation. In particular, a final-step
+    // terminal must not `continue` out without committing a public outcome.
+    if (
+      !input.recoveryCapability.liveContinuation
+      || !input.recoveryCapability.toolsAvailable
+      || !input.recoveryCapability.externalStateInspection
+    ) {
+      return unavailable('resume_unavailable', route);
     }
     return {
       status: 'decided',

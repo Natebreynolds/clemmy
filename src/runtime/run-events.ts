@@ -27,6 +27,38 @@ export interface RunEvent {
   data?: Record<string, unknown>;
 }
 
+export type RunInputBlocker =
+  | {
+    kind: 'clarifying_question';
+    questionId: string;
+    question: string;
+    source: { kind: 'background_task'; taskId: string };
+    nextAction: string;
+  }
+  | {
+    kind: 'continue_authorization';
+    questionId: string;
+    question: string;
+    source: { kind: 'background_task'; taskId: string };
+    nextAction: string;
+  }
+  | {
+    kind: 'workflow_clarification';
+    questionId: string;
+    question: string;
+    source: { kind: 'workflow_step'; workflow: string; runId: string; stepId: string };
+    nextAction: string;
+  }
+  | {
+    kind: 'capability_dependency';
+    dependencyId: string;
+    source: { kind: 'workflow_step'; workflow: string; runId: string; stepId: string };
+    operation: { stepId: string; tool: string; toolkit: string; reason: string };
+    nextAction: string;
+    retryAt?: string;
+    provenNoDispatch: boolean;
+  };
+
 export interface RunRecord {
   id: string;
   sessionId: string;
@@ -41,6 +73,8 @@ export interface RunRecord {
   completedAt?: string;
   queuedTaskId?: string;
   pendingApprovalId?: string;
+  /** Typed user dependency. Mutually exclusive with pendingApprovalId. */
+  pendingInput?: RunInputBlocker;
   error?: string;
   outputPreview?: string;
   /** Terminal run completed mechanically but still needs human review/action. */
@@ -122,6 +156,8 @@ export function startRun(input: {
     existing.status = 'running';
     existing.updatedAt = now;
     delete existing.needsAttention;
+    delete existing.pendingApprovalId;
+    delete existing.pendingInput;
     existing.events.push({
       id: randomUUID(),
       type: 'received',
@@ -182,6 +218,10 @@ export function addRunEvent(
   });
   run.events = run.events.slice(-MAX_EVENTS_PER_RUN);
   run.status = event.status ?? run.status;
+  if (event.status && event.status !== 'awaiting_approval' && event.status !== 'awaiting_input') {
+    delete run.pendingApprovalId;
+    delete run.pendingInput;
+  }
   run.updatedAt = now;
   saveRuns(runs);
   emitLatestEvent(run);
@@ -196,6 +236,7 @@ export function finishRun(
     outputPreview?: string;
     queuedTaskId?: string;
     pendingApprovalId?: string;
+    pendingInput?: RunInputBlocker;
     error?: string;
     needsAttention?: boolean;
   },
@@ -213,7 +254,16 @@ export function finishRun(
   }
   run.outputPreview = input.outputPreview ? clean(input.outputPreview, 1200) : run.outputPreview;
   run.queuedTaskId = input.queuedTaskId ?? run.queuedTaskId;
-  run.pendingApprovalId = input.pendingApprovalId ?? run.pendingApprovalId;
+  if (input.status === 'awaiting_approval') {
+    run.pendingApprovalId = input.pendingApprovalId;
+    delete run.pendingInput;
+  } else if (input.status === 'awaiting_input') {
+    run.pendingInput = input.pendingInput;
+    delete run.pendingApprovalId;
+  } else {
+    delete run.pendingApprovalId;
+    delete run.pendingInput;
+  }
   run.error = input.error ?? run.error;
   if (input.needsAttention === true) run.needsAttention = true;
   else delete run.needsAttention;
@@ -235,6 +285,7 @@ export function finishRun(
     data: {
       queuedTaskId: input.queuedTaskId,
       pendingApprovalId: input.pendingApprovalId,
+      pendingInput: input.pendingInput,
     },
   });
   run.events = run.events.slice(-MAX_EVENTS_PER_RUN);

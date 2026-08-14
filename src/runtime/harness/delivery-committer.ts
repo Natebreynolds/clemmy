@@ -54,6 +54,7 @@ const DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
   'blockedReason',
   'verificationDetail',
   'verificationMissing',
+  'failureDetail',
   'deliveryDisclosure',
   'terminalRepairStatus',
   'terminalRepairGrantId',
@@ -343,6 +344,7 @@ function deliveryMustHoldWhenJudgeUnavailable(audit: AcceptedSourceSettlementAud
     || (
       audit.facts.successfulBusinessSettlements === 0
       && audit.facts.successfulSdkBusinessResults === 0
+      && audit.facts.successfulSdkAuthoringResults === 0
       && audit.facts.confirmedWrites === 0
     );
 }

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import {
   getProactivityPolicySnapshot,
@@ -12,6 +13,11 @@ import {
 } from '../harness/eventlog.js';
 import type { TurnIdentity } from '../harness/turn-outcome.js';
 import type { TaskContinuationContext } from '../../types.js';
+import {
+  rehydrateConsumedClarificationContext,
+  verifyDurableClarificationContext,
+  verifiedAcceptedControlSemanticInput,
+} from '../harness/task-continuity-runtime.js';
 import {
   compileTurnGraph,
   snapshotTurnGraphPolicy,
@@ -28,12 +34,85 @@ export interface RecordTurnGraphShadowInput {
   surface?: TurnGraphSurface;
   allowedToolNames?: readonly string[];
   excludedToolNames?: readonly string[];
-  /** Exact-source runtime continuation context. Only the independently parsed
-   * fresh clause of `declined_with_new_task` may override graph semantics; the
-   * accepted event remains the graph's immutable parent/identity. */
+  /** Exact-source runtime continuation context. A non-decline compiles from
+   * its durable A/Q/B capsule; only the independently parsed fresh clause of
+   * `declined_with_new_task` may exclude A. B remains the immutable graph
+   * parent and accepted-task identity in either case. */
   verifiedTaskContinuation?: TaskContinuationContext;
   /** Injection seam for callers/tests that already captured the policy. */
   policy?: TurnGraphPolicySnapshot | ProactivityPolicySnapshot;
+}
+
+interface TaskContinuationLineage {
+  packetId: string;
+  parentSourceUserSeq: number;
+  parentAcceptedTaskId: string;
+  consumingSourceUserSeq: number;
+  acceptedTaskId: string;
+  disposition: TaskContinuationContext['disposition'];
+}
+
+// Keep the graph reader off attempt-identity's dispatch-ledger module cycle.
+// This is the accepted-task protocol's public deterministic identity formula;
+// production pins compare it to acceptedTaskIdFor at the authority boundary.
+function lineageAcceptedTaskId(sessionId: string, sourceUserSeq: number): string {
+  return `task:${sessionId}#${sourceUserSeq}`;
+}
+
+function continuationLineageFor(
+  sessionId: string,
+  context: TaskContinuationContext,
+): TaskContinuationLineage {
+  return {
+    packetId: context.packetId,
+    parentSourceUserSeq: context.parentSourceUserSeq,
+    parentAcceptedTaskId: lineageAcceptedTaskId(sessionId, context.parentSourceUserSeq),
+    consumingSourceUserSeq: context.consumingSourceUserSeq,
+    acceptedTaskId: lineageAcceptedTaskId(sessionId, context.consumingSourceUserSeq),
+    disposition: context.disposition,
+  };
+}
+
+function parseContinuationLineage(value: unknown): TaskContinuationLineage | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const dispositions = new Set<TaskContinuationContext['disposition']>([
+    'affirmed', 'declined', 'declined_with_new_task', 'selected', 'provided',
+  ]);
+  if (
+    typeof row.packetId !== 'string'
+    || !row.packetId
+    || typeof row.parentSourceUserSeq !== 'number'
+    || !Number.isSafeInteger(row.parentSourceUserSeq)
+    || Number(row.parentSourceUserSeq) <= 0
+    || typeof row.parentAcceptedTaskId !== 'string'
+    || typeof row.consumingSourceUserSeq !== 'number'
+    || !Number.isSafeInteger(row.consumingSourceUserSeq)
+    || Number(row.consumingSourceUserSeq) <= 0
+    || typeof row.acceptedTaskId !== 'string'
+    || !dispositions.has(row.disposition as TaskContinuationContext['disposition'])
+    || Object.keys(row).some((key) => ![
+      'packetId',
+      'parentSourceUserSeq',
+      'parentAcceptedTaskId',
+      'consumingSourceUserSeq',
+      'acceptedTaskId',
+      'disposition',
+    ].includes(key))
+  ) return null;
+  return row as unknown as TaskContinuationLineage;
+}
+
+function sameContinuationLineage(
+  left: TaskContinuationLineage,
+  right: TaskContinuationLineage,
+): boolean {
+  return left.packetId === right.packetId
+    && left.parentSourceUserSeq === right.parentSourceUserSeq
+    && left.parentAcceptedTaskId === right.parentAcceptedTaskId
+    && left.consumingSourceUserSeq === right.consumingSourceUserSeq
+    && left.acceptedTaskId === right.acceptedTaskId
+    && left.disposition === right.disposition;
 }
 
 /**
@@ -56,6 +135,38 @@ export function turnGraphFromShadowEvent(event: EventRow | null): TurnGraphIR | 
     || graph.graphId !== event.data.graphId
     || graph.compiler.graphHash !== event.data.graphHash
   ) return null;
+  const rawLineage = event.data.taskContinuationLineage;
+  if (rawLineage !== undefined) {
+    const lineage = parseContinuationLineage(rawLineage);
+    const source = acceptedSource(graph.identity);
+    const sourceText = source ? acceptedText(source) : '';
+    if (!lineage || !source || !sourceText) return null;
+    const durable = rehydrateConsumedClarificationContext({
+      sessionId: event.sessionId,
+      sourceUserSeq: graph.identity.sourceUserSeq,
+      answer: sourceText,
+    });
+    if (
+      !durable
+      || !sameContinuationLineage(
+        lineage,
+        continuationLineageFor(event.sessionId, durable),
+      )
+    ) return null;
+    const semanticText = graphSemanticText(sourceText, graph.identity, durable, source);
+    const expectedInputHash = createHash('sha256').update(semanticText, 'utf8').digest('hex');
+    if (graph.source.inputHash !== expectedInputHash) return null;
+  } else {
+    const source = acceptedSource(graph.identity);
+    const sourceText = source ? acceptedText(source) : '';
+    const semanticText = source
+      ? graphSemanticText(sourceText, graph.identity, undefined, source)
+      : sourceText;
+    if (
+      !sourceText
+      || graph.source.inputHash !== createHash('sha256').update(semanticText, 'utf8').digest('hex')
+    ) return null;
+  }
   const validation = validateTurnGraph(graph);
   return validation.ok ? graph : null;
 }
@@ -78,17 +189,50 @@ function graphSemanticText(
   sourceText: string,
   identity: RecordTurnGraphShadowInput['identity'],
   context?: TaskContinuationContext,
+  source?: EventRow,
 ): string {
+  // A conversational Yes is not a fresh semantic task. Rehydrate the exact
+  // frozen send only after the registry proves this accepted source is the
+  // addressed response that resolved it. This makes the graph/expected-work
+  // contract an act/external_write contract instead of direct_reply/zero-op.
+  const acceptedControl = source
+    ? verifiedAcceptedControlSemanticInput(source, identity)
+    : null;
+  if (acceptedControl) return acceptedControl;
   if (
-    context?.disposition !== 'declined_with_new_task'
+    !context
     || context.consumingSourceUserSeq !== identity.sourceUserSeq
     || context.answer !== sourceText
-    || typeof context.activeTaskInput !== 'string'
-    || !context.activeTaskInput.trim()
   ) return sourceText;
-  const normalizedSource = sourceText.replace(/\s+/g, ' ').trim();
-  const normalizedActive = context.activeTaskInput.replace(/\s+/g, ' ').trim();
-  return normalizedSource.includes(normalizedActive) ? normalizedActive : sourceText;
+  if (context.disposition === 'declined_with_new_task') {
+    if (typeof context.activeTaskInput !== 'string' || !context.activeTaskInput.trim()) {
+      return sourceText;
+    }
+    const normalizedSource = sourceText.replace(/\s+/g, ' ').trim();
+    const normalizedActive = context.activeTaskInput.replace(/\s+/g, ' ').trim();
+    return normalizedSource.includes(normalizedActive) ? normalizedActive : sourceText;
+  }
+  if (context.disposition === 'declined') return sourceText;
+  // affirmed / selected / provided: the answer resolves the parent ask's open
+  // slot, so THE TASK IS THE CANONICAL A/Q/B CAPSULE. In particular Q may
+  // contain the model's corrected interpretation or destination (live:
+  // "amplify" meant Apify and Nate meant nathan.reynolds@scorpion.co). Omitting
+  // it would correctly recover the action ceiling while still executing the
+  // wrong task. Classifying the bare answer routed a
+  // full action turn as a zero-op retrieve — "Highest value would be perfect"
+  // compiled with ceiling read while the run pulled Salesforce data, built a
+  // draft, and needed to send it (live 2026-08-12, seq 44061), which severed
+  // the send from every authority YOLO auto-approve rides on. Compile route,
+  // effect ceiling, and contract from the composite instead.
+  if (
+    typeof context.retrievalQuery === 'string'
+    && context.retrievalQuery.trim()
+    && context.parentInput.trim()
+    && context.question.trim()
+  ) {
+    return context.retrievalQuery.trim();
+  }
+  return sourceText;
 }
 
 function isGraphPolicy(value: RecordTurnGraphShadowInput['policy']): value is TurnGraphPolicySnapshot {
@@ -98,9 +242,10 @@ function isGraphPolicy(value: RecordTurnGraphShadowInput['policy']): value is Tu
 /**
  * Compile and persist the observational graph for one exact accepted chat turn.
  *
- * This function is intentionally fail-open. It never changes routing, prompts,
- * tools, approvals, execution, or the public terminal, and any compiler/DB
- * failure is swallowed so the v3.6 path remains byte-for-byte authoritative.
+ * Ordinary observations remain best-effort. A supplied continuation is
+ * execution-sensitive because it can raise the effect ceiling, so unverifiable
+ * A/Q/B lineage returns null and the provider admission boundary fails closed.
+ * This function never performs external work.
  */
 export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventRow | null {
   try {
@@ -117,13 +262,36 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
     if (!session) return null;
     const source = acceptedSource(input.identity);
     if (!source || source.turn !== input.identity.turn) return null;
+    const sourceText = acceptedText(source);
+    const verifiedContinuation = input.verifiedTaskContinuation
+      ? verifyDurableClarificationContext({
+          sessionId: input.identity.sessionId,
+          sourceUserSeq: input.identity.sourceUserSeq,
+          answer: sourceText,
+          context: input.verifiedTaskContinuation,
+        })
+      : undefined;
+    // Continuation semantics can raise the route/effect ceiling. A stale or
+    // caller-forged A/Q/B capsule therefore fails closed instead of compiling
+    // the bare answer and later admitting work under contradictory authority.
+    if (input.verifiedTaskContinuation && !verifiedContinuation) return null;
+    const lineage = verifiedContinuation
+      ? continuationLineageFor(input.identity.sessionId, verifiedContinuation)
+      : undefined;
     const graphId = `turn-graph:v1:${input.identity.sourceUserSeq}`;
     const prior = getTurnGraphEventForSource(
       input.identity.sessionId,
       input.identity.sourceUserSeq,
     );
     if (prior) {
-      return prior.turn === source.turn
+      const priorLineage = prior.data.taskContinuationLineage === undefined
+        ? undefined
+        : parseContinuationLineage(prior.data.taskContinuationLineage);
+      if (lineage && (!priorLineage || !sameContinuationLineage(lineage, priorLineage))) {
+        return null;
+      }
+      return turnGraphFromShadowEvent(prior)
+        && prior.turn === source.turn
         && prior.parentEventId === source.id
         && prior.data.graphId === graphId
         ? prior
@@ -131,9 +299,10 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
     }
 
     const text = graphSemanticText(
-      acceptedText(source),
+      sourceText,
       input.identity,
-      input.verifiedTaskContinuation,
+      verifiedContinuation ?? undefined,
+      source,
     );
     const policy = isGraphPolicy(input.policy)
       ? input.policy
@@ -178,6 +347,7 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
         authorityRequirements,
         capabilityKinds,
         warnings: compiled.validation.warnings,
+        ...(lineage ? { taskContinuationLineage: lineage } : {}),
         graph,
       },
     }).event;

@@ -10,10 +10,21 @@ process.env.CLEMMY_APPROVAL_POLL_MS = '15'; // fast poll for the test
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { createSession, listEvents } = await import('./eventlog.js');
+const {
+  beginRunAttempt,
+  createSession,
+  listEvents,
+  recordRunAttemptUserInput,
+} = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
-const { buildGatedToolPermission, workflowApprovalResumeKey } = await import('./claude-agent-approval.js');
+const {
+  buildGatedToolPermission,
+  surfaceDeferredConversationalApproval,
+  workflowApprovalResumeKey,
+} = await import('./claude-agent-approval.js');
 const { closePlanScope, destructivePlanActionKey, openPlanScope } = await import('../../agents/plan-scope.js');
+const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
+const { listNotifications } = await import('../notifications.js');
 
 // These tests exercise the approval-GATE MACHINERY (register → await →
 // allow/deny, park mode, replay safety). Their precondition is "this action
@@ -24,6 +35,68 @@ const { closePlanScope, destructivePlanActionKey, openPlanScope } = await import
 // execution gate.) Irreversible sends are held regardless of posture.
 const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
 saveProactivityPolicy({ autoApproveScope: 'strict' });
+
+test('production direct SDK send in autonomous mode creates an ordinary exact-action question, not a card', async () => {
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const sess = createSession({
+      kind: 'chat',
+      channel: 'discord',
+      metadata: { channelId: 'direct-send-channel' },
+    });
+    const attempt = beginRunAttempt(sess.id, { runId: 'direct-send-inbound' });
+    const originReplyTarget = { type: 'discord_channel' as const, channelId: 'direct-send-channel' };
+    const accepted = recordRunAttemptUserInput(attempt, {
+      turn: 1,
+      role: 'user',
+      data: {
+        text: 'Make the sheet, then send the email to nate@example.com.',
+        displayText: 'Make the sheet, then send the email to nate@example.com.',
+        source: 'channel:discord',
+        userId: 'user-nate',
+        conversationKey: 'discord:direct-send-channel',
+        originReplyTarget,
+        originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget),
+      },
+    }, { armRunInFlight: true });
+    const args = {
+      to: 'nate@example.com',
+      subject: 'Sales pipeline summary',
+      body: 'The sheet is ready: https://docs.google.com/spreadsheets/d/example',
+    };
+    let boundary: Parameters<typeof surfaceDeferredConversationalApproval>[0] | null = null;
+    const perm = buildGatedToolPermission(
+      sess.id,
+      ['memory_read'],
+      { approvalMode: 'park', sourceUserSeq: accepted.seq, onApprovalBoundary: (value) => { boundary = value; } },
+    ) as unknown as Perm;
+    const result = await perm('mcp__outlook__OUTLOOK_SEND_EMAIL', args, opts());
+    assert.equal(result.behavior, 'deny');
+    const [row] = approvalRegistry.listPending({ sessionId: sess.id });
+    assert.equal(row.presentation?.kind, 'autonomous_send_consent');
+    assert.equal(row.presentation?.audienceUserId, 'user-nate');
+    assert.equal(row.presentation?.conversationKey, 'discord:direct-send-channel');
+    assert.match(row.presentation?.question ?? '', /nate@example\.com/);
+    assert.match(row.presentation?.question ?? '', /Sales pipeline summary/);
+    assert.match(row.presentation?.question ?? '', /docs\.google\.com/);
+    assert.equal(approvalRegistry.isFormalApprovalSurface(row), false);
+    assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 0,
+      'permission hook parks before exposing a question while the SDK still owns A');
+    assert.ok(boundary);
+    assert.equal(surfaceDeferredConversationalApproval(boundary!), row.presentation?.question);
+    const event = listEvents(sess.id, { types: ['approval_requested'] }).at(-1);
+    const surfacedRow = approvalRegistry.get(row.approvalId);
+    assert.equal(event?.data.approvalPresentation, 'conversation');
+    assert.equal(surfacedRow?.presentation?.promptEventId, event?.id);
+    assert.equal(
+      listNotifications(100).some((notification) => notification.metadata?.approvalId === row.approvalId),
+      false,
+      'ordinary conversational consent must not enter any approval-card notification projector',
+    );
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'strict' });
+  }
+});
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const opts = (): unknown => ({ signal: new AbortController().signal, toolUseID: 't' });

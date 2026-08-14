@@ -22,7 +22,10 @@
  * surface as soft signals the user can override.
  */
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
-import { getCachedToolSchema } from '../tools/composio-schema-cache.js';
+import {
+  getCachedToolSchema,
+  liveComposioSchemaFingerprint,
+} from '../tools/composio-schema-cache.js';
 import { validateArgsAgainstSchema } from '../tools/composio-batch-validator.js';
 import { matchToolChoicesForStep, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
 import { composioSlugEffectEvidence } from '../integrations/composio/slug-effect.js';
@@ -33,6 +36,10 @@ import {
   textMentionsDeliverable,
 } from './workflow-deliverable-hints.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import {
+  argsHaveStaticSendTarget,
+  isSendTargetArgumentKey,
+} from '../runtime/harness/grounding-gate.js';
 import { textTargetsConfiguredUserRecipient } from '../runtime/user-profile.js';
 
 /**
@@ -74,7 +81,13 @@ export interface WorkflowStepShape {
   side_effect?: 'read' | 'write' | 'send';
   /** Typed step contract (P0). Keys = declared input names. */
   inputs?: Record<string, unknown>;
-  output?: Record<string, unknown>;
+  output?: {
+    type?: string;
+    required_keys?: unknown;
+    non_empty?: unknown;
+    min_items?: unknown;
+    verify?: { path_exists?: unknown; url_present?: unknown };
+  };
   loopUntil?: {
     maxAttempts?: number;
     probe?: { runner?: string };
@@ -87,6 +100,7 @@ export interface WorkflowStepShape {
     until?: unknown;
   };
   loop_safe?: boolean;
+  optional?: boolean;
 }
 
 export interface WorkflowFrontmatter {
@@ -110,6 +124,8 @@ export interface WorkflowFrontmatter {
     maxAttempts?: number;
     max_attempts?: number;
   };
+  allowSends?: boolean;
+  allow_sends?: boolean;
 }
 
 export interface WorkflowValidation {
@@ -565,6 +581,13 @@ export interface ValidateOptions {
    *  should bind a proven cli/mcp choice but doesn't (and stays exposed to the
    *  composio drift gateway) gets a WARNING. Caller passes listToolChoices(). */
   rememberedToolChoices?: ToolChoiceRecord[];
+  /** Disabled drafts must be installable before provider auth/schema exists,
+   * but enable/run validation never sets this relaxation. */
+  allowDisabledExactSendDraft?: boolean;
+  /** Runner-only: exact call slots already carrying a durable committed
+   * dispatch contract may validate for replay without renewing a live schema
+   * lease. The call node still re-renders/binds args before exposing output. */
+  exactSendCommittedReplayStepIds?: ReadonlySet<string>;
 }
 
 const MULTI_ITEM_NOUN = '(?:accounts?|sites?|firms?|leads?|contacts?|emails?|drafts?|rows?|prospects?|messages?|posts?)';
@@ -620,7 +643,7 @@ export function stepLooksMultiItemWithoutForEach(step: WorkflowStepShape): boole
 /** CALL-2b: a call step's side-effect class for validation — declared sideEffect
  *  wins, else derived from the tool slug (mirrors callToolSideEffectClass in the
  *  runner; kept local to avoid a validator→runner import cycle). */
-function callSideEffectClass(step: WorkflowStepShape): 'read' | 'write' | 'send' {
+export function structuredCallSideEffectClass(step: WorkflowStepShape): 'read' | 'write' | 'send' {
   const t = (step.call?.tool ?? '');
   // A real SEND slug can NEVER be downgraded by an explicit sideEffect — the
   // canonical predicate is checked FIRST so an author labeling a VAPI_CREATE_CALL
@@ -638,6 +661,302 @@ function callSideEffectClass(step: WorkflowStepShape): 'read' | 'write' | 'send'
   // send slugs above can never be downgraded (fold 2026-07-17 final-wave #4).
   if (evidence === 'unknown' && step.sideEffect === 'read') return 'read';
   return 'write';
+}
+
+export type ExactScheduledSendIneligibility =
+  | 'workflow_not_explicitly_enabled'
+  | 'workflow_not_scheduled'
+  | 'autonomous_sends_disabled'
+  | 'step_approval_required'
+  | 'explicit_send_class_required'
+  | 'direct_send_tool_required'
+  | 'direct_send_tool_unverified'
+  | 'live_schema_authority_unavailable'
+  | 'multiple_autonomous_send_steps'
+  | 'unsupported_executor_shape'
+  | 'fixed_target_required'
+  | 'unsupported_template'
+  | 'payload_required'
+  | 'template_source_not_dependency'
+  | 'template_source_not_host_owned'
+  | 'template_source_may_be_empty'
+  | 'host_commit_evidence_contract_required';
+
+export type ExactScheduledSendEligibility =
+  | { eligible: true }
+  | { eligible: false; reason: ExactScheduledSendIneligibility };
+
+interface ExactCallTemplateReference {
+  stepId: string;
+  path: string;
+  inPayload: boolean;
+}
+
+const EXACT_CALL_TEMPLATE_RE = /\{\{\s*([^{}]+?)\s*\}\}/g;
+const EXACT_CALL_STEP_TOKEN_RE = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.([a-zA-Z0-9_.-]+))?$/;
+const STRUCTURED_CALL_MULTIPLEXERS = new Set([
+  'call_tool',
+  'composio_execute_tool',
+  'run_batch',
+  'run_tool_program',
+  'work_call',
+]);
+
+// Provider-neutral content fields. Destination/recipient/channel identifiers
+// are intentionally absent: target proof is separate, and a literal target
+// must never masquerade as message substance.
+const EXACT_SEND_PAYLOAD_KEYS = new Set([
+  'attachments',
+  'blocks',
+  'body',
+  'caption',
+  'content',
+  'fields',
+  'html',
+  'markdown_text',
+  'message',
+  'row',
+  'rows',
+  'row_data',
+  'subject',
+  'text',
+  'value',
+  'values',
+]);
+
+function normalizedExactSendArgKey(key: string): string {
+  return key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[-\s]+/g, '_').toLowerCase();
+}
+
+function exactCallTemplateReferences(value: unknown):
+  | { ok: true; references: ExactCallTemplateReference[]; hasLiteralPayload: boolean }
+  | { ok: false } {
+  const references: ExactCallTemplateReference[] = [];
+  let hasLiteralPayload = false;
+  const visit = (candidate: unknown, depth = 0, inPayload = false): boolean => {
+    if (depth > 12) return false;
+    if (candidate === null || typeof candidate === 'number' || typeof candidate === 'boolean') return true;
+    if (typeof candidate === 'string') {
+      const matches = [...candidate.matchAll(EXACT_CALL_TEMPLATE_RE)];
+      const unmatched = candidate.replace(EXACT_CALL_TEMPLATE_RE, '');
+      if (unmatched.includes('{{') || unmatched.includes('}}')) return false;
+      if (inPayload && matches.length === 0 && candidate.trim()) hasLiteralPayload = true;
+      const isOneFullToken = matches.length === 1 && candidate.trim() === matches[0][0].trim();
+      for (const match of matches) {
+        const parsed = EXACT_CALL_STEP_TOKEN_RE.exec(match[1].trim());
+        if (!parsed) return false;
+        // renderTemplate supports embedded whole outputs, while dotted output
+        // paths preserve their raw value only when the token is the full arg.
+        if (parsed[2] && !isOneFullToken) return false;
+        references.push({ stepId: parsed[1], path: parsed[2] ?? '', inPayload });
+      }
+      return true;
+    }
+    if (Array.isArray(candidate)) return candidate.every((entry) => visit(entry, depth + 1, inPayload));
+    if (candidate && typeof candidate === 'object') {
+      return Object.entries(candidate as Record<string, unknown>).every(([key, entry]) => (
+        !key.includes('{{')
+        && !key.includes('}}')
+        && visit(
+          entry,
+          depth + 1,
+          !isSendTargetArgumentKey(key)
+            && (inPayload || EXACT_SEND_PAYLOAD_KEYS.has(normalizedExactSendArgKey(key))),
+        )
+      ));
+    }
+    return false;
+  };
+  return visit(value) ? { ok: true, references, hasLiteralPayload } : { ok: false };
+}
+
+function transitiveDependenciesOf(step: WorkflowStepShape, steps: WorkflowStepShape[]): Set<string> {
+  const byId = new Map(steps.map((candidate) => [candidate.id, candidate]));
+  const seen = new Set<string>();
+  const pending = [...(step.dependsOn ?? [])];
+  while (pending.length > 0) {
+    const id = pending.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    pending.push(...(byId.get(id)?.dependsOn ?? []));
+  }
+  return seen;
+}
+
+function outputContractProvesReferenceNonEmpty(step: WorkflowStepShape, path: string): boolean {
+  const output = step.output;
+  if (!output || typeof output !== 'object' || Array.isArray(output)) return false;
+  const nonEmpty = Array.isArray(output.non_empty)
+    ? output.non_empty.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  if (!path) {
+    return nonEmpty.some((entry) => entry === '' || entry === '.')
+      || (
+        output.type === 'array'
+        && Boolean(output.min_items)
+        && typeof output.min_items === 'object'
+        && !Array.isArray(output.min_items)
+        && typeof (output.min_items as Record<string, unknown>)[''] === 'number'
+        && ((output.min_items as Record<string, number>)[''] ?? 0) >= 1
+      );
+  }
+  const first = path.split('.')[0];
+  const required = Array.isArray(output.required_keys)
+    ? output.required_keys.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  return required.includes(first) && nonEmpty.includes(path);
+}
+
+function hostOwnsExactTemplateSource(step: WorkflowStepShape): boolean {
+  if (step.optional === true) return false;
+  // A sandboxed deterministic runner's output is host-captured even when the
+  // runner also performs a governed local write (for example, atomically
+  // advancing a baseline). Side-effect class and output provenance are
+  // separate facts; this predicate proves only the latter.
+  if (step.deterministic?.runner?.trim()) return true;
+  if (!step.call?.tool) return false;
+  const declared = step.sideEffect ?? step.side_effect;
+  return structuredCallSideEffectClass({ ...step, sideEffect: declared }) === 'read';
+}
+
+const EXACT_SEND_REQUIRED_OUTPUT_KEYS = ['providerResult', 'callEvidence'] as const;
+const EXACT_SEND_REQUIRED_NON_EMPTY_PATHS = [
+  'providerResult.kind',
+  'providerResult.resultId',
+  'providerResult.digest',
+  'callEvidence.evidenceId',
+  'callEvidence.mutationReceiptId',
+  'callEvidence.canonicalTool',
+  'callEvidence.kind',
+  'callEvidence.status',
+  'callEvidence.dispatchSchemaFingerprint',
+  'callEvidence.expectedArgsDigest',
+  'callEvidence.providerReadyArgsDigest',
+  'callEvidence.providerResultDigest',
+  'callEvidence.payloadDigest',
+  'callEvidence.target.digest',
+] as const;
+
+function exactSendDeclaresHostCommitEvidence(step: WorkflowStepShape): boolean {
+  const output = step.output;
+  if (!output || typeof output !== 'object' || Array.isArray(output) || output.type !== 'object') return false;
+  const required = new Set(Array.isArray(output.required_keys)
+    ? output.required_keys.filter((entry): entry is string => typeof entry === 'string')
+    : []);
+  const nonEmpty = new Set(Array.isArray(output.non_empty)
+    ? output.non_empty.filter((entry): entry is string => typeof entry === 'string')
+    : []);
+  return EXACT_SEND_REQUIRED_OUTPUT_KEYS.every((key) => required.has(key))
+    && EXACT_SEND_REQUIRED_NON_EMPTY_PATHS.every((path) => nonEmpty.has(path));
+}
+
+/**
+ * Positive authority for one exact unattended scheduled send. This is the only
+ * exception to SEND-CALL GATE: saving/enabling a schedule is standing consent
+ * for one fixed direct action, never a dynamic carrier or model-shaped target.
+ */
+export function exactScheduledSendDefinitionEligibility(
+  workflow: WorkflowFrontmatter,
+  step: WorkflowStepShape,
+): ExactScheduledSendEligibility {
+  if (workflow.enabled !== true) return { eligible: false, reason: 'workflow_not_explicitly_enabled' };
+  if (typeof workflow.trigger?.schedule !== 'string' || !workflow.trigger.schedule.trim()) {
+    return { eligible: false, reason: 'workflow_not_scheduled' };
+  }
+  if (workflow.allowSends !== true && workflow.allow_sends !== true) {
+    return { eligible: false, reason: 'autonomous_sends_disabled' };
+  }
+  if (step.requiresApproval === true || step.requires_approval === true) {
+    return { eligible: false, reason: 'step_approval_required' };
+  }
+  if ((step.sideEffect ?? step.side_effect) !== 'send') {
+    return { eligible: false, reason: 'explicit_send_class_required' };
+  }
+  const autonomousSendSteps = (workflow.steps ?? []).filter((candidate) => (
+    Boolean(candidate.call?.tool)
+    && candidate.requiresApproval !== true
+    && candidate.requires_approval !== true
+    && structuredCallSideEffectClass(candidate) === 'send'
+  ));
+  if (autonomousSendSteps.length !== 1 || autonomousSendSteps[0]?.id !== step.id) {
+    return { eligible: false, reason: 'multiple_autonomous_send_steps' };
+  }
+  const tool = typeof step.call?.tool === 'string' ? step.call.tool.trim() : '';
+  if (
+    !tool
+    || !/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(tool)
+    || STRUCTURED_CALL_MULTIPLEXERS.has(tool.toLowerCase())
+    || !isIrreversibleSendSlug(tool)
+  ) {
+    return { eligible: false, reason: 'direct_send_tool_required' };
+  }
+  if (step.optional === true || step.forEach || step.deterministic || step.subgraph || step.loopUntil || step.loop_until) {
+    return { eligible: false, reason: 'unsupported_executor_shape' };
+  }
+  const args = step.call?.args;
+  if (!args || typeof args !== 'object' || Array.isArray(args) || !argsHaveStaticSendTarget(args)) {
+    return { eligible: false, reason: 'fixed_target_required' };
+  }
+  const parsed = exactCallTemplateReferences(args);
+  if (!parsed.ok) return { eligible: false, reason: 'unsupported_template' };
+  // Exact authority must bind actual message substance, not merely a literal
+  // recipient plus an unrelated dynamic option. Permit either a host-owned
+  // upstream template inside a provider-neutral payload field, or an exact
+  // non-empty literal payload. Target fields never satisfy this check.
+  if (!parsed.hasLiteralPayload && !parsed.references.some((reference) => reference.inPayload)) {
+    return { eligible: false, reason: 'payload_required' };
+  }
+  const dependencies = transitiveDependenciesOf(step, workflow.steps ?? []);
+  const byId = new Map((workflow.steps ?? []).map((candidate) => [candidate.id, candidate]));
+  for (const reference of parsed.references) {
+    if (!dependencies.has(reference.stepId)) {
+      return { eligible: false, reason: 'template_source_not_dependency' };
+    }
+    const source = byId.get(reference.stepId);
+    if (!source || !hostOwnsExactTemplateSource(source)) {
+      return { eligible: false, reason: 'template_source_not_host_owned' };
+    }
+    if (!outputContractProvesReferenceNonEmpty(source, reference.path)) {
+      return { eligible: false, reason: 'template_source_may_be_empty' };
+    }
+  }
+  if (!exactSendDeclaresHostCommitEvidence(step)) {
+    return { eligible: false, reason: 'host_commit_evidence_contract_required' };
+  }
+  return { eligible: true };
+}
+
+/** Structurally bounded exact slugs that are safe to refresh by identifier.
+ * This does not grant execution authority: it deliberately omits provider
+ * schema state and exists only to make a stale/missing lease self-healing
+ * without broad discovery. */
+export function exactScheduledSendCandidateToolSlugs(workflow: WorkflowFrontmatter): string[] {
+  const slugs = new Set<string>();
+  for (const step of workflow.steps ?? []) {
+    if (!step.call?.tool) continue;
+    if (exactScheduledSendDefinitionEligibility(workflow, step).eligible) {
+      slugs.add(step.call.tool.trim());
+    }
+  }
+  return [...slugs].sort();
+}
+
+/** Execution/enable authority adds provider-observed identity and shape to the
+ * static definition proof. Durable validation contracts alone never qualify. */
+export function exactScheduledSendCallEligibility(
+  workflow: WorkflowFrontmatter,
+  step: WorkflowStepShape,
+): ExactScheduledSendEligibility {
+  const definition = exactScheduledSendDefinitionEligibility(workflow, step);
+  if (!definition.eligible) return definition;
+  const tool = step.call?.tool?.trim() ?? '';
+  if (!getCachedToolSchema(tool)) {
+    return { eligible: false, reason: 'direct_send_tool_unverified' };
+  }
+  if (!liveComposioSchemaFingerprint(tool)) {
+    return { eligible: false, reason: 'live_schema_authority_unavailable' };
+  }
+  return { eligible: true };
 }
 
 function checkDeterministicRunner(step: WorkflowStepShape): string | null {
@@ -774,16 +1093,42 @@ export function validateWorkflowDefinition(
       // double-fire on retry/crash-resume (a direct call records no external_write
       // for the guards to see), so it stays blocked until idempotency tracking
       // lands and is live-tested.
-      if (step.forEach && callSideEffectClass(step) !== 'read') {
-        errors.push(`Step "${step.id ?? '?'}" declares a ${callSideEffectClass(step)}-class call with forEach — a per-item send/write call is not supported yet (double-act risk without per-call idempotency). Use a plain forEach step for the mutating action, or declare sideEffect: read only if the call truly is read-only.`);
+      if (step.forEach && structuredCallSideEffectClass(step) !== 'read') {
+        errors.push(`Step "${step.id ?? '?'}" declares a ${structuredCallSideEffectClass(step)}-class call with forEach — a per-item send/write call is not supported yet (double-act risk without per-call idempotency). Use a plain forEach step for the mutating action, or declare sideEffect: read only if the call truly is read-only.`);
       }
       // SEND-CALL GATE (2026-07-09 Lane 4): a structured call-node that SENDS
-      // (email/call/post) dispatches directly — no LLM, never through the
-      // bracket battery, so an unattended run fires it with no card. Require
-      // an explicit approval declaration so an ungated send call-node is
-      // un-saveable and un-runnable.
-      if (!step.requiresApproval && callSideEffectClass(step) === 'send') {
-        errors.push(`Step "${step.id ?? '?'}" is a SEND-class call node (${step.call?.tool ?? '?'}) with no approval. A structured send call dispatches directly with no approval card — set requiresApproval: true (+ a short approvalPreview), or route the send through run_batch so it queues for the user's approval.`);
+      // normally requires an explicit approval. The one positive exception is
+      // a saved+enabled schedule whose exact direct action, literal target, and
+      // host-owned non-empty payload sources are all frozen by the definition.
+      // Runtime still owns the exact-call mutation receipt around dispatch.
+      const callRequiresApproval = step.requiresApproval === true || step.requires_approval === true;
+      // A disabled definition is an inert draft: it must be installable before
+      // provider authorization/schema discovery exists. Enabling the workflow
+      // runs this same canonical validator again, and the runner independently
+      // refuses disabled definitions, so autonomous authority is granted only
+      // when the persisted definition is enabled and satisfies every exact-call
+      // condition below.
+      if (!callRequiresApproval && structuredCallSideEffectClass(step) === 'send') {
+        const disabledExactDraft = data.enabled === false
+          && opts.allowDisabledExactSendDraft === true;
+        // The authoring-only draft seam exempts only provider-observed schema
+        // readiness. It must still prove the complete static exact-call class;
+        // otherwise a disabled dynamic carrier could be stored and later reach
+        // a less strict enable surface.
+        let authority = disabledExactDraft
+          ? exactScheduledSendDefinitionEligibility({ ...data, enabled: true }, step)
+          : exactScheduledSendCallEligibility(data, step);
+        if (
+          !disabledExactDraft
+          && !authority.eligible
+          && (authority.reason === 'direct_send_tool_unverified' || authority.reason === 'live_schema_authority_unavailable')
+          && opts.exactSendCommittedReplayStepIds?.has(step.id)
+        ) {
+          authority = exactScheduledSendDefinitionEligibility(data, step);
+        }
+        if (!authority.eligible) {
+          errors.push(`Step "${step.id ?? '?'}" is a SEND-class call node (${step.call?.tool ?? '?'}) with no approval. Autonomous direct sends are allowed only for an explicitly enabled schedule with allowSends enabled, an explicit send class, one direct send action, a literal fixed target, and an exact non-empty payload (literal or host-owned upstream template); this step failed ${authority.reason}. Set requiresApproval: true (+ a short approvalPreview), or make the scheduled call exact.`);
+        }
       }
     }
     if (step.subgraph !== undefined) {

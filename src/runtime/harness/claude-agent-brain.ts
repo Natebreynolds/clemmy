@@ -3,7 +3,10 @@ import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
 import { codeModeMandateDirective } from '../../tools/code-mode-tool.js';
 import { getComposio } from '../../integrations/composio/client.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from '../../agents/tool-jit.js';
-import { renderCapabilityCandidateCard } from '../read-path/capability-candidates.js';
+import {
+  renderCapabilityCandidateCard,
+  resolveTurnCapabilityCandidates,
+} from '../read-path/capability-candidates.js';
 import { resolveHotSet } from '../../agents/tool-catalog.js';
 import {
   buildWorkspaceContextPrimer, workspaceSlugFromSessionId,
@@ -37,6 +40,7 @@ import { recordRunTokenWindow, resolveRunTokenCeiling, runTokenBudgetEnforcement
 import { withModelUsageAttribution } from '../usage-log.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import {
+  appendConversationPreambleOnce,
   beginRunAttempt,
   clearKill,
   createSession,
@@ -73,7 +77,14 @@ import {
   effectiveTurnObjective,
   recordTurnPreflightDecision,
   standardAwareBeatText,
+  type TurnPreflightDecision,
 } from './turn-control.js';
+import {
+  createAgentsPreflightConversationPort,
+  publishPreflightConversation,
+  startSettledPreflightConversationAuthor,
+  type PreflightConversationPort,
+} from './preflight-conversation.js';
 import {
   recordCapabilityResolution,
   renderCapabilityResolutionForContext,
@@ -82,13 +93,16 @@ import {
 import {
   renderTurnOpennessForContext,
   resolveTurnOpenness,
+  turnOpennessBrainFamily,
   turnOpennessEnabled,
   turnOpennessWarranted,
+  type TurnOpenness,
 } from './turn-openness.js';
 import {
   pullRecentTurnsForSession,
   renderRecentActionsForHarnessHistory,
   renderCrossSessionPrefixesForModel,
+  renderTranscriptTurns,
 } from './session-transcript.js';
 import { resolveWriteEvidence } from './work-report.js';
 import { gatherSessionSkills, skillExecutionShortfall } from './skill-execution.js';
@@ -96,7 +110,7 @@ import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../..
 import { renderProvenSkillForPrompt } from '../../memory/skill-choice-store.js';
 import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput, projectCommandsLineForInput } from './context-packet.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
-import { publicReplyText } from './public-presentation.js';
+import { PUBLIC_RUN_FAILURE_TEXT, publicReplyText } from './public-presentation.js';
 import { finalizePreparedWorkflowDispatchForSource } from './loop.js';
 import {
   assessAcceptedSourceDelivery,
@@ -120,7 +134,10 @@ import {
   readPendingWorkflowChatDispatchOwnership,
 } from '../../tools/workflow-run-queue.js';
 import { turnOutcomeId, type TurnIdentity, type TurnOutcome } from './turn-outcome.js';
-import { markRunInFlight } from './restart-recovery.js';
+import {
+  clearRunInFlightAfterTerminal,
+  markRunInFlight,
+} from './restart-recovery.js';
 import { actionBus } from '../action-bus.js';
 import {
   judgeObjectiveComplete,
@@ -157,7 +174,9 @@ import {
 } from './tool-evidence.js';
 import { renderHarnessCapabilityHealthForContext } from './capability-health.js';
 import { toolCallHint } from './tool-call-hint.js';
+import { classifyRuntimeToolEffect } from './tool-effect.js';
 import {
+  mcpToolScopeAuthority,
   resolveMcpToolScopeWithRecall,
   type McpToolScope,
 } from '../mcp-tool-scope.js';
@@ -185,6 +204,7 @@ import {
   queuedApprovalTransitionShouldMaterialize,
   queuedApprovalTransitionsForRequest,
 } from './pending-action-transition.js';
+import * as approvalRegistry from './approval-registry.js';
 import {
   activateDispatchLease,
   captureDispatchRecoveryLedgerBaseline,
@@ -195,13 +215,25 @@ import {
 import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
 import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { requireKnownExpectedWorkContract } from './expected-work-contract.js';
-import { requireActionExpectedWorkActivation } from './action-expected-work-boundary.js';
+import {
+  actionExpectedWorkCarrierSelection,
+  requireActionExpectedWorkActivation,
+} from './action-expected-work-boundary.js';
+import { resolveActionTaskState } from './action-task-state.js';
+import { discoveryGovernor } from './discovery-governor.js';
+import { buildAuthorizedToolSearchCandidateSources } from '../../tools/tool-search-provider-sources.js';
+import { toolSearchBrokerCoverage } from '../../tools/tool-search-tool.js';
+import {
+  actionControlAdmittedForTaskState,
+  actionControlContextFor,
+} from '../../tools/tool-registry.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
 let runPostTurnHooksImpl: typeof runPostTurnHooks = runPostTurnHooks;
 let terminalPresentationRepairPortForTest: TerminalPresentationRepairPort | null = null;
 let terminalDeliveryJudgePortForTest: TerminalDeliveryJudgePort | null = null;
+let preflightConversationPortForTest: PreflightConversationPort | null = null;
 
 export function setClaudeAgentSdkBrainRunForTest(fn: ClaudeAgentSdkRunFn | null): void {
   runClaudeAgentSdkImpl = fn ?? runClaudeAgentSdk;
@@ -217,6 +249,12 @@ export function setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(
   port: TerminalDeliveryJudgePort | null,
 ): void {
   terminalDeliveryJudgePortForTest = port;
+}
+
+export function setClaudeAgentSdkBrainPreflightConversationPortForTest(
+  port: PreflightConversationPort | null,
+): void {
+  preflightConversationPortForTest = port;
 }
 
 export function setClaudeAgentSdkBrainPostTurnHooksForTest(
@@ -662,6 +700,18 @@ export function claudeAgentSdkAdvertisedToolUniverse(
   return [...new Set(names)].filter((name) => !excluded.has(name));
 }
 
+/** Provider-neutral projection shared with Codex's registry class. Fresh
+ * accepted work cannot search or dispatch prior-task archaeology, and neither
+ * fresh nor continued work may acquire a second action owner. */
+export function projectClaudeAcceptedActionSurface(
+  names: readonly string[],
+  acceptedAction: boolean,
+  taskState: 'fresh' | 'continuation',
+): string[] {
+  if (!acceptedAction) return [...names];
+  return names.filter((name) => actionControlAdmittedForTaskState(name, taskState));
+}
+
 export function partitionClaudeAgentSdkJitSurface(
   fastAllowNames: readonly string[],
   advertisedUniverse: readonly string[],
@@ -778,6 +828,9 @@ function renderArtifactVerificationPrompt(artifacts: readonly RunArtifact[]): st
     if (artifact.kind === 'google_doc') {
       return `- Google Doc document_id=${artifact.resourceId}: call GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT (or the connected exact get-document-by-id equivalent) with exactly that document_id.`;
     }
+    if (artifact.kind === 'resource' && artifact.provider === 'googlesheets') {
+      return `- Google Sheet spreadsheet_id=${artifact.resourceId}: call GOOGLESHEETS_BATCH_GET (or the connected exact spreadsheet/range getter equivalent) with exactly that spreadsheet_id, the exact constructor range covering its header and rows, and valueRenderOption=UNFORMATTED_VALUE.`;
+    }
     return `- Netlify site_id=${artifact.resourceId}: call run_shell_command once with netlify api getSite --data '{"site_id":"${artifact.resourceId}"}'.`;
   });
   return [
@@ -854,7 +907,7 @@ function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
       'CAPABILITY — you are the AGENTIC Clementine brain on the user\'s Claude subscription. You CAN execute tools to complete the request: run shell commands (run_shell_command), discover + execute Composio actions (composio_search_tools → composio_execute_tool), write files, and chain multi-step work — exactly like the Codex harness.',
       '- Every tool call runs through Clementine\'s safety gates (grounding, goal-fidelity, execution-wrap, destination, duplicate-write, loop-guard). Irreversible/external actions (sends, batch external writes) PAUSE for the user\'s approval BEFORE they run. Do the work — the gates + approval protect it; you do not need to ask permission in prose first.',
       '- SURFACE NOTE: the intent-matched native vendor MCP servers for THIS turn (e.g. a native dataforseo/firecrawl/supabase MCP) ARE attached on this lane — their tool schemas load on demand via tool search (surfaced by name, fetched when you call them). When a skill or instruction says "use the <X> MCP", use that native server/tool directly. Fall back to composio_search_tools → composio_execute_tool (e.g. a DATAFORSEO_* slug) or run_shell_command (the vendor CLI) only when no native server is attached for the need. Use ONE surface per capability — do not pull the same data from two surfaces in the same run.',
-      '- Before a MUTATING external write (a composio send/create, a batch), call execution_create FIRST (title, objective, successCriteria), then proceed — the harness requires an active execution lane for those.',
+      '- Execute accepted external work through work_call. Its exact host-frozen binding authorizes admitted writes, so do not call execution_list or execution_create merely to wrap them. Certified batches and approved pending actions carry their own exact authority; only follow EXECUTION_WRAP_REQUIRED for a direct legacy mutation when execution_create is actually exposed.',
       `- A large tool result may be clipped with a \`[digest: …]\` footer naming a call id — pull the stored records with ${toolCallHint('tool_output_query', { call_id: '<call id>', fields: ['<field>'] })} or the raw payload with ${toolCallHint('recall_tool_result', { call_id: '<call id>' })}. Never report stored data as unavailable.`,
       '- Do NOT claim you ran a command, sent a message, or wrote a file unless a tool result in THIS run proves it. If a tool result begins with `ERROR:`, treat that item as failed and say so.',
       '- If an installed skill applies (design/report/audit), call skill_read for it before producing the artifact.',
@@ -1055,10 +1108,28 @@ interface ClaudeTurnMemoryPrimerTelemetry {
 
 async function buildClaudeAgentBrainTurnContext(
   request: AssistantRequest,
-  opts?: { sourceUserSeq?: number },
+  opts?: {
+    sourceUserSeq?: number;
+    sourceTurn?: number;
+    /** Live execution only: start the SETTLED author beside openness. */
+    prestartSettledConversation?: boolean;
+    /** Frozen prior-turn text available only at the outer live caller. */
+    conversationContext?: string;
+  },
 ): Promise<{
   text: string;
   memoryPrimer: ClaudeTurnMemoryPrimerTelemetry;
+  preflight: TurnPreflightDecision;
+  preflightConversation?: {
+    port: PreflightConversationPort;
+    settledProceedAuthor?: Promise<string>;
+  };
+  alignmentContext: {
+    conversationContext: string;
+    memoryContext: string;
+    capabilityContext: string;
+    openness: TurnOpenness | null;
+  };
 }> {
   const declinedContinuation = isDeclinedTaskContinuation(request);
   const declinedParentWithNewTask = isDeclinedParentWithNewTask(request);
@@ -1213,12 +1284,6 @@ async function buildClaudeAgentBrainTurnContext(
       // Future-intention projection is advisory context, never turn authority.
     }
   }
-  if (!splitContext) {
-    return {
-      text: [recall, prospectiveContext, prospectiveCapture].filter(Boolean).join('\n\n'),
-      memoryPrimer,
-    };
-  }
   // Legacy cross-store breadcrumbs are retained only when the unified primer is
   // explicitly disabled or unavailable. The primary result already contains
   // entities, resources, episodes, policies, notes, facts, and procedures.
@@ -1252,7 +1317,11 @@ async function buildClaudeAgentBrainTurnContext(
   // alignment beat before autonomous execution. Continuations, questions,
   // pre-authorized hand-offs, and non-chat kinds stay silent.
   let confirmBeat = '';
-  let certainOpen: string[] = [];
+  let preflight: TurnPreflightDecision = {
+    phase: 'execute',
+    consequential: false,
+    reason: 'ordinary_execution',
+  };
   const sourceBoundTurn = Number.isSafeInteger(opts?.sourceUserSeq)
     && Number(opts?.sourceUserSeq) > 0;
   let preflightSessionKind: NonNullable<ReturnType<typeof getSession>>['kind'] | undefined;
@@ -1270,7 +1339,7 @@ async function buildClaudeAgentBrainTurnContext(
     // fan-out directive merely because A/Q/B are present in taskInput.
     const multi = detectMultiItemIntent(authorityInput);
     if (multi.isMultiItem) fanoutDirective = fanoutDirectiveLine(multi);
-    const preflight = classifyTurnPreflight({
+    preflight = classifyTurnPreflight({
       message: authorityInput,
       sessionId: request.sessionId,
       sessionKind: preflightSessionKind,
@@ -1290,13 +1359,8 @@ async function buildClaudeAgentBrainTurnContext(
       && preflight.phase === 'align'
       ? standardAwareBeatText(authorityInput)
       : '';
-    // A named destination whose INSTANCE was never stated is a certain unknown,
-    // not an inference — carried to the openness pass so it is settled before
-    // the work rather than discovered by a failed write at the end.
-    if (preflight.destinationInstanceUnstated && preflight.destination) {
-      certainOpen = [`which ${preflight.destination} account/instance to use — you have more than one and none was named`];
-    }
-  } catch {
+  } catch (error) {
+    if (sourceBoundTurn && preflightSessionKind === 'chat') throw error;
     // Preflight state is directive/telemetry, not execution authority — a
     // classify/persist failure degrades to no beat, never a failed turn.
     // Consent enforcement lives in plan-scope/approvals.
@@ -1321,13 +1385,52 @@ async function buildClaudeAgentBrainTurnContext(
       capabilityResolution = '';
     }
   }
+  const activeModelId = request.model && request.model.startsWith('claude-')
+    ? request.model
+    : resolveRoleModel('brain').modelId;
+  let preflightConversation: {
+    port: PreflightConversationPort;
+    settledProceedAuthor?: Promise<string>;
+  } | undefined;
+  if (
+    opts?.prestartSettledConversation === true
+    && preflightSessionKind === 'chat'
+    && preflight.phase === 'align'
+    && Number.isSafeInteger(opts.sourceUserSeq)
+    && Number(opts.sourceUserSeq) > 0
+    && Number.isSafeInteger(opts.sourceTurn)
+    && Number(opts.sourceTurn) >= 0
+  ) {
+    const port = preflightConversationPortForTest
+      ?? createAgentsPreflightConversationPort({ model: getClaudeHeadlessModel(activeModelId) });
+    const prepared = {
+      identity: {
+        sessionId: request.sessionId,
+        turn: Number(opts.sourceTurn),
+        sourceUserSeq: Number(opts.sourceUserSeq),
+      },
+      decision: preflight,
+      conversationContext: [
+        opts.conversationContext,
+        continuationContext,
+        sessionActions,
+      ].filter(Boolean).join('\n\n'),
+      memoryContext: [recall, breadcrumbs, volatile].filter(Boolean).join('\n\n'),
+      capabilityContext: capabilityResolution,
+      port,
+    };
+    preflightConversation = {
+      port,
+      settledProceedAuthor: startSettledPreflightConversationAuthor(prepared),
+    };
+  }
   // WHAT IS STILL OPEN. A separate, cross-family pass over the readings of this
   // request — the decision to ask cannot be made by the model that is trying to
   // finish the work, and it cannot be made from the request text alone. Gated
   // on the runtime's OWN facts rather than on grammar: a turn that resolved real
   // capabilities is a turn that is about to do something. Fail-open and
   // time-boxed, so it can inform a turn but never delay or break one.
-  let openness = '';
+  let turnOpenness: TurnOpenness | null = null;
   if (
     preflightSessionKind === 'chat'
     && request.taskContinuation?.disposition !== 'declined'
@@ -1346,14 +1449,15 @@ async function buildClaudeAgentBrainTurnContext(
     && (Boolean(confirmBeat) || turnOpennessWarranted(resolvedCapabilityEntries))
   ) {
     try {
-      openness = renderTurnOpennessForContext(await resolveTurnOpenness({
+      turnOpenness = await resolveTurnOpenness({
         message: taskInput,
+        brainFamily: turnOpennessBrainFamily(activeModelId),
         capabilityBlock: capabilityResolution,
         memoryBlock: recall,
-        deterministicOpen: certainOpen,
-      }));
-    } catch { openness = ''; }
+      });
+    } catch { turnOpenness = null; }
   }
+  const opennessContext = renderTurnOpennessForContext(turnOpenness);
   // Pre-flight error library (parity with the context packet's Known-pitfalls
   // line — this lane doesn't consume the packet): the freshest distilled
   // lessons for the skills this turn will likely use, so a known failure mode
@@ -1403,11 +1507,19 @@ async function buildClaudeAgentBrainTurnContext(
       fanoutDirective,
       confirmBeat,
       capabilityResolution,
-      openness,
+      opennessContext,
       pitfalls,
       projectRoutes,
     ].filter(Boolean).join('\n\n'),
     memoryPrimer,
+    preflight,
+    ...(preflightConversation ? { preflightConversation } : {}),
+    alignmentContext: {
+      conversationContext: [continuationContext, sessionActions].filter(Boolean).join('\n\n'),
+      memoryContext: [recall, breadcrumbs, volatile].filter(Boolean).join('\n\n'),
+      capabilityContext: capabilityResolution,
+      openness: turnOpenness,
+    },
   };
 }
 
@@ -1846,6 +1958,30 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       });
     }
   }
+  const acceptedActionSurface = Boolean(actionExpectedWorkCarrierSelection({
+    sessionId,
+    sourceUserSeq: userInputEvent.seq,
+  }));
+  // The standard lane receives this provider-neutral requirement projection at
+  // its capability-resolve node. Claude diverges before that node, so derive
+  // the same bounded advisory projection here when the caller did not already
+  // carry one. It grants no tool authority; it only supplies the immutable role
+  // membership used by discovery admission and the candidate card.
+  if (
+    acceptedActionSurface
+    && !declinedContinuation
+    && request.turnCandidates === undefined
+  ) {
+    try {
+      request = {
+        ...request,
+        turnCandidates: await resolveTurnCapabilityCandidates({ userInput: taskInput }),
+      };
+    } catch {
+      // Missing projection is a compatibility state, never an all-resolved
+      // claim. initializeRoles below therefore keeps the legacy task-wide slot.
+    }
+  }
   // Source binding and restart ownership committed atomically above. Any crash
   // during context, memory, tool-surface, or provider setup is recoverable.
   try {
@@ -1936,6 +2072,158 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     ? request.model
     : resolveRoleModel('brain').modelId;
 
+  // Resolve memory, cross-session continuity, capability facts, openness, and
+  // the typed preflight before assembling any ordinary tool surface. An align
+  // source takes the sealed no-tool conversation path below and never reaches
+  // Claude's tool-capable SDK run.
+  const renderedTurnContext = durableMemoryConversationOnly
+    ? {
+        text: '',
+        memoryPrimer: {
+          enabled: queryRecallEnabled(),
+          hitCount: 0,
+          omittedCount: 0,
+          candidateCount: 0,
+          source: null,
+          recallId: null,
+          answerability: null,
+          stores: [],
+          recallElapsedMs: null,
+          skippedReason: 'durable_memory_receipt_conversation_only',
+        } satisfies ClaudeTurnMemoryPrimerTelemetry,
+        preflight: {
+          phase: 'execute',
+          consequential: false,
+          reason: 'ordinary_execution',
+        } satisfies TurnPreflightDecision,
+        preflightConversation: undefined,
+        alignmentContext: {
+          conversationContext: '',
+          memoryContext: '',
+          capabilityContext: '',
+          openness: null,
+        },
+      }
+    : await buildClaudeAgentBrainTurnContext(request, {
+        sourceUserSeq: userInputEvent.seq,
+        sourceTurn: userInputEvent.turn,
+        prestartSettledConversation: true,
+        conversationContext: renderTranscriptTurns(priorTurns),
+      });
+  const durableMemoryReceiptDirective = durableMemoryConversationOnly
+    ? [
+        '[durable-memory-receipt]',
+        'This exact memory instruction is already durably queued. The user requested acknowledgement only.',
+        'The literal latest user message is authoritative and supersedes any older conflicting value in persistent context.',
+        'Do not mention internal machinery. Acknowledge it naturally in your own voice without searching for or calling tools.',
+      ].join('\n')
+    : '';
+  let turnContext = durableMemoryReceiptDirective
+    ? [renderedTurnContext.text, durableMemoryReceiptDirective].filter(Boolean).join('\n\n')
+    : renderedTurnContext.text;
+  emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext, renderedTurnContext.memoryPrimer);
+
+  if (renderedTurnContext.preflight.phase === 'align') {
+    const disposition = await publishPreflightConversation({
+      identity: {
+        sessionId,
+        turn: userInputEvent.turn,
+        sourceUserSeq: userInputEvent.seq,
+      },
+      decision: renderedTurnContext.preflight,
+      conversationContext: [
+        renderTranscriptTurns(priorTurns),
+        renderedTurnContext.alignmentContext.conversationContext,
+      ].filter(Boolean).join('\n\n'),
+      memoryContext: renderedTurnContext.alignmentContext.memoryContext,
+      capabilityContext: renderedTurnContext.alignmentContext.capabilityContext,
+      openness: renderedTurnContext.alignmentContext.openness,
+      port: renderedTurnContext.preflightConversation?.port
+        ?? preflightConversationPortForTest
+        ?? createAgentsPreflightConversationPort({ model: getClaudeHeadlessModel(modelId) }),
+      ...(renderedTurnContext.preflightConversation?.settledProceedAuthor
+        ? { settledProceedAuthor: renderedTurnContext.preflightConversation.settledProceedAuthor }
+        : {}),
+      transport: 'claude_agent_sdk_brain',
+    });
+    if (disposition.kind === 'ask') {
+      try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
+      clearRunInFlightAfterTerminal(sessionId, attempt.attemptId, userInputEvent.seq);
+      return {
+        text: disposition.presentation.text,
+        sessionId,
+        stoppedReason: 'awaiting-input',
+        turnsUsed: 1,
+        raw: {
+          transport: 'claude_agent_sdk_brain',
+          mode,
+          model: modelId,
+          toolUses: [],
+          preflightPhase: 'align',
+        },
+      };
+    }
+    if (disposition.preamble) {
+      const persisted = appendConversationPreambleOnce({
+        source: userInputEvent,
+        text: disposition.preamble,
+        ...(renderedTurnContext.preflight.intentKey
+          ? { intentKey: renderedTurnContext.preflight.intentKey }
+          : {}),
+      });
+      const persistedText = typeof persisted.event.data.text === 'string'
+        ? persisted.event.data.text
+        : disposition.preamble;
+      if (request.onConversationPreamble) {
+        const delivered = await request.onConversationPreamble(persistedText);
+        if (delivered.status === 'failed') {
+          const identity: TurnIdentity = {
+            sessionId,
+            turn: userInputEvent.turn,
+            sourceUserSeq: userInputEvent.seq,
+          };
+          const terminal = commitTurnOutcome({
+            version: 2,
+            id: turnOutcomeId(identity),
+            identity,
+            status: 'failed',
+            resumable: false,
+            presentation: { kind: 'error', text: PUBLIC_RUN_FAILURE_TEXT },
+          }, {
+            legacyReason: 'pre_execution_presentation_failed',
+            metadata: {
+              transport: 'claude_agent_sdk_brain',
+              failureStage: 'pre_execution_presentation',
+              failureDetail: delivered.reason,
+            },
+          }).presentation;
+          try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
+          clearRunInFlightAfterTerminal(sessionId, attempt.attemptId, userInputEvent.seq);
+          return {
+            text: terminal.text,
+            sessionId,
+            stoppedReason: 'error',
+            turnsUsed: 1,
+            raw: {
+              transport: 'claude_agent_sdk_brain',
+              mode,
+              model: modelId,
+              toolUses: [],
+              preflightPhase: 'align',
+              preambleDelivery: delivered.reason,
+            },
+          };
+        }
+      }
+      turnContext = [
+        turnContext,
+        '[pre-execution opening already delivered for this exact request]',
+        persistedText,
+        'Continue the requested work now; do not repeat this opening or ask for generic permission.',
+      ].filter(Boolean).join('\n\n');
+    }
+  }
+
   // Tool acquisition for the Claude Agent SDK brain. In full/agentic mode, keep
   // the ENTIRE permission surface same-turn reachable while registering only a
   // tiny hot set plus tool_search/call_tool. Unlike native MCP deferral, omitted
@@ -1952,12 +2240,27 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     conversationOnlyToolBoundary ? { ...request, allowedToolNames: [] } : request,
     mode,
   );
-  const fullAllowed = fullToolPolicy.names;
-  const advertisedUniverse = claudeAgentSdkAdvertisedToolUniverse(
+  const actionTaskState = acceptedActionSurface
+    ? resolveActionTaskState({
+        sessionId,
+        userInput: request.message,
+        taskContinuation: request.taskContinuation,
+      })
+    : { kind: 'fresh' as const };
+  const fullAllowed = projectClaudeAcceptedActionSurface(
+    fullToolPolicy.names,
+    acceptedActionSurface,
+    actionTaskState.kind,
+  );
+  const advertisedUniverse = projectClaudeAcceptedActionSurface(
+    claudeAgentSdkAdvertisedToolUniverse(
     mode,
     fullAllowed,
     request.excludeToolNames,
     explicitToolAuthority,
+    ),
+    acceptedActionSurface,
+    actionTaskState.kind,
   );
   try {
     appendEvent({
@@ -2048,7 +2351,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       // A local-runtime-only tool cannot become a first-class MCP schema. Leave
       // it deferred even when explicitly named; tool_search → call_tool remains
       // the truthful, gated route.
-      jitAdvertised = advertisedUniverse.filter((name) => hotFloor.has(name) && firstClassCapable.has(name));
+      jitAdvertised = advertisedUniverse.filter((name) => (
+        hotFloor.has(name)
+        && firstClassCapable.has(name)
+        // Recovery/history remains behind the one bounded
+        // tool_search→call_tool route even on a continuation; it never also
+        // becomes a direct first-class schema.
+        && (!acceptedActionSurface || actionControlContextFor(name) !== 'task_recovery')
+      ));
       // Permissions remain fullAllowed. mcpToolAllowlist is the tiny first-class
       // schema set; the SDK omits every other schema and keeps it reachable via
       // tool_search → call_tool.
@@ -2128,35 +2438,6 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // Provider text remains private until the graph reduces the run to a typed
   // TurnOutcome. Long-running feedback comes from typed tool/progress events,
   // not speculative prose that a retry or completion judge may invalidate.
-  const renderedTurnContext = durableMemoryConversationOnly
-    ? {
-        text: '',
-        memoryPrimer: {
-          enabled: queryRecallEnabled(),
-          hitCount: 0,
-          omittedCount: 0,
-          candidateCount: 0,
-          source: null,
-          recallId: null,
-          answerability: null,
-          stores: [],
-          recallElapsedMs: null,
-          skippedReason: 'durable_memory_receipt_conversation_only',
-        } satisfies ClaudeTurnMemoryPrimerTelemetry,
-      }
-    : await buildClaudeAgentBrainTurnContext(request, { sourceUserSeq: userInputEvent.seq });
-  const durableMemoryReceiptDirective = durableMemoryConversationOnly
-    ? [
-        '[durable-memory-receipt]',
-        'This exact memory instruction is already durably queued. The user requested acknowledgement only.',
-        'The literal latest user message is authoritative and supersedes any older conflicting value in persistent context.',
-        'Do not mention internal machinery. Acknowledge it naturally in your own voice without searching for or calling tools.',
-      ].join('\n')
-    : '';
-  const turnContext = durableMemoryReceiptDirective
-    ? [renderedTurnContext.text, durableMemoryReceiptDirective].filter(Boolean).join('\n\n')
-    : renderedTurnContext.text;
-  emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext, renderedTurnContext.memoryPrimer);
   const attemptTrackerScopeId = `${sessionId}::brain:${attempt.runId ?? attempt.attemptId}`;
   // POLICY AUTHORITY is intentionally separate from retrieval context. The
   // private semantic task is A + Clem's question + B; using it here made a
@@ -2214,6 +2495,39 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         allowedServerSlugs: [],
         maxTools: 0,
       };
+  // Arm role-scoped discovery only when the exact Claude surface can mount the
+  // same two provider-neutral candidate adapters behind tool_search. Explicit
+  // local allowlists and user-denied external authority retain builtins_only;
+  // a missing requirement projection does too inside initializeRoles.
+  const actionToolSearchCandidateSources = acceptedActionSurface
+    && mode === 'full'
+    && !explicitToolAuthority
+    && mcpToolScopeAuthority(nativeMcpScope) !== 'none'
+    ? buildAuthorizedToolSearchCandidateSources(nativeMcpScope)
+    : undefined;
+  if (acceptedActionSurface) {
+    discoveryGovernor.initializeTask({
+      sessionId,
+      sourceUserSeq: userInputEvent.seq,
+      knownCapability: false,
+    });
+    discoveryGovernor.initializeRoles({
+      sessionId,
+      sourceUserSeq: userInputEvent.seq,
+      requirements: request.turnCandidates?.requirements ?? [],
+      brokerCoverage: toolSearchBrokerCoverage(actionToolSearchCandidateSources),
+    });
+  }
+  const nativeExternalInspectionAvailable = mode === 'full'
+    && mcpToolScopeAuthority(nativeMcpScope) !== 'none';
+  const localReadInspectionAvailable = !conversationOnlyToolBoundary
+    && jitAllowed.some((toolName) => {
+      try { return classifyRuntimeToolEffect(toolName, {}).effect === 'read'; } catch { return false; }
+    });
+  const continuationToolsAvailable = !conversationOnlyToolBoundary
+    && (jitAllowed.length > 0 || nativeExternalInspectionAvailable);
+  const continuationExternalStateInspectionAvailable = continuationToolsAvailable
+    && (localReadInspectionAvailable || nativeExternalInspectionAvailable);
   try {
     appendEvent({
       sessionId,
@@ -2288,7 +2602,15 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     requiredLocalMcpTools: explicitToolAuthority
       ? []
       : schemaOnDemandAcquisition
-        ? ['memory_recall_all', 'tool_search', 'call_tool']
+        ? [
+            'memory_recall_all',
+            'tool_search',
+            // An accepted action deliberately replaces the unbound generic
+            // dispatcher with its one semantic business carrier. Requiring
+            // call_tool here made the otherwise healthy work_call surface fail
+            // the SDK init sentinel before the first model turn.
+            acceptedActionSurface ? 'work_call' : 'call_tool',
+          ]
         : ['memory_recall_all'],
     // Scope the native external MCP servers to THIS turn's intent (the user's message)
     // so the Claude brain reaches native capabilities (dataforseo, browsermcp, …) like
@@ -2296,7 +2618,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     nativeMcpScopeInput: declinedParentWithNewTask
       ? taskInput
       : request.taskContinuation
-        ? request.message
+        ? renderedTurnContext.preflight.confirmedIntentKey
+          ? turnObjective
+          : request.message
         : turnObjective,
     nativeMcpToolScope: nativeMcpScope,
     maxTurns: sdkMaxTurns,
@@ -2542,6 +2866,12 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     };
   };
   let result: ClaudeAgentSdkTerminalResult;
+  // One physical continuation budget covers every post-result correction,
+  // including terminal-delivery RESUME. Keeping the counter outside the
+  // ordinary correction block lets the terminal judge see whether that edge
+  // still exists instead of receiving a hard-coded promise.
+  let continuationsUsed = 0;
+  const continuationBudget = maxTurnContinuations();
   // Queue + an explicit execution question is already a complete graph state.
   // Keep this outside the ordinary correction block so the bounded terminal
   // judge continuation cannot strand or duplicate a newly queued approval.
@@ -2597,12 +2927,6 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     logicalRunScopeId = result.artifactRunScopeId;
     const resultIsAwaitingInput = (): boolean =>
       result.stoppedReason === 'awaiting-input' || result.stoppedReason === 'pending-approval';
-
-    // Phase 1.3: ONE shared budget across all post-result corrective continuations
-    // (narration, reasoning-leak, judge) so they can't compound into 4-5 full-context
-    // re-runs of a single turn. Healthy turns spend 0.
-    let continuationsUsed = 0;
-    const continuationBudget = maxTurnContinuations();
 
     const receiptAcknowledgementNeedsRepair = (): boolean => durableMemoryConversationOnly
       && (
@@ -2973,7 +3297,11 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       const repairable = unresolved.filter(
         (artifact) => artifact.status === 'bound'
           && Boolean(artifact.resourceId)
-          && (artifact.kind === 'google_doc' || artifact.kind === 'site'),
+          && (
+            artifact.kind === 'google_doc'
+            || artifact.kind === 'site'
+            || (artifact.kind === 'resource' && artifact.provider === 'googlesheets')
+          ),
       );
       if (repairable.length > 0) {
         try {
@@ -2992,7 +3320,11 @@ async function respondViaClaudeAgentSdkBrainAttempt(
             prompt: renderArtifactVerificationPrompt(repairable),
             ...runOptions,
             artifactVerificationOnly: repairable.flatMap((artifact) =>
-              artifact.resourceId && (artifact.kind === 'google_doc' || artifact.kind === 'site')
+              artifact.resourceId && (
+                artifact.kind === 'google_doc'
+                || artifact.kind === 'site'
+                || (artifact.kind === 'resource' && artifact.provider === 'googlesheets')
+              )
                 ? [{ kind: artifact.kind, resourceId: artifact.resourceId }]
                 : []),
           });
@@ -3220,11 +3552,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     });
   };
   carryMixedNarrationConcern();
-  // This lane's inner SDK tools do not cross the dispatch ledger, so a worked
-  // Claude-lane action turn would otherwise look evidence-free to the
-  // store-driven terminal adjudication (repair below + delivery committer)
-  // and fail closed. Record the business tool uses durably BEFORE either
-  // consults the stores; control/discovery uses are not work.
+  // Durable tool-use summary for observability and model-loop diagnostics.
+  // This is deliberately NOT terminal evidence: it contains calls regardless
+  // of result, and the canonical `tool_returned` host verdict is the only SDK
+  // event preparation/audit may treat as successful work.
   let recordedSdkToolUseCount = 0;
   const recordSdkToolUseEvidence = (): void => {
     const newlyRecorded = result.toolUses.slice(recordedSdkToolUseCount);
@@ -3240,11 +3571,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     });
   };
   try {
-    // ALL tool uses count: the marker answers "did this turn do anything?",
-    // and control-plane work (authoring a workflow, staging an approval) is
-    // exactly as real as provider dispatch for that question. Filtering by
-    // topology role false-blocked authoring turns when the coordination class
-    // moved to control (live 2026-08-11).
+    // Keep all tool uses for diagnostics. Terminal authority does not read this
+    // marker; only exact successful business/authoring return rows can close.
     recordSdkToolUseEvidence();
   } catch { /* evidence recording must never break the terminal */ }
   let terminalJudgeDisposition: 'deliver' | undefined;
@@ -3331,6 +3659,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           ? { missing: [...assessment.deliveryGap.missing] }
           : {}),
       };
+      const continuationCancelled = request.shouldCancel
+        ? await Promise.resolve(request.shouldCancel()).catch(() => true)
+        : false;
       const terminalDecision = await evaluateTerminalDelivery({
         objective: turnObjective,
         // The empty-reply fallback above is public safety copy, not authored
@@ -3340,6 +3671,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         deliveryConcern: concern,
         settlementAudit: assessment.settlementAudit,
         priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+        recoveryCapability: {
+          liveContinuation:
+            continuationsUsed < continuationBudget
+            && !budgetWindowExhausted()
+            && !continuationCancelled,
+          toolsAvailable: continuationToolsAvailable,
+          externalStateInspection: continuationExternalStateInspectionAvailable,
+        },
       }, {
         ...(terminalDeliveryJudgePortForTest
           ? { port: terminalDeliveryJudgePortForTest }
@@ -3354,6 +3693,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       };
       if (terminalDecision.verb === 'resume') {
         terminalJudgeConsecutiveResumes = 1;
+        // The judge was shown a live edge, and this branch now consumes it.
+        // Count the physical query even when it fails or returns no parseable
+        // result so a provider stumble cannot silently mint another attempt.
+        continuationsUsed += 1;
         try {
           appendEvent({
             sessionId,
@@ -3543,6 +3886,23 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       : 'success');
   const awaitingInput = stoppedReason === 'awaiting-input';
   const awaitingApproval = stoppedReason === 'pending-approval';
+  // Re-read after every queued transition has materialized. Registering a
+  // sibling atomically demotes conversational presentations to formal cards,
+  // so the first materialization snapshot can be stale by this boundary.
+  const graphApproval = awaitingApproval && graphApprovalId
+    ? approvalRegistry.get(graphApprovalId)
+    : undefined;
+  const graphApprovalDependency = graphApproval
+    ? approvalRegistry.projectPendingApprovalUserDependency(graphApproval)
+    : null;
+  const conversationalApprovalQuestion = graphApprovalDependency?.kind === 'input'
+    ? graphApprovalDependency.question
+    : null;
+  const awaitingConversationalApproval = awaitingApproval
+    && conversationalApprovalQuestion !== null;
+  const publicStoppedReason: AssistantResponse['stoppedReason'] = awaitingConversationalApproval
+    ? 'awaiting-input'
+    : stoppedReason;
   // Report-back / observability parity (gap analysis): the harness loop emits
   // conversation_completed + runtime.completed on a clean terminal so the Tasks
   // board, report-back, and watchdog see the run. The Agent SDK lane runs its
@@ -3595,7 +3955,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // fields are not accepted by the committer. A narrated legacy envelope is a
   // compatibility input only; its explicit reply/question is projected before
   // the typed boundary.
-  const publicText = publicReplyText(
+  const publicText = conversationalApprovalQuestion ?? publicReplyText(
     text,
     result.limitHit
       ? 'I hit this run\'s budget before finishing. Say "continue" to keep going.'
@@ -3630,7 +3990,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       needs: { kind: 'continue' },
       presentation: { kind: 'continue', text: publicText },
     };
-  } else if (awaitingApproval && graphApprovalId) {
+  } else if (awaitingApproval && graphApprovalDependency?.kind === 'approval') {
     outcome = {
       version: 2,
       id: turnOutcomeId(identity),
@@ -3638,7 +3998,11 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       status: 'needs_input',
       resumable: true,
       needs: { kind: 'approval' },
-      presentation: { kind: 'approval', text: publicText, approvalId: graphApprovalId },
+      presentation: {
+        kind: 'approval',
+        text: publicText,
+        approvalId: graphApprovalDependency.approvalId,
+      },
     };
   } else if (awaitingInput || awaitingApproval) {
     outcome = {
@@ -3674,7 +4038,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       ? 'verification_required'
       : result.limitHit
       ? 'awaiting_continue'
-      : awaitingInput
+      : awaitingInput || awaitingConversationalApproval
         ? 'awaiting_user_input'
         : awaitingApproval
           ? 'awaiting_approval'
@@ -3708,9 +4072,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   const terminalEventRecorded = true;
   const terminalEventInserted = terminal.inserted;
   const responseStoppedReason: AssistantResponse['stoppedReason'] =
-    stoppedReason === 'success' && terminal.presentation.status === 'blocked'
+    publicStoppedReason === 'success' && terminal.presentation.status === 'blocked'
       ? 'unverified'
-      : stoppedReason;
+      : publicStoppedReason;
 
   // The committed public event is the sole live-delivery signal. Emitting the
   // same text through request.onChunk after commit races the terminal event and
@@ -3833,7 +4197,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   return {
     text,
     sessionId,
-    ...(awaitingApproval && graphApprovalId ? { pendingApprovalId: graphApprovalId } : {}),
+    ...(awaitingApproval && graphApprovalDependency?.kind === 'approval'
+      ? { pendingApprovalId: graphApprovalDependency.approvalId }
+      : {}),
     stoppedReason: responseStoppedReason,
     turnsUsed: result.toolUses.length > 0 ? result.toolUses.length : 1,
     raw: {

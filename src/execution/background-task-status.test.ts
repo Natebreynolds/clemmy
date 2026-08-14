@@ -26,6 +26,9 @@ const {
   renderBackgroundTaskStatus,
   resolveBackgroundTask,
 } = await import('./background-task-status.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { createSession } = await import('../runtime/harness/eventlog.js');
+const { exactOriginDeliveryTargetDigest } = await import('../runtime/exact-origin-delivery.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -58,6 +61,64 @@ test('background task status resolves ids and includes tool activity/result', ()
   assert.equal(details.toolEvents.length, 1);
   assert.equal(details.toolEvents[0]?.toolName, 'write_file');
   assert.match(renderBackgroundTaskStatus(details), /Report complete/);
+});
+
+test('background task status exposes formal cards but never the hidden conversational approval id', () => {
+  const formalTask = createBackgroundTask({
+    title: 'Formal approval status',
+    prompt: 'wait for formal approval',
+    source: 'desktop',
+  });
+  createSession({ id: formalTask.runSessionId, kind: 'execution' });
+  const formal = approvalRegistry.register({
+    sessionId: formalTask.runSessionId,
+    subject: 'Approve the destructive action',
+    tool: 'request_approval',
+  });
+  const formalDetails = getBackgroundTaskStatus(formalTask.id);
+  assert.equal(formalDetails?.pendingApprovals[0]?.approvalId, formal.approvalId);
+
+  const conversationalTask = createBackgroundTask({
+    title: 'Conversational send status',
+    prompt: 'prepare one exact email',
+    source: 'discord',
+  });
+  const channelId = 'discord-background-status-consent';
+  const userId = 'discord-background-status-user';
+  const originReplyTarget = { type: 'discord_channel' as const, channelId };
+  createSession({
+    id: conversationalTask.runSessionId,
+    kind: 'execution',
+    channel: 'discord',
+    userId,
+    metadata: { channelId, userId },
+  });
+  const hidden = approvalRegistry.register({
+    sessionId: conversationalTask.runSessionId,
+    channel: 'discord',
+    channelId,
+    subject: 'Send the reviewed email',
+    tool: 'request_approval',
+    presentation: {
+      version: 1,
+      kind: 'autonomous_send_consent',
+      question: 'The exact email is ready. Do you want me to send it?',
+      actionLabel: 'email',
+      target: 'proof@example.com',
+      subject: 'Reviewed sheet',
+      bodyPreview: 'The reviewed sheet is attached.',
+      resultUrl: null,
+      sourceUserSeq: 1,
+      originReplyTarget,
+      originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget),
+      conversationKey: `discord:${channelId}`,
+      audienceUserId: userId,
+    },
+  });
+  assert.equal(approvalRegistry.isFormalApprovalSurface(hidden), false);
+  const conversationalDetails = getBackgroundTaskStatus(conversationalTask.id);
+  assert.deepEqual(conversationalDetails?.pendingApprovals, []);
+  assert.doesNotMatch(renderBackgroundTaskStatus(conversationalDetails!), new RegExp(hidden.approvalId));
 });
 
 test('background task status summaries include awaiting_continue in active work', () => {

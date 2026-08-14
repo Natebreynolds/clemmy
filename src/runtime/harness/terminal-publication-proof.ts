@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { ObligationManifest } from './obligation-manifest.js';
-import { providerEnvelopeHasContradiction } from './provider-read-evidence.js';
+import { inspectProviderEnvelope } from './provider-read-evidence.js';
 import { deriveResultHandleFactsFromRaw } from './result-facts.js';
 
 const MAX_DURABLE_CURSOR_BYTES = 65_536;
@@ -67,7 +67,9 @@ interface ReceiptAuthorityRow {
   settlement_outcome_kind: string;
   settlement_result_handle_id: string | null;
   settlement_crossing_count: number;
+  settlement_host_crossing_count: number | null;
   settlement_crossings_digest: string;
+  dispatch_execution_site: string | null;
   logical_accepted_task_id: string;
   logical_tool_name: string;
   logical_argument_digest: string;
@@ -253,6 +255,7 @@ function exactReceiptAuthority(
       s.outcome_kind AS settlement_outcome_kind,
       s.result_handle_id AS settlement_result_handle_id,
       s.physical_crossing_count AS settlement_crossing_count,
+      s.host_crossing_count AS settlement_host_crossing_count,
       s.physical_crossings_digest AS settlement_crossings_digest,
       l.accepted_task_id AS logical_accepted_task_id,
       l.tool_name AS logical_tool_name,
@@ -277,6 +280,7 @@ function exactReceiptAuthority(
       h.projected_records_json, h.status_code,
       h.continuation_ref, h.cursor_bytes, h.cursor_sha256, h.cursor_repeated,
       p.state AS dispatch_state,
+      p.execution_site AS dispatch_execution_site,
       p.tool_name AS dispatch_tool_name,
       p.argument_digest AS dispatch_argument_digest,
       p.ordinal AS dispatch_ordinal,
@@ -332,7 +336,13 @@ function verifyReceipt(input: {
   const row = exactReceiptAuthority(input.db, input.transition.receipt_id);
   if (!row) return { ok: false, status: 'conflict', reason: 'proof receipt has no exact normalized authority chain' };
   const expectedKind = input.obligation === 'source_observed' ? 'observation' : 'collection';
-  const expectedMode = input.obligation === 'source_observed' ? 'point_read' : 'collection_read';
+  // Obligation names the PROOF owed, the manifest node names the MODE the
+  // capability actually has. A resolved-operation retrieve owes observation
+  // and may legitimately ride a collection-shaped read; the node-mode equality
+  // below still pins the receipt to the exact manifest capability.
+  const allowedModes: readonly string[] = input.obligation === 'source_observed'
+    ? ['point_read', 'collection_read']
+    : ['collection_read'];
   if (
     row.protocol_version !== 1
     || row.kind !== expectedKind
@@ -342,7 +352,7 @@ function verifyReceipt(input: {
     || row.manifest_id !== input.manifestId
     || row.node_id !== input.node.nodeId
     || row.obligation !== input.obligation
-    || row.operation_mode !== expectedMode
+    || !allowedModes.includes(row.operation_mode)
     || row.operation_mode !== input.node.operationMode
     || row.receipt_logical_tool_call_id !== input.node.operationId
     || row.receipt_tool_name !== input.node.resolvedTool
@@ -354,10 +364,15 @@ function verifyReceipt(input: {
   ) {
     return { ok: false, status: 'conflict', reason: 'proof transition and receipt identity disagree' };
   }
+  // The host's own returned execution is redeemable evidence: its crossing is
+  // recorded with executionSite 'host' and its bytes are handle-bound exactly
+  // like a provider result. Any other local settlement stays refused.
+  const hostExecutedEvidence = row.settlement_execution_kind === 'local_execution'
+    && row.dispatch_execution_site === 'host';
   if (
     row.logical_accepted_task_id !== input.acceptedTaskId
     || row.logical_state !== 'settled'
-    || row.settlement_execution_kind !== 'provider_execution'
+    || (row.settlement_execution_kind !== 'provider_execution' && !hostExecutedEvidence)
     || !['succeeded', 'empty_result'].includes(row.settlement_outcome_kind)
     || row.settlement_result_handle_id !== row.receipt_result_handle_id
     || row.settlement_result_handle_id !== row.handle_id
@@ -377,7 +392,10 @@ function verifyReceipt(input: {
     || row.dispatch_argument_digest !== row.handle_argument_digest
     || row.dispatch_ordinal !== row.final_dispatch_ordinal
     || row.frozen_handle_crossing_count !== 1
-    || row.frozen_crossing_count !== row.settlement_crossing_count
+    // The frozen crossing rows cover provider AND host crossings; the
+    // settlement counts them in separate columns.
+    || row.frozen_crossing_count
+      !== row.settlement_crossing_count + (row.settlement_host_crossing_count ?? 0)
   ) {
     return { ok: false, status: 'conflict', reason: 'receipt settlement, crossing, and result handle disagree' };
   }
@@ -389,9 +407,11 @@ function verifyReceipt(input: {
   });
   const frozenCrossings = crossingProjection(crossingAuthority.frozen);
   const liveCrossings = crossingProjection(crossingAuthority.live);
+  const totalCrossingCount = row.settlement_crossing_count
+    + (row.settlement_host_crossing_count ?? 0);
   if (
-    crossingAuthority.frozen.length !== row.settlement_crossing_count
-    || crossingAuthority.live.length !== row.settlement_crossing_count
+    crossingAuthority.frozen.length !== totalCrossingCount
+    || crossingAuthority.live.length !== totalCrossingCount
     || crossingAuthority.live.some((crossing) => crossing.accepted_task_id !== input.acceptedTaskId)
     || sha256Bytes(JSON.stringify(frozenCrossings)) !== row.settlement_crossings_digest
     || JSON.stringify(liveCrossings) !== JSON.stringify(frozenCrossings)
@@ -415,8 +435,8 @@ function verifyReceipt(input: {
   } catch {
     return { ok: false, status: 'conflict', reason: 'receipt backing payload is not valid JSON' };
   }
-  if (providerEnvelopeHasContradiction(rawPayload)) {
-    return { ok: false, status: 'conflict', reason: 'receipt backing provider envelope is contradictory' };
+  if (inspectProviderEnvelope(rawPayload).verdict !== 'clean') {
+    return { ok: false, status: 'conflict', reason: 'receipt backing provider envelope is contradictory or uninspected' };
   }
   const facts = deriveResultHandleFactsFromRaw(rawPayload);
   const cursorBytes = facts.cursor === null ? null : Buffer.from(facts.cursor, 'utf8');

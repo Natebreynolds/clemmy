@@ -35,8 +35,12 @@ import {
 import {
   commitWorkflowOriginTerminal,
   renderWorkflowOriginTerminalText,
+  reviewAndCommitWorkflowOriginTerminal,
   workflowOriginTerminalCommitMatches,
+  workflowOriginTerminalNeedsAsyncJudge,
+  type WorkflowOriginTerminalInput,
 } from './workflow-origin-terminal.js';
+import type { TerminalDeliveryJudgePort } from '../runtime/harness/terminal-delivery-judge.js';
 import {
   compactSettledWorkflowOriginGroup,
   createWorkflowOriginGroupSettlementReceipt,
@@ -48,6 +52,7 @@ import {
   type WorkflowOriginGroupSettlementReceipt,
   type WorkflowOriginGroupMemberReportBackDigest,
   type WorkflowOriginGroupSettlementTerminalInput,
+  type WorkflowOriginGroupTerminalStatus,
 } from './workflow-origin-group.js';
 
 export type WorkflowRunReportBackOutcome = 'done' | 'blocked' | 'failed';
@@ -111,6 +116,16 @@ type DeliverOutcomeImpl = (
 let deliverOutcomeImpl: DeliverOutcomeImpl = deliverOutcomeWithAcknowledgement;
 let beforeCheckpointLockForTests: (() => void) | undefined;
 let afterExactReceiptObservationForTests: (() => void) | undefined;
+let workflowOriginTerminalJudgePortForTests: TerminalDeliveryJudgePort | undefined;
+
+interface PendingWorkflowOriginTerminalReview {
+  callbacks: Set<() => void>;
+}
+
+const pendingWorkflowOriginTerminalReviews = new Map<
+  string,
+  PendingWorkflowOriginTerminalReview
+>();
 
 /** Narrow deterministic failure seam for the report-back acknowledgement tests. */
 export function _setWorkflowRunReportBackDeliveryForTests(
@@ -133,6 +148,54 @@ export function _setWorkflowRunReportBackAfterExactReceiptObservationForTests(
   hook?: () => void,
 ): void {
   afterExactReceiptObservationForTests = hook;
+}
+
+/** Test-only model boundary. Production always uses the shared independent
+ * terminal-delivery judge route. */
+export function _setWorkflowRunReportBackTerminalJudgeForTests(
+  port?: TerminalDeliveryJudgePort,
+): void {
+  workflowOriginTerminalJudgePortForTests = port;
+}
+
+function workflowOriginTerminalReviewKey(input: WorkflowOriginTerminalInput): string {
+  return [
+    input.observer.originSessionId,
+    input.observer.sourceUserSeq,
+    input.identityRunId ?? input.runId,
+  ].join('\0');
+}
+
+function scheduleWorkflowOriginTerminalReview(
+  input: WorkflowOriginTerminalInput,
+  onCommitted?: () => void,
+): void {
+  const key = workflowOriginTerminalReviewKey(input);
+  const pending = pendingWorkflowOriginTerminalReviews.get(key);
+  if (pending) {
+    if (onCommitted) pending.callbacks.add(onCommitted);
+    return;
+  }
+  const review: PendingWorkflowOriginTerminalReview = { callbacks: new Set() };
+  if (onCommitted) review.callbacks.add(onCommitted);
+  pendingWorkflowOriginTerminalReviews.set(key, review);
+  void reviewAndCommitWorkflowOriginTerminal(input, {
+    ...(workflowOriginTerminalJudgePortForTests
+      ? { port: workflowOriginTerminalJudgePortForTests }
+      : {}),
+  }).then((committed) => {
+    pendingWorkflowOriginTerminalReviews.delete(key);
+    if (!committed) return;
+    // The original synchronous attempt still owns its lock until this stack
+    // unwinds. Re-enter on a fresh microtask after the durable terminal exists.
+    for (const callback of review.callbacks) {
+      queueMicrotask(() => {
+        try { callback(); } catch { /* watchdog/retry owns later convergence */ }
+      });
+    }
+  }, () => {
+    pendingWorkflowOriginTerminalReviews.delete(key);
+  });
 }
 
 function uniqueStrings(...values: unknown[]): string[] {
@@ -447,8 +510,11 @@ function reportBackOutcomeRank(outcome: WorkflowRunReportBackOutcome): number {
 
 function workflowOriginTerminalStatus(
   status: string,
-): WorkflowRunReportBackOutcome | null {
-  return status === 'done' || status === 'blocked' || status === 'failed'
+): WorkflowOriginGroupTerminalStatus | null {
+  return status === 'done'
+    || status === 'blocked'
+    || status === 'failed'
+    || status === 'needs_input'
     ? status
     : null;
 }
@@ -705,6 +771,7 @@ function deliverToOrigins(
   run: WorkflowRunReportBackRecord,
   envelope: WorkflowRunReportBackEnvelope,
   onlyOrigins?: ReadonlySet<string>,
+  onTerminalReviewCommitted?: () => void,
 ): {
   acknowledgedSessions: string[];
   acknowledgedObservers: string[];
@@ -739,14 +806,21 @@ function deliverToOrigins(
         continue;
       }
       const projection = groupReport.projection;
-      const committed = commitWorkflowOriginTerminal({
+      const terminalInput: WorkflowOriginTerminalInput = {
         observer,
         runId: projection.primaryRunId,
         identityRunId: projection.identityRunId,
         evidenceRunIds: projection.memberRunIds,
         outcome: projection.outcome,
         detail: projection.detail,
-      });
+      };
+      if (workflowOriginTerminalNeedsAsyncJudge(terminalInput)) {
+        exactEvidenceComplete = false;
+        errors.push(`Origin observer ${observer.observerId} terminal review is pending.`);
+        scheduleWorkflowOriginTerminalReview(terminalInput, onTerminalReviewCommitted);
+        continue;
+      }
+      const committed = commitWorkflowOriginTerminal(terminalInput);
       if (!committed) {
         exactEvidenceComplete = false;
         corruptEvidence = true;
@@ -869,7 +943,11 @@ function deliverToOrigins(
       addNotification({
         id: notificationId,
         kind: 'workflow',
-        title: `Workflow ${committedStatus === 'done' ? 'completed' : committedStatus}: ${projection.workflowName}`,
+        title: `Workflow ${committedStatus === 'done'
+          ? 'completed'
+          : committedStatus === 'needs_input'
+            ? 'needs input'
+            : committedStatus}: ${projection.workflowName}`,
         body: committed.presentation.text,
         createdAt: new Date().toISOString(),
         read: false,
@@ -1015,7 +1093,11 @@ function deliverToOrigins(
  * entire read/deliver/merge/write is serialized with checkpoint replacement,
  * so an older attempt can never overwrite a newer exact envelope.
  */
-export function attemptWorkflowRunReportBack(filePath: string, now: number = Date.now()): boolean {
+function attemptWorkflowRunReportBackInternal(
+  filePath: string,
+  now: number,
+  bypassRetrySchedule: boolean,
+): boolean {
   try {
     return withWorkflowRunRecordLock(filePath, () => {
       const current = readRunRecordUnlocked(filePath);
@@ -1024,7 +1106,16 @@ export function attemptWorkflowRunReportBack(filePath: string, now: number = Dat
         || !workflowRunRecordPathOwnsId(filePath, current.id)
         || current.reportBack === undefined
       ) return false;
-      if (!workflowRunReportBackRetryDue(current, now)) return false;
+      if (bypassRetrySchedule) {
+        // Judge completion may bypass only the delivery backoff installed by
+        // its own pending attempt. It never reopens quarantined or corrupt
+        // evidence, and all envelope/status validation below still reruns.
+        if (
+          !workflowRunReportBackNeedsRetry(current)
+          || current.reportBackRetry?.kind === 'corrupt_evidence'
+          || current.reportBackRetry?.quarantinedAt
+        ) return false;
+      } else if (!workflowRunReportBackRetryDue(current, now)) return false;
       if (!validEnvelope(current.reportBack)) {
         const next = {
           ...current,
@@ -1049,7 +1140,14 @@ export function attemptWorkflowRunReportBack(filePath: string, now: number = Dat
         return false;
       }
 
-      const delivered = deliverToOrigins(current, current.reportBack);
+      const delivered = deliverToOrigins(
+        current,
+        current.reportBack,
+        undefined,
+        () => {
+          attemptWorkflowRunReportBackInternal(filePath, Date.now(), true);
+        },
+      );
       const acknowledgedSessions = uniqueStrings(
         current.reportBack.acknowledgedOriginSessionIds,
         delivered.acknowledgedSessions,
@@ -1124,6 +1222,10 @@ export function attemptWorkflowRunReportBack(filePath: string, now: number = Dat
   } catch {
     return false;
   }
+}
+
+export function attemptWorkflowRunReportBack(filePath: string, now: number = Date.now()): boolean {
+  return attemptWorkflowRunReportBackInternal(filePath, now, false);
 }
 
 export function recordAndAttemptWorkflowRunReportBack(
@@ -1222,7 +1324,11 @@ export function deliverWorkflowRunOutcome(
     detail,
     acknowledgedOriginSessionIds: [],
   };
-  const delivered = deliverToOrigins(run, envelope);
+  const delivered = deliverToOrigins(run, envelope, undefined, () => {
+    // Compatibility callers do not own a durable run-file path to update, but
+    // the exact-origin notification can still converge after async review.
+    deliverToOrigins(run, envelope);
+  });
   const required = workflowRunReportBackOrigins(run);
   const acknowledged = delivered.complete
     && required.complete

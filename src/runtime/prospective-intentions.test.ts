@@ -4,11 +4,13 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { after } from 'node:test';
 import Database from 'better-sqlite3';
+import type { BackgroundTaskRecord } from '../execution/background-tasks.js';
 
 const testHome = mkdtempSync(path.join(os.tmpdir(), 'clem-prospective-'));
 process.env.CLEMENTINE_HOME = testHome;
 
 const prospective = await import('./prospective-intentions.js');
+const { backgroundProspectiveDefinition } = await import('./prospective-adapters.js');
 
 after(() => {
   prospective.closeProspectiveIntentionsDbForTest();
@@ -328,6 +330,56 @@ test('generic execution vocabulary does not recall unrelated future intentions',
     assert.match(relevant.text, /weekly Salesforce snapshot task/);
   } finally {
     prospective.cancelProspectiveIntention(id, 'test_cleanup');
+  }
+});
+
+test('cross-session background matches stay prior-work candidates and expose the child status', () => {
+  const task = {
+    id: 'ventura-restaurants-sheet-email',
+    title: 'Pull Ventura restaurants into a Google Sheet and email the link',
+    prompt: 'Pull Ventura restaurants into a Google Sheet and email the link',
+    status: 'awaiting_input',
+    originSessionId: 'sess-prior-live-run',
+    runSessionId: 'background:ventura-restaurants-sheet-email',
+    maxMinutes: 90,
+    source: 'discord',
+    createdAt: '2026-08-12T18:00:00.000Z',
+    updatedAt: '2026-08-12T18:05:00.000Z',
+  } satisfies BackgroundTaskRecord;
+  const definition = backgroundProspectiveDefinition(task);
+  assert.ok(definition);
+  const indexed = prospective.upsertProspectiveIntention(
+    definition,
+    new Date('2026-08-12T18:05:00.000Z'),
+  );
+  assert.equal(
+    indexed?.status,
+    'active',
+    'the rebuildable parent index may remain active while the child task is paused',
+  );
+
+  try {
+    const context = prospective.buildProspectiveIntentionContext({
+      query: 'Pull the Ventura restaurants into a Google Sheet and email me the link',
+      sessionId: 'sess-fresh-live-run',
+      now: new Date('2026-08-12T19:00:00.000Z'),
+    });
+
+    assert.deepEqual(
+      context.ids,
+      [definition.id],
+      'lexical matching across sessions must preserve duplicate-work protection',
+    );
+    assert.match(context.text, /child status: awaiting_input/i);
+    assert.match(context.text, /prior-work candidate/i);
+    assert.match(context.text, /reconcile the child task/i);
+    assert.doesNotMatch(
+      context.text,
+      /\[ACTIVE\]/,
+      'the parent index state must not be presented as the child execution state',
+    );
+  } finally {
+    prospective.cancelProspectiveIntention(definition.id, 'test_cleanup');
   }
 });
 

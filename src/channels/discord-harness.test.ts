@@ -18,6 +18,7 @@ import {
   applyEventToState,
   isContinueCompletionReason,
   parseApprovalIntent,
+  tryHandleHarnessApprovalReply,
   parseHarnessCommand,
   progressPresentationForPrompt,
   toDiscordMarkdown,
@@ -25,6 +26,10 @@ import {
   type DisplayState,
 } from './discord-harness.js';
 import type { PendingApprovalRow } from '../runtime/harness/approval-registry.js';
+import {
+  autonomousSendConsent,
+  parseAutonomousSendConsentReply,
+} from '../runtime/harness/autonomous-send-consent.js';
 
 function freshState(): DisplayState {
   return { summary: '', status: 'starting', done: false, toolsCalled: [], toolCount: 0 };
@@ -393,6 +398,157 @@ test('exact pending-action approval hides Edit and surfaces target, risk, and pr
   assert.match(s.summary, /Risk:.*cannot be undone/);
   assert.match(s.summary, /Preview:.*Clementine 3\.0 is ready/);
   assert.doesNotMatch(s.summary, /\*\*Edit\*\*/);
+});
+
+test('autonomous single email projects an ordinary exact-action question with result link and no card', () => {
+  const priorScope = process.env.CLEMMY_AUTONOMOUS_CONVERSATIONAL_CONSENT;
+  process.env.CLEMMY_AUTONOMOUS_CONVERSATIONAL_CONSENT = 'on';
+  const s = freshState();
+  try {
+    applyEventToState(event('approval_requested', {
+      subject: 'Run OUTLOOK_OUTLOOK_SEND_EMAIL?',
+      tool: 'composio_execute_tool',
+      approvalId: 'apr-send',
+      approvalPresentation: 'conversation',
+      question: [
+        'I’ve got what you needed — here’s the result: https://docs.google.com/spreadsheets/d/sheet-proof/edit',
+        'The exact email is ready for **nathan.reynolds@scorpion.co** with subject **Top 5 restaurants in Ventura, CA**. Do you want me to send it?',
+      ].join('\n\n'),
+      args: {
+        tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+        arguments: JSON.stringify({
+          to_email: 'nathan.reynolds@scorpion.co',
+          subject: 'Top 5 restaurants in Ventura, CA',
+          body: 'Here is the finished sheet: https://docs.google.com/spreadsheets/d/sheet-proof/edit',
+        }),
+      },
+    }), s);
+  } finally {
+    if (priorScope === undefined) delete process.env.CLEMMY_AUTONOMOUS_CONVERSATIONAL_CONSENT;
+    else process.env.CLEMMY_AUTONOMOUS_CONVERSATIONAL_CONSENT = priorScope;
+  }
+
+  assert.equal(s.status, 'awaiting reply');
+  assert.equal(s.done, true);
+  assert.equal(s.pendingApprovalId, undefined, 'hidden durable authority must not become card chrome');
+  assert.equal(__test__.approvalComponentsForState(s), null);
+  assert.match(s.summary, /https:\/\/docs\.google\.com\/spreadsheets\/d\/sheet-proof\/edit/);
+  assert.match(s.summary, /nathan\.reynolds@scorpion\.co/);
+  assert.match(s.summary, /Top 5 restaurants in Ventura, CA/);
+  assert.match(s.summary, /Do you want me to send it\?/);
+});
+
+test('autonomous consent stays fail-closed for qualified changes and missing exact email identity', () => {
+  assert.equal(parseAutonomousSendConsentReply('yes'), 'approve');
+  assert.equal(parseAutonomousSendConsentReply("Yes, that's all correct"), 'approve');
+  assert.equal(parseAutonomousSendConsentReply('Yes, that’s all correct'), 'approve');
+  assert.equal(parseAutonomousSendConsentReply('no thanks'), 'reject');
+  assert.equal(parseAutonomousSendConsentReply('yes, but change the subject'), null);
+  assert.equal(parseAutonomousSendConsentReply('send it to Alex instead'), null);
+  assert.equal(autonomousSendConsent('composio_execute_tool', {
+    tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    arguments: JSON.stringify({ to_email: 'nathan.reynolds@scorpion.co', body: 'No subject supplied.' }),
+  }), null, 'an unreviewable email keeps the formal approval surface');
+});
+
+test('autonomous email recipient extraction is nested, order-independent, and excludes sender metadata', () => {
+  const nested = (emailAddress: Record<string, string>) => autonomousSendConsent(
+    'mcp__outlook__OUTLOOK_SEND_EMAIL',
+    {
+      toRecipients: [{ emailAddress }],
+      from: { emailAddress: { address: 'clem@corp.example', name: 'Clem' } },
+      replyTo: [{ emailAddress: { address: 'reply@corp.example' } }],
+      subject: 'Exact subject',
+      body: 'Exact preview and a body-only address nobody@body.example',
+    },
+  );
+  assert.equal(nested({ name: 'Nathan', address: 'nathan@example.ai' })?.target, 'nathan@example.ai');
+  assert.equal(nested({ address: 'nathan@example.ai', name: 'Nathan' })?.target, 'nathan@example.ai');
+  assert.equal(nested({ name: 'Nathan' }), null, 'display name alone is never a destination');
+  assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    to_recipients: [{ name: 'Nathan', email: 'nathan@example.ai' }],
+    subject: 'Exact subject',
+    body: 'Exact preview',
+  })?.target, 'nathan@example.ai', 'snake_case recipient objects retain their exact email target');
+  assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    from: { name: 'Nathan', email: 'from@example.ai' },
+    reply_to: [{ email: 'reply@example.ai' }],
+    subject: 'Exact subject',
+    body: 'Exact preview mentions body@example.ai',
+  }), null, 'sender, reply-to, and body-only addresses never become a destination');
+  assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    toRecipients: [
+      { emailAddress: { address: 'one@example.ai' } },
+      { emailAddress: { address: 'two@example.ai' } },
+    ],
+    subject: 'Exact subject',
+    body: 'Exact preview',
+  }), null, 'multiple recipients retain the formal surface');
+});
+
+test('autonomous email consent rejects conflicting nested subject or body decoys', () => {
+  const recipient = {
+    toRecipients: [{ emailAddress: { address: 'nathan@example.ai', name: 'Nathan' } }],
+  };
+  assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    ...recipient,
+    metadata: { subject: 'SAFE subject shown by a naive recursive first match' },
+    subject: 'ACTUAL provider subject',
+    body: { contentType: 'HTML', content: 'ACTUAL provider body' },
+  }), null, 'a conflicting recursive subject keeps the formal approval surface');
+  assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    ...recipient,
+    metadata: { body: 'SAFE body shown by a naive recursive first match' },
+    subject: 'ACTUAL provider subject',
+    body: { contentType: 'HTML', content: 'ACTUAL provider body' },
+  }), null, 'a conflicting recursive body keeps the formal approval surface');
+  assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    ...recipient,
+    metadata: {
+      subject: 'Decoy subject',
+      body: 'Decoy body',
+    },
+    subject: '   ',
+    body: { contentType: 'HTML', content: '' },
+  }), null, 'blank provider-semantic fields cannot leave nested decoys as the displayed values');
+  assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    ...recipient,
+    metadata: {
+      subject: 'Decoy subject',
+      body: 'Decoy body',
+    },
+    subject: null,
+    body: { contentType: 'HTML', content: null },
+  }), null, 'null provider-semantic fields cannot leave nested decoys as the displayed values');
+  assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    ...recipient,
+    metadata: { body: 'Decoy body' },
+    subject: 'Literal JSON stays literal',
+    body: '{"amount":100}',
+  }), null, 'a JSON-looking literal body remains a conflicting exact candidate');
+  assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    ...recipient,
+    metadata: { subject: 'Invoice 1' },
+    subject: 'Invoice ①',
+    body: 'Exact body',
+  }), null, 'compatibility-distinct subject values are never deduplicated');
+  assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    ...recipient,
+    subject: `${'A'.repeat(180)} HIDDEN`,
+    body: 'Exact body',
+  }), null, 'a subject too long to show exactly retains the formal surface');
+
+  const equivalent = autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
+    ...recipient,
+    metadata: {
+      subject: '  Exact   subject  ',
+      body: ' Exact\nbody ',
+    },
+    subject: 'Exact subject',
+    body: { contentType: 'HTML', content: 'Exact body' },
+  });
+  assert.equal(equivalent?.subject, 'Exact subject');
+  assert.equal(equivalent?.bodyPreview, 'Exact body');
 });
 
 test('sibling approval buttons preserve one exact control per action', () => {
@@ -894,4 +1050,37 @@ test('toDiscordMarkdown: plain prose and empty input pass through untouched', ()
   assert.equal(toDiscordMarkdown('just a normal **bold** line with a [link](https://x)'),
     'just a normal **bold** line with a [link](https://x)');
   assert.equal(toDiscordMarkdown(''), '');
+});
+
+test('a bare approval verb with NO pending card falls through to a normal turn (live 2026-08-12)', async () => {
+  // Clem asked "Reply 'go ahead' and I'll run it"; the approval router
+  // intercepted the answer and replied "No pending approval is waiting in
+  // this conversation", dropping the user's actual instruction. With nothing
+  // pending, a bare verb is conversation, not approval control.
+  const handled = await tryHandleHarnessApprovalReply({
+    channelId: 'channel-no-pending-approval',
+    prompt: 'Go ahead and run it',
+    transport: {
+      sendInitial: async () => { throw new Error('must not reply as approval control'); },
+      update: async () => {},
+      final: async () => {},
+    } as never,
+  });
+  assert.equal(handled, false, 'the router declines the message so the normal turn runs');
+});
+
+test('an explicit apr-id with no matching card still gets a typed approval answer', async () => {
+  let replied = '';
+  const handled = await tryHandleHarnessApprovalReply({
+    channelId: 'channel-no-pending-approval',
+    prompt: 'approve apr-zz99',
+    transport: {
+      sendInitial: async (text: string) => { replied = text; },
+      sendError: async (text: string) => { replied = text; },
+      update: async () => {},
+      final: async () => {},
+    } as never,
+  });
+  assert.equal(handled, true, 'a named approval is approval control even when it is stale');
+  assert.match(replied, /apr-zz99/);
 });

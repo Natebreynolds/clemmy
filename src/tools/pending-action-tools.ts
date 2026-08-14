@@ -248,7 +248,7 @@ export function registerPendingActionTools(server: McpServer): void {
         kind,
         toolName,
         payload,
-      });
+      }, { sessionId });
       if (needsFormalApproval && !sessionId) {
         return textResult('pending_action_queue refused: an approval-bound action requires an authoritative harness session.');
       }

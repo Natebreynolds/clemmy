@@ -21,6 +21,7 @@ const dispatch = await import('../runtime/harness/dispatch-ledger.js');
 const attempts = await import('../runtime/harness/attempt-outcome.js');
 const settlements = await import('../runtime/harness/logical-call-settlement-store.js');
 const brackets = await import('../runtime/harness/brackets.js');
+const workCallModule = await import('../tools/work-call.js');
 const { buildWorkerAgent } = await import('./sub-agents.js');
 const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
 
@@ -34,6 +35,9 @@ test.after(() => {
 const ASK = 'Read every open lead and write a local follow-up draft file for each one.';
 const SOURCE_TOOL = 'read_file';
 const DRAFT_TOOL = 'write_file';
+const PROFILE_READ_TOOL = 'user_profile_read';
+const COMPUTE_TOOL = 'run_shell_command';
+const EXTERNAL_SEND_TOOL = 'composio_execute_tool';
 
 let serial = 0;
 
@@ -329,4 +333,230 @@ test('a worker item outside the sealed universe is still refused', async () => {
   const rendered = typeof output === 'string' ? output : JSON.stringify(output ?? null);
   assert.match(rendered, /work_cardinality_mismatch/, rendered);
   assert.equal(ran.length, 0, 'an item outside the sealed universe crosses no tool boundary');
+});
+
+test('the gentle-call predicate excludes durable binding and authority refusals', () => {
+  assert.equal(workCallModule.isReadComputeSemanticRefusal(
+    'work_contract_conflict',
+    'a different action topology is already frozen',
+  ), true, 'a candidate proposal disagreement is semantic only');
+  assert.equal(workCallModule.isReadComputeSemanticRefusal(
+    'work_contract_conflict',
+    'logical call already owns a different work binding',
+  ), false, 'an actual persisted binding collision remains fail-closed');
+  assert.equal(workCallModule.isReadComputeSemanticRefusal(
+    'work_binding_required',
+    'call logical:conflict is not bound to the frozen contract',
+  ), false, 'a binding-authority refusal is never generalized into the fallback');
+  assert.equal(workCallModule.isReadComputeSemanticRefusal(
+    'work_authority_unavailable',
+    'logical call is not the exact open normalized inner call',
+  ), false);
+  assert.equal(workCallModule.isReadComputeSemanticRefusal(
+    'work_already_satisfied',
+    'this requirement instance is already durably settled',
+  ), false, 'a satisfied instance stays on the stored-result redemption lane');
+});
+
+test('a worker can execute an unbound host read through a conflicting proposal, but the same conflict cannot open an external write', async () => {
+  const task = acceptDelegatedAction('conflicting-read-fallback');
+  const boundSourceCallId = stageSealedSource(task, [{ id: 'lead-001' }]);
+  assert.deepEqual(workCallModule.unboundReadComputeAuthority({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId: boundSourceCallId,
+    toolName: SOURCE_TOOL,
+    args: { path: 'leads.json' },
+  }), {
+    ok: false,
+    reason: 'logical call already owns a durable work binding',
+  }, 'a conflicting proposal cannot mask an already-persisted binding from the fallback');
+
+  let readExecutions = 0;
+  let computeExecutions = 0;
+  let sendExecutions = 0;
+  _setCodeModeToolsForTests(new Map([
+    [PROFILE_READ_TOOL, {
+      name: PROFILE_READ_TOOL,
+      invoke: async () => {
+        readExecutions += 1;
+        return { successful: true, data: { marker: 'worker-read-reached-provider' } };
+      },
+    }],
+    [COMPUTE_TOOL, {
+      name: COMPUTE_TOOL,
+      invoke: async () => {
+        computeExecutions += 1;
+        return { successful: true, stdout: 'worker-compute-reached-provider' };
+      },
+    }],
+    [EXTERNAL_SEND_TOOL, {
+      name: EXTERNAL_SEND_TOOL,
+      invoke: async () => {
+        sendExecutions += 1;
+        return { successful: true, data: { id: 'must-not-send' } };
+      },
+    }],
+  ] as never));
+
+  const worker = await buildWorkerAgent({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  const workCall = invokable(worker as { tools?: Array<{ name?: string }> }, 'work_call');
+  const conflictingOneOperationProposal = {
+    version: 1,
+    operations: [{
+      id: 'inspect-profile',
+      // Deliberately disagree with both the broader frozen contract and the
+      // host-resolved read. Host effect truth, not proposal prose, decides
+      // whether the fallback is safe.
+      effect: 'compute',
+      coverage: null,
+      dependsOn: [],
+      dataFrom: [],
+      cardinality: { kind: 'once' },
+    }],
+    universes: [],
+  };
+
+  const readCallId = `worker-conflicting-read-${task.label}`;
+  const readOutput = await brackets.withHarnessRunContext(
+    {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      workerScope: true,
+    },
+    () => workCall.invoke(
+      { context: { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: 1 } },
+      JSON.stringify({
+        proposal: conflictingOneOperationProposal,
+        requirement_id: 'inspect-profile',
+        universe_item_id: null,
+        universe_selector: null,
+        name: PROFILE_READ_TOOL,
+        args_json: '{}',
+      }),
+      { toolCall: { callId: readCallId } },
+    ),
+  );
+  const renderedRead = typeof readOutput === 'string'
+    ? readOutput
+    : JSON.stringify(readOutput ?? null);
+  assert.match(renderedRead, /worker-read-reached-provider/, renderedRead);
+  assert.equal(readExecutions, 1, 'the host-classified read reaches its provider path once');
+  assert.equal(
+    (eventlog.openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM expected_work_call_bindings
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(task.sessionId, task.sourceUserSeq, readCallId) as { n: number }).n,
+    0,
+    'the conflicting read is truthful unbound work, not a fabricated contract binding',
+  );
+
+  const computeCallId = `worker-conflicting-compute-${task.label}`;
+  const computeOutput = await brackets.withHarnessRunContext(
+    {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      workerScope: true,
+    },
+    () => workCall.invoke(
+      { context: { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: 1 } },
+      JSON.stringify({
+        proposal: conflictingOneOperationProposal,
+        requirement_id: 'inspect-profile',
+        universe_item_id: null,
+        universe_selector: null,
+        name: COMPUTE_TOOL,
+        args_json: JSON.stringify({ command: 'echo worker-compute-reached-provider' }),
+      }),
+      { toolCall: { callId: computeCallId } },
+    ),
+  );
+  const renderedCompute = typeof computeOutput === 'string'
+    ? computeOutput
+    : JSON.stringify(computeOutput ?? null);
+  assert.match(renderedCompute, /worker-compute-reached-provider/, renderedCompute);
+  assert.equal(computeExecutions, 1, 'the host-classified compute reaches its provider path once');
+  assert.equal(
+    (eventlog.openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM expected_work_call_bindings
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(task.sessionId, task.sourceUserSeq, computeCallId) as { n: number }).n,
+    0,
+    'the conflicting compute also remains explicitly unbound',
+  );
+
+  const sendCallId = `worker-conflicting-send-${task.label}`;
+  const sendOutput = await brackets.withHarnessRunContext(
+    {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      workerScope: true,
+    },
+    () => workCall.invoke(
+      { context: { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: 1 } },
+      JSON.stringify({
+        proposal: conflictingOneOperationProposal,
+        requirement_id: 'inspect-profile',
+        universe_item_id: null,
+        universe_selector: null,
+        name: EXTERNAL_SEND_TOOL,
+        args_json: JSON.stringify({
+          tool_slug: 'OUTLOOK_SEND_EMAIL',
+          arguments: JSON.stringify({
+            to: 'prospect@example.test',
+            subject: 'Contract isolation test',
+            body: 'This must not dispatch.',
+          }),
+          connected_account_id: null,
+        }),
+      }),
+      { toolCall: { callId: sendCallId } },
+    ),
+  );
+  const renderedSend = typeof sendOutput === 'string'
+    ? sendOutput
+    : JSON.stringify(sendOutput ?? null);
+  assert.match(renderedSend, /work_contract_conflict/, renderedSend);
+  assert.equal(sendExecutions, 0, 'a conflicting proposal still authorizes zero external writes');
+  assert.equal(
+    (eventlog.openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(task.sessionId, task.sourceUserSeq, sendCallId) as { n: number }).n,
+    0,
+    'the external write never crosses a provider boundary',
+  );
+
+  eventlog.openEventLog().prepare(`
+    UPDATE accepted_task_authority
+       SET state = 'conflict', revision = revision + 1, updated_at = ?
+     WHERE session_id = ? AND source_user_seq = ? AND state = 'armed'
+  `).run(new Date().toISOString(), task.sessionId, task.sourceUserSeq);
+  const closedReadOutput = await brackets.withHarnessRunContext(
+    {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      workerScope: true,
+    },
+    () => workCall.invoke(
+      { context: { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: 1 } },
+      JSON.stringify({
+        proposal: conflictingOneOperationProposal,
+        requirement_id: 'inspect-profile',
+        universe_item_id: null,
+        universe_selector: null,
+        name: PROFILE_READ_TOOL,
+        args_json: '{}',
+      }),
+      { toolCall: { callId: `worker-closed-read-${task.label}` } },
+    ),
+  );
+  const renderedClosedRead = typeof closedReadOutput === 'string'
+    ? closedReadOutput
+    : JSON.stringify(closedReadOutput ?? null);
+  assert.match(renderedClosedRead, /work_contract_conflict|work_authority_unavailable/, renderedClosedRead);
+  assert.equal(readExecutions, 1, 'a conflicted accepted authority cannot use the read fallback');
 });

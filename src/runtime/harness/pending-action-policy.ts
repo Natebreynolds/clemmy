@@ -6,13 +6,29 @@ export interface PendingActionSafetyInput {
   payload: unknown;
 }
 
+export interface PendingActionApprovalContext {
+  /** Session that owns the queued action. Presentation policy may use this,
+   * but it can never weaken the irreversible-send decision boundary. */
+  sessionId?: string | null;
+}
+
 /**
  * Human consent is derived from the canonical stored call, never weakened by
  * a model-declared kind. Unknown external mutations fail closed.
+ *
+ * A recipient named in the original request identifies the destination; it is
+ * not fresh authorization to cross the later irreversible provider boundary.
+ * Autonomous mode changes how that fresh decision is presented (an ordinary
+ * exact-action question), never whether the durable human decision exists.
  */
 export function pendingActionRequiresHumanApproval(
   action: PendingActionSafetyInput,
+  _context?: PendingActionApprovalContext,
 ): boolean {
+  return baseRequiresHumanApproval(action);
+}
+
+function baseRequiresHumanApproval(action: PendingActionSafetyInput): boolean {
   if (action.kind === 'external_send') return true;
 
   if (action.toolName === 'run_batch') {

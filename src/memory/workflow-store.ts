@@ -470,9 +470,10 @@ export interface WorkflowDefinition {
   synthesis?: WorkflowSynthesis;
   /** Free-form prose body — everything not under a ## step: anchor. */
   description_body?: string;
-  /** CHANGE 3: Approval gate flexibility. When true (default), sends/publishes run autonomously
-   *  without requiring approval gates. Users can opt-in to approval per-step via requiresApproval.
-   *  Set to false to re-enable strict validation (old behavior: send gates required). */
+  /** Approval policy. Legacy/model-authored send steps retain the historical
+   *  undefined default; an unattended structured direct send requires this to
+   *  be explicitly true plus the runner's narrow exact-send authority proof.
+   *  Per-step requiresApproval always wins, and false disables autonomy. */
   allowSends?: boolean;
   /** Run-level pinned goal — external validation + bounded re-pursuit. */
   goal?: WorkflowGoal;
@@ -879,9 +880,14 @@ if (step.optional === true || (step as Record<string, unknown>).optional === 'tr
       inputs: typeof data.inputs === 'object' && data.inputs ? data.inputs as WorkflowDefinition['inputs'] : undefined,
       synthesis: typeof data.synthesis === 'object' && data.synthesis ? data.synthesis as WorkflowSynthesis : undefined,
       description_body: body.description_body || undefined,
-      // allowSends round-trip: only `false` is meaningful (strict send gating);
-      // the default-true case stays unwritten so legacy files are byte-identical.
-      ...(data.allow_sends === false || data.allowSends === false ? { allowSends: false } : {}),
+      // Preserve explicit standing send consent in either direction. Undefined
+      // remains the legacy model-step default; exact unattended structured
+      // sends require an authored true value and must survive round-trip.
+      ...(data.allow_sends === true || data.allowSends === true
+        ? { allowSends: true }
+        : data.allow_sends === false || data.allowSends === false
+          ? { allowSends: false }
+          : {}),
       ...((): Partial<WorkflowDefinition> => {
         const raw = (data.models ?? data.model_pins) as { brain?: unknown; worker?: unknown } | undefined;
         if (!raw || typeof raw !== 'object') return {};
@@ -1064,8 +1070,9 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   }
   if (def.inputs && Object.keys(def.inputs).length > 0) frontmatter.inputs = def.inputs;
   if (def.synthesis?.prompt) frontmatter.synthesis = def.synthesis;
-  // Only the strict (non-default) setting is persisted — see the parse side.
-  if (def.allowSends === false) frontmatter.allow_sends = false;
+  // Exact unattended structured sends distinguish explicit true standing
+  // consent from the legacy undefined default, so preserve both booleans.
+  if (def.allowSends === true || def.allowSends === false) frontmatter.allow_sends = def.allowSends;
   if (def.models && (def.models.brain || def.models.worker)) frontmatter.models = { ...def.models };
   // Only 'dev' is persisted — absent means 'user', keeping legacy files byte-identical.
   if (def.origin === 'dev') frontmatter.origin = 'dev';

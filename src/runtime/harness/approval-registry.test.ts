@@ -11,11 +11,61 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import type { NewConversationalApprovalPresentation } from './approval-registry.js';
 
 const reg = await import('./approval-registry.js');
 const pending = await import('./pending-actions.js');
-const { createSession, closeEventLog, openEventLog } = await import('./eventlog.js');
+const { appendEvent, createSession, closeEventLog, openEventLog } = await import('./eventlog.js');
 const { addNotification, listNotifications } = await import('../notifications.js');
+const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
+const { pendingActionApprovalView } = await import('./pending-action-view.js');
+
+function conversationalPresentation(
+  sourceUserSeq: number,
+  overrides: Partial<NewConversationalApprovalPresentation> = {},
+): NewConversationalApprovalPresentation {
+  const originReplyTarget = { type: 'discord_channel' as const, channelId: 'consent-channel' };
+  return {
+    version: 1,
+    kind: 'autonomous_send_consent',
+    question: 'The sheet is ready. Send the exact email to proof@example.com with subject **Proof**?',
+    actionLabel: 'email',
+    target: 'proof@example.com',
+    subject: 'Proof',
+    bodyPreview: 'Here is the finished sheet: https://docs.google.com/spreadsheets/d/proof',
+    resultUrl: 'https://docs.google.com/spreadsheets/d/proof',
+    sourceUserSeq,
+    originReplyTarget,
+    originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget),
+    conversationKey: 'discord:consent-channel',
+    audienceUserId: 'human-proof',
+    ...overrides,
+  };
+}
+
+function bindConsentPrompt(input: {
+  sessionId: string;
+  approvalId: string;
+  question: string;
+}): ReturnType<typeof appendEvent> {
+  const prompt = appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'approval_requested',
+    data: {
+      approvalId: input.approvalId,
+      approvalPresentation: 'conversation',
+      question: input.question,
+    },
+  });
+  reg.bindConversationalApprovalPrompt({
+    approvalId: input.approvalId,
+    promptEventId: prompt.id,
+    promptEventSeq: prompt.seq,
+  });
+  return prompt;
+}
 
 test.beforeEach(() => {
   // Tests share one DB across the file; wipe the registry rows so each
@@ -277,6 +327,271 @@ test('resumable approval registration dedupes and an approved grant is claimed e
 
   const replay = reg.claimResumableApproval(input.resumeKey);
   assert.equal(replay.state, 'consumed', 'the exact approved payload cannot reuse the grant twice');
+});
+
+test('conversational send consent survives restart windows and grants its frozen payload exactly once', () => {
+  const session = createSession({ kind: 'chat', channel: 'discord' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Make the sheet and prepare an email to proof@example.com.',
+      userId: 'human-proof',
+      conversationKey: 'discord:consent-channel',
+    },
+  });
+  const input = {
+    sessionId: session.id,
+    subject: 'Send exact proof email?',
+    tool: 'mcp__outlook__OUTLOOK_SEND_EMAIL',
+    args: {
+      to: 'proof@example.com',
+      subject: 'Proof',
+      body: 'Here is the finished sheet: https://docs.google.com/spreadsheets/d/proof',
+    },
+    resumeKey: 'direct-consent-restart-exact',
+    presentation: conversationalPresentation(source.seq),
+  };
+  const registered = reg.registerResumable(input);
+  const duplicateBeforePrompt = reg.registerResumable(input);
+  assert.equal(duplicateBeforePrompt.created, false);
+  assert.equal(duplicateBeforePrompt.row.approvalId, registered.row.approvalId);
+  assert.equal(reg.listPending({ sessionId: session.id }).length, 1);
+
+  const prompt = bindConsentPrompt({
+    sessionId: session.id,
+    approvalId: registered.row.approvalId,
+    question: input.presentation.question,
+  });
+  const response = appendEvent({
+    sessionId: session.id,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Yes',
+      source: 'channel_send_consent',
+      approvalId: registered.row.approvalId,
+      decision: 'approve',
+      userId: 'human-proof',
+      conversationKey: 'discord:consent-channel',
+    },
+  });
+  assert.equal(reg.claimConversationalApprovalReply({
+    approvalId: registered.row.approvalId,
+    sourceUserSeq: response.seq,
+    userId: 'human-proof',
+    conversationKey: 'discord:consent-channel',
+    decision: 'approve',
+  }), null, 'a persisted prompt event without a successful transport receipt grants nothing');
+
+  reg.markConversationalApprovalPresented({
+    approvalId: registered.row.approvalId,
+    promptEventId: prompt.id,
+    promptEventSeq: prompt.seq,
+  });
+  const claimedReply = reg.claimConversationalApprovalReply({
+    approvalId: registered.row.approvalId,
+    sourceUserSeq: response.seq,
+    userId: 'human-proof',
+    conversationKey: 'discord:consent-channel',
+    decision: 'approve',
+  });
+  assert.equal(claimedReply?.presentation?.responseSourceUserSeq, response.seq);
+  assert.equal(reg.claimConversationalApprovalReply({
+    approvalId: registered.row.approvalId,
+    sourceUserSeq: response.seq,
+    userId: 'human-proof',
+    conversationKey: 'discord:consent-channel',
+    decision: 'approve',
+  }), null, 'the durable reply CAS has one winner');
+
+  assert.equal(reg.resolve(registered.row.approvalId, 'approved', 'discord-conversation').ok, true);
+  closeEventLog(); // crash after resolution, before the frozen provider call claims authority
+  const firstExecution = reg.claimResumableApproval(input.resumeKey, registered.row.approvalId);
+  assert.equal(firstExecution.state, 'pending_action_owned');
+  assert.equal(reg.claimResumableApproval(input.resumeKey, registered.row.approvalId).state, 'pending_action_owned');
+  assert.equal(reg.get(registered.row.approvalId)?.consumedAt, null,
+    'raw replay cannot consume host-owned pending-action authority');
+});
+
+test('conversational consent is exact-user, exact-thread, immediate-next and atomically demotes siblings', () => {
+  const firstSession = createSession({ kind: 'chat', channel: 'discord' });
+  const firstSource = appendEvent({
+    sessionId: firstSession.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Prepare it.', userId: 'human-proof', conversationKey: 'discord:consent-channel' },
+  });
+  const first = reg.register({
+    sessionId: firstSession.id,
+    subject: 'First exact send?',
+    tool: 'mcp__outlook__OUTLOOK_SEND_EMAIL',
+    args: { to: 'proof@example.com', subject: 'Proof', body: 'Exact.' },
+    presentation: conversationalPresentation(firstSource.seq),
+  });
+  const firstPrompt = bindConsentPrompt({
+    sessionId: firstSession.id,
+    approvalId: first.approvalId,
+    question: first.presentation!.question,
+  });
+  reg.markConversationalApprovalPresented({
+    approvalId: first.approvalId,
+    promptEventId: firstPrompt.id,
+    promptEventSeq: firstPrompt.seq,
+  });
+
+  const wrongPerson = appendEvent({
+    sessionId: firstSession.id,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Yes', source: 'channel_send_consent', approvalId: first.approvalId,
+      decision: 'approve', userId: 'other-human', conversationKey: 'discord:consent-channel',
+    },
+  });
+  assert.equal(reg.claimConversationalApprovalReply({
+    approvalId: first.approvalId,
+    sourceUserSeq: wrongPerson.seq,
+    userId: 'other-human',
+    conversationKey: 'discord:consent-channel',
+    decision: 'approve',
+  }), null);
+  const lateRightPerson = appendEvent({
+    sessionId: firstSession.id,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Yes', source: 'channel_send_consent', approvalId: first.approvalId,
+      decision: 'approve', userId: 'human-proof', conversationKey: 'discord:consent-channel',
+    },
+  });
+  assert.equal(reg.claimConversationalApprovalReply({
+    approvalId: first.approvalId,
+    sourceUserSeq: lateRightPerson.seq,
+    userId: 'human-proof',
+    conversationKey: 'discord:consent-channel',
+    decision: 'approve',
+  }), null, 'a later Yes cannot reclaim a slot whose immediate reply came from another user');
+
+  const secondSession = createSession({ kind: 'chat', channel: 'discord' });
+  const secondSource = appendEvent({
+    sessionId: secondSession.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Prepare another.', userId: 'human-proof', conversationKey: 'discord:consent-channel' },
+  });
+  const second = reg.register({
+    sessionId: secondSession.id,
+    subject: 'Second exact send?',
+    tool: 'mcp__outlook__OUTLOOK_SEND_EMAIL',
+    args: { to: 'proof@example.com', subject: 'Another', body: 'Exact second.' },
+    presentation: conversationalPresentation(secondSource.seq),
+  });
+  assert.equal(reg.get(first.approvalId)?.presentation, null);
+  assert.equal(second.presentation, null);
+  assert.equal(reg.isFormalApprovalSurface(reg.get(first.approvalId)!), true);
+  assert.equal(reg.isFormalApprovalSurface(reg.get(second.approvalId)!), true);
+});
+
+test('pending-action execution accepts typed conversation evidence only for the exact frozen action', () => {
+  const session = createSession({ kind: 'chat', channel: 'discord' });
+  const originReplyTarget = { type: 'discord_channel' as const, channelId: 'consent-channel' };
+  const originReplyTargetDigest = exactOriginDeliveryTargetDigest(originReplyTarget);
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Build the sheet and prepare the exact proof email.',
+      userId: 'human-proof',
+      conversationKey: 'discord:consent-channel',
+      originReplyTarget,
+      originReplyTargetDigest,
+    },
+  });
+  const action = pending.queuePendingAction({
+    title: 'Send proof email',
+    summary: 'The finished sheet is ready.',
+    kind: 'external_send',
+    toolName: 'mcp__outlook__OUTLOOK_SEND_EMAIL',
+    payload: {
+      to: 'proof@example.com',
+      subject: 'Proof',
+      body: 'Here is the finished sheet: https://docs.google.com/spreadsheets/d/proof',
+    },
+    targetSummary: 'proof@example.com',
+    preview: 'Here is the finished sheet: https://docs.google.com/spreadsheets/d/proof',
+    sessionId: session.id,
+  });
+  const row = reg.register({
+    sessionId: session.id,
+    subject: 'Send exact proof email?',
+    tool: 'request_approval',
+    args: {
+      pendingActionId: action.id,
+      pendingAction: pendingActionApprovalView(action),
+    },
+    presentation: conversationalPresentation(source.seq),
+  });
+  const prompt = bindConsentPrompt({
+    sessionId: session.id,
+    approvalId: row.approvalId,
+    question: row.presentation!.question,
+  });
+  reg.markConversationalApprovalPresented({
+    approvalId: row.approvalId,
+    promptEventId: prompt.id,
+    promptEventSeq: prompt.seq,
+  });
+  const response = appendEvent({
+    sessionId: session.id,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Yes',
+      source: 'channel_send_consent',
+      approvalId: row.approvalId,
+      decision: 'approve',
+      userId: 'human-proof',
+      conversationKey: 'discord:consent-channel',
+    },
+  });
+  assert.ok(reg.claimConversationalApprovalReply({
+    approvalId: row.approvalId,
+    sourceUserSeq: response.seq,
+    userId: 'human-proof',
+    conversationKey: 'discord:consent-channel',
+    decision: 'approve',
+  }));
+  assert.equal(reg.resolve(row.approvalId, 'approved', 'discord-conversation').ok, true);
+
+  const approved = pending.getPendingAction(action.id);
+  assert.equal(approved?.approvedBy, 'human');
+  assert.equal(approved?.approvalEvidence?.kind, 'conversation');
+  assert.notEqual(approved?.approvalEvidence?.kind, 'card');
+  const execution = pending.claimPendingActionExecution(action.id, 'typed-consent-test', {
+    expectedSessionId: session.id,
+    requireResolvedHumanCard: true,
+  });
+  assert.equal(execution.claimed, true, execution.record?.resultSummary ?? execution.reason);
+  assert.ok(execution.claimToken);
+  assert.equal(
+    pending.claimPendingActionExecution(action.id, 'duplicate-consent-test', {
+      expectedSessionId: session.id,
+      requireResolvedHumanCard: true,
+    }).claimed,
+    false,
+    'the same conversational decision cannot dispatch the pending action twice',
+  );
 });
 
 test('resumable approval expected-id claim consumes the awaited row, not a newer same-key row', () => {

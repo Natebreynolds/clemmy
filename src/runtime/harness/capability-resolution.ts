@@ -27,7 +27,6 @@
  * with the live schema fetch and the effect gates at the tool boundary.
  */
 import {
-  matchToolChoicesForStep,
   matchInvalidatedToolChoices,
   type ToolChoiceKind,
 } from '../../memory/tool-choice-store.js';
@@ -38,6 +37,7 @@ import { getRuntimeEnv } from '../../config.js';
 import { discoveryGovernor } from './discovery-governor.js';
 import { resolveActiveTaskContext } from './active-task-context.js';
 import { recallLearnedContracts, renderLearnedContracts } from '../../tools/tool-contract-recall.js';
+import { lexicalCapabilityMatchesForRequest } from '../read-path/lexical-capability-matches.js';
 
 export type CapabilityStatus = 'proven' | 'previously_failed';
 export type ConnectionState = 'active' | 'missing' | 'unknown' | 'not_applicable';
@@ -213,7 +213,7 @@ export function resolveTurnCapabilities(
   const entries: CapabilityResolutionEntry[] = [];
   const seen = new Set<string>();
   try {
-    for (const m of matchToolChoicesForStep(text, { purpose: 'advertise', limit: 4 })) {
+    for (const m of lexicalCapabilityMatchesForRequest({ userInput: text, limit: 4 })) {
       const key = `${m.kind}:${m.identifier}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -405,7 +405,8 @@ export function renderCapabilityResolutionForContext(
     + 'Never pass the learned intent label to call_tool, and never rediscover the same proven capability. ',
     'Floor: a previously-failed path must be re-verified with a cheap probe before you rely on it '
     + 'or ask for a go-ahead that assumes it — and say so. A toolkit with no active connection must be '
-    + 'surfaced to the user, never worked around silently. Capabilities not listed are ordinary discovery.',
+    + 'surfaced to the user, never worked around silently. A capability not listed is an unresolved requirement: '
+    + 'use the single discovery broker once for that requirement, not several provider-specific search surfaces.',
   );
   if (contractBlock) lines.push(contractBlock);
   return lines.join('\n');

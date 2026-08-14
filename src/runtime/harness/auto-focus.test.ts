@@ -12,7 +12,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { resetEventLog, createSession, appendEvent, closeEventLog } = await import('./eventlog.js');
+const { resetEventLog, createSession, appendEvent, closeEventLog, openEventLog } = await import('./eventlog.js');
 const { resetMemoryDb } = await import('../../memory/db.js');
 const { getActiveFocus, createFocus } = await import('../../memory/focus.js');
 const { maybeAutoFocusSession } = await import('./auto-focus.js');
@@ -109,6 +109,131 @@ test('maybeAutoFocusSession ignores gateway mirror inflation for thread and reso
   assert.equal(getActiveFocus(), null);
 });
 
+test('maybeAutoFocusSession ignores historical resource URLs nested in control-call context refs', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'dispatch unrelated background work' });
+  const historicalSpreadsheetId = 'historical_google_sheet_00000001';
+  const historicalUrl = `https://docs.google.com/spreadsheets/d/${historicalSpreadsheetId}/edit`;
+  for (let turn = 1; turn <= 2; turn += 1) {
+    appendEvent({
+      sessionId: sess.id,
+      turn,
+      role: 'system',
+      type: 'user_input_received',
+      data: { text: turn === 1 ? 'run this new task in the background' : 'queue the follow-up too' },
+    });
+    appendEvent({
+      sessionId: sess.id,
+      turn,
+      role: 'Clem',
+      type: 'tool_called',
+      data: {
+        tool: 'dispatch_background_task',
+        callId: `dispatch-${turn}`,
+        canonicalCallId: `dispatch-${turn}`,
+        accounting: 'top_level',
+        arguments: JSON.stringify({
+          objective: `Background task ${turn}`,
+          context_refs: [historicalUrl],
+        }),
+      },
+    });
+  }
+
+  assert.equal(maybeAutoFocusSession({ sessionId: sess.id }), null);
+  assert.equal(getActiveFocus(), null, 'a control packet must not turn referenced history into worked resource focus');
+});
+
+test('maybeAutoFocusSession counts one canonical resource call only once', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'single sheet read' });
+  const spreadsheetId = 'fixture_google_sheet_0000000004';
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'user_input_received',
+    data: { text: 'read this sheet once' },
+  });
+  for (let copy = 0; copy < 2; copy += 1) {
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'Clem',
+      type: 'tool_called',
+      data: {
+        tool: 'composio_execute_tool',
+        callId: `sheet-copy-${copy}`,
+        canonicalCallId: 'sheet-logical-1',
+        accounting: 'top_level',
+        arguments: JSON.stringify({
+          tool_slug: 'GOOGLESHEETS_GET_SPREADSHEET',
+          arguments: JSON.stringify({ spreadsheet_id: spreadsheetId }),
+        }),
+      },
+    });
+  }
+
+  assert.equal(maybeAutoFocusSession({ sessionId: sess.id }), null);
+  assert.equal(getActiveFocus(), null, 'duplicate lifecycle rows for one logical call cannot satisfy the hit threshold');
+});
+
+test('maybeAutoFocusSession counts a run artifact only after provider read-back verification', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'verified sheet work' });
+  const spreadsheetId = 'fixture_google_sheet_0000000005';
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'user_input_received',
+    data: { text: 'continue work on the created sheet' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'sheet-read-after-create',
+      canonicalCallId: 'sheet-read-after-create',
+      accounting: 'top_level',
+      arguments: JSON.stringify({
+        tool_slug: 'GOOGLESHEETS_GET_SPREADSHEET',
+        arguments: JSON.stringify({ spreadsheet_id: spreadsheetId }),
+      }),
+    },
+  });
+  const now = new Date().toISOString();
+  openEventLog().prepare(`
+    INSERT INTO run_artifacts
+      (id, session_id, run_scope_id, slot_key, kind, provider, title,
+       create_shape, status, resource_id, uri, binding_verified_at,
+       created_at, updated_at)
+    VALUES (?, ?, ?, ?, 'resource', 'googlesheets', ?,
+            'GOOGLESHEETS_CREATE', 'bound', ?, ?, NULL, ?, ?)
+  `).run(
+    'artifact-sheet-verification-pin',
+    sess.id,
+    sess.id,
+    'resource:primary',
+    'Verified sheet',
+    spreadsheetId,
+    `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+    now,
+    now,
+  );
+
+  assert.equal(maybeAutoFocusSession({ sessionId: sess.id }), null, 'a merely bound artifact is not trusted focus evidence');
+  openEventLog().prepare(
+    'UPDATE run_artifacts SET binding_verified_at=? WHERE id=?',
+  ).run(new Date().toISOString(), 'artifact-sheet-verification-pin');
+
+  assert.ok(maybeAutoFocusSession({ sessionId: sess.id }));
+  assert.equal(getActiveFocus()?.resource_ref, `https://docs.google.com/spreadsheets/d/${spreadsheetId}`);
+});
+
 test('maybeAutoFocusSession pins repeated Google Sheet work to the concrete resource', () => {
   resetAll();
   const sess = createSession({ kind: 'chat', title: 'priority account sheet' });
@@ -128,6 +253,9 @@ test('maybeAutoFocusSession pins repeated Google Sheet work to the concrete reso
       type: 'tool_called',
       data: {
         tool: 'composio_execute_tool',
+        callId: `sheet-update-${turn}`,
+        canonicalCallId: `sheet-update-${turn}`,
+        accounting: 'top_level',
         arguments: JSON.stringify({
           tool_slug: 'GOOGLESHEETS_UPDATE_VALUES',
           arguments: JSON.stringify({ spreadsheet_id: spreadsheetId, range: 'A1:B2' }),

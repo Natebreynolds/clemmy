@@ -16,10 +16,85 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { backgroundRouteForOriginSession, registerBackgroundTaskTools } = await import('./background-task-tools.js');
-const { createSession } = await import('../runtime/harness/eventlog.js');
-const { createBackgroundTask, getBackgroundTask, markBackgroundTaskDone } = await import('../execution/background-tasks.js');
+const {
+  appendConversationPreambleOnce,
+  appendEvent,
+  createSession,
+} = await import('../runtime/harness/eventlog.js');
+const {
+  createBackgroundTask,
+  getBackgroundTask,
+  listBackgroundTasks,
+  markBackgroundTaskDone,
+} = await import('../execution/background-tasks.js');
 const { createFocus, getActiveFocus, getFocusWorkstate } = await import('../memory/focus.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+const { recordTurnPreflightDecision } = await import('../runtime/harness/turn-control.js');
+const { publishPreflightConversation } = await import('../runtime/harness/preflight-conversation.js');
+
+type ToolHandler = (input: Record<string, unknown>) => Promise<{ content?: Array<{ text?: string }> }>;
+
+function registeredDispatch(): ToolHandler {
+  const handlers = new Map<string, ToolHandler>();
+  registerBackgroundTaskTools({
+    tool(name: string, _description: string, _schema: unknown, handler: ToolHandler) {
+      handlers.set(name, handler);
+    },
+  } as never);
+  const dispatch = handlers.get('dispatch_background_task');
+  assert.ok(dispatch);
+  return dispatch;
+}
+
+function alignedDispatchFixture(label: string) {
+  const session = createSession({ kind: 'chat', channel: 'desktop', title: label });
+  const objective = `Create the ${label} artifact, then email its link.`;
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective },
+  });
+  const decision: import('../runtime/harness/turn-control.js').TurnPreflightDecision = {
+    phase: 'align',
+    consequential: true,
+    destination: 'Google Sheet',
+    objective,
+    intentKey: `intent:${label}`,
+    allowedMutationEffects: ['external_write'],
+    allowedDestinations: ['google_sheets', 'email'],
+    allowedActionFamilies: ['create', 'send'],
+    reason: 'external_action',
+  };
+  recordTurnPreflightDecision(session.id, decision, source.seq);
+  return { session, source, decision };
+}
+
+async function invokeDispatch(
+  dispatch: ToolHandler,
+  fixture: ReturnType<typeof alignedDispatchFixture>,
+): Promise<string> {
+  const result = await withHarnessRunContext({
+    sessionId: fixture.session.id,
+    turn: fixture.source.turn,
+    sourceUserSeq: fixture.source.seq,
+    counter: new ToolCallsCounter(20),
+  }, () => withToolOutputContext({
+    sessionId: fixture.session.id,
+    sourceUserSeq: fixture.source.seq,
+  }, () => dispatch({
+    objective: fixture.decision.objective,
+    handoff_note: 'I’m handling this in the background and will report back here.',
+    plan: '- Create the artifact\n- Verify it\n- Send the link once',
+    success_criteria: ['The artifact is verified', 'The link is sent once'],
+    context_refs: [],
+    max_minutes: 15,
+    manifest: null,
+  })));
+  return result.content?.[0]?.text ?? '';
+}
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -115,7 +190,6 @@ test('background_task_revise versions the same durable task through the model-fa
 });
 
 test('dispatch_background_task links and terminally reconciles the shared conversation workstate', async () => {
-  type ToolHandler = (input: Record<string, unknown>) => Promise<{ content?: Array<{ text?: string }> }>;
   const handlers = new Map<string, ToolHandler>();
   registerBackgroundTaskTools({
     tool(name: string, _description: string, _schema: unknown, handler: ToolHandler) {
@@ -154,4 +228,63 @@ test('dispatch_background_task links and terminally reconciles the shared conver
   const completed = getFocusWorkstate(getActiveFocus())?.actions.find((action) => action.ref === taskId);
   assert.equal(completed?.status, 'done');
   assert.equal(completed?.note, 'Completed and reported back.');
+});
+
+test('dispatch_background_task accepts the exact settled same-turn conversation preamble as its structural opening', async () => {
+  const dispatch = registeredDispatch();
+  const fixture = alignedDispatchFixture('settled-background-dispatch');
+  appendConversationPreambleOnce({
+    source: fixture.source,
+    text: 'I have the requested artifact, verification, and delivery steps. I’m starting them now.',
+    intentKey: fixture.decision.intentKey,
+  });
+
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const output = await invokeDispatch(dispatch, fixture);
+
+  assert.doesNotMatch(output, /alignment beat owed/i);
+  assert.match(output, /Dispatched .* to the background/i);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1);
+});
+
+test('dispatch_background_task cannot cross a genuine OPEN needs-input terminal', async () => {
+  const dispatch = registeredDispatch();
+  const fixture = alignedDispatchFixture('open-background-dispatch');
+  const disposition = await publishPreflightConversation({
+    identity: {
+      sessionId: fixture.session.id,
+      turn: fixture.source.turn,
+      sourceUserSeq: fixture.source.seq,
+    },
+    decision: fixture.decision,
+    openness: { open: ['which connected workspace should own the artifact'] },
+    port: { async render() { return 'Which connected workspace should own the artifact?'; } },
+    transport: 'openai_agents_harness',
+  });
+  assert.equal(disposition.kind, 'ask');
+  // Impossible through the normal discriminated publisher, but pin the safety
+  // order at the dispatch gate: an exact needs-input terminal wins even if a
+  // stale/fallover writer also left preamble-shaped evidence for this source.
+  appendConversationPreambleOnce({
+    source: fixture.source,
+    text: 'A stale writer claimed this request was settled.',
+    intentKey: fixture.decision.intentKey,
+  });
+
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const output = await invokeDispatch(dispatch, fixture);
+
+  assert.match(output, /alignment beat owed/i);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before);
+});
+
+test('dispatch_background_task still refuses a legacy unsafe align row with no structural opening', async () => {
+  const dispatch = registeredDispatch();
+  const fixture = alignedDispatchFixture('legacy-background-dispatch');
+
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const output = await invokeDispatch(dispatch, fixture);
+
+  assert.match(output, /alignment beat owed/i);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before);
 });

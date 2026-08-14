@@ -6,10 +6,13 @@ import { autoInvalidateOnFailure } from './auto-invalidate.js';
 import { autoRememberOnSuccess } from './auto-remember.js';
 import { fanoutLedgerEnabled, recordWorkerResult } from './fanout-ledger.js';
 import {
+  actionTopologyRoleForRuntimeCall,
   runtimeToolAccountingMetadata,
   unwrapRuntimeEffectiveToolIdentity,
   type RuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
+import { terminalAuthoringResultIsProven } from '../../tools/tool-registry.js';
+import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { isDispatchLeaseCurrent, type DispatchLeaseRef } from './dispatch-lease.js';
 import { toolCallHint } from './tool-call-hint.js';
@@ -183,6 +186,16 @@ function effectiveToolTail(toolName: string): string {
   return toolName.split('__').at(-1) ?? toolName;
 }
 
+/** A terminal-authoring receipt is a two-part host result: the private first
+ * line grants provenance, while the body must still describe a successful
+ * return. The OpenAI Runner hook has no `isError` bit, so reject a contradictory
+ * stamped error banner instead of laundering it into completion evidence. */
+function terminalAuthoringReceiptBodyLooksSuccessful(result: string | null): boolean {
+  if (typeof result !== 'string') return false;
+  const firstNewline = result.indexOf('\n');
+  return firstNewline >= 0 && toolOutputLooksSuccessful(result.slice(firstNewline + 1));
+}
+
 /**
  * Recursively peel transport-only wrappers while preserving the arguments that
  * belong to the resulting capability. Codex, BYO, and raw-Claude all flow
@@ -240,6 +253,7 @@ export function attachEventLogHooks(
   // retry; permanent `seen call id` sets used to erase that later lifecycle.
   const callIdToCalledEventId = new Map<string, string>();
   const callIdToAccounting = new Map<string, ReturnType<typeof runtimeToolAccountingMetadata>>();
+  const callIdToTopologyRole = new Map<string, ReturnType<typeof actionTopologyRoleForRuntimeCall>>();
   const activeToolCallKeys = new Set<string>();
   const closedToolCallKeys = new Set<string>();
   // The SDK can replay the exact same lifecycle notification. Object identity
@@ -355,6 +369,10 @@ export function attachEventLogHooks(
       return;
     }
     const accounting = runtimeToolAccountingMetadata(tool?.name ?? '', details?.toolCall?.arguments);
+    const topologyRole = actionTopologyRoleForRuntimeCall(
+      tool?.name ?? '',
+      details?.toolCall?.arguments,
+    );
     let event: EventRow;
     try {
       event = appendEvent({
@@ -369,6 +387,7 @@ export function attachEventLogHooks(
           canonicalCallId: callId ?? null,
           ...(lease ? { dispatchLeaseId: lease.leaseId } : {}),
           accounting: 'top_level',
+          topologyRole,
           effect: accounting.effect,
           ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
           ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
@@ -385,6 +404,7 @@ export function attachEventLogHooks(
       activeToolCallKeys.add(key);
       callIdToCalledEventId.set(key, event.id);
       callIdToAccounting.set(key, accounting);
+      callIdToTopologyRole.set(key, topologyRole);
       if (tool?.name === 'run_worker' && fanoutLedgerEnabled()) {
         callIdToWorkerItem.set(key, workerItemFromDetails(details));
       }
@@ -428,10 +448,21 @@ export function attachEventLogHooks(
     }
     if (notification) seenToolEndNotifications.add(notification);
     const parentEventId = key ? callIdToCalledEventId.get(key) : undefined;
+    const pairedAdmittedStart = Boolean(
+      physicalAttemptAuthoritative
+      && key
+      && activeToolCallKeys.has(key)
+      && parentEventId
+      && callIdToAccounting.has(key)
+      && callIdToTopologyRole.has(key),
+    );
     if (key) callIdToCalledEventId.delete(key);
     const accounting = (key ? callIdToAccounting.get(key) : undefined)
       ?? runtimeToolAccountingMetadata(tool?.name ?? '', details?.toolCall?.arguments);
     if (key) callIdToAccounting.delete(key);
+    const topologyRole = (key ? callIdToTopologyRole.get(key) : undefined)
+      ?? actionTopologyRoleForRuntimeCall(tool?.name ?? '', details?.toolCall?.arguments);
+    if (key) callIdToTopologyRole.delete(key);
     // Normalize the result to a string up front. The SDK *usually* hands us a
     // string, but a tool (or a worker via Agent.asTool) can return an
     // object/array/error. Previously the lossless write + clip footer were
@@ -586,9 +617,17 @@ export function attachEventLogHooks(
           canonicalCallId: callId ?? null,
           ...(lease ? { dispatchLeaseId: lease.leaseId } : {}),
           accounting: 'top_level',
+          topologyRole,
           effect: accounting.effect,
           ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
           ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
+          ...(pairedAdmittedStart
+            && topologyRole === 'control'
+            && accounting.effectiveTool
+            && terminalAuthoringResultIsProven(accounting.effectiveTool, resultStr)
+            && terminalAuthoringReceiptBodyLooksSuccessful(resultStr)
+            ? { successfulAuthoringResult: true }
+            : {}),
           ...(settledReadReplay ? {
             providerDispatched: false,
             replayedFromCallId: settledReadReplay.sourceCallId,

@@ -239,11 +239,25 @@ test('the host classifies its own returned execution, and never overrides a real
   );
   assert.equal(
     outcomes.classifyAttemptOutcome({ hostExecuted: true, envelopeSuccessful: false }).kind,
-    'unsupported_capability',
+    'unknown',
   );
   assert.equal(
     outcomes.classifyAttemptOutcome({ hostExecuted: true, httpStatus: 500 }).kind,
     'transient',
+  );
+  assert.deepEqual(
+    {
+      kind: outcomes.classifyAttemptOutcome({ hostExecuted: true, outputTruncated: true }).kind,
+      action: outcomes.classifyAttemptOutcome({ hostExecuted: true, outputTruncated: true }).directive.action,
+      retry: outcomes.classifyAttemptOutcome({ hostExecuted: true, outputTruncated: true }).directive.retrySameCandidate,
+    },
+    { kind: 'invalid_arguments', action: 'repair_arguments', retry: true },
+    'an oversized read cannot mint success; it may be narrowed or paged through the same capability',
+  );
+  assert.equal(
+    outcomes.classifyAttemptOutcome({ hostExecuted: true, outputTruncated: true, mutating: true }).kind,
+    'uncertain_write',
+    'an oversized mutation fails safe because its external effect may already have landed',
   );
   // And without it, an envelope-less local result is still honestly unknown.
   assert.equal(outcomes.classifyAttemptOutcome({ text: 'file contents' }).kind, 'unknown');
@@ -527,8 +541,11 @@ test('the execution-site migration is idempotent and preserves existing dispatch
   const beforeDigest = digestOf();
 
   // Return the store to its pre-migration shape, then let the migration run
-  // again exactly as it would on a live store that has never seen it.
+  // again exactly as it would on a live store that has never seen it. The
+  // v38 receipt-authority trigger references execution_site, so a faithful
+  // pre-v35 store must shed it too — v38's replay recreates it.
   const live = eventlog.openEventLog();
+  live.exec('DROP TRIGGER IF EXISTS trg_evidence_receipt_exact_authority');
   live.exec('ALTER TABLE physical_dispatches DROP COLUMN execution_site');
   // The runner resumes from MAX(version), so a store rolled back to its
   // pre-v35 shape must lose every version at or above it.
@@ -574,6 +591,7 @@ test('a store that recorded a PARTIAL earlier version is repaired, not stranded'
   const live = eventlog.openEventLog();
   const rows = (live.prepare('SELECT COUNT(*) AS n FROM logical_tool_calls').get() as { n: number }).n;
   assert.ok(rows > 0, 'the fixture already wrote logical calls');
+  live.exec('DROP TRIGGER IF EXISTS trg_evidence_receipt_exact_authority');
   live.exec('ALTER TABLE logical_tool_calls DROP COLUMN conflict_reason');
   live.exec('ALTER TABLE physical_dispatches DROP COLUMN execution_site');
   // The runner resumes from MAX(version), so simulating "never received v36"
@@ -1223,6 +1241,142 @@ test('a discharged contract finalizes despite stray unbound bookkeeping, and sti
     /unsettled logical or physical work/,
   );
 });
+
+test('an unbound local execution under the deterministic retrieve contract carries the whole evidence chain', () => {
+  // The live 2026-08-11 chat shape: the deterministic retrieve route freezes
+  // one implicit read (no expected_work_call_bindings row can ever exist), the
+  // model answers through a read-only CLI, and the settlement is an UNBOUND
+  // local execution. Before the door widened, that call minted no crossing, no
+  // handle and no observed operation, so a correct answer terminal-blocked as
+  // verification_required.
+  const session = eventlog.createSession({
+    id: `local-evidence-retrieve-${++serial}`,
+    kind: 'chat',
+  });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Find all current alpha records.' },
+  });
+  const task: LocalTask = {
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq),
+    label: `retrieve-${serial}`,
+  };
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: task.turn },
+  }));
+  const fixed = contracts.freezeDeterministicExpectedWorkContract({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.ok(fixed.status === 'fixed' || fixed.status === 'replayed', JSON.stringify(fixed));
+
+  const args = { command: 'alpha-cli records list --json' };
+  const call = `logical:${task.label}:shell`;
+  assert.equal(dispatch.admitLogicalCall({
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      turn: task.turn,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId: call,
+    },
+    tool: 'run_shell_command',
+    args,
+  }).status, 'inserted');
+  const settled = settleLocal({
+    task,
+    logicalToolCallId: call,
+    tool: 'run_shell_command',
+    args,
+    result: JSON.stringify({ records: [{ id: 'alpha-1' }, { id: 'alpha-2' }] }),
+  });
+  assert.equal(settled.outcome.kind, 'succeeded', JSON.stringify(settled.outcome));
+
+  const row = settlementRow(task, call);
+  assert.equal(row?.execution_kind, 'local_execution');
+  assert.equal(row?.host_crossing_count, 1, 'the unbound retrieve call records its host crossing');
+  assert.ok(row?.result_handle_id, 'the host kept the bytes it got back');
+
+  const projected = projector.projectObservedExpectedWorkHistory({
+    contract: frozenContract(task),
+    finalized: true,
+  });
+  assert.equal(projected.status, 'ok');
+  if (projected.status !== 'ok') throw new Error(projected.reason);
+  assert.deepEqual(
+    projected.history.operations.map((operation) => ({
+      effect: operation.effect,
+      outcome: operation.outcome,
+      coverage: operation.coverage,
+    })),
+    [{ effect: 'compute', outcome: 'succeeded', coverage: 'observed' }],
+    'a substantive local compute execution projects as observed',
+  );
+
+  const finalizedResolution = resolution.finalizeResolutionAgainstExpectedWork({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    turn: task.turn,
+  });
+  assert.equal(
+    finalizedResolution.status,
+    'finalized',
+    JSON.stringify(finalizedResolution.status === 'incomplete'
+      ? finalizedResolution.match.gaps
+      : finalizedResolution),
+  );
+  if (finalizedResolution.status !== 'finalized') throw new Error('the retrieve did not finalize');
+  assert.equal(finalizedResolution.match.status, 'complete');
+});
+
+test('an unbound local business call under an ACTION contract still records no crossing', () => {
+  // The widened door is scoped to the implicit one-read retrieve shape. An
+  // action contract's business calls must still bind before their local
+  // evidence counts — an unbound write acquiring authority by side effect is
+  // exactly what the binding wall exists to prevent.
+  const task = acceptLocalAction('unbound-action');
+  const args = { path: 'leads.json' };
+  const call = `logical:${task.label}:unbound`;
+  assert.equal(dispatch.admitLogicalCall({
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      turn: task.turn,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId: call,
+    },
+    tool: SOURCE_TOOL,
+    args,
+  }).status, 'inserted');
+  // Freeze the two-op action contract through a separate bound call first.
+  const boundCall = openAndBind({
+    task,
+    suffix: 'source',
+    tool: SOURCE_TOOL,
+    args: { path: 'other.json' },
+    requirementId: 'read_leads',
+    withProposal: true,
+  });
+  assert.ok(boundCall);
+  const settled = settleLocal({
+    task,
+    logicalToolCallId: call,
+    tool: SOURCE_TOOL,
+    args,
+    result: localSourcePayload([{ id: 'lead-001' }]),
+  });
+  assert.equal(settled.outcome.kind, 'succeeded');
+  const row = settlementRow(task, call);
+  assert.equal(row?.host_crossing_count ?? 0, 0, 'an unbound call under an action contract stays evidence-free');
+  assert.equal(row?.result_handle_id, null);
+});
+
 test('a carrier-serialized pre-dispatch refusal never settles as succeeded host work (live 44256)', () => {
   // The composio lane returns `[provider-dispatch:not-started:*]` as a typed
   // instance, but a work_call child receives it as `{output: "…"}` — and the
@@ -1283,4 +1437,82 @@ test('a carrier-serialized pre-dispatch refusal never settles as succeeded host 
     assert.equal(row?.host_crossing_count ?? 0, 0, 'no crossing for a call that never started');
     assert.equal(row?.result_handle_id, null, 'a refusal string is not redeemable evidence');
   }
+});
+
+test('corrective failure prose crossing a carrier never settles as succeeded host work (live 44386)', () => {
+  const session = eventlog.createSession({
+    id: `local-evidence-corrective-${++serial}`,
+    kind: 'chat',
+  });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Find the alpha records we keep on file.' },
+  });
+  const task: LocalTask = {
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq),
+    label: `corrective-${serial}`,
+  };
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: task.turn },
+  }));
+  const fixed = contracts.freezeDeterministicExpectedWorkContract({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.ok(fixed.status === 'fixed' || fixed.status === 'replayed');
+
+  const prose = '⚠️ composio_execute_tool FAILED (slug=APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET): '
+    + 'Provider dispatch refused before I/O: work_binding_required\n\nThis is a HARD failure.';
+  const call = `logical:${task.label}:corrective`;
+  assert.equal(dispatch.admitLogicalCall({
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      turn: task.turn,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId: call,
+    },
+    tool: 'apify_act_run_sync_get_dataset_items_get',
+    args: { run_input: {} },
+  }).status, 'inserted');
+  const settled = settleLocal({
+    task,
+    logicalToolCallId: call,
+    tool: 'apify_act_run_sync_get_dataset_items_get',
+    args: { run_input: {} },
+    result: prose,
+  });
+  assert.notEqual(settled.outcome.kind, 'succeeded', JSON.stringify(settled.outcome));
+  const row = settlementRow(task, call);
+  assert.equal(row?.host_crossing_count ?? 0, 0, 'failure prose mints no crossing');
+  assert.equal(row?.result_handle_id, null, 'failure prose is not redeemable evidence');
+
+  // Prose that merely MENTIONS failure inside a successful result keeps its
+  // honest classification: only the corrective prefix is the marker.
+  const benign = `logical:${task.label}:benign`;
+  assert.equal(dispatch.admitLogicalCall({
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      turn: task.turn,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId: benign,
+    },
+    tool: 'run_shell_command',
+    args: { command: 'alpha-cli records list --json' },
+  }).status, 'inserted');
+  const benignSettled = settleLocal({
+    task,
+    logicalToolCallId: benign,
+    tool: 'run_shell_command',
+    args: { command: 'alpha-cli records list --json' },
+    result: JSON.stringify({ records: [{ id: 'alpha-1', note: 'previous attempt FAILED but retried fine' }] }),
+  });
+  assert.equal(benignSettled.outcome.kind, 'succeeded', JSON.stringify(benignSettled.outcome));
 });

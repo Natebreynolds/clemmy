@@ -21,6 +21,7 @@ const {
   renderOpenCheckInsForAgent,
   validateCheckInQuestion,
 } = await import('./check-ins.js');
+const { listNotifications } = await import('../runtime/notifications.js');
 
 const INBOX_DIR = path.join(TEST_HOME, 'agents-inbox');
 
@@ -32,6 +33,8 @@ before(() => {
 beforeEach(() => {
   rmSync(CHECK_INS_DIR, { recursive: true, force: true });
   rmSync(INBOX_DIR, { recursive: true, force: true });
+  rmSync(path.join(TEST_HOME, 'state', 'notifications.json'), { force: true });
+  rmSync(path.join(TEST_HOME, 'state', 'notification-delivery-queue.json'), { force: true });
 });
 
 test('createCheckIn writes an open record', () => {
@@ -48,6 +51,19 @@ test('createCheckIn writes an open record', () => {
   assert.ok(rec.askedAt);
   // Persisted to disk
   assert.ok(existsSync(path.join(CHECK_INS_DIR, `${rec.id}.json`)));
+});
+
+test('createCheckIn projects an ordinary question notification, never an approval card', () => {
+  const rec = createCheckIn({
+    agentSlug: 'clementine',
+    question: 'Which exact mailbox address should receive the finished report?',
+  });
+  const notification = listNotifications(10).find(
+    (item) => item.metadata?.checkInId === rec.id,
+  );
+  assert.ok(notification, 'the question still reaches the notification inbox');
+  assert.equal(notification.kind, 'execution');
+  assert.equal(notification.metadata?.approvalId, undefined);
 });
 
 test('createCheckIn rejects empty question', () => {

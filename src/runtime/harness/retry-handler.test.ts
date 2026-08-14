@@ -110,3 +110,39 @@ import { shouldRetryToolCall, formatRetryMessage } from './retry-handler.js';
     throw new Error('Format message should show attempt count');
   }
 }
+
+// Test: a long timeout is NOT repeated identically — the remote work may still
+// be running. Live 2026-08-12: a 60s synchronous actor-run wait timed out, the
+// identical call was auto-retried for another 60s, and the provider recorded
+// FOUR actor starts for one request. A full-budget timeout is not a blip.
+{
+  const timeout = new Error('Request timed out after 60000ms');
+
+  const long = shouldRetryToolCall(timeout, 1, [], 60_000);
+  if (long.shouldRetry) throw new Error('a long timeout must not be repeated identically');
+  if (long.remoteMayStillBeRunning !== true) throw new Error('the decision must say the remote work may still be running');
+  if (!/may still be running/i.test(long.reason)) throw new Error('the reason must name the unresolved remote work');
+  if (!/status|poll/i.test(long.reason)) throw new Error('the reason must name the honest next step');
+
+  // A FAST timeout is still an ordinary transient blip and keeps its retry.
+  if (!shouldRetryToolCall(timeout, 1, [], 900).shouldRetry) {
+    throw new Error('a fast timeout is still retryable');
+  }
+
+  // Unmeasured elapsed time keeps the historical behavior exactly.
+  if (!shouldRetryToolCall(timeout, 1, []).shouldRetry) {
+    throw new Error('an unmeasured timeout keeps its retry');
+  }
+
+  // A long NON-timeout transient (rate limit) still retries: nothing was left
+  // running, and backing off is the correct response.
+  if (!shouldRetryToolCall(new Error('429 rate limit exceeded'), 1, [], 45_000).shouldRetry) {
+    throw new Error('a long rate-limit wait is still retryable');
+  }
+
+  // Terminal errors are unaffected by elapsed time.
+  const terminal = shouldRetryToolCall(new Error('403 forbidden'), 1, [], 60_000);
+  if (terminal.shouldRetry || terminal.remoteMayStillBeRunning === true) {
+    throw new Error('a terminal error is unchanged by elapsed time');
+  }
+}

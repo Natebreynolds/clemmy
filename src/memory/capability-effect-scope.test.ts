@@ -62,6 +62,10 @@ test('request scope distinguishes reads, writes, compounds, and ambiguous asks',
   assert.equal(requestedCapabilityEffectScope("What's on my Outlook calendar?"), 'read');
   assert.equal(requestedCapabilityEffectScope('whats on my Outlook calendar tomorrow'), 'read');
   assert.equal(requestedCapabilityEffectScope('Send the Gmail email now.'), 'write');
+  assert.equal(requestedCapabilityEffectScope('Send me an email with the link to the sheet.'), 'write',
+    'recipient-first payload grammar is one send role, not a fabricated read dependency');
+  assert.equal(requestedCapabilityEffectScope('Send me the latest email from Alice.'), 'mixed',
+    'an explicit source-selection cue keeps the real read predecessor');
   assert.equal(requestedCapabilityEffectScope('Read the Gmail email, then send a reply.'), 'mixed');
   assert.equal(requestedCapabilityEffectScope('Create a summary report of my Gmail emails.'), 'mixed',
     'an artifact write keeps the obvious provider-read dependency');

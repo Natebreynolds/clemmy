@@ -45,6 +45,7 @@ const {
   planBlockedDependencySkips,
   callToolSideEffectClass,
   runDeterministicWorkflowStepForTest,
+  DeterministicWorkflowStepError,
   workflowRunnerInternalsForTest,
   explainDeterministicSpawnError,
   reapResolvedParkedRuns,
@@ -67,6 +68,7 @@ const {
   stepSideEffectClass,
   isPhantomStepCompletion,
   phantomBlockedOutput,
+  settlementGuardedStepOutput,
   decideBatchSettlement,
   ParkRunSignal,
   finalizeStepOutput,
@@ -219,6 +221,11 @@ const {
   getLatestRunAttempt,
   isKillRequested,
 } = await import('../runtime/harness/eventlog.js');
+const workflowSettlementIdentities = await import('../runtime/harness/attempt-identity.js');
+const workflowSettlementDispatch = await import('../runtime/harness/dispatch-ledger.js');
+const workflowSettlementOutcomes = await import('../runtime/harness/attempt-outcome.js');
+const workflowSettlements = await import('../runtime/harness/logical-call-settlement-store.js');
+const workflowSettlementShadow = await import('../runtime/graph/turn-graph-shadow.js');
 const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
 const { setClaudeAgentSdkWorkflowStepRunForTest } = await import('../runtime/harness/claude-agent-workflow-step.js');
 const { ClaudeAgentSdkApprovalBoundaryError } = await import('../runtime/harness/claude-agent-sdk.js');
@@ -1719,9 +1726,23 @@ const statusOf = (filePath: string): string | undefined =>
 function writeCapabilityBlockedRun(runId: string, retryAt: string): string {
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const definition = {
+    name: 'Capability Resume WF',
+    description: 'Resume one admitted capability-blocked workflow.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'publish', prompt: 'Publish after the dependency recovers.', sideEffect: 'write' as const }],
+  };
   writeFileSync(filePath, JSON.stringify({
     id: runId,
     workflow: 'Capability Resume WF',
+    // Manual/chat admissions do not require the top-level slug projection;
+    // resume authority comes from this authenticated immutable snapshot.
+    workflowDefinitionSnapshot: createWorkflowRunDefinitionSnapshot(
+      'capability-resume-wf',
+      definition,
+      '2026-07-26T12:00:00.000Z',
+    ),
     status: 'blocked_capability',
     capabilityBlock: {
       stepId: 'publish',
@@ -1801,6 +1822,38 @@ test('capability retry re-admits the same run only when due, and manual resume b
   assert.equal(resumeCapabilityBlockedWorkflowRun('capability-manual-resume'), true);
   assert.equal(statusOf(manual), 'running');
   assert.equal(resumeCapabilityBlockedWorkflowRun('../unsafe'), false);
+
+  for (const [runId, capabilityBlockPatch] of [
+    ['capability-manual-not-proven', { provenNoDispatch: false }],
+    ['capability-manual-already-retrying', { state: 'retrying' }],
+  ] as const) {
+    const malformed = writeCapabilityBlockedRun(runId, new Date(now + 60 * 60_000).toISOString());
+    const record = JSON.parse(readFileSync(malformed, 'utf-8')) as Record<string, unknown>;
+    writeFileSync(malformed, JSON.stringify({
+      ...record,
+      capabilityBlock: {
+        ...(record.capabilityBlock as Record<string, unknown>),
+        ...capabilityBlockPatch,
+      },
+    }, null, 2), 'utf-8');
+    assert.equal(resumeCapabilityBlockedWorkflowRun(runId), false);
+    assert.equal(statusOf(malformed), 'blocked_capability');
+    rmSync(malformed, { force: true });
+  }
+  const conflictingSlug = writeCapabilityBlockedRun('capability-manual-conflicting-slug', new Date(now + 60 * 60_000).toISOString());
+  const conflictingSlugRecord = JSON.parse(readFileSync(conflictingSlug, 'utf-8')) as Record<string, unknown>;
+  conflictingSlugRecord.workflowSlug = 'forged-conflicting-slug';
+  writeFileSync(conflictingSlug, JSON.stringify(conflictingSlugRecord, null, 2), 'utf-8');
+  assert.equal(resumeCapabilityBlockedWorkflowRun('capability-manual-conflicting-slug'), false);
+  assert.equal(statusOf(conflictingSlug), 'blocked_capability');
+  rmSync(conflictingSlug, { force: true });
+  const corruptSlug = writeCapabilityBlockedRun('capability-manual-corrupt-slug', new Date(now + 60 * 60_000).toISOString());
+  const corruptSlugRecord = JSON.parse(readFileSync(corruptSlug, 'utf-8')) as Record<string, unknown>;
+  corruptSlugRecord.workflowSlug = 42;
+  writeFileSync(corruptSlug, JSON.stringify(corruptSlugRecord, null, 2), 'utf-8');
+  assert.equal(resumeCapabilityBlockedWorkflowRun('capability-manual-corrupt-slug'), false);
+  assert.equal(statusOf(corruptSlug), 'blocked_capability');
+  rmSync(corruptSlug, { force: true });
 
   withEnv({
     CLEMENTINE_WORKFLOW_CAPABILITY_RETRY_BASE_MS: '1000',
@@ -3818,6 +3871,383 @@ test('deterministic workflow step runs a bundled scripts/ helper with JSON stdin
   assert.deepEqual(output, { stepId: 'script', account: 'Acme', prior: ['one'] });
 });
 
+test('deterministic workflow payload preserves a host-owned occurrenceAt and never synthesizes one', async () => {
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-occurrence-at', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'echo.mjs'),
+    [
+      'let input = "";',
+      'for await (const chunk of process.stdin) input += chunk;',
+      'const payload = JSON.parse(input);',
+      'process.stdout.write(JSON.stringify({ occurrenceAt: payload.occurrenceAt }));',
+    ].join('\n'),
+    'utf-8',
+  );
+  const occurrenceAt = '2026-08-13T16:00:00.000Z';
+  const output = await runDeterministicWorkflowStepForTest('echo.mjs', {
+    workflow: 'Det occurrence at',
+    workflowSlug: 'det-occurrence-at',
+    runId: 'det-occurrence-at-run',
+    stepId: 'pull',
+    inputs: {},
+    stepOutputs: {},
+    occurrenceAt,
+  });
+  assert.deepEqual(output, { occurrenceAt });
+
+  const missing = await runDeterministicWorkflowStepForTest('echo.mjs', {
+    workflow: 'Det occurrence at',
+    workflowSlug: 'det-occurrence-at',
+    runId: 'det-occurrence-at-missing-run',
+    stepId: 'pull',
+    inputs: {},
+    stepOutputs: {},
+  });
+  assert.deepEqual(missing, {});
+});
+
+test('deterministic occurrenceAt binds catch-up and schedule receipts to the exact workflow slug', () => {
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const scheduledId = 'det-scheduled-occurrence-run';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${scheduledId}.json`), JSON.stringify({
+    id: scheduledId,
+    workflow: 'wf',
+    createdAt: '2026-08-13T16:05:00.000Z',
+    source: 'schedule',
+    triggerReceiptId: `workflow-schedule:v1:wf:${Date.parse('2026-08-13T16:00:00.000Z')}`,
+  }), 'utf8');
+  assert.equal(
+    workflowRunnerInternalsForTest.deterministicOccurrenceAt(scheduledId, 'wf'),
+    '2026-08-13T16:00:00.000Z',
+  );
+  assert.equal(
+    workflowRunnerInternalsForTest.deterministicOccurrenceAt(scheduledId, 'other-wf'),
+    '2026-08-13T16:05:00.000Z',
+  );
+
+  const catchupId = 'det-catchup-occurrence-run';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${catchupId}.json`), JSON.stringify({
+    id: catchupId,
+    workflow: 'wf',
+    createdAt: '2026-08-13T18:00:00.000Z',
+    source: 'schedule',
+    triggerReceiptId: `workflow-schedule:v1:wf:${Date.parse('2026-08-13T17:00:00.000Z')}`,
+    catchupOccurrenceAtMs: Date.parse('2026-08-13T16:00:00.000Z'),
+  }), 'utf8');
+  assert.equal(
+    workflowRunnerInternalsForTest.deterministicOccurrenceAt(catchupId, 'wf'),
+    '2026-08-13T16:00:00.000Z',
+  );
+});
+
+test('deterministic runner preserves structured stdout failure instead of blaming a stderr warning', async () => {
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-failure-evidence', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'fail.mjs'),
+    [
+      'process.stderr.write("Warning: sf CLI update available.\\n");',
+      'process.stdout.write(JSON.stringify({ found: false, kind: "deterministic_source_failure", code: "salesforce_provider_error", failedRead: "salesforce-org-readiness", providerErrorId: "INVALID_SESSION_ID", error: "Salesforce target org is not authenticated." }));',
+      'process.exit(1);',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  const failure = await runDeterministicWorkflowStepForTest('fail.mjs', {
+    workflow: 'Det failure evidence',
+    workflowSlug: 'det-failure-evidence',
+    runId: 'det-failure-evidence-run',
+    stepId: 'pull',
+    inputs: {},
+    stepOutputs: {},
+  }).then(
+    () => null,
+    (error: unknown) => error,
+  );
+
+  assert.ok(failure instanceof DeterministicWorkflowStepError);
+  assert.equal(failure.failure.structuredFailureSource, 'stdout');
+  assert.equal(failure.failure.summary, 'Salesforce target org is not authenticated.');
+  assert.deepEqual(failure.failure.sourceFailure, {
+    kind: 'deterministic_source_failure',
+    code: 'salesforce_provider_error',
+    failedRead: 'salesforce-org-readiness',
+    providerErrorId: 'INVALID_SESSION_ID',
+  });
+  assert.equal(failure.failure.stdout, undefined, 'raw structured stdout is not persisted');
+  assert.equal(failure.failure.stderr, 'Warning: sf CLI update available.');
+  assert.match(failure.message, /Reported reason: Salesforce target org is not authenticated\./);
+  assert.match(failure.message, /stderr diagnostic: Warning: sf CLI update available\./);
+  assert.doesNotMatch(failure.message, /reason: Warning: sf CLI update/i);
+});
+
+test('deterministic source failure projection rejects unsafe or overlong metadata without retaining packet fields', async () => {
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-failure-projection-rejects', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'fail.mjs'),
+    [
+      'let input = "";',
+      'for await (const chunk of process.stdin) input += chunk;',
+      'const payload = JSON.parse(input);',
+      'process.stdout.write(payload.inputs.packet);',
+      'process.exit(1);',
+    ].join('\n'),
+    'utf-8',
+  );
+  const base = Object.freeze({
+    found: false,
+    kind: 'deterministic_source_failure',
+    code: 'salesforce_provider_error',
+    failedRead: 'salesforce-org-readiness',
+    error: 'Safe adapter failure.',
+  });
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['kind', { ...base, kind: 'provider_failure' }],
+    ['code characters', { ...base, code: 'unsafe-retry-code' }],
+    ['code bound', { ...base, code: `x${'a'.repeat(64)}` }],
+    ['read characters', { ...base, failedRead: 'unsafe read' }],
+    ['read bound', { ...base, failedRead: `read:${'a'.repeat(156)}` }],
+    ['provider id', { ...base, providerErrorId: 'Bearer super-secret-token' }],
+    ['extra key', { ...base, arbitrarySecret: 'unredacted-secret-material' }],
+  ];
+  for (const [label, packet] of cases) {
+    const failure = await runDeterministicWorkflowStepForTest('fail.mjs', {
+      workflow: 'Det failure projection rejects',
+      workflowSlug: 'det-failure-projection-rejects',
+      runId: `det-failure-projection-rejects-${label}`,
+      stepId: 'pull',
+      inputs: { packet: JSON.stringify(packet) },
+      stepOutputs: {},
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    assert.ok(failure instanceof DeterministicWorkflowStepError, label);
+    assert.equal(failure.failure.summary, 'Safe adapter failure.', label);
+    assert.equal(failure.failure.sourceFailure, undefined, label);
+    assert.equal(failure.failure.stdout, undefined, label);
+    assert.doesNotMatch(JSON.stringify(failure.failure), /super-secret|unredacted-secret/i, label);
+  }
+});
+
+test('an embedded JSON line cannot mint deterministic source failure metadata', async () => {
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-embedded-failure-projection', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'fail.mjs'),
+    [
+      'process.stdout.write("adapter prelude\\n");',
+      'process.stdout.write(JSON.stringify({ found: false, kind: "deterministic_source_failure", code: "provider_error", failedRead: "crm-read:Account_01", error: "Embedded adapter failure." }));',
+      'process.exit(1);',
+    ].join('\n'),
+    'utf-8',
+  );
+  const failure = await runDeterministicWorkflowStepForTest('fail.mjs', {
+    workflow: 'Det embedded failure projection',
+    workflowSlug: 'det-embedded-failure-projection',
+    runId: 'det-embedded-failure-projection-run',
+    stepId: 'pull',
+    inputs: {},
+    stepOutputs: {},
+  }).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.ok(failure instanceof DeterministicWorkflowStepError);
+  assert.equal(failure.failure.summary, 'Embedded adapter failure.');
+  assert.equal(failure.failure.structuredFailureSource, 'stdout');
+  assert.equal(failure.failure.sourceFailure, undefined);
+  assert.equal(failure.failure.stdout, undefined, 'selected multiline stdout is not persisted');
+});
+
+test('an over-4k structured failure is recognized before diagnostic bounding', async () => {
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-large-failure-envelope', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'fail.mjs'),
+    [
+      'process.stdout.write(JSON.stringify({',
+      '  found: false,',
+      '  kind: "deterministic_source_failure",',
+      '  code: "provider_error",',
+      '  failedRead: "crm-read",',
+      '  arbitrarySecret: "unredacted-secret-material-" + "x".repeat(5_000),',
+      '  error: "Oversized adapter failure.",',
+      '}));',
+      'process.exit(1);',
+    ].join('\n'),
+    'utf-8',
+  );
+  const failure = await runDeterministicWorkflowStepForTest('fail.mjs', {
+    workflow: 'Det large failure envelope',
+    workflowSlug: 'det-large-failure-envelope',
+    runId: 'det-large-failure-envelope-run',
+    stepId: 'pull',
+    inputs: {},
+    stepOutputs: {},
+  }).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.ok(failure instanceof DeterministicWorkflowStepError);
+  assert.equal(failure.failure.summary, 'Oversized adapter failure.');
+  assert.equal(failure.failure.sourceFailure, undefined, 'extra packet fields reject typed projection');
+  assert.equal(failure.failure.stdout, undefined, 'complete structured envelope is not retained');
+  assert.doesNotMatch(JSON.stringify(failure.failure), /unredacted-secret/i);
+});
+
+test('a reasonless failure envelope cannot leak arbitrary fields through raw stdout', async () => {
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-reasonless-failure-envelope', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'fail.mjs'),
+    'process.stdout.write(JSON.stringify({ found: false, kind: "deterministic_source_failure", code: "provider_error", failedRead: "crm-read", arbitrarySecret: "unredacted-secret-material" })); process.exit(1);',
+    'utf-8',
+  );
+  const failure = await runDeterministicWorkflowStepForTest('fail.mjs', {
+    workflow: 'Det reasonless failure envelope',
+    workflowSlug: 'det-reasonless-failure-envelope',
+    runId: 'det-reasonless-failure-envelope-run',
+    stepId: 'pull',
+    inputs: {},
+    stepOutputs: {},
+  }).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.ok(failure instanceof DeterministicWorkflowStepError);
+  assert.equal(failure.failure.summary, 'The runner exited without emitting a structured failure reason.');
+  assert.equal(failure.failure.sourceFailure, undefined);
+  assert.equal(failure.failure.stdout, undefined);
+  assert.doesNotMatch(JSON.stringify(failure.failure), /unredacted-secret/i);
+});
+
+test('provider-controlled stderr cannot mint deterministic source failure metadata', async () => {
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-stderr-failure-projection', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'fail.mjs'),
+    [
+      'process.stderr.write(JSON.stringify({ found: false, kind: "deterministic_source_failure", code: "salesforce_provider_error", failedRead: "salesforce-org-readiness", error: "Provider stderr failure." }));',
+      'process.exit(1);',
+    ].join('\n'),
+    'utf-8',
+  );
+  const failure = await runDeterministicWorkflowStepForTest('fail.mjs', {
+    workflow: 'Det stderr failure projection',
+    workflowSlug: 'det-stderr-failure-projection',
+    runId: 'det-stderr-failure-projection-run',
+    stepId: 'pull',
+    inputs: {},
+    stepOutputs: {},
+  }).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.ok(failure instanceof DeterministicWorkflowStepError);
+  assert.equal(failure.failure.summary, 'Provider stderr failure.');
+  assert.equal(failure.failure.structuredFailureSource, 'stderr');
+  assert.equal(failure.failure.sourceFailure, undefined);
+  assert.equal(failure.failure.stderr, undefined, 'raw structured stderr is not persisted');
+});
+
+test('warning-only stderr is retained as a diagnostic but never promoted to root cause', async () => {
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-warning-only', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'fail.mjs'),
+    'process.stderr.write("›   Warning: dependency CLI update available.\\n"); process.exit(1);',
+    'utf-8',
+  );
+
+  const failure = await runDeterministicWorkflowStepForTest('fail.mjs', {
+    workflow: 'Det warning only',
+    workflowSlug: 'det-warning-only',
+    runId: 'det-warning-only-run',
+    stepId: 'pull',
+    inputs: {},
+    stepOutputs: {},
+  }).then(
+    () => null,
+    (error: unknown) => error,
+  );
+
+  assert.ok(failure instanceof DeterministicWorkflowStepError);
+  assert.equal(failure.failure.summary, 'The runner exited without emitting a structured failure reason.');
+  assert.match(failure.failure.stderr ?? '', /Warning: dependency CLI update available/);
+  assert.match(failure.message, /without emitting a structured failure reason/);
+  assert.doesNotMatch(failure.message, /Reported reason: .*Warning/i);
+});
+
+test('deterministic structured failure reaches the terminal record unchanged and bypasses the voice model', async () => {
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const stamp = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const slug = `det-terminal-failure-${stamp}`;
+  const workflowName = `Det terminal failure ${stamp}`;
+  const runId = `det-terminal-failure-run-${stamp}`;
+  writeWorkflow(slug, {
+    name: workflowName,
+    description: 'Pins faithful deterministic failure reporting.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'pull',
+      prompt: '',
+      deterministic: {
+        runner: 'fail.mjs',
+        source: [
+          'process.stderr.write("Warning: sf CLI update available.\\n");',
+          'process.stdout.write(JSON.stringify({ found: false, kind: "deterministic_source_failure", code: "salesforce_provider_error", failedRead: "salesforce-org-readiness", providerErrorId: "INVALID_SESSION_ID", error: "Salesforce target org nathan@example.test is not authenticated." }));',
+          'process.exit(1);',
+        ].join('\n'),
+      },
+      sideEffect: 'read',
+    }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(runFile, JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    status: 'queued',
+    inputs: {},
+    createdAt: new Date().toISOString(),
+  }), 'utf-8');
+
+  let voiceCalls = 0;
+  _setWorkflowVoiceRewriteForTests((async () => {
+    voiceCalls += 1;
+    return { message: 'Warning was the root cause. Next step: apply fix <id>', nothingHappened: false };
+  }) as never);
+  try {
+    await processWorkflowRuns({} as never);
+  } finally {
+    _setWorkflowVoiceRewriteForTests(null);
+  }
+
+  const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
+  assert.equal(terminal.status, 'error');
+  assert.equal(voiceCalls, 0, 'typed deterministic failures cannot be semantically rewritten by a model');
+  assert.equal(terminal.failure?.kind, 'deterministic_runner');
+  assert.equal(terminal.failure?.summary, 'Salesforce target org nathan@example.test is not authenticated.');
+  assert.equal(terminal.failure?.structuredFailureSource, 'stdout');
+  assert.deepEqual(terminal.failure?.sourceFailure, {
+    kind: 'deterministic_source_failure',
+    code: 'salesforce_provider_error',
+    failedRead: 'salesforce-org-readiness',
+    providerErrorId: 'INVALID_SESSION_ID',
+  });
+  assert.equal(terminal.failure?.stdout, undefined);
+  assert.match(terminal.error ?? '', /Reported reason: Salesforce target org nathan@example\.test is not authenticated\./);
+  assert.match(terminal.error ?? '', /stderr diagnostic: Warning: sf CLI update available\./);
+  assert.equal(terminal.reportBack?.detail, terminal.error);
+  assert.doesNotMatch(terminal.reportBack?.detail ?? '', /apply fix <id>/i);
+  const failedEvent = readWorkflowEvents(slug, runId).find((event) => event.kind === 'step_failed');
+  assert.equal((failedEvent?.meta?.failure as Record<string, unknown> | undefined)?.kind, 'deterministic_runner');
+});
+
 test('deterministic workflow step now runs a .ts runner via the shared tsx interpreter', async () => {
   const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-ts-test', 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
@@ -5587,6 +6017,47 @@ test('P0-3 a crash-resumed run with a lost lifecycle event parks before an uncom
   );
 });
 
+test('P0-3 a lost-event exact pre-dispatch proof exempts only its one ready-frontier step', () => {
+  const sendOnly = wfWith([
+    { id: 'send', prompt: '', sideEffect: 'send', call: { tool: 'SLACK_SEND_MESSAGE', args: { channel: 'fixed', markdown_text: 'fixed' } } },
+  ]);
+  const resumed = resumeState(undefined);
+  assert.equal(
+    shouldHaltResumeForSideEffect(sendOnly, resumed, undefined, {
+      resumedRun: true,
+      durableMutationProtocolStepIds: new Set(),
+      provenNoDispatchStepIds: new Set(['send']),
+    }),
+    null,
+    'the authenticated same-run pre-dispatch proof survives a missing step_started event',
+  );
+  for (const provenNoDispatchStepIds of [new Set<string>(), new Set(['different-step'])]) {
+    assert.deepEqual(
+      shouldHaltResumeForSideEffect(sendOnly, resumed, undefined, {
+        resumedRun: true,
+        durableMutationProtocolStepIds: new Set(),
+        provenNoDispatchStepIds,
+      }),
+      { stepId: 'send', cls: 'send', declared: true },
+      'absent or wrong-step proof remains fail-closed',
+    );
+  }
+
+  const siblingMutation = wfWith([
+    ...sendOnly.steps,
+    { id: 'write', prompt: 'Update the CRM.', sideEffect: 'write' },
+  ]);
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(siblingMutation, resumed, undefined, {
+      resumedRun: true,
+      durableMutationProtocolStepIds: new Set(),
+      provenNoDispatchStepIds: new Set(['send']),
+    }),
+    { stepId: 'write', cls: 'write', declared: true },
+    'one step proof cannot hide a concurrent unproven mutation',
+  );
+});
+
 test('P0-3 a lost-event crash resume does NOT park a downstream mutation execution never reached', () => {
   // Crash during the FIRST read step: the send step deep in the chain provably
   // never started (its dependency never completed), so a lost step_started must
@@ -5870,6 +6341,238 @@ test('isPhantomStepCompletion: workflow_step_result is result emission, not acti
   assert.equal(isPhantomStepCompletion({ id: 'notify', sideEffect: 'send' }, ['StructuredOutput', 'workflow_step_result'], {}), true);
   // NOT phantom: emitted the result AND actually acted
   assert.equal(isPhantomStepCompletion({ id: 'notify', sideEffect: 'send' }, ['workflow_step_result', 'mcp__clementine-local__notify_user'], {}), false);
+});
+
+test('required read failures cannot be laundered into a downstream-ready dashboard', () => {
+  resetEventLog();
+  const sessionId = 'workflow:source-failed-dashboard:pull';
+  HarnessSession.create({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Required source failure',
+    metadata: { source: 'workflow' },
+  });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Read the source and produce the dashboard.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: source.seq,
+      tool: 'run_shell_command',
+      callId: 'call-source-failed',
+      arguments: JSON.stringify({ command: 'provider-cli query --json' }),
+      accounting: 'top_level',
+    },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      sourceUserSeq: source.seq,
+      tool: 'run_shell_command',
+      callId: 'call-source-failed',
+      ok: false,
+      error: 'exit_code: 1 — required provider account is signed out',
+    },
+  });
+
+  const guarded = settlementGuardedStepOutput({
+    step: { id: 'pull', prompt: 'Read the required provider source.', sideEffect: 'read' },
+    sessionId,
+    sourceUserSeq: source.seq,
+    toolUses: ['run_shell_command', 'workflow_step_result'],
+    output: {
+      summary: 'Every metric is unavailable.',
+      totals: { calls: 0, emails: 0, total: 0 },
+    },
+  });
+
+  assert.equal((guarded as { blocked?: unknown }).blocked, true);
+  assert.match(
+    String((guarded as { reason?: unknown }).reason),
+    /no completed business settlement|not complete yet/i,
+  );
+});
+
+test('one successful workflow read cannot launder a failed sibling required read', () => {
+  resetEventLog();
+  const sessionId = 'workflow:mixed-source-dashboard:pull';
+  HarnessSession.create({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Mixed required sources',
+    metadata: { source: 'workflow' },
+  });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Run every required source query and produce the dashboard.' },
+  });
+
+  const recordRead = (callId: string, ok: boolean, output: string): void => {
+    appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'Clem',
+      type: 'tool_called',
+      data: {
+        sourceUserSeq: source.seq,
+        tool: 'run_shell_command',
+        callId,
+        arguments: JSON.stringify({ command: `provider-cli query ${callId} --json` }),
+        accounting: 'top_level',
+      },
+    });
+    appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'tool',
+      type: 'tool_returned',
+      data: {
+        sourceUserSeq: source.seq,
+        tool: 'run_shell_command',
+        callId,
+        ok,
+        ...(ok ? { output } : { error: output }),
+      },
+    });
+  };
+  recordRead('call-required-success', true, '{"records":[{"id":"001"}]}');
+  recordRead('call-required-failure', false, 'exit_code: 1 — one required query failed');
+
+  const guarded = settlementGuardedStepOutput({
+    step: { id: 'pull', prompt: 'Run both required provider reads.', sideEffect: 'read' },
+    sessionId,
+    sourceUserSeq: source.seq,
+    toolUses: ['run_shell_command', 'run_shell_command', 'workflow_step_result'],
+    output: {
+      summary: 'The available metric looks healthy; the missing metric is unavailable.',
+      sourceEvidence: { queriesSucceeded: ['required-success', 'required-failure'] },
+    },
+  });
+
+  assert.equal((guarded as { blocked?: unknown }).blocked, true);
+  assert.match(
+    String((guarded as { reason?: unknown }).reason),
+    /unrecovered|not complete yet|failed/i,
+  );
+});
+
+test('a local-write source step cannot fabricate complete evidence over a failed read or dispatch its dependent send', () => {
+  resetEventLog();
+  const sessionId = 'workflow:mixed-source-local-baseline:pull';
+  HarnessSession.create({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Required source reads plus local baseline',
+    metadata: { source: 'workflow' },
+  });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Run every required query, save the local baseline, then post the summary.' },
+  });
+  assert.ok(workflowSettlementShadow.recordTurnGraphShadow({
+    identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
+    surface: 'workflow',
+  }));
+  const acceptedTaskId = workflowSettlementIdentities.acceptedTaskIdFor(sessionId, source.seq);
+
+  const settleRead = (callId: string, ok: boolean): void => {
+    const args = { query: callId };
+    const logicalToolCallId = `logical:${callId}`;
+    const begun = workflowSettlementDispatch.beginPhysicalDispatch({
+      identity: {
+        sessionId,
+        sourceUserSeq: source.seq,
+        turn: source.turn,
+        acceptedTaskId,
+        logicalToolCallId,
+        physicalDispatchId: `dispatch:${callId}`,
+        ordinal: 0,
+      },
+      tool: 'alpha_records_read',
+      args,
+    });
+    assert.equal(begun.status, 'inserted');
+    if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+    assert.equal(workflowSettlementDispatch.settlePhysicalDispatch({
+      identity: begun.identity,
+      tool: 'alpha_records_read',
+      outcome: 'returned',
+    }).status, 'inserted');
+    const settled = workflowSettlements.commitLogicalCallSettlement({
+      identity: {
+        sessionId,
+        sourceUserSeq: source.seq,
+        turn: source.turn,
+        acceptedTaskId,
+        logicalToolCallId,
+      },
+      contract: { toolName: 'alpha_records_read', args },
+      execution: { kind: 'provider_execution' },
+      ...(ok ? { result: { payload: { successful: true, data: { records: [] } } } } : {}),
+      outcome: ok
+        ? workflowSettlementOutcomes.classifyAttemptOutcome({ envelopeSuccessful: true })
+        : workflowSettlementOutcomes.classifyAttemptOutcome({ executionFailed: true }),
+      recovery: { businessCall: true, mutating: false },
+      observer: { lane: 'agents_runner', turn: source.turn },
+    });
+    assert.equal(settled.status, 'committed');
+  };
+  settleRead('required-read-success', true);
+  settleRead('required-read-failure', false);
+
+  const sourceStep = {
+    id: 'pull_activity',
+    prompt: 'Read every required source query and persist the local morning baseline.',
+    sideEffect: 'write' as const,
+  };
+  const guarded = settlementGuardedStepOutput({
+    step: sourceStep,
+    sessionId,
+    sourceUserSeq: source.seq,
+    toolUses: ['alpha_records_read', 'alpha_records_read', 'workflow_step_result'],
+    output: {
+      summary: 'All metrics are ready.',
+      sourceEvidence: {
+        queriesSucceeded: ['calls', 'pace', 'meetings-set', 'meetings-held', 'closed-won', 'stale-opportunities'],
+      },
+    },
+  });
+
+  assert.equal((guarded as { blocked?: unknown }).blocked, true);
+  const skips = planBlockedDependencySkips(
+    [
+      sourceStep,
+      {
+        id: 'post_summary',
+        prompt: 'Post the summary to the declared destination.',
+        dependsOn: ['pull_activity'],
+        sideEffect: 'send' as const,
+      },
+    ],
+    { pull_activity: guarded },
+  );
+  assert.deepEqual(skips.map((skip) => skip.stepId), ['post_summary']);
+  assert.match(skips[0]?.output.reason ?? '', /required source query failed|not complete yet|unrecovered/i);
 });
 
 test('decideBatchSettlement: park OUTRANKS a sibling failure (T1.3 — the approval survives)', () => {

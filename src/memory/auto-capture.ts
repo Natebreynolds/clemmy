@@ -5,6 +5,7 @@ import { extractNamedResource } from './focus.js';
 import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
 import { getRuntimeEnv } from '../config.js';
 import { isHarnessInjectedInput } from '../runtime/harness/objective-judge.js';
+import { EXPLICIT_MEMORY_INSTRUCTION_RE } from '../assistant/message-intent.js';
 import pino from 'pino';
 
 /** Defense-in-depth (2026-06-23): auto-memory must learn only from REAL user
@@ -241,8 +242,10 @@ const EXPLICIT_REMEMBER_LEADERS = [
 // A memory command may follow independent live work ("Summarize this, and
 // remember that Cedar is Cedar-17"). Find only command-shaped occurrences at a
 // clause boundary; a mid-sentence mention such as "explain what remember means"
-// grants no durable-write authority.
-const EXPLICIT_REMEMBER_COMMAND_RE = /(?:^|[.!?;]\s+|[—–]\s+|,\s*)(?:(?:and|also|then)\s+)?((?:please\s+)?(?:remember\b|note(?:\s+that\b|\s*:)|keep\s+in\s+mind\b|don'?t\s+forget\b|make\s+a\s+note\b))/i;
+// grants no durable-write authority. The shape is shared with the router
+// (message-intent) so capture and routing can never disagree about what a
+// memory instruction is.
+const EXPLICIT_REMEMBER_COMMAND_RE = EXPLICIT_MEMORY_INSTRUCTION_RE;
 
 const SECONDARY_MEMORY_REQUEST_VERB_SOURCE = [
   'answer', 'analy[sz]e', 'assess', 'advise', 'brainstorm', 'calculate',

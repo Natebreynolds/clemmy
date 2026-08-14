@@ -71,6 +71,16 @@ test('argument key ORDER never changes the digest', () => {
     composioCarrierDigest(reversed.canonical),
     'key order changed the approval fingerprint',
   );
+  assert.deepEqual(
+    Object.keys(JSON.parse(serializeComposioCarrier(forward.canonical).arguments as string)),
+    ['a', 'b'],
+    'provider-ready wire retains the caller\'s semantic field order',
+  );
+  assert.deepEqual(
+    Object.keys(JSON.parse(serializeComposioCarrier(reversed.canonical).arguments as string)),
+    ['b', 'a'],
+    'identity canonicalization must not reorder provider-visible fields',
+  );
 });
 
 test('the wire form is a JSON string, and absent arguments are null not "{}"', () => {

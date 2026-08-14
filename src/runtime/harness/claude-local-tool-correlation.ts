@@ -64,6 +64,32 @@ function localCorrelationAllowed(toolName: string, input: unknown): boolean {
   return metadata.effect === 'read' && Boolean(metadata.toolSlug);
 }
 
+/**
+ * Correlation authority follows the carrier's real owner, not one lane label.
+ *
+ * The legacy bare Composio bridge is a conversational-orchestrator read replay
+ * and remains direct-only. `work_call` is different: its MCP registration is
+ * already conditional on the exact persisted source having active expected-work
+ * authority, and workers/steps inherit that accepted source without becoming
+ * the direct conversational orchestrator. Requiring both facts stranded every
+ * Claude worker action before provider dispatch (live 2026-08-12).
+ */
+function localCorrelationAuthorityAllowed(input: {
+  toolName: string;
+  directOrchestrator: boolean;
+  actionExpectedWork?: boolean;
+}): boolean {
+  if (input.toolName === LOCAL_WORK_CALL_TOOL) return input.actionExpectedWork === true;
+  if (input.toolName === LOCAL_COMPOSIO_TOOL) return input.directOrchestrator === true;
+  return false;
+}
+
+function eventCarriesLocalCorrelationAuthority(event: EventRow, toolName: string): boolean {
+  return toolName === LOCAL_WORK_CALL_TOOL
+    ? event.data.actionExpectedWork === true
+    : toolName === LOCAL_COMPOSIO_TOOL && event.data.directOrchestrator === true;
+}
+
 export interface ClaudeLocalPermissionAdmissionInput {
   sessionId: string;
   sourceUserSeq: number;
@@ -72,6 +98,8 @@ export interface ClaudeLocalPermissionAdmissionInput {
   sdkToolName: string;
   input: unknown;
   directOrchestrator: boolean;
+  /** Host-derived from the exact persisted accepted source. Never model input. */
+  actionExpectedWork?: boolean;
   dispatchLease?: DispatchLeaseRef;
 }
 
@@ -86,8 +114,12 @@ export function recordClaudeLocalPermissionAdmission(
 ): EventRow | null {
   try {
     const localTool = correlatableLocalToolFromSdkName(input.sdkToolName);
-    if (!input.directOrchestrator
-      || !localTool
+    if (!localTool
+      || !localCorrelationAuthorityAllowed({
+        toolName: localTool,
+        directOrchestrator: input.directOrchestrator,
+        actionExpectedWork: input.actionExpectedWork,
+      })
       || !input.sessionId.trim()
       || !input.runScopeId.trim()
       || !input.providerCallId.trim()
@@ -110,7 +142,8 @@ export function recordClaudeLocalPermissionAdmission(
         ...(metadata.effectiveTool ? { effectiveTool: metadata.effectiveTool } : {}),
         ...(metadata.toolSlug ? { toolSlug: metadata.toolSlug } : {}),
         dispatchLeaseId: dispatchLeaseId(input.dispatchLease),
-        directOrchestrator: true,
+        directOrchestrator: input.directOrchestrator === true,
+        ...(localTool === LOCAL_WORK_CALL_TOOL ? { actionExpectedWork: true } : {}),
       },
     });
   } catch {
@@ -125,6 +158,8 @@ export interface ClaudeLocalCanonicalClaimInput {
   toolName: string;
   rawInput: unknown;
   directOrchestrator: boolean;
+  /** Host-derived from the exact persisted accepted source. Never model input. */
+  actionExpectedWork?: boolean;
   dispatchLease?: DispatchLeaseRef;
 }
 
@@ -189,7 +224,7 @@ export function claimClaudeLocalPermissionAdmission(
   input: ClaudeLocalCanonicalClaimInput,
 ): ClaudeLocalCanonicalClaim | null {
   try {
-    if (!input.directOrchestrator
+    if (!localCorrelationAuthorityAllowed(input)
       || !localCorrelationAllowed(input.toolName, input.rawInput)
       || !input.sessionId.trim()
       || !input.runScopeId.trim()
@@ -214,7 +249,7 @@ export function claimClaudeLocalPermissionAdmission(
       && eventString(event, 'tool') === input.toolName
       && eventString(event, 'correlationFingerprint') === correlationFingerprint
       && eventString(event, 'dispatchLeaseId') === leaseId
-      && event.data.directOrchestrator === true
+      && eventCarriesLocalCorrelationAuthority(event, input.toolName)
     );
     const claimedAdmissionIds = handlerClaimedAdmissionIds(events);
     const unclaimed = admissions.filter((admission) => !claimedAdmissionIds.has(admission.id));
@@ -255,7 +290,8 @@ export function claimClaudeLocalPermissionAdmission(
           runScopeId: input.runScopeId,
           tool: input.toolName,
           correlationFingerprint,
-          directOrchestrator: true,
+          directOrchestrator: input.directOrchestrator === true,
+          ...(input.toolName === LOCAL_WORK_CALL_TOOL ? { actionExpectedWork: true } : {}),
         },
       });
       return { providerCallId, calledEventId: called.id, admissionEventId: admission.id };
@@ -280,6 +316,8 @@ export function claimClaudeLocalPermissionAdmission(
         arguments: exactArgumentsPreview(input.rawInput),
         claudePermissionAdmissionEventId: admission.id,
         claudeLocalHandlerClaimed: true,
+        directOrchestrator: input.directOrchestrator === true,
+        ...(input.toolName === LOCAL_WORK_CALL_TOOL ? { actionExpectedWork: true } : {}),
       },
     });
     return { providerCallId, calledEventId: called.id, admissionEventId: admission.id };
@@ -297,6 +335,8 @@ export function findClaimedClaudeLocalCanonicalCall(input: {
   providerCallId: string;
   sdkToolName: string;
   rawInput: unknown;
+  directOrchestrator: boolean;
+  actionExpectedWork?: boolean;
 }): EventRow | null {
   try {
     const localTool = correlatableLocalToolFromSdkName(input.sdkToolName);
@@ -306,6 +346,11 @@ export function findClaimedClaudeLocalCanonicalCall(input: {
       || !Number.isSafeInteger(input.sourceUserSeq)
       || input.sourceUserSeq <= 0
       || !localTool
+      || !localCorrelationAuthorityAllowed({
+        toolName: localTool,
+        directOrchestrator: input.directOrchestrator,
+        actionExpectedWork: input.actionExpectedWork,
+      })
       || !localCorrelationAllowed(localTool, input.rawInput)) return null;
     const fingerprint = toolCallCorrelationFingerprint(localTool, input.rawInput);
     const events = listEvents(input.sessionId, {
@@ -324,7 +369,7 @@ export function findClaimedClaudeLocalCanonicalCall(input: {
       && eventString(event, 'tool') === localTool
       && eventString(event, 'providerCallId') === input.providerCallId
       && eventString(event, 'correlationFingerprint') === fingerprint
-      && event.data.directOrchestrator === true
+      && eventCarriesLocalCorrelationAuthority(event, localTool)
     );
     if (admissions.length !== 1) return null;
     const admission = admissions[0]!;
@@ -350,7 +395,7 @@ export function findClaimedClaudeLocalCanonicalCall(input: {
       && eventString(event, 'runScopeId') === input.runScopeId
       && eventString(event, 'tool') === localTool
       && eventString(event, 'correlationFingerprint') === fingerprint
-      && event.data.directOrchestrator === true
+      && eventCarriesLocalCorrelationAuthority(event, localTool)
     );
     return handlerAuthored || streamFirstClaims.length === 1 ? called : null;
   } catch {

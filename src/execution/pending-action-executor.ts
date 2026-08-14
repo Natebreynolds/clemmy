@@ -11,6 +11,7 @@ import {
   getPendingAction,
   recordPendingActionResult,
   type PendingActionExecutionClaim,
+  type PendingActionExecutionCapability,
   type PendingActionRecord,
 } from '../runtime/harness/pending-actions.js';
 import { dispatchBatchItemTool } from '../tools/code-mode-tool.js';
@@ -25,6 +26,9 @@ export interface ExecuteApprovedResult {
   status: 'executed' | 'failed' | 'skipped';
   resultSummary: string;
   record: PendingActionRecord | null;
+  /** A pre-provider bookkeeping owner is still live. No execution claim or
+   * dispatch began; the exact caller may retry after bounded backoff. */
+  retryable?: boolean;
 }
 
 /**
@@ -41,10 +45,20 @@ export type ApprovedCallDispatch = (
   payload: unknown,
   sessionId: string,
   certifiedBatch: { batchId: string; payloadHash: string },
+  executionCapability: PendingActionExecutionCapability,
 ) => Promise<unknown>;
 
-const defaultDispatch: ApprovedCallDispatch = (toolName, payload, sessionId, certifiedBatch) =>
-  dispatchBatchItemTool(toolName, payload, sessionId, new ToolCallsCounter(50), certifiedBatch);
+const defaultDispatch: ApprovedCallDispatch = (toolName, payload, sessionId, certifiedBatch, executionCapability) =>
+  dispatchBatchItemTool(
+    toolName,
+    payload,
+    sessionId,
+    new ToolCallsCounter(50),
+    certifiedBatch,
+    undefined,
+    undefined,
+    executionCapability,
+  );
 
 /** Nominal local refusal for dispatcher implementations that can establish the
  * provider thunk was never invoked. Text returned from a dispatch is never
@@ -77,6 +91,8 @@ function skippedClaimResult(id: string, claim: PendingActionExecutionClaim): Exe
       ?? `Pending action ${id} failed its pre-dispatch authorization integrity check. No provider call was made.`
     : claim.reason === 'session_authority_mismatch'
       ? `Pending action ${id} belongs to a different session and was not executed.`
+      : claim.reason === 'pre_provider_transition_in_progress'
+        ? `Pending action ${id} has a live pre-provider bookkeeping owner. No provider call began; retry after that exact transition settles.`
       : claim.reason === 'claim_in_progress_or_uncertain' || status === 'executing'
     ? `Pending action ${id} already has an execution claim. It may still be in progress or its outcome may be uncertain — no second dispatch was attempted, and it must not be retried automatically.`
     : status === 'executed'
@@ -91,6 +107,7 @@ function skippedClaimResult(id: string, claim: PendingActionExecutionClaim): Exe
     status: integrityFailure ? 'failed' : 'skipped',
     resultSummary: detail,
     record: claim.record,
+    ...(claim.reason === 'pre_provider_transition_in_progress' ? { retryable: true } : {}),
   };
 }
 
@@ -136,7 +153,7 @@ function verifyPendingActionExecutionAuthority(record: PendingActionRecord): str
 
 export async function executeApprovedPendingActionCall(
   id: string,
-  opts: { sessionId?: string; dispatch?: ApprovedCallDispatch } = {},
+  opts: { sessionId?: string; sourceUserSeq?: number; dispatch?: ApprovedCallDispatch } = {},
 ): Promise<ExecuteApprovedResult> {
   const record = getPendingAction(id);
   if (!record) return { ok: false, status: 'skipped', resultSummary: `No pending action ${id}.`, record: null };
@@ -148,16 +165,33 @@ export async function executeApprovedPendingActionCall(
       record,
     };
   }
+  const conversationEvidence = record.approvalEvidence?.kind === 'conversation'
+    ? record.approvalEvidence
+    : null;
+  if (
+    conversationEvidence
+    && (
+      !Number.isSafeInteger(opts.sourceUserSeq)
+      || opts.sourceUserSeq !== conversationEvidence.responseSourceUserSeq
+    )
+  ) {
+    return {
+      ok: false,
+      status: 'skipped',
+      resultSummary: `Pending action ${id} has no exact accepted reply source and was not executed.`,
+      record,
+    };
+  }
   if (record.status !== 'approved') {
     return skippedClaimResult(id, { claimed: false, reason: 'not_approved', record });
   }
   // GRANT INVARIANT I1 (Phase 1): irreversible sends execute only on HUMAN
   // consent — a policy-minted approval is inert at every executor.
-  if (pendingActionRequiresHumanApproval(record) && record.approvedBy !== 'human') {
+  if (pendingActionRequiresHumanApproval(record, { sessionId: record.sessionId }) && record.approvedBy !== 'human') {
     return {
       ok: false,
       status: 'skipped',
-      resultSummary: `Pending action ${id} is an irreversible send approved by POLICY, not the user — it requires their explicit approval card before execution.`,
+      resultSummary: `Pending action ${id} is an irreversible send approved by POLICY, not the user — it requires their explicit human decision before execution.`,
       record,
     };
   }
@@ -171,17 +205,25 @@ export async function executeApprovedPendingActionCall(
   try {
     claim = claimPendingActionExecution(id, 'pending-action-executor', {
       expectedSessionId: opts.sessionId,
-      requireResolvedHumanCard: pendingActionRequiresHumanApproval(record),
+      requireResolvedHumanCard: pendingActionRequiresHumanApproval(record, { sessionId: record.sessionId }),
       verifyExecutionAuthority: verifyPendingActionExecutionAuthority,
     });
   } catch {
     // If durable claim storage itself is unavailable, the only safe choice is
-    // zero dispatch. Treat the boundary as uncertain instead of throwing or
-    // falling back to an unclaimed provider call.
+    // zero dispatch. Reread the durable phase: APPROVED means the provider
+    // boundary never began and the outer transition is retryable; EXECUTING
+    // remains strict/uncertain and can never be replayed automatically.
+    const current = getPendingAction(id);
     claim = {
       claimed: false,
-      reason: 'claim_in_progress_or_uncertain',
-      record: getPendingAction(id),
+      reason: !current
+        ? 'not_found'
+        : current.status === 'approved'
+          ? 'pre_provider_transition_in_progress'
+          : current.status === 'executing'
+            ? 'claim_in_progress_or_uncertain'
+            : 'not_approved',
+      record: current,
     };
   }
   if (!claim.claimed || !claim.record || !claim.claimToken) return skippedClaimResult(id, claim);
@@ -202,6 +244,11 @@ export async function executeApprovedPendingActionCall(
     const out = await dispatch(claimedRecord.toolName, claimedRecord.payload, sessionId, {
       batchId: claimedRecord.id,
       payloadHash: claimedRecord.payloadHash,
+    }, {
+      pendingActionId: claimedRecord.id,
+      payloadHash: claimedRecord.payloadHash,
+      claimToken,
+      sourceUserSeq: opts.sourceUserSeq ?? 0,
     });
     const outText = typeof out === 'string' ? out : JSON.stringify(out ?? '');
     const structuredFailure = detectStructuredToolFailure(outText);

@@ -5,6 +5,11 @@ import { resumeWorkflowRun } from '../../tools/workflow-run-queue.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { runPlanFirstPreflight } from './plan-first.js';
 import { extractNamedResource } from '../../memory/focus.js';
+import {
+  findSoleAwaitingInputWorkflowRunForOrigin,
+  queueWorkflowRunInputResolution,
+  type AwaitingInputWorkflowMatch,
+} from '../../execution/workflow-awaiting-input.js';
 
 /**
  * Deterministic self-contained-request guard (code-level, not a prompt rule).
@@ -330,6 +335,102 @@ export async function classifyWorkflowInputAnswers(
   }
 }
 
+type WorkflowQuestionReplyKind = 'answers' | 'new_topic' | 'abandon' | 'uncertain';
+
+interface WorkflowQuestionReplyClassification {
+  kind: WorkflowQuestionReplyKind;
+  confidence: number;
+  reason: string;
+}
+
+/**
+ * Runtime clarification is different from author-time named inputs: an answer
+ * can authorize the SAME already-executing workflow step to continue. The
+ * classifier therefore receives the exact durable question identity and has
+ * an explicit UNCERTAIN result. It never sees a fabricated catch-all field.
+ */
+export function buildWorkflowQuestionClassifierPrompt(
+  paused: AwaitingInputWorkflowMatch,
+  message: string,
+): string {
+  return [
+    'A workflow is paused on one exact clarifying question. Decide whether the user\'s new message answers THAT question. Do not execute anything.',
+    '',
+    `Workflow: ${paused.workflowName}`,
+    `Run id: ${paused.runId}`,
+    `Step id: ${paused.awaitingInput.stepId}`,
+    `Question id: ${paused.awaitingInput.questionId}`,
+    '',
+    `Exact pending question:\n${paused.awaitingInput.question}`,
+    '',
+    `User's new message:\n${message}`,
+    '',
+    'Reply with exactly one marker and nothing else:',
+    '- ANSWERS — the message supplies an answer to the exact pending question.',
+    '- NEW_TOPIC — the message is a different request or ordinary conversation, not an answer.',
+    '- ABANDON — the user explicitly wants to drop/cancel/forget the paused work.',
+    '- UNCERTAIN — the relation is ambiguous or cannot be determined safely.',
+    '',
+    'Do not infer an answer merely because this is the next message. When unsure, choose UNCERTAIN.',
+  ].join('\n');
+}
+
+export function parseWorkflowQuestionVerdict(raw: string): WorkflowQuestionReplyKind | null {
+  const marker = /^\s*(ANSWERS|NEW[\s_-]?TOPIC|ABANDON|UNCERTAIN)\s*$/i.exec(raw);
+  if (!marker) return null;
+  const token = marker[1].toUpperCase().replace(/[\s-]/g, '_');
+  if (token === 'ANSWERS') return 'answers';
+  if (token === 'NEW_TOPIC') return 'new_topic';
+  if (token === 'ABANDON') return 'abandon';
+  return 'uncertain';
+}
+
+function buildWorkflowQuestionClassifierAgent(): Agent {
+  return new Agent({
+    name: 'WorkflowQuestionClassifier',
+    instructions: [
+      'Classify whether one user message answers one exact pending workflow question.',
+      'Reply with exactly ANSWERS, NEW_TOPIC, ABANDON, or UNCERTAIN. Do not call tools. Do not execute anything. Choose UNCERTAIN whenever the relation is not clear.',
+    ].join('\n\n'),
+    model: MODELS.fast,
+    tools: [],
+  });
+}
+
+async function classifyWorkflowQuestionReply(
+  paused: AwaitingInputWorkflowMatch,
+  message: string,
+): Promise<WorkflowQuestionReplyClassification> {
+  try {
+    const runner = new Runner({ workflowName: 'clementine-workflow-question-continuity' });
+    const result = await runner.run(
+      buildWorkflowQuestionClassifierAgent(),
+      buildWorkflowQuestionClassifierPrompt(paused, message),
+      { maxTurns: 1 },
+    );
+    const raw = String((result as { finalOutput?: unknown }).finalOutput ?? '').trim();
+    const kind = parseWorkflowQuestionVerdict(raw);
+    if (!kind) {
+      return {
+        kind: 'uncertain',
+        confidence: 0,
+        reason: 'workflow-question classifier returned no valid marker',
+      };
+    }
+    return {
+      kind,
+      confidence: kind === 'uncertain' ? 0 : 0.8,
+      reason: `classified against exact workflow question as ${kind}`,
+    };
+  } catch {
+    return {
+      kind: 'uncertain',
+      confidence: 0,
+      reason: 'workflow-question classifier unavailable; the paused run was left unchanged',
+    };
+  }
+}
+
 export interface PlanContinuityRouteInput {
   channel: string;
   input: string;
@@ -418,6 +519,49 @@ async function routeWorkflowPendingInputs(
 export async function routeOpenQuestionPlan(
   input: PlanContinuityRouteInput,
 ): Promise<PlanContinuityRouteResult> {
+  // A question raised DURING an executing workflow owns the next plausible
+  // answer before author-time plans/missing-input proposals do. Exact origin +
+  // sole-match lookup prevents one chat reply from widening across runs.
+  const pausedWorkflow = findSoleAwaitingInputWorkflowRunForOrigin(input.sessionId);
+  if (pausedWorkflow) {
+    const classification = await classifyWorkflowQuestionReply(pausedWorkflow, input.input);
+    if (classification.kind === 'answers') {
+      const resumed = queueWorkflowRunInputResolution({
+        runId: pausedWorkflow.runId,
+        questionId: pausedWorkflow.awaitingInput.questionId,
+        stepId: pausedWorkflow.awaitingInput.stepId,
+        originSessionId: input.sessionId,
+        answer: input.input,
+      });
+      if (input.sendNote) {
+        await input.sendNote(
+          resumed.status === 'queued'
+            ? `🍊 Got it — I’m resuming "${pausedWorkflow.workflowName}" from where it paused.`
+            : `🍊 That workflow question is no longer waiting, so I’ll handle your message normally.`,
+        );
+      }
+      return {
+        handled: resumed.status === 'queued',
+        kind: 'answers',
+        reason: resumed.status === 'queued' ? classification.reason : resumed.reason,
+      };
+    }
+    if (input.sendNote) {
+      await input.sendNote(
+        classification.kind === 'abandon'
+          ? `🍊 I’ve left "${pausedWorkflow.workflowName}" paused. On your message now:`
+          : classification.kind === 'uncertain'
+            ? `🍊 I couldn’t safely tell whether that answered "${pausedWorkflow.awaitingInput.question}", so I left "${pausedWorkflow.workflowName}" paused. On your message now:`
+            : `🍊 "${pausedWorkflow.workflowName}" is still waiting on your earlier answer. Meanwhile, on your new request:`,
+      );
+    }
+    return {
+      handled: false,
+      ...(classification.kind !== 'uncertain' ? { kind: classification.kind } : {}),
+      reason: classification.reason,
+    };
+  }
+
   // Session-keyed workflow ask-then-resume takes priority over the channel
   // path (the workflow_run tool that creates these has only a sessionId).
   const openWf = findOpenWorkflowPendingInputs(input.sessionId);

@@ -40,6 +40,8 @@ const {
   turnOutcomeId,
 } = await import('../runtime/harness/turn-outcome.js');
 const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { exactOriginDeliveryTargetDigest } = await import('../runtime/exact-origin-delivery.js');
 const {
   PUBLIC_RUN_FAILURE_TEXT,
   publicAsyncWorkDispatchedData,
@@ -675,6 +677,73 @@ test('gateway preserves a legacy awaiting-input stop as a typed question without
   assert.equal(getRun('run-gateway-legacy-awaiting-input')?.status, 'awaiting_input');
 });
 
+test('gateway stop keeps a conversational send row hidden while formal approval stop stays addressable', async () => {
+  const hiddenSessionId = 'sess-gateway-hidden-send-stop';
+  const channelId = 'gateway-hidden-send-channel';
+  const userId = 'gateway-hidden-send-user';
+  const originReplyTarget = { type: 'discord_channel' as const, channelId };
+  createSession({
+    id: hiddenSessionId,
+    kind: 'chat',
+    channel: 'discord',
+    userId,
+    metadata: { channelId, userId },
+  });
+  const hidden = approvalRegistry.register({
+    sessionId: hiddenSessionId,
+    channel: 'discord',
+    channelId,
+    subject: 'Send the reviewed email',
+    tool: 'request_approval',
+    presentation: {
+      version: 1,
+      kind: 'autonomous_send_consent',
+      question: 'The exact email is ready. Do you want me to send it?',
+      actionLabel: 'email',
+      target: 'proof@example.com',
+      subject: 'Reviewed sheet',
+      bodyPreview: 'The reviewed sheet is attached.',
+      resultUrl: null,
+      sourceUserSeq: 1,
+      originReplyTarget,
+      originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget),
+      conversationKey: `discord:${channelId}`,
+      audienceUserId: userId,
+    },
+  });
+  const gateway = new ClementineGateway({
+    respond: async () => { throw new Error('stop must not invoke the model'); },
+  } as never);
+
+  const hiddenResponse = await gateway.handleMessage({
+    message: 'stop',
+    sessionId: hiddenSessionId,
+    channel: 'discord',
+    source: 'discord',
+    userId,
+  });
+  assert.match(hiddenResponse.text, /prepared email.*unsent/i);
+  assert.doesNotMatch(hiddenResponse.text, /approval|card|apr-/i);
+  assert.doesNotMatch(hiddenResponse.text, new RegExp(hidden.approvalId));
+  assert.equal(approvalRegistry.get(hidden.approvalId)?.resolution, 'rejected');
+
+  const formalSessionId = 'sess-gateway-formal-approval-stop';
+  createSession({ id: formalSessionId, kind: 'chat', channel: 'webhook' });
+  const formal = approvalRegistry.register({
+    sessionId: formalSessionId,
+    subject: 'Delete the reviewed record',
+    tool: 'request_approval',
+  });
+  const formalResponse = await gateway.handleMessage({
+    message: 'stop',
+    sessionId: formalSessionId,
+    channel: 'webhook',
+    source: 'webhook',
+  });
+  assert.match(formalResponse.text, /Rejected approval/i);
+  assert.match(formalResponse.text, new RegExp(formal.approvalId));
+});
+
 test('gateway routes a legacy unverified stop through the shared terminal judge before first write', async () => {
   const authored = 'The report run returned, but its completion record is unverified.';
   const judged = 'The report run returned, but I could not verify its completion record, so I am sharing only that confirmed status.';
@@ -793,6 +862,9 @@ test('gateway legacy completion verifies before first write and conservatively h
   assert.equal(judge.runCalls(), 1, 'durable replay must not judge the same source again');
   assert.deepEqual(judge.request()?.tools, []);
   assert.equal(judge.request()?.maxTurns, 1);
+  assert.match(judge.request()?.prompt ?? '', /Live continuation: UNAVAILABLE/);
+  assert.match(judge.request()?.prompt ?? '', /Tools during continuation: UNAVAILABLE/);
+  assert.match(judge.request()?.prompt ?? '', /Read-only external-state inspection: UNAVAILABLE/);
   const terminals = listEvents(request.sessionId, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1);
   const presentation = presentationEventFromCompletionData(terminals[0].data);

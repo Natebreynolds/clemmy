@@ -4,7 +4,11 @@ import { BASE_DIR } from '../config.js';
 import { redactSensitiveValue } from '../runtime/security.js';
 import { listEvents, type EventRow } from '../runtime/harness/eventlog.js';
 import { projectCanonicalTopLevelToolEvents } from '../runtime/harness/tool-effect.js';
-import { listPending, type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
+import {
+  isFormalApprovalSurface,
+  listPending,
+  type PendingApprovalRow,
+} from '../runtime/harness/approval-registry.js';
 import { listNotifications, type NotificationRecord } from '../runtime/notifications.js';
 import { summarizeWorkManifests, type WorkManifestSummary } from '../runtime/harness/work-manifest.js';
 import {
@@ -98,7 +102,7 @@ function safeHarnessEvents(sessionId: string): EventRow[] {
 
 function safePendingApprovals(sessionId: string): PendingApprovalRow[] {
   try {
-    return listPending({ sessionId, status: 'pending' });
+    return listPending({ sessionId, status: 'pending' }).filter(isFormalApprovalSurface);
   } catch {
     return [];
   }

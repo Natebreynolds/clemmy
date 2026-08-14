@@ -311,7 +311,11 @@ test('a resolved continuation initializes the accepted task as known', () => {
   recordCapabilityResolution(sess.id, resolution, source.seq);
   const state = discoveryGovernor.getTaskState({ sessionId: sess.id, sourceUserSeq: source.seq });
   assert.equal(state?.policy.knownCapability, true);
-  assert.equal(state?.policy.broadDiscoveryAllowance, 0);
+  assert.equal(
+    state?.policy.broadDiscoveryAllowance,
+    1,
+    'known is ranking context, not proof that every capability in the task is covered',
+  );
 });
 
 test('an internal verification retry cannot tighten an unresolved continuation from an unrelated proven capability', () => {
