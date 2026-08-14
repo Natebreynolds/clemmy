@@ -28,9 +28,11 @@ import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { ingestMemorySource, scanMemorySource, undoMemoryImportBatch } from '../memory/memory-import.js';
 import { validateManifest, renderConsentSummary, type PluginContents, type PluginManifest } from './plugin-manifest.js';
+import { spaceStore, isValidSpaceSlug, resolveSpaceDir, type SpaceDataSource } from '../spaces/store.js';
+import { workspaceDataSourceSafetyError } from '../spaces/space-execution-policy.js';
 
 /** For 'memory', name is the import batch id (undoMemoryImportBatch removes it). */
-export interface PluginArtifact { kind: 'skill' | 'workflow' | 'mcp-server' | 'memory'; name: string }
+export interface PluginArtifact { kind: 'skill' | 'workflow' | 'mcp-server' | 'memory' | 'workspace'; name: string }
 export interface InstalledPlugin {
   manifest: PluginManifest;
   installedAt: string;
@@ -112,7 +114,73 @@ export function discoverContents(dir: string): PluginContents {
   if (existsSync(memoryDir)) {
     memoryFiles = scanMemorySource(memoryDir).files.map((f) => path.relative(dir, f.path));
   }
-  return { skills, workflows, mcpServers, memoryFiles };
+  // workspaces/<slug>/workspace.json — the shipped view + its declared sources.
+  const workspaces = (readdirSafe(path.join(dir, 'workspaces')) ?? [])
+    .filter((n) => !n.startsWith('.') && existsSync(path.join(dir, 'workspaces', n, 'workspace.json')));
+  return { skills, workflows, mcpServers, memoryFiles, workspaces };
+}
+
+export interface ShippedWorkspace {
+  slug: string;
+  title: string;
+  viewEntry: string;
+  dataSources: SpaceDataSource[];
+}
+
+/**
+ * Read and vet one shipped workspace BEFORE consent.
+ *
+ * A cartridge is a distributable file from someone else, so it may only carry
+ * what `space_save` itself would accept. The data-source verdict is delegated
+ * to `workspaceDataSourceSafetyError` — the same function the runtime refresh
+ * consults — rather than re-derived here, because a second copy of that rule is
+ * exactly how the two drift and the stricter one stops being the one that runs.
+ * Opaque runners, frozen CLI argv, and executable actions are all refused: they
+ * need a human standing at the boundary, and a download is not that.
+ */
+export function readShippedWorkspace(dir: string, slug: string): ShippedWorkspace {
+  if (!isValidSpaceSlug(slug)) throw new Error(`workspace "${slug}" has an unsafe slug`);
+  const root = path.join(dir, 'workspaces', slug);
+  let raw: unknown;
+  try { raw = JSON.parse(readFileSync(path.join(root, 'workspace.json'), 'utf-8')); } catch (err) {
+    throw new Error(`workspace "${slug}": workspace.json is not valid JSON (${err instanceof Error ? err.message : String(err)})`);
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`workspace "${slug}": workspace.json is not an object`);
+  const m = raw as Record<string, unknown>;
+  const title = typeof m.title === 'string' ? m.title.trim() : '';
+  if (!title) throw new Error(`workspace "${slug}": missing title`);
+  if (Array.isArray(m.actions) && m.actions.length) {
+    throw new Error(`workspace "${slug}" declares executable actions — a downloaded cartridge may not ship them; add them by hand after install`);
+  }
+  const viewEntry = (typeof m.view === 'string' && m.view.trim()) ? m.view.trim() : 'view/index.html';
+  // The view must resolve INSIDE the shipped workspace: a relative path is
+  // author convenience, not a way to reach the rest of the filesystem.
+  const viewFile = path.resolve(root, viewEntry);
+  if (viewFile !== root && !viewFile.startsWith(root + path.sep)) {
+    throw new Error(`workspace "${slug}": view "${viewEntry}" escapes the workspace directory`);
+  }
+  if (!existsSync(viewFile)) throw new Error(`workspace "${slug}": view file "${viewEntry}" is missing`);
+  const dataSources: SpaceDataSource[] = [];
+  const declared = Array.isArray(m.dataSources) ? m.dataSources : [];
+  for (const entry of declared) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`workspace "${slug}": a data source is not an object`);
+    const d = entry as Record<string, unknown>;
+    const id = typeof d.id === 'string' ? d.id.trim() : '';
+    if (!id) throw new Error(`workspace "${slug}": a data source is missing its id`);
+    const source = {
+      id,
+      ...(typeof d.composioSlug === 'string' ? { composioSlug: d.composioSlug.trim() } : {}),
+      ...(typeof d.runner === 'string' ? { runner: d.runner.trim() } : {}),
+      ...(Array.isArray(d.cliArgv) ? { cliArgv: d.cliArgv.filter((v): v is string => typeof v === 'string') } : {}),
+      ...(d.args && typeof d.args === 'object' ? { args: d.args as Record<string, unknown> } : {}),
+      ...(typeof d.schedule === 'string' ? { schedule: d.schedule.trim() } : {}),
+      ...(typeof d.timezone === 'string' ? { timezone: d.timezone.trim() } : {}),
+    } as SpaceDataSource;
+    const unsafe = workspaceDataSourceSafetyError(source);
+    if (unsafe) throw new Error(`workspace "${slug}": ${unsafe}`);
+    dataSources.push(source);
+  }
+  return { slug, title, viewEntry, dataSources };
 }
 
 export interface PluginPreview {
@@ -155,6 +223,9 @@ export function previewPlugin(dir: string): PluginPreview {
   for (const s of contents.skills) {
     if (!isSafeSkillName(s)) throw new Error(`skill "${s}" has an unsafe name`);
   }
+  // Same posture as workflows above: a workspace that declares an unsafe source
+  // is rejected at the slot, not after the user has already consented.
+  for (const w of contents.workspaces) readShippedWorkspace(dir, w);
   return { manifest, contents, consent: renderConsentSummary(manifest, contents), warnings };
 }
 
@@ -177,6 +248,7 @@ export async function installPlugin(dir: string): Promise<InstalledPlugin> {
           delete servers[a.name];
           saveUserMcpServers(servers);
         } else if (a.kind === 'memory') undoMemoryImportBatch(a.name);
+        else if (a.kind === 'workspace') spaceStore.remove(a.name);
       } catch { /* best-effort rollback */ }
     }
   };
@@ -207,6 +279,31 @@ export async function installPlugin(dir: string): Promise<InstalledPlugin> {
         done.push({ kind: 'mcp-server', name });
       }
       saveUserMcpServers(servers);
+    }
+    for (const w of contents.workspaces) {
+      const shipped = readShippedWorkspace(dir, w);
+      // A slug collision with a hand-built Workspace blocks rather than clobbers,
+      // exactly as skills and workflows do.
+      if (spaceStore.get(shipped.slug)) throw new Error(`workspace "${shipped.slug}" already exists — refusing to overwrite`);
+      const target = resolveSpaceDir(shipped.slug);
+      if (existsSync(target)) throw new Error(`workspace "${shipped.slug}" already has a directory — refusing to overwrite`);
+      cpSync(path.join(dir, 'workspaces', w), target, { recursive: true });
+      // The shipped manifest is the AUTHOR's file; the record is the store's.
+      // Removing it keeps one authority for what this Workspace is.
+      try { rmSync(path.join(target, 'workspace.json'), { force: true }); } catch { /* best-effort */ }
+      try {
+        spaceStore.save({
+          id: shipped.slug,
+          title: shipped.title,
+          viewEntry: shipped.viewEntry,
+          dataSources: shipped.dataSources,
+          recipe: `plugin:${manifest.id}`,
+        });
+      } catch (err) {
+        rmSync(target, { recursive: true, force: true });
+        throw err;
+      }
+      done.push({ kind: 'workspace', name: shipped.slug });
     }
     // Memory ingests LAST so a failure here rolls back the whole cartridge.
     // distill:false keeps install deterministic (no model call) — authors ship
@@ -292,6 +389,7 @@ export function uninstallPlugin(id: string): { removed: PluginArtifact[] } {
         if (servers[a.name]) { delete servers[a.name]; saveUserMcpServers(servers); removed.push(a); }
       }
       else if (a.kind === 'memory' && undoMemoryImportBatch(a.name).batch) removed.push(a);
+      else if (a.kind === 'workspace' && spaceStore.remove(a.name)) removed.push(a);
     } catch { /* keep going — report what actually came out */ }
   }
   const fresh = readLedger();

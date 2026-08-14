@@ -17,6 +17,7 @@
  *   workflows/<name>/SKILL.md   (scripts/ + references/ ride along)
  *   mcp/servers.json     ← fragment merged into the user's servers.json
  *   memory/*.md          ← structured-frontmatter facts, imported on install
+ *   workspaces/<slug>/workspace.json + its view file(s)
  */
 
 export interface PluginPermissions {
@@ -50,6 +51,13 @@ export interface PluginContents {
   workflows: string[];   // workflow dir names under workflows/
   mcpServers: string[];  // server names in mcp/servers.json
   memoryFiles: string[]; // importable files under memory/, relative to the plugin root
+  /**
+   * Workspace slugs under workspaces/<slug>/workspace.json — a shipped view
+   * plus its declared data sources. Same shelf a hand-built Workspace lives on,
+   * and the SAME refusal: a cartridge may only carry what `space_save` itself
+   * would accept, so it can never become the way an opaque runner gets in.
+   */
+  workspaces: string[];
 }
 
 const ID_RE = /^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$/;
@@ -110,7 +118,8 @@ export function renderConsentSummary(manifest: PluginManifest, contents: PluginC
   if (contents.workflows.length) lines.push(`  • ${contents.workflows.length} workflow${contents.workflows.length === 1 ? '' : 's'}: ${contents.workflows.join(', ')}`);
   if (contents.mcpServers.length) lines.push(`  • ${contents.mcpServers.length} MCP server${contents.mcpServers.length === 1 ? '' : 's'}: ${contents.mcpServers.join(', ')}`);
   if (contents.memoryFiles.length) lines.push(`  • ${contents.memoryFiles.length} memory file${contents.memoryFiles.length === 1 ? '' : 's'}: imported as facts (removed on uninstall; disable leaves them)`);
-  if (!contents.skills.length && !contents.workflows.length && !contents.mcpServers.length && !contents.memoryFiles.length) lines.push('  • (nothing — empty plugin)');
+  if (contents.workspaces.length) lines.push(`  • ${contents.workspaces.length} workspace${contents.workspaces.length === 1 ? '' : 's'}: ${contents.workspaces.join(', ')} (read-only data sources only)`);
+  if (!contents.skills.length && !contents.workflows.length && !contents.mcpServers.length && !contents.memoryFiles.length && !contents.workspaces.length) lines.push('  • (nothing — empty plugin)');
   const p = manifest.permissions ?? {};
   lines.push('Asks for:');
   lines.push(`  • external writes: ${p.externalWrites === 'never' ? 'NEVER (send-class steps disabled)' : 'normal approval gates'}`);

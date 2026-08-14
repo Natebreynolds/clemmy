@@ -87,6 +87,7 @@ test('cartridge lifecycle: preview → install → shelves populated → disable
     workflows: ['acme-daily-prep'],
     mcpServers: ['acme-data'],
     memoryFiles: [path.join('memory', 'acme-playbook.md')],
+    workspaces: [],
   });
   const consent = renderConsentSummary(preview.manifest, preview.contents).join('\n');
   assert.match(consent, /1 skill.*acme-outbound/s);
