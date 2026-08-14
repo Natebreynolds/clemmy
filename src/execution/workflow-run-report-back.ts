@@ -35,6 +35,7 @@ import {
 import {
   commitWorkflowOriginTerminal,
   renderWorkflowOriginTerminalText,
+  workflowOriginTerminalCommitMatches,
 } from './workflow-origin-terminal.js';
 import {
   compactSettledWorkflowOriginGroup,
@@ -444,6 +445,14 @@ function reportBackOutcomeRank(outcome: WorkflowRunReportBackOutcome): number {
   return outcome === 'failed' ? 3 : outcome === 'blocked' ? 2 : 1;
 }
 
+function workflowOriginTerminalStatus(
+  status: string,
+): WorkflowRunReportBackOutcome | null {
+  return status === 'done' || status === 'blocked' || status === 'failed'
+    ? status
+    : null;
+}
+
 function workflowRunRecordFile(runId: string): string | null {
   const safe = runId.replace(/[^a-zA-Z0-9_.:-]/g, '');
   return safe && safe === runId ? path.join(WORKFLOW_RUNS_DIR, `${safe}.json`) : null;
@@ -745,11 +754,16 @@ function deliverToOrigins(
         continue;
       }
       const expectedText = renderWorkflowOriginTerminalText(projection.detail, projection.primaryRunId);
+      const committedStatus = workflowOriginTerminalStatus(committed.presentation.status);
       if (
         committed.presentation.identity.runId !== projection.identityRunId
         || committed.presentation.identity.sourceUserSeq !== observer.sourceUserSeq
-        || committed.presentation.status !== projection.outcome
-        || committed.presentation.text !== expectedText
+        || committedStatus === null
+        || !workflowOriginTerminalCommitMatches({
+          committed,
+          outcome: projection.outcome,
+          expectedText,
+        })
       ) {
         exactEvidenceComplete = false;
         corruptEvidence = true;
@@ -774,7 +788,7 @@ function deliverToOrigins(
         turn: committed.presentation.identity.turn,
         sourceUserSeq: committed.presentation.identity.sourceUserSeq,
         runId: committed.presentation.identity.runId ?? '',
-        status: projection.outcome,
+        status: committedStatus,
         text: committed.presentation.text,
       };
 
@@ -855,7 +869,7 @@ function deliverToOrigins(
       addNotification({
         id: notificationId,
         kind: 'workflow',
-        title: `Workflow ${projection.outcome === 'done' ? 'completed' : projection.outcome}: ${projection.workflowName}`,
+        title: `Workflow ${committedStatus === 'done' ? 'completed' : committedStatus}: ${projection.workflowName}`,
         body: committed.presentation.text,
         createdAt: new Date().toISOString(),
         read: false,

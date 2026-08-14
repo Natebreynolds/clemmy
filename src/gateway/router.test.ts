@@ -11,11 +11,17 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
+import type { BoundaryJudgeRouting } from '../runtime/harness/debate-model.js';
+import type {
+  TerminalDeliveryJudgePort,
+  TerminalDeliveryJudgeRequest,
+} from '../runtime/harness/terminal-delivery-judge.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-gateway-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
 process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+process.env.CLEMMY_VERIFY_DELIVERED = 'on';
 
 const { ClementineGateway } = await import('./router.js');
 const {
@@ -61,12 +67,14 @@ afterEach(() => {
   resetEventLog();
   process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
   process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  process.env.CLEMMY_VERIFY_DELIVERED = 'on';
 });
 
 test.after(() => {
   resetEventLog();
   delete process.env.CLEMMY_HARNESS_WEBHOOK;
   delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  delete process.env.CLEMMY_VERIFY_DELIVERED;
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
@@ -142,6 +150,36 @@ function commitAnswerForSource(
     resumable: false,
     presentation: { kind: 'answer', text },
   }, { legacyReason: 'gateway_dispatch_test_terminal' });
+}
+
+function gatewayTerminalJudge(output: unknown, failure?: Error): {
+  port: TerminalDeliveryJudgePort;
+  runCalls(): number;
+  request(): TerminalDeliveryJudgeRequest | null;
+} {
+  const route: BoundaryJudgeRouting = {
+    model: {} as BoundaryJudgeRouting['model'],
+    modelId: 'claude-haiku-4-5',
+    judgeFamily: 'claude',
+    brainFamily: 'codex',
+    transport: 'claude_subscription',
+    selfJudge: false,
+  };
+  let runs = 0;
+  let seen: TerminalDeliveryJudgeRequest | null = null;
+  return {
+    port: {
+      async resolveRoute() { return route; },
+      async run(request) {
+        runs += 1;
+        seen = request;
+        if (failure) throw failure;
+        return output;
+      },
+    },
+    runCalls: () => runs,
+    request: () => seen,
+  };
 }
 
 test('bare continue after an awaiting_continue completion is rewritten with prior summary context', async () => {
@@ -602,6 +640,75 @@ test('gateway records max-turns-with-grace as a non-completed run', async () => 
   assert.match(run?.error ?? '', /continue|budget/i);
 });
 
+test('gateway preserves a legacy awaiting-input stop as a typed question without terminal judging', async () => {
+  const question = 'Which connected account should I use for the requested lookup?';
+  let judgeCalls = 0;
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => ({
+      text: question,
+      sessionId: req.sessionId,
+      stoppedReason: 'awaiting-input',
+    }),
+  } as never, {
+    terminalDeliveryJudgePort: {
+      async resolveRoute() { judgeCalls += 1; return null; },
+      async run() { throw new Error('a native question must not reach terminal delivery judging'); },
+    },
+  });
+
+  const response = await gateway.handleMessage({
+    message: 'Look up the account record.',
+    sessionId: 'sess-gateway-legacy-awaiting-input',
+    channel: 'mobile',
+    source: 'mobile',
+    runId: 'run-gateway-legacy-awaiting-input',
+  });
+
+  assert.equal(judgeCalls, 0);
+  assert.equal(response.text, question);
+  assert.equal(response.stoppedReason, 'awaiting-input');
+  const [terminal] = listEvents(response.sessionId, { types: ['conversation_completed'] });
+  const presentation = presentationEventFromCompletionData(terminal.data);
+  assert.equal(presentation?.status, 'needs_input');
+  assert.equal(presentation?.needs?.kind, 'input');
+  assert.equal(presentation?.text, question);
+  assert.equal(getRun('run-gateway-legacy-awaiting-input')?.status, 'awaiting_input');
+});
+
+test('gateway routes a legacy unverified stop through the shared terminal judge before first write', async () => {
+  const authored = 'The report run returned, but its completion record is unverified.';
+  const judged = 'The report run returned, but I could not verify its completion record, so I am sharing only that confirmed status.';
+  const judge = gatewayTerminalJudge({
+    verb: 'deliver',
+    reason: 'the confirmed status is useful with the missing completion record stated plainly',
+    publicText: judged,
+  });
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => ({
+      text: authored,
+      sessionId: req.sessionId,
+      stoppedReason: 'unverified',
+    }),
+  } as never, { terminalDeliveryJudgePort: judge.port });
+
+  const response = await gateway.handleMessage({
+    message: 'Run the report and tell me what happened.',
+    sessionId: 'sess-gateway-legacy-unverified',
+    channel: 'mobile',
+    source: 'mobile',
+    runId: 'run-gateway-legacy-unverified',
+  });
+
+  assert.equal(judge.runCalls(), 1);
+  assert.equal(response.text, judged);
+  const [terminal] = listEvents(response.sessionId, { types: ['conversation_completed'] });
+  const presentation = presentationEventFromCompletionData(terminal.data);
+  assert.equal(presentation?.status, 'done');
+  assert.equal(presentation?.text, judged);
+  assert.equal(terminal.data.terminalJudgeDisposition, 'deliver');
+  assert.equal(terminal.data.deliveryDisclosure, 'unverified_completion');
+});
+
 test('gateway records an intentionally stopped run as cancelled exactly once', async () => {
   const gateway = new ClementineGateway({
     respond: async (req: { sessionId: string }) => ({
@@ -651,6 +758,175 @@ test('gateway returns and records model route diagnostics', async () => {
   const routeEvent = run?.events.find((event) => event.message.startsWith('Model route:'));
   assert.equal(routeEvent?.data?.routeKind, 'legacy');
   assert.equal(routeEvent?.data?.requestedModel, 'claude-sonnet-5');
+});
+
+test('gateway legacy completion verifies before first write and conservatively holds an unhonorable RESUME', async () => {
+  const authoredText = 'I am blocked on missing credentials, so I cannot complete this task.';
+  const judge = gatewayTerminalJudge({
+    verb: 'resume',
+    reason: 'one account-scoped credential check could repair the result',
+    recoveryInstruction: 'Inspect the configured account credential and retry the exact read-only lookup once.',
+    askIfRepeated: 'Which account should I use to finish the requested lookup?',
+  });
+  let respondCalls = 0;
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => {
+      respondCalls += 1;
+      return { text: authoredText, sessionId: req.sessionId };
+    },
+  } as never, { terminalDeliveryJudgePort: judge.port });
+  const request = {
+    message: 'Pull the account data and finish the report.',
+    sessionId: 'sess-gateway-legacy-resume-hold',
+    channel: 'mobile',
+    source: 'mobile' as const,
+    runId: 'run-gateway-legacy-resume-hold',
+  };
+
+  const first = await gateway.handleMessage(request);
+  const replay = await gateway.handleMessage(request);
+
+  assert.equal(first.text, authoredText, 'the shared hold keeps an already-authored blocker account');
+  assert.equal(first.stoppedReason, 'error');
+  assert.equal(replay.text, authoredText);
+  assert.equal(respondCalls, 1, 'durable replay must not run the legacy responder again');
+  assert.equal(judge.runCalls(), 1, 'durable replay must not judge the same source again');
+  assert.deepEqual(judge.request()?.tools, []);
+  assert.equal(judge.request()?.maxTurns, 1);
+  const terminals = listEvents(request.sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  const presentation = presentationEventFromCompletionData(terminals[0].data);
+  assert.equal(presentation?.status, 'blocked');
+  assert.equal(presentation?.kind, 'blocked');
+  assert.equal(presentation?.text, authoredText);
+  assert.equal(terminals[0].data.terminalJudgeDisposition, 'resume');
+  assert.equal(terminals[0].data.terminalJudgeFamily, 'claude');
+  assert.equal(terminals[0].data.terminalJudgeResumeCount, 0,
+    'a RESUME the legacy carrier cannot honor must not consume a strike');
+  assert.equal(getRun(request.runId)?.status, 'failed');
+});
+
+test('gateway legacy completion publishes a different-family ASK as the only terminal', async () => {
+  const authoredText = 'I am blocked on missing credentials, so I cannot complete this task.';
+  const publicQuestion = 'Which account should I use to access the requested records?';
+  const judge = gatewayTerminalJudge({
+    verb: 'ask',
+    reason: 'the account choice belongs to the user',
+    publicText: publicQuestion,
+  });
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => ({ text: authoredText, sessionId: req.sessionId }),
+  } as never, { terminalDeliveryJudgePort: judge.port });
+
+  const response = await gateway.handleMessage({
+    message: 'Pull the account data and finish the report.',
+    sessionId: 'sess-gateway-legacy-judge-ask',
+    channel: 'mobile',
+    source: 'mobile',
+    runId: 'run-gateway-legacy-judge-ask',
+  });
+
+  assert.equal(response.text, publicQuestion);
+  const [terminal] = listEvents(response.sessionId, { types: ['conversation_completed'] });
+  const presentation = presentationEventFromCompletionData(terminal.data);
+  assert.equal(presentation?.status, 'needs_input');
+  assert.equal(presentation?.kind, 'question');
+  assert.equal(presentation?.needs?.kind, 'input');
+  assert.equal(presentation?.text, publicQuestion);
+  assert.equal(terminal.data.reason, 'awaiting_user_input');
+  assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
+  assert.equal(getRun('run-gateway-legacy-judge-ask')?.status, 'awaiting_input');
+});
+
+test('gateway legacy completion sends a different-family DELIVER through the shared concern rule', async () => {
+  const authoredText = 'I am blocked on missing credentials, so I cannot complete this task.';
+  const publicAnswer = 'I could not access the account records, so no report was created.';
+  const judge = gatewayTerminalJudge({
+    verb: 'deliver',
+    reason: 'the truthful access failure is the complete result available to report',
+    publicText: publicAnswer,
+  });
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => ({ text: authoredText, sessionId: req.sessionId }),
+  } as never, { terminalDeliveryJudgePort: judge.port });
+
+  const response = await gateway.handleMessage({
+    message: 'Pull the account data and finish the report.',
+    sessionId: 'sess-gateway-legacy-judge-deliver',
+    channel: 'mobile',
+    source: 'mobile',
+    runId: 'run-gateway-legacy-judge-deliver',
+  });
+
+  assert.equal(response.text, publicAnswer);
+  const [terminal] = listEvents(response.sessionId, { types: ['conversation_completed'] });
+  const presentation = presentationEventFromCompletionData(terminal.data);
+  assert.equal(presentation?.status, 'done');
+  assert.equal(presentation?.kind, 'answer');
+  assert.equal(presentation?.text, publicAnswer, 'no committer-authored caveat is added to judge-authored disclosure');
+  assert.equal(terminal.data.terminalJudgeDisposition, 'deliver');
+  assert.equal(terminal.data.deliveryDisclosure, 'unverified_completion');
+  assert.equal(getRun('run-gateway-legacy-judge-deliver')?.status, 'completed');
+});
+
+test('gateway legacy completion keeps the shared conservative hold when the judge is unavailable', async () => {
+  const authoredText = 'I am blocked on missing credentials, so I cannot complete this task.';
+  const judge = gatewayTerminalJudge(null, new Error('judge provider unavailable'));
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => ({ text: authoredText, sessionId: req.sessionId }),
+  } as never, { terminalDeliveryJudgePort: judge.port });
+
+  const response = await gateway.handleMessage({
+    message: 'Pull the account data and finish the report.',
+    sessionId: 'sess-gateway-legacy-judge-outage',
+    channel: 'mobile',
+    source: 'mobile',
+    runId: 'run-gateway-legacy-judge-outage',
+  });
+
+  assert.equal(judge.runCalls(), 1);
+  assert.equal(response.text, authoredText, 'judge outage must not manufacture replacement user text');
+  const [terminal] = listEvents(response.sessionId, { types: ['conversation_completed'] });
+  const presentation = presentationEventFromCompletionData(terminal.data);
+  assert.equal(presentation?.status, 'blocked');
+  assert.equal(presentation?.text, authoredText);
+  assert.equal(terminal.data.terminalJudgeDisposition, undefined);
+});
+
+test('gateway preserves an already-committed bridge terminal without legacy re-judging', async () => {
+  const judge = gatewayTerminalJudge({
+    verb: 'ask',
+    reason: 'must not run for an existing bridge winner',
+    publicText: 'must not surface',
+  });
+  const durableText = 'The harness already committed this verified answer.';
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string; sourceUserSeq?: number }) => {
+      const source = listEvents(req.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === req.sourceUserSeq);
+      assert.ok(source);
+      commitAnswerForSource(source, durableText);
+      return {
+        text: 'I am blocked on a replaceable raw response.',
+        sessionId: req.sessionId,
+      };
+    },
+  } as never, { terminalDeliveryJudgePort: judge.port });
+
+  const response = await gateway.handleMessage({
+    message: 'Return the verified answer.',
+    sessionId: 'sess-gateway-existing-bridge-terminal',
+    channel: 'mobile',
+    source: 'mobile',
+    runId: 'run-gateway-existing-bridge-terminal',
+  });
+
+  assert.equal(response.text, durableText);
+  assert.equal(judge.runCalls(), 0, 'an existing typed terminal bypasses the legacy review lane');
+  assert.equal(getRun('run-gateway-existing-bridge-terminal')?.status, 'completed');
+  const terminals = listEvents(response.sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal(presentationEventFromCompletionData(terminals[0].data)?.text, durableText);
 });
 
 test('gateway keeps verified workflow dispatch nonterminal across replay until the real result wins', async () => {

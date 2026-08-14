@@ -88,12 +88,21 @@ import {
   publicAsyncWorkDispatchedData,
   publicReplyText,
 } from './public-presentation.js';
-import { commitTurnOutcome } from './delivery-committer.js';
+import {
+  assessAcceptedSourceDelivery,
+  commitTurnOutcome,
+  deliveryMustHoldForHuman,
+} from './delivery-committer.js';
 import {
   repairActionTerminalBeforeCommit,
+  repairTerminalPresentation,
   type TerminalPresentationRepairPort,
 } from './terminal-presentation-repair.js';
 import { createAgentsTerminalPresentationRepairPort } from './terminal-presentation-repair-port.js';
+import {
+  evaluateTerminalDelivery,
+  type TerminalDeliveryJudgePort,
+} from './terminal-delivery-judge.js';
 import {
   turnOutcomeId,
   type PresentationEvent,
@@ -640,6 +649,7 @@ function reduceStandardConversationTerminal(input: {
 
   let outcome: TurnOutcome;
   let legacyReason: string;
+  let reducedStatus = result.status;
   let transferredToTaskId: string | undefined;
   switch (result.status) {
     case 'dispatched':
@@ -652,15 +662,33 @@ function reduceStandardConversationTerminal(input: {
       if (!text) {
         try { text = synthesizeTurnReport(result.sessionId, sourceUserSeq) ?? ''; } catch { text = ''; }
       }
-      outcome = {
-        version: 2,
-        id: turnOutcomeId(identity),
-        identity,
-        status: 'done',
-        resumable: false,
-        presentation: { kind: 'answer', text: text || MISSING_REPLY_USER_FALLBACK },
-      };
-      legacyReason = 'success';
+      if (text) {
+        outcome = {
+          version: 2,
+          id: turnOutcomeId(identity),
+          identity,
+          status: 'done',
+          resumable: false,
+          presentation: { kind: 'answer', text },
+        };
+        legacyReason = 'success';
+      } else {
+        // A provider completion with neither authored text nor a durable work
+        // report is a failed model reply, not a successful user outcome. Keep
+        // the one permitted deterministic floor, but publish it as a genuine
+        // question so this carrier can never first-write a false `done`.
+        outcome = {
+          version: 2,
+          id: turnOutcomeId(identity),
+          identity,
+          status: 'needs_input',
+          resumable: true,
+          needs: { kind: 'input' },
+          presentation: { kind: 'question', text: MISSING_REPLY_USER_FALLBACK },
+        };
+        legacyReason = 'awaiting_user_input';
+        reducedStatus = 'awaiting_user_input';
+      }
       break;
     }
     case 'awaiting_approval': {
@@ -776,8 +804,10 @@ function reduceStandardConversationTerminal(input: {
       ...(transferredToTaskId ? { transferredToTaskId } : {}),
     },
   });
-  return { ...result, publicPresentation: committed.presentation };
+  return { ...result, status: reducedStatus, publicPresentation: committed.presentation };
 }
+
+export const _testOnly_reduceStandardConversationTerminal = reduceStandardConversationTerminal;
 
 function commitStandardNeedsInputTerminal(input: {
   sessionId: string;
@@ -954,23 +984,38 @@ function finalizeStandardConversation(input: {
   eventData: Record<string, unknown>;
   result: RunConversationResult;
   verifiedReadCompletionReceipt?: ExactVerifiedReadCompletionCertificate;
+  /** The reply is already the model's own account of an unverified gap, so the
+   * publish gate must not staple a generic sentence on top of it. */
+  presentationAlreadyDiscloses?: boolean;
+  /** A completed upstream verifier found a gap. Keep the candidate as `done`
+   * and let the shared committer decide disclosure versus human hold. */
+  deliveryConcern?: { reason: string; missing?: readonly string[] };
+  /** A different-family terminal judge explicitly chose truthful delivery.
+   * The committer still enforces the deterministic irreversible-effect floor. */
+  terminalJudgeDisposition?: 'deliver';
+  /** The reconciliation branch already resolved its pending-artifact
+   * disposition through the terminal judge/repair path. Its legacy typed park
+   * is retained only when that repair itself fell back. */
+  skipPendingArtifactPark?: boolean;
 }): RunConversationResult {
   const summary = typeof input.eventData.summary === 'string'
     ? input.eventData.summary
     : 'The requested work is complete.';
-  const parked = parkForPendingStandardArtifacts({
-    sessionId: input.sessionId,
-    sourceUserSeq: input.sourceUserSeq,
-    turn: input.turn,
-    steps: input.result.steps,
-    summary,
-    internalSummary: typeof input.eventData.internalSummary === 'string'
-      ? input.eventData.internalSummary
-      : null,
-    reply: typeof input.eventData.reply === 'string' ? input.eventData.reply : null,
-    lastDecision: input.result.lastDecision,
-    lastTurn: input.result.lastTurn,
-  });
+  const parked = input.skipPendingArtifactPark
+    ? null
+    : parkForPendingStandardArtifacts({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        turn: input.turn,
+        steps: input.result.steps,
+        summary,
+        internalSummary: typeof input.eventData.internalSummary === 'string'
+          ? input.eventData.internalSummary
+          : null,
+        reply: typeof input.eventData.reply === 'string' ? input.eventData.reply : null,
+        lastDecision: input.result.lastDecision,
+        lastTurn: input.result.lastTurn,
+      });
   if (parked) return parked;
   const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
   const dataOut: Record<string, unknown> = {
@@ -1032,9 +1077,22 @@ function finalizeStandardConversation(input: {
     presentation: { kind: 'answer', text },
   }, {
     ...(legacyReason ? { legacyReason } : {}),
+    ...(input.presentationAlreadyDiscloses ? { presentationAlreadyDiscloses: true } : {}),
+    ...(input.deliveryConcern ? { deliveryConcern: input.deliveryConcern } : {}),
+    ...(input.terminalJudgeDisposition ? { terminalJudgeDisposition: input.terminalJudgeDisposition } : {}),
     metadata: dataOut,
   });
-  return { ...input.result, publicPresentation: committed.presentation };
+  return {
+    ...input.result,
+    // The durable terminal—not the lane's pre-commit proposal—is public
+    // authority. In particular, a disclosed `done` can be sent back to the
+    // hold when the accepted-task state machine refuses to close authority
+    // that never entered manifested verification.
+    ...(committed.presentation.status === 'blocked'
+      ? { status: 'awaiting_user_input' as const }
+      : {}),
+    publicPresentation: committed.presentation,
+  };
 }
 
 /** Pair an ordinary awaiting-user result with durable artifact lineage when
@@ -1181,6 +1239,21 @@ function freshExternalWriteGapReason(status: Exclude<FreshExternalWriteEvidenceS
   return 'there is no external-write receipt after the user event that owns this request; historical execution summaries and receipts do not count';
 }
 
+function combineTerminalDeliveryConcerns(
+  ...concerns: Array<{ reason: string; missing?: readonly string[] } | null | undefined>
+): { reason: string; missing?: readonly string[] } | undefined {
+  const reasons = [...new Set(concerns
+    .map((concern) => concern?.reason.replace(/\s+/g, ' ').trim())
+    .filter((reason): reason is string => Boolean(reason)))];
+  const missing = [...new Set(concerns.flatMap((concern) => concern?.missing ?? []))]
+    .slice(0, 16);
+  if (reasons.length === 0 && missing.length === 0) return undefined;
+  return {
+    reason: reasons.join('; ').slice(0, 1_200),
+    ...(missing.length > 0 ? { missing } : {}),
+  };
+}
+
 interface SelfReconciliationArtifactRequirement {
   id: string;
   slotKey: string;
@@ -1193,6 +1266,7 @@ interface EffectArtifactSelfReconciliation {
   originalDecision: OrchestratorDecisionShape;
   originTurn: number;
   objective: string;
+  deliveryConcern?: { reason: string; missing?: readonly string[] };
   artifactRequirements: SelfReconciliationArtifactRequirement[];
   ambiguousExternalWrite: boolean;
   externalWriteRequiredByObjective: boolean;
@@ -1203,7 +1277,6 @@ interface EffectArtifactSelfReconciliation {
 interface SelfReconciliationAssessment {
   status: 'settled' | 'ambiguous' | 'failed';
   reason: string;
-  publicText: string;
   externalWriteStatus?: FreshExternalWriteEvidenceStatus;
 }
 
@@ -1225,7 +1298,6 @@ function assessEffectArtifactSelfReconciliation(input: {
       return {
         status: 'failed',
         reason: 'artifact_reconciliation_has_no_bound_result',
-        publicText: 'I could not confirm the artifact after read-only reconciliation. The original create claim is no longer enough to prove a deliverable exists, and no bound replacement is recorded, so I cannot call this complete.',
       };
     }
     for (const required of input.recovery.artifactRequirements) {
@@ -1243,13 +1315,11 @@ function assessEffectArtifactSelfReconciliation(input: {
         return {
           status: 'ambiguous',
           reason: 'artifact_reconciliation_remains_unresolved',
-          publicText: 'I cannot honestly confirm it was created yet — the attempt is still unresolved, and I did not create a duplicate. Say "check it" and I\'ll look at what actually happened, or if you can see it on your side, tell me and I\'ll continue from there.',
         };
       }
       return {
         status: 'failed',
         reason: 'artifact_reconciliation_found_no_deliverable',
-        publicText: 'I could not confirm the artifact after read-only reconciliation. No bound artifact or verified replacement is recorded, so the original success answer cannot be published as complete.',
       };
     }
   }
@@ -1268,7 +1338,6 @@ function assessEffectArtifactSelfReconciliation(input: {
       return {
         status: 'ambiguous',
         reason: 'external_write_reconciliation_remains_ambiguous',
-        publicText: 'I cannot honestly confirm that change went through — I checked without re-sending it, and the result is still unclear. I did not do it twice. Say "check it" and I\'ll verify what actually happened, or if you can see the result on your side, tell me and I\'ll continue from there.',
         externalWriteStatus,
       };
   }
@@ -1276,7 +1345,6 @@ function assessEffectArtifactSelfReconciliation(input: {
     return {
       status: 'failed',
       reason: 'external_write_reconciliation_proved_incomplete',
-      publicText: 'The reconciliation did not confirm the requested external write. It is recorded as absent or failed, so the original success answer cannot be published as complete.',
       externalWriteStatus,
     };
   }
@@ -1285,13 +1353,11 @@ function assessEffectArtifactSelfReconciliation(input: {
     return {
       status: 'failed',
       reason: 'reconciliation_has_no_safe_public_candidate',
-      publicText: 'The uncertainty was reconciled, but the original turn did not produce a safe user-facing answer. I will not expose the internal recovery response as the result.',
     };
   }
   return {
     status: 'settled',
     reason: 'effect_artifact_reconciliation_settled',
-    publicText: input.recovery.publicText,
     ...(input.recovery.ambiguousExternalWrite || externalWriteStatus !== 'missing'
       ? { externalWriteStatus }
       : {}),
@@ -2154,6 +2220,8 @@ export interface RunConversationOptions {
   /** Test injection for the one sealed text-only presentation repair. Live
    * callers omit this and reuse the active brain model with no tools/history. */
   terminalPresentationRepairPort?: TerminalPresentationRepairPort;
+  /** Test seam for the different-family terminal RESUME/ASK/DELIVER judge. */
+  terminalDeliveryJudgePort?: TerminalDeliveryJudgePort;
   /** @deprecated Raw executor deltas are private. Retained temporarily for API
    * compatibility; terminal delivery occurs through committed public events. */
   onChunk?: (delta: string) => void | Promise<void>;
@@ -3984,6 +4052,18 @@ async function runConversationCore(
   // of how the request was phrased.
   const OBJECTIVE_JUDGE_WORK_THRESHOLD = 3;
   let objectiveJudgeContinuations = 0;
+  // The terminal judge may reopen the live loop once. A second consecutive
+  // RESUME verdict becomes ASK inside evaluateTerminalDelivery, so this edge
+  // cannot grow a new unbounded completion loop.
+  let terminalJudgeConsecutiveResumes: 0 | 1 = 0;
+  // A self-reconciliation RESUME deliberately clears its private-control
+  // marker before reopening the ordinary authored loop. Keep the exact judged
+  // gap alongside the strike so that recovery cannot make the second terminal
+  // decision disappear merely by leaving the private reconciliation branch.
+  let terminalJudgeResumedConcern: {
+    reason: string;
+    missing?: readonly string[];
+  } | undefined;
   let claimGroundingNudged = false;
   let selfResolveNudged = false;
   // Set only by the effect/artifact self-resolve node. The next model turn is
@@ -4318,9 +4398,14 @@ async function runConversationCore(
     // protocol (`done=true / nextAction=...`) can never replace the answer.
     if (turnResult.status === 'completed' && effectArtifactSelfReconciliation) {
       const recovery = effectArtifactSelfReconciliation;
+      if (!Number.isSafeInteger(activeSourceUserSeq) || (activeSourceUserSeq ?? 0) <= 0) {
+        throw new Error('self-reconciliation terminal requires an exact accepted source');
+      }
+      const sourceUserSeq = activeSourceUserSeq as number;
+      const authoredText = recovery.publicText ?? '';
       const assessment = assessEffectArtifactSelfReconciliation({
         sessionId: options.sessionId,
-        sourceUserSeq: activeSourceUserSeq,
+        sourceUserSeq,
         recovery,
       });
       if (assessment.status !== 'settled') {
@@ -4338,53 +4423,14 @@ async function runConversationCore(
             externalWriteStatus: assessment.externalWriteStatus ?? null,
           },
         });
-        // Keep the established artifact retry contract: an exact unresolved
-        // create parks as needs-input with its artifact IDs/options. External
-        // write ambiguity has no equivalent safe retry, so it stays blocked.
-        if (assessment.reason === 'artifact_reconciliation_remains_unresolved') {
-          const parked = parkForPendingStandardArtifacts({
-            sessionId: options.sessionId,
-            sourceUserSeq: activeSourceUserSeq,
-            turn: turnResult.turn,
-            steps: stepIndex,
-            summary: assessment.publicText,
-            internalSummary: recovery.originalDecision.summary,
-            reply: recovery.publicText,
-            lastDecision: recovery.originalDecision,
-            lastTurn,
-          });
-          if (parked) return parked;
-        }
-        const artifactState = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
-        const publicPresentation = commitStandardBlockedTerminal({
-          sessionId: options.sessionId,
-          sourceUserSeq: activeSourceUserSeq,
-          turn: turnResult.turn,
-          text: assessment.publicText,
-          legacyReason: 'blocked',
-          metadata: {
-            steps: stepIndex,
-            blockedReason: assessment.reason,
-            reconciliationOriginTurn: recovery.originTurn,
-            reconciliationStatus: assessment.status,
-            ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
-          },
-        });
-        return {
-          sessionId: options.sessionId,
-          status: 'awaiting_user_input',
-          steps: stepIndex,
-          lastDecision: recovery.originalDecision,
-          lastTurn,
-          publicPresentation,
-        };
       }
 
       const deliveryGateRan = verifyDeliveredEnabled()
+        && assessment.status === 'settled'
         && !recovery.skipDeliveryGate
         && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn);
       const delivery: DeliveryVerdict = deliveryGateRan
-        ? await verifyDelivered(recovery.objective, assessment.publicText, {
+        ? await verifyDelivered(recovery.objective, authoredText, {
           judgeFn: recovery.completionVerdict
             ? async () => recovery.completionVerdict as ObjectiveJudgeVerdict
             : objectiveJudge,
@@ -4401,42 +4447,230 @@ async function runConversationCore(
         });
       }
       if (delivery.verification) completionVerification = delivery.verification;
-      if (!delivery.delivered) {
-        const artifactState = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
-        const publicPresentation = commitStandardBlockedTerminal({
+
+      let reconciliationConcern = combineTerminalDeliveryConcerns(
+        recovery.deliveryConcern,
+        assessment.status !== 'settled'
+          ? { reason: assessment.reason, missing: [assessment.reason] }
+          : undefined,
+        !delivery.delivered
+          ? {
+              reason: delivery.reason ?? 'saved public candidate did not pass completion verification',
+              ...(delivery.blockerType ? { missing: [delivery.blockerType] } : {}),
+            }
+          : undefined,
+      );
+      const terminalAssessment = assessAcceptedSourceDelivery({
+        sessionId: options.sessionId,
+        sourceUserSeq,
+        proposedReply: authoredText,
+        deliveryConcern: reconciliationConcern,
+      });
+      reconciliationConcern = combineTerminalDeliveryConcerns(
+        reconciliationConcern,
+        terminalAssessment.deliveryGap
+          ? {
+              reason: terminalAssessment.deliveryGap.reason ?? 'terminal evidence is incomplete',
+              ...(terminalAssessment.deliveryGap.missing?.length
+                ? { missing: terminalAssessment.deliveryGap.missing }
+                : {}),
+            }
+          : undefined,
+      );
+
+      if (terminalAssessment.deliveryGap && reconciliationConcern) {
+        const terminalDecision = await evaluateTerminalDelivery({
+          objective: recovery.objective,
+          authoredText,
+          deliveryConcern: reconciliationConcern,
+          settlementAudit: terminalAssessment.settlementAudit,
+          priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+        }, {
+          ...(options.terminalDeliveryJudgePort
+            ? { port: options.terminalDeliveryJudgePort }
+            : {}),
+        });
+
+        if (terminalDecision.status === 'decided') {
+          const terminalJudgeMetadata = {
+            terminalJudgeDisposition: terminalDecision.verb,
+            terminalJudgeReason: terminalDecision.reason,
+            terminalJudgeFamily: terminalDecision.judge.judgeFamily,
+            terminalJudgeResumeCount: terminalDecision.consecutiveResumeCount,
+          };
+          if (terminalDecision.verb === 'resume') {
+            terminalJudgeConsecutiveResumes = 1;
+            terminalJudgeResumedConcern = reconciliationConcern;
+            // The next turn is an ordinary authored recovery turn. Keeping the
+            // reconciliation marker would discard its answer as private control
+            // output and re-run this same assessment instead of honoring RESUME.
+            effectArtifactSelfReconciliation = null;
+            lastDecision = recovery.originalDecision;
+            safeAppend({
+              sessionId: options.sessionId,
+              turn: turnResult.turn,
+              role: 'system',
+              type: 'heartbeat',
+              data: {
+                kind: 'terminal_delivery_resume',
+                reason: terminalDecision.reason,
+                attempt: terminalDecision.consecutiveResumeCount,
+                path: 'self_reconciliation',
+              },
+            });
+            nextInput = [
+              'TERMINAL DELIVERY RESUME — an independent different-family judge found one gap you can close now.',
+              `Recovery instruction: ${terminalDecision.recoveryInstruction}`,
+              `ORIGINAL USER OBJECTIVE (immutable): ${recovery.objective.slice(0, 4000)}`,
+              'Continue within the original authority. Do not repeat an irreversible action or widen the task. Return a newly authored final answer when the gap is resolved; if it cannot be resolved, state the exact blocker.',
+            ].join('\n');
+            continue;
+          }
+
+          terminalJudgeConsecutiveResumes = 0;
+          if (terminalDecision.verb === 'ask') {
+            const askedThisTurn = listEvents(options.sessionId, { types: ['awaiting_user_input'] })
+              .some((event) => event.turn === turnResult.turn);
+            if (!askedThisTurn) {
+              safeAppend({
+                sessionId: options.sessionId,
+                turn: turnResult.turn,
+                role: 'Clem',
+                type: 'awaiting_user_input',
+                data: {
+                  question: terminalDecision.publicText,
+                  source: 'terminal_delivery_judge',
+                  sourceUserSeq,
+                },
+              });
+            }
+            const publicPresentation = commitStandardNeedsInputTerminal({
+              sessionId: options.sessionId,
+              sourceUserSeq,
+              turn: turnResult.turn,
+              text: terminalDecision.publicText,
+              legacyReason: 'awaiting_user_input',
+              metadata: { steps: stepIndex, ...terminalJudgeMetadata },
+            });
+            return {
+              sessionId: options.sessionId,
+              status: 'awaiting_user_input',
+              steps: stepIndex,
+              lastDecision: recovery.originalDecision,
+              lastTurn,
+              publicPresentation,
+            };
+          }
+
+          return finalizeStandardConversation({
+            sessionId: options.sessionId,
+            sourceUserSeq,
+            turn: turnResult.turn,
+            eventData: {
+              steps: stepIndex,
+              reason: 'blocked',
+              summary: terminalDecision.publicText,
+              reply: terminalDecision.publicText,
+              internalSummary: recovery.originalDecision.summary,
+              internalReply: recovery.originalDecision.reply ?? null,
+              reconciliationOriginTurn: recovery.originTurn,
+              reconciliationStatus: assessment.status,
+              ...(completionVerification ? { verification: completionVerification } : {}),
+              ...terminalJudgeMetadata,
+            },
+            result: {
+              sessionId: options.sessionId,
+              status: 'completed',
+              steps: stepIndex,
+              lastDecision: recovery.originalDecision,
+              lastTurn,
+            },
+            presentationAlreadyDiscloses: true,
+            deliveryConcern: reconciliationConcern,
+            terminalJudgeDisposition: 'deliver',
+            skipPendingArtifactPark: true,
+          });
+        }
+
+        // Judge outage/off-contract output keeps the old conservative policy,
+        // but the harness still does not speak for Clementine. Spend the one
+        // sealed text-only repair grant; only its failure floor may be canned.
+        const activeModel = (currentAgent as unknown as { model?: string | Model } | undefined)?.model
+          ?? MODELS.primary;
+        const repairMissing = reconciliationConcern.missing?.length
+          ? reconciliationConcern.missing
+          : [assessment.status !== 'settled' ? assessment.reason : 'verification_unavailable'];
+        const repaired = await repairTerminalPresentation({
           sessionId: options.sessionId,
-          sourceUserSeq: activeSourceUserSeq,
-          turn: turnResult.turn,
-          text: assessment.publicText,
-          legacyReason: 'blocked',
-          metadata: {
+          sourceUserSeq,
+          proposedReply: authoredText,
+          missing: repairMissing,
+          port: options.terminalPresentationRepairPort
+            ?? createAgentsTerminalPresentationRepairPort({ model: activeModel }),
+        });
+        if (
+          repaired.status === 'blocked_fallback'
+          && assessment.reason === 'artifact_reconciliation_remains_unresolved'
+        ) {
+          // This is a genuine typed verification choice, retained only after
+          // both independent authoring calls were unavailable/unsafe.
+          const parked = parkForPendingStandardArtifacts({
+            sessionId: options.sessionId,
+            sourceUserSeq,
+            turn: turnResult.turn,
             steps: stepIndex,
-            blockedReason: delivery.reason ?? 'saved_public_candidate_not_delivered',
+            summary: repaired.text,
+            internalSummary: recovery.originalDecision.summary,
+            reply: authoredText || null,
+            lastDecision: recovery.originalDecision,
+            lastTurn,
+          });
+          if (parked) return parked;
+        }
+        return finalizeStandardConversation({
+          sessionId: options.sessionId,
+          sourceUserSeq,
+          turn: turnResult.turn,
+          eventData: {
+            steps: stepIndex,
+            reason: 'blocked',
+            summary: repaired.text,
+            reply: repaired.text,
+            internalSummary: recovery.originalDecision.summary,
+            internalReply: recovery.originalDecision.reply ?? null,
             reconciliationOriginTurn: recovery.originTurn,
             reconciliationStatus: assessment.status,
             ...(completionVerification ? { verification: completionVerification } : {}),
-            ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
+            terminalRepairStatus: repaired.status,
+            ...('grantId' in repaired && repaired.grantId
+              ? { terminalRepairGrantId: repaired.grantId }
+              : {}),
+            terminalMissing: repairMissing,
           },
+          result: {
+            sessionId: options.sessionId,
+            status: 'completed',
+            steps: stepIndex,
+            lastDecision: recovery.originalDecision,
+            lastTurn,
+          },
+          ...(repaired.status !== 'unchanged'
+            ? { presentationAlreadyDiscloses: true }
+            : {}),
+          deliveryConcern: reconciliationConcern,
+          skipPendingArtifactPark: true,
         });
-        return {
-          sessionId: options.sessionId,
-          status: 'awaiting_user_input',
-          steps: stepIndex,
-          lastDecision: recovery.originalDecision,
-          lastTurn,
-          publicPresentation,
-        };
       }
 
       return finalizeStandardConversation({
         sessionId: options.sessionId,
-        sourceUserSeq: activeSourceUserSeq,
+        sourceUserSeq,
         turn: turnResult.turn,
         eventData: {
           steps: stepIndex,
           reason: 'effect_artifact_reconciled',
-          summary: assessment.publicText,
-          reply: assessment.publicText,
+          summary: authoredText,
+          reply: authoredText,
           internalSummary: recovery.originalDecision.summary,
           internalReply: recovery.originalDecision.reply ?? null,
           delivered: true,
@@ -5377,7 +5611,7 @@ async function runConversationCore(
       // the generic transcript judge for these sessions (never both). Bounded
       // by the goal's persistent attempt budget; a dead judge resolves
       // not-satisfied + escalates (it can never auto-satisfy a goal).
-      let goalUnmetNote = '';
+      let goalUnmetConcern: { reason: string; missing?: readonly string[] } | undefined;
       // True when THIS turn's goal CONTRACT validated 'satisfied'. The honest-
       // completion verifyDelivered gate below must NOT override a contract-verified
       // completion just because the final reply is promise-shaped — the goal
@@ -5655,9 +5889,15 @@ async function runConversationCore(
           ].join('\n');
           continue;
         } else {
-          goalUnmetNote = validation.judgeFailedOpen
-            ? 'Note: the pinned goal could not be validated (completion judge unavailable). The goal stays pinned — say "continue" to retry, or /goal cancel to drop it.'
-            : `Note: the pinned goal still has unmet criteria after ${attempt}/${maxAttempts} validation attempts: ${failures.slice(0, 3).map((f) => f.criterion).join('; ')}. The goal stays pinned — say "continue" to keep working, or /goal cancel to drop it.`;
+          goalUnmetConcern = validation.judgeFailedOpen
+            ? {
+                reason: 'the pinned goal could not be validated because its completion judge was unavailable',
+                missing: ['pinned_goal_validation_unavailable'],
+              }
+            : {
+                reason: `the pinned goal still has unmet criteria after ${attempt}/${maxAttempts} validation attempts`,
+                missing: failures.slice(0, 8).map((failure) => failure.criterion),
+              };
         }
       // Independent completion gate (Hermes-style): the model just declared
       // itself done. For a multi-step action objective, verify with an
@@ -5941,7 +6181,7 @@ async function runConversationCore(
       // failure bump is committed only when the bounce is actually surfaced
       // (a bounce verdict discarded by an earlier judge `continue` never leaks
       // a count — same integrity contract as the brackets pre-write gates).
-      let outputGroundingNote = '';
+      let outputGroundingConcern: { reason: string; missing?: readonly string[] } | undefined;
       if (eagerOutputGroundingPromise) {
         try {
           {
@@ -5958,11 +6198,12 @@ async function runConversationCore(
               nextInput = buildOutputGroundingChatRetry(og);
               continue;
             } else if (og.action === 'advisory') {
-              // FLOOR disclosure (allowed template class): fires only for figures
-              // traceable to NEITHER this session's tool results NOR consolidated
-              // memory — genuinely unverifiable, so honest uncertainty is owed.
-              const figs = og.figures.slice(0, 4).join(', ');
-              outputGroundingNote = `Heads up: I couldn't trace ${figs} back to anything I've pulled or remember, so treat ${og.figures.length > 1 ? 'those numbers' : 'that number'} as unverified.`;
+              // Keep this as durable DATA. A terminal judge—not the harness—
+              // decides whether to recover, ask, or author a qualified answer.
+              outputGroundingConcern = {
+                reason: og.reason || 'one or more numeric claims are not grounded in observed sources',
+                missing: og.figures.slice(0, 8).map((figure) => `unverified figure: ${figure}`),
+              };
               try {
                 safeAppend({
                   sessionId: options.sessionId, turn: turnResult.turn, role: 'system', type: 'output_grounding_judged',
@@ -6041,16 +6282,16 @@ async function runConversationCore(
           if (!publicCandidate) {
             try { publicCandidate = synthesizeTurnReport(options.sessionId, activeSourceUserSeq) ?? ''; } catch { publicCandidate = ''; }
           }
-          const candidateNotes = [goalUnmetNote, outputGroundingNote]
-            .filter((note) => note && note.trim());
-          if (publicCandidate && candidateNotes.length > 0) {
-            publicCandidate = `${publicCandidate}\n\n${candidateNotes.join('\n\n')}`;
-          }
+          const carriedDeliveryConcern = combineTerminalDeliveryConcerns(
+            goalUnmetConcern,
+            outputGroundingConcern,
+          );
           effectArtifactSelfReconciliation = {
             publicText: publicCandidate || null,
             originalDecision: { ...decision },
             originTurn: turnResult.turn,
             objective,
+            ...(carriedDeliveryConcern ? { deliveryConcern: carriedDeliveryConcern } : {}),
             artifactRequirements: selfResolve.artifactRequirements,
             ambiguousExternalWrite: selfResolve.ambiguousExternalWrite,
             externalWriteRequiredByObjective: freshExternalWriteRequirement({
@@ -6145,11 +6386,16 @@ async function runConversationCore(
           : isCompletedAction
             ? MISSING_REPLY_USER_FALLBACK
             : decision.summary;
-      // Goal contract: criteria still unmet after the attempt budget — the
-      // user must SEE that, never a silent clean-looking completion. The
-      // output-grounding advisory (an unverifiable figure) rides the same rail.
-      const completionNotes = [goalUnmetNote, outputGroundingNote].filter((n) => n && n.trim());
-      let userVisibleSummary = completionNotes.length ? `${baseSummary}\n\n${completionNotes.join('\n\n')}` : baseSummary;
+      let userVisibleSummary = baseSummary;
+      /** The reply is already the model's own account of an unverified gap. */
+      let terminalRepairAlreadyDiscloses = false;
+      /** An upstream completion verifier found a gap. It remains a completion
+       * candidate until the one shared delivery rule labels or holds it. */
+      let terminalDeliveryConcern = combineTerminalDeliveryConcerns(
+        goalUnmetConcern,
+        outputGroundingConcern,
+        terminalJudgeResumedConcern,
+      );
       const terminalExternalWriteRequired = objectiveJudgeOptIn
         && freshExternalWriteRequirement({
           objectiveText: objective,
@@ -6175,11 +6421,10 @@ async function runConversationCore(
           )
         : '';
       if (terminalFreshWriteGap) {
-        userVisibleSummary = terminalExternalWriteStatus === 'ambiguous'
-          ? 'I cannot honestly confirm this change went through — the outcome is still ambiguous, and I did not run it twice or count an older receipt as proof. Say "check it" and I\'ll verify the live state before calling this complete.'
-          : terminalExternalWriteStatus === 'failed'
-            ? 'At least one external write required by this request was recorded as failed, so I cannot call the task complete or substitute another action’s receipt. That exact failure needs to be resolved before any full-success claim.'
-            : 'I cannot honestly confirm the work went out for this request — I have no receipt of it landing after your message, and I did not count an older one as proof. If it still needs to go out, tell me and I\'ll do it properly.';
+        // Keep the brain's authored terminal intact. The missing current-turn
+        // receipt is durable DATA for the terminal judge; replacing the reply
+        // here with one of three harness-written speeches made code speak in
+        // Clementine's voice before either RESUME/ASK/DELIVER could run.
         safeAppend({
           sessionId: options.sessionId,
           turn: turnResult.turn,
@@ -6239,80 +6484,151 @@ async function runConversationCore(
       }
       if (delivery.verification) completionVerification = delivery.verification;
       if (!delivery.delivered) {
-        const artifactState = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
-        const blockedText = terminalFreshWriteGap
-          ? userVisibleSummary
-          : hasReply
-            ? publicReplyText(decision.reply, 'I could not finish this turn safely. Please tell me how you would like to proceed.')
-            : missingReplyWorkReport
-              ? missingReplyWorkReport
-              : 'I could not finish this turn safely. Please tell me how you would like to proceed.';
-        const publicPresentation = commitStandardBlockedTerminal({
-          sessionId: options.sessionId,
-          sourceUserSeq: activeSourceUserSeq,
-          turn: turnResult.turn,
-          text: blockedText,
-          legacyReason: 'blocked',
-          metadata: {
-            steps: stepIndex,
-            missingReply: isCompletedAction && !hasReply ? true : undefined,
-            blockedReason: (delivery.reason ?? userVisibleSummary).slice(0, 400),
-            ...(completionVerification ? { verification: completionVerification } : {}),
-            ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
-          },
+        terminalDeliveryConcern = combineTerminalDeliveryConcerns(terminalDeliveryConcern, {
+          reason: (delivery.reason ?? userVisibleSummary).slice(0, 800),
+          ...(delivery.blockerType ? { missing: [delivery.blockerType] } : {}),
         });
-        const goalForBlocked = safeActiveGoal(options.sessionId);
-        if (goalForBlocked) {
-          safeAppendGoalLedger(goalForBlocked.id, 'blocked', delivery.reason ?? userVisibleSummary);
-        }
-        return {
-          sessionId: options.sessionId,
-          status: 'awaiting_user_input',
-          steps: stepIndex,
-          lastDecision: decision,
-          lastTurn,
-          publicPresentation,
-        };
       }
 
-      // Terminal truth can reject an action after its provider-authored reply
-      // says "done". Repair that presentation BEFORE the synchronous durable
-      // committer, while the task's one CAS-backed grant can still produce a
-      // natural blocked response. Direct/retrieve and verified action terminals
-      // return `unchanged` without a repair model call.
+      // One terminal policy gate. It sees the exact same durable assessment the
+      // committer will re-check at publication and chooses what happens next:
+      // RESUME reopens this live loop; ASK publishes the judge-authored question;
+      // DELIVER publishes its truthful account. A different family is mandatory.
+      // When that judge is unavailable, preserve the earlier safe repair/hold
+      // behavior byte-for-byte.
+      let terminalJudgeDisposition: 'deliver' | undefined;
+      let terminalJudgeMetadata: Record<string, unknown> = {};
       if (isCompletedAction && activeSourceUserSeq) {
-        const activeModel = (currentAgent as unknown as { model?: string | Model } | undefined)?.model
-          ?? MODELS.primary;
-        const repaired = await repairActionTerminalBeforeCommit({
+        const assessment = assessAcceptedSourceDelivery({
           sessionId: options.sessionId,
           sourceUserSeq: activeSourceUserSeq,
           proposedReply: userVisibleSummary,
-          port: options.terminalPresentationRepairPort
-            ?? createAgentsTerminalPresentationRepairPort({ model: activeModel }),
+          deliveryConcern: terminalDeliveryConcern,
         });
-        if (repaired.status !== 'unchanged') {
-          const publicPresentation = commitStandardBlockedTerminal({
-            sessionId: options.sessionId,
-            sourceUserSeq: activeSourceUserSeq,
-            turn: turnResult.turn,
-            text: repaired.text,
-            legacyReason: 'verification_required',
-            metadata: {
-              steps: stepIndex,
-              blockedReason: 'authoritative_terminal_verification_incomplete',
-              terminalRepairStatus: repaired.status,
-              terminalRepairGrantId: repaired.grantId,
-              terminalMissing: repaired.missing,
-            },
-          });
-          return {
-            sessionId: options.sessionId,
-            status: 'awaiting_user_input',
-            steps: stepIndex,
-            lastDecision: decision,
-            lastTurn,
-            publicPresentation,
+        if (assessment.deliveryGap) {
+          const concern = {
+            reason: assessment.deliveryGap.reason ?? 'terminal evidence is incomplete',
+            ...(assessment.deliveryGap.missing?.length
+              ? { missing: assessment.deliveryGap.missing }
+              : {}),
           };
+          const terminalDecision = await evaluateTerminalDelivery({
+            objective,
+            authoredText: userVisibleSummary,
+            deliveryConcern: concern,
+            settlementAudit: assessment.settlementAudit,
+            priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+          }, {
+            ...(options.terminalDeliveryJudgePort
+              ? { port: options.terminalDeliveryJudgePort }
+              : {}),
+          });
+          if (terminalDecision.status === 'decided') {
+            terminalJudgeMetadata = {
+              terminalJudgeDisposition: terminalDecision.verb,
+              terminalJudgeReason: terminalDecision.reason,
+              terminalJudgeFamily: terminalDecision.judge.judgeFamily,
+              terminalJudgeResumeCount: terminalDecision.consecutiveResumeCount,
+            };
+            if (terminalDecision.verb === 'resume') {
+              terminalJudgeConsecutiveResumes = 1;
+              safeAppend({
+                sessionId: options.sessionId,
+                turn: turnResult.turn,
+                role: 'system',
+                type: 'heartbeat',
+                data: {
+                  kind: 'terminal_delivery_resume',
+                  reason: terminalDecision.reason,
+                  attempt: terminalDecision.consecutiveResumeCount,
+                },
+              });
+              nextInput = [
+                'TERMINAL DELIVERY RESUME — an independent different-family judge found one gap you can close now.',
+                `Recovery instruction: ${terminalDecision.recoveryInstruction}`,
+                `ORIGINAL USER OBJECTIVE (immutable): ${objective.slice(0, 4000)}`,
+                'Continue within the original authority. Do not repeat an irreversible action or widen the task. Return a newly authored final answer when the gap is resolved; if it cannot be resolved, state the exact blocker.',
+              ].join('\n');
+              continue;
+            }
+            terminalJudgeConsecutiveResumes = 0;
+            if (terminalDecision.verb === 'ask') {
+              const askedThisTurn = listEvents(options.sessionId, { types: ['awaiting_user_input'] })
+                .some((event) => event.turn === turnResult.turn);
+              if (!askedThisTurn) {
+                safeAppend({
+                  sessionId: options.sessionId,
+                  turn: turnResult.turn,
+                  role: 'Clem',
+                  type: 'awaiting_user_input',
+                  data: {
+                    question: terminalDecision.publicText,
+                    source: 'terminal_delivery_judge',
+                    sourceUserSeq: activeSourceUserSeq,
+                  },
+                });
+              }
+              const publicPresentation = commitStandardNeedsInputTerminal({
+                sessionId: options.sessionId,
+                sourceUserSeq: activeSourceUserSeq,
+                turn: turnResult.turn,
+                text: terminalDecision.publicText,
+                legacyReason: 'awaiting_user_input',
+                metadata: { steps: stepIndex, ...terminalJudgeMetadata },
+              });
+              return {
+                sessionId: options.sessionId,
+                status: 'awaiting_user_input',
+                steps: stepIndex,
+                lastDecision: decision,
+                lastTurn,
+                publicPresentation,
+              };
+            }
+            userVisibleSummary = terminalDecision.publicText;
+            terminalRepairAlreadyDiscloses = true;
+            terminalJudgeDisposition = 'deliver';
+            terminalDeliveryConcern = concern;
+          } else {
+            const activeModel = (currentAgent as unknown as { model?: string | Model } | undefined)?.model
+              ?? MODELS.primary;
+            const repaired = await repairActionTerminalBeforeCommit({
+              sessionId: options.sessionId,
+              sourceUserSeq: activeSourceUserSeq,
+              proposedReply: userVisibleSummary,
+              port: options.terminalPresentationRepairPort
+                ?? createAgentsTerminalPresentationRepairPort({ model: activeModel }),
+            });
+            if (repaired.status !== 'unchanged'
+              && deliveryMustHoldForHuman(assessment.settlementAudit)) {
+              const publicPresentation = commitStandardBlockedTerminal({
+                sessionId: options.sessionId,
+                sourceUserSeq: activeSourceUserSeq,
+                turn: turnResult.turn,
+                text: repaired.text,
+                legacyReason: 'verification_required',
+                metadata: {
+                  steps: stepIndex,
+                  blockedReason: 'authoritative_terminal_verification_incomplete',
+                  terminalRepairStatus: repaired.status,
+                  terminalRepairGrantId: repaired.grantId,
+                  terminalMissing: repaired.missing,
+                },
+              });
+              return {
+                sessionId: options.sessionId,
+                status: 'awaiting_user_input',
+                steps: stepIndex,
+                lastDecision: decision,
+                lastTurn,
+                publicPresentation,
+              };
+            }
+            if (repaired.status === 'blocked_repaired') {
+              userVisibleSummary = repaired.text;
+              terminalRepairAlreadyDiscloses = true;
+            }
+          }
         }
       }
 
@@ -6385,6 +6701,11 @@ async function runConversationCore(
         turn: turnResult.turn,
         eventData: {
           steps: stepIndex,
+          ...(terminalDeliveryConcern
+            ? { reason: 'blocked' }
+            : stallJudgeDelivery
+              ? { reason: 'stall_judge_delivered' }
+              : {}),
           summary: userVisibleSummary,
           internalSummary: decision.summary,
           // Goal/output-verification notes are part of the authorized public
@@ -6397,11 +6718,11 @@ async function runConversationCore(
           delivered: true,
           ...(stallJudgeDelivery
             ? {
-                reason: 'stall_judge_delivered',
                 stallDetail: { signal: stallJudgeDelivery.signal, ...stallJudgeDelivery.detail },
               }
             : {}),
           ...(completionVerification ? { verification: completionVerification } : {}),
+          ...terminalJudgeMetadata,
         },
         result: {
           sessionId: options.sessionId,
@@ -6413,6 +6734,9 @@ async function runConversationCore(
         ...(terminalVerifiedReadReceipt
           ? { verifiedReadCompletionReceipt: terminalVerifiedReadReceipt }
           : {}),
+        ...(terminalRepairAlreadyDiscloses ? { presentationAlreadyDiscloses: true } : {}),
+        ...(terminalDeliveryConcern ? { deliveryConcern: terminalDeliveryConcern } : {}),
+        ...(terminalJudgeDisposition ? { terminalJudgeDisposition } : {}),
       });
       return finalized;
     }
@@ -8793,6 +9117,10 @@ export async function runConversationFromResume(opts: {
   runRunner?: RunRunnerFn;
   /** Test injection for promise-shaped completion verification (defaults to judgeObjectiveComplete). */
   judgeFn?: ObjectiveJudgeFn;
+  /** Test injection for the sealed terminal presentation repair. */
+  terminalPresentationRepairPort?: TerminalPresentationRepairPort;
+  /** Test injection for the different-family terminal delivery judge. */
+  terminalDeliveryJudgePort?: TerminalDeliveryJudgePort;
   /** @deprecated Raw executor deltas are private. Retained temporarily for API
    * compatibility; terminal delivery occurs through committed public events. */
   onChunk?: (delta: string) => void | Promise<void>;
@@ -8920,6 +9248,8 @@ async function runConversationFromResumeCore(opts: {
   makeRunner?: () => Runner;
   runRunner?: RunRunnerFn;
   judgeFn?: ObjectiveJudgeFn;
+  terminalPresentationRepairPort?: TerminalPresentationRepairPort;
+  terminalDeliveryJudgePort?: TerminalDeliveryJudgePort;
   onChunk?: (delta: string) => void | Promise<void>;
 }): Promise<RunConversationResult> {
   let budget = getHarnessBudgetSettings();
@@ -8964,6 +9294,7 @@ async function runConversationFromResumeCore(opts: {
   let stallRetriesUsed = 0;
   let missingReplyRetriesUsed = 0;
   let resumeContinuationInput = CONTINUATION_INPUT;
+  let terminalJudgeConsecutiveResumes: 0 | 1 = 0;
 
   // Approval resumes are a second entry into the same conversation machine,
   // so they receive the same one-way standard → long promotion as fresh
@@ -9179,7 +9510,7 @@ async function runConversationFromResumeCore(opts: {
       const resumeFloor = opts.approvalId
         ? `Your approval of ${opts.approvalId} was applied and the run continued, but I don't have a clean summary of that step. Ask "status" and I'll check the current state — no need to approve again.`
         : MISSING_REPLY_USER_FALLBACK;
-      const userVisibleSummary = hasReply
+      let userVisibleSummary = hasReply
         ? decision!.reply!
         : resumeWorkReport
           ? resumeWorkReport
@@ -9195,58 +9526,192 @@ async function runConversationFromResumeCore(opts: {
         && !dispatchedBackgroundWorkflowRun(opts.sessionId, lastTurn)
         ? await verifyDelivered(deliveryObjective, userVisibleSummary ?? '', { judgeFn: objectiveJudge })
         : { delivered: true as const, status: 'completed' as const };
-      if (!delivery.delivered) {
-        const artifactState = standardArtifactTerminalState(opts.sessionId, activeSourceUserSeq);
-        const blockedText = publicReplyText(decision?.reply, '')
-          || resumeWorkReport
-          || 'I could not finish this turn safely. Please tell me how you would like to proceed.';
-        const publicPresentation = commitStandardBlockedTerminal({
+      let resumeDeliveryConcern: { reason: string; missing?: readonly string[] } | undefined = !delivery.delivered
+        ? {
+            reason: (delivery.reason ?? userVisibleSummary ?? '').slice(0, 800),
+            ...(delivery.blockerType ? { missing: [delivery.blockerType] } : {}),
+          }
+        : undefined;
+      let terminalJudgeDisposition: 'deliver' | undefined;
+      let terminalJudgeMetadata: Record<string, unknown> = {};
+      let terminalPresentationAlreadyDiscloses = false;
+      let resumeFromTerminalJudge = false;
+      if (activeSourceUserSeq) {
+        const assessment = assessAcceptedSourceDelivery({
+          sessionId: opts.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+          proposedReply: userVisibleSummary ?? '',
+          deliveryConcern: resumeDeliveryConcern,
+        });
+        if (assessment.deliveryGap) {
+          const concern = {
+            reason: assessment.deliveryGap.reason ?? 'terminal evidence is incomplete',
+            ...(assessment.deliveryGap.missing?.length
+              ? { missing: assessment.deliveryGap.missing }
+              : {}),
+          };
+          resumeDeliveryConcern = concern;
+          const terminalDecision = await evaluateTerminalDelivery({
+            objective: deliveryObjective,
+            authoredText: userVisibleSummary ?? '',
+            deliveryConcern: concern,
+            settlementAudit: assessment.settlementAudit,
+            priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+          }, {
+            ...(opts.terminalDeliveryJudgePort
+              ? { port: opts.terminalDeliveryJudgePort }
+              : {}),
+          });
+          if (terminalDecision.status === 'decided') {
+            terminalJudgeMetadata = {
+              terminalJudgeDisposition: terminalDecision.verb,
+              terminalJudgeReason: terminalDecision.reason,
+              terminalJudgeFamily: terminalDecision.judge.judgeFamily,
+              terminalJudgeResumeCount: terminalDecision.consecutiveResumeCount,
+            };
+            if (terminalDecision.verb === 'resume') {
+              terminalJudgeConsecutiveResumes = 1;
+              safeAppend({
+                sessionId: opts.sessionId,
+                turn: lastTurn,
+                role: 'system',
+                type: 'heartbeat',
+                data: {
+                  kind: 'terminal_delivery_resume',
+                  reason: terminalDecision.reason,
+                  attempt: terminalDecision.consecutiveResumeCount,
+                  path: 'approval_resume',
+                },
+              });
+              resumeContinuationInput = [
+                'TERMINAL DELIVERY RESUME — an independent different-family judge found one gap you can close now.',
+                `Recovery instruction: ${terminalDecision.recoveryInstruction}`,
+                `ORIGINAL USER OBJECTIVE (immutable): ${deliveryObjective.slice(0, 4000)}`,
+                'Continue within the original authority. Do not repeat an irreversible action or widen the task. Return a newly authored final answer when the gap is resolved; if it cannot be resolved, state the exact blocker.',
+              ].join('\n');
+              decision = decision
+                ? { ...decision, done: false, nextAction: 'awaiting_handoff_result' }
+                : {
+                    summary: userVisibleSummary ?? '',
+                    reply: userVisibleSummary ?? null,
+                    done: false,
+                    nextAction: 'awaiting_handoff_result',
+                    reason: null,
+                  };
+              lastDecision = decision;
+              resumeFromTerminalJudge = true;
+            } else {
+              terminalJudgeConsecutiveResumes = 0;
+              if (terminalDecision.verb === 'ask') {
+                const askedThisTurn = listEvents(opts.sessionId, { types: ['awaiting_user_input'] })
+                  .some((event) => event.turn === lastTurn);
+                if (!askedThisTurn) {
+                  safeAppend({
+                    sessionId: opts.sessionId,
+                    turn: lastTurn,
+                    role: 'Clem',
+                    type: 'awaiting_user_input',
+                    data: {
+                      question: terminalDecision.publicText,
+                      source: 'terminal_delivery_judge',
+                      sourceUserSeq: activeSourceUserSeq,
+                    },
+                  });
+                }
+                const publicPresentation = commitStandardNeedsInputTerminal({
+                  sessionId: opts.sessionId,
+                  sourceUserSeq: activeSourceUserSeq,
+                  turn: lastTurn,
+                  text: terminalDecision.publicText,
+                  legacyReason: 'awaiting_user_input',
+                  metadata: { steps: stepIndex, ...terminalJudgeMetadata },
+                });
+                return {
+                  sessionId: opts.sessionId,
+                  status: 'awaiting_user_input',
+                  steps: stepIndex,
+                  lastDecision: decision ?? undefined,
+                  lastTurn,
+                  publicPresentation,
+                };
+              }
+              userVisibleSummary = terminalDecision.publicText;
+              terminalPresentationAlreadyDiscloses = true;
+              terminalJudgeDisposition = 'deliver';
+            }
+          } else {
+            const activeModel = (opts.agent as unknown as { model?: string | Model }).model
+              ?? MODELS.primary;
+            const repaired = await repairActionTerminalBeforeCommit({
+              sessionId: opts.sessionId,
+              sourceUserSeq: activeSourceUserSeq,
+              proposedReply: userVisibleSummary ?? '',
+              port: opts.terminalPresentationRepairPort
+                ?? createAgentsTerminalPresentationRepairPort({ model: activeModel }),
+            });
+            if (repaired.status !== 'unchanged'
+              && deliveryMustHoldForHuman(assessment.settlementAudit)) {
+              const publicPresentation = commitStandardBlockedTerminal({
+                sessionId: opts.sessionId,
+                sourceUserSeq: activeSourceUserSeq,
+                turn: lastTurn,
+                text: repaired.text,
+                legacyReason: 'verification_required',
+                metadata: {
+                  steps: stepIndex,
+                  blockedReason: 'authoritative_terminal_verification_incomplete',
+                  terminalRepairStatus: repaired.status,
+                  terminalRepairGrantId: repaired.grantId,
+                  terminalMissing: repaired.missing,
+                },
+              });
+              return {
+                sessionId: opts.sessionId,
+                status: 'awaiting_user_input',
+                steps: stepIndex,
+                lastDecision: decision ?? undefined,
+                lastTurn,
+                publicPresentation,
+              };
+            }
+            if (repaired.status === 'blocked_repaired') {
+              userVisibleSummary = repaired.text;
+              terminalPresentationAlreadyDiscloses = true;
+            }
+          }
+        }
+      }
+
+      if (!resumeFromTerminalJudge) {
+        return finalizeStandardConversation({
           sessionId: opts.sessionId,
           sourceUserSeq: activeSourceUserSeq,
           turn: lastTurn,
-          text: blockedText,
-          legacyReason: 'blocked',
-          metadata: {
+          eventData: {
             steps: stepIndex,
+            ...(resumeDeliveryConcern ? { reason: 'blocked' } : {}),
+            summary: userVisibleSummary,
+            internalSummary: decision?.summary,
+            reply: userVisibleSummary ?? null,
             missingReply: isCompletedAction && !hasReply ? true : undefined,
-            blockedReason: (delivery.reason ?? userVisibleSummary ?? '').slice(0, 400),
+            delivered: true,
             ...(delivery.verification ? { verification: delivery.verification } : {}),
-            ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
+            ...terminalJudgeMetadata,
           },
+          result: {
+            sessionId: opts.sessionId,
+            status: 'completed',
+            steps: stepIndex,
+            lastDecision: decision ?? undefined,
+            lastTurn,
+          },
+          ...(terminalPresentationAlreadyDiscloses
+            ? { presentationAlreadyDiscloses: true }
+            : {}),
+          ...(resumeDeliveryConcern ? { deliveryConcern: resumeDeliveryConcern } : {}),
+          ...(terminalJudgeDisposition ? { terminalJudgeDisposition } : {}),
         });
-        const goalForBlocked = safeActiveGoal(opts.sessionId);
-        if (goalForBlocked) safeAppendGoalLedger(goalForBlocked.id, 'blocked', delivery.reason ?? userVisibleSummary ?? '');
-        return {
-          sessionId: opts.sessionId,
-          status: 'awaiting_user_input',
-          steps: stepIndex,
-          lastDecision: decision ?? undefined,
-          lastTurn,
-          publicPresentation,
-        };
       }
-
-      return finalizeStandardConversation({
-        sessionId: opts.sessionId,
-        sourceUserSeq: activeSourceUserSeq,
-        turn: lastTurn,
-        eventData: {
-          steps: stepIndex,
-          summary: userVisibleSummary,
-          internalSummary: decision?.summary,
-          reply: decision?.reply ?? null,
-          missingReply: isCompletedAction && !hasReply ? true : undefined,
-          delivered: true,
-          ...(delivery.verification ? { verification: delivery.verification } : {}),
-        },
-        result: {
-          sessionId: opts.sessionId,
-          status: 'completed',
-          steps: stepIndex,
-          lastDecision: decision ?? undefined,
-          lastTurn,
-        },
-      });
     }
     // Unreachable in practice: a null decision makes doneStands true and returns
     // above. The guard restores TS's non-null narrowing for the handlers below.

@@ -730,6 +730,39 @@ export function summarizeWorkManifest(
   return summaries.at(-1) ?? null;
 }
 
+/** Bounded durable evidence owned by manifests declared for one exact source. */
+export function workEvidenceForAcceptedSource(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  limit?: number;
+}): WorkEvidenceRef[] {
+  const limit = Math.max(1, Math.min(100, input.limit ?? 40));
+  const manifestIds = [...new Set(
+    listEvents(input.sessionId, { types: ['work_manifest_declared'] })
+      .filter((event) => event.data.sourceUserSeq === input.sourceUserSeq)
+      .map((event) => clean(event.data.manifestId, 160))
+      .filter(Boolean),
+  )];
+  const evidence: WorkEvidenceRef[] = [];
+  const seen = new Set<string>();
+  for (const manifestId of manifestIds) {
+    const summary = summarizeWorkManifest(input.sessionId, manifestId);
+    if (!summary) continue;
+    for (const item of summary.items) {
+      for (const state of Object.values(item.phases)) {
+        for (const ref of state.evidence) {
+          const key = `${ref.kind}:${ref.ref}`;
+          if (!ref.ref || seen.has(key)) continue;
+          seen.add(key);
+          evidence.push(ref);
+          if (evidence.length >= limit) return evidence;
+        }
+      }
+    }
+  }
+  return evidence;
+}
+
 export function resolveWorkItemId(
   sessionId: string,
   manifestId: string,

@@ -50,6 +50,7 @@ const {
   createWorkflowOriginGroupCloseAuthority,
   createWorkflowOriginGroupClosedBatchReceipt,
   finalizeWorkflowOriginGroupClosedBatch,
+  readWorkflowOriginGroupSettlement,
   recordWorkflowChatDispatchPreparation,
   recordWorkflowOriginGroupClosedBatch,
   workflowChatDispatchQueueRequestDigest,
@@ -63,6 +64,11 @@ const {
   getFocusWorkstate,
   linkFocusActionForSession,
 } = await import('../memory/focus.js');
+const dispatch = await import('../runtime/harness/dispatch-ledger.js');
+const outcomes = await import('../runtime/harness/attempt-outcome.js');
+const settlements = await import('../runtime/harness/logical-call-settlement-store.js');
+const audit = await import('../runtime/harness/accepted-source-settlement-audit.js');
+const shadow = await import('../runtime/graph/turn-graph-shadow.js');
 
 test.after(() => {
   _setWorkflowRunReportBackAfterExactReceiptObservationForTests();
@@ -188,6 +194,63 @@ function addAcceptedSource(input: {
     type: 'user_input_received',
     data: { text: input.text ?? 'Run the review.' },
   });
+}
+
+function markRunPartial(file: string): void {
+  const run = readRun(file);
+  run.status = 'completed_with_errors';
+  run.terminalOutcome = 'partial';
+  writeFileSync(file, JSON.stringify(run), 'utf-8');
+}
+
+function settleOriginBusinessCall(
+  source: ReturnType<typeof addAcceptedSource>,
+  label: string,
+  succeeded: boolean,
+): void {
+  const toolName = succeeded ? 'googlesheets_batch_get' : 'googlesheets_insert_dimension';
+  const args = succeeded ? { ranges: ['A1:C5'] } : { index: 9 };
+  const identity = {
+    sessionId: source.sessionId,
+    sourceUserSeq: source.seq,
+    turn: source.turn,
+    acceptedTaskId: `task:${source.sessionId}#${source.seq}`,
+    logicalToolCallId: `logical:${label}`,
+  };
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: {
+      sessionId: source.sessionId,
+      sourceUserSeq: source.seq,
+      turn: source.turn,
+    },
+    surface: 'workflow',
+  }));
+  const begun = dispatch.beginPhysicalDispatch({
+    identity: { ...identity, physicalDispatchId: `dispatch:${label}`, ordinal: 0 },
+    tool: toolName,
+    args,
+  });
+  assert.equal(begun.status, 'inserted', JSON.stringify(begun));
+  if (begun.status !== 'inserted') return;
+  assert.equal(dispatch.settlePhysicalDispatch({
+    identity: begun.identity,
+    tool: toolName,
+    outcome: 'returned',
+  }).status, 'inserted');
+  const settled = settlements.commitLogicalCallSettlement({
+    identity,
+    contract: { toolName, args },
+    execution: { kind: 'provider_execution' },
+    ...(succeeded
+      ? { result: { payload: { successful: true, data: { rows: [['ok']] } } } }
+      : {}),
+    outcome: outcomes.classifyAttemptOutcome(
+      succeeded ? { envelopeSuccessful: true } : { executionFailed: true },
+    ),
+    recovery: { businessCall: true, mutating: !succeeded },
+    observer: { lane: 'composio', turn: source.turn },
+  });
+  assert.equal(settled.status, 'committed', JSON.stringify(settled));
 }
 
 test('failed origin write stays unacknowledged and a later retry marks notified exactly once', () => {
@@ -365,6 +428,42 @@ test('an exact desktop observer settles the original source directly without the
     (entry) => entry.metadata?.originObserverId === observerId,
   );
   assert.equal(receiptCarrier?.silent, true, 'origin_chat terminal must not create a second desktop toast');
+});
+
+test('a blocked member is qualified by the shared rule and report-back accepts the authoritative winner', () => {
+  const runId = 'report-exact-blocked-qualified';
+  const origin = 'report-exact-blocked-qualified-origin';
+  const source = addAcceptedSource({ sessionId: origin, channel: 'desktop' });
+  settleOriginBusinessCall(source, 'report-exact-blocked-qualified-read', true);
+  settleOriginBusinessCall(source, 'report-exact-blocked-qualified-write', false);
+  const settlementAudit = audit.auditAcceptedSourceSettlementTruth({
+    sessionId: origin,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(settlementAudit.status, 'unrecovered_failure', JSON.stringify(settlementAudit));
+  assert.ok(settlementAudit.facts.successfulBusinessSettlements > 0, JSON.stringify(settlementAudit));
+
+  const file = writeRun(runId, origin);
+  markRunPartial(file);
+  const observerId = addExactOrigin(runId, origin, source.seq);
+  const authored = 'The main review completed, but one optional follow-up needs attention.';
+  assert.equal(recordAndAttemptWorkflowRunReportBack(file, {
+    workflowName: 'Ack Workflow',
+    outcome: 'blocked',
+    detail: authored,
+  }), true);
+
+  const terminal = listEvents(origin, { types: ['conversation_completed'] })[0];
+  assert.ok(terminal);
+  assert.equal(terminal.data.presentation.status, 'done');
+  assert.equal(terminal.data.reply, authored);
+  assert.equal(terminal.data.deliveryDisclosure, 'unverified_completion');
+  assert.deepEqual(readRun(file).reportBack.acknowledgedOriginObserverIds, [observerId]);
+  assert.equal(readRun(file).reportBackRetry, undefined);
+  const carrier = listNotifications(2_000).find(
+    (entry) => entry.metadata?.originObserverId === observerId,
+  );
+  assert.equal(carrier?.title, 'Workflow completed: Ack Workflow');
 });
 
 test('an observed exact receipt survives indefinitely until group settlement consumes it', () => {
@@ -861,6 +960,51 @@ test('one accepted source with two out-of-order runs publishes one ordered reduc
     true,
     'recomputing a same-file projection cannot rewrite immutable settlement membership',
   );
+});
+
+test('a blocked group reducer is qualified once and settles against the committer status', () => {
+  const origin = 'report-group-blocked-qualified-origin';
+  const source = addAcceptedSource({
+    sessionId: origin,
+    channel: 'desktop',
+    text: 'Run both checks and report whatever completed.',
+  });
+  settleOriginBusinessCall(source, 'report-group-blocked-qualified-read', true);
+  settleOriginBusinessCall(source, 'report-group-blocked-qualified-write', false);
+  const runA = 'report-group-blocked-qualified-a';
+  const runB = 'report-group-blocked-qualified-b';
+  const fileA = writeRun(runA, origin);
+  const fileB = writeRun(runB, origin);
+  markRunPartial(fileB);
+  const { observerId, active } = addExactOriginGroup([runA, runB], origin, source.seq);
+
+  assert.equal(recordAndAttemptWorkflowRunReportBack(fileB, {
+    workflowName: 'Optional Review',
+    outcome: 'blocked',
+    detail: 'The optional review needs attention.',
+  }), false, 'the partial member waits for its sealed sibling');
+  assert.equal(recordAndAttemptWorkflowRunReportBack(fileA, {
+    workflowName: 'Primary Review',
+    outcome: 'done',
+    detail: 'The primary review completed.',
+  }), true);
+  assert.equal(attemptWorkflowRunReportBack(fileB), true);
+
+  const terminals = listEvents(origin, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0].data.presentation.status, 'done');
+  assert.equal(terminals[0].data.deliveryDisclosure, 'unverified_completion');
+  assert.match(String(terminals[0].data.reply), /The optional review needs attention/);
+  for (const file of [fileA, fileB]) {
+    assert.deepEqual(readRun(file).reportBack.acknowledgedOriginObserverIds, [observerId]);
+    assert.equal(readRun(file).reportBackRetry, undefined);
+  }
+  const settlement = readWorkflowOriginGroupSettlement(active.sealed.sourceGroupId);
+  assert.equal(settlement?.terminalStatus, 'done');
+  const carrier = listNotifications(2_000).find(
+    (entry) => entry.metadata?.sourceGroupId === active.sealed.sourceGroupId,
+  );
+  assert.equal(carrier?.title, 'Workflow completed: 2 workflows');
 });
 
 test('a corrupt member prevents the whole source-group reducer from publishing', () => {

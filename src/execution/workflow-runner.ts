@@ -24,11 +24,16 @@ import {
   getSession as getHarnessSession,
   isKillRequested,
   listEvents as listHarnessEvents,
+  openEventLog,
   preserveCurrentKillAndClearStale,
   recordRunAttemptUserInput,
   requestKill,
   type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
+import {
+  auditAcceptedSourceSettlementTruth,
+  type AcceptedSourceSettlementRecoveryIdentity,
+} from '../runtime/harness/accepted-source-settlement-audit.js';
 import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
 import {
   evaluateLearningCandidate,
@@ -87,7 +92,10 @@ import { reduceShardMembers, reduceShardSize, reduceTierEnabled, shardFingerprin
 import { resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from '../runtime/harness/run-token-budget.js';
 import { sumSessionTokensUsedByPrefix } from '../runtime/harness/eventlog.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
-import { projectCanonicalTopLevelToolEvents } from '../runtime/harness/tool-effect.js';
+import {
+  actionTopologyRoleForRuntimeCall,
+  projectCanonicalTopLevelToolEvents,
+} from '../runtime/harness/tool-effect.js';
 import { checkerReportFromVerdict } from './workflow-run-checker.js';
 import { compactWorkflowGoalEvidence, countNonEmptyLines } from './workflow-goal-evidence.js';
 import {
@@ -973,6 +981,76 @@ function terminalReportMatchesStatus(record: QueuedRunRecord, report: TerminalRe
     || ((record.status === 'dry_run' || record.status === 'creation_test') && typeof record.finishedAt === 'string')
   ) return report.outcome !== 'failed';
   return false;
+}
+
+function settlementRecoveryIdentityKey(identity: AcceptedSourceSettlementRecoveryIdentity): string {
+  return identity.kind === 'requirement'
+    ? JSON.stringify(['requirement', identity.requirementId])
+    // argumentDigest is accepted-task salted and intentionally cannot grant
+    // cross-source authority. Legacy recovery therefore requires the exact
+    // durable logical call id (plus tool identity), never merely similar args.
+    : JSON.stringify(['call', identity.logicalToolCallId, identity.toolName]);
+}
+
+export function auditWorkflowRunSettlementTruth(runId: string): {
+  clean: boolean;
+  reasons: string[];
+} {
+  try {
+    const prefix = `workflow:${runId}:`;
+    const sources = openEventLog().prepare(`
+      SELECT session_id, seq AS source_user_seq
+        FROM events
+       WHERE type = 'user_input_received'
+         AND substr(session_id, 1, ?) = ?
+       ORDER BY session_id, seq
+    `).all(prefix.length, prefix) as Array<{ session_id: string; source_user_seq: number }>;
+    const audited = sources.map((source) => ({
+      ...source,
+      audit: auditAcceptedSourceSettlementTruth({
+        sessionId: source.session_id,
+        sourceUserSeq: source.source_user_seq,
+      }),
+    }));
+    const reasons: string[] = [];
+    for (const source of audited) {
+      const { audit } = source;
+      if (audit.status === 'clean') continue;
+
+      // A later source repairs an ordinary failure only when durable identity
+      // says it completed the SAME requirement (or, for legacy unbound work,
+      // the exact logical call identity). Chronology and unrelated
+      // business success are never recovery authority. Hard blockers remain
+      // source-owned until their exact dispatch/write authority settles them.
+      const hardBlocker = audit.status === 'storage_error'
+        || audit.status === 'in_flight'
+        || audit.status === 'uncertain_write';
+      const laterSuccessKeys = new Set(
+        audited
+          .filter((candidate) =>
+            candidate.session_id === source.session_id
+            && candidate.source_user_seq > source.source_user_seq,
+          )
+          .flatMap((candidate) => candidate.audit.facts.successfulBusinessIdentities)
+          .map(settlementRecoveryIdentityKey),
+      );
+      const failedIdentityKeys = audit.facts.unrecoveredBusinessFailureIdentities
+        .map(settlementRecoveryIdentityKey);
+      const laterRecovery = audit.status === 'unrecovered_failure'
+        && failedIdentityKeys.length > 0
+        && failedIdentityKeys.every((identity) => laterSuccessKeys.has(identity));
+      if (hardBlocker || !laterRecovery) {
+        const sourceLabel = source.session_id.slice(prefix.length);
+        reasons.push(`${sourceLabel}@${source.source_user_seq}: ${audit.reason}`);
+      }
+    }
+    return { clean: reasons.length === 0, reasons };
+  } catch (error) {
+    return {
+      clean: false,
+      reasons: [`workflow settlement authority is unreadable: ${String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 200)}`],
+    };
+  }
 }
 
 function sameTerminalReport(envelope: WorkflowRunReportBackEnvelope, report: TerminalReportInput): boolean {
@@ -3213,10 +3291,13 @@ async function runStepViaHarness(
       });
       // Phantom-completion guard (#2): a send/write step that called no real tool
       // didn't actually act — surface it as blocked instead of a silent success.
-      let sdkOutput = sdkResult.output;
-      if (isPhantomStepCompletion(step, sdkResult.toolUses, sdkOutput)) {
-        sdkOutput = phantomBlockedOutput(step);
-      }
+      const sdkOutput = settlementGuardedStepOutput({
+        step,
+        sessionId: realSessionId,
+        sourceUserSeq: sourceUserEvent.seq,
+        toolUses: sdkResult.toolUses,
+        output: sdkResult.output,
+      });
       stepAttemptStatus = 'completed';
       markWorkflowHarnessSessionTerminal(session, 'completed');
       return {
@@ -3430,8 +3511,13 @@ async function runStepViaHarness(
     const stepToolUses = listHarnessEvents(realSessionId, { types: ['tool_called'] })
       .map((e) => (typeof e.data?.tool === 'string' ? e.data.tool : ''))
       .filter((t) => t.length > 0);
-    const guardPhantom = (output: unknown): unknown =>
-      isPhantomStepCompletion(step, stepToolUses, output) ? phantomBlockedOutput(step) : output;
+    const guardStepOutput = (output: unknown): unknown => settlementGuardedStepOutput({
+      step,
+      sessionId: realSessionId,
+      sourceUserSeq: sourceUserEvent.seq,
+      toolUses: stepToolUses,
+      output,
+    });
 
     // Fold 3 capture (best-effort, never blocks a step): remember the LAST
     // proven composio call of a step that emitted a real (non-blocked) result,
@@ -3490,7 +3576,7 @@ async function runStepViaHarness(
     }
     if (captured.found) {
       stepAttemptStatus = 'completed';
-      return { output: guardPhantom(captured.value), hadApprovals, approvalIds, usedStructuredResult: true, sessionId: realSessionId, lane: 'harness', route };
+      return { output: guardStepOutput(captured.value), hadApprovals, approvalIds, usedStructuredResult: true, sessionId: realSessionId, lane: 'harness', route };
     }
     if (result.status !== 'completed') {
       throw new Error(
@@ -3501,7 +3587,7 @@ async function runStepViaHarness(
       throw new WorkflowStepStructuralResultError(step.id, prose);
     }
     stepAttemptStatus = 'completed';
-    return { output: guardPhantom(prose), hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId, lane: 'harness', route };
+    return { output: guardStepOutput(prose), hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId, lane: 'harness', route };
   } catch (err) {
     if (err instanceof ParkRunSignal || err instanceof WorkflowCapabilityBlockedError) {
       stepAttemptStatus = 'interrupted';
@@ -6092,6 +6178,37 @@ export function isPhantomStepCompletion(step: WorkflowStepInput, toolUses: strin
     .map((t) => (typeof t === 'string' ? (t.split('__').at(-1) ?? t) : ''))
     .filter((t) => t.length > 0 && !PHANTOM_GUARD_INERT_TOOLS.has(t));
   return realTools.length === 0;
+}
+
+function settlementGuardedStepOutput(input: {
+  step: WorkflowStepInput;
+  sessionId: string;
+  sourceUserSeq: number;
+  toolUses: string[] | undefined;
+  output: unknown;
+}): unknown {
+  if (isPhantomStepCompletion(input.step, input.toolUses, input.output)) {
+    return phantomBlockedOutput(input.step);
+  }
+  const businessTools = (input.toolUses ?? [])
+    .map((tool) => (typeof tool === 'string' ? (tool.split('__').at(-1) ?? tool) : ''))
+    .filter((tool) =>
+      tool.length > 0
+      && !PHANTOM_GUARD_INERT_TOOLS.has(tool)
+      && actionTopologyRoleForRuntimeCall(tool, {}) !== 'control');
+  const audit = auditAcceptedSourceSettlementTruth({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    // A write/send step necessarily owes business evidence. A read/synthesis
+    // step owes it once the runtime observed a real tool invocation; SDK
+    // summaries alone never satisfy the audit.
+    requiresBusinessEvidence: stepSideEffectClass(input.step) !== 'read' || businessTools.length > 0,
+  });
+  if (audit.status === 'clean') return input.output;
+  return {
+    blocked: true,
+    reason: `Step "${input.step.id}" is not complete yet: ${audit.reason}. Its captured output remains in the run record for recovery.`,
+  };
 }
 
 /** Does `consumer` read `sourceId`'s output — via dependsOn, a forEach over it,
@@ -10141,6 +10258,21 @@ async function processOneRunFile(
         publicStepOutputs,
         publicExecutionSteps.map((step) => step.id),
       );
+      // Run-level settlement truth must join the ordinary needs-attention path
+      // before the report, activity mirror, notification, and learning decision
+      // are built. Downgrading inside writeRunRecord changed only the persisted
+      // envelope; its caller then compared against the stale proposed report and
+      // returned before finishRun, leaving the shared card stuck `running`.
+      const terminalSettlementAudit = auditWorkflowRunSettlementTruth(run.id);
+      if (!terminalSettlementAudit.clean) {
+        blockedSteps.push({
+          stepId: '(run settlement)',
+          kind: 'blocked',
+          reason:
+            'Runtime evidence still needs reconciliation: '
+            + terminalSettlementAudit.reasons.slice(0, 5).join('; '),
+        });
+      }
 
       // Wave 2.1 (substance gap): a read step that produced NO data while a
       // downstream step depends on it — the canonical "forEach over an empty

@@ -323,7 +323,7 @@ export function commitPlanFirstOutcome(input: {
   sessionId: string;
   sourceUserSeq: number;
   text: string;
-  status: 'needs_input' | 'blocked';
+  status: 'needs_input';
   reason: string;
   metadata?: Record<string, unknown>;
 }): void {
@@ -333,24 +333,15 @@ export function commitPlanFirstOutcome(input: {
     turn: source.turn,
     sourceUserSeq: source.seq,
   };
-  const outcome: TurnOutcome = input.status === 'needs_input'
-    ? {
-        version: 2,
-        id: turnOutcomeId(identity),
-        identity,
-        status: 'needs_input',
-        resumable: true,
-        needs: { kind: 'input' },
-        presentation: { kind: 'question', text: input.text },
-      }
-    : {
-        version: 2,
-        id: turnOutcomeId(identity),
-        identity,
-        status: 'blocked',
-        resumable: true,
-        presentation: { kind: 'blocked', text: input.text },
-      };
+  const outcome: TurnOutcome = {
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: input.text },
+  };
   commitTurnOutcome(outcome, {
     legacyReason: input.reason,
     metadata: input.metadata,
@@ -381,7 +372,11 @@ function surfacePlanFirstFailure(
     sessionId: input.sessionId,
     sourceUserSeq,
     text: renderPlanFirstFailureReply(),
-    status: 'blocked',
+    // The planner did not execute business work and its authored response asks
+    // the user to choose retry/simplify/proceed. That is a typed question, not
+    // an unverified-completion hold; routing it as blocked bypassed the shared
+    // delivery rule and mislabeled a live decision point as failed work.
+    status: 'needs_input',
     reason: 'plan_first_failed',
   });
 

@@ -97,6 +97,7 @@ function settledTask(input: {
   outcome?: 'succeeded' | 'empty_result';
   businessCall?: boolean;
   mutating?: boolean;
+  requirementId?: string;
   priorPayload?: unknown;
 }) {
   const task = accept(input.text ?? 'Find the current alpha records.');
@@ -145,6 +146,7 @@ function settledTask(input: {
     recovery: {
       businessCall: input.businessCall !== false,
       mutating: input.mutating === true,
+      ...(input.requirementId ? { requirementId: input.requirementId } : {}),
     },
     observer: { lane: 'composio', turn: task.turn },
   });
@@ -230,6 +232,26 @@ test('point lookup mints an observation without pretending to exhaust a collecti
     settled.task.sessionId,
     issued.receipt.receiptId,
     { sourceUserSeq: settled.task.sourceUserSeq, expectKind: 'observation' },
+  ).ok, true);
+});
+
+test('expected-work requirement ids resolve to their concrete logical result handle', () => {
+  const settled = settledTask({
+    tool: 'alpha_record_get_by_id',
+    args: { id: 'r1' },
+    payload: { successful: true, data: { id: 'r1', name: 'Alpha' } },
+    requirementId: 'read-source',
+  });
+  const manifest = manifestSettledTask(settled);
+  assert.equal(manifest.nodes[0]?.operationId, 'read-source');
+  assert.notEqual(manifest.nodes[0]?.operationId, settled.logicalToolCallId);
+  const issued = issueFor(settled, manifest);
+  assert.equal(issued.status, 'issued', JSON.stringify(issued));
+  if (issued.status !== 'issued') return;
+  assert.equal(issued.receipt.logicalToolCallId, settled.logicalToolCallId);
+  assert.equal(receipts.redeemHostReadEvidenceReceipt(
+    settled.task.sessionId,
+    issued.receipt.receiptId,
   ).ok, true);
 });
 

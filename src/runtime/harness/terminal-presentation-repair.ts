@@ -42,12 +42,18 @@ export interface TerminalPresentationGap {
   fact: string;
 }
 
+export interface TerminalUnavailableSource {
+  source: string;
+  reason: string;
+}
+
 export interface TerminalPresentationRepairPacketV1 {
   version: typeof TERMINAL_PRESENTATION_REPAIR_VERSION;
   instruction: typeof TERMINAL_PRESENTATION_REPAIR_INSTRUCTION;
   acceptedRequest: string;
   proposedReply: string;
   gaps: TerminalPresentationGap[];
+  unavailableSources: TerminalUnavailableSource[];
 }
 
 /** A lane adapter must implement this as one text-only model call with every
@@ -83,6 +89,25 @@ const FALLBACK_TEXT = 'I haven\'t been able to verify the result yet. I can keep
 const MAX_REQUEST_CHARS = 6_000;
 const MAX_REPLY_CHARS = 6_000;
 const MAX_RENDER_CHARS = 8_000;
+
+function unavailableSources(values: readonly TerminalUnavailableSource[] | undefined): TerminalUnavailableSource[] {
+  const out: TerminalUnavailableSource[] = [];
+  const seen = new Set<string>();
+  for (const value of values ?? []) {
+    const source = typeof value?.source === 'string'
+      ? value.source.trim().replace(/\s+/g, ' ').slice(0, 160)
+      : '';
+    const reason = typeof value?.reason === 'string'
+      ? value.reason.trim().replace(/\s+/g, ' ').slice(0, 320)
+      : '';
+    const key = source.toLowerCase();
+    if (!source || !reason || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ source, reason });
+    if (out.length >= 16) break;
+  }
+  return out;
+}
 
 const GAP_FACTS: Record<TerminalPresentationGapKind, string> = {
   source_not_observed: 'The requested source result has not yet been verified.',
@@ -168,17 +193,24 @@ export async function repairTerminalPresentation(input: {
   sourceUserSeq: number;
   proposedReply: string;
   missing: readonly string[];
+  unavailableSources?: readonly TerminalUnavailableSource[];
   port: TerminalPresentationRepairPort;
   timeoutMs?: number;
 }): Promise<TerminalPresentationRepairResult> {
   if (input.missing.length === 0) {
     return { status: 'unchanged', text: assertPublicPresentationText(input.proposedReply) };
   }
+  const unavailable = unavailableSources(input.unavailableSources);
+  // A constant public sentence is permitted only after a render was actually
+  // attempted and failed/returned unsafe output. Authority or source lookup
+  // failures happen before any model call, so preserve the model's proposed
+  // words rather than making deterministic code speak in Clementine's voice.
+  const authoredFallback = assertPublicPresentationText(input.proposedReply);
   const acceptedRequest = acceptedRequestFor(input.sessionId, input.sourceUserSeq);
   if (!acceptedRequest) {
     return {
       status: 'blocked_fallback',
-      text: FALLBACK_TEXT,
+      text: authoredFallback,
       reason: 'accepted_request_unavailable',
     };
   }
@@ -186,12 +218,15 @@ export async function repairTerminalPresentation(input: {
   const claimed = claimTerminalRepairGrant({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
-    missing: gaps.map((gap) => gap.kind),
+    missing: [
+      ...gaps.map((gap) => gap.kind),
+      ...unavailable.map((entry) => `unavailable_source:${entry.source}`),
+    ],
   });
   if (claimed.status !== 'granted') {
     return {
       status: 'blocked_fallback',
-      text: FALLBACK_TEXT,
+      text: authoredFallback,
       reason: 'authority_unavailable',
     };
   }
@@ -202,6 +237,7 @@ export async function repairTerminalPresentation(input: {
     acceptedRequest,
     proposedReply: input.proposedReply.slice(0, MAX_REPLY_CHARS),
     gaps,
+    unavailableSources: unavailable,
   };
   let rendered: string | null = null;
   let failure: Extract<
@@ -235,7 +271,10 @@ export async function repairTerminalPresentation(input: {
   if (consumed.status !== 'consumed' && consumed.status !== 'replayed') {
     return {
       status: 'blocked_fallback',
-      text: FALLBACK_TEXT,
+      // The render already produced safe model-authored words. A later host
+      // bookkeeping failure must not replace them with deterministic voice.
+      // The constant remains reserved for a render that actually failed.
+      text: rendered ?? FALLBACK_TEXT,
       reason: 'consume_failed',
       grantId: claimed.grant.grantId,
     };
@@ -302,10 +341,11 @@ export async function repairActionTerminalBeforeCommit(input: {
   });
   if (repaired.status === 'unchanged') {
     // `missing` is guaranteed non-empty, but keep this branch fail-closed if a
-    // future controller version changes its result contract.
+    // future controller version changes its result contract. No render failed
+    // on this impossible branch, so preserve the authored terminal.
     return {
       status: 'blocked_fallback',
-      text: FALLBACK_TEXT,
+      text: input.proposedReply,
       missing,
       fallbackReason: 'render_failed',
     };

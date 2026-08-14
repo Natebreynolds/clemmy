@@ -49,6 +49,29 @@ test('a newer unrelated user row cannot steal a plan-first terminal', () => {
   assert.notEqual(terminal.data.sourceUserSeq, unrelated.seq);
 });
 
+test('planner failure is a typed user decision, not a lane-local blocked completion', () => {
+  const sessionId = 'plan-first-failure-question';
+  createSession({ id: sessionId, kind: 'chat' });
+  const accepted = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Plan a multi-step report.' },
+  });
+  commitPlanFirstOutcome({
+    sessionId,
+    sourceUserSeq: accepted.seq,
+    text: 'The planner could not finish. Would you like me to retry, simplify, or proceed?',
+    status: 'needs_input',
+    reason: 'plan_first_failed',
+  });
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(terminal?.data.turnOutcome?.status, 'needs_input');
+  assert.equal(terminal?.data.presentation?.status, 'needs_input');
+  assert.equal(terminal?.data.presentation?.kind, 'question');
+});
+
 test('reuseRecordedUserInput fails before planning when its exact source is absent or foreign', async () => {
   const sessionId = 'plan-first-reuse-source';
   const otherSessionId = 'plan-first-reuse-source-other';

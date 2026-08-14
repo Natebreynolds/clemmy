@@ -98,7 +98,16 @@ import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput, p
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { publicReplyText } from './public-presentation.js';
 import { finalizePreparedWorkflowDispatchForSource } from './loop.js';
-import { commitTurnOutcome } from './delivery-committer.js';
+import {
+  assessAcceptedSourceDelivery,
+  commitTurnOutcome,
+  deliveryMustHoldForHuman,
+} from './delivery-committer.js';
+import { auditAcceptedSourceSettlementTruth } from './accepted-source-settlement-audit.js';
+import {
+  evaluateTerminalDelivery,
+  type TerminalDeliveryJudgePort,
+} from './terminal-delivery-judge.js';
 import {
   repairActionTerminalBeforeCommit,
   type PrecommitTerminalPresentationResult,
@@ -192,6 +201,7 @@ type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<Claude
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
 let runPostTurnHooksImpl: typeof runPostTurnHooks = runPostTurnHooks;
 let terminalPresentationRepairPortForTest: TerminalPresentationRepairPort | null = null;
+let terminalDeliveryJudgePortForTest: TerminalDeliveryJudgePort | null = null;
 
 export function setClaudeAgentSdkBrainRunForTest(fn: ClaudeAgentSdkRunFn | null): void {
   runClaudeAgentSdkImpl = fn ?? runClaudeAgentSdk;
@@ -201,6 +211,12 @@ export function setClaudeAgentSdkBrainTerminalPresentationRepairPortForTest(
   port: TerminalPresentationRepairPort | null,
 ): void {
   terminalPresentationRepairPortForTest = port;
+}
+
+export function setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(
+  port: TerminalDeliveryJudgePort | null,
+): void {
+  terminalDeliveryJudgePortForTest = port;
 }
 
 export function setClaudeAgentSdkBrainPostTurnHooksForTest(
@@ -339,17 +355,31 @@ export function bumpSessionToolFloor(sessionId: string, exposed: Iterable<string
 function claudeSdkSalvageEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_SALVAGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
+
+interface ClaudePreterminalDeliveryConcern {
+  reason: string;
+  missing?: string[];
+  /** The replacement text already tells the user what could not be verified. */
+  presentationAlreadyDiscloses?: boolean;
+}
+
+/** Private brain-to-terminal marker. It is stripped before the public result is
+ * returned; its only purpose is to keep a committed provider ambiguity from
+ * becoming a synthetic user question before the shared delivery gate runs. */
+type ClaudeAgentSdkTerminalResult = ClaudeAgentSdkRunResult & {
+  preterminalDeliveryConcern?: ClaudePreterminalDeliveryConcern;
+};
 /** SDK-named alias for the SHARED fallover classifier (transient-error.ts), so the
  *  chat lane and the workflow step-boundary fallover classify a parse-failure
  *  identically. The SDK's `query()` throws this — its own parse-retry already failed
  *  — when the model emits a tool call whose JSON can't be parsed. */
 export const isClaudeSdkUnparseableToolCall = isUnparseableToolCallError;
-/** When the SDK throws AFTER side effects already committed this turn (the work is
- *  done — only the SDK's final wrap-up failed), synthesize a SUCCESS result from
- *  the turn's own external_write ledger so the normal terminal block delivers a
- *  grounded confirmation instead of a hard "Didn't finish". NEVER re-runs (that
- *  would double-act). Returns null when nothing committed (let the caller retry). */
-function salvageCommittedResult(sessionId: string, sinceSeq = 0): ClaudeAgentSdkRunResult | null {
+/** When the SDK throws AFTER side effects already committed this turn, derive a
+ *  private evidence summary from this turn's external_write ledger and carry a
+ *  concrete terminal-delivery concern. A different-family judge authors the
+ *  terminal when available; this summary is only failed-model fallback context.
+ *  NEVER re-runs (that would double-act). Returns null when nothing committed. */
+function salvageCommittedResult(sessionId: string, sinceSeq = 0): ClaudeAgentSdkTerminalResult | null {
   type WriteTruth = {
     seq: number;
     callId?: string;
@@ -387,14 +417,27 @@ function salvageCommittedResult(sessionId: string, sinceSeq = 0): ClaudeAgentSdk
       limitHit: false,
       sessionId,
       stoppedReason: 'awaiting-input',
+      preterminalDeliveryConcern: {
+        reason: 'an external write started but its provider result was not observed',
+        missing: ['external_write_result_unresolved'],
+        presentationAlreadyDiscloses: true,
+      },
     };
   }
-  // HONEST salvage: we know N writes LANDED, but NOT whether the task was fully
-  // complete (the model errored before confirming). Do not over-claim "Done" — say
-  // what ran, that nothing was duplicated, and ask the user to verify / offer to
-  // finish. Reporting partial completion as success would be its own bug.
+  // We know N writes LANDED, but NOT whether the task was fully complete. Keep
+  // this ledger-derived account private as judge context whenever the judge is
+  // available; it is public only as the fallback for the failed model call.
   const text = `⚠️ The model errored before it could confirm completion, but ${landed.length} ${noun} already went through${targetList} — nothing was duplicated. Please check these are what you intended; if anything's still missing, tell me and I'll finish it.`;
-  return { text, toolUses: landed.map((w) => w.toolName ?? 'tool'), limitHit: false, sessionId };
+  return {
+    text,
+    toolUses: landed.map((w) => w.toolName ?? 'tool'),
+    limitHit: false,
+    sessionId,
+    preterminalDeliveryConcern: {
+      reason: 'confirmed external writes landed, but the model failed before authoring a terminal account of task completion',
+      missing: ['terminal_account_missing_after_confirmed_write'],
+    },
+  };
 }
 
 function renderLimitHitReply(text: string): string {
@@ -727,10 +770,6 @@ function mergeClaudeRunEvidence(
   };
 }
 
-function artifactPointer(artifact: RunArtifact): string {
-  return artifact.uri ?? artifact.resourceId ?? artifact.sourceCallId ?? artifact.id;
-}
-
 /** One deterministic repair query for resources whose create response yielded
  * an id but whose exact provider binding has not yet been read back. This text
  * is deliberately generated from ledger state—not from the model's prose. */
@@ -746,23 +785,6 @@ function renderArtifactVerificationPrompt(artifacts: readonly RunArtifact[]): st
     'Do NOT create, deploy, publish, search, or list anything. Do NOT substitute a title match. Make at most one exact-ID getter call per row:',
     ...rows,
     'Then report only whether those exact bindings were readable. Reuse the existing resource; never create a replacement.',
-  ].join('\n');
-}
-
-function renderUnverifiedArtifactReply(artifacts: readonly RunArtifact[]): string {
-  const rows = artifacts.map((artifact) => {
-    const pointer = artifactPointer(artifact);
-    const state = artifact.status === 'bound'
-      ? 'the resource pointer was found, but the provider read-back did not verify it'
-      : artifact.status === 'uncertain'
-        ? 'the create outcome is uncertain'
-        : 'the create attempt is still unresolved';
-    return `- ${artifact.provider} ${artifact.title || artifact.slotKey}: ${pointer} — ${state}.`;
-  });
-  return [
-    'I stopped before claiming this deliverable was finished because I could not independently verify the exact provider resource:',
-    ...rows,
-    'I did not create a replacement, so this did not duplicate the document or site. Please restore the provider connection (if needed) and tell me to retry verification of this exact resource.',
   ].join('\n');
 }
 
@@ -2371,7 +2393,35 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       }
     }
   };
-  const runWithSalvage = async (opts: Parameters<typeof runClaudeAgentSdkImpl>[0]): Promise<ClaudeAgentSdkRunResult> => {
+  let preterminalDeliveryConcern: ClaudePreterminalDeliveryConcern | null = null;
+  const notePreterminalDeliveryConcern = (concern: ClaudePreterminalDeliveryConcern): void => {
+    if (!preterminalDeliveryConcern) {
+      preterminalDeliveryConcern = {
+        reason: concern.reason,
+        ...(concern.missing?.length ? { missing: [...new Set(concern.missing)].slice(0, 16) } : {}),
+        presentationAlreadyDiscloses: concern.presentationAlreadyDiscloses === true,
+      };
+      return;
+    }
+    preterminalDeliveryConcern = {
+      reason: [...new Set([
+        ...preterminalDeliveryConcern.reason.split('; '),
+        concern.reason,
+      ])].join('; ').slice(0, 800),
+      missing: [...new Set([
+        ...(preterminalDeliveryConcern.missing ?? []),
+        ...(concern.missing ?? []),
+      ])].slice(0, 16),
+      // Suppress the committer's disclosure floor only when every accumulated
+      // concern is already stated in the proposed presentation.
+      presentationAlreadyDiscloses:
+        preterminalDeliveryConcern.presentationAlreadyDiscloses === true
+        && concern.presentationAlreadyDiscloses === true,
+    };
+  };
+  const currentPreterminalDeliveryConcern = (): ClaudePreterminalDeliveryConcern | null =>
+    preterminalDeliveryConcern;
+  const runWithSalvage = async (opts: Parameters<typeof runClaudeAgentSdkImpl>[0]): Promise<ClaudeAgentSdkTerminalResult> => {
     try {
       return await runSdkPhysicalAttempt(opts);
     } catch (err) {
@@ -2491,7 +2541,55 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       },
     };
   };
-  let result: ClaudeAgentSdkRunResult;
+  let result: ClaudeAgentSdkTerminalResult;
+  // Queue + an explicit execution question is already a complete graph state.
+  // Keep this outside the ordinary correction block so the bounded terminal
+  // judge continuation cannot strand or duplicate a newly queued approval.
+  const reconcileQueuedApprovalEdge = (): boolean => {
+    const approvalQuestion = isQueuedActionApprovalQuestion(result.text);
+    const transitions = queuedApprovalTransitionsForRequest(sessionId, userInputEvent.seq)
+      .filter((transition) => queuedApprovalTransitionShouldMaterialize(
+        transition,
+        approvalQuestion,
+      ));
+    if (transitions.length === 0) return false;
+    const materialized = materializeQueuedApprovals(
+      sessionId,
+      0,
+      userInputEvent.seq,
+      transitions,
+    );
+    if (materialized.length > 0) {
+      graphApprovalId ??= materialized[0].approval.approvalId;
+      result = {
+        ...result,
+        limitHit: false,
+        selfStopped: false,
+        stoppedReason: 'pending-approval',
+      };
+      for (const item of materialized) {
+        try {
+          appendEvent({
+            sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'heartbeat',
+            data: {
+              kind: 'pending_action_transition_materialized',
+              pendingActionId: item.transition.record.id,
+              approvalId: item.approval.approvalId,
+              sourceEventSeq: item.transition.eventSeq,
+              approvalIntent: item.transition.approvalIntent,
+              autoMaterialize: item.transition.autoMaterialize,
+              message: 'Materialized the exact queued-action approval edge without another model turn.',
+            },
+          });
+        } catch { /* transition state is already durable */ }
+      }
+      return true;
+    }
+    return false;
+  };
   try {
     result = await runWithSalvage({ prompt: request.message, ...runOptions });
     const initialDispatch = finalizedWorkflowDispatchResponse();
@@ -2561,54 +2659,6 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       };
     }
 
-    // Queue + an explicit execution question is already a complete graph
-    // state. Reconcile after every result merge so a narration/judge/max-turn
-    // continuation cannot strand or duplicate the queued action.
-    const reconcileQueuedApprovalEdge = (): boolean => {
-      const approvalQuestion = isQueuedActionApprovalQuestion(result.text);
-      const transitions = queuedApprovalTransitionsForRequest(sessionId, userInputEvent.seq)
-        .filter((transition) => queuedApprovalTransitionShouldMaterialize(
-          transition,
-          approvalQuestion,
-        ));
-      if (transitions.length === 0) return false;
-      const materialized = materializeQueuedApprovals(
-        sessionId,
-        0,
-        userInputEvent.seq,
-        transitions,
-      );
-      if (materialized.length > 0) {
-        graphApprovalId ??= materialized[0].approval.approvalId;
-        result = {
-          ...result,
-          limitHit: false,
-          selfStopped: false,
-          stoppedReason: 'pending-approval',
-        };
-        for (const item of materialized) {
-          try {
-            appendEvent({
-              sessionId,
-              turn: 0,
-              role: 'system',
-              type: 'heartbeat',
-              data: {
-                kind: 'pending_action_transition_materialized',
-                pendingActionId: item.transition.record.id,
-                approvalId: item.approval.approvalId,
-                sourceEventSeq: item.transition.eventSeq,
-                approvalIntent: item.transition.approvalIntent,
-                autoMaterialize: item.transition.autoMaterialize,
-                message: 'Materialized the exact queued-action approval edge without another model turn.',
-              },
-            });
-          } catch { /* transition state is already durable */ }
-        }
-        return true;
-      }
-      return false;
-    };
     reconcileQueuedApprovalEdge();
 
     // Narrate-instead-of-call backstop (defense-in-depth; the lean rubric prevents
@@ -2980,13 +3030,11 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       }
       if (unresolved.length > 0) {
         artifactVerificationPending = unresolved;
-        result = {
-          ...result,
-          text: renderUnverifiedArtifactReply(unresolved),
-          limitHit: false,
-          selfStopped: false,
-          stoppedReason: 'awaiting-input',
-        };
+        notePreterminalDeliveryConcern({
+          reason: 'one or more created artifacts could not be verified by exact-ID read-back',
+          missing: unresolved.map((artifact) =>
+            `artifact_readback:${artifact.kind}:${artifact.resourceId ?? artifact.slotKey}`),
+        });
       }
     }
     // Final deterministic floor after the bounded judge continuations. A
@@ -3003,15 +3051,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       const reason = claudeFreshWriteGapReason(
         status as Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>,
       );
-      result = {
-        ...result,
-        text: status === 'ambiguous'
-          ? 'I cannot honestly confirm this change went through — the outcome is still ambiguous, and I did not run it twice or count an older receipt as proof. Say "check it" and I\'ll verify the live state before calling this complete.'
-          : status === 'failed'
-            ? 'At least one external write required by this request was recorded as failed, so I cannot call the request complete or substitute another action’s receipt.'
-            : 'I cannot honestly confirm the work went out for this request — I have no receipt of it landing after your message, and I did not count an older one as proof. If it still needs to go out, tell me and I\'ll do it properly.',
-        stoppedReason: 'awaiting-input',
-      };
+      notePreterminalDeliveryConcern({
+        reason,
+        missing: [`fresh_external_write:${status}`],
+      });
       try {
         appendEvent({
           sessionId,
@@ -3096,9 +3139,43 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     };
   }
 
+  // Salvage deliberately kept its historical awaiting-input marker while the
+  // corrective-loop phase ran, because replaying an ambiguous committed write
+  // is unsafe. At the terminal boundary it is not a genuine user question:
+  // carry the uncertainty as a delivery concern and let the shared audit decide
+  // whether it is an irreversible HOLD or a qualified DISCLOSE.
+  if (result.preterminalDeliveryConcern) {
+    notePreterminalDeliveryConcern(result.preterminalDeliveryConcern);
+    const { preterminalDeliveryConcern: _privateConcern, ...publicResult } = result;
+    result = { ...publicResult, stoppedReason: undefined };
+  }
+
+  const carryMissingReplyConcern = (): void => {
+    if (
+      result.limitHit
+      || result.stoppedReason === 'awaiting-input'
+      || result.stoppedReason === 'pending-approval'
+      || result.stoppedReason === 'cancelled'
+      || result.text.trim().length > 0
+    ) return;
+    notePreterminalDeliveryConcern({
+      reason: 'the model did not produce a terminal reply',
+      missing: ['missing_reply'],
+    });
+  };
+  carryMissingReplyConcern();
+  // A constant is permitted here only because the model call produced no
+  // words. It is a failed-model fallback, not a successful terminal default;
+  // the delivery concern below forces judge review or a conservative hold.
+  const failedModelTerminalFallback = 'The model did not produce a usable final reply for this turn. No recorded work was repeated.';
   let text = result.limitHit
     ? renderLimitHitReply(result.text)
-    : (result.text.trim() || '(no reply produced)');
+    : (result.text.trim() || failedModelTerminalFallback);
+  const refreshTerminalText = (): void => {
+    text = result.limitHit
+      ? renderLimitHitReply(result.text)
+      : (result.text.trim() || failedModelTerminalFallback);
+  };
   // ROOT-CAUSE guard (2026-07-01 Acme-calendar): if the FINAL reply is itself SHAPED like
   // a printed tool call — the model narrated instead of invoking, and the retry corrective
   // didn't fix it (or `limitHit` short-circuited it) — do NOT show the user raw
@@ -3109,7 +3186,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // (side-effect-safe); real tools fired ⇒ pause on the durable state. A mixed turn proves
   // only that SOME work ran, not that the objective finished, and re-running can duplicate
   // side effects.
-  if (!result.limitHit && looksLikeToolCallShape(text)) {
+  const carryMixedNarrationConcern = (): void => {
+    if (
+      result.limitHit
+      || result.stoppedReason === 'awaiting-input'
+      || result.stoppedReason === 'pending-approval'
+      || result.stoppedReason === 'cancelled'
+      || !looksLikeToolCallShape(text)
+    ) return;
     if (result.toolUses.length === 0) {
       // SELF-HEAL, not apology (live 2026-07-01 Discord calendar): a narration
       // give-up means ZERO tools ran, so re-dispatching the whole turn on the
@@ -3123,63 +3207,332 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         'I started to turn that into an action but it did not go through as a real tool call. Say the word and I will run it properly.',
       );
     }
-    // MIXED TURN (live 2026-07-24): real tools ran, then the model printed a later
-    // `<invoke ...>` instead of executing it. Never "salvage" the surrounding prose
-    // into a success — the live prose was only a lead-in and acknowledgement, while
-    // the unexecuted call was `execution_complete`. Deleting the call launders an
-    // incomplete run into a false green. Do not replay either: earlier writes may have
-    // committed. Park on the recorded state and ask before resuming.
+    // MIXED TURN (live 2026-07-24): real tools ran, then the model printed a
+    // later call. Keep the model's bytes private but intact for the independent
+    // judge; a harness-owned replacement would erase the only authored account
+    // before RESUME / ASK / DELIVER gets to evaluate it.
     try {
       appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'narration_mixed_turn_paused', toolUses: result.toolUses.length, preview: text.slice(0, 120) } });
     } catch { /* telemetry best-effort */ }
-    text = 'Some of the work ran, but a later tool call was printed instead of executed, so I cannot claim the task is finished. I did not replay the turn because that could duplicate an action. Should I continue from the recorded state?';
-    result = { ...result, stoppedReason: 'awaiting-input' };
-  }
+    notePreterminalDeliveryConcern({
+      reason: 'a later narrated tool call was not executed after earlier real tool work',
+      missing: ['narrated_tool_call_not_executed'],
+    });
+  };
+  carryMixedNarrationConcern();
   // This lane's inner SDK tools do not cross the dispatch ledger, so a worked
   // Claude-lane action turn would otherwise look evidence-free to the
   // store-driven terminal adjudication (repair below + delivery committer)
   // and fail closed. Record the business tool uses durably BEFORE either
   // consults the stores; control/discovery uses are not work.
+  let recordedSdkToolUseCount = 0;
+  const recordSdkToolUseEvidence = (): void => {
+    const newlyRecorded = result.toolUses.slice(recordedSdkToolUseCount);
+    recordedSdkToolUseCount = result.toolUses.length;
+    if (newlyRecorded.length === 0) return;
+    const recordedToolUses = newlyRecorded.map((name) => name.split('__').pop() ?? name);
+    appendEvent({
+      sessionId,
+      turn: userInputEvent.turn,
+      role: 'system',
+      type: 'sdk_tool_use_recorded',
+      data: { sourceUserSeq: userInputEvent.seq, tools: recordedToolUses.slice(0, 40) },
+    });
+  };
   try {
     // ALL tool uses count: the marker answers "did this turn do anything?",
     // and control-plane work (authoring a workflow, staging an approval) is
     // exactly as real as provider dispatch for that question. Filtering by
     // topology role false-blocked authoring turns when the coordination class
     // moved to control (live 2026-08-11).
-    const recordedToolUses = result.toolUses.map((name) => name.split('__').pop() ?? name);
-    if (recordedToolUses.length > 0) {
-      appendEvent({
-        sessionId,
-        turn: userInputEvent.turn,
-        role: 'system',
-        type: 'sdk_tool_use_recorded',
-        data: { sourceUserSeq: userInputEvent.seq, tools: recordedToolUses.slice(0, 40) },
+    recordSdkToolUseEvidence();
+  } catch { /* evidence recording must never break the terminal */ }
+  let terminalJudgeDisposition: 'deliver' | undefined;
+  let terminalJudgeAlreadyDiscloses = false;
+  let terminalJudgeAsked = false;
+  let terminalJudgeMetadata: Record<string, unknown> = {};
+  let terminalJudgeConcernForCommit: ClaudePreterminalDeliveryConcern | null = null;
+  let terminalJudgeConsecutiveResumes: 0 | 1 = 0;
+
+  const rebuildPreterminalConcernsAfterResume = (): void => {
+    preterminalDeliveryConcern = null;
+    logicalRunScopeId = result.artifactRunScopeId ?? logicalRunScopeId;
+    artifactVerificationPending = logicalRunScopeId
+      ? listUnverifiedRunArtifacts(sessionId, logicalRunScopeId)
+      : [];
+    if (artifactVerificationPending.length > 0) {
+      notePreterminalDeliveryConcern({
+        reason: 'one or more created artifacts could not be verified by exact-ID read-back',
+        missing: artifactVerificationPending.map((artifact) =>
+          `artifact_readback:${artifact.kind}:${artifact.resourceId ?? artifact.slotKey}`),
       });
     }
-  } catch { /* evidence recording must never break the terminal */ }
-  let terminalPresentationRepair: Exclude<
-    PrecommitTerminalPresentationResult,
-    { status: 'unchanged' }
-  > | null = null;
+    if (
+      completionJudgeForSurface
+      && freshExternalWriteRequired
+      && !result.limitHit
+      && result.stoppedReason !== 'awaiting-input'
+      && result.stoppedReason !== 'pending-approval'
+      && !claudeFreshWriteVerified(sessionId, userInputEvent.seq)
+    ) {
+      const status = claudeRequestFreshExternalWriteStatus(sessionId, userInputEvent.seq);
+      notePreterminalDeliveryConcern({
+        reason: claudeFreshWriteGapReason(
+          status as Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>,
+        ),
+        missing: [`fresh_external_write:${status}`],
+      });
+    }
+    const settlementAudit = auditAcceptedSourceSettlementTruth({
+      sessionId,
+      sourceUserSeq: userInputEvent.seq,
+    });
+    if (settlementAudit.facts.uncertainWrites > 0) {
+      notePreterminalDeliveryConcern({
+        reason: 'an external write started but its provider result was not observed',
+        missing: ['external_write_result_unresolved'],
+      });
+    }
+    carryMissingReplyConcern();
+    carryMixedNarrationConcern();
+  };
+
+  // One independent terminal policy gate. A completion candidate with a
+  // concrete gap is judged before presentation repair or publication. RESUME
+  // reopens the existing Claude SDK continuation once; evaluateTerminalDelivery
+  // deterministically converts a second consecutive RESUME into ASK.
   if (
     !result.limitHit
     && result.stoppedReason !== 'awaiting-input'
     && result.stoppedReason !== 'pending-approval'
     && result.stoppedReason !== 'cancelled'
   ) {
+    for (;;) {
+      const concernAtAssessment = currentPreterminalDeliveryConcern();
+      const assessment = assessAcceptedSourceDelivery({
+        sessionId,
+        sourceUserSeq: userInputEvent.seq,
+        proposedReply: text,
+        ...(concernAtAssessment
+          ? {
+              deliveryConcern: {
+                reason: concernAtAssessment.reason,
+                ...(concernAtAssessment.missing?.length
+                  ? { missing: concernAtAssessment.missing }
+                  : {}),
+              },
+            }
+          : {}),
+      });
+      if (!assessment.deliveryGap) break;
+      const concern: ClaudePreterminalDeliveryConcern = {
+        reason: assessment.deliveryGap.reason ?? 'terminal evidence is incomplete',
+        ...(assessment.deliveryGap.missing?.length
+          ? { missing: [...assessment.deliveryGap.missing] }
+          : {}),
+      };
+      const terminalDecision = await evaluateTerminalDelivery({
+        objective: turnObjective,
+        // The empty-reply fallback above is public safety copy, not authored
+        // model output. Keep the judge evidence honest by passing the actual
+        // terminal bytes (empty when the model emitted none).
+        authoredText: result.text.trim(),
+        deliveryConcern: concern,
+        settlementAudit: assessment.settlementAudit,
+        priorConsecutiveResumes: terminalJudgeConsecutiveResumes,
+      }, {
+        ...(terminalDeliveryJudgePortForTest
+          ? { port: terminalDeliveryJudgePortForTest }
+          : {}),
+      });
+      if (terminalDecision.status !== 'decided') break;
+      terminalJudgeMetadata = {
+        terminalJudgeDisposition: terminalDecision.verb,
+        terminalJudgeReason: terminalDecision.reason,
+        terminalJudgeFamily: terminalDecision.judge.judgeFamily,
+        terminalJudgeResumeCount: terminalDecision.consecutiveResumeCount,
+      };
+      if (terminalDecision.verb === 'resume') {
+        terminalJudgeConsecutiveResumes = 1;
+        try {
+          appendEvent({
+            sessionId,
+            turn: userInputEvent.turn,
+            role: 'system',
+            type: 'heartbeat',
+            data: {
+              kind: 'terminal_delivery_resume',
+              reason: terminalDecision.reason,
+              attempt: terminalDecision.consecutiveResumeCount,
+            },
+          });
+        } catch { /* terminal recovery telemetry is best-effort */ }
+        let resumed: ClaudeAgentSdkRunResult | null = null;
+        try {
+          resumed = await runContinuation({
+            prompt: [
+              'TERMINAL DELIVERY RESUME — an independent different-family judge found one gap you can close now.',
+              `Recovery instruction: ${terminalDecision.recoveryInstruction}`,
+              `ORIGINAL USER OBJECTIVE (immutable): ${turnObjective.slice(0, 4000)}`,
+              'Continue within the original authority. Do not repeat an irreversible action or widen the task. Return a newly authored final answer when the gap is resolved; if it cannot be resolved, state the exact blocker.',
+            ].join('\n'),
+            ...runOptions,
+          });
+        } catch (error) {
+          if (error instanceof AgentRuntimeCancelledError) {
+            result = {
+              ...result,
+              text: 'Stopped — you asked me to halt this run. Nothing further will execute; tell me how you\'d like to proceed.',
+              limitHit: false,
+              selfStopped: false,
+              stoppedReason: 'cancelled',
+            };
+          } else {
+            try {
+              appendEvent({
+                sessionId,
+                turn: userInputEvent.turn,
+                role: 'system',
+                type: 'guardrail_tripped',
+                data: {
+                  kind: 'terminal_delivery_resume_failed',
+                  reason: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+                },
+              });
+            } catch { /* recovery failure telemetry is best-effort */ }
+          }
+        }
+        const resumedDispatch = finalizedWorkflowDispatchResponse();
+        if (resumedDispatch) return resumedDispatch;
+        if (resumed) {
+          result = mergeClaudeRunEvidence(result, resumed);
+          reconcileQueuedApprovalEdge();
+          if (
+            result.stoppedReason !== 'awaiting-input'
+            && result.stoppedReason !== 'pending-approval'
+            && modeCanAuthorOrExecute(mode)
+            && isDirectionSeekingQuestion(result.text)
+          ) {
+            result = { ...result, stoppedReason: 'awaiting-input' };
+          }
+          refreshTerminalText();
+          try { recordSdkToolUseEvidence(); } catch { /* evidence marker is best-effort */ }
+          if (
+            result.stoppedReason !== 'awaiting-input'
+            && result.stoppedReason !== 'pending-approval'
+            && result.stoppedReason !== 'cancelled'
+            && !result.limitHit
+          ) {
+            rebuildPreterminalConcernsAfterResume();
+          }
+        }
+        if (
+          result.stoppedReason === 'awaiting-input'
+          || result.stoppedReason === 'pending-approval'
+          || result.stoppedReason === 'cancelled'
+          || result.limitHit
+        ) break;
+        continue;
+      }
+
+      terminalJudgeConsecutiveResumes = 0;
+      terminalJudgeConcernForCommit = concern;
+      if (terminalDecision.verb === 'ask') {
+        text = terminalDecision.publicText;
+        terminalJudgeAsked = true;
+        result = {
+          ...result,
+          text,
+          limitHit: false,
+          selfStopped: false,
+          stoppedReason: 'awaiting-input',
+        };
+      } else {
+        text = terminalDecision.publicText;
+        terminalJudgeAlreadyDiscloses = true;
+        terminalJudgeDisposition = 'deliver';
+        result = {
+          ...result,
+          text,
+          limitHit: false,
+          selfStopped: false,
+          stoppedReason: 'success',
+        };
+      }
+      break;
+    }
+  }
+  let terminalPresentationRepair: Exclude<
+    PrecommitTerminalPresentationResult,
+    { status: 'unchanged' }
+  > | null = null;
+  /** Whether the verification shortfall is one a human must actually look at. */
+  let terminalRepairHolds = false;
+  /** Whether the delivered reply is already the model's own account of the gap. */
+  let terminalRepairDiscloses = false;
+  if (
+    !result.limitHit
+    && result.stoppedReason !== 'awaiting-input'
+    && result.stoppedReason !== 'pending-approval'
+    && result.stoppedReason !== 'cancelled'
+    && terminalJudgeDisposition !== 'deliver'
+  ) {
+    // The sealed repair boundary requires public-safe input. Raw narrated tool
+    // protocol remains intact for the terminal judge above, but an unavailable
+    // judge cannot make that protocol safe to feed through a public-text port.
+    // The constant is used only as a failed-model fallback; a successful repair
+    // still supplies newly model-authored terminal words.
+    const terminalRepairCandidate = publicReplyText(text, failedModelTerminalFallback);
     const repaired = await repairActionTerminalBeforeCommit({
       sessionId,
       sourceUserSeq: userInputEvent.seq,
-      proposedReply: text,
+      proposedReply: terminalRepairCandidate,
       port: terminalPresentationRepairPortForTest
         ?? createAgentsTerminalPresentationRepairPort({ model: getClaudeHeadlessModel(modelId) }),
     });
     if (repaired.status !== 'unchanged') {
       terminalPresentationRepair = repaired;
-      text = repaired.text;
-      result = { ...result, stoppedReason: 'awaiting-input' };
+      // THIS PATH IS A GATE TOO, AND IT SITS UPSTREAM OF THE COMMITTER'S.
+      // It converts the turn to `blocked` before commitTurnOutcome is ever
+      // called, so the single publish gate — which asks whether holding is the
+      // honest act — never sees it. Live 2026-08-12: a background task pulled
+      // its Apify data successfully and was still withheld here, downstream of
+      // every gate fix that day. Ask the same question this lane, so one rule
+      // governs delivery no matter which lane reached the terminal.
+      const settlementAudit = auditAcceptedSourceSettlementTruth({
+        sessionId,
+        sourceUserSeq: userInputEvent.seq,
+      });
+      terminalRepairHolds = deliveryMustHoldForHuman(settlementAudit);
+      if (terminalRepairHolds) {
+        text = repaired.text;
+        // NOT 'awaiting-input': nothing here asks the user anything. The turn
+        // could not verify its own work, so a background run must park BLOCKED
+        // (needs attention) instead of waiting forever on an answer to a
+        // non-question — which is how a task sat 45 minutes on "I haven't been
+        // able to verify the result yet" and then intercepted the next attempt
+        // at the same work (live 2026-08-12).
+        result = { ...result, stoppedReason: 'unverified' };
+      } else if (repaired.status === 'blocked_repaired') {
+        // The model wrote its own account of what it could not confirm. That is
+        // a better disclosure than any sentence the harness owns, so it becomes
+        // the delivered answer. A FALLBACK render is canned prose instead, so
+        // the original reply is kept and the committer attaches its floor.
+        text = repaired.text;
+        terminalRepairDiscloses = true;
+      }
     }
   }
+  const preterminalConcernAtCommit = currentPreterminalDeliveryConcern();
+  const concernAtCommit = terminalJudgeConcernForCommit ?? preterminalConcernAtCommit;
+  const deliveryConcernForCommit = concernAtCommit
+    ? {
+        reason: concernAtCommit.reason,
+        ...(concernAtCommit.missing?.length
+          ? { missing: concernAtCommit.missing }
+          : {}),
+      }
+    : undefined;
 
   // Long-running parity: a turn-budget stop surfaces as a graceful
   // "say continue", not a failure (claude-agent-sdk.ts returns limitHit).
@@ -3230,7 +3583,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           data: {
             question: text,
             purpose: 'clarification',
-            source: 'decision_awaiting',
+            source: terminalJudgeAsked ? 'terminal_delivery_judge' : 'decision_awaiting',
             sourceUserSeq: userInputEvent.seq,
           },
         });
@@ -3250,7 +3603,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         ? 'I need your approval before I can continue.'
         : awaitingInput
           ? 'I need your input before I can continue.'
-          : 'I finished the turn, but no safe final reply was produced.',
+          : failedModelTerminalFallback,
   );
   const identity: TurnIdentity = {
     sessionId,
@@ -3258,7 +3611,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     sourceUserSeq: userInputEvent.seq,
   };
   let outcome: TurnOutcome;
-  if (terminalPresentationRepair) {
+  if (terminalPresentationRepair && terminalRepairHolds) {
     outcome = {
       version: 2,
       id: turnOutcomeId(identity),
@@ -3308,7 +3661,16 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     };
   }
   const terminal = commitTurnOutcome(outcome, {
-    legacyReason: terminalPresentationRepair
+    ...(
+      terminalRepairDiscloses
+      || terminalJudgeAlreadyDiscloses
+      || preterminalConcernAtCommit?.presentationAlreadyDiscloses === true
+        ? { presentationAlreadyDiscloses: true }
+        : {}
+    ),
+    ...(deliveryConcernForCommit ? { deliveryConcern: deliveryConcernForCommit } : {}),
+    ...(terminalJudgeDisposition ? { terminalJudgeDisposition } : {}),
+    legacyReason: terminalPresentationRepair && terminalRepairHolds
       ? 'verification_required'
       : result.limitHit
       ? 'awaiting_continue'
@@ -3335,7 +3697,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           }
         : {}),
       ...(completionVerification ? { verification: completionVerification } : {}),
-      ...(terminalPresentationRepair
+      ...terminalJudgeMetadata,
+      ...(terminalPresentationRepair && terminalRepairHolds
         ? { blockedReason: 'authoritative_terminal_verification_incomplete' }
         : {}),
       ...(result.limitHit ? { transport: 'claude_agent_sdk_brain', maxTurns: sdkMaxTurns } : {}),
@@ -3344,6 +3707,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   text = terminal.presentation.text;
   const terminalEventRecorded = true;
   const terminalEventInserted = terminal.inserted;
+  const responseStoppedReason: AssistantResponse['stoppedReason'] =
+    stoppedReason === 'success' && terminal.presentation.status === 'blocked'
+      ? 'unverified'
+      : stoppedReason;
 
   // The committed public event is the sole live-delivery signal. Emitting the
   // same text through request.onChunk after commit races the terminal event and
@@ -3389,7 +3756,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // paused, ambiguous, and incomplete runs remain useful traces but cannot
   // silently become procedural memory.
   try {
-    if (stoppedReason === 'success' && result.toolUses.length >= 2 && getSession(sessionId)?.kind === 'chat') {
+    if (responseStoppedReason === 'success' && result.toolUses.length >= 2 && getSession(sessionId)?.kind === 'chat') {
       const controllerVerified = claudeRequestHasAcceptedExecutionCompletion(
         sessionId,
         userInputEvent.seq,
@@ -3467,7 +3834,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     text,
     sessionId,
     ...(awaitingApproval && graphApprovalId ? { pendingApprovalId: graphApprovalId } : {}),
-    stoppedReason,
+    stoppedReason: responseStoppedReason,
     turnsUsed: result.toolUses.length > 0 ? result.toolUses.length : 1,
     raw: {
       transport: 'claude_agent_sdk_brain',
@@ -3478,7 +3845,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       usage: result.usage,
       modelUsage: result.modelUsage,
       limitHit: result.limitHit ?? false,
-      stoppedReason,
+      stoppedReason: responseStoppedReason,
       ...(logicalRunScopeId ? { artifactRunScopeId: logicalRunScopeId } : {}),
       ...(toolEconomyState
         ? {

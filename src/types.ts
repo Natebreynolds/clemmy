@@ -75,6 +75,15 @@ export type RunStoppedReason =
   // awaiting_continue WITHOUT burning free auto-continues (auto-continue must
   // never tunnel past a budget park; only a user continue opens a new window).
   | 'token-budget'
+  // The turn produced no publishable terminal because its work could not be
+  // verified. DISTINCT from 'awaiting-input': there is no question for the
+  // user to answer, so a background run must park BLOCKED (needs attention)
+  // rather than as a clarifying question. Parking it as a question left a
+  // task idling 45 minutes with "I haven't been able to verify the result
+  // yet" as its prompt, and it then hijacked the next attempt at the same
+  // work (live 2026-08-12). Forward-only: callers that do not know this
+  // member treat it as success, exactly as before.
+  | 'unverified'
   | 'cancelled'
   | 'error';
 

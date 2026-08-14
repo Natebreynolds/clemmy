@@ -264,8 +264,11 @@ export function buildTerminalReportBody(input: {
       types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
       sinceSeq: input.startSeq,
     }).filter((event) => event.seq <= input.terminalSeq);
-  } catch { /* fall through to the generic line */ }
-  return synthesizeWorkReport(evidence) ?? 'This run finished. Open the conversation for the result.';
+  } catch { /* absence remains absence; deterministic code does not author a report */ }
+  // No terminal prose and no durable work ledger means there is no truthful
+  // report body to synthesize. Stay silent instead of voice-cosplaying a
+  // successful Clementine response.
+  return synthesizeWorkReport(evidence) ?? '';
 }
 
 // ── Arming ──────────────────────────────────────────────────────────────────

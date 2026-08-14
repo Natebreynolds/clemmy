@@ -4717,6 +4717,25 @@ async function finishWorkerRun(
     logger.info({ taskId: task.id, questionId }, 'Background task paused for clarifying input');
     return;
   }
+  if (response.stoppedReason === 'unverified') {
+    // The turn could not verify its own work, and there is no question for
+    // the user to answer. Park BLOCKED (needs attention) — never as a
+    // clarifying question. Parked-as-a-question, this exact state idled 45
+    // minutes showing "I haven't been able to verify the result yet" as its
+    // prompt, and then intercepted the user's next attempt at the same work
+    // because a task for it was already "pending" (live 2026-08-12).
+    const reason = (response.text || 'The run could not verify its own work.').trim().slice(0, 400);
+    clearLedger(task.runSessionId);
+    const blocked = markBackgroundTaskBlocked(task.id, reason, response.text ?? reason);
+    if (!acceptWorkerTransition(blocked, 'blocked')) return;
+    finishRun(run.id, {
+      status: 'failed',
+      message: `Background task ${task.id} stopped without verifiable work.`,
+      outputPreview: response.text,
+    });
+    logger.warn({ taskId: task.id, reason }, 'Background task blocked: unverifiable terminal');
+    return;
+  }
   if (response.stoppedReason === 'token-budget') {
     // Stage 4 — the run's aggregate TOKEN budget window is exhausted. Park
     // awaiting_continue (the docstring's "internal run budget" state) —

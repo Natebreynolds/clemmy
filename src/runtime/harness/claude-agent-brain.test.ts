@@ -19,6 +19,7 @@ const {
   setClaudeAgentSdkBrainRunForTest,
   setClaudeAgentSdkBrainPostTurnHooksForTest,
   setClaudeAgentSdkBrainJudgeForTest,
+  setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest,
   setClaudeAgentSdkBrainSearchFactsHybridForTest,
   setClaudeAgentSdkBrainUnifiedPrimerForTest,
   looksLikeToolNarration,
@@ -31,6 +32,10 @@ const {
   resolveClaudeAgentBrainMaxTurns,
   durableMemoryReceiptAllowsConversationOnly,
 } = brain;
+const UNAVAILABLE_TERMINAL_DELIVERY_JUDGE = {
+  async resolveRoute() { return null; },
+  async run() { throw new Error('unavailable fixture must not run'); },
+} satisfies import('./terminal-delivery-judge.js').TerminalDeliveryJudgePort;
 const {
   accrueSessionTokens,
   appendEvent,
@@ -190,6 +195,7 @@ beforeEach(() => {
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkBrainPostTurnHooksForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
+  setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(UNAVAILABLE_TERMINAL_DELIVERY_JUDGE);
   setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
   setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => ({
     objective: query, hits: [], perStore: {}, answerability: 'insufficient',
@@ -218,6 +224,7 @@ after(() => {
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkBrainPostTurnHooksForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
+  setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(null);
   setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
   setClaudeAgentSdkBrainUnifiedPrimerForTest(null);
   closeProspectiveIntentionsDbForTest();
@@ -2253,8 +2260,8 @@ test('an exact affirmative still recovers the aligned send objective and keeps w
     null,
     'the typed decline boundary must not suppress semantic enrichment for an affirmative answer',
   );
-  assert.equal(response.stoppedReason, 'awaiting-input');
-  assert.match(response.text, /no receipt of it landing after your message/i);
+  assert.equal(response.stoppedReason, 'unverified');
+  assert.equal(response.text, 'Sent it.', 'the hold preserves the model-authored terminal account');
   assert.ok(
     listEvents(sid, { types: ['guardrail_tripped'] })
       .some((event) => event.data.kind === 'request_bound_external_write_missing'),
@@ -3069,9 +3076,8 @@ test('full mode: exhausted completion retries never false-green a stale external
     sessionId: 'brain-request-bound-write-exhausted',
   });
 
-  assert.equal(res.stoppedReason, 'awaiting-input');
-  assert.match(res.text, /no receipt of it landing after your message/i);
-  assert.doesNotMatch(res.text, /^PASS\b/);
+  assert.equal(res.stoppedReason, 'unverified');
+  assert.match(res.text, /^PASS\b/, 'the durable hold preserves the model-authored terminal account');
   assert.ok(
     listEvents('brain-request-bound-write-exhausted', { types: ['guardrail_tripped'] })
       .some((event) => event.data.kind === 'request_bound_external_write_missing'),
@@ -3123,9 +3129,8 @@ test('full mode: the fresh-write terminal floor is phrase-independent and reques
     sessionId,
   });
 
-  assert.equal(res.stoppedReason, 'awaiting-input');
-  assert.match(res.text, /no receipt of it landing after your message/i);
-  assert.doesNotMatch(res.text, /fresh Sheet write is complete/i);
+  assert.equal(res.stoppedReason, 'unverified');
+  assert.equal(res.text, 'The fresh Sheet write is complete.', 'the hold keeps the authored account and carries uncertainty as state');
 });
 
 test('full mode: an accepted execution cannot hide a mixed orphaned write', async () => {
@@ -3200,9 +3205,8 @@ test('full mode: an accepted execution cannot hide a mixed orphaned write', asyn
     sessionId,
   });
 
-  assert.equal(res.stoppedReason, 'awaiting-input');
-  assert.match(res.text, /ambiguous/i);
-  assert.doesNotMatch(res.text, /Sent both emails successfully/i);
+  assert.equal(res.stoppedReason, 'unverified');
+  assert.equal(res.text, 'Sent both emails successfully.', 'the durable hold does not replace model-authored prose');
   const trip = listEvents(sessionId, { types: ['guardrail_tripped'] })
     .find((event) => event.data.kind === 'request_bound_external_write_missing');
   assert.equal(trip?.data.status, 'ambiguous');
@@ -3341,13 +3345,12 @@ test('artifact completion stays honest when exact read-back cannot verify the bi
   });
 
   assert.equal(calls, 2, 'verification is attempted once and never loops');
-  assert.equal(response.stoppedReason, 'awaiting-input');
-  assert.match(response.text, /could not independently verify/i);
-  assert.match(response.text, /did not create a replacement/i);
+  assert.equal(response.stoppedReason, 'unverified');
+  assert.equal(response.text, 'Done — document created.', 'the hold keeps the original model-authored account');
   assert.equal(artifactLedger.listRunArtifacts(sessionId).length, 1, 'no duplicate resource slot');
   assert.equal(artifactLedger.listUnverifiedRunArtifacts(sessionId).length, 1);
   const terminal = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
-  assert.equal(terminal?.data.reason, 'awaiting_user_input');
+  assert.notEqual(terminal?.data.reason, 'awaiting_user_input');
   assert.equal((terminal?.data.artifactVerification as { status?: string } | undefined)?.status, 'pending');
 });
 
@@ -3897,7 +3900,7 @@ test('looksLikeToolNarration flags described-but-not-called tool protocol, ignor
   assert.equal(looksLikeToolNarration('', []), false);
 });
 
-test('mixed turn with a printed later tool call pauses honestly instead of laundering prose into success', async () => {
+test('mixed turn with a printed later tool call reports honestly instead of laundering prose into success', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
@@ -3932,15 +3935,14 @@ test('mixed turn with a printed later tool call pauses honestly instead of laund
   });
 
   assert.equal(calls, 1, 'never replay a mixed turn that may have committed writes');
-  assert.equal(res.stoppedReason, 'awaiting-input');
-  assert.match(res.text, /cannot claim the task is finished/i);
-  assert.match(res.text, /continue from the recorded state/i);
+  assert.equal(res.stoppedReason, 'unverified');
+  assert.match(res.text, /did not produce a usable final reply/i, 'unsafe protocol uses only the failed-model public fallback');
   assert.doesNotMatch(res.text, /Creation test PASSED|workflow is now ENABLED|invoke|call_placeholder/i);
   assert.deepEqual(chunks, [], 'raw model output never reaches the callback');
   assert.doesNotMatch(chunks.join(''), /invoke|parameter|call_placeholder/i, 'protocol never reaches the live stream');
   const terminal = listEvents('brain-mixed-protocol', { types: ['conversation_completed'] }).at(-1);
-  assert.equal(terminal?.data.reason, 'awaiting_user_input');
-  assert.equal(terminal?.data.awaitingUser, true);
+  assert.notEqual(terminal?.data.reason, 'awaiting_user_input');
+  assert.notEqual(terminal?.data.awaitingUser, true);
 });
 
 test('renderClaudeAgentBrainSystemAppend injects the workspace primer for a "space-" session', async () => {

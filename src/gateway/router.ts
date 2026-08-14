@@ -21,7 +21,10 @@ import { parseApprovalIntent } from '../channels/discord-harness.js';
 import { addRunEvent, finishRun, getRun, listRuns, startRun, type RunRecord } from '../runtime/run-events.js';
 import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix, revertWorkflowFix } from '../execution/workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
-import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import {
+  matchesBlockedText,
+  verifyDelivered,
+} from '../runtime/harness/verify-delivered.js';
 import { withModelUsageAttribution } from '../runtime/usage-log.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
@@ -40,7 +43,14 @@ import {
   type EventRow,
   type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
-import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
+import {
+  assessAcceptedSourceDelivery,
+  commitTurnOutcome,
+} from '../runtime/harness/delivery-committer.js';
+import {
+  evaluateTerminalDelivery,
+  type TerminalDeliveryJudgePort,
+} from '../runtime/harness/terminal-delivery-judge.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import {
   PUBLIC_RUN_FAILURE_TEXT,
@@ -366,6 +376,9 @@ function commitGatewayTerminal(input: {
   approvalId?: string;
   legacyReason: string;
   metadata?: Record<string, unknown>;
+  deliveryConcern?: { reason: string; missing?: readonly string[] };
+  presentationAlreadyDiscloses?: boolean;
+  terminalJudgeDisposition?: 'deliver';
 }): ReturnType<typeof commitTurnOutcome> {
   const identity = gatewayTurnIdentity(input.source);
   const common = {
@@ -439,7 +452,102 @@ function commitGatewayTerminal(input: {
   return commitTurnOutcome(outcome, {
     legacyReason: input.legacyReason,
     metadata: input.metadata,
+    ...(input.deliveryConcern ? { deliveryConcern: input.deliveryConcern } : {}),
+    ...(input.presentationAlreadyDiscloses ? { presentationAlreadyDiscloses: true } : {}),
+    ...(input.terminalJudgeDisposition ? { terminalJudgeDisposition: input.terminalJudgeDisposition } : {}),
   });
+}
+
+interface LegacyGatewayCompletionReview {
+  status: GatewayTerminalStatus;
+  text: string;
+  legacyReason: string;
+  metadata: Record<string, unknown>;
+  deliveryConcern?: { reason: string; missing?: readonly string[] };
+  presentationAlreadyDiscloses?: boolean;
+  terminalJudgeDisposition?: 'deliver';
+}
+
+/**
+ * The legacy responder has no live continuation handle after respond() returns,
+ * so it can safely honor an independent ASK or DELIVER but cannot execute a
+ * RESUME instruction. A RESUME verdict (or unavailable judge) therefore keeps
+ * the authored proposal and sends its verification gap through the shared
+ * committer, whose conservative no-judge policy remains authoritative.
+ */
+async function reviewLegacyGatewayCompletion(input: {
+  source: EventRow;
+  objective: string;
+  authoredText: string;
+  deliveryConcern?: { reason: string; missing?: readonly string[] };
+  route?: AssistantRouteDiagnostics;
+  terminalDeliveryJudgePort?: TerminalDeliveryJudgePort;
+}): Promise<LegacyGatewayCompletionReview> {
+  const assessment = assessAcceptedSourceDelivery({
+    sessionId: input.source.sessionId,
+    sourceUserSeq: input.source.seq,
+    proposedReply: input.authoredText,
+    deliveryConcern: input.deliveryConcern,
+  });
+  const base: LegacyGatewayCompletionReview = {
+    status: 'done',
+    text: input.authoredText,
+    legacyReason: 'success',
+    metadata: { ...(input.route ? { route: input.route } : {}) },
+  };
+  if (!assessment.deliveryGap) return base;
+  const concern = {
+    reason: assessment.deliveryGap.reason ?? 'The completed response could not be verified.',
+    ...(assessment.deliveryGap.missing?.length
+      ? { missing: assessment.deliveryGap.missing }
+      : {}),
+  };
+  const concerned: LegacyGatewayCompletionReview = {
+    ...base,
+    deliveryConcern: concern,
+    ...(matchesBlockedText(input.authoredText) ? { presentationAlreadyDiscloses: true } : {}),
+  };
+  const decision = await evaluateTerminalDelivery({
+    objective: input.objective,
+    authoredText: input.authoredText,
+    deliveryConcern: concern,
+    settlementAudit: assessment.settlementAudit,
+    priorConsecutiveResumes: 0,
+  }, {
+    ...(input.terminalDeliveryJudgePort ? { port: input.terminalDeliveryJudgePort } : {}),
+  });
+  if (decision.status !== 'decided') return concerned;
+
+  const metadata = {
+    ...concerned.metadata,
+    terminalJudgeDisposition: decision.verb,
+    terminalJudgeReason: decision.reason,
+    terminalJudgeFamily: decision.judge.judgeFamily,
+    // This carrier cannot honor RESUME, so no strike was actually consumed.
+    terminalJudgeResumeCount: decision.verb === 'resume' ? 0 : decision.consecutiveResumeCount,
+  };
+  if (decision.verb === 'ask') {
+    return {
+      status: 'needs_input',
+      text: decision.publicText,
+      legacyReason: 'awaiting_user_input',
+      metadata,
+    };
+  }
+  if (decision.verb === 'deliver') {
+    return {
+      status: 'done',
+      text: decision.publicText,
+      legacyReason: 'success',
+      metadata,
+      deliveryConcern: concern,
+      presentationAlreadyDiscloses: true,
+      terminalJudgeDisposition: 'deliver',
+    };
+  }
+  // This carrier cannot reopen the completed legacy respond() call. Keeping
+  // the proposal as done+concern lets the one shared rule choose the safe hold.
+  return { ...concerned, metadata };
 }
 
 function gatewayResponseFromTerminal(
@@ -456,6 +564,8 @@ function gatewayResponseFromTerminal(
     ? 'cancelled'
     : presentation.needs?.kind === 'continue'
       ? 'max-turns-with-grace'
+      : presentation.needs?.kind === 'input'
+        ? 'awaiting-input'
       : presentation.status === 'failed' || presentation.status === 'blocked'
         ? 'error'
         : undefined;
@@ -489,9 +599,15 @@ function gatewayResponseFromDispatch(
 
 function terminalStatusForResponse(response: AssistantResponse): GatewayTerminalStatus {
   if (response.pendingApprovalId) return 'needs_approval';
-  if (response.stoppedReason === 'max-turns-with-grace') return 'needs_continue';
+  if (response.stoppedReason === 'awaiting-input'
+    || response.stoppedReason === 'pending-approval') return 'needs_input';
+  if (response.stoppedReason === 'max-turns-with-grace'
+    || response.stoppedReason === 'token-budget') return 'needs_continue';
   if (response.stoppedReason === 'cancelled') return 'cancelled';
   if (response.stoppedReason === 'error') return 'failed';
+  // `unverified` is not a question and must not become a lane-local block.
+  // Keep it as a done proposal so reviewLegacyGatewayCompletion sends its gap
+  // through the shared terminal judge and committer.
   return 'done';
 }
 
@@ -763,8 +879,17 @@ function handleStopActive(request: GatewayRequest): GatewayResponse {
   };
 }
 
+export interface ClementineGatewayOptions {
+  /** Test seam and production override for the independent terminal-delivery
+   * judge. Ordinary callers use resolveBoundaryJudge() through the default port. */
+  terminalDeliveryJudgePort?: TerminalDeliveryJudgePort;
+}
+
 export class ClementineGateway {
-  constructor(private readonly assistant: ClementineAssistant) {}
+  constructor(
+    private readonly assistant: ClementineAssistant,
+    private readonly options: ClementineGatewayOptions = {},
+  ) {}
 
   private handleCommand(command: GatewayCommand, request: GatewayRequest): GatewayResponse {
     if (command.type === 'list_tasks') {
@@ -1090,8 +1215,8 @@ export class ClementineGateway {
         onToolActivity: request.onToolActivity,
       }, (req) => this.assistant.respond(req));
       const route = recordGatewayRoute(run.id, response, request.model);
-      const dispatched = acceptedSourceOutcome(accepted.source);
-      if (dispatched?.kind === 'dispatched') {
+      const sourceOutcomeAfterResponse = acceptedSourceOutcome(accepted.source);
+      if (sourceOutcomeAfterResponse?.kind === 'dispatched') {
         // The foreground bridge has handed this accepted source to the durable
         // workflow graph. Its acknowledgement closes only this physical HTTP /
         // mobile request; the workflow reducer still owns the one later public
@@ -1100,30 +1225,55 @@ export class ClementineGateway {
         finishRun(run.id, {
           status: 'queued',
           message: 'Workflow dispatch accepted; awaiting its durable terminal.',
-          outputPreview: dispatched.presentation.text,
+          outputPreview: sourceOutcomeAfterResponse.presentation.text,
         });
-        return gatewayResponseFromDispatch(dispatched, run.id, {
+        return gatewayResponseFromDispatch(sourceOutcomeAfterResponse, run.id, {
           turnsUsed: response.turnsUsed,
           route,
         });
       }
-      const committed = commitGatewayTerminal({
-        source: accepted.source,
-        status: terminalStatusForResponse(response),
-        text: response.text,
-        approvalId: response.pendingApprovalId,
-        legacyReason: response.pendingApprovalId
-          ? 'awaiting_approval'
-          : response.stoppedReason === 'max-turns-with-grace'
-            ? 'awaiting_continue'
-            : response.stoppedReason ?? 'success',
-        metadata: { ...(route ? { route } : {}) },
-      });
+      if (sourceOutcomeAfterResponse?.kind === 'terminal') {
+        // The harness/bridge already owns publication for this accepted source.
+        // Do not run the legacy verifier or judge over its replaceable transport
+        // response, and do not propose a second terminal merely to lose the
+        // idempotent race. Re-read and return the durable typed winner.
+        const presentation = sourceOutcomeAfterResponse.presentation;
+        const runStatus = presentation.status === 'cancelled'
+          ? 'cancelled'
+          : presentation.status === 'failed' || presentation.status === 'blocked'
+            ? 'failed'
+            : presentation.needs?.kind === 'approval'
+              ? 'awaiting_approval'
+              : presentation.needs?.kind === 'input'
+                ? 'awaiting_input'
+                : presentation.needs?.kind === 'continue'
+                  ? 'failed'
+                  : 'completed';
+        try {
+          settleGatewayAttempt(
+            activeAttempt,
+            runStatus === 'cancelled' ? 'cancelled' : runStatus === 'failed' ? 'failed' : 'completed',
+          );
+        } catch { /* bridge may already have settled the shared physical attempt */ }
+        const durableResponse = gatewayResponseFromTerminal(sourceOutcomeAfterResponse, run.id);
+        finishRun(run.id, {
+          status: runStatus,
+          message: 'The harness committed the durable gateway turn outcome.',
+          outputPreview: durableResponse.text,
+          pendingApprovalId: durableResponse.pendingApprovalId,
+          ...(runStatus === 'failed' ? { error: 'The durable turn did not complete cleanly.' } : {}),
+        });
+        return {
+          ...durableResponse,
+          turnsUsed: response.turnsUsed,
+          ...(route ? { route } : {}),
+        };
+      }
       const runCancelled = response.stoppedReason === 'cancelled';
       // Report-back honesty: a non-pending, non-throwing respond() can still be
-      // a blocked / promised / errored run. Fail-open + suspicious-only; the run
-      // status enum has no 'blocked', so a not-delivered verdict maps to 'failed'
-      // with the reason. The returned text is left as the agent wrote it.
+      // a blocked / promised / errored run. This check must happen before the
+      // first terminal write: a raw legacy response is only a proposal until
+      // verification and (when needed) independent terminal review finish.
       const verdict = response.pendingApprovalId || runCancelled
         ? null
         : await withModelUsageAttribution(
@@ -1134,30 +1284,103 @@ export class ClementineGateway {
             },
             () => verifyDelivered(request.message, response.text, { stoppedReason: response.stoppedReason }),
           );
-      const runFailedNotDelivered = verdict ? !verdict.delivered : false;
+      const responseTerminalStatus = terminalStatusForResponse(response);
+      let terminalProposal: LegacyGatewayCompletionReview = {
+        status: responseTerminalStatus,
+        text: response.text,
+        legacyReason: response.pendingApprovalId
+          ? 'awaiting_approval'
+          : response.stoppedReason === 'max-turns-with-grace'
+            ? 'awaiting_continue'
+            : response.stoppedReason === 'awaiting-input'
+              ? 'awaiting_user_input'
+            : response.stoppedReason ?? 'success',
+        metadata: { ...(route ? { route } : {}) },
+      };
+      if (responseTerminalStatus === 'done') {
+        const verifierConcern = response.stoppedReason === 'unverified'
+          ? {
+              reason: 'the runtime completed with an unverified terminal account',
+              missing: ['unverified_completion'],
+            }
+          : verdict && !verdict.delivered
+            ? {
+                reason: (verdict.reason ?? 'The completed response could not be verified.').slice(0, 800),
+                ...(verdict.blockerType ? { missing: [verdict.blockerType] } : {}),
+              }
+            : undefined;
+        terminalProposal = await withModelUsageAttribution(
+          {
+            sessionId: request.sessionId,
+            sourceUserSeq: accepted.source.seq,
+            attemptId: activeAttempt.attemptId,
+          },
+          () => reviewLegacyGatewayCompletion({
+            source: accepted.source,
+            objective: request.message,
+            authoredText: response.text,
+            deliveryConcern: verifierConcern,
+            route,
+            terminalDeliveryJudgePort: this.options.terminalDeliveryJudgePort,
+          }),
+        );
+      }
+      const committed = commitGatewayTerminal({
+        source: accepted.source,
+        status: terminalProposal.status,
+        text: terminalProposal.text,
+        approvalId: response.pendingApprovalId,
+        legacyReason: terminalProposal.legacyReason,
+        metadata: terminalProposal.metadata,
+        ...(terminalProposal.deliveryConcern
+          ? { deliveryConcern: terminalProposal.deliveryConcern }
+          : {}),
+        ...(terminalProposal.presentationAlreadyDiscloses
+          ? { presentationAlreadyDiscloses: true }
+          : {}),
+        ...(terminalProposal.terminalJudgeDisposition
+          ? { terminalJudgeDisposition: terminalProposal.terminalJudgeDisposition }
+          : {}),
+      });
+      const runAwaitingInput = committed.presentation.status === 'needs_input'
+        && committed.presentation.needs?.kind === 'input';
+      // A judge-authored ASK is a real input park, and a judge/shared-rule
+      // DELIVER is a qualified completion. Only a remaining blocked/failed
+      // verification result maps to this timeline's nearest non-completion.
+      const runFailedNotDelivered = committed.presentation.status === 'failed'
+        || committed.presentation.status === 'blocked'
+        || committed.presentation.needs?.kind === 'continue';
       finishRun(run.id, {
         status: runCancelled
           ? 'cancelled'
           : response.pendingApprovalId
-          ? 'awaiting_approval'
-          : runFailedNotDelivered
-            ? 'failed'
-            : 'completed',
+            ? 'awaiting_approval'
+            : runAwaitingInput
+              ? 'awaiting_input'
+              : runFailedNotDelivered
+                ? 'failed'
+                : 'completed',
         message: runCancelled
           ? 'Assistant run stopped by request.'
           : response.pendingApprovalId
-          ? `Approval required: ${response.pendingApprovalId}.`
-          : runFailedNotDelivered
-            ? `Assistant run did not finish cleanly: ${verdict?.reason ?? 'no verifiable result'}`
-            : 'Assistant run completed.',
-        outputPreview: response.text,
+            ? `Approval required: ${response.pendingApprovalId}.`
+            : runAwaitingInput
+              ? 'Assistant run is waiting for user input.'
+              : runFailedNotDelivered
+                ? `Assistant run did not finish cleanly: ${verdict?.reason ?? 'no verifiable result'}`
+                : 'Assistant run completed.',
+        outputPreview: committed.presentation.text,
         pendingApprovalId: response.pendingApprovalId,
         ...(runFailedNotDelivered ? { error: verdict?.reason ?? 'Run did not finish cleanly.' } : {}),
       });
       try {
         settleGatewayAttempt(
           activeAttempt,
-          runCancelled ? 'cancelled' : committed.presentation.status === 'failed' ? 'failed' : 'completed',
+          runCancelled
+            ? 'cancelled'
+            : committed.presentation.status === 'failed' || committed.presentation.status === 'blocked'
+              ? 'failed'
+              : 'completed',
         );
       } catch { /* bridge may already have settled the shared physical attempt */ }
       return {

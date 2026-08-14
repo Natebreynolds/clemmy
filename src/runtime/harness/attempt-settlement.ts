@@ -29,6 +29,7 @@ import {
   type LogicalCallSettlementResult,
 } from './logical-call-settlement-store.js';
 import { beginPhysicalDispatch, settlePhysicalDispatch } from './dispatch-ledger.js';
+import { actionTopologyRoleForRuntimeCall } from './tool-effect.js';
 
 export { normalizeCallableArguments, toResultHandle };
 
@@ -330,6 +331,27 @@ function signalsFromThrown(thrown: unknown): AttemptSignals {
   return signals;
 }
 
+/** Reason token of a carrier-serialized provider refusal. */
+function providerNotStartedReason(result: unknown, toolName?: string): string | null {
+  const candidates: unknown[] = [result];
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const wrapper = result as Record<string, unknown>;
+    candidates.push(wrapper.output, wrapper.text, wrapper.preview, wrapper.result);
+  }
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const match = /^\s*\[provider-dispatch:not-started:([a-z0-9_-]+)\]/i.exec(candidate);
+    if (match) return match[1]!.toLowerCase();
+    if (toolName === 'call_tool' || toolName === 'work_call') {
+      try {
+        const parsed = JSON.parse(candidate) as { error?: unknown };
+        if (parsed?.error === 'arg_validation') return 'invalid-args';
+      } catch { /* not a carrier refusal envelope */ }
+    }
+  }
+  return null;
+}
+
 function hasTaskIdentity(input: SettleToolAttemptInput): input is SettleToolAttemptInput & {
   sessionId: string; sourceUserSeq: number;
 } {
@@ -428,6 +450,13 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     // A lane's own nominal knowledge outranks anything extracted here.
     ...(input.signals ?? {}),
   };
+  // A carrier-serialized not-started marker is typed pre-dispatch truth.
+  const notStartedReason = providerNotStartedReason(input.result, input.toolName);
+  if (notStartedReason) {
+    extracted.preDispatch = true;
+    if (notStartedReason === 'invalid-args') extracted.argumentValidationFailed = true;
+    else extracted.policyRefused = true;
+  }
   if (input.mutating && extracted.acknowledged === undefined) {
     // A mutation that threw was never acknowledged — and a mutation whose
     // envelope merely says "not successful" has not proved that nothing landed
@@ -472,6 +501,13 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     throw new ToolAttemptSettlementAuthorityError('storage_error', bindingState.reason);
   }
   const binding = bindingState.status === 'ok' ? bindingState.binding : undefined;
+  const topologyRole = actionTopologyRoleForRuntimeCall(input.toolName, input.args);
+  if (binding && topologyRole === 'control') {
+    throw new ToolAttemptSettlementAuthorityError(
+      'conflict',
+      'a control call cannot settle or discharge immutable business work',
+    );
+  }
   if (
     binding
     && input.requirementId
@@ -483,7 +519,9 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     );
   }
   const requirementId = binding?.requirementId ?? input.requirementId;
-  const businessCall = binding ? true : input.businessCall === true;
+  const businessCall = topologyRole === 'control'
+    ? false
+    : binding ? true : input.businessCall === true;
   const continuesRequirement = input.continuesRequirement === true;
 
   const priorCrossingCount = durablePhysicalCrossingCount(identity);

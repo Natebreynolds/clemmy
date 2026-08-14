@@ -27,6 +27,7 @@ import { adjudicateTerminalForTaskSync, type TerminalVerdict } from './terminal-
 import { replyClaimsCompletedWork } from './objective-judge.js';
 import { prepareDurableMemoryIntakeHostCompletion } from './durable-memory-intake-receipt.js';
 import { listEvents, openEventLog } from './eventlog.js';
+import { resolveWriteEvidence } from './work-report.js';
 import { summarizeWorkManifest, type WorkManifestSummary } from './work-manifest.js';
 
 export type AcceptedTaskTerminalPreparation =
@@ -184,32 +185,46 @@ function sourceHasWorkEvidence(input: {
 }): boolean {
   try {
     const db = openEventLog();
-    // A pre-dispatch refusal settles an ATTEMPT, not work — a turn whose only
-    // settlement is its own corrective refusal has no work evidence.
+    // Only completed BUSINESS settlement is work evidence. A control call,
+    // transport marker, crossing, refusal, retry, or in-flight attempt cannot
+    // authorize terminal success.
     const settled = db.prepare(`
       SELECT 1 FROM logical_call_settlements
        WHERE session_id = ? AND source_user_seq = ?
-         AND execution_kind != 'refused_pre_dispatch'
+         AND business_call = 1
+         AND continues_requirement = 0
+         AND (
+           outcome_kind = 'succeeded'
+           OR (outcome_kind = 'empty_result' AND mutating = 0)
+         )
        LIMIT 1
     `).get(input.sessionId, input.sourceUserSeq);
     if (settled !== undefined) return true;
-    const dispatched = db.prepare(`
-      SELECT 1 FROM physical_dispatches
-       WHERE session_id = ? AND source_user_seq = ?
-       LIMIT 1
-    `).get(input.sessionId, input.sourceUserSeq);
-    if (dispatched !== undefined) return true;
-    // Legacy external-write rows carry no source binding; scope by position
-    // (after the accepted input) the same way the salvage watermark does.
-    // sdk_tool_use_recorded is the Claude lane's durable marker — its inner
-    // SDK tools do not cross the dispatch ledger.
-    return listEvents(input.sessionId, {
-      types: ['external_write', 'external_write_succeeded', 'sdk_tool_use_recorded'],
-      sinceSeq: input.sourceUserSeq,
-    }).length > 0;
+    // A CONFIRMED external write is equally durable work evidence: the
+    // artifact/effect lanes settle through write-evidence records rather than
+    // logical settlements. The same resolution the settlement audit trusts
+    // decides here.
+    const sourceEvents = turnEventsForWorkEvidence(input.sessionId, input.sourceUserSeq);
+    if (resolveWriteEvidence(sourceEvents).confirmed.length > 0) return true;
+    // The Claude SDK lane records its tool activity as sdk_tool_use_recorded.
+    // Any recorded tool use keeps that lane's completion-judge authority;
+    // only a zero-tool claim stays held.
+    return sourceEvents.some((event) => {
+      if (event.type !== 'sdk_tool_use_recorded') return false;
+      const tools = (event.data as { tools?: unknown }).tools;
+      return Array.isArray(tools) && tools.some((tool) => typeof tool === 'string' && tool.trim());
+    });
   } catch {
     return false;
   }
+}
+
+function turnEventsForWorkEvidence(sessionId: string, sourceUserSeq: number) {
+  const events = listEvents(sessionId, { sinceSeq: sourceUserSeq - 1 });
+  const nextSource = events.find((event) =>
+    event.seq > sourceUserSeq && event.type === 'user_input_received');
+  return events.filter((event) =>
+    event.seq >= sourceUserSeq && (!nextSource || event.seq < nextSource.seq));
 }
 
 function verdictResult(

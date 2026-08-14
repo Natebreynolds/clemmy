@@ -9,6 +9,7 @@
  */
 import { createHash } from 'node:crypto';
 import {
+  AcceptedTaskTerminalPublicationError,
   appendTerminalEventOnce,
   listEvents,
   type EventRow,
@@ -19,6 +20,7 @@ import {
   presentationEventForOutcome,
   presentationEventFromCompletionData,
   type PresentationEvent,
+  type TurnEvidenceKind,
   type TurnIdentity,
   type TurnNeed,
   type TurnOutcome,
@@ -31,6 +33,11 @@ import type { ExactVerifiedReadCompletionCertificate } from './verified-read-com
 import { loadManifestState } from './obligation-store.js';
 import { adjudicateTerminalForTaskSync } from './terminal-truth.js';
 import { prepareAcceptedTaskTerminal } from './accepted-task-terminal-preparation.js';
+import {
+  auditAcceptedSourceSettlementTruth,
+  type AcceptedSourceSettlementAudit,
+} from './accepted-source-settlement-audit.js';
+import { workEvidenceForAcceptedSource, type WorkEvidenceRef } from './work-manifest.js';
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -45,6 +52,16 @@ const DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
   'steps',
   'missingReply',
   'blockedReason',
+  'verificationDetail',
+  'verificationMissing',
+  'deliveryDisclosure',
+  'terminalRepairStatus',
+  'terminalRepairGrantId',
+  'terminalMissing',
+  'terminalJudgeDisposition',
+  'terminalJudgeReason',
+  'terminalJudgeFamily',
+  'terminalJudgeResumeCount',
   'limitKind',
   'lastDecisionSummary',
   'verification',
@@ -184,30 +201,260 @@ export interface DeliveryCommitOptions {
   /** Compatibility classifier for legacy readers. Typed status remains the
    * control-plane authority; this value is never presentation text. */
   legacyReason?: string;
+  /**
+   * The caller already replaced the reply with a MODEL-AUTHORED account of what
+   * could not be verified. The floor is met by better words than this module
+   * owns, so the generic sentence is not appended on top of it.
+   */
+  presentationAlreadyDiscloses?: boolean;
+  /** A completed caller reached its own verification/judge gap before this
+   * boundary. It must still propose `done`; the shared delivery rule decides
+   * centrally whether that gap is a disclosure or a human hold. */
+  deliveryConcern?: {
+    reason: string;
+    missing?: readonly string[];
+  };
+  /** A different-family terminal judge explicitly chose to deliver this
+   * qualified completion. When absent, the judge was unavailable or this
+   * legacy carrier has not reached the async gate, so the old conservative
+   * hold policy remains the fallback. */
+  terminalJudgeDisposition?: 'deliver';
 }
 
-function unverifiedCompletionOutcome(outcome: Extract<TurnOutcome, { status: 'done' }>): TurnOutcome {
+export type DeliveryGap = { reason?: string; missing?: readonly string[] };
+
+function mergeDeliveryGaps(...values: Array<DeliveryGap | null | undefined>): DeliveryGap | null {
+  const reasons = [...new Set(values
+    .map((value) => value?.reason?.replace(/\s+/g, ' ').trim())
+    .filter((value): value is string => Boolean(value)))];
+  const missing = [...new Set(values.flatMap((value) => value?.missing ?? []))].slice(0, 16);
+  if (reasons.length === 0 && missing.length === 0) return null;
   return {
-    version: 2,
-    id: outcome.id,
-    identity: outcome.identity,
-    status: 'blocked',
-    resumable: true,
-    presentation: {
-      kind: 'blocked',
-      text: 'I’m not marking this finished yet because I still need to verify the result.',
-    },
-    ...(outcome.evidenceRefs ? { evidenceRefs: outcome.evidenceRefs } : {}),
+    ...(reasons.length > 0 ? { reason: reasons.join('; ').slice(0, 800) } : {}),
+    ...(missing.length > 0 ? { missing } : {}),
   };
 }
 
-function unverifiedCompletionOptions(options: DeliveryCommitOptions): DeliveryCommitOptions {
+export interface AcceptedSourceDeliveryAssessment {
+  settlementAudit: AcceptedSourceSettlementAudit;
+  deliveryGap: DeliveryGap | null;
+}
+
+/**
+ * Read the exact same terminal facts the synchronous committer will enforce.
+ * Async brain lanes use this before publication so a different-family judge
+ * can choose RESUME / ASK / DELIVER without reimplementing the manifest and
+ * settlement rules. The committer calls it again at the final write boundary;
+ * durable state—not an earlier snapshot—still wins any race.
+ */
+export function assessAcceptedSourceDelivery(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  proposedReply: string;
+  deliveryConcern?: DeliveryGap | null;
+}): AcceptedSourceDeliveryAssessment {
+  const settlementAudit = auditAcceptedSourceSettlementTruth({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+  });
+  const preparation = settlementAudit.status === 'clean'
+    ? prepareAcceptedTaskTerminal({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        proposedReply: input.proposedReply,
+      })
+    : { status: 'needs_verification' as const, reason: settlementAudit.reason };
+  let deliveryGap = mergeDeliveryGaps(input.deliveryConcern);
+  if (preparation.status !== 'ready' && preparation.status !== 'unstaged') {
+    deliveryGap = mergeDeliveryGaps(deliveryGap, {
+      ...('reason' in preparation && preparation.reason ? { reason: preparation.reason } : {}),
+      ...('missing' in preparation && preparation.missing ? { missing: preparation.missing } : {}),
+    });
+  } else if (preparation.status === 'unstaged') {
+    // Compatibility for historical manifests created before expected-work
+    // staging. A source that has a work contract never enters this branch.
+    const manifest = loadManifestState(input.sessionId, input.sourceUserSeq);
+    if (manifest.status !== 'missing') {
+      const verdict = adjudicateTerminalForTaskSync({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+      });
+      if (verdict.status !== 'done') {
+        deliveryGap = mergeDeliveryGaps(deliveryGap, {
+          reason: verdict.facts.join('; ') || 'authoritative terminal evidence is incomplete',
+          missing: verdict.missing,
+        });
+      }
+    }
+  }
+  return { settlementAudit, deliveryGap };
+}
+
+function publicEvidenceKind(kind: WorkEvidenceRef['kind']): TurnEvidenceKind {
+  switch (kind) {
+    case 'artifact': return 'artifact';
+    case 'source': return 'source';
+    case 'external_write':
+    case 'readback': return 'external_receipt';
+    case 'tool_result':
+    case 'worker_result':
+    case 'other': return 'tool_result';
+  }
+}
+
+/**
+ * ONE GATE, AND IT DECIDES WHETHER A HUMAN CHECKS — NOT WHETHER YOU SEE ANYTHING.
+ *
+ * Roughly thirty independent conditions sit on this path (six settlement-audit
+ * statuses, seventeen matcher conflict kinds, eight preparation refusals), and
+ * every one of them could independently withhold a completed turn. ANDed
+ * together at PUBLISH — after the work is done and the money spent — they
+ * delivered about as often as that arithmetic predicts. Six consecutive live
+ * runs on 2026-08-12 each finished their actual job and were each refused by a
+ * DIFFERENT gate; not one of those refusals protected the user from anything.
+ *
+ * So the checks all still run, but the asynchronous terminal judge chooses
+ * RESUME, ASK, or DELIVER from those facts. The sole deterministic HOLD floor
+ * is an ambiguous IRREVERSIBLE effect (it may have sent; a human must inspect
+ * state). A missing judge retains the older conservative policy so an outage
+ * cannot make an existing carrier less safe. The precise concern keeps
+ * travelling as metadata for forensics.
+ */
+export function deliveryMustHoldForHuman(audit: AcceptedSourceSettlementAudit): boolean {
+  // The sole deterministic floor: an irreversible effect may have happened
+  // and nobody can prove which state the world is in. A human must inspect it;
+  // no model verdict is authority to repeat or wave away that ambiguity.
+  return audit.status === 'uncertain_write';
+}
+
+/** A missing/failed/deliberately unavailable terminal judge must not make an
+ * existing carrier less safe. This is the pre-judge policy, isolated from the
+ * one deterministic floor so normal judged turns no longer inherit four
+ * hard-coded dispositions. */
+function deliveryMustHoldWhenJudgeUnavailable(audit: AcceptedSourceSettlementAudit): boolean {
+  return deliveryMustHoldForHuman(audit)
+    || audit.status === 'in_flight'
+    || audit.status === 'storage_error'
+    // A source where NOTHING worked has no answer to qualify. Disclosure only
+    // makes sense alongside real work: attaching a caveat to a reply whose every
+    // business call failed would publish a bare claim with a footnote, which is
+    // worse than holding. Same earned-exemption rule the settlement audit uses.
+    || audit.status === 'no_business_evidence'
+    || (
+      audit.facts.successfulBusinessSettlements === 0
+      && audit.facts.successfulSdkBusinessResults === 0
+      && audit.facts.confirmedWrites === 0
+    );
+}
+
+/** Durable partial evidence belongs to the turn however it publishes. A
+ * qualified completion that dropped its refs would be a weaker terminal than
+ * the hold it replaced. */
+function withDurablePartialEvidence(
+  outcome: Extract<TurnOutcome, { status: 'done' }>,
+): NonNullable<TurnOutcome['evidenceRefs']> {
+  let durablePartial: NonNullable<TurnOutcome['evidenceRefs']> = [];
+  try {
+    durablePartial = workEvidenceForAcceptedSource({
+      sessionId: outcome.identity.sessionId,
+      sourceUserSeq: outcome.identity.sourceUserSeq,
+    }).map((ref) => ({ kind: publicEvidenceKind(ref.kind), id: ref.ref }));
+  } catch { /* absence/unreadability cannot manufacture presentation evidence */ }
+  return [...(outcome.evidenceRefs ?? []), ...durablePartial]
+    .filter((ref, index, all) => all.findIndex((candidate) =>
+      candidate.kind === ref.kind && candidate.id === ref.id && candidate.uri === ref.uri) === index)
+    .slice(0, 100);
+}
+
+/** Publish the exact model/judge-authored answer. Qualification is DATA in the
+ * terminal metadata; the synchronous committer must never improvise a second
+ * Clementine sentence. Legacy callers without an async judge retain their
+ * authored text and the conservative status fallback. */
+function disclosedCompletionOutcome(
+  outcome: Extract<TurnOutcome, { status: 'done' }>,
+  _alreadyDiscloses: boolean,
+): TurnOutcome {
+  const evidenceRefs = withDurablePartialEvidence(outcome);
+  return {
+    ...outcome,
+    ...(evidenceRefs.length > 0 ? { evidenceRefs } : {}),
+  };
+}
+
+function disclosedCompletionOptions(
+  options: DeliveryCommitOptions,
+  detail?: { reason?: string; missing?: readonly string[] },
+): DeliveryCommitOptions {
+  const metadata = { ...(options.metadata ?? {}) };
+  // A read-lane completion certificate asserts verification this turn does not
+  // have. Publishing the answer never manufactures that proof.
+  delete metadata.verifiedReadCompletionReceipt;
+  metadata.deliveryDisclosure = 'unverified_completion';
+  if (detail?.reason) {
+    metadata.verificationDetail = String(detail.reason).replace(/\s+/g, ' ').slice(0, 400);
+  }
+  if (detail?.missing?.length) {
+    metadata.verificationMissing = detail.missing.slice(0, 8);
+  }
+  return { metadata };
+}
+
+function unverifiedCompletionOutcome(
+  outcome: Extract<TurnOutcome, { status: 'done' }>,
+  /** The reply is already the model's own account of the shortfall. Holding the
+   * turn is no reason to throw those words away for a canned line — the hold
+   * deserves the better explanation just as much as the completion does. */
+  _keepAuthoredText = false,
+): TurnOutcome {
+  const evidenceRefs = withDurablePartialEvidence(outcome);
+  // There is no safe generic substitute for a real model's account. Even on
+  // the judge-unavailable fallback, preserve the only authored terminal rather
+  // than replacing Clementine's voice in deterministic code. Async lanes mark
+  // their authored disclosure explicitly; this fallback
+  // covers legacy carriers too.
+  if (outcome.presentation.text.trim().length > 0) {
+    return {
+      version: 2,
+      id: outcome.id,
+      identity: outcome.identity,
+      status: 'blocked',
+      resumable: true,
+      presentation: { kind: 'blocked', text: outcome.presentation.text },
+      ...(evidenceRefs.length > 0 ? { evidenceRefs } : {}),
+    };
+  }
+  throw new InvalidTurnOutcomeError(
+    'An unverified completion has no model- or judge-authored public text.',
+  );
+}
+
+function unverifiedCompletionOptions(
+  options: DeliveryCommitOptions,
+  detail?: { reason?: string; missing?: readonly string[] },
+): DeliveryCommitOptions {
   const metadata = { ...(options.metadata ?? {}) };
   // A read-lane completion certificate cannot accompany a terminal that the
   // authoritative manifest has refused as complete.
   delete metadata.verifiedReadCompletionReceipt;
-  metadata.blockedReason = 'verification_required';
-  return { metadata, legacyReason: 'verification_required' };
+  const verificationDetail = detail?.reason
+    ? String(detail.reason).replace(/\s+/g, ' ').slice(0, 400)
+    : null;
+  // Preserve the upstream verifier's concrete diagnosis in the compatibility
+  // field. `verification_required` alone erased exactly the information the
+  // old lane-local hold exposed, making the one-gate migration a forensic
+  // regression even though the typed status stayed correct.
+  metadata.blockedReason = verificationDetail ?? 'verification_required';
+  // Name the refusing gate as DATA (never presentation text): two live
+  // incidents (2026-08-11 shell, 2026-08-12 calendar) each cost an hour of
+  // database forensics because the terminal said only verification_required.
+  if (verificationDetail) metadata.verificationDetail = verificationDetail;
+  if (detail?.missing?.length) {
+    metadata.verificationMissing = detail.missing.slice(0, 8);
+  }
+  return {
+    metadata,
+    legacyReason: options.legacyReason ?? 'verification_required',
+  };
 }
 
 interface DurableTurnOutcomeProjection {
@@ -481,37 +728,40 @@ export function commitTurnOutcome(
   assertExactAcceptedSource(requested.identity);
   let effectiveOutcome = outcome;
   let effectiveOptions = options;
+  /** Set when a verification shortfall was DISCLOSED rather than held, so a
+   * durable publication invariant can still send it back to the hold. */
+  let disclosedInsteadOfHeld = false;
+  let disclosureDetail: { reason?: string; missing?: readonly string[] } = {};
   // An immutable expected-work contract is the staged cut-over marker. Before
   // publishing `done`, derive the manifest and redeem host evidence from the
   // exact settled calls. Historical/action-deferred sources retain their
   // existing behavior; they never borrow staged authority by accident.
   if (outcome.status === 'done') {
-    const preparation = prepareAcceptedTaskTerminal({
+    const assessment = assessAcceptedSourceDelivery({
       sessionId: requested.identity.sessionId,
       sourceUserSeq: requested.identity.sourceUserSeq,
       proposedReply: requested.text,
+      deliveryConcern: options.deliveryConcern,
     });
-    if (preparation.status !== 'ready' && preparation.status !== 'unstaged') {
-      effectiveOutcome = unverifiedCompletionOutcome(outcome);
-      effectiveOptions = unverifiedCompletionOptions(options);
-    } else if (preparation.status === 'unstaged') {
-      // Compatibility for historical manifests created before expected-work
-      // staging. A source that has a work contract never enters this branch.
-      const manifest = loadManifestState(
-        requested.identity.sessionId,
-        requested.identity.sourceUserSeq,
-      );
-      if (manifest.status === 'missing') {
-        // Historical/action-deferred source: preserve the existing behavior.
+    const { settlementAudit, deliveryGap } = assessment;
+    if (deliveryGap) {
+      const mustHold = options.terminalJudgeDisposition === 'deliver'
+        ? deliveryMustHoldForHuman(settlementAudit)
+        : deliveryMustHoldWhenJudgeUnavailable(settlementAudit);
+      if (mustHold) {
+        effectiveOutcome = unverifiedCompletionOutcome(
+          outcome,
+          options.presentationAlreadyDiscloses === true,
+        );
+        effectiveOptions = unverifiedCompletionOptions(options, deliveryGap);
       } else {
-        const verdict = adjudicateTerminalForTaskSync({
-          sessionId: requested.identity.sessionId,
-          sourceUserSeq: requested.identity.sourceUserSeq,
-        });
-        if (verdict.status !== 'done') {
-          effectiveOutcome = unverifiedCompletionOutcome(outcome);
-          effectiveOptions = unverifiedCompletionOptions(options);
-        }
+        effectiveOutcome = disclosedCompletionOutcome(
+          outcome,
+          options.presentationAlreadyDiscloses === true,
+        );
+        effectiveOptions = disclosedCompletionOptions(options, deliveryGap);
+        disclosedInsteadOfHeld = true;
+        disclosureDetail = deliveryGap;
       }
     }
   }
@@ -524,13 +774,48 @@ export function commitTurnOutcome(
     sessionId: proposed.identity.sessionId,
     sourceUserSeq: proposed.identity.sourceUserSeq,
   });
-  const data = completionDataForTurnOutcome(effectiveOutcome, effectiveOptions);
-  const terminal = appendTerminalEventOnce({
-    sessionId: proposed.identity.sessionId,
-    turn: proposed.identity.turn,
-    role: 'system',
-    data,
-  }, proposed.outcomeId);
+  let data = completionDataForTurnOutcome(effectiveOutcome, effectiveOptions);
+  let terminal;
+  try {
+    terminal = appendTerminalEventOnce({
+      sessionId: proposed.identity.sessionId,
+      turn: proposed.identity.turn,
+      role: 'system',
+      data,
+    }, proposed.outcomeId);
+  } catch (error) {
+    // A `done` terminal is not only a presentation: it CLOSES the accepted-task
+    // authority, and the durable state machine refuses to close one that never
+    // entered manifested verification. That invariant is older and deeper than
+    // the disclosure rule, so the database stays authoritative here rather than
+    // this module re-deriving the condition and drifting from it. A turn that
+    // cannot legally complete is genuinely incomplete: fall back to the hold.
+    if (!disclosedInsteadOfHeld || !(error instanceof AcceptedTaskTerminalPublicationError)) throw error;
+    effectiveOutcome = unverifiedCompletionOutcome(
+      outcome as Extract<TurnOutcome, { status: 'done' }>,
+      options.presentationAlreadyDiscloses === true,
+    );
+    effectiveOptions = unverifiedCompletionOptions(options, disclosureDetail);
+    effectiveOptions = {
+      ...effectiveOptions,
+      metadata: {
+        ...(effectiveOptions.metadata ?? {}),
+        // The shared rule selected DISCLOSE, then the durable accepted-task
+        // state machine correctly refused to close an unmanifested authority.
+        // Keep that two-stage disposition observable instead of making it look
+        // indistinguishable from a direct human hold.
+        deliveryDisclosure: 'state_machine_hold',
+      },
+    };
+    const heldPresentation = presentationEventForOutcome(effectiveOutcome);
+    data = completionDataForTurnOutcome(effectiveOutcome, effectiveOptions);
+    terminal = appendTerminalEventOnce({
+      sessionId: heldPresentation.identity.sessionId,
+      turn: heldPresentation.identity.turn,
+      role: 'system',
+      data,
+    }, heldPresentation.outcomeId);
+  }
   // THE FENCE IS WRITTEN WHERE THE FOREGROUND ACTUALLY STOPS. Detach cannot
   // assert it: at that point the run is still executing and may yet complete an
   // in-flight tool call. Only the committer knows the final model/tool boundary

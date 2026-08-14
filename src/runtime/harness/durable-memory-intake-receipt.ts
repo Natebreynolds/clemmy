@@ -260,9 +260,18 @@ function deriveExactEvidence(input: {
     const message = acceptedSourceText(sourceData);
     if (!message) return { status: 'conflict', reason: 'accepted user source has no display text' };
     const normalizedMessage = normalizeMessage(message);
-    const candidates = extractAutoMemoryCandidates(message, 3);
-    if (candidates.length === 0) {
-      return { status: 'ineligible', reason: 'accepted source produced no durable memory candidates' };
+    const graphInputHash = expected.graph.source?.inputHash;
+    let captureMessage = digest(normalizedMessage) === graphInputHash
+      ? normalizedMessage
+      : '';
+    let candidates = captureMessage
+      ? extractAutoMemoryCandidates(captureMessage, 3)
+      : [];
+    // Ordinary non-memory actions remain ineligible without demanding a
+    // memory episode. Only a graph whose semantic input differs from the full
+    // accepted sentence needs the episode-backed fresh-clause recovery below.
+    if (captureMessage && candidates.length === 0) {
+      return { status: 'ineligible', reason: 'accepted graph input produced no durable memory candidates' };
     }
     const sourceEventIdentity = `user-source:${input.sourceUserSeq}`;
     const callId = `auto-capture:${sourceEventIdentity}`;
@@ -282,12 +291,36 @@ function deriveExactEvidence(input: {
       };
     }
     const episode = episodes[0]!;
+    // A compound clarification answer keeps the complete conversational
+    // sentence in the immutable accepted event, while the verified turn graph
+    // and auto-memory admission intentionally operate on only the independent
+    // fresh clause. Bind that narrower capture to the graph's content address
+    // instead of re-learning (or requiring) the declined parent clause. The
+    // episode bytes are never sufficient on their own: they must hash to the
+    // accepted graph semantic input and remain an exact substring of the
+    // accepted user message.
+    const normalizedEpisodeMessage = normalizeMessage(episode.evidence_excerpt ?? '');
+    captureMessage ||= normalizedEpisodeMessage
+        && normalizedMessage.includes(normalizedEpisodeMessage)
+        && digest(normalizedEpisodeMessage) === graphInputHash
+        ? normalizedEpisodeMessage
+        : '';
+    if (!captureMessage) {
+      return {
+        status: 'conflict',
+        reason: 'auto-capture episode is not bound to the accepted graph semantic input',
+      };
+    }
+    candidates = extractAutoMemoryCandidates(captureMessage, 3);
+    if (candidates.length === 0) {
+      return { status: 'ineligible', reason: 'accepted graph input produced no durable memory candidates' };
+    }
     let metadata: unknown;
     try { metadata = JSON.parse(episode.metadata_json); } catch {
       return { status: 'conflict', reason: 'auto-capture episode metadata is malformed' };
     }
     const expectedMetadata = { candidateCount: candidates.length, sourceEventId: sourceEventIdentity };
-    const expectedContentHash = digest(normalizedMessage);
+    const expectedContentHash = digest(captureMessage);
     if (
       episode.kind !== 'user_turn'
       || episode.source_app !== 'Conversation'
@@ -296,7 +329,7 @@ function deriveExactEvidence(input: {
       || episode.source_uri !== sourceUri
       || episode.subtype !== 'auto_capture'
       || episode.status !== 'available'
-      || episode.evidence_excerpt !== normalizedMessage
+      || episode.evidence_excerpt !== captureMessage
       || episode.content_hash !== expectedContentHash
       || !isDeepStrictEqual(metadata, expectedMetadata)
     ) {
@@ -353,7 +386,7 @@ function deriveExactEvidence(input: {
     }
     normalizedRows.sort((left, right) => left.hash.localeCompare(right.hash) || left.id - right.id);
     if (!durableMemoryReceiptAllowsConversationOnly({
-      message,
+      message: captureMessage,
       candidates,
       queuedCandidateCount: rows.length,
       episodeId: episode.id,

@@ -1,4 +1,9 @@
-import { TOOL_REGISTRY, type ToolSideEffect } from '../../tools/tool-registry.js';
+import {
+  TOOL_REGISTRY,
+  actionTopologyRoleFor,
+  type ActionTopologyRole,
+  type ToolSideEffect,
+} from '../../tools/tool-registry.js';
 import { classifyShellCommand, classifyShellNetworkMutation, expandLiteralShellCommands } from './destination-gate.js';
 import { isMutatingExternalWrite } from './execution-gate.js';
 import { resolveCallToolAlias } from '../../tools/call-tool-alias.js';
@@ -350,6 +355,23 @@ function classifyRegistered(toolName: string): RuntimeToolEffectDecision | null 
     case 'send': return externalWriteDecision('registry');
     case 'admin': return { effect: 'admin', mutating: true, dangerousWrite: true, source: 'registry' };
   }
+}
+
+/** Resolve control/business role from Clementine's own registry after peeling
+ * trusted local carriers. Foreign/provider tools with lookalike names remain
+ * business because their effect provenance is not the local registry. */
+export function actionTopologyRoleForRuntimeCall(
+  toolName: string,
+  args: unknown,
+): ActionTopologyRole {
+  const effective = unwrapRuntimeEffectiveToolIdentity(toolName, args);
+  if (!effective.toolName) return 'business';
+  if (classifyRuntimeToolEffect(toolName, args).source !== 'registry') return 'business';
+  const registryName = localToolTail(effective.toolName)
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/-/g, '_')
+    .toLowerCase();
+  return actionTopologyRoleFor(registryName);
 }
 
 export function classifyRuntimeToolEffect(toolName: string, args: unknown): RuntimeToolEffectDecision {

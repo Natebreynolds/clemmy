@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { BASE_DIR } from '../config.js';
 import { actionBus } from './action-bus.js';
 
-export type RunStatus = 'received' | 'running' | 'queued' | 'awaiting_approval' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus = 'received' | 'running' | 'queued' | 'awaiting_approval' | 'awaiting_input' | 'completed' | 'failed' | 'cancelled';
 
 export type RunEventType =
   | 'received'
@@ -12,6 +12,7 @@ export type RunEventType =
   | 'model_started'
   | 'tool_started'
   | 'approval_required'
+  | 'input_required'
   | 'run_resumed'
   | 'completed'
   | 'failed'
@@ -190,7 +191,7 @@ export function addRunEvent(
 export function finishRun(
   runId: string | undefined,
   input: {
-    status: Extract<RunStatus, 'queued' | 'awaiting_approval' | 'completed' | 'failed' | 'cancelled'>;
+    status: Extract<RunStatus, 'queued' | 'awaiting_approval' | 'awaiting_input' | 'completed' | 'failed' | 'cancelled'>;
     message: string;
     outputPreview?: string;
     queuedTaskId?: string;
@@ -224,6 +225,8 @@ export function finishRun(
         ? 'cancelled'
         : input.status === 'awaiting_approval'
           ? 'approval_required'
+          : input.status === 'awaiting_input'
+            ? 'input_required'
           : input.status === 'queued'
             ? 'queued_background'
             : 'completed',

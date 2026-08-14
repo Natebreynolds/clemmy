@@ -874,16 +874,30 @@ function commitRecoveryCandidateTerminal(input: {
   sourceTurn: number;
   steps: number;
   completedReason: 'no_structured_output' | 'sub_agent_stalled';
-}): string {
+}): EventRow {
   const identity: TurnIdentity = {
     sessionId: input.sessionId,
     turn: Math.max(0, Math.trunc(input.sourceTurn)),
     sourceUserSeq: input.sourceUserSeq,
   };
   const completedWork = synthesizeCompletedWorkReport(input.sessionId, input.sourceUserSeq);
-  const text = completedWork || (input.completedReason === 'no_structured_output'
+  if (completedWork) {
+    return commitBridgeUnverifiedCompletionCandidate({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      sourceTurn: input.sourceTurn,
+      text: completedWork.replace(
+        /^I finished — here's what I did this turn:/,
+        'Before the response stopped, the action ledger recorded:',
+      ),
+      reason: input.completedReason,
+      metadata: { steps: input.steps },
+      presentationAlreadyDiscloses: true,
+    });
+  }
+  const text = input.completedReason === 'no_structured_output'
     ? 'I could not produce a safe final answer for that turn. Please ask me to try again.'
-    : 'I could not complete that run safely. Please ask me to continue from the recorded state.');
+    : 'I could not complete that run safely. Please ask me to continue from the recorded state.';
   const committed = commitTurnOutcomeImpl({
     version: 2,
     id: turnOutcomeId(identity),
@@ -896,7 +910,41 @@ function commitRecoveryCandidateTerminal(input: {
     metadata: { steps: input.steps },
   });
   markRunInFlight(input.sessionId, false);
-  return committed.presentation.text;
+  return committed.event;
+}
+
+/** A recovery path observed completed work but could not produce its ordinary
+ * final answer. Propose the work as a completion and name that gap; the shared
+ * delivery rule is the only authority that may turn it into a human hold. */
+function commitBridgeUnverifiedCompletionCandidate(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  sourceTurn: number;
+  text: string;
+  reason: string;
+  metadata?: Record<string, unknown>;
+  presentationAlreadyDiscloses?: boolean;
+}): EventRow {
+  const identity: TurnIdentity = {
+    sessionId: input.sessionId,
+    turn: Math.max(0, Math.trunc(input.sourceTurn)),
+    sourceUserSeq: input.sourceUserSeq,
+  };
+  const committed = commitTurnOutcomeImpl({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text: input.text },
+  }, {
+    legacyReason: input.reason,
+    metadata: input.metadata,
+    presentationAlreadyDiscloses: input.presentationAlreadyDiscloses,
+    deliveryConcern: { reason: input.reason },
+  });
+  markRunInFlight(input.sessionId, false);
+  return committed.event;
 }
 
 interface AcceptedRecoveryTurn {
@@ -1666,19 +1714,30 @@ export async function respondViaHarness(
                   ? 'The action ledger recorded a successful external write before the brain stopped.'
                   : 'The action ledger recorded an external write attempt with an unresolved outcome.')}\n\nI did not rerun the task on another model because that could repeat or conflict with the external action.`
               : 'The first brain stopped before it produced a safe final answer. I could not verify the external-write ledger for that attempt, so I did not rerun the task on another model.';
-            const terminal = commitBridgeBlockedTerminal({
-              request,
-              turn: {
-                attempt: requestAttempt,
-                sourceUserSeq: sourceUserEvent.seq,
-                sourceTurn: sourceUserEvent.turn,
-              },
-              text: blockedText,
-              reason: recoveryCheck.reason === 'external_write'
-                ? 'parse_recovery_external_write'
-                : 'parse_recovery_ledger_unreadable',
-              metadata: { steps: result.steps },
-            });
+            const reason = recoveryCheck.reason === 'external_write'
+              ? 'parse_recovery_external_write'
+              : 'parse_recovery_ledger_unreadable';
+            const terminal = recoveryCheck.reason === 'external_write'
+              ? commitBridgeUnverifiedCompletionCandidate({
+                  sessionId: request.sessionId,
+                  sourceUserSeq: sourceUserEvent.seq,
+                  sourceTurn: sourceUserEvent.turn,
+                  text: blockedText,
+                  reason,
+                  metadata: { steps: result.steps },
+                  presentationAlreadyDiscloses: true,
+                })
+              : commitBridgeBlockedTerminal({
+                  request,
+                  turn: {
+                    attempt: requestAttempt,
+                    sourceUserSeq: sourceUserEvent.seq,
+                    sourceTurn: sourceUserEvent.turn,
+                  },
+                  text: blockedText,
+                  reason,
+                  metadata: { steps: result.steps },
+                });
             return withRouteDiagnostics(
               responseForCommittedTerminal(terminal, { recoverySkipped: recoveryCheck.reason }),
               routeForHarness(surface, request, opts.modelOverride),
@@ -1709,7 +1768,7 @@ export async function respondViaHarness(
           }
         }
         if (result.completedReason) {
-          const text = commitRecoveryCandidateTerminal({
+          const terminal = commitRecoveryCandidateTerminal({
             sessionId,
             sourceUserSeq: sourceUserEvent.seq,
             sourceTurn: sourceUserEvent.turn,
@@ -1717,9 +1776,9 @@ export async function respondViaHarness(
             completedReason: result.completedReason,
           });
           return withRouteDiagnostics({
-            text,
-            sessionId,
-            stoppedReason: 'error',
+            ...responseForCommittedTerminal(terminal, {
+              recoveryCandidate: result.completedReason,
+            }),
             turnsUsed: result.lastTurn,
           }, routeForHarness(surface, request, opts.modelOverride));
         }
@@ -2046,16 +2105,30 @@ async function respondPreferHarnessOnce(
       try {
         const turn = ensureAcceptedRecoveryTurn(surface, request);
         if (err instanceof Error && (err as { narrationGiveUp?: boolean }).narrationGiveUp === true) {
-          const terminal = commitBridgeBlockedTerminal({
-            request,
-            turn,
-            text: publicReplyText(
-              err.message,
-              'I could not complete that turn safely. Please ask me to try again.',
-            ),
-            reason: 'narration_giveup',
-            metadata: { transport: 'claude_agent_sdk_brain' },
-          });
+          const completedWork = synthesizeCompletedWorkReport(request.sessionId, turn.sourceUserSeq);
+          const terminal = completedWork
+            ? commitBridgeUnverifiedCompletionCandidate({
+                sessionId: request.sessionId,
+                sourceUserSeq: turn.sourceUserSeq,
+                sourceTurn: turn.sourceTurn,
+                text: completedWork.replace(
+                  /^I finished — here's what I did this turn:/,
+                  'Before the response stopped, the action ledger recorded:',
+                ),
+                reason: 'narration_giveup',
+                metadata: { transport: 'claude_agent_sdk_brain' },
+                presentationAlreadyDiscloses: true,
+              })
+            : commitBridgeBlockedTerminal({
+                request,
+                turn,
+                text: publicReplyText(
+                  err.message,
+                  'I could not complete that turn safely. Please ask me to try again.',
+                ),
+                reason: 'narration_giveup',
+                metadata: { transport: 'claude_agent_sdk_brain' },
+              });
           const response = responseForCommittedTerminal(terminal, {
             failure: 'narration_giveup',
             transport: 'claude_agent_sdk_brain',
@@ -2213,15 +2286,26 @@ function blockedWholeTurnRecoveryResponse(
   const text = check.reason === 'external_write'
     ? `${recorded ?? 'The action ledger recorded an external write attempt but did not confirm a completed change.'}\n\nThat turn stopped before it finished. I did not rerun it because that could repeat or conflict with the external action already recorded. Tell me how you'd like to proceed.`
     : 'That turn stopped before it finished. I could not verify the external-write ledger for the attempt, so I did not rerun it, and nothing further was changed. Tell me how you\'d like to proceed.';
-  const terminal = commitBridgeBlockedTerminal({
-    request,
-    turn,
-    text,
-    reason: check.reason === 'external_write'
-      ? 'claude_recovery_external_write'
-      : 'claude_recovery_ledger_unreadable',
-    metadata: { transport: 'claude_agent_sdk_brain' },
-  });
+  const reason = check.reason === 'external_write'
+    ? 'claude_recovery_external_write'
+    : 'claude_recovery_ledger_unreadable';
+  const terminal = check.reason === 'external_write'
+    ? commitBridgeUnverifiedCompletionCandidate({
+        sessionId: request.sessionId,
+        sourceUserSeq: turn.sourceUserSeq,
+        sourceTurn: turn.sourceTurn,
+        text,
+        reason,
+        metadata: { transport: 'claude_agent_sdk_brain' },
+        presentationAlreadyDiscloses: true,
+      })
+    : commitBridgeBlockedTerminal({
+        request,
+        turn,
+        text,
+        reason,
+        metadata: { transport: 'claude_agent_sdk_brain' },
+      });
   const response = responseForCommittedTerminal(terminal, {
       recoverySkipped: check.reason,
       transport: 'claude_agent_sdk_brain',

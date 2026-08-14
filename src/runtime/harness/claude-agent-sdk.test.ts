@@ -2468,6 +2468,12 @@ test('runClaudeAgentSdk reflects each tool return into the learning pipeline (br
   assert.equal(returned[0].data.accounting, 'top_level');
   assert.equal(returned[0].data.toolSlug, 'SALESFORCE_QUERY');
   assert.equal(returned[0].data.effect, 'read');
+  assert.equal(returned[0].data.topologyRole, 'business');
+  assert.equal(
+    returned[0].data.successfulBusinessResult,
+    true,
+    'the exact SDK return boundary—not a later tool-use summary—records successful business work',
+  );
   assert.match(String(returned[0].data.preview ?? ''), /Acme Corp has 3 open opportunities/);
 });
 

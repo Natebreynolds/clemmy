@@ -161,3 +161,48 @@ test('the chat prompt snapshot names active work with counts; silent when idle',
 
   for (const existing of list4()) archive4(existing.id);
 });
+
+test('an unverifiable terminal parks BLOCKED, never as a question nobody can answer', async () => {
+  // Live 2026-08-12: a worker whose terminal was the verification fallback
+  // parked as `awaiting_input` with "I haven't been able to verify the result
+  // yet" AS THE QUESTION. It idled 45 minutes, surfaced nothing answerable,
+  // and then intercepted the user's next attempt at the same work because a
+  // task for it was already pending.
+  const {
+    createBackgroundTask,
+    markBackgroundTaskRunning: running,
+    markBackgroundTaskBlocked,
+    markBackgroundTaskAwaitingInput,
+    getBackgroundTask,
+  } = await import('./background-tasks.js');
+
+  const unverified = createBackgroundTask({
+    title: 'Create and verify a Google Sheet',
+    prompt: 'scrape and build the sheet',
+    source: 'discord',
+  });
+  running(unverified.id);
+  const blocked = markBackgroundTaskBlocked(
+    unverified.id,
+    'I haven’t been able to verify the result yet.',
+    'I haven’t been able to verify the result yet.',
+  );
+  assert.equal(blocked?.status, 'blocked', 'an unverifiable stop is blocked, not awaiting_input');
+  assert.equal(blocked?.pendingQuestion, undefined, 'no phantom question is left for the user');
+  assert.equal(getBackgroundTask(unverified.id)?.status, 'blocked');
+
+  // A REAL clarifying question still parks awaiting_input with its question.
+  const asked = createBackgroundTask({
+    title: 'Pick a ranking',
+    prompt: 'rank the restaurants',
+    source: 'discord',
+  });
+  running(asked.id);
+  const parked = markBackgroundTaskAwaitingInput(
+    asked.id,
+    `bgq-${asked.id}-q1`,
+    'Rank by highest rating or by most recent activity?',
+  );
+  assert.equal(parked?.status, 'awaiting_input');
+  assert.match(parked?.pendingQuestion ?? '', /highest rating/);
+});

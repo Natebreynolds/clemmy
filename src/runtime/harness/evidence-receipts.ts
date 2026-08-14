@@ -406,6 +406,39 @@ function poisonAcceptedAuthority(
 }
 
 /**
+ * A frozen expected-work operation is named by its semantic requirement
+ * (`read-source`, or `read-source:item:<digest>`), while the settlement/result
+ * handle is keyed by the concrete logical invocation. Historical manifests
+ * happened to use the logical call id for both. Resolve either shape through
+ * the immutable accepted-operation join instead of guessing that the two
+ * identifiers are interchangeable.
+ */
+function logicalCallIdForManifestNode(
+  db: ReturnType<typeof openEventLog>,
+  input: { sessionId: string; sourceUserSeq: number },
+  node: ObligationManifestNode,
+): string | null {
+  const rows = db.prepare(`
+    SELECT logical_tool_call_id, resolved_tool
+      FROM accepted_task_operations
+     WHERE session_id = ? AND source_user_seq = ?
+       AND (operation_id = ? OR logical_tool_call_id = ?)
+     ORDER BY CASE WHEN operation_id = ? THEN 0 ELSE 1 END
+     LIMIT 2
+  `).all(
+    input.sessionId,
+    input.sourceUserSeq,
+    node.operationId,
+    node.operationId,
+    node.operationId,
+  ) as Array<{ logical_tool_call_id: string; resolved_tool: string }>;
+  const matching = [...new Set(rows
+    .filter((row) => row.resolved_tool === node.resolvedTool)
+    .map((row) => row.logical_tool_call_id))];
+  return matching.length === 1 ? matching[0]! : null;
+}
+
+/**
  * Issue point-observation or complete-collection evidence from durable host
  * authority only. The caller names the accepted task and manifest node; every
  * verdict, identity, continuation fact and byte digest is derived here.
@@ -438,11 +471,15 @@ export function issueHostReadEvidenceForManifestNode(input: {
       if (node.effectKind !== 'read') {
         return { status: 'refused', reason: 'manifest node is not a read operation' };
       }
+      const logicalToolCallId = logicalCallIdForManifestNode(db, input, node);
+      if (!logicalToolCallId) {
+        return { status: 'conflict', reason: 'manifest operation has no unique accepted logical call' };
+      }
       const result = redeemSuccessfulSettlementResultForHost({
         sessionId: input.sessionId,
         sourceUserSeq: input.sourceUserSeq,
         acceptedTaskId: manifestState.authority.accepted_task_id,
-        logicalToolCallId: node.operationId,
+        logicalToolCallId,
       });
       if (result.status !== 'ok') {
         return {
@@ -630,7 +667,13 @@ export function redeemHostReadEvidenceReceipt(
       return { ok: false, reason: 'receipt accepted-task owner no longer matches authority' };
     }
     const node = manifestState.manifest.nodes.find((entry) => entry.nodeId === row.node_id);
-    if (!node || node.operationId !== row.logical_tool_call_id || node.resolvedTool !== row.tool_name) {
+    const logicalToolCallId = node
+      ? logicalCallIdForManifestNode(db, {
+          sessionId,
+          sourceUserSeq: row.source_user_seq,
+        }, node)
+      : null;
+    if (!node || logicalToolCallId !== row.logical_tool_call_id || node.resolvedTool !== row.tool_name) {
       return { ok: false, reason: 'receipt no longer matches its exact manifest operation' };
     }
     const result = redeemSuccessfulSettlementResultForHost({

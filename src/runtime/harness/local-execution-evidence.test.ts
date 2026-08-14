@@ -1223,3 +1223,64 @@ test('a discharged contract finalizes despite stray unbound bookkeeping, and sti
     /unsettled logical or physical work/,
   );
 });
+test('a carrier-serialized pre-dispatch refusal never settles as succeeded host work (live 44256)', () => {
+  // The composio lane returns `[provider-dispatch:not-started:*]` as a typed
+  // instance, but a work_call child receives it as `{output: "…"}` — and the
+  // bare string classified as a SUCCEEDED host execution, minting a crossing
+  // and a durable handle for an Apify call that never dispatched.
+  const session = eventlog.createSession({
+    id: `local-evidence-notstarted-${++serial}`,
+    kind: 'chat',
+  });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Find the alpha records we keep on file.' },
+  });
+  const task: LocalTask = {
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq),
+    label: `notstarted-${serial}`,
+  };
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: task.turn },
+  }));
+  const fixed = contracts.freezeDeterministicExpectedWorkContract({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.ok(fixed.status === 'fixed' || fixed.status === 'replayed');
+
+  const refusalText = '[provider-dispatch:not-started:invalid-args] ⚠️  Operation validation '
+    + 'failed before dispatch (schema check): Field: actorId — missing required field(s).';
+  for (const [index, result] of [refusalText, { output: refusalText }].entries()) {
+    const call = `logical:${task.label}:refusal-${index}`;
+    assert.equal(dispatch.admitLogicalCall({
+      identity: {
+        sessionId: task.sessionId,
+        sourceUserSeq: task.sourceUserSeq,
+        turn: task.turn,
+        acceptedTaskId: task.acceptedTaskId,
+        logicalToolCallId: call,
+      },
+      tool: 'apify_act_run_sync_get_dataset_items_get',
+      args: { run_input: {} },
+    }).status, 'inserted');
+    const settled = settleLocal({
+      task,
+      logicalToolCallId: call,
+      tool: 'apify_act_run_sync_get_dataset_items_get',
+      args: { run_input: {} },
+      result,
+    });
+    assert.equal(settled.outcome.kind, 'invalid_arguments', JSON.stringify(settled.outcome));
+    const row = settlementRow(task, call);
+    assert.equal(row?.execution_kind, 'refused_pre_dispatch', 'the refusal never counts as executed');
+    assert.equal(row?.host_crossing_count ?? 0, 0, 'no crossing for a call that never started');
+    assert.equal(row?.result_handle_id, null, 'a refusal string is not redeemable evidence');
+  }
+});

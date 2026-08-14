@@ -93,11 +93,15 @@ const {
   looksLikeHealthyDurableMemoryAcknowledgement,
 } = await import('./durable-memory-receipt.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
+type TerminalDeliveryJudgePort = import('./terminal-delivery-judge.js').TerminalDeliveryJudgePort;
 const fixtureDispatchLedger = await import('./dispatch-ledger.js');
 const fixtureOutcomes = await import('./attempt-outcome.js');
 const fixtureSettlements = await import('./logical-call-settlement-store.js');
 const fixtureIdentities = await import('./attempt-identity.js');
 const fixtureWorkManifest = await import('./work-manifest.js');
+const fixtureAttempts = await import('./attempt-settlement.js');
+const fixtureExpectedWork = await import('./expected-work-admission.js');
+const outputGrounding = await import('./output-grounding-gate.js');
 
 
 /** Wrap runConversation options so each model pass first settles one real
@@ -123,6 +127,66 @@ const fixtureReadSettled = new Set<string>();
  *  (retrieval-is-not-authority); a stub that claims "I searched" without a
  *  settled read is the fabrication class that gate exists to block, so these
  *  fixtures settle the read the way a live turn does. */
+/**
+ * Durably settle a successful business SEND for the newest accepted source.
+ * The terminal truth layers read ONLY durable settlements — an emitted
+ * external_write event without one is a claim, not evidence, and a
+ * claim-shaped "Sent." reply correctly holds without it.
+ */
+function settleFixtureSend(sessionId: string, callId: string, toolSlug: string): void {
+  const source = listEvents(sessionId, { types: ['user_input_received'] }).at(-1);
+  if (!source) return;
+  fixtureReadSerial += 1;
+  const identity = {
+    sessionId,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    acceptedTaskId: fixtureIdentities.acceptedTaskIdFor(sessionId, source.seq),
+    logicalToolCallId: `logical:loop-fixture-send:${fixtureReadSerial}:${callId}`,
+    physicalDispatchId: `dispatch:loop-fixture-send:${fixtureReadSerial}:${callId}`,
+    ordinal: 0,
+  };
+  // A plain send-shaped tool keeps admission and settlement on one identity
+  // (a composio carrier canonicalizes to its inner slug and would poison the
+  // hand-rolled settlement contract).
+  const tool = 'fixture_send_email';
+  const args = { to: 'fixture@example.invalid', slug: toolSlug };
+  // An act-routed chat turn arms the expected-work wall; a direct send rides
+  // the same mandate the product requires live — a resolved-approved card for
+  // the exact payload.
+  try {
+    const card = approvalRegistry.register({
+      sessionId,
+      subject: `Send ${toolSlug}`,
+      tool,
+      args,
+    });
+    approvalRegistry.resolve(card.approvalId, 'approved', 'fixture-user');
+  } catch { /* an unarmed turn needs no mandate */ }
+  const begun = fixtureDispatchLedger.beginPhysicalDispatch({ identity, tool, args });
+  if (begun.status !== 'inserted') return;
+  fixtureDispatchLedger.settlePhysicalDispatch({
+    identity: begun.identity,
+    tool,
+    outcome: 'returned',
+  });
+  fixtureSettlements.commitLogicalCallSettlement({
+    identity: {
+      sessionId,
+      sourceUserSeq: source.seq,
+      turn: 1,
+      acceptedTaskId: identity.acceptedTaskId,
+      logicalToolCallId: identity.logicalToolCallId,
+    },
+    contract: { toolName: tool, args },
+    execution: { kind: 'provider_execution' },
+    result: { payload: { successful: true, data: { id: `sent-${callId}` } } },
+    outcome: fixtureOutcomes.classifyAttemptOutcome({ envelopeSuccessful: true, acknowledged: true }),
+    recovery: { businessCall: true, mutating: true },
+    observer: { lane: 'composio', turn: 1 },
+  });
+}
+
 function settleFixtureRead(sessionId: string): void {
   const source = listEvents(sessionId, { types: ['user_input_received'] }).at(-1);
   if (!source) return;
@@ -429,6 +493,24 @@ function makeRunnerStub(): Runner {
 // the runRunner sees the agent.
 function makeAgentStub(): import('@openai/agents').Agent<any, any> {
   return {} as import('@openai/agents').Agent<any, any>;
+}
+
+function terminalDeliveryJudgeFixture(
+  run: () => unknown | Promise<unknown>,
+): TerminalDeliveryJudgePort {
+  return {
+    async resolveRoute() {
+      return {
+        model: {} as any,
+        modelId: 'claude-haiku-4-5',
+        judgeFamily: 'claude',
+        brainFamily: 'codex',
+        transport: 'claude_subscription',
+        selfJudge: false,
+      };
+    },
+    async run() { return run(); },
+  };
 }
 
 function makeApprovalRunState(agent: import('@openai/agents').Agent<any, any>, toolName: string): string {
@@ -3804,11 +3886,13 @@ test('a completed reconciliation turn that asks a question pauses before the sav
   assert.notEqual(terminals[0]?.data.reply, savedCandidate);
 });
 
-test('effect self-reconciliation that remains ambiguous returns one deterministic blocked terminal', async () => {
+test('effect self-reconciliation publishes the terminal judge\'s exact ASK instead of harness-authored prose', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   const verifiedAnswer = 'The workspace cadence workflow run completed successfully and its durable record is complete.';
+  const judgeQuestion = 'I cannot verify whether that exact workflow change landed. Can you check the workspace cadence target and tell me what you see?';
   let calls = 0;
+  let judgeCalls = 0;
   const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
     calls += 1;
     const sourceUserSeq = listEvents(sess.id, { types: ['user_input_received'] })[0]!.seq;
@@ -3855,16 +3939,323 @@ test('effect self-reconciliation that remains ambiguous returns one deterministi
     input: 'Check the latest workspace cadence workflow run and give me the verified result.',
     makeRunner: makeRunnerStub,
     runRunner,
+    terminalPresentationRepairPort: {
+      async render() { throw new Error('a decided terminal judge must own the public words'); },
+    },
+    terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => {
+      judgeCalls += 1;
+      return {
+        verb: 'ask',
+        reason: 'the exact external state requires human inspection',
+        publicText: judgeQuestion,
+      };
+    }),
   });
 
   assert.equal(result.status, 'awaiting_user_input');
   assert.equal(calls, 2, 'the reconciliation attempt is bounded to one model continuation');
+  assert.equal(judgeCalls, 1, 'the reconciliation assessment must reach the terminal judge');
   const terminals = listEvents(sess.id, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1, 'the ambiguous effect never gets a green terminal first');
-  assert.equal(terminals[0]?.data.reason, 'blocked');
+  assert.equal(terminals[0]?.data.reason, 'awaiting_user_input');
   assert.equal(terminals[0]?.data.delivered, false);
-  assert.match(String(terminals[0]?.data.reply), /ambiguous external-write outcome|cannot honestly confirm/i);
+  assert.equal(terminals[0]?.data.reply, judgeQuestion);
+  assert.equal(terminals[0]?.data.terminalJudgeDisposition, 'ask');
+  assert.equal(terminals[0]?.data.terminalJudgeFamily, 'claude');
   assert.doesNotMatch(String(terminals[0]?.data.reply), /done\s*=|nextAction\s*=/i);
+});
+
+test('self-reconciliation judge unavailability spends the sealed terminal repair before fallback', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const savedCandidate = 'The terminal-repair report is ready.';
+  const repairedText = 'I could not verify the exact report resource after checking the retained create attempt. I left that attempt intact and did not create a replacement.';
+  let calls = 0;
+  let repairCalls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    if (calls === 1) {
+      const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
+      assert.equal(
+        fixtureExpectedWork.actionExpectedWorkState({
+          sessionId: sess.id,
+          sourceUserSeq: source.seq,
+        }).status,
+        'required',
+      );
+      const acceptedTaskId = fixtureIdentities.acceptedTaskIdFor(sess.id, source.seq);
+      const logicalToolCallId = `logical:self-reconciliation-repair:${source.seq}`;
+      const args = { path: 'fixtures/source.json' };
+      assert.equal(fixtureDispatchLedger.admitLogicalCall({
+        identity: {
+          sessionId: sess.id,
+          sourceUserSeq: source.seq,
+          turn: source.turn,
+          acceptedTaskId,
+          logicalToolCallId,
+        },
+        tool: 'read_file',
+        args,
+      }).status, 'inserted');
+      assert.equal(fixtureExpectedWork.admitExpectedWorkInvocation({
+        sessionId: sess.id,
+        sourceUserSeq: source.seq,
+        logicalToolCallId,
+        proposal: {
+          version: 1,
+          operations: [
+            {
+              id: 'read-source', effect: 'read', coverage: 'single', dependsOn: [], dataFrom: [],
+              cardinality: { kind: 'once' },
+            },
+            {
+              id: 'write-report', effect: 'local_write',
+              dependsOn: ['read-source'], dataFrom: ['read-source'], cardinality: { kind: 'once' },
+            },
+          ],
+          universes: [],
+        },
+        requirementId: 'read-source',
+        tool: 'read_file',
+        args,
+      }).status, 'bound');
+      fixtureAttempts.settleToolAttempt({
+        sessionId: sess.id,
+        sourceUserSeq: source.seq,
+        turn: source.turn,
+        lane: 'agents_runner',
+        toolName: 'read_file',
+        callId: logicalToolCallId,
+        args,
+        mutating: false,
+        businessCall: true,
+        requirementId: 'read-source',
+        result: { successful: true, data: { records: [{ id: 'source-row' }] }, complete: true },
+      });
+      artifactLedger.claimArtifactSlot(sess.id, {
+        kind: 'google_doc',
+        provider: 'Fixture Docs',
+        slotKey: 'google_doc:terminal-repair',
+        title: 'Terminal repair report',
+        createShape: 'FIXTURE_CREATE_DOCUMENT',
+      }, 'create-terminal-repair', `${sess.id}::turn:1`);
+    }
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: calls === 1
+        ? {
+            summary: savedCandidate,
+            reply: savedCandidate,
+            done: true,
+            nextAction: 'completed',
+            reason: null,
+          }
+        : {
+            summary: 'done=true / nextAction=completed',
+            reply: 'done=true / nextAction=completed',
+            done: true,
+            nextAction: 'completed',
+            reason: null,
+          },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Read the source file, then create and verify the terminal-repair report.',
+    judgeCompletion: false,
+    makeRunner: makeRunnerStub,
+    runRunner,
+    terminalDeliveryJudgePort: {
+      async resolveRoute() { return null; },
+      async run() { throw new Error('an unavailable route must not run'); },
+    },
+    terminalPresentationRepairPort: {
+      async render(packet) {
+        repairCalls += 1;
+        assert.equal(packet.proposedReply, savedCandidate);
+        return repairedText;
+      },
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(repairCalls, 1, 'judge outage must spend the sealed model repair before fallback');
+  assert.equal(result.publicPresentation?.text, repairedText);
+  const terminal = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(terminal?.data.terminalRepairStatus, 'blocked_repaired');
+  assert.equal(terminal?.data.terminalJudgeDisposition, undefined);
+});
+
+test('a post-reconciliation delivery gap publishes the terminal judge\'s exact DELIVER text', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const savedCandidate = 'I cannot complete the report until its exact resource is verified.';
+  const judgeAnswer = 'The report resource is now verified as fixture-doc-terminal-deliver. The earlier draft was cautious, but the durable read-back confirms this exact document.';
+  let calls = 0;
+  let judgeCalls = 0;
+  let repairCalls = 0;
+  let artifactId = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    if (calls === 1) {
+      const claim = artifactLedger.claimArtifactSlot(sess.id, {
+        kind: 'google_doc',
+        provider: 'Fixture Docs',
+        slotKey: 'google_doc:terminal-deliver',
+        title: 'Terminal delivery report',
+        createShape: 'FIXTURE_CREATE_DOCUMENT',
+      }, 'create-terminal-deliver', `${sess.id}::turn:1`);
+      artifactId = claim.artifact.id;
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: savedCandidate,
+          reply: savedCandidate,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      } as never;
+    }
+
+    seedArtifactVerification(sess.id, 'verify-terminal-deliver', 'fixture-doc-terminal-deliver');
+    const settlement = artifactLedger.resolveUncertainArtifactClaim(
+      sess.id,
+      artifactId,
+      {
+        kind: 'bind',
+        resourceId: 'fixture-doc-terminal-deliver',
+        verificationCallId: 'verify-terminal-deliver',
+      },
+    );
+    assert.equal(settlement.ok, true);
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'done=true / nextAction=completed',
+        reply: 'done=true / nextAction=completed',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create and verify the terminal delivery report.',
+    judgeCompletion: false,
+    makeRunner: makeRunnerStub,
+    runRunner,
+    terminalPresentationRepairPort: {
+      async render() {
+        repairCalls += 1;
+        throw new Error('a decided terminal judge must bypass presentation repair');
+      },
+    },
+    terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => {
+      judgeCalls += 1;
+      return {
+        verb: 'deliver',
+        reason: 'the durable resource is verified and the stale candidate only needs truthful re-authoring',
+        publicText: judgeAnswer,
+      };
+    }),
+  });
+
+  assert.equal(calls, 2, 'one model turn creates and one private turn reconciles');
+  assert.equal(judgeCalls, 1, 'the post-reconciliation delivery concern reaches the terminal judge');
+  assert.equal(repairCalls, 0);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.publicPresentation?.status, 'done');
+  assert.equal(result.publicPresentation?.text, judgeAnswer);
+  const terminal = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(terminal?.data.terminalJudgeDisposition, 'deliver');
+  assert.equal(terminal?.data.terminalJudgeFamily, 'claude');
+  assert.doesNotMatch(String(terminal?.data.reply), /done\s*=|nextAction\s*=/i);
+});
+
+test('self-reconciliation RESUME clears private mode and a repeated RESUME becomes the judge-authored ASK', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const savedCandidate = 'The report is ready.';
+  const repeatedAsk = 'The report still has no verified resource. Can you check whether Fixture Docs created it and share the exact document you see?';
+  let calls = 0;
+  let judgeCalls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    if (calls === 1) {
+      artifactLedger.claimArtifactSlot(sess.id, {
+        kind: 'google_doc',
+        provider: 'Fixture Docs',
+        slotKey: 'google_doc:terminal-resume',
+        title: 'Terminal resume report',
+        createShape: 'FIXTURE_CREATE_DOCUMENT',
+      }, 'create-terminal-resume', `${sess.id}::turn:1`);
+    }
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: calls === 2
+        ? {
+            summary: 'done=true / nextAction=completed',
+            reply: 'done=true / nextAction=completed',
+            done: true,
+            nextAction: 'completed',
+            reason: null,
+          }
+        : {
+            summary: savedCandidate,
+            reply: savedCandidate,
+            done: true,
+            nextAction: 'completed',
+            reason: null,
+          },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create the terminal resume report and give me its verified document.',
+    maxSteps: 4,
+    judgeCompletion: false,
+    makeRunner: makeRunnerStub,
+    runRunner,
+    terminalPresentationRepairPort: {
+      async render() { throw new Error('a decided terminal judge must bypass presentation repair'); },
+    },
+    terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => {
+      judgeCalls += 1;
+      return {
+        verb: 'resume',
+        reason: 'one exact read-back can still close the resource gap',
+        recoveryInstruction: 'Read the retained Fixture Docs create target once and settle that exact artifact without creating a replacement.',
+        askIfRepeated: repeatedAsk,
+      };
+    }),
+  });
+
+  assert.equal(calls, 3, 'the judge reopens one ordinary authored model turn after private reconciliation');
+  assert.equal(judgeCalls, 2, 'the second RESUME is evaluated and deterministically escalated');
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.publicPresentation?.status, 'needs_input');
+  assert.equal(result.publicPresentation?.text, repeatedAsk);
+  assert.equal(listEvents(sess.id, { types: ['heartbeat'] })
+    .some((event) => event.data.kind === 'terminal_delivery_resume'
+      && event.data.path === 'self_reconciliation'), true);
+  const terminal = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(terminal?.data.terminalJudgeDisposition, 'ask');
+  assert.equal(terminal?.data.terminalJudgeResumeCount, 0);
 });
 
 test('non-reconciliation completion correction still replaces a rejected public candidate', async () => {
@@ -5375,6 +5766,7 @@ test('objective judge: a successful concrete send slug is completion evidence', 
       type: 'external_write',
       data: { shapeKey: 'GMAIL_SEND_EMAIL', targets: ['fixture@example.invalid'] },
     });
+    settleFixtureSend(sess.id, 'send-1', 'GMAIL_SEND_EMAIL');
     ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, 'sent', details);
     const decision = { summary: 'sent', reply: 'Sent the email.', done: true, nextAction: 'completed', reason: null };
     ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
@@ -5455,6 +5847,7 @@ test('objective judge: one successful send does not certify a plural objective',
       type: 'external_write',
       data: { shapeKey: 'GMAIL_SEND_EMAIL', targets: ['fixture@example.invalid'] },
     });
+    settleFixtureSend(sess.id, 'send-plural-1', 'GMAIL_SEND_EMAIL');
     ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, 'sent', details);
     const decision = { summary: 'sent', reply: 'Sent the emails.', done: true, nextAction: 'completed', reason: null };
     ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
@@ -5688,6 +6081,7 @@ test('request-bound write evidence: stale execution receipts cannot certify a fr
 
 test('request-bound write evidence: exhausted verification never false-greens a stale PASS', async () => {
   resetEventLog();
+  const judgeQuestion = 'I could not verify a fresh Google Sheets receipt for this request. Can you check the target sheet and tell me whether the new write appears?';
   const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
   process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
   try {
@@ -5711,11 +6105,21 @@ test('request-bound write evidence: exhausted verification never false-greens a 
       judgeFn: async () => ({ done: true, reason: 'accepted stale claim' }),
       makeRunner: makeRunnerStub,
       runRunner: runner,
+      terminalPresentationRepairPort: {
+        async render() { throw new Error('the terminal judge must own the public words'); },
+      },
+      terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => ({
+        verb: 'ask',
+        reason: 'this accepted request has no current durable write receipt',
+        publicText: judgeQuestion,
+      })),
     });
     assert.equal(result.status, 'awaiting_user_input');
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, false);
-    assert.match(String(terminal.data.summary), /no receipt of it landing after your message/i);
+    assert.equal(terminal.data.summary, judgeQuestion);
+    assert.equal(terminal.data.reply, judgeQuestion);
+    assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
     assert.doesNotMatch(String(terminal.data.reply), /^PASS\b/);
     const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
     assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
@@ -5727,6 +6131,7 @@ test('request-bound write evidence: exhausted verification never false-greens a 
 
 test('request-bound write evidence: a direct communication command requires a current receipt', async () => {
   resetEventLog();
+  const judgeQuestion = 'I could not verify a current send receipt for that email. Can you check Sent mail for the prospect before the message is retried?';
   const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
   process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
   try {
@@ -5748,11 +6153,22 @@ test('request-bound write evidence: a direct communication command requires a cu
       judgeFn: async () => ({ done: true, reason: 'accepted unsupported claim' }),
       makeRunner: makeRunnerStub,
       runRunner: runner,
+      terminalPresentationRepairPort: {
+        async render() { throw new Error('the terminal judge must own the public words'); },
+      },
+      terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => ({
+        verb: 'ask',
+        reason: 'the direct communication has no current durable send receipt',
+        publicText: judgeQuestion,
+      })),
     });
     assert.equal(result.status, 'awaiting_user_input');
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, false);
-    assert.match(String(terminal.data.summary), /no receipt of it landing after your message/i);
+    assert.equal(terminal.data.summary, judgeQuestion);
+    assert.equal(terminal.data.reply, judgeQuestion);
+    assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
+    assert.doesNotMatch(String(terminal.data.reply), /emailed the prospect/i);
     const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
     assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
   } finally {
@@ -5763,6 +6179,7 @@ test('request-bound write evidence: a direct communication command requires a cu
 
 test('request-bound write evidence: a direct invitation response cannot false-complete without a receipt', async () => {
   resetEventLog();
+  const judgeQuestion = 'I could not verify a current RSVP receipt for that invitation. Can you check the invitation response before it is retried?';
   const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
   process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
   try {
@@ -5784,11 +6201,22 @@ test('request-bound write evidence: a direct invitation response cannot false-co
       judgeFn: async () => ({ done: true, reason: 'accepted unsupported claim' }),
       makeRunner: makeRunnerStub,
       runRunner: runner,
+      terminalPresentationRepairPort: {
+        async render() { throw new Error('the terminal judge must own the public words'); },
+      },
+      terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => ({
+        verb: 'ask',
+        reason: 'the invitation response has no current durable receipt',
+        publicText: judgeQuestion,
+      })),
     });
     assert.equal(result.status, 'awaiting_user_input');
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, false);
-    assert.match(String(terminal.data.summary), /no receipt of it landing after your message/i);
+    assert.equal(terminal.data.summary, judgeQuestion);
+    assert.equal(terminal.data.reply, judgeQuestion);
+    assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
+    assert.doesNotMatch(String(terminal.data.reply), /RSVP.d yes/i);
     const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
     assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
   } finally {
@@ -5799,6 +6227,7 @@ test('request-bound write evidence: a direct invitation response cannot false-co
 
 test('request-bound write evidence: an overlapping request completion cannot certify this request', async () => {
   resetEventLog();
+  const judgeQuestion = 'I could not verify a fresh Google Sheets receipt for request A. Can you check request A\'s target sheet and tell me whether the new write appears?';
   const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
   process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
   try {
@@ -5845,12 +6274,23 @@ test('request-bound write evidence: an overlapping request completion cannot cer
       judgeFn: async () => ({ done: true, reason: 'accepted foreign execution certificate' }),
       makeRunner: makeRunnerStub,
       runRunner,
+      terminalPresentationRepairPort: {
+        async render() { throw new Error('the terminal judge must own the public words'); },
+      },
+      terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => ({
+        verb: 'ask',
+        reason: 'the only execution certificate belongs to a different accepted request',
+        publicText: judgeQuestion,
+      })),
     });
 
     assert.equal(result.status, 'awaiting_user_input');
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, false);
-    assert.match(String(terminal.data.summary), /no receipt of it landing after your message/i);
+    assert.equal(terminal.data.summary, judgeQuestion);
+    assert.equal(terminal.data.reply, judgeQuestion);
+    assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
+    assert.doesNotMatch(String(terminal.data.reply), /^PASS\b/);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
     else process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = prev;
@@ -5859,6 +6299,7 @@ test('request-bound write evidence: an overlapping request completion cannot cer
 
 test('request-bound write evidence: an accepted execution cannot hide a mixed orphaned write', async () => {
   resetEventLog();
+  const judgeQuestion = 'One of the two email sends has an ambiguous provider outcome. Can you check Sent mail for b@example.com before anything is retried?';
   const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
   process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
   try {
@@ -5926,12 +6367,22 @@ test('request-bound write evidence: an accepted execution cannot hide a mixed or
       judgeFn: async () => ({ done: true, reason: 'accepted execution certificate' }),
       makeRunner: makeRunnerStub,
       runRunner,
+      terminalPresentationRepairPort: {
+        async render() { throw new Error('the terminal judge must own the public words'); },
+      },
+      terminalDeliveryJudgePort: terminalDeliveryJudgeFixture(() => ({
+        verb: 'ask',
+        reason: 'one irreversible send remains ambiguous and requires human inspection',
+        publicText: judgeQuestion,
+      })),
     });
 
     assert.equal(result.status, 'awaiting_user_input');
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, false);
-    assert.match(String(terminal.data.summary), /outcome is still ambiguous/i);
+    assert.equal(terminal.data.summary, judgeQuestion);
+    assert.equal(terminal.data.reply, judgeQuestion);
+    assert.equal(terminal.data.terminalJudgeDisposition, 'ask');
     assert.doesNotMatch(String(terminal.data.reply), /Sent both emails successfully/i);
     const trip = listEventsForConv(sess.id, { types: ['guardrail_tripped'] })
       .find((event) => event.data.kind === 'request_bound_external_write_missing');
@@ -5968,7 +6419,7 @@ test('objective judge: does NOT fire for a non-action (lookup) intent', async ()
     { finalOutput: { summary: 'answered', reply: 'Paris.', done: true, nextAction: 'completed', reason: null } },
   ]);
   let judgeInvoked = false;
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'what is the capital of France',
@@ -5976,7 +6427,7 @@ test('objective judge: does NOT fire for a non-action (lookup) intent', async ()
     judgeFn: async () => { judgeInvoked = true; return { done: false, reason: 'x' }; },
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 1);
   assert.equal(judgeInvoked, false, 'lookup intent must not invoke the objective judge');
@@ -6073,6 +6524,95 @@ test('honest-completion: a normal delivered reply still completes (delivered:tru
   assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!.data.delivered, true);
 });
 
+test('output-grounding advisory becomes terminal-judge DATA instead of a harness-authored caveat', async () => {
+  resetEventLog();
+  outputGrounding._resetOutputGroundingStateForTests();
+  const sess = HarnessSession.create({ kind: 'chat', title: 'output-grounding-terminal-voice' });
+  const judgeText = 'The captured source supports $100 in revenue. I could not verify the $999K figure, so I am leaving it out.';
+  outputGrounding._setOutputGroundingJudgeForTests(async () => ({
+    verdict: 'unverifiable',
+    offending: [{ figure: '$999K', kind: 'unverifiable', note: 'not present in the captured source' }],
+    reason: 'the claimed revenue figure is absent from the captured source',
+  }));
+  try {
+    const result = await runConversation(withSettledWork({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Summarize the current revenue result.',
+      maxSteps: 1,
+      judgeCompletion: false,
+      makeRunner: makeRunnerStub,
+      runRunner: async (runner: Runner, _agent: unknown, items: AgentInputItem[]) => {
+        (runner as unknown as EventEmitter).emit('agent_tool_start');
+        const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
+        const called = appendEvent({
+          sessionId: sess.id,
+          turn: source.turn,
+          role: 'tool',
+          type: 'tool_called',
+          data: { tool: 'revenue_read', callId: 'revenue-source', effect: 'read', sourceUserSeq: source.seq },
+        });
+        writeToolOutput({
+          sessionId: sess.id,
+          callId: 'revenue-source',
+          tool: 'revenue_read',
+          output: 'Current revenue: $100.',
+          invocationNonce: 'nonce-revenue-source',
+        });
+        appendEvent({
+          sessionId: sess.id,
+          turn: source.turn,
+          role: 'tool',
+          type: 'tool_returned',
+          parentEventId: called.id,
+          data: { tool: 'revenue_read', callId: 'revenue-source', effect: 'read', sourceUserSeq: source.seq },
+        });
+        return {
+          history: items,
+          lastResponseId: undefined,
+          finalOutput: {
+            summary: 'Revenue summary ready.',
+            reply: 'Current revenue is $999K.',
+            done: true,
+            nextAction: 'completed',
+            reason: null,
+          },
+        } as never;
+      },
+      terminalPresentationRepairPort: {
+        async render() { throw new Error('a decided terminal judge owns the words'); },
+      },
+      terminalDeliveryJudgePort: {
+        async resolveRoute() {
+          return {
+            model: {} as any,
+            modelId: 'claude-haiku-4-5',
+            judgeFamily: 'claude',
+            brainFamily: 'codex',
+            transport: 'claude_subscription',
+            selfJudge: false,
+          };
+        },
+        async run() {
+          return {
+            verb: 'deliver',
+            reason: 'the verified source value is useful when the unsupported figure is removed',
+            publicText: judgeText,
+          };
+        },
+      },
+    }));
+    assert.equal(result.publicPresentation?.text, judgeText);
+    assert.doesNotMatch(result.publicPresentation?.text ?? '', /Heads up:|treat .*unverified/i);
+    const terminal = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal(terminal.data.terminalJudgeDisposition, 'deliver');
+    assert.match(String(terminal.data.verificationDetail), /absent from the captured source/i);
+  } finally {
+    outputGrounding._setOutputGroundingJudgeForTests(null);
+    outputGrounding._resetOutputGroundingStateForTests();
+  }
+});
+
 test('honest-completion: the live RESUME path (runConversationFromResume) also guards blocked replies', async () => {
   resetEventLog();
   const agent = new Agent({ name: 'ResumeBlockedTest', instructions: 'test' });
@@ -6103,6 +6643,99 @@ test('honest-completion: the live RESUME path (runConversationFromResume) also g
   });
   assert.equal(result.status, 'awaiting_user_input', 'resume blocked reply must not bank completed');
   assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!.data.delivered, false);
+});
+
+test('terminal delivery judge reopens the live approval-resume loop once and then publishes the repaired answer', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeTerminalJudgeTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-terminal-judge' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'send the approved draft' },
+  });
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'composio_execute_tool', callId: 'resume-terminal-c1',
+    argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
+  }]));
+  approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'one draft',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'X', arguments: '{}' },
+  });
+  let runnerCalls = 0;
+  let judgeCalls = 0;
+  const repairedReply = 'The approved draft is now sent, and the provider returned the exact send receipt.';
+  const result = await runConversationFromResume({
+    agent,
+    sessionId: sess.id,
+    decision: 'approve',
+    resolver: 'unit-test',
+    maxSteps: 3,
+    judgeFn: async (_objective, response) => response === repairedReply
+      ? { done: true, reason: 'the resumed answer contains the completed result' }
+      : { done: false, reason: 'the first answer still reports a terminal gap' },
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items) => {
+      runnerCalls += 1;
+      if (runnerCalls === 2) settleFixtureRead(sess.id);
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: runnerCalls === 1
+          ? {
+              done: true,
+              nextAction: 'completed',
+              reply: 'I am blocked before the approved draft can be confirmed.',
+              summary: 'The approved path still has one recoverable gap.',
+              reason: null,
+            }
+          : {
+              done: true,
+              nextAction: 'completed',
+              reply: repairedReply,
+              summary: 'Recovered the terminal gap after approval.',
+              reason: null,
+            },
+      };
+    },
+    terminalPresentationRepairPort: {
+      async render() { throw new Error('a decided terminal judge must not invoke repair'); },
+    },
+    terminalDeliveryJudgePort: {
+      async resolveRoute() {
+        return {
+          model: {} as any,
+          modelId: 'claude-haiku-4-5',
+          judgeFamily: 'claude',
+          brainFamily: 'codex',
+          transport: 'claude_subscription',
+          selfJudge: false,
+        };
+      },
+      async run() {
+        judgeCalls += 1;
+        return {
+          verb: 'resume',
+          reason: 'one provider verification can close the terminal gap',
+          recoveryInstruction: 'Inspect the retained send result and finish the exact approved draft operation now.',
+          askIfRepeated: 'I still cannot verify the approved send. Would you like me to inspect the provider state again?',
+        };
+      },
+    },
+  });
+
+  assert.equal(runnerCalls, 2, 'the judge RESUME must reuse the live approval-resume loop');
+  assert.equal(judgeCalls, 1);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.publicPresentation?.status, 'done');
+  assert.equal(result.publicPresentation?.text, repairedReply);
+  assert.equal(listEvents(sess.id, { types: ['heartbeat'] })
+    .some((event) => event.data.kind === 'terminal_delivery_resume'
+      && event.data.path === 'approval_resume'), true);
 });
 
 test('runConversationFromResume: completed decision with empty reply is retried before surfacing', async () => {
@@ -7444,13 +8077,13 @@ test('runConversation: synthetic parse retry classifies against the original too
     },
   ]);
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'Check my acme for tomorrow',
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
   const packets = listEventsForConv(sess.id, { types: ['agent_context_packet'] });
@@ -8398,6 +9031,10 @@ test('runConversation: stall triggers one auto-retry; retry success completes co
     const last = items.at(-1) as { content?: unknown } | undefined;
     modelInputs.push(typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? ''));
     const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
+    // The second pass represents the successful mailbox lookup described by
+    // the fixture. Record its durable read settlement so the terminal test
+    // does not rely on model prose as proof of current state.
+    if (scriptIndex === 1) settleFixtureRead(sess.id);
     scriptIndex += 1;
     return { history: items, lastResponseId: undefined, finalOutput: output };
   };
@@ -8859,10 +9496,10 @@ test('runConversation: zero-tool ABANDONED claim with announcement is force-corr
     const o = scripted[i] ?? scripted[scripted.length - 1]; i += 1;
     return { history: items, lastResponseId: undefined, finalOutput: o };
   };
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(), sessionId: sess.id, input: 'find the record',
     makeRunner: makeRunnerStub, runRunner,
-  });
+  }));
   assert.equal(result.status, 'completed');
   const stuck = listEventsForConv(sess.id, { types: ['stuck_detected'] });
   assert.equal(stuck.length, 1);

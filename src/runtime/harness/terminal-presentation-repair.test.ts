@@ -163,3 +163,27 @@ test('renderer failure or unsafe protocol output consumes the grant and never re
   }
 });
 
+test('a post-render authority failure preserves the model-authored terminal text', async () => {
+  const task = acceptedAction('Update the customer record and verify the saved values.');
+  const authored = 'I still cannot verify the saved customer values, so the update remains paused for review.';
+  const result = await repair.repairTerminalPresentation({
+    ...task,
+    proposedReply: 'Updated.',
+    missing: ['verify_committed_readback'],
+    port: {
+      async render() {
+        // The grant is issued before render. Simulate a later authority CAS
+        // conflict without making the model call itself fail.
+        eventlog.openEventLog().prepare(`
+          UPDATE accepted_task_authority
+             SET repair_grant_id = 'repair-grant-conflict'
+           WHERE session_id = ? AND source_user_seq = ?
+        `).run(task.sessionId, task.sourceUserSeq);
+        return authored;
+      },
+    },
+  });
+  assert.equal(result.status, 'blocked_fallback');
+  assert.equal(result.reason, 'consume_failed');
+  assert.equal(result.text, authored, 'host bookkeeping cannot overwrite a successful model render');
+});

@@ -107,6 +107,15 @@ test('report-back body uses the same safe public projection as live chat', () =>
   assert.doesNotMatch(body, /summary:|done:|nextAction:|reason:|private execution/i);
 });
 
+test('report-back with neither terminal prose nor durable work stays silent', () => {
+  assert.equal(buildTerminalReportBody({
+    sessionId: 'missing-report-body',
+    terminalSeq: 2,
+    startSeq: 1,
+    terminalData: {},
+  }), '');
+});
+
 test('Discord and Slack already delivered the reply — pinging again is a duplicate', () => {
   for (const channel of ['discord', 'slack', 'cli']) {
     const decision = decideTerminalReportBack({ ...BASE, channel });

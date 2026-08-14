@@ -589,7 +589,12 @@ test('Claude action terminal uses one sealed repair and publishes blocked when e
   assert.equal(initialCalls, 1, 'presentation repair does not re-enter the action SDK surface');
   assert.equal(repairCalls, 1);
   assert.equal(repairPacket?.acceptedRequest, request);
-  assert.equal(response.stoppedReason, 'awaiting-input');
+  // NOT 'awaiting-input': a repaired terminal asks the user nothing. Reusing
+  // the clarifying-question reason made a background worker park on "I
+  // haven't been able to verify the result yet" AS ITS QUESTION — it idled 45
+  // minutes and then intercepted the next attempt at the same work (live
+  // 2026-08-12). The public terminal stays `blocked`, asserted below.
+  assert.equal(response.stoppedReason, 'unverified');
   assert.equal(response.text, 'I can\'t verify that the report was written yet. I can resume with the source read and report write.');
   const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
   assert.equal(terminal?.data.turnOutcome?.status, 'blocked');

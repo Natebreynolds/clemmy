@@ -46,7 +46,11 @@ import {
   grindGateVerdict,
   composeKillAwareShouldCancel,
 } from './turn-control.js';
-import { classifyRuntimeToolEffect, runtimeToolAccountingMetadata } from './tool-effect.js';
+import {
+  actionTopologyRoleForRuntimeCall,
+  classifyRuntimeToolEffect,
+  runtimeToolAccountingMetadata,
+} from './tool-effect.js';
 import { countDominantArray } from './tool-output-digest.js';
 import { toolCallCorrelationFingerprint } from './tool-correlation.js';
 import {
@@ -951,6 +955,8 @@ function appendSdkTopLevelToolEvent(
   source: { name: string; input: unknown } | undefined,
   result?: {
     isError: boolean;
+    /** Exact host verdict from the returned SDK tool-result envelope. */
+    successful?: boolean;
     output?: unknown;
     invocationNonce?: string;
     providerDispatched?: boolean;
@@ -963,6 +969,7 @@ function appendSdkTopLevelToolEvent(
   try {
     const name = source?.name ?? '';
     const metadata = runtimeToolAccountingMetadata(name, source?.input);
+    const topologyRole = actionTopologyRoleForRuntimeCall(name, source?.input);
     const event = appendEvent({
       sessionId,
       turn: 0,
@@ -977,6 +984,7 @@ function appendSdkTopLevelToolEvent(
         callId,
         canonicalCallId: callId,
         accounting: 'top_level',
+        topologyRole,
         ...(type === 'tool_called' ? {
           correlationFingerprint: toolCallCorrelationFingerprint(name ? mcpToolTail(name) : '', source?.input),
         } : {}),
@@ -986,6 +994,7 @@ function appendSdkTopLevelToolEvent(
         ...(type === 'tool_called' ? { arguments: sdkToolArgumentsPreview(source?.input) } : {}),
         ...(type === 'tool_returned' ? {
           ok: !result?.isError,
+          successfulBusinessResult: result?.successful === true && topologyRole === 'business',
           ...(result?.invocationNonce ? { invocationNonce: result.invocationNonce } : {}),
           // Keep the canonical row independently useful to semantic readers.
           // The full payload still lives in tool_outputs; this matches the
@@ -3502,6 +3511,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             source,
             {
               isError: resultFailed,
+              successful: resultLooksSuccessful,
               output: tr.output,
               invocationNonce,
               ...(settledReadReplay ? {

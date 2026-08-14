@@ -66,6 +66,28 @@ function makeAgentStub(): import('@openai/agents').Agent<any, any> {
   return {} as import('@openai/agents').Agent<any, any>;
 }
 
+function deliverJudge(publicText: string) {
+  return {
+    async resolveRoute() {
+      return {
+        model: {} as any,
+        modelId: 'claude-haiku-4-5',
+        judgeFamily: 'claude' as const,
+        brainFamily: 'codex' as const,
+        transport: 'claude_subscription' as const,
+        selfJudge: false,
+      };
+    },
+    async run() {
+      return {
+        verb: 'deliver',
+        reason: 'the partial result is useful when the remaining goal gap is stated plainly',
+        publicText,
+      };
+    },
+  };
+}
+
 /** Settle a tiny work manifest bound to the CURRENT accepted source. The
  *  fail-closed action terminal refuses done-claims with zero settled work
  *  (that is the H4 guarantee, validated live 2026-08-11); a stub that says
@@ -291,6 +313,7 @@ test('goal validation: attempt budget exhausted → honest unmet note, goal stay
   const sess = HarnessSession.create({ kind: 'chat', title: 'goal exhaust' });
   const goal = createDirectGoal({ objective: 'land the migration', sessionId: sess.id, maxAttempts: 1 })!;
 
+  const judgedText = 'I created the migration report, but the pinned migration goal still lacks evidence that the migration itself landed.';
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
@@ -298,6 +321,7 @@ test('goal validation: attempt budget exhausted → honest unmet note, goal stay
     makeRunner: makeRunnerStub,
     runRunner: doneRunner('Done — migration report saved to /tmp/migration-report.md.', sess.id),
     goalValidator: async () => failResult('no migration evidence'),
+    terminalDeliveryJudgePort: deliverJudge(judgedText),
   });
 
   assert.equal(result.status, 'completed', 'exhaustion completes honestly instead of spinning');
@@ -307,7 +331,8 @@ test('goal validation: attempt budget exhausted → honest unmet note, goal stay
 
   const completed = listEvents(sess.id, { types: ['conversation_completed'] });
   const last = completed[completed.length - 1];
-  assert.match(String(last.data.summary), /unmet criteria/, 'the user SEES the unmet criteria');
+  assert.equal(last.data.summary, judgedText, 'the terminal judge authors the truthful qualification');
+  assert.equal(last.data.terminalJudgeDisposition, 'deliver');
 });
 
 test('goal validation: dead judge (judgeFailedOpen) never spins and never satisfies', async () => {
@@ -316,6 +341,7 @@ test('goal validation: dead judge (judgeFailedOpen) never spins and never satisf
   const goal = createDirectGoal({ objective: 'publish the report', sessionId: sess.id })!;
 
   let calls = 0;
+  const judgedText = 'The report draft exists, but I could not validate the pinned publish goal because its validator was unavailable.';
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
@@ -326,13 +352,15 @@ test('goal validation: dead judge (judgeFailedOpen) never spins and never satisf
       calls += 1;
       return { pass: false, judgeFailedOpen: true, perCriterion: [], advice: 'judge unavailable' };
     },
+    terminalDeliveryJudgePort: deliverJudge(judgedText),
   });
 
   assert.equal(result.status, 'completed');
   assert.equal(calls, 1, 'a dead judge does not retry-spin');
   assert.equal(getPlanProposal(goal.id)!.status, 'active', 'a dead judge can never auto-satisfy');
   const completed = listEvents(sess.id, { types: ['conversation_completed'] });
-  assert.match(String(completed[completed.length - 1].data.summary), /could not be validated/);
+  assert.equal(completed[completed.length - 1].data.summary, judgedText);
+  assert.equal(completed[completed.length - 1].data.terminalJudgeDisposition, 'deliver');
 });
 
 test('goal validation gate: a casual no-work turn never triggers validation', async () => {
