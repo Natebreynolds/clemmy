@@ -7,7 +7,13 @@
  * user_input_received and conversation_completed to the event log, so this returns
  * the brain's own prior turns with no schema change.
  */
+import { createHash } from 'node:crypto';
 import { SessionStore } from '../../memory/session-store.js';
+import {
+  cosine,
+  getLocalEmbeddingProvider,
+  localEmbeddingProviderSync,
+} from '../../memory/embeddings.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import {
   getSession as getHarnessSession,
@@ -25,6 +31,35 @@ import {
 } from './public-presentation.js';
 
 export interface PriorTurn { who: 'user' | 'assistant'; text: string; at: string }
+
+export type RelevantPriorWorkStatusSource = 'typed_terminal' | 'run_attempt';
+export type RelevantPriorWorkMatchKind = 'exact' | 'semantic' | 'lexical';
+
+export interface RelevantPriorWorkSource {
+  sourceSessionId: string;
+  sourceUserSeq: number;
+}
+
+export interface RelevantPriorWorkItem {
+  sourceSessionId: string;
+  sourceUserSeq: number;
+  /** The historical task description, not a continuation owner. */
+  objective: string;
+  /** Retrieval evidence only. It does not assert that the tasks are identical. */
+  matchKind: RelevantPriorWorkMatchKind;
+  matchScore: number;
+  statusSource: RelevantPriorWorkStatusSource;
+  status: 'done' | 'needs_input' | 'blocked' | 'failed' | 'cancelled' | 'interrupted' | 'superseded';
+  evidenceRefs: string[];
+}
+
+export interface RelevantPriorWorkProjection {
+  text: string;
+  count: number;
+  /** Digest of the current retrieval query, not an identity assertion. */
+  queryHash: string;
+  items: RelevantPriorWorkItem[];
+}
 
 /**
  * Render the IRREVERSIBLE external actions that already SUCCEEDED in this session,
@@ -476,6 +511,539 @@ export function pullRecentTurnsForSessions(
 
 function normalizeTranscriptText(text: string): string {
   return text.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/** Exact fast-path identity. Semantic candidates use a separate, explicitly
+ * non-authoritative retrieval tier. */
+function normalizedPriorWorkObjective(text: string): string {
+  return text.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+export function normalizedPriorWorkObjectiveHash(text: string): string {
+  return createHash('sha256').update(normalizedPriorWorkObjective(text), 'utf8').digest('hex');
+}
+
+interface PriorWorkSourceRow {
+  seq: number;
+  session_id: string;
+  role: string;
+  data_json: string;
+}
+
+interface PriorWorkCandidate {
+  order: number;
+  historical: Pick<
+    RelevantPriorWorkItem,
+    'sourceSessionId' | 'sourceUserSeq' | 'statusSource' | 'status' | 'evidenceRefs'
+  >;
+  outcomeText?: string;
+  objective: string;
+}
+
+interface MatchedPriorWorkCandidate extends PriorWorkCandidate {
+  item: RelevantPriorWorkItem;
+}
+
+const HISTORICAL_TYPED_TERMINALS = new Set(['done', 'needs_input', 'blocked', 'failed', 'cancelled']);
+const HISTORICAL_RUN_ATTEMPTS = new Set(['interrupted', 'failed', 'cancelled', 'superseded']);
+const PRIOR_WORK_SOURCE_LIMIT = 24;
+const PRIOR_WORK_OUTCOME_MAX_CHARS = 96;
+const PRIOR_WORK_SEMANTIC_DEADLINE_MS = 120;
+const PRIOR_WORK_SEMANTIC_MIN_SCORE = 0.84;
+const PRIOR_WORK_LEXICAL_MIN_SCORE = 0.55;
+
+const PRIOR_WORK_STOP_WORDS = new Set([
+  'a', 'an', 'and', 'api', 'about', 'at', 'be', 'by', 'ca', 'can', 'could',
+  'for', 'from', 'i', 'in', 'into', 'it', 'link', 'me', 'mcp', 'my', 'new',
+  'of', 'on', 'please', 'quick', 'the', 'them', 'then', 'to', 'using', 'via',
+  'with', 'would',
+]);
+
+const ARTIFACT_FAMILIES: ReadonlyArray<readonly [string, RegExp]> = [
+  ['sheet', /\b(?:google\s+sheet|spreadsheet|xlsx?|csv)\b/i],
+  ['pdf', /\bpdf\b/i],
+  ['document', /\b(?:google\s+doc|document|docx?)\b/i],
+  ['presentation', /\b(?:slide\s*deck|slides?|presentation|pptx?)\b/i],
+];
+
+const PROVIDER_FAMILIES: ReadonlyArray<readonly [string, RegExp]> = [
+  ['apify', /\bapify\b/i],
+  ['firecrawl', /\bfirecrawl\b/i],
+  ['airtable', /\bairtable\b/i],
+  ['notion', /\bnotion\b/i],
+  ['salesforce', /\bsalesforce\b/i],
+  ['hubspot', /\bhubspot\b/i],
+  ['outlook', /\boutlook\b/i],
+  ['gmail', /\bgmail\b/i],
+];
+
+const EFFECT_FAMILIES: ReadonlyArray<readonly [string, RegExp]> = [
+  ['email', /\b(?:e-?mail(?:ing|ed|s)?|outlook|gmail)\b/i],
+  ['message', /\b(?:send|post)\s+(?:a\s+)?message\b|\b(?:slack|discord)\b/i],
+  ['upload', /\bupload\b/i],
+  ['delete', /\b(?:delete|remove|trash)\b/i],
+];
+
+function oneLine(text: string, maxChars: number): string {
+  const compact = text.replace(/\s+/g, ' ').trim();
+  return compact.length <= maxChars
+    ? compact
+    : `${compact.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function priorWorkTokens(text: string): Set<string> {
+  const words = text.normalize('NFKC').toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}'-]*/gu) ?? [];
+  const tokens = new Set<string>();
+  for (const raw of words) {
+    let token = raw.replace(/^['-]+|['-]+$/g, '');
+    if (!token || PRIOR_WORK_STOP_WORDS.has(token)) continue;
+    if (token.length > 5 && token.endsWith('ies')) token = `${token.slice(0, -3)}y`;
+    else if (token.length > 4 && token.endsWith('s') && !token.endsWith('ss')) token = token.slice(0, -1);
+    if (!PRIOR_WORK_STOP_WORDS.has(token)) tokens.add(token);
+  }
+  return tokens;
+}
+
+function tokenOverlapScore(leftText: string, rightText: string): { overlap: number; containment: number } {
+  const left = priorWorkTokens(leftText);
+  const right = priorWorkTokens(rightText);
+  if (left.size === 0 || right.size === 0) return { overlap: 0, containment: 0 };
+  let overlap = 0;
+  for (const token of left) if (right.has(token)) overlap += 1;
+  return { overlap, containment: overlap / Math.min(left.size, right.size) };
+}
+
+function matchedFamilies(text: string, families: ReadonlyArray<readonly [string, RegExp]>): Set<string> {
+  const found = new Set<string>();
+  for (const [name, pattern] of families) {
+    pattern.lastIndex = 0;
+    if (pattern.test(text)) found.add(name);
+  }
+  return found;
+}
+
+function stableAnchorGroups(text: string): Set<string>[] {
+  const emails = new Set<string>();
+  for (const value of text.match(/\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b/gi) ?? []) {
+    emails.add(value.toLowerCase());
+  }
+  const domains = new Set<string>();
+  for (const value of text.match(/\b[\w-]+\.(?:com|ai|io|org|net|dev|co\.uk|example)\b/gi) ?? []) {
+    domains.add(value.toLowerCase());
+  }
+  const ids = new Set<string>();
+  for (const value of text.match(/\b(?:tbl|app|rec)[a-z0-9]{12,}\b/gi) ?? []) {
+    ids.add(value.toLowerCase());
+  }
+  // Families stay separate: two different recipients at the same domain are
+  // still an explicit identity conflict even though the domain intersects.
+  return [emails, domains, ids];
+}
+
+const LOCATION_CONTEXT_RE = /\b(?:restaurants?|hotels?|businesses?|venues?|places?|stores?|offices?|properties?|homes?|companies|law\s+firms?)\s+(?:in|near|around)\s+([a-z][a-z.'-]*(?:\s+[a-z][a-z.'-]*){0,2}?)(?=\s+(?:from|using|via|with|and|then|to|for|into|on|but)\b|[,.;!?]|$)/gi;
+
+function locationAnchors(text: string): Set<string> {
+  const anchors = new Set<string>();
+  LOCATION_CONTEXT_RE.lastIndex = 0;
+  for (const match of text.matchAll(LOCATION_CONTEXT_RE)) {
+    const normalized = (match[1] ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (normalized) anchors.add(normalized);
+  }
+  return anchors;
+}
+
+/** A place named with a broader qualifier ("Ventura CA", "Lyon France") is the
+ * same place as the bare name, so one anchor standing inside the other is
+ * agreement, not conflict. Deciding that by word containment keeps the rule
+ * true everywhere; a list of region names would only ever be true where the
+ * list was written. */
+function conflictingLocationAnchors(left: Set<string>, right: Set<string>): boolean {
+  if (left.size === 0 || right.size === 0) return false;
+  for (const current of left) {
+    const currentWords = current.split(' ');
+    for (const historical of right) {
+      const historicalWords = historical.split(' ');
+      const [shorter, longer] = currentWords.length <= historicalWords.length
+        ? [currentWords, historicalWords]
+        : [historicalWords, currentWords];
+      if (shorter.every((word) => longer.includes(word))) return false;
+    }
+  }
+  return true;
+}
+
+function disjointWhenBothPresent(left: Set<string>, right: Set<string>): boolean {
+  if (left.size === 0 || right.size === 0) return false;
+  for (const value of left) if (right.has(value)) return false;
+  return true;
+}
+
+function effectPolarity(text: string, familyPattern: RegExp): 'positive' | 'negative' | null {
+  familyPattern.lastIndex = 0;
+  const match = familyPattern.exec(text);
+  if (!match || match.index === undefined) return null;
+  const before = text.slice(Math.max(0, match.index - 48), match.index).toLowerCase();
+  return /\b(?:do\s+not|don't|never|without|no|avoid)\b[^.!?;]{0,44}$/.test(before)
+    ? 'negative'
+    : 'positive';
+}
+
+/** A cosine can propose a candidate; it cannot erase an explicit identity,
+ * artifact, or effect conflict. Missing detail is allowed because prior turns
+ * are often less specific than the current request. */
+function conservativePriorWorkCompatibility(
+  currentObjective: string,
+  historicalObjective: string,
+): { eligible: boolean; tokenScore: number } {
+  const tokenScore = tokenOverlapScore(currentObjective, historicalObjective);
+  if (tokenScore.overlap < 4 || tokenScore.containment < 0.4) {
+    return { eligible: false, tokenScore: tokenScore.containment };
+  }
+  if (conflictingLocationAnchors(locationAnchors(currentObjective), locationAnchors(historicalObjective))) {
+    return { eligible: false, tokenScore: tokenScore.containment };
+  }
+  const currentStableAnchors = stableAnchorGroups(currentObjective);
+  const historicalStableAnchors = stableAnchorGroups(historicalObjective);
+  for (let index = 0; index < currentStableAnchors.length; index += 1) {
+    if (disjointWhenBothPresent(currentStableAnchors[index]!, historicalStableAnchors[index]!)) {
+      return { eligible: false, tokenScore: tokenScore.containment };
+    }
+  }
+  if (disjointWhenBothPresent(
+    matchedFamilies(currentObjective, ARTIFACT_FAMILIES),
+    matchedFamilies(historicalObjective, ARTIFACT_FAMILIES),
+  )) {
+    return { eligible: false, tokenScore: tokenScore.containment };
+  }
+  if (disjointWhenBothPresent(
+    matchedFamilies(currentObjective, PROVIDER_FAMILIES),
+    matchedFamilies(historicalObjective, PROVIDER_FAMILIES),
+  )) {
+    return { eligible: false, tokenScore: tokenScore.containment };
+  }
+  for (const [, pattern] of EFFECT_FAMILIES) {
+    const currentPolarity = effectPolarity(currentObjective, pattern);
+    const historicalPolarity = effectPolarity(historicalObjective, pattern);
+    if (currentPolarity && historicalPolarity && currentPolarity !== historicalPolarity) {
+      return { eligible: false, tokenScore: tokenScore.containment };
+    }
+  }
+  return { eligible: true, tokenScore: tokenScore.containment };
+}
+
+async function withPriorWorkDeadline<T>(work: Promise<T>, ms: number): Promise<T | null> {
+  let timer: NodeJS.Timeout | undefined;
+  const expiry = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([work, expiry]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function priorWorkSourceRows(
+  db: ReturnType<typeof openEventLog>,
+  input: { priorSources?: RelevantPriorWorkSource[]; priorSessionIds?: string[] },
+): PriorWorkSourceRow[] {
+  if (input.priorSources) {
+    const statement = db.prepare(
+      `SELECT seq, session_id, role, data_json FROM events
+         WHERE session_id = ? AND seq = ? AND type = 'user_input_received'
+         LIMIT 1`,
+    );
+    const seen = new Set<string>();
+    const rows: PriorWorkSourceRow[] = [];
+    for (const source of input.priorSources) {
+      if (!Number.isSafeInteger(source.sourceUserSeq) || source.sourceUserSeq <= 0) continue;
+      const key = `${source.sourceSessionId}:${source.sourceUserSeq}`;
+      if (!source.sourceSessionId.trim() || seen.has(key)) continue;
+      seen.add(key);
+      const row = statement.get(source.sourceSessionId, source.sourceUserSeq) as PriorWorkSourceRow | undefined;
+      if (row?.role === 'user') rows.push(row);
+      if (rows.length >= PRIOR_WORK_SOURCE_LIMIT) break;
+    }
+    return rows;
+  }
+
+  const rows: PriorWorkSourceRow[] = [];
+  for (const sessionId of uniqueSessionIds(input.priorSessionIds ?? [])) {
+    try {
+      rows.push(...db.prepare(
+        `SELECT seq, session_id, role, data_json FROM events
+           WHERE session_id = ? AND type = 'user_input_received' AND role = 'user'
+           ORDER BY seq DESC
+           LIMIT ?`,
+      ).all(sessionId, PRIOR_WORK_SOURCE_LIMIT) as PriorWorkSourceRow[]);
+    } catch {
+      // One unavailable historical session cannot break the current turn.
+    }
+  }
+  return rows.sort((left, right) => right.seq - left.seq).slice(0, PRIOR_WORK_SOURCE_LIMIT);
+}
+
+function historicalObjectiveForSource(
+  db: ReturnType<typeof openEventLog>,
+  row: PriorWorkSourceRow,
+): string {
+  try {
+    const decisions = db.prepare(
+      `SELECT data_json FROM events
+         WHERE session_id = ?
+           AND type = 'turn_preflight_decision'
+           AND json_extract(data_json, '$.sourceUserSeq') = ?
+         ORDER BY seq DESC
+         LIMIT 12`,
+    ).all(row.session_id, row.seq) as Array<{ data_json: string }>;
+    for (const decisionRow of decisions) {
+      const decision = JSON.parse(decisionRow.data_json) as { objective?: unknown };
+      if (typeof decision.objective === 'string' && decision.objective.trim()) {
+        return decision.objective.trim();
+      }
+    }
+  } catch {
+    // Fall through to the exact accepted public source text.
+  }
+  try {
+    const data = JSON.parse(row.data_json) as unknown;
+    if ((data as { synthetic?: unknown } | null)?.synthetic === true) return '';
+    return publicUserInputText(data);
+  } catch {
+    return '';
+  }
+}
+
+function exactTypedTerminalForSource(
+  db: ReturnType<typeof openEventLog>,
+  sessionId: string,
+  sourceUserSeq: number,
+) {
+  const rows = db.prepare(
+    `SELECT data_json FROM events
+       WHERE session_id = ?
+         AND type = 'conversation_completed'
+         AND (
+           json_extract(data_json, '$.sourceUserSeq') = ?
+           OR json_extract(data_json, '$.presentation.identity.sourceUserSeq') = ?
+         )
+       ORDER BY seq ASC
+       LIMIT 12`,
+  ).all(sessionId, sourceUserSeq, sourceUserSeq) as Array<{ data_json: string }>;
+  for (const row of rows) {
+    try {
+      const data = JSON.parse(row.data_json) as unknown;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) continue;
+      const presentation = validTypedCompletionPresentation(
+        data as Record<string, unknown>,
+        sessionId,
+      );
+      if (presentation?.identity.sourceUserSeq === sourceUserSeq) return presentation;
+    } catch {
+      // A malformed row that claims typed ownership is not historical truth.
+    }
+  }
+  return null;
+}
+
+function latestHistoricalAttemptForSource(
+  db: ReturnType<typeof openEventLog>,
+  sessionId: string,
+  sourceUserSeq: number,
+): RelevantPriorWorkItem['status'] | null {
+  const row = db.prepare(
+    `SELECT status FROM run_attempts
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY started_at DESC, rowid DESC
+       LIMIT 1`,
+  ).get(sessionId, sourceUserSeq) as { status: string } | undefined;
+  return row && HISTORICAL_RUN_ATTEMPTS.has(row.status)
+    ? row.status as RelevantPriorWorkItem['status']
+    : null;
+}
+
+/**
+ * Render bounded historical candidates for the model to judge or ignore.
+ *
+ * The exact accepted source remains the provenance identity. Semantic and
+ * lexical retrieval are advisory candidate generators only: neither can own
+ * the current task, resume an old edge, carry an approval, or authorize an
+ * effect. Only typed historical terminals or durable run-attempt states are
+ * presented as facts about what happened before.
+ */
+export async function renderRelevantPriorWorkForModel(
+  db: ReturnType<typeof openEventLog>,
+  input: {
+    currentObjective: string;
+    priorSources?: RelevantPriorWorkSource[];
+    /** Compatibility seam for exact unit callers. Runtime candidate discovery
+     * supplies exact source refs so the global 24-source bound is durable. */
+    priorSessionIds?: string[];
+    maxItems?: number;
+    maxChars?: number;
+    semanticDeadlineMs?: number;
+  },
+): Promise<RelevantPriorWorkProjection> {
+  const normalizedObjective = normalizedPriorWorkObjective(input.currentObjective);
+  const queryHash = normalizedPriorWorkObjectiveHash(input.currentObjective);
+  const empty: RelevantPriorWorkProjection = { text: '', count: 0, queryHash, items: [] };
+  if (!normalizedObjective) return empty;
+
+  const candidates: PriorWorkCandidate[] = [];
+  for (const row of priorWorkSourceRows(db, input)) {
+    const objective = historicalObjectiveForSource(db, row);
+    if (!objective) continue;
+    const terminal = exactTypedTerminalForSource(db, row.session_id, row.seq);
+    if (terminal) {
+      if (!HISTORICAL_TYPED_TERMINALS.has(terminal.status)) continue;
+      const evidenceRefs = (terminal.evidenceRefs ?? [])
+        .slice(0, 4)
+        .map((ref) => `${ref.kind}:${oneLine(ref.id, 96)}`);
+      candidates.push({
+        order: row.seq,
+        objective,
+        historical: {
+          sourceSessionId: row.session_id,
+          sourceUserSeq: row.seq,
+          statusSource: 'typed_terminal',
+          status: terminal.status as RelevantPriorWorkItem['status'],
+          evidenceRefs,
+        },
+        outcomeText: oneLine(terminal.text, PRIOR_WORK_OUTCOME_MAX_CHARS),
+      });
+      continue;
+    }
+
+    // A durable physical-attempt status may still prove that work failed or
+    // was interrupted. It can never launder reply text from an invalid typed
+    // terminal row, so this fallback carries status only.
+    const attemptStatus = latestHistoricalAttemptForSource(db, row.session_id, row.seq);
+    if (!attemptStatus) continue;
+    candidates.push({
+      order: row.seq,
+      objective,
+      historical: {
+        sourceSessionId: row.session_id,
+        sourceUserSeq: row.seq,
+        statusSource: 'run_attempt',
+        status: attemptStatus,
+        evidenceRefs: [],
+      },
+    });
+  }
+  if (candidates.length === 0) return empty;
+
+  // Exact normalized wording is a zero-latency ranking fast path. It remains
+  // retrieval evidence rather than task/authority identity.
+  let matched: MatchedPriorWorkCandidate[] = candidates
+    .filter((candidate) => normalizedPriorWorkObjective(candidate.objective) === normalizedObjective)
+    .map((candidate) => ({
+      ...candidate,
+      item: { ...candidate.historical, objective: candidate.objective, matchKind: 'exact' as const, matchScore: 1 },
+    }));
+
+  if (matched.length === 0) {
+    const compatible = candidates
+      .map((candidate) => ({
+        candidate,
+        compatibility: conservativePriorWorkCompatibility(input.currentObjective, candidate.objective),
+      }))
+      .filter(({ compatibility }) => compatibility.eligible);
+
+    const provider = localEmbeddingProviderSync();
+    let semanticCompleted = false;
+    if (provider && compatible.length > 0) {
+      const vectors = await withPriorWorkDeadline(
+        provider.embed([input.currentObjective, ...compatible.map(({ candidate }) => candidate.objective)])
+          .catch(() => null),
+        Math.max(20, Math.min(500, Math.trunc(input.semanticDeadlineMs ?? PRIOR_WORK_SEMANTIC_DEADLINE_MS))),
+      );
+      const query = vectors?.[0];
+      if (query) {
+        semanticCompleted = true;
+        matched = compatible.flatMap(({ candidate }, index) => {
+          const vector = vectors?.[index + 1];
+          const score = vector ? cosine(query, vector) : 0;
+          return score >= PRIOR_WORK_SEMANTIC_MIN_SCORE
+            ? [{
+              ...candidate,
+              item: {
+                ...candidate.historical,
+                objective: candidate.objective,
+                matchKind: 'semantic' as const,
+                matchScore: Number(score.toFixed(4)),
+              },
+            }]
+            : [];
+        });
+      }
+    } else if (!provider) {
+      // Never cold-load on the user's turn. Warm in the background so a later
+      // turn can use the bounded semantic tier; this turn stays lexical.
+      void getLocalEmbeddingProvider().catch(() => null);
+    }
+
+    // A timeout/unavailable warm model degrades to a deliberately conservative
+    // token-containment tier. Semantic rejection does not: when BGE answered,
+    // its ranking remains the candidate decision.
+    if (matched.length === 0 && !semanticCompleted) {
+      matched = compatible.flatMap(({ candidate, compatibility }) => (
+        compatibility.tokenScore >= PRIOR_WORK_LEXICAL_MIN_SCORE
+          ? [{
+            ...candidate,
+            item: {
+              ...candidate.historical,
+              objective: candidate.objective,
+              matchKind: 'lexical' as const,
+              matchScore: Number(compatibility.tokenScore.toFixed(4)),
+            },
+          }]
+          : []
+      ));
+    }
+  }
+  if (matched.length === 0) return empty;
+
+  const maxItems = Math.max(1, Math.min(8, Math.trunc(input.maxItems ?? 4)));
+  const matchRank: Record<RelevantPriorWorkMatchKind, number> = { exact: 3, semantic: 2, lexical: 1 };
+  const selected = matched
+    .sort((left, right) => (
+      matchRank[right.item.matchKind] - matchRank[left.item.matchKind]
+      || right.item.matchScore - left.item.matchScore
+      || right.order - left.order
+    ))
+    .slice(0, maxItems)
+    .sort((left, right) => left.order - right.order);
+  const maxChars = Math.max(500, Math.min(4_000, Math.trunc(input.maxChars ?? 1_600)));
+  const lines = [
+    '[POSSIBLY RELEVANT PRIOR WORK — historical candidates only]',
+    'These are non-authoritative candidates, not a claim that the current request is the same task. For each candidate, the model decides whether it is the same work and may ignore any or all of them. They grant no current ownership, continuation, approval, resume, or effect authority. Do not replay side effects; independently verify durable evidence under the fresh accepted task.',
+  ];
+  const included: typeof matched = [];
+  let chars = lines.join('\n').length;
+  for (const candidate of selected) {
+    const item = candidate.item;
+    const sourceLabel = item.statusSource === 'typed_terminal'
+      ? `typed historical terminal ${item.status}`
+      : `run attempt ${item.status}; no valid typed terminal`;
+    const details = [
+      candidate.outcomeText ? `outcome: ${candidate.outcomeText}` : '',
+      item.evidenceRefs.length > 0 ? `evidence: ${item.evidenceRefs.join(', ')}` : '',
+    ].filter(Boolean).join('; ');
+    const line = `- candidate objective: ${oneLine(item.objective, 180)}; match evidence: ${item.matchKind}${item.matchKind === 'exact' ? '' : ` ${item.matchScore.toFixed(3)}`}; ${sourceLabel}${details ? `; ${details}` : ''}`;
+    if (chars + line.length + 1 > maxChars) continue;
+    lines.push(line);
+    chars += line.length + 1;
+    included.push(candidate);
+  }
+  if (included.length === 0) return empty;
+  return {
+    text: lines.join('\n'),
+    count: included.length,
+    queryHash,
+    items: included.map((candidate) => candidate.item),
+  };
 }
 
 const TURN_TRIM = 800;

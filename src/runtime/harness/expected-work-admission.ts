@@ -11,6 +11,13 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type Database from 'better-sqlite3';
 import { armAcceptedTaskAuthority } from './accepted-task-authority.js';
 import {
+  authorizeGeneratedArtifactReadback,
+  generatedArtifactReadContentVerified,
+  generatedArtifactWriteContentVerified,
+} from './artifact-ledger.js';
+import { compileGoogleSheetsSheetFromJsonContract } from './sheet-from-json-content-contract.js';
+import { classifyExternalWrite } from './confirm-first-gate.js';
+import {
   canonicalExpectedWorkJson,
   expectedWorkDigest,
   freezePreparedExpectedWorkContractInTransaction,
@@ -30,6 +37,7 @@ import {
   type ExpectedWorkUniverseSealCache,
 } from './expected-work-universe-seal.js';
 import { getSession, openEventLog } from './eventlog.js';
+import { computeResultHasSubstance } from './expected-work-matcher.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import { detectMultiItemIntent } from './multi-item-intent.js';
 import {
@@ -37,19 +45,28 @@ import {
   refinePreDispatchReadEvidence,
   type FiniteReadStructuralProof,
 } from './read-evidence-refinement.js';
-import { providerEnvelopeHasContradiction } from './provider-read-evidence.js';
+import { inspectProviderEnvelope } from './provider-read-evidence.js';
+import { recordsAtRecordPath } from './result-facts.js';
 import {
   redeemedReadIsExhausted,
   redeemSuccessfulSettlementResultForHost,
 } from './result-handle.js';
 import { expectedTaskFor } from './resolution-ledger.js';
 import {
-  isClementineLocalToolNamespace,
   isPlainOrClementineLocalTool,
-  runtimeToolTail,
 } from './runtime-tool-identity.js';
-import { classifyRuntimeToolEffect, type RuntimeToolEffect } from './tool-effect.js';
-import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
+import {
+  getPendingAction,
+  verifyConversationalPendingActionAuthority,
+} from './pending-actions.js';
+import { pendingActionIdFromArgs } from './pending-action-view.js';
+import {
+  actionTopologyRoleForRuntimeCall,
+  classifyRuntimeToolEffect,
+  inspectTrustedRuntimeEffectCarrier,
+  type RuntimeToolEffect,
+  type TrustedRuntimeEffectCarrier,
+} from './tool-effect.js';
 
 export interface ExpectedWorkUniverseSelectorV1 {
   /** RFC 6901 pointer into the normalized inner tool arguments. */
@@ -75,6 +92,7 @@ export interface ExpectedWorkCallBinding {
   evidenceBasis?: string;
   schemaFingerprint?: string;
   schemaDigest?: string;
+  generatedArtifactContentContract?: unknown;
 }
 
 export type ExpectedWorkActivationResult =
@@ -98,6 +116,8 @@ export type ExpectedWorkAdmissionFailureKind =
   | 'work_universe_unsealed'
   | 'work_source_witness_missing'
   | 'work_already_satisfied'
+  | 'work_evidence_incomplete'
+  | 'work_effect_already_executed'
   | 'work_authority_unavailable';
 
 /** One line per contract operation: what is owed, what is settled, what
@@ -120,6 +140,24 @@ export type ExpectedWorkInvocationAdmission =
    *  the carrier can hand back its stored result instead of an error. */
   | {
       status: 'satisfied';
+      priorLogicalToolCallId: string;
+      contract: AcceptedTaskWorkContractV1;
+      plan: ExpectedWorkPlanLine[];
+    }
+  /** The exact non-mutating call already settled without discharging the
+   * requirement. Return its retained bytes; do not pay for an exact replay
+   * and do not label the plan satisfied. */
+  | {
+      status: 'evidence_retained';
+      priorLogicalToolCallId: string;
+      contract: AcceptedTaskWorkContractV1;
+      plan: ExpectedWorkPlanLine[];
+    }
+  /** A mutation crossed exactly once but lacks the verification evidence
+   * required to discharge the plan. It must not replay and must not be called
+   * satisfied. */
+  | {
+      status: 'effect_already_executed';
       priorLogicalToolCallId: string;
       contract: AcceptedTaskWorkContractV1;
       plan: ExpectedWorkPlanLine[];
@@ -355,36 +393,206 @@ export function assertExpectedWorkLogicalAdmission(input: {
   sessionId: string;
   sourceUserSeq: number;
   logicalToolCallId?: string;
+  /** A bound orchestration parent may authorize a genuinely distinct child
+   * call. Prefer the child's own binding when it has one; retain the parent as
+   * a compatibility fallback for existing host orchestrators. */
+  fallbackLogicalToolCallId?: string;
   tool: string;
   args?: unknown;
+  /** Opaque host provenance retained when a trusted wrapper has already been
+   * peeled to this exact provider call. Models cannot mint this carrier. */
+  trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
 }): void {
   const db = openEventLog();
   const authority = authorityActivationRow(db, input.sessionId, input.sourceUserSeq);
   if (!authority || authority.expected_work_required !== 1 || isCarrier(input.tool)) return;
-  if (input.logicalToolCallId) {
+  const candidateLogicalIds = [
+    input.logicalToolCallId,
+    input.fallbackLogicalToolCallId,
+  ].filter((value, index, all): value is string => (
+    typeof value === 'string' && value.length > 0 && all.indexOf(value) === index
+  ));
+  if (candidateLogicalIds.length > 0) {
     const bound = db.prepare(`
       SELECT 1 FROM expected_work_call_bindings
-       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
-    `).get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId);
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id IN (${candidateLogicalIds.map(() => '?').join(', ')})
+       LIMIT 1
+    `).get(input.sessionId, input.sourceUserSeq, ...candidateLogicalIds);
     if (bound) return;
   }
-  const registryName = isClementineLocalToolNamespace(input.tool)
-    ? runtimeToolTail(input.tool)
-    : input.tool.includes('__')
-      ? ''
-      : input.tool;
   // Control-role tools (ask/status/discovery/execution bookkeeping) are exempt
   // REGARDLESS of contract state — the wall exists for BUSINESS dispatch, and
   // a status probe after freezing is still acquisition, not work. Gating the
   // exemption on !work_contract_id turned the first post-freeze mcp_status
   // into a turn-killing 500 on a plain conversational scenario (live
   // 2026-08-11, converse-first: run_failed ExpectedWorkBindingRequiredError).
-  if (actionTopologyRoleFor(registryName) === 'control') return;
+  if (actionTopologyRoleForRuntimeCall(input.tool, input.args) === 'control') return;
+  // Some host adapters peel a trusted wrapper before opening the provider's
+  // logical call. The bare slug then loses the wrapper's effect vocabulary:
+  // `APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS` is conservatively unknown even
+  // though the exact Composio invocation is a proven read. Preserve that
+  // provenance across this wall only when BOTH forms canonicalize to the same
+  // accepted-task contract. The opaque carrier is WeakSet-backed, so a model
+  // field or structural lookalike cannot nominate read authority.
+  const trustedCarrier = inspectTrustedRuntimeEffectCarrier(input.trustedEffectCarrier);
+  if (
+    trustedCarrier
+    && (trustedCarrier.decision.effect === 'read' || trustedCarrier.decision.effect === 'compute')
+  ) {
+    const directContract = durableLogicalCallContract(
+      authority.accepted_task_id,
+      input.tool,
+      input.args,
+    );
+    const carrierContract = durableLogicalCallContract(
+      authority.accepted_task_id,
+      trustedCarrier.toolName,
+      trustedCarrier.args,
+    );
+    if (
+      directContract
+      && carrierContract
+      && directContract.toolName === carrierContract.toolName
+      && directContract.argumentDigest === carrierContract.argumentDigest
+    ) return;
+  }
+  // THE CONTRACT IS REQUIRED WHERE ITS GUARANTEE IS LOAD-BEARING, NOT EVERYWHERE.
+  // A frozen plan exists to prove per-item once-ness and to stop an
+  // unproposed irreversible effect. For a read, a compute, a local write, or
+  // a reversible external write, it proves nothing the settlement ledger and
+  // the evidence gates do not already prove — and demanding it first turned
+  // the planner's grammar into a wall in front of every tool: three live
+  // fan-out workers spent their entire budget being refused for `coverage`
+  // and `dataFrom` bookkeeping, made ZERO business calls, and honestly
+  // reported they had verified nothing (2026-08-12). The boundary is the
+  // codebase's own definition of a dangerous effect — the same test that
+  // decides whether a human must approve it.
+  // A READ OR COMPUTE IS NEVER GATED BY THE BINDING. It cannot duplicate an
+  // effect, so there is nothing for a frozen plan to protect — and gating it
+  // makes recovery impossible: an uncertain write can only be resolved by
+  // READING the destination, and nobody declares "the verification read I
+  // will need if my write comes back unacknowledged" in advance. Live
+  // 2026-08-12: an Apify actor run settled uncertain_write, the exact status
+  // read (APIFY_ACTOR_RUNS_GET) was refused `work_binding_required`, the
+  // refusal advised "use a different action or tool", and the run escalated
+  // to a browser workaround and then parked asking the user to enable Chrome
+  // remote debugging — to answer a question one API read answers.
+  const runtimeEffect = classifyRuntimeToolEffect(input.tool, input.args).effect;
+  if (runtimeEffect === 'read' || runtimeEffect === 'compute') return;
+  if (!authority.work_contract_id && !frozenContractRequiredForCall(input.tool, input.args)) return;
+  // A user-approved card for this EXACT call is the strongest mandate the
+  // system holds: the user reviewed this payload and said yes. The wall
+  // exists to stop UNPROPOSED business work; the approved card IS the
+  // proposal, ratified by the one authority above any frozen contract.
+  // Without this door the approve-resume dispatch of an act-routed turn died
+  // here with the approval consumed and nothing sent (live 2026-08-12,
+  // apr-r7i2: run_failed ExpectedWorkBindingRequiredError). Exact-payload
+  // once-ness stays owned by the pending-action execution claim and the send
+  // gates; this admits the dispatch, it never bypasses those.
+  if (approvedMandateAdmitsCall(db, input.sessionId, input.sourceUserSeq, input.tool, input.args)) return;
   throw new ExpectedWorkBindingRequiredError(
     authority.work_contract_id
       ? `call ${input.logicalToolCallId ?? '(unidentified)'} is not bound to the frozen contract`
       : 'the action topology must be frozen before any business call',
   );
+}
+
+/**
+ * Whether this exact call may only run under a frozen expected-work contract.
+ *
+ * IRREVERSIBILITY is the property that makes a pre-declared plan load-bearing:
+ * only an effect that cannot be redone or corrected needs its once-ness proved
+ * BEFORE it happens. A reversible external write (create a doc, update a
+ * sheet) that ran twice is fixable, and a call the taxonomy has never seen —
+ * which is most third-party actions, including the Apify actor runs at the
+ * center of the live failure — is not evidence of danger, it is evidence of an
+ * unfamiliar name. Making the unknown bucket require a plan put the planner's
+ * grammar back in front of exactly the work that kept failing.
+ *
+ * Unknown-but-mutating calls are NOT unguarded: the pending-action policy
+ * still fails closed on them for HUMAN approval, and that gate is unchanged.
+ * A classifier that throws still fails closed here.
+ */
+export function frozenContractRequiredForCall(tool: string, args: unknown): boolean {
+  try {
+    return classifyExternalWrite(tool, args).irreversible === true;
+  } catch {
+    return true;
+  }
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).filter((key) => record[key] !== undefined).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`;
+}
+
+/**
+ * True when a resolved-approved pending approval in this session names this
+ * exact tool call (tool + canonical argument identity). Deliberately session-
+ * scoped and exact: an approval admits only the byte-payload the user saw.
+ * Shared by BOTH walls — logical admission and the dispatch ledger's paid-
+ * crossing backstop — so an approved resume cannot pass one and die at the
+ * other (live 2026-08-12, apr-r7i2).
+ */
+export function approvedMandateAdmitsCall(
+  db: ReturnType<typeof openEventLog>,
+  sessionId: string,
+  sourceUserSeq: number,
+  tool: string,
+  args: unknown,
+): boolean {
+  try {
+    const rows = db.prepare(`
+      SELECT approval_id, tool, args_json, presentation_json FROM pending_approvals
+       WHERE session_id = ? AND status = 'resolved' AND resolution = 'approved'
+         AND (tool = ? OR presentation_json IS NOT NULL)
+       ORDER BY resolved_at DESC
+    `).all(sessionId, tool) as Array<{
+      approval_id: string;
+      tool: string;
+      args_json: string | null;
+      presentation_json: string | null;
+    }>;
+    if (rows.length === 0) return false;
+    const dispatchIdentity = stableJson(args ?? null);
+    return rows.some((row) => {
+      if (!row.args_json) return false;
+      try {
+        const approvedArgs = JSON.parse(row.args_json) as unknown;
+        if (!row.presentation_json && row.tool === tool && stableJson(approvedArgs) === dispatchIdentity) {
+          return true;
+        }
+        // Autonomous conversational consent deliberately registers the
+        // control surface as request_approval while freezing the real provider
+        // call in a PendingAction. Admit that provider call only when the
+        // resolved row points to the exact immutable action, its complete
+        // human conversation provenance verifies, and the dispatched payload
+        // is byte-equivalent. This is the same mandate as a formal exact-call
+        // card, without falsely claiming a card was shown.
+        const pendingActionId = pendingActionIdFromArgs(approvedArgs);
+        const pendingAction = pendingActionId ? getPendingAction(pendingActionId) : null;
+        const presentation = row.presentation_json
+          ? JSON.parse(row.presentation_json) as { responseSourceUserSeq?: unknown }
+          : null;
+        return Boolean(
+          pendingAction
+          && presentation?.responseSourceUserSeq === sourceUserSeq
+          && pendingAction.approvalId === row.approval_id
+          && pendingAction.sessionId === sessionId
+          && pendingAction.toolName === tool
+          && stableJson(pendingAction.payload) === dispatchIdentity
+          && verifyConversationalPendingActionAuthority(pendingAction)
+        );
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
 }
 
 function universeFor(
@@ -468,7 +676,7 @@ function dischargedRequirementSettlements(
     SELECT b.logical_tool_call_id, b.effect_kind, b.cardinality_kind,
            b.universe_id, b.universe_item_id, b.universe_selector_json,
            b.universe_member_digest, b.universe_member_count,
-           b.evidence_mode, b.schema_digest,
+           b.evidence_mode, b.evidence_basis, b.schema_digest,
            s.outcome_kind, s.recovery_action, s.retry_same_candidate,
            s.requires_reconciliation, s.continues_requirement,
            s.execution_kind, s.result_handle_id
@@ -494,6 +702,7 @@ function dischargedRequirementSettlements(
     universe_member_digest: string | null;
     universe_member_count: number | null;
     evidence_mode: 'point_read' | 'collection_read' | 'finite_read' | null;
+    evidence_basis: string | null;
     schema_digest: string | null;
     outcome_kind: string;
     recovery_action: string;
@@ -508,22 +717,52 @@ function dischargedRequirementSettlements(
       (row.outcome_kind !== 'succeeded' && row.outcome_kind !== 'empty_result')
       || row.continues_requirement !== 0
     ) return false;
-    if (row.effect_kind === 'compute') return row.outcome_kind === 'succeeded';
+    if (row.effect_kind === 'compute') {
+      if (row.outcome_kind !== 'succeeded') return false;
+      const redeemed = redeemSuccessfulSettlementResultForHost({
+        sessionId: contract.identity.sessionId,
+        sourceUserSeq: contract.identity.sourceUserSeq,
+        acceptedTaskId: contract.acceptedTaskId,
+        logicalToolCallId: row.logical_tool_call_id,
+      });
+      return redeemed.status === 'ok' && computeResultHasSubstance(redeemed.value.rawPayload);
+    }
     // Mutation dependencies require a host-issued commit/send/readback proof.
-    // Nominal provider success is intentionally insufficient here.
-    if (row.effect_kind !== 'read') return false;
+    // Nominal provider success is intentionally insufficient here. A generated
+    // artifact write discharges only after a downstream exact-ID read, bound
+    // to this same contract, proves the frozen content contract.
+    if (row.effect_kind !== 'read') {
+      return generatedArtifactWriteContentVerified({
+        sessionId: contract.identity.sessionId,
+        sourceUserSeq: contract.identity.sourceUserSeq,
+        contractId: contract.contractId,
+        createLogicalToolCallId: row.logical_tool_call_id,
+      });
+    }
+    if (generatedArtifactReadContentVerified({
+      sessionId: contract.identity.sessionId,
+      sourceUserSeq: contract.identity.sourceUserSeq,
+      contractId: contract.contractId,
+      verificationLogicalToolCallId: row.logical_tool_call_id,
+    })) return true;
     const redeemed = redeemSuccessfulSettlementResultForHost({
       sessionId: contract.identity.sessionId,
       sourceUserSeq: contract.identity.sourceUserSeq,
       acceptedTaskId: contract.acceptedTaskId,
       logicalToolCallId: row.logical_tool_call_id,
     });
-    if (redeemed.status !== 'ok' || providerEnvelopeHasContradiction(redeemed.value.rawPayload)) {
+    if (redeemed.status !== 'ok' || inspectProviderEnvelope(redeemed.value.rawPayload).verdict !== 'clean') {
       return false;
     }
     if (row.evidence_mode === 'point_read') return true;
     // Exhaustion has ONE authority, shared with the seal and the projector.
-    if (row.evidence_mode === 'collection_read') return redeemedReadIsExhausted(redeemed.value);
+    if (row.evidence_mode === 'collection_read') {
+      // A complete requested response window is useful predecessor evidence,
+      // but it is not provider exhaustion. Keep `complete_set` open for the
+      // terminal judge and irreversible consumers unless this shared oracle
+      // has actual exhaustion evidence.
+      return redeemedReadIsExhausted(redeemed.value);
+    }
     if (
       row.evidence_mode !== 'finite_read'
       || !row.universe_id
@@ -563,27 +802,207 @@ function dischargedRequirementSettlements(
   }));
 }
 
-function dependencySatisfied(
+function dependencyReadyForCurrentOperation(
   db: Database.Database,
   contract: AcceptedTaskWorkContractV1,
   dependency: ExpectedWorkOperationV1,
   current: ExpectedWorkOperationV1,
   currentItemId: string | undefined,
+  currentTool: string,
+  currentArgs: unknown,
 ): boolean {
   const discharged = dischargedRequirementSettlements(db, contract, dependency.id);
-  if (dependency.cardinality.kind === 'once' || dependency.cardinality.kind === 'set') {
-    return discharged.length === 1;
-  }
+  const instancesReady = (
+    rows: Array<{ logical_tool_call_id: string; universe_item_id: string | null }>,
+  ): boolean => {
+    if (dependency.cardinality.kind === 'once' || dependency.cardinality.kind === 'set') {
+      return rows.length >= 1;
+    }
+    if (
+      current.cardinality.kind === 'each'
+      && dependency.cardinality.universeId === current.cardinality.universeId
+      && currentItemId
+    ) return rows.some((row) => row.universe_item_id === currentItemId);
+    const dependencyCardinality = dependency.cardinality;
+    if (dependencyCardinality.kind !== 'each') return false;
+    const universe = contract.universes.find((entry) => entry.id === dependencyCardinality.universeId);
+    return universe?.seal === 'accepted_input'
+      && universe.members.every((member) => rows.some((row) => row.universe_item_id === member));
+  };
+  if (instancesReady(discharged)) return true;
+
+  // A declared readback may begin before its reversible create predecessor is
+  // itself discharged, because the readback is the act that supplies that
+  // discharge proof. This edge is generated-target-only: the exact read id
+  // must equal the single artifact id retained from the predecessor's clean
+  // settled create. A title/list lookup, an ambient id, a different create, or
+  // an ambiguous artifact root stays blocked.
   if (
-    current.cardinality.kind === 'each'
-    && dependency.cardinality.universeId === current.cardinality.universeId
-    && currentItemId
-  ) return discharged.some((row) => row.universe_item_id === currentItemId);
-  const dependencyCardinality = dependency.cardinality;
-  if (dependencyCardinality.kind !== 'each') return false;
-  const universe = contract.universes.find((entry) => entry.id === dependencyCardinality.universeId);
-  return universe?.seal === 'accepted_input'
-    && universe.members.every((member) => discharged.some((row) => row.universe_item_id === member));
+    current.effect === 'read'
+    && current.cardinality.kind === 'once'
+    && dependency.effect === 'external_write'
+    && dependency.cardinality.kind === 'once'
+  ) {
+    const predecessors = db.prepare(`
+      SELECT b.logical_tool_call_id
+        FROM expected_work_call_bindings b
+        JOIN logical_call_settlements s
+          ON s.session_id = b.session_id
+         AND s.source_user_seq = b.source_user_seq
+         AND s.logical_tool_call_id = b.logical_tool_call_id
+       WHERE b.session_id = ? AND b.source_user_seq = ?
+         AND b.contract_id = ? AND b.requirement_id = ?
+         AND b.effect_kind = 'external_write'
+         AND s.outcome_kind = 'succeeded'
+         AND s.continues_requirement = 0
+    `).all(
+      contract.identity.sessionId,
+      contract.identity.sourceUserSeq,
+      contract.contractId,
+      dependency.id,
+    ) as Array<{ logical_tool_call_id: string }>;
+    if (predecessors.length === 1) {
+      const generated = authorizeGeneratedArtifactReadback({
+        sessionId: contract.identity.sessionId,
+        sourceUserSeq: contract.identity.sourceUserSeq,
+        contractId: contract.contractId,
+        createLogicalToolCallId: predecessors[0]!.logical_tool_call_id,
+        verificationRequirementId: current.id,
+        readToolName: currentTool,
+        readArgs: currentArgs,
+      });
+      if (generated.status === 'authorized') return true;
+    }
+  }
+
+  // Readiness is not discharge. A specifically known reversible successor may
+  // consume a clean, redeemable predecessor read while coverage stays open for
+  // the plan projector/terminal judge. This lets the system stage/edit useful
+  // work without turning a provider alias or an unproved `complete_set` claim
+  // into authority for an irreversible send.
+  const successorCanBeCorrected = (() => {
+    if (current.effect === 'read' || current.effect === 'compute' || current.effect === 'local_write') {
+      return true;
+    }
+    if (current.effect !== 'external_write') return false;
+    try {
+      const effect = classifyExternalWrite(currentTool, currentArgs);
+      return effect.external
+        && effect.mutating
+        && effect.reversibility === 'reversible';
+    } catch {
+      return false;
+    }
+  })();
+  if (
+    !successorCanBeCorrected
+    || dependency.effect !== 'read'
+    // Provisional evidence cannot authorize a set/each lane: fanout cardinality
+    // still requires strict discharge and, for source-derived universes, the
+    // canonical complete-source seal.
+    || dependency.cardinality.kind !== 'once'
+    || current.cardinality.kind !== 'once'
+  ) return false;
+
+  const provisionalRows = db.prepare(`
+    SELECT b.logical_tool_call_id, b.universe_item_id
+      FROM expected_work_call_bindings b
+      JOIN logical_call_settlements s
+        ON s.session_id = b.session_id
+       AND s.source_user_seq = b.source_user_seq
+       AND s.logical_tool_call_id = b.logical_tool_call_id
+     WHERE b.session_id = ? AND b.source_user_seq = ?
+       AND b.contract_id = ? AND b.requirement_id = ?
+       AND b.effect_kind = 'read'
+       AND s.outcome_kind = 'succeeded'
+       AND s.continues_requirement = 0
+  `).all(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.contractId,
+    dependency.id,
+  ) as Array<{ logical_tool_call_id: string; universe_item_id: string | null }>;
+  const cleanRedeemable = provisionalRows.filter((row) => {
+    const redeemed = redeemSuccessfulSettlementResultForHost({
+      sessionId: contract.identity.sessionId,
+      sourceUserSeq: contract.identity.sourceUserSeq,
+      acceptedTaskId: contract.acceptedTaskId,
+      logicalToolCallId: row.logical_tool_call_id,
+    });
+    if (redeemed.status !== 'ok') return false;
+    const records = recordsAtRecordPath(
+      redeemed.value.rawPayload,
+      redeemed.value.handle.recordPath,
+    );
+    return redeemed.value.handle.success
+      && records !== null
+      && records.length === redeemed.value.handle.recordCount
+      && records.some((record) => computeResultHasSubstance(record))
+      && redeemed.value.handle.completeness !== 'partial'
+      && redeemed.value.handle.continuationRef === null
+      && !redeemed.value.handle.continuationRepeated
+      && inspectProviderEnvelope(redeemed.value.rawPayload).verdict === 'clean';
+  });
+  return instancesReady(cleanRedeemable);
+}
+
+/**
+ * Compiles the content contract a generated Sheet create must later prove by
+ * exact readback. The shape checks below are properties of the declared work —
+ * one create, one exact read behind it — so they hold for any provider and any
+ * column layout. Whether the created rows actually descend from that read is a
+ * separate question this function deliberately does not answer: proving it
+ * requires deriving the mapping from the settled source result, not consulting
+ * a table of request shapes someone enumerated ahead of time.
+ */
+function generatedSheetContentContractForAdmission(input: {
+  contract: AcceptedTaskWorkContractV1;
+  operation: ExpectedWorkOperationV1;
+  tool: string;
+  args: unknown;
+}): { ok: true; contentContract: unknown } | { ok: false; reason: string } | null {
+  const sheetContract = compileGoogleSheetsSheetFromJsonContract(input.tool, input.args);
+  if (!sheetContract) return null;
+  if (input.operation.cardinality.kind !== 'once' || input.operation.effect !== 'external_write') {
+    return { ok: false, reason: 'a generated Sheet requires one declared create operation' };
+  }
+  const sourceRequirements = input.operation.dataFrom;
+  if (sourceRequirements.length !== 1) {
+    return { ok: false, reason: 'generated Sheet create requires exactly one declared dataFrom source' };
+  }
+  const sourceOperation = input.contract.operations.find((operation) => operation.id === sourceRequirements[0]);
+  if (!sourceOperation || sourceOperation.effect !== 'read' || sourceOperation.cardinality.kind !== 'once') {
+    return { ok: false, reason: 'generated Sheet dataFrom source must be one exact read' };
+  }
+  return { ok: true, contentContract: sheetContract };
+}
+
+function ensureGeneratedArtifactContractSchema(db: Database.Database): void {
+  const rows = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
+  const present = new Set(rows.map((row) => row.name));
+  if (!present.has('expected_work_generated_artifact_contracts')) {
+    throw new Error('generated artifact content contract schema migration is unavailable');
+  }
+}
+
+function generatedArtifactContractForBinding(
+  db: Database.Database,
+  binding: ExpectedWorkCallBinding,
+): ExpectedWorkCallBinding {
+  const row = db.prepare(`
+    SELECT contract_json FROM expected_work_generated_artifact_contracts
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(
+    binding.sessionId,
+    binding.sourceUserSeq,
+    binding.logicalToolCallId,
+  ) as { contract_json: string } | undefined;
+  if (!row) return binding;
+  try {
+    return { ...binding, generatedArtifactContentContract: JSON.parse(row.contract_json) as unknown };
+  } catch {
+    throw new Error('persisted generated artifact contract is unreadable');
+  }
 }
 
 function priorRequirementAllowsAdmission(
@@ -592,9 +1011,18 @@ function priorRequirementAllowsAdmission(
   operation: ExpectedWorkOperationV1,
   universeItemId: string | undefined,
   currentTool: string,
-): { ok: true } | { ok: false; reason: string; satisfiedByLogicalToolCallId?: string } {
+  currentArgumentDigest: string,
+): { ok: true } | {
+  ok: false;
+  reason: string;
+  refusalKind?: ExpectedWorkAdmissionFailureKind;
+  satisfiedByLogicalToolCallId?: string;
+  retainedByLogicalToolCallId?: string;
+  executedByLogicalToolCallId?: string;
+} {
   const rows = db.prepare(`
-    SELECT b.tool_name, b.universe_item_id, b.logical_tool_call_id, l.state,
+    SELECT b.tool_name, b.argument_digest, b.universe_item_id,
+           b.logical_tool_call_id, l.state,
            s.outcome_kind, s.recovery_action, s.retry_same_candidate,
            s.eliminates_candidate, s.requires_reconciliation
       FROM expected_work_call_bindings b
@@ -608,6 +1036,7 @@ function priorRequirementAllowsAdmission(
        AND s.logical_tool_call_id = b.logical_tool_call_id
      WHERE b.session_id = ? AND b.source_user_seq = ?
        AND b.contract_id = ? AND b.requirement_id = ?
+     ORDER BY l.opened_at, b.logical_tool_call_id
   `).all(
     contract.identity.sessionId,
     contract.identity.sourceUserSeq,
@@ -615,6 +1044,7 @@ function priorRequirementAllowsAdmission(
     operation.id,
   ) as Array<{
     tool_name: string;
+    argument_digest: string;
     universe_item_id: string | null;
     logical_tool_call_id: string;
     state: string;
@@ -631,12 +1061,51 @@ function priorRequirementAllowsAdmission(
   if (relevant.some((row) => row.state === 'open' || row.outcome_kind === null)) {
     return { ok: false, reason: 'this requirement instance already has an open logical call' };
   }
-  const latest = relevant.at(-1)!;
-  if (latest.outcome_kind === 'succeeded' || latest.outcome_kind === 'empty_result') {
+  // The same oracle that drives dependency admission and plan projection is
+  // the only authority allowed to say a read/compute requirement is
+  // satisfied. Nominal settlement alone is not evidence discharge.
+  const dischargedIds = new Set(
+    dischargedRequirementSettlements(db, contract, operation.id)
+      .map((row) => row.logical_tool_call_id),
+  );
+  const latestDischarged = [...relevant]
+    .reverse()
+    .find((row) => dischargedIds.has(row.logical_tool_call_id));
+  if (latestDischarged) {
     return {
       ok: false,
-      reason: 'this requirement instance is already durably settled',
-      satisfiedByLogicalToolCallId: latest.logical_tool_call_id,
+      reason: 'this requirement instance is already durably discharged',
+      satisfiedByLogicalToolCallId: latestDischarged.logical_tool_call_id,
+    };
+  }
+  if (operation.effect === 'read' || operation.effect === 'compute') {
+    const exactRetained = [...relevant].reverse().find((row) => (
+      (row.outcome_kind === 'succeeded' || row.outcome_kind === 'empty_result')
+      && row.tool_name === currentTool
+      && row.argument_digest === currentArgumentDigest
+    ));
+    if (exactRetained) {
+      return {
+        ok: false,
+        refusalKind: 'work_evidence_incomplete',
+        reason: 'the exact read or compute already settled, but its retained evidence does not durably discharge this requirement; reuse the retained result or change the call to gather different evidence',
+        retainedByLogicalToolCallId: exactRetained.logical_tool_call_id,
+      };
+    }
+  }
+  const latest = relevant.at(-1)!;
+  if (latest.outcome_kind === 'succeeded' || latest.outcome_kind === 'empty_result') {
+    if (operation.effect === 'read' || operation.effect === 'compute') {
+      // Reads and computes are safe to retry when their normalized identity
+      // changes. The terminal discharge oracle remains strict, so a changed
+      // query can gather better evidence but cannot claim complete coverage.
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      refusalKind: 'work_effect_already_executed',
+      reason: 'this mutation already crossed once but is not yet durably verified; do not repeat it — verify or reconcile the existing effect',
+      executedByLogicalToolCallId: latest.logical_tool_call_id,
     };
   }
   if (latest.outcome_kind === 'uncertain_write' || latest.requires_reconciliation === 1) {
@@ -775,8 +1244,16 @@ function planLinesFor(
     }
     settledByRequirement.set(operation.id, set);
   }
-  const satisfied = new Set<string>();
-  const lines: ExpectedWorkPlanLine[] = [];
+  // Compute intrinsic completion independently from presentation order. The
+  // canonical contract sorts operations by id for stable hashing, but ids do
+  // not encode dependency order: `a_write -> z_source` is valid. Building the
+  // satisfied set while walking that lexical order made readiness depend on
+  // how the model happened to name operations.
+  const intrinsic = new Map<string, {
+    settled: number;
+    required: number | 'unknown';
+    done: boolean;
+  }>();
   for (const operation of contract.operations) {
     const settled = settledByRequirement.get(operation.id)?.size ?? 0;
     let required: number | 'unknown' = 1;
@@ -797,8 +1274,21 @@ function planLinesFor(
         ? (operation.cardinality.kind === 'each' ? resolved.members.length : 1)
         : 'unknown';
     }
-    const done = typeof required === 'number' && settled >= required;
-    if (done) satisfied.add(operation.id);
+    intrinsic.set(operation.id, {
+      settled,
+      required,
+      done: typeof required === 'number' && settled >= required,
+    });
+  }
+  const satisfied = new Set(
+    [...intrinsic.entries()]
+      .filter(([, state]) => state.done)
+      .map(([requirementId]) => requirementId),
+  );
+  const lines: ExpectedWorkPlanLine[] = [];
+  for (const operation of contract.operations) {
+    const state = intrinsic.get(operation.id)!;
+    const { settled, required, done } = state;
     const blocked = !done && operation.dependsOn.some((dep) => !satisfied.has(dep));
     lines.push({
       requirementId: operation.id,
@@ -861,6 +1351,43 @@ export function deriveWorkerPacketExpectedWork(input: {
   } catch {
     return null;
   }
+}
+
+/**
+ * Attach the host-derived frozen-work binding to a worker packet.
+ *
+ * Every worker lane uses this one function immediately before dispatch. The
+ * packet supplied by a model is not authority: when the durable accepted-task
+ * contract yields one unambiguous binding, that binding wins even if a caller
+ * supplied a stale or conflicting hint. When no binding can be proved, the
+ * packet is left unchanged and the ordinary admission wall remains in force.
+ */
+export function bindWorkerPacketExpectedWork<
+  T extends { expectedWork?: { requirementId: string; universeId?: string | null } | null },
+>(input: {
+  packet: T;
+  sessionId: string;
+  sourceUserSeq: number | undefined;
+  items: string[];
+}): T {
+  if (!input.sessionId) return input.packet;
+  const derived = deriveWorkerPacketExpectedWork({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    items: input.items,
+  });
+  if (!derived) return input.packet;
+  if (
+    input.packet.expectedWork?.requirementId === derived.requirementId
+    && input.packet.expectedWork?.universeId === derived.universeId
+  ) return input.packet;
+  return {
+    ...input.packet,
+    expectedWork: {
+      requirementId: derived.requirementId,
+      universeId: derived.universeId,
+    },
+  };
 }
 
 /** Freeze/replay the proposal and bind the exact current logical call in one
@@ -947,6 +1474,12 @@ export function admitExpectedWorkInvocation(input: {
   };
   const operation = contract.operations.find((entry) => entry.id === input.requirementId);
   if (!operation) return refusedWithPlan('work_requirement_unknown', `requirement ${input.requirementId} is not in the frozen proposal`);
+  if (actionTopologyRoleForRuntimeCall(input.tool, input.args) === 'control') {
+    return refusedWithPlan(
+      'work_effect_mismatch',
+      `requirement ${operation.id} is business work; a control call cannot discharge it`,
+    );
+  }
   const runtime = classifyRuntimeToolEffect(input.tool, input.args);
   if (runtime.effect === 'unknown' || runtime.effect !== operation.effect) {
     return refusedWithPlan(
@@ -961,6 +1494,7 @@ export function admitExpectedWorkInvocation(input: {
     const evidenceArgs = input.evidenceArgs ?? input.args;
     const evidenceInputSchema = input.evidenceInputSchema ?? input.inputSchema;
     const db = openEventLog();
+    ensureGeneratedArtifactContractSchema(db);
     const tx = db.transaction((): ExpectedWorkInvocationAdmission => {
       const authority = authorityActivationRow(db, input.sessionId, input.sourceUserSeq);
       if (
@@ -1007,7 +1541,7 @@ export function admitExpectedWorkInvocation(input: {
           && binding.universeItemId === (input.universeItemId ?? undefined)
           && String(existing.tool_name) === logicalContract.toolName
           && String(existing.argument_digest) === logicalContract.argumentDigest
-        ) return { status: 'replayed', binding, contract };
+        ) return { status: 'replayed', binding: generatedArtifactContractForBinding(db, binding), contract };
         return refusedWithPlan('work_contract_conflict', 'logical call already owns a different work binding');
       }
 
@@ -1032,6 +1566,7 @@ export function admitExpectedWorkInvocation(input: {
         operation,
         input.universeItemId ?? undefined,
         logicalContract.toolName,
+        logicalContract.argumentDigest,
       );
       if (!prior.ok) {
         // A SETTLED requirement instance is not an error: hand the carrier
@@ -1046,17 +1581,35 @@ export function admitExpectedWorkInvocation(input: {
             plan: planLinesFor(db, contract, sealCache),
           };
         }
-        return refusedWithPlan('work_already_satisfied', prior.reason);
+        if (prior.retainedByLogicalToolCallId) {
+          return {
+            status: 'evidence_retained',
+            priorLogicalToolCallId: prior.retainedByLogicalToolCallId,
+            contract,
+            plan: planLinesFor(db, contract, sealCache),
+          };
+        }
+        if (prior.executedByLogicalToolCallId) {
+          return {
+            status: 'effect_already_executed',
+            priorLogicalToolCallId: prior.executedByLogicalToolCallId,
+            contract,
+            plan: planLinesFor(db, contract, sealCache),
+          };
+        }
+        return refusedWithPlan(prior.refusalKind ?? 'work_already_satisfied', prior.reason);
       }
 
       for (const dependencyId of operation.dependsOn) {
         const dependency = contract.operations.find((entry) => entry.id === dependencyId);
-        if (!dependency || !dependencySatisfied(
+        if (!dependency || !dependencyReadyForCurrentOperation(
           db,
           contract,
           dependency,
           operation,
           input.universeItemId ?? undefined,
+          input.tool,
+          input.args,
         )) return refusedWithPlan(
           'work_dependency_pending',
           `dependency ${dependencyId} is not durably satisfied${
@@ -1204,6 +1757,16 @@ export function admitExpectedWorkInvocation(input: {
         }
       }
 
+      const generatedSheetContract = generatedSheetContentContractForAdmission({
+        contract,
+        operation,
+        tool: input.tool,
+        args: input.args,
+      });
+      if (generatedSheetContract && !generatedSheetContract.ok) {
+        return refusedWithPlan('work_source_witness_missing', generatedSheetContract.reason);
+      }
+
       const freeze = prepared
         ? freezePreparedExpectedWorkContractInTransaction(db, {
             sessionId: input.sessionId,
@@ -1256,6 +1819,23 @@ export function admitExpectedWorkInvocation(input: {
         schemaDigest,
         new Date().toISOString(),
       );
+      if (generatedSheetContract?.ok) {
+        const frozenJson = JSON.stringify(generatedSheetContract.contentContract);
+        if (Buffer.byteLength(frozenJson, 'utf8') > 1_000_000) {
+          throw new Error('generated artifact content contract exceeds the durable bound');
+        }
+        db.prepare(`
+          INSERT INTO expected_work_generated_artifact_contracts
+            (session_id, source_user_seq, logical_tool_call_id, contract_json, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(
+          input.sessionId,
+          input.sourceUserSeq,
+          input.logicalToolCallId,
+          frozenJson,
+          new Date().toISOString(),
+        );
+      }
       const binding: ExpectedWorkCallBinding = {
         sessionId: input.sessionId,
         sourceUserSeq: input.sourceUserSeq,
@@ -1277,6 +1857,9 @@ export function admitExpectedWorkInvocation(input: {
         ...(evidenceBasis ? { evidenceBasis } : {}),
         ...(schemaFingerprint ? { schemaFingerprint } : {}),
         ...(schemaDigest ? { schemaDigest } : {}),
+        ...(generatedSheetContract?.ok
+          ? { generatedArtifactContentContract: generatedSheetContract.contentContract }
+          : {}),
       };
       return { status: 'bound', binding, contract };
     });

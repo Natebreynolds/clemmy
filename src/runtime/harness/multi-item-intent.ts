@@ -178,6 +178,22 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
       && (SINGLE_PARENT_RE.test(listPreamble) || LIST_SINGLE_CONTAINER_RE.test(listPreamble))
       && !EXPLICIT_LIST_TARGET_RE.test(listPreamble);
     const enumerated = listedBodies.length >= 3 && !singleParentRequirements;
+    // NON_ITEM_NOUNS below is a heuristic about which nouns usually describe one
+    // parent task rather than N jobs. When the user's own grammar already states
+    // the per-item/parallel structure outright, that stated fact outranks the
+    // harness vocabulary: otherwise a fixed noun list silently discards a count
+    // the user supplied explicitly, and no phrasing can recover it. This mirrors
+    // the override COLLECTION_ITEM_NOUNS already applies further down.
+    //
+    // Deliberately a subset of that override: the kind-dependent half of
+    // explicitPerTarget cannot be computed until extraction has produced a kind.
+    // This only lets a count SURVIVE extraction — every gate below still decides,
+    // including the full explicitPerTarget. Each pattern is tested against the
+    // same string its existing use below tests, so hoisting changes no semantics.
+    const statedPerItemStructure = EXPLICIT_PARALLEL_RE.test(actionText)
+      || STRUCTURAL_PER_ITEM_WORK_RE.test(actionText)
+      || EXPLICIT_LIST_TARGET_RE.test(text)
+      || TRAILING_EACH_OUTPUT_RE.test(text);
     let count = 0;
     let kind: string | null = null;
     let countIndex = -1;
@@ -197,7 +213,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
         if (
           !Number.isSafeInteger(itemCount)
           || itemCount < 3
-          || NON_ITEM_NOUNS.has(noun)
+          || (NON_ITEM_NOUNS.has(noun) && !statedPerItemStructure)
         ) continue;
         const countOffset = markedMatch[0].indexOf(markedMatch[1]);
         lastMarked = {
@@ -215,7 +231,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
           !Number.isFinite(itemCount)
           || itemCount < 3
           || !Number.isSafeInteger(itemCount)
-          || NON_ITEM_NOUNS.has(noun)
+          || (NON_ITEM_NOUNS.has(noun) && !statedPerItemStructure)
         ) continue;
         const priorChar = match.index > 0 ? text[match.index - 1] : '';
         if (/[-./:#]/.test(priorChar)) continue;

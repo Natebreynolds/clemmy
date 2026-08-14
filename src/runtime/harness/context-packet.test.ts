@@ -306,6 +306,70 @@ test('an already-prepared Netlify deploy does not summon an artifact-generation 
   assert.deepEqual(packet.skills, [], 'paths, URLs, and generic deploy words are payload—not skill intent');
 });
 
+test('a fresh fully specified data flow receives no unrelated skill checklist', () => {
+  const packet = buildAgentContextPacket(
+    'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.',
+    { enabled: true, hitCount: 0, source: 'unified', injected: false },
+  );
+  assert.deepEqual(packet.skills, []);
+  assert.doesNotMatch(packet.text, /proposal-builder|email-report-helper|skill_read before creating/i);
+});
+
+// ─── NON_ITEM_NOUNS may not erase a count the user stated outright ──────────
+
+test('explicit per-item grammar overrides the non-item noun list', () => {
+  // The noun list is a guess about which nouns describe one parent task. When
+  // the user supplies the per-item structure in their own words, the guess must
+  // not discard the count — previously no phrasing could recover it, because
+  // the veto ran during extraction, before any override was computed.
+  for (const objective of [
+    'Research each of these 5 requirements in parallel',
+    'Research each of these 4 steps in parallel and write up each one',
+    'For each of the 6 questions, research the answer and draft a reply',
+  ]) {
+    const intent = detectMultiItemIntent(objective);
+    assert.equal(intent.isMultiItem, true, objective);
+    assert.ok(intent.itemCount >= 3, `${objective} — count survived extraction`);
+  }
+});
+
+test('the non-item noun list still refuses fan-out with no explicit per-item grammar', () => {
+  // The other half of the veto is correct and must survive: these name one
+  // parent task, a duration, or a length — never N independent workers.
+  for (const objective of [
+    'Give me 5 ideas',
+    'wait 5 days',
+    'keep it under 5 words',
+    'give me 5 options for the headline',
+    'summarize the 5 steps',
+    'draft 4 reasons we should ship',
+  ]) {
+    assert.equal(detectMultiItemIntent(objective).isMultiItem, false, objective);
+  }
+});
+
+test('a count that survives the noun list is still refused by the downstream gates', () => {
+  // Both carry the same non-item noun AND the same explicit parallel grammar,
+  // so extraction registers the count in BOTH. Only the downstream
+  // sequence/distinct gate differs. This proves extraction widened without the
+  // decision weakening: a later gate can still say no, and does.
+  assert.equal(
+    detectMultiItemIntent('Research 5 requirements in parallel then send the report').isMultiItem,
+    false,
+    'sequence without a distinct marker is still refused downstream',
+  );
+  assert.equal(
+    detectMultiItemIntent('Research each of these 5 requirements in parallel then send the report').isMultiItem,
+    true,
+    'the same objective with a distinct marker passes the same gate',
+  );
+  // Aggregate retrieval with no deep work stays a single read, not five jobs.
+  assert.equal(
+    detectMultiItemIntent('Show me 5 requirements in parallel').isMultiItem,
+    false,
+  );
+});
+
 // ─── detectMultiItemIntentFromConversation — count carried from prior turns ──
 
 test('conversation carry: "yes" answering the assistant\'s own "18 firms?" proposal inherits the batch', () => {

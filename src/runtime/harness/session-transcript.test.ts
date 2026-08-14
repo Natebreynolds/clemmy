@@ -20,15 +20,26 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const {
+  normalizedPriorWorkObjectiveHash,
   pullRecentTurnsForSession,
+  renderRelevantPriorWorkForModel,
   renderRecentActionsForHarnessHistory,
   renderCrossSessionPrefixesForModel,
   renderSessionHistoryForModel,
   renderTranscriptTurns,
   renderRecentSessionActions,
 } = await import('./session-transcript.js');
-const { resetEventLog, createSession, appendEvent, openEventLog } = await import('./eventlog.js');
+const {
+  appendEvent,
+  beginRunAttempt,
+  createSession,
+  finishRunAttempt,
+  openEventLog,
+  recordRunAttemptUserInput,
+  resetEventLog,
+} = await import('./eventlog.js');
 const { SessionStore } = await import('../../memory/session-store.js');
+const { _setLocalProviderForTest } = await import('../../memory/embeddings.js');
 
 test('renderRecentSessionActions surfaces this session\'s completed sends so the brain knows it already did them', () => {
   resetEventLog();
@@ -383,6 +394,376 @@ function typedTerminal(
     data: typedTerminalData({ sessionId: sid, sourceUserSeq, text, ...(attemptId ? { attemptId } : {}) }),
   });
 }
+
+function historicalTypedTerminal(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  status: 'done' | 'needs_input' | 'failed';
+  text: string;
+  evidenceRefs?: Array<{ kind: 'artifact' | 'source'; id: string; uri?: string }>;
+}) {
+  const outcomeId = `turn:${input.sourceUserSeq}`;
+  const identity = { sessionId: input.sessionId, turn: 1, sourceUserSeq: input.sourceUserSeq };
+  const resumable = input.status === 'needs_input';
+  const kind = input.status === 'done'
+    ? 'answer'
+    : input.status === 'needs_input'
+      ? 'question'
+      : 'error';
+  const needs = input.status === 'needs_input' ? { kind: 'input' as const } : undefined;
+  return appendEvent({
+    sessionId: input.sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'conversation_completed',
+    data: {
+      logicalTerminalVersion: 1,
+      terminalKey: outcomeId,
+      sourceUserSeq: input.sourceUserSeq,
+      presentation: {
+        version: 1,
+        id: `${outcomeId}:presentation`,
+        outcomeId,
+        audience: 'user',
+        phase: 'final',
+        identity,
+        status: input.status,
+        kind,
+        text: input.text,
+        resumable,
+        ...(needs ? { needs } : {}),
+        ...(input.evidenceRefs ? { evidenceRefs: input.evidenceRefs } : {}),
+      },
+      turnOutcome: {
+        version: 2,
+        id: outcomeId,
+        status: input.status,
+        resumable,
+        ...(needs ? { needs } : {}),
+        ...(input.evidenceRefs ? { evidenceRefs: input.evidenceRefs } : {}),
+      },
+      reply: input.text,
+    },
+  });
+}
+
+test('relevant prior work projects exact normalized completed, failed, or paused objectives as historical context', async (t) => {
+  resetEventLog();
+  let embedCalls = 0;
+  _setLocalProviderForTest({
+    name: 'local',
+    model: 'exact-fast-path-must-not-embed',
+    dim: 1,
+    async embed() { embedCalls += 1; throw new Error('exact fast path called the embedder'); },
+  });
+  t.after(() => _setLocalProviderForTest(undefined));
+  const objective = 'Pull the top 5 restaurants in Ventura CA and email the Google Sheet link.';
+  const needsInput = createSession({ kind: 'chat', channel: 'discord', title: 'prior needs input' });
+  const needsSource = appendEvent({
+    sessionId: needsInput.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective },
+  });
+  historicalTypedTerminal({
+    sessionId: needsInput.id,
+    sourceUserSeq: needsSource.seq,
+    status: 'needs_input',
+    text: 'PRIOR-QUESTION: I still need to verify whether the sheet and email landed.',
+    evidenceRefs: [{ kind: 'artifact', id: 'sheet-prior' }],
+  });
+
+  const failed = createSession({ kind: 'chat', channel: 'discord', title: 'prior failed' });
+  const failedSource = appendEvent({
+    sessionId: failed.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective.toUpperCase() },
+  });
+  historicalTypedTerminal({
+    sessionId: failed.id,
+    sourceUserSeq: failedSource.seq,
+    status: 'failed',
+    text: 'PRIOR-FAILURE: the earlier attempt did not finish.',
+  });
+
+  const unrelated = createSession({ kind: 'chat', channel: 'discord', title: 'unrelated prior failure' });
+  const unrelatedSource = appendEvent({
+    sessionId: unrelated.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Pull five restaurants in Santa Barbara and make a PDF.' },
+  });
+  historicalTypedTerminal({
+    sessionId: unrelated.id,
+    sourceUserSeq: unrelatedSource.seq,
+    status: 'failed',
+    text: 'UNRELATED-FAILURE-MUST-NOT-SURFACE',
+  });
+
+  const done = createSession({ kind: 'chat', channel: 'discord', title: 'completed prior work' });
+  const doneSource = appendEvent({
+    sessionId: done.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective },
+  });
+  historicalTypedTerminal({
+    sessionId: done.id,
+    sourceUserSeq: doneSource.seq,
+    status: 'done',
+    text: 'DONE-WORK-IS-HISTORICAL-NOT-REPLAY-AUTHORITY',
+    evidenceRefs: [{ kind: 'artifact', id: 'prior-done-receipt' }],
+  });
+
+  const projection = await renderRelevantPriorWorkForModel(openEventLog(), {
+    currentObjective: `  PULL the top 5 restaurants in Ventura CA and email the Google Sheet link.  `,
+    priorSessionIds: [needsInput.id, failed.id, unrelated.id, done.id],
+  });
+
+  assert.equal(projection.count, 3);
+  assert.equal(
+    projection.queryHash,
+    normalizedPriorWorkObjectiveHash(objective),
+    'case and whitespace normalization has one deterministic exact-match identity',
+  );
+  assert.deepEqual(
+    projection.items.map((item: { statusSource: string; status: string }) => `${item.statusSource}:${item.status}`),
+    ['typed_terminal:needs_input', 'typed_terminal:failed', 'typed_terminal:done'],
+  );
+  assert.match(projection.text, /POSSIBLY RELEVANT PRIOR WORK/i);
+  assert.match(projection.text, /historical/i);
+  assert.match(projection.text, /no current ownership/i);
+  assert.match(projection.text, /no current ownership.*resume.*authority/i);
+  assert.match(projection.text, /replay side effects/i);
+  assert.match(projection.text, /PRIOR-QUESTION/);
+  assert.match(projection.text, /PRIOR-FAILURE/);
+  assert.match(projection.text, /DONE-WORK-IS-HISTORICAL-NOT-REPLAY-AUTHORITY/);
+  assert.match(projection.text, /artifact:sheet-prior/);
+  assert.match(projection.text, /artifact:prior-done-receipt/);
+  assert.doesNotMatch(projection.text, /UNRELATED-FAILURE-MUST-NOT-SURFACE/);
+  assert.equal(embedCalls, 0, 'exact normalized candidates never pay the semantic deadline');
+});
+
+test('relevant prior work uses an exact interrupted attempt fallback without laundering a corrupt terminal', async () => {
+  resetEventLog();
+  const objective = 'Prepare the verified renewal report.';
+  const prior = createSession({ kind: 'chat', channel: 'discord', title: 'interrupted prior work' });
+  const attempt = beginRunAttempt(prior.id, { attemptId: 'attempt-prior-interrupted' });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: objective },
+  });
+  finishRunAttempt(attempt, 'interrupted');
+  appendEvent({
+    sessionId: prior.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'conversation_completed',
+    data: {
+      sourceUserSeq: source.seq,
+      presentation: { status: 'done', text: 'FORGED-TERMINAL-MUST-NOT-SURFACE' },
+      reply: 'FORGED-TERMINAL-MUST-NOT-SURFACE',
+    },
+  });
+
+  const projection = await renderRelevantPriorWorkForModel(openEventLog(), {
+    currentObjective: objective,
+    priorSessionIds: [prior.id],
+  });
+
+  assert.equal(projection.count, 1);
+  assert.equal(projection.items[0]?.statusSource, 'run_attempt');
+  assert.equal(projection.items[0]?.status, 'interrupted');
+  assert.match(projection.text, /attempt interrupted/i);
+  assert.doesNotMatch(projection.text, /FORGED-TERMINAL-MUST-NOT-SURFACE/);
+});
+
+test('semantic prior-work candidates recover the rephrased Ventura objective without crossing entity, artifact, or effect conflicts', async (t) => {
+  resetEventLog();
+  _setLocalProviderForTest({
+    name: 'local',
+    model: 'deterministic-prior-work-test',
+    dim: 3,
+    async embed(texts: string[]) {
+      // Deliberately make every non-exact candidate look semantically identical.
+      // The conservative entity/artifact/effect floor — not a magic cosine —
+      // must reject the three near-neighbour conflicts below.
+      return texts.map(() => Float32Array.from([1, 0, 0]));
+    },
+  });
+  t.after(() => _setLocalProviderForTest(undefined));
+
+  const currentObjective = 'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.';
+  const candidates = [
+    {
+      objective: 'Find me the top 5 restaurants in Ventura ca using Apify mcp please and just send me a quick email about them',
+      outcome: 'VENTURA-PRIOR-WORK-REACHABLE',
+    },
+    {
+      objective: 'Find the top 5 restaurants in Santa Barbara using Apify, put them in a Google Sheet, and email the link.',
+      outcome: 'SANTA-BARBARA-MUST-STAY-OUT',
+    },
+    {
+      objective: 'Find the top 5 restaurants in Ventura using Apify, make a PDF, and email it.',
+      outcome: 'PDF-MUST-STAY-OUT',
+    },
+    {
+      objective: 'Find the top 5 restaurants in Ventura using Apify and put them in a Google Sheet, but do not email anything.',
+      outcome: 'NEGATED-EMAIL-MUST-STAY-OUT',
+    },
+  ];
+  const sources: Array<{ sourceSessionId: string; sourceUserSeq: number }> = [];
+  for (const [index, candidate] of candidates.entries()) {
+    const session = createSession({ kind: 'chat', channel: 'discord', title: `semantic candidate ${index}` });
+    const source = appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: index === 0 ? 'Go ahead' : candidate.objective },
+    });
+    if (index === 0) {
+      appendEvent({
+        sessionId: session.id,
+        turn: 1,
+        role: 'system',
+        type: 'turn_preflight_decision',
+        data: {
+          sourceUserSeq: source.seq,
+          phase: 'execute',
+          objective: candidate.objective,
+          // These authority-shaped fields are intentionally poison pills: the
+          // historical projection may copy the objective, never their power.
+          intentKey: 'must-not-project',
+          approvalId: 'apr-must-not-project',
+          resumable: true,
+        },
+      });
+    }
+    historicalTypedTerminal({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      status: 'needs_input',
+      text: candidate.outcome,
+    });
+    sources.push({ sourceSessionId: session.id, sourceUserSeq: source.seq });
+  }
+
+  const projection = await renderRelevantPriorWorkForModel(openEventLog(), {
+    currentObjective,
+    priorSources: sources,
+  });
+
+  assert.equal(projection.count, 1);
+  assert.equal(projection.items[0]?.sourceUserSeq, sources[0]?.sourceUserSeq);
+  assert.equal(projection.items[0]?.matchKind, 'semantic');
+  assert.match(projection.text, /VENTURA-PRIOR-WORK-REACHABLE/);
+  assert.match(projection.text, /model decides whether it is the same work/i);
+  assert.match(projection.text, /may ignore/i);
+  assert.doesNotMatch(projection.text, /SANTA-BARBARA-MUST-STAY-OUT/);
+  assert.doesNotMatch(projection.text, /PDF-MUST-STAY-OUT/);
+  assert.doesNotMatch(projection.text, /NEGATED-EMAIL-MUST-STAY-OUT/);
+  assert.doesNotMatch(JSON.stringify(projection), /must-not-project|apr-must-not-project/);
+});
+
+test('a broader place qualifier agrees with the bare place name anywhere in the world, while a different place still conflicts', async (t) => {
+  resetEventLog();
+  _setLocalProviderForTest({
+    name: 'local',
+    model: 'deterministic-prior-work-test',
+    dim: 3,
+    // Identical vectors for every candidate, because the real model behaves
+    // almost this way here: BGE scores the wrong-city objective 0.8909 against
+    // 0.8917 for the true rephrase (live measurement 2026-08-13). The place
+    // floor, not the cosine, has to separate them.
+    async embed(texts: string[]) {
+      return texts.map(() => Float32Array.from([1, 0, 0]));
+    },
+  });
+  t.after(() => _setLocalProviderForTest(undefined));
+
+  const candidates = [
+    {
+      objective: 'Find the top 5 hotels in Lyon using Apify, put them in a Google Sheet, and email the link.',
+      outcome: 'SAME-PLACE-NAMED-MORE-BROADLY-IS-REACHABLE',
+    },
+    {
+      objective: 'Find the top 5 hotels in Marseille using Apify, put them in a Google Sheet, and email the link.',
+      outcome: 'DIFFERENT-PLACE-MUST-STAY-OUT',
+    },
+  ];
+  const sources: Array<{ sourceSessionId: string; sourceUserSeq: number }> = [];
+  for (const [index, candidate] of candidates.entries()) {
+    const session = createSession({ kind: 'chat', channel: 'discord', title: `place candidate ${index}` });
+    const source = appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: candidate.objective },
+    });
+    historicalTypedTerminal({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      status: 'needs_input',
+      text: candidate.outcome,
+    });
+    sources.push({ sourceSessionId: session.id, sourceUserSeq: source.seq });
+  }
+
+  const projection = await renderRelevantPriorWorkForModel(openEventLog(), {
+    currentObjective: 'Pull the top 5 hotels in Lyon France using Apify, put them in a Google Sheet, and email the link.',
+    priorSources: sources,
+  });
+
+  assert.equal(projection.count, 1);
+  assert.match(projection.text, /SAME-PLACE-NAMED-MORE-BROADLY-IS-REACHABLE/);
+  assert.doesNotMatch(projection.text, /DIFFERENT-PLACE-MUST-STAY-OUT/);
+});
+
+test('semantic prior-work retrieval stops at its deadline and degrades to conservative lexical evidence', async (t) => {
+  resetEventLog();
+  _setLocalProviderForTest({
+    name: 'local',
+    model: 'hung-prior-work-test',
+    dim: 3,
+    async embed() {
+      return new Promise<Float32Array[]>(() => {});
+    },
+  });
+  t.after(() => _setLocalProviderForTest(undefined));
+  const prior = createSession({ kind: 'chat', channel: 'discord', title: 'deadline fallback' });
+  const source = appendEvent({
+    sessionId: prior.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Find the top 5 Ventura restaurants with Apify and email me the results.' },
+  });
+  historicalTypedTerminal({
+    sessionId: prior.id,
+    sourceUserSeq: source.seq,
+    status: 'failed',
+    text: 'LEXICAL-AFTER-DEADLINE',
+  });
+
+  const startedAt = Date.now();
+  const projection = await renderRelevantPriorWorkForModel(openEventLog(), {
+    currentObjective: 'Pull the top 5 restaurants in Ventura from Apify, then send the results by email.',
+    priorSources: [{ sourceSessionId: prior.id, sourceUserSeq: source.seq }],
+    semanticDeadlineMs: 20,
+  });
+
+  assert.ok(Date.now() - startedAt < 250, 'a hung warm embedder never holds the user turn');
+  assert.equal(projection.items[0]?.matchKind, 'lexical');
+  assert.match(projection.text, /LEXICAL-AFTER-DEADLINE/);
+});
 
 test('pulls prior turns chronologically (user → assistant → user)', () => {
   resetEventLog();

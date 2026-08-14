@@ -5,6 +5,10 @@
  * would create a cycle at the provider boundary.
  */
 
+import {
+  documentedComposioOperationSemantic,
+} from './operation-semantics.js';
+
 export type ComposioSlugEffect = 'read' | 'external_write';
 
 /** Evidence-grade classification: 'read' and 'write' are affirmative verb
@@ -58,6 +62,8 @@ export function classifyComposioActionConsequence(
   slug: string | null | undefined,
 ): ComposioActionConsequence {
   if (!slug) return 'other';
+  const documented = documentedComposioOperationSemantic(slug);
+  if (documented) return documented.consequence;
   const tokens = actionTokens(slug);
   // Most specific consequence wins; a slug naming several verbs is judged by
   // the most consequential one it declares.
@@ -210,6 +216,14 @@ export function classifyComposioSlugEffect(slug: string | null | undefined): Com
 export function composioSlugEffectEvidence(slug: string | null | undefined): ComposioSlugEffectEvidence {
   const upper = String(slug ?? '').trim().toUpperCase();
   if (!upper) return 'unknown';
+
+  const documented = documentedComposioOperationSemantic(upper);
+  // A documented noun-shaped WRITE is affirmative effect evidence. Keep a
+  // noun-shaped READ at `unknown` in this low-level verb-evidence API: callers
+  // that accept author-declared reads depend on that distinction, while the
+  // canonical external-effect classifier consumes the full documented
+  // descriptor and can affirm the read directly.
+  if (documented?.effect === 'write') return 'write';
 
   if (dataForSeoResearchActionIsReadOnly(upper)) {
     return 'read';
