@@ -269,12 +269,32 @@ function admitLogicalCallInTransaction(
     return { status: 'inserted', identity };
   }
 
-  if (
-    !logicalMatches(row, expected.acceptedTaskId, contract.toolName, contract.argumentDigest, phase)
-    || row.state !== 'open'
-  ) {
+  if (!logicalMatches(row, expected.acceptedTaskId, contract.toolName, contract.argumentDigest, phase)) {
     poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId, 'logical call identity conflicts with its durable contract');
     return { status: 'conflict', reason: 'logical call identity conflicts with its durable contract' };
+  }
+  // AN EXACT RE-ADMISSION OF A CALL THAT ALREADY SETTLED IS NOT A FORGERY.
+  // The identity matched on the line above, so this is the same tool with the
+  // same digest under the same accepted task — an idempotent second admission,
+  // which a refusal path produces routinely: the refusal settles the call, then
+  // the ordinary post-tool accounting admits the same provider call id again.
+  // Folding it into the conflict branch above poisoned the WHOLE accepted task,
+  // so every later work_call was refused "accepted task resolution is ambiguous"
+  // and the turn could no longer dispatch anything (live 2026-08-14: one denied
+  // tool_search strangled two consecutive turns until the row was edited by
+  // hand). Contract refinement already draws this exact distinction below —
+  // mismatch poisons, already-settled returns 'closed' — so this says the same
+  // thing in the same words rather than inventing a third answer.
+  //
+  // A PAID crossing is the other question. Re-admitting a settled call to cross
+  // the boundary again risks a duplicate effect, so that keeps failing closed
+  // exactly as before. Only the logical admission is benign.
+  if (row.state !== 'open') {
+    if (phase === 'physical') {
+      poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId, 'logical call identity conflicts with its durable contract');
+      return { status: 'conflict', reason: 'logical call identity conflicts with its durable contract' };
+    }
+    return { status: 'closed', reason: 'logical call is already settled' };
   }
   return {
     status: 'replayed',

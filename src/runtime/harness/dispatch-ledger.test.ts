@@ -15,6 +15,8 @@ const shadow = await import('../graph/turn-graph-shadow.js');
 const ledger = await import('./dispatch-ledger.js');
 const resolution = await import('./resolution-ledger.js');
 const identities = await import('./attempt-identity.js');
+const settlements = await import('./logical-call-settlement-store.js');
+const outcomes = await import('./attempt-outcome.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -427,4 +429,97 @@ test('a poisoned call records the FIRST cause on the dispatch path, and later re
     conflict_reason: string | null;
   };
   assert.equal(after.conflict_reason, row.conflict_reason, 'the FIRST cause survives later conflicts');
+});
+
+/**
+ * Live 2026-08-14: one DENIED tool_search strangled two consecutive turns.
+ *
+ * A refusal settles the logical call before it ever crosses; the ordinary
+ * post-tool accounting then admits the same provider call id again. That exact
+ * re-admission used to be folded into the identity-conflict branch, so it
+ * poisoned the whole accepted task and every later work_call was refused
+ * "accepted task resolution is ambiguous" — until the row was edited by hand.
+ *
+ * Both directions are pinned deliberately. The benign case must not poison, and
+ * a genuine mismatch must still poison, so the split cannot later be
+ * "simplified" back into one branch.
+ */
+function settleAsRefusal(identity: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+}, tool: string, args: unknown): void {
+  const committed = settlements.commitLogicalCallSettlement({
+    identity,
+    contract: { toolName: tool, args },
+    execution: { kind: 'refused_pre_dispatch' },
+    outcome: outcomes.classifyAttemptOutcome({ preDispatch: true, policyRefused: true }),
+    recovery: { businessCall: false, mutating: false },
+    observer: { lane: 'agents_runner', turn: identity.turn },
+  });
+  assert.ok(
+    committed.status === 'committed' || committed.status === 'replayed',
+    `fixture settlement failed: ${JSON.stringify(committed)}`,
+  );
+}
+
+test('an exact re-admission of a settled logical call is closed, never poisoned', () => {
+  const task = accept();
+  const identity = {
+    ...task,
+    acceptedTaskId: identities.acceptedTaskIdFor(task.sessionId, task.sourceUserSeq),
+    logicalToolCallId: 'logical:denied-discovery',
+  };
+  const tool = 'tool_search';
+  const args = { query: 'coffee shops in san luis obispo' };
+  assert.equal(ledger.admitLogicalCall({ identity, tool, args }).status, 'inserted');
+  settleAsRefusal(identity, tool, args);
+
+  const readmitted = ledger.admitLogicalCall({ identity, tool, args });
+  assert.equal(readmitted.status, 'closed', JSON.stringify(readmitted));
+
+  const db = eventlog.openEventLog();
+  assert.equal((db.prepare(`
+    SELECT state FROM accepted_task_resolutions
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(task.sessionId, task.sourceUserSeq) as { state: string }).state, 'open',
+    'a benign duplicate admission must leave the accepted task usable');
+
+  // The whole point: the task can still do its actual work afterwards.
+  assert.equal(ledger.admitLogicalCall({
+    identity: { ...identity, logicalToolCallId: 'logical:the-real-work' },
+    tool: 'alpha_records_search',
+    args: { query: 'coffee shops' },
+  }).status, 'inserted', 'later work must still be dispatchable');
+});
+
+test('a settled logical call still poisons when the re-admission is a different contract', () => {
+  const task = accept();
+  const identity = {
+    ...task,
+    acceptedTaskId: identities.acceptedTaskIdFor(task.sessionId, task.sourceUserSeq),
+    logicalToolCallId: 'logical:settled-then-forged',
+  };
+  assert.equal(ledger.admitLogicalCall({
+    identity,
+    tool: 'alpha_records_search',
+    args: { query: 'alpha' },
+  }).status, 'inserted');
+  settleAsRefusal(identity, 'alpha_records_search', { query: 'alpha' });
+
+  // Same id, DIFFERENT arguments: an identity conflict, settled or not.
+  const forged = ledger.admitLogicalCall({
+    identity,
+    tool: 'alpha_records_search',
+    args: { query: 'beta' },
+  });
+  assert.equal(forged.status, 'conflict');
+  const db = eventlog.openEventLog();
+  assert.equal((db.prepare(`
+    SELECT state FROM accepted_task_resolutions
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(task.sessionId, task.sourceUserSeq) as { state: string }).state, 'legacy_ambiguous',
+    'a forged identity must still poison even after the call settled');
 });
