@@ -3110,7 +3110,10 @@ test('full mode: schema-on-demand loads a bounded hot set without pruning permis
   );
   assert.deepEqual(
     captured.requiredLocalMcpTools,
-    ['memory_recall_all', 'tool_search', 'call_tool'],
+    // An accepted action mounts its one semantic business carrier INSTEAD of the
+    // unbound generic dispatcher, so the kernel's third slot is work_call here.
+    // The non-action half of that same rule is pinned by the dock test below.
+    ['memory_recall_all', 'tool_search', 'work_call'],
     'the acquisition and recovery kernel is required at SDK init',
   );
   const scope = listEvents('native-tool-search-run', { types: ['tool_jit_scope'] }).at(-1);
@@ -3136,6 +3139,14 @@ test('Workspace dock: schema-on-demand loads the common edit kernel and defers s
     sessionId: 'space-schema-lean-space',
   });
 
+  // The other half of the kernel's carrier rule. A non-action turn keeps the
+  // generic dispatcher, so both branches of that one decision stay pinned and
+  // neither lane can drift alone.
+  assert.deepEqual(
+    captured.requiredLocalMcpTools,
+    ['memory_recall_all', 'tool_search', 'call_tool'],
+    'a non-action dock keeps the generic dispatcher in the kernel',
+  );
   for (const common of ['space_get', 'space_get_view', 'space_edit_view']) {
     assert.ok(captured.mcpToolAllowlist.includes(common), `${common} stays first-class in a dock`);
   }
@@ -3469,6 +3480,27 @@ test('artifact completion performs one exact-ID read-back before reporting succe
       options.sourceUserSeq,
     );
     if (calls === 1) {
+      // The real SDK tool path records this for every returned business call
+      // (claude-agent-sdk.ts). A stubbed run replaces that path wholesale, so it
+      // must leave the same durable evidence itself — otherwise the turn claims
+      // a finished artifact while the ledger shows no work happened at all, and
+      // the committer correctly refuses to publish success for it.
+      appendEvent({
+        sessionId,
+        turn: 0,
+        role: 'tool',
+        type: 'tool_returned',
+        data: {
+          sourceUserSeq: options.sourceUserSeq,
+          tool: 'composio_execute_tool',
+          callId: 'toolu_create_doc',
+          canonicalCallId: 'toolu_create_doc',
+          accounting: 'top_level',
+          topologyRole: 'business',
+          ok: true,
+          successfulBusinessResult: true,
+        },
+      });
       const intent = artifactLedger.artifactIntentForTool('composio_execute_tool', {
         tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT',
         arguments: JSON.stringify({ title: 'Firm brief' }),

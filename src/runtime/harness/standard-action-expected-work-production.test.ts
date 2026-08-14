@@ -309,6 +309,9 @@ test('standard action keeps control discovery before freeze, fuses proposal with
 
     const searchResult = await search.invoke(
       runContext,
+      // A strict tool schema advertises every property as required, so a
+      // hand-written call must carry them all. This task registered no
+      // requirement roles, and null is how the schema spells "no role".
       JSON.stringify({ query: 'read the user profile', limit: 1, role_key: null }),
       { toolCall: { callId: 'control-search' } },
     );

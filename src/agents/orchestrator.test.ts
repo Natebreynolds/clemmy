@@ -419,6 +419,16 @@ test('every tool the instructions tell the model to call is ON the surface (allo
   // the instructions legitimately reference. Keep this list as small as the
   // instructions allow — every entry is a name the model might try to call.
   const NON_TOOL_MENTIONS = new Set(['awaiting_approval', 'awaiting_user_input', 'tool_called']);
+  // ROUTE-SCOPED CARRIERS. This guard builds ONE default surface, so it cannot
+  // see a tool that exists only on another route. `work_call` is mounted only on
+  // an accepted action turn, where it REPLACES call_tool as the sole business
+  // carrier, and the instruction naming it is itself scoped to accepted actions
+  // — so the promise is kept on the turn that hears it. That surface is pinned
+  // elsewhere (standard-action-expected-work-production test 1: work_call
+  // present, call_tool absent), which is what keeps this exemption from being a
+  // hole. Keep the set to carriers a route genuinely swaps — anything else here
+  // would be a real allowlist omission hiding behind an exemption.
+  const ROUTE_SCOPED_CARRIERS = new Set(['work_call']);
   const mentioned = new Set<string>();
   for (const m of String(ORCHESTRATOR_INSTRUCTIONS).matchAll(/`([a-z][a-z0-9_]+)(?:\([^`]*)?`/g)) {
     const n = m[1];
@@ -427,7 +437,9 @@ test('every tool the instructions tell the model to call is ON the surface (allo
     if (n.includes('_') && !n.includes('__')) mentioned.add(n);
   }
   assert.ok(mentioned.size >= 30, `extraction sanity: expected 30+ instructed tool mentions, got ${mentioned.size}`);
-  const missing = [...mentioned].filter((n) => !surface.has(n) && !NON_TOOL_MENTIONS.has(n)).sort();
+  const missing = [...mentioned]
+    .filter((n) => !surface.has(n) && !NON_TOOL_MENTIONS.has(n) && !ROUTE_SCOPED_CARRIERS.has(n))
+    .sort();
   assert.deepEqual(missing, [], `instructions promise tools the surface does not expose: ${missing.join(', ')}`);
 
   // The clip/digest RECOVERY tools are instructed at RUNTIME by the digest
