@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import tls from 'node:tls';
 import os from 'node:os';
@@ -24,7 +24,7 @@ test.after(() => {
   try { rmSync(TMP_ROOT, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
-const { encodeFrame, frameReader, FRAME, startMobileRelayClient, ensureRelayAuthToken, relayPairId, relayConfigFromEnv } =
+const { encodeFrame, frameReader, FRAME, startMobileRelayClient, ensureRelayAuthToken, relayPairId, relayConfigFromEnv, loadRelayConfig, DEFAULT_RELAY_CONFIG } =
   await import('./mobile-relay.js');
 const { startRelay, parseSni } = await import('../../apps/relay/server.mjs') as {
   startRelay: (opts: Record<string, unknown>) => Promise<{ port: number; tunnelCount(): number; close(): Promise<void> }>;
@@ -232,6 +232,43 @@ test('relayConfigFromEnv: kill switch and completeness', () => {
     CLEMENTINE_RELAY_CERT_FP: 'fp',
   });
   assert.deepEqual(full, { url: 'relay.example:30123', baseDomain: 'r.example.com', relayCertFp: 'fp' });
+});
+
+test('loadRelayConfig: built-in hosted default, overridden by state file and env, killed by switch', () => {
+  const stateDir = path.join(TMP_ROOT, 'cfg-default');
+
+  // Zero config = the hosted relay, so a fresh install is remote-capable.
+  const fallback = loadRelayConfig(stateDir, {});
+  assert.deepEqual(fallback, DEFAULT_RELAY_CONFIG, 'nothing configured = built-in hosted relay');
+  assert.match(DEFAULT_RELAY_CONFIG.url, /^[a-z0-9.-]+:\d+$/);
+  assert.match(DEFAULT_RELAY_CONFIG.baseDomain, /^r\./);
+  assert.match(DEFAULT_RELAY_CONFIG.relayCertFp, /^[A-Za-z0-9_-]{43}$/, 'base64url sha256 pin');
+
+  // The kill switch beats the default too.
+  assert.equal(loadRelayConfig(stateDir, { CLEMENTINE_MOBILE_RELAY: 'off' }), null);
+
+  // A self-hoster's state file beats the default.
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, 'mobile-relay.json'),
+    JSON.stringify({ url: 'self.example:9400', baseDomain: 'r.self.example', relayCertFp: 'selffp' }),
+  );
+  assert.deepEqual(loadRelayConfig(stateDir, {}), {
+    url: 'self.example:9400',
+    baseDomain: 'r.self.example',
+    relayCertFp: 'selffp',
+  });
+
+  // Env beats everything but the kill switch.
+  const fromEnv = loadRelayConfig(stateDir, {
+    CLEMENTINE_RELAY_URL: 'env.example:1', CLEMENTINE_RELAY_BASE: 'r.env.example', CLEMENTINE_RELAY_CERT_FP: 'envfp',
+  });
+  assert.deepEqual(fromEnv, { url: 'env.example:1', baseDomain: 'r.env.example', relayCertFp: 'envfp' });
+
+  // A partial state file (e.g. only an authToken, the common pre-default
+  // shape) must not mask the default.
+  writeFileSync(path.join(stateDir, 'mobile-relay.json'), JSON.stringify({ authToken: 'tok-only' }));
+  assert.deepEqual(loadRelayConfig(stateDir, {}), DEFAULT_RELAY_CONFIG);
 });
 
 test('relayPairId is DNS-safe lowercase hex derived from the cert', () => {

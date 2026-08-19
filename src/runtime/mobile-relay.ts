@@ -142,9 +142,25 @@ export function relayConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Mobile
 }
 
 /**
+ * The hosted relay every install can reach with zero setup. Baked in so a
+ * fresh download gets off-LAN access the moment it pairs — the relay is
+ * untrusted-by-design (TLS passthrough, phone pins THIS Mac's cert), so a
+ * built-in default widens reachability, never trust. Self-hosters override
+ * via the state file or CLEMENTINE_RELAY_* envs; CLEMENTINE_MOBILE_RELAY=off
+ * kills it entirely. Rotating the hosted relay's cert or address requires
+ * shipping an update carrying the new values — the pin here is the daemon
+ * side's proof it is talking to OUR relay, not a DNS hijacker.
+ */
+export const DEFAULT_RELAY_CONFIG: MobileRelayConfig = {
+  url: 'sakura.proxy.rlwy.net:53028',
+  baseDomain: 'r.breakthroughcoaching.ai',
+  relayCertFp: 'GglWxWdKH37etWzaG7zDe4OeQOYfhQ_4PGQWl1N_rzo',
+};
+
+/**
  * The production loader: env config wins (dev/testing), else the persisted
- * state file (how the packaged, app-owned daemon is configured). The kill
- * switch applies to both sources.
+ * state file (self-hosters and pre-default installs), else the built-in
+ * hosted relay. The kill switch applies to all three sources.
  */
 export function loadRelayConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.env): MobileRelayConfig | null {
   if ((env.CLEMENTINE_MOBILE_RELAY ?? '').toLowerCase() === 'off') return null;
@@ -154,8 +170,8 @@ export function loadRelayConfig(stateDir?: string, env: NodeJS.ProcessEnv = proc
   const url = state.url?.trim();
   const baseDomain = state.baseDomain?.trim();
   const relayCertFp = state.relayCertFp?.trim();
-  if (!url || !baseDomain || !relayCertFp) return null;
-  return { url, baseDomain, relayCertFp };
+  if (url && baseDomain && relayCertFp) return { url, baseDomain, relayCertFp };
+  return { ...DEFAULT_RELAY_CONFIG };
 }
 
 // ─── relay runtime registry ─────────────────────────────────────────────────
