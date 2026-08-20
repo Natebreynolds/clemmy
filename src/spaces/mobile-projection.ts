@@ -202,6 +202,41 @@ function findHeadline(data: unknown): MobileWorkspaceField[] {
 }
 
 /** Ranks a row's keys and keeps the few that identify and qualify it. */
+/**
+ * Rows whose substance lives one level down project as nearly-empty cards:
+ * a sales rep row of { name, id, thisWeek: {...}, wow: {...}, risk: {...} }
+ * has two flat fields — one is the title, one is an id — so the phone showed
+ * a bare list of names (live). When a row set is scalar-sparse like that,
+ * flatten ONE level: nested scalar leaves become "This week calls"-style
+ * fields and the normal field ranking takes over. Rows that are already flat
+ * are returned untouched, so well-shaped workspaces cannot regress.
+ */
+export function flattenSparseRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  if (rows.length === 0) return rows;
+  const sample = rows.slice(0, 20);
+  const scalarCounts = sample.map((row) =>
+    Object.values(row).filter((value) => isScalar(value) && value !== null && value !== '').length);
+  const avgScalars = scalarCounts.reduce((a, b) => a + b, 0) / scalarCounts.length;
+  const hasNested = sample.some((row) =>
+    Object.values(row).some((value) => value && typeof value === 'object' && !Array.isArray(value)));
+  if (avgScalars >= 3 || !hasNested) return rows;
+  return rows.map((row) => {
+    const flat: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      if (isScalar(value)) {
+        flat[key] = value;
+        continue;
+      }
+      if (value && typeof value === 'object' && !Array.isArray(value) && !key.startsWith('_')) {
+        for (const [innerKey, innerValue] of Object.entries(value as Record<string, unknown>)) {
+          if (isScalar(innerValue)) flat[`${key} ${innerKey}`] = innerValue;
+        }
+      }
+    }
+    return flat;
+  });
+}
+
 export function chooseFields(rows: Array<Record<string, unknown>>): string[] {
   const keys = new Map<string, number>();
   for (const row of rows.slice(0, 20)) {
@@ -270,7 +305,8 @@ export function projectWorkspaceData(data: unknown): MobileWorkspaceProjection {
   if (!found) {
     return { recordPath: null, recordLabel: null, total: 0, shown: 0, headline, breakdowns, records: [] };
   }
-  const { path, rows } = found as { path: string; rows: Array<Record<string, unknown>> };
+  const { path, rows: rawRows } = found as { path: string; rows: Array<Record<string, unknown>> };
+  const rows = flattenSparseRows(rawRows);
   const chosen = chooseFields(rows);
   const [primaryKey, ...rest] = chosen;
   const records: MobileWorkspaceRecord[] = rows.slice(0, MAX_RECORDS).map((row, index) => {
@@ -408,10 +444,29 @@ function authoredFields(raw: unknown, cap: number): MobileWorkspaceField[] {
  * Reads `_mobile` if the workspace wrote one. Returns null when it is absent
  * or too malformed to be worth showing — inference then takes over, which is
  * why adding this can never make an existing workspace worse.
+ *
+ * Looked up at the top level AND one level inside each data source's output.
+ * The nested spot is the one that actually works long-term: refresh rebuilds
+ * data.json from per-source observations, so a top-level block written once
+ * by hand is wiped on the next refresh — but a RUNNER that emits `_mobile`
+ * inside its own result re-authors the layout with every refresh, so the
+ * phone view can never go stale relative to the data it summarizes.
  */
 export function readAuthoredProjection(data: unknown): MobileWorkspaceProjection | null {
   if (!data || typeof data !== 'object') return null;
-  const authored = (data as Record<string, unknown>)._mobile;
+  const doc = data as Record<string, unknown>;
+  let authored = doc._mobile;
+  if (!authored || typeof authored !== 'object' || Array.isArray(authored)) {
+    authored = undefined;
+    for (const [key, value] of Object.entries(doc)) {
+      if (key.startsWith('_') || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const nested = (value as Record<string, unknown>)._mobile;
+      if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+        authored = nested;
+        break;
+      }
+    }
+  }
   if (!authored || typeof authored !== 'object' || Array.isArray(authored)) return null;
   const block = authored as Record<string, unknown>;
 

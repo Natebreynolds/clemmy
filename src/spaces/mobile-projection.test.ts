@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chooseFields, formatValue, humanizeKey, projectSourceHealth, projectWorkspaceData } from './mobile-projection.js';
+import { chooseFields, flattenSparseRows, formatValue, humanizeKey, projectSourceHealth, projectWorkspaceData } from './mobile-projection.js';
 
 test('counts are not money: `total*` alone never renders as dollars', () => {
   // Live bug: totalOpen (41 deals) rendered as "$41" beside totalOpenValue.
@@ -222,4 +222,46 @@ test('_mobile is never mistaken for the dataset by inference', () => {
     _mobile: { headline: [] },
   });
   assert.equal(p.recordPath, 'deals');
+});
+
+test('scalar-sparse nested rows flatten one level so cards show numbers, not just names', () => {
+  // The live shape that projected as a bare list of names: per-rep rows whose
+  // substance lives in nested thisWeek/wow/risk objects.
+  const reps = Array.from({ length: 5 }, (_, i) => ({
+    id: `005-${i}`,
+    name: `Rep ${i}`,
+    thisWeek: { calls: 40 + i, emails: 90 - i, won: i % 2 },
+    wow: { calls: -3, won: 1 },
+    risk: { openDeals: 3, missingNextStep: 1 },
+  }));
+  const p = projectWorkspaceData({ weekly: { reps } });
+  assert.equal(p.total, 5);
+  const first = p.records[0];
+  assert.ok(first.fields.length >= 3, `flattened fields expected, got ${JSON.stringify(first.fields)}`);
+  const labels = p.records.flatMap((r) => r.fields.map((f) => f.label.toLowerCase()));
+  assert.ok(labels.some((l) => l.includes('calls')), 'nested metrics surface as fields');
+});
+
+test('already-flat rows are untouched by the sparse flattener', () => {
+  const rows = Array.from({ length: 4 }, (_, i) => ({
+    account: `Acme ${i}`, stage: 'Proposal', amount: 1000 * i, owner: 'Sam',
+  }));
+  const flattened = flattenSparseRows(rows);
+  assert.equal(flattened, rows, 'same reference — no rewrite for healthy rows');
+});
+
+test('a runner-emitted nested _mobile block is honored (survives refresh by construction)', () => {
+  const p = projectWorkspaceData({
+    _meta: { sources: {} },
+    weekly: {
+      reps: [{ name: 'x' }],
+      _mobile: {
+        headline: [{ label: 'Team calls', value: '412' }],
+        records: { label: 'Reps', total: 8, items: [{ primary: 'Bobby', fields: [{ label: 'Calls', value: '42' }] }] },
+      },
+    },
+  });
+  assert.equal(p.headline[0]?.label, 'Team calls');
+  assert.equal(p.recordLabel, 'Reps');
+  assert.equal(p.records[0]?.primary, 'Bobby');
 });
