@@ -1405,6 +1405,145 @@ test('chat transcript preserves limit-exceeded reason metadata for mobile contin
   } finally { await h.close(); }
 });
 
+test('chat transcript carries full tool fidelity — callId and glimpse survive to the phone', async () => {
+  // The old serializer trimmed tool events to {tool, argsPreview}/{tool, ok},
+  // so the phone could never correlate called→returned nor show result
+  // glimpses — the whole activity strip degraded. The phone is the same owner
+  // behind stronger auth than the console; it gets the same projection.
+  resetEventLog();
+  const h = await startHarness();
+  try {
+    await setPin('TestPin1!', { stateDir: h.stateDir });
+    const login = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'TestPin1!' }),
+    });
+    const cookie = extractCookie(login.headers.get('set-cookie'))!;
+    const session = createHarnessSession({
+      kind: 'chat', channel: 'mobile', title: 'Fidelity check', metadata: { source: 'mobile' },
+    });
+    appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'look this up' } });
+    appendEvent({
+      sessionId: session.id, turn: 1, role: 'assistant', type: 'tool_called',
+      data: { tool: 'web_search', callId: 'call-77', args: JSON.stringify({ query: 'roofing leads' }) },
+    });
+    appendEvent({
+      sessionId: session.id, turn: 1, role: 'assistant', type: 'tool_returned',
+      data: { tool: 'web_search', callId: 'call-77', ok: true, glimpse: { count: 12, key: 'records', fields: ['name', 'phone'], sample: 'Acme Roofing' } },
+    });
+
+    const res = await fetch(`${h.url}/m/api/chat/sessions/${session.id}`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { events: Array<{ type: string; sessionId?: string; data: Record<string, unknown> }> };
+    const called = body.events.find((event) => event.type === 'tool_called');
+    const returned = body.events.find((event) => event.type === 'tool_returned');
+    assert.ok(called && returned, 'both tool events reach the phone');
+    assert.equal(called!.data.callId, 'call-77', 'correlation id survives');
+    assert.equal(typeof called!.data.argsPreview, 'string', 'legacy preview kept for shipped builds');
+    assert.equal(returned!.data.callId, 'call-77');
+    const glimpse = returned!.data.glimpse as { count?: number } | undefined;
+    assert.equal(glimpse?.count, 12, 'result glimpse survives');
+    assert.equal(called!.sessionId, session.id, 'events carry their session id for bridged-frame telling');
+  } finally { await h.close(); }
+});
+
+test('chat events/recent is a cursor catch-up: only newer events, latestSeq advances', async () => {
+  // The stream can die without the client ever seeing an HTTP status (webview
+  // suspension, spent ticket). This endpoint is the recovery path — the live
+  // defect it pins: a turn completed server-side while the phone was locked
+  // and the reply was never rendered.
+  resetEventLog();
+  const h = await startHarness();
+  try {
+    await setPin('TestPin1!', { stateDir: h.stateDir });
+    const login = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'TestPin1!' }),
+    });
+    const cookie = extractCookie(login.headers.get('set-cookie'))!;
+    const session = createHarnessSession({
+      kind: 'chat', channel: 'mobile', title: 'Catch-up check', metadata: { source: 'mobile' },
+    });
+    const first = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'q' } });
+    appendEvent({ sessionId: session.id, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'x', callId: 'c1' } });
+    const terminal = appendEvent({ sessionId: session.id, turn: 1, role: 'assistant', type: 'conversation_completed', data: { reply: 'the missed answer' } });
+
+    const res = await fetch(`${h.url}/m/api/chat/sessions/${session.id}/events/recent?sinceSeq=${first.seq}`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { events: Array<{ seq: number; type: string; data: Record<string, unknown> }>; latestSeq: number };
+    assert.ok(body.events.every((event) => event.seq > first.seq), 'cursor excludes already-seen events');
+    const reply = body.events.find((event) => event.type === 'conversation_completed');
+    assert.equal(reply?.data.reply, 'the missed answer', 'the missed terminal is recoverable by poll');
+    assert.equal(body.latestSeq, terminal.seq);
+
+    const missing = await fetch(`${h.url}/m/api/chat/sessions/does-not-exist/events/recent`, { headers: { cookie } });
+    assert.equal(missing.status, 404);
+    const anon = await fetch(`${h.url}/m/api/chat/sessions/${session.id}/events/recent`);
+    assert.equal(anon.status, 401, 'catch-up is session-gated like everything else');
+  } finally { await h.close(); }
+});
+
+test('chat/send async mode: 202 on the durable claim, the run continues, replays are idempotent', async () => {
+  resetEventLog();
+  _clearIdempotencyForTests();
+  _clearMobileChatInFlightForTests();
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  let dispatches = 0;
+  const assistant = {
+    respond: async (req: { sessionId: string }) => {
+      dispatches += 1;
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      return { text: 'Landed after the ack.', sessionId: req.sessionId };
+    },
+  } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    const cookie = await loginMobile(h, 'Async send phone');
+    const send = () => fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, 'idempotency-key': 'mobile-async-send-key' },
+      // Wording matters: phrases like "in the background" route to the task
+      // queue instead of the assistant, which is not what this pin tests.
+      body: JSON.stringify({ message: 'summarize the pipeline numbers', async: true }),
+    });
+    const res = await send();
+    assert.equal(res.status, 202, 'async send acknowledges on the claim, not the turn');
+    const ack = await res.json() as { accepted: boolean; sessionId: string; runId: string; sinceSeq: number };
+    assert.equal(ack.accepted, true);
+    assert.ok(ack.sessionId && ack.runId);
+    assert.equal(typeof ack.sinceSeq, 'number');
+
+    // The run keeps going after the ack — the reply lands durably as if the
+    // phone had stayed connected.
+    let terminals: ReturnType<typeof listEvents> = [];
+    for (let i = 0; i < 100 && terminals.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      terminals = listEvents(ack.sessionId, { types: ['conversation_completed'] });
+    }
+    assert.equal(terminals.length, 1, 'the accepted run reached its durable terminal');
+
+    // A replay of the same key re-acknowledges the SAME run — never a second dispatch.
+    const replay = await send();
+    assert.equal(replay.status, 202);
+    const replayAck = await replay.json() as typeof ack;
+    assert.equal(replayAck.sessionId, ack.sessionId);
+    assert.equal(replayAck.runId, ack.runId);
+    assert.equal(dispatches, 1, 'idempotent replay never dispatches twice');
+  } finally {
+    _setBridgeImplsForTests({});
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
+    await h.close();
+  }
+});
+
 test('setPin enforces 8-64 char floor + allowed-char policy', async () => {
   const h = await startHarness();
   try {

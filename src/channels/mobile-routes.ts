@@ -85,6 +85,11 @@ import {
   publicUserInputText,
   PUBLIC_RUN_FAILURE_TEXT,
 } from '../runtime/harness/public-presentation.js';
+import {
+  collectBridgedWorkflowReplay,
+  createBridgePredicate,
+  isCanonicalBridgedActivity,
+} from '../runtime/harness/bridged-activity.js';
 import { actionBus } from '../runtime/action-bus.js';
 import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
@@ -250,10 +255,18 @@ function serializeSessionForMobile(session: HarnessSessionRow): {
 }
 
 /**
- * Strip an event down to what the PWA actually renders. Tool args are
- * truncated because mobile screens are narrow + payload size matters
- * for push-driven cold starts. Full args remain available on the
- * dashboard.
+ * Shape an already-public-projected event for the phone.
+ *
+ * The input is projectHarnessEventForPublic's output — the same fail-closed,
+ * user-facing projection the desktop console ships over its SSE untouched.
+ * Trimming it further is what used to break the phone: tool correlation ids,
+ * result glimpses, worker/batch progress and token deltas all arrived as
+ * `data: {}`, so the mobile chat could never render the activity the desktop
+ * renders. The phone is the same owner on the same daemon behind stronger
+ * auth than the console; it gets the same events.
+ *
+ * The only per-type work left here is enrichment the projection doesn't
+ * carry (plan-proposal status lookup) and the derived user-input text.
  */
 function serializeEventForMobile(event: HarnessEventRow): {
   seq: number;
@@ -262,13 +275,14 @@ function serializeEventForMobile(event: HarnessEventRow): {
   role: string;
   type: string;
   createdAt: number;
+  sessionId: string;
   data: Record<string, unknown>;
 } {
   const data = event.data ?? {};
-  let trimmed: Record<string, unknown> = {};
+  let shaped: Record<string, unknown>;
   switch (event.type) {
     case 'user_input_received':
-      trimmed = { text: publicUserInputText(data) };
+      shaped = { ...data, text: publicUserInputText(data) };
       break;
     case 'conversation_completed':
       {
@@ -277,9 +291,9 @@ function serializeEventForMobile(event: HarnessEventRow): {
         const planProposalStatus = typeof data.planProposalStatus === 'string'
           ? data.planProposalStatus
           : (planProposal?.status ?? null);
-        trimmed = {
+        shaped = {
+          ...data,
           reply: typeof data.reply === 'string' ? data.reply : (typeof data.summary === 'string' ? data.summary : ''),
-          reason: data.reason,
           planProposalId,
           planProposalStatus,
           planProposalNeedsUserInput: planProposal ? planProposalNeedsUserInput(planProposal) : false,
@@ -287,7 +301,10 @@ function serializeEventForMobile(event: HarnessEventRow): {
       }
       break;
     case 'conversation_limit_exceeded':
-      trimmed = {
+      // Passthrough plus explicit nulls: the continue UX reads these fields
+      // and the contract pins absent limits as null, not missing.
+      shaped = {
+        ...data,
         reason: typeof data.reason === 'string' ? data.reason : 'limit_exceeded',
         steps: typeof data.steps === 'number' ? data.steps : null,
         maxSteps: typeof data.maxSteps === 'number' ? data.maxSteps : null,
@@ -297,37 +314,22 @@ function serializeEventForMobile(event: HarnessEventRow): {
       };
       break;
     case 'tool_called':
-      trimmed = {
+      // Keep the legacy preview field a shipped PWA build still reads while
+      // passing the full projected payload (callId, publicSlug, reused …).
+      shaped = {
+        ...data,
         tool: typeof data.tool === 'string' ? data.tool : String(data.name ?? 'unknown'),
         argsPreview: shortArgsPreview(data.arguments ?? data.args),
       };
       break;
-    case 'tool_returned':
-      trimmed = {
-        tool: typeof data.tool === 'string' ? data.tool : String(data.name ?? 'unknown'),
-        ok: data.ok ?? data.success ?? true,
-      };
-      break;
-    case 'approval_requested':
-      trimmed = {
-        subject: typeof data.subject === 'string' ? data.subject : '',
-        tool: typeof data.tool === 'string' ? data.tool : '',
-        approvalId: typeof data.approvalId === 'string' ? data.approvalId : null,
-      };
-      break;
-    case 'approval_resolved':
-      trimmed = {
-        decision: data.decision ?? data.resolution ?? 'resolved',
-      };
-      break;
     case 'run_failed':
-      trimmed = { error: typeof data.error === 'string' ? data.error.slice(0, 240) : 'failed' };
+      shaped = { ...data, error: typeof data.error === 'string' ? data.error.slice(0, 500) : 'failed' };
       break;
     default:
-      // Pass through nothing for events the phone doesn't render —
-      // keeps the event in the timeline (so seq cursors stay correct)
-      // but doesn't ship arbitrary payloads to the phone.
-      trimmed = {};
+      // Public projection passthrough — identical to what the desktop SSE
+      // writes. Includes stream_token deltas the moment the projection
+      // starts emitting them; seq cursors stay correct either way.
+      shaped = { ...data };
   }
   return {
     seq: event.seq,
@@ -336,7 +338,10 @@ function serializeEventForMobile(event: HarnessEventRow): {
     role: event.role,
     type: event.type,
     createdAt: typeof event.createdAt === 'number' ? event.createdAt : Date.parse(String(event.createdAt)),
-    data: trimmed,
+    // Bridged delegated-work frames keep their own session id so the client
+    // can tell foreground turn state from mirrored background activity.
+    sessionId: event.sessionId,
+    data: shaped,
   };
 }
 
@@ -792,6 +797,13 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         activeToken = rotated.token;
         record = rotated.record;
         setSessionCookie(req, res, rotated.token);
+        // The device proof signs over the session fingerprint, which is
+        // derived from the token — so a rotation the client can't observe
+        // guarantees a BAD_DEVICE_PROOF 401 on its next request (live: a
+        // paired phone bounced to the login screen every 12h). The cookie is
+        // HttpOnly by design, so the new fingerprint rides a response header
+        // the fetch layer folds into its signing state.
+        res.setHeader('x-clem-session-fp', sessionFingerprint(rotated.token));
       }
     }
 
@@ -1803,13 +1815,19 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     };
 
     try {
-      const replay = projectHarnessEventsForPublic(
-        harnessListEvents(session.id, { sinceSeq, limit: 500 }),
-      );
+      // Merge host-dispatched workflow activity into the replay so a
+      // reconnect mid-run seeds the live activity strip instead of waiting
+      // for the next tool frame — same rule as the desktop console stream.
+      const ownEvents = harnessListEvents(session.id, { sinceSeq, limit: 500 });
+      const bridged = collectBridgedWorkflowReplay(session.id, ownEvents)
+        .filter((ev) => ev.seq > sinceSeq);
+      const merged = [...ownEvents, ...bridged].sort((a, b) => a.seq - b.seq);
+      const replay = projectHarnessEventsForPublic(merged.slice(-500));
       const shaped = replay.map(serializeEventForMobile);
-      // Last event's seq becomes the resume cursor on the next
-      // reconnect — even when no live events fire in between.
-      const lastSeq = shaped.length > 0 ? shaped[shaped.length - 1].seq : sinceSeq;
+      // The resume cursor must come from the session's OWN ledger — bridged
+      // frames carry foreign seq numbers that would corrupt it.
+      const ownShaped = shaped.filter((ev) => ev.sessionId === session.id);
+      const lastSeq = ownShaped.length > 0 ? ownShaped[ownShaped.length - 1].seq : sinceSeq;
       writeEvent(
         'replay',
         {
@@ -1825,11 +1843,21 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       writeEvent('replay', { sessionId: session.id, events: [], error: PUBLIC_RUN_FAILURE_TEXT });
     }
 
+    // Besides the session's own events, forward activity-shaped events from
+    // background tasks this chat spawned and from host-dispatched workflow
+    // step sessions whose origin observer is this chat — without them the
+    // phone shows a silent bubble for the whole delegated run.
+    const bridgesToThisSession = createBridgePredicate(session.id);
     const unsubscribe = actionBus.subscribe((event) => {
       if (event.kind !== 'harness.public_event') return;
-      if (event.sessionId !== session.id) return;
+      if (event.sessionId !== session.id) {
+        if (!isCanonicalBridgedActivity(event.event)) return;
+        if (!bridgesToThisSession(event.sessionId)) return;
+      }
       const shaped = serializeEventForMobile(event.event as HarnessEventRow);
-      writeEvent('event', shaped, shaped.seq);
+      // Only the session's own frames advance the browser's Last-Event-ID —
+      // a bridged frame's foreign seq must never become the resume cursor.
+      writeEvent('event', shaped, shaped.sessionId === session.id ? shaped.seq : undefined);
     });
 
     // Phone-in-hand is the same "in the room" signal the desktop dock provides:
@@ -1849,6 +1877,40 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     };
     res.on('close', cleanup);
     res.on('error', cleanup);
+  });
+
+  /**
+   * JSON catch-up for the chat stream. The stream can die without the client
+   * ever seeing an HTTP status (webview suspension, cellular handoff, spent
+   * stream ticket), and the live defect this fixes was exactly that: a turn
+   * completed server-side and the phone never rendered it. This endpoint
+   * lets the client poll the same serialized events over normal fetch auth
+   * (device proof — no ticket needed) and recover the visible turn.
+   */
+  router.get('/api/chat/sessions/:sessionId/events/recent', requireMobileSession, (req, res) => {
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    const session = harnessGetSession(sessionId);
+    if (!session) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+    const sinceSeqRaw = typeof req.query.sinceSeq === 'string' ? Number(req.query.sinceSeq) : 0;
+    const sinceSeq = Number.isFinite(sinceSeqRaw) && sinceSeqRaw > 0 ? sinceSeqRaw : 0;
+    const limit = clampInt(req.query.limit, 200, 1, 500);
+    try {
+      const ownEvents = harnessListEvents(session.id, { sinceSeq, limit });
+      const bridged = collectBridgedWorkflowReplay(session.id, ownEvents)
+        .filter((ev) => ev.seq > sinceSeq);
+      const merged = [...ownEvents, ...bridged].sort((a, b) => a.seq - b.seq);
+      const shaped = projectHarnessEventsForPublic(merged.slice(-limit)).map(serializeEventForMobile);
+      const ownShaped = shaped.filter((ev) => ev.sessionId === session.id);
+      res.json({
+        sessionId: session.id,
+        sessionStatus: session.status,
+        events: shaped,
+        latestSeq: ownShaped.length > 0 ? ownShaped[ownShaped.length - 1].seq : sinceSeq,
+      });
+    } catch (err) {
+      console.error('mobile chat catch-up failed:', err);
+      res.status(500).json({ error: 'CATCH_UP_FAILED' });
+    }
   });
 
   /**
@@ -1963,6 +2025,21 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           if (mobileChatInFlight.get(requestId) === execution) mobileChatInFlight.delete(requestId);
         });
         mobileChatInFlight.set(requestId, execution);
+      }
+      // Async mode: acknowledge the durable claim and let the reply ride the
+      // event stream. A phone must never hold a fetch open across a whole
+      // turn — the webview suspends on lock and the connection dies with it,
+      // while the accepted run keeps going. Idempotent replays of the same
+      // key get the same acknowledgement (and the same run).
+      if (req.body?.async === true) {
+        execution.catch((err) => console.error('mobile chat async run failed:', err));
+        res.status(202).json({
+          accepted: true,
+          sessionId,
+          runId: requestClaim.receipt.runId,
+          sinceSeq: requestClaim.receipt.sinceSeq,
+        });
+        return;
       }
       const gatewayResponse = await execution;
       if (gatewayResponse.stoppedReason === 'error') {
