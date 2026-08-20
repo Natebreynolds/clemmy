@@ -1034,6 +1034,104 @@ input, textarea { font: inherit; }
   .act-spinner { animation: none; border-top-color: var(--accent); }
 }
 
+/* ── memory: tabs, add composer, detail, dossier ────────────────── */
+.memory-tabs {
+  display: flex;
+  gap: var(--sp-1);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px;
+  margin-bottom: var(--sp-3);
+}
+.memory-tab {
+  flex: 1;
+  background: transparent;
+  border: none;
+  border-radius: 999px;
+  color: var(--fg-2);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  padding: 8px 0;
+}
+.memory-tab.active { background: var(--bg-3); color: var(--fg); }
+
+.memory-add { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+.memory-add-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 24px;
+  color: var(--fg);
+  padding: 10px 16px;
+  font-size: var(--t-sm);
+  outline: none;
+}
+.memory-add-input:focus { border-color: var(--line-hot); }
+.memory-add-save {
+  flex: 0 0 auto;
+  background: var(--bg-3);
+  border: 1px solid var(--line-strong);
+  border-radius: 24px;
+  color: var(--fg);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  padding: 10px 16px;
+}
+.memory-add-save:disabled { opacity: 0.4; }
+.memory-add-outcome { flex-basis: 100%; font-size: var(--t-xs); color: var(--accent-2); }
+
+.memory-fact-tap {
+  display: block;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+.memory-fact-tap:active { background: var(--bg-2); }
+.memory-hit-tap { display: block; width: 100%; text-align: left; }
+.memory-fact-past { opacity: 0.6; }
+.memory-entity-name { font-weight: 600; color: var(--fg); }
+
+.memory-detail-content { font-size: var(--t-body); line-height: 1.5; margin: var(--sp-3) 0; }
+.memory-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin: var(--sp-3) 0; }
+.btn-danger {
+  background: var(--fail-soft);
+  border: 1px solid rgba(240, 101, 90, 0.4);
+  border-radius: 999px;
+  color: var(--accent-fail);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  padding: 8px 16px;
+}
+.memory-superseded {
+  display: block;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: var(--t-sm);
+  padding: 0;
+  margin-bottom: var(--sp-2);
+  text-align: left;
+}
+.fact-historical {
+  font-size: var(--t-xs);
+  color: var(--fg-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.memory-subsection { margin-top: var(--sp-4); }
+.memory-evidence {
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--line);
+}
+.memory-evidence:last-child { border-bottom: none; }
+.memory-evidence-snippet { font-size: var(--t-sm); color: var(--fg-2); }
+.memory-edit { margin: var(--sp-3) 0; }
+.memory-edit-input { width: 100%; border-radius: var(--r-md); }
+.memory-fineprint { font-size: var(--t-xs); color: var(--fg-3); margin-top: var(--sp-2); }
+
 /* ── screen notice (offline / load failure + retry) ─────────────── */
 /* One honest failure surface for every screen. Banner mode rides above
    stale-but-usable data; full mode replaces an empty screen. */

@@ -2129,6 +2129,176 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   });
 
   /**
+   * Fact detail — full content plus everything the desktop's fact card shows:
+   * evidence, validity history (the "continued as #N" supersession chain),
+   * and the policy attached to it. Same enrichment call the desktop list
+   * route makes per row (getFactWithEvidence); the phone just asks for one.
+   */
+  router.get('/api/memory/facts/:id', requireMobileSession, async (req, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    try {
+      const { getFactWithEvidence } = await import('../memory/facts.js');
+      const { listMemoryPolicies } = await import('../memory/temporal-memory.js');
+      const fact = getFactWithEvidence(id);
+      if (!fact) { res.status(404).json({ error: `no fact #${id}` }); return; }
+      const policy = listMemoryPolicies().find((p) => p.fact_id === id) ?? null;
+      res.json({ fact, policy });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Memory mutations — the same four verbs the desktop console exposes, each
+   * delegating to the canonical function so all surfaces share ONE
+   * implementation and ONE safety story:
+   *  - corrections SUPERSEDE (validity chain + pin transfer preserved), never
+   *    overwrite;
+   *  - forget is soft-delete only — hard delete is never exposed here;
+   *  - every successful mutation bumps the stable-context generation, or the
+   *    running agent's prompt cache keeps serving the retired/unpinned fact.
+   *    (We bump on supersede too: the old content is retired there as well.)
+   */
+  router.post('/api/memory/facts/:id/forget', requireMobileSession, async (req, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    try {
+      const { forgetFact } = await import('../memory/facts.js');
+      const { bumpStableContextGeneration } = await import('../runtime/stable-context-generation.js');
+      const ok = forgetFact(id);
+      if (ok) bumpStableContextGeneration();
+      res.json({ ok });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post('/api/memory/facts/:id/restore', requireMobileSession, async (req, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    try {
+      const { reactivateFact } = await import('../memory/facts.js');
+      const { bumpStableContextGeneration } = await import('../runtime/stable-context-generation.js');
+      const ok = reactivateFact(id);
+      if (ok) bumpStableContextGeneration();
+      res.json({ ok });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post('/api/memory/facts/:id/pin', requireMobileSession, async (req, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    const pinned = ((req.body ?? {}) as { pinned?: unknown }).pinned !== false;
+    try {
+      const { getFact, setFactPinned } = await import('../memory/facts.js');
+      const { bumpStableContextGeneration } = await import('../runtime/stable-context-generation.js');
+      if (!getFact(id)) { res.status(404).json({ error: `no fact #${id}` }); return; }
+      const ok = setFactPinned(id, pinned);
+      if (ok) bumpStableContextGeneration();
+      res.json({ ok, pinned });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.patch('/api/memory/facts/:id', requireMobileSession, async (req, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    const body = (req.body ?? {}) as { content?: unknown; importance?: unknown };
+    const patch: { content?: string; importance?: number } = {};
+    if (typeof body.content === 'string' && body.content.trim()) patch.content = body.content.trim().slice(0, 800);
+    if (typeof body.importance === 'number' && Number.isFinite(body.importance)) patch.importance = Math.max(0, Math.min(10, body.importance));
+    if (patch.content === undefined && patch.importance === undefined) {
+      res.status(400).json({ error: 'nothing to update (provide content and/or importance)' });
+      return;
+    }
+    try {
+      const { getFact, supersedeFact, updateFact } = await import('../memory/facts.js');
+      const { bumpStableContextGeneration } = await import('../runtime/stable-context-generation.js');
+      const existing = getFact(id);
+      if (!existing) { res.status(404).json({ error: `no fact #${id}` }); return; }
+      const updated = patch.content
+        ? supersedeFact(id, {
+            content: patch.content,
+            importance: patch.importance ?? existing.importance ?? undefined,
+            trustLevel: 1,
+            sourceApp: 'Clementine Mobile',
+          })
+        : updateFact(id, { importance: patch.importance });
+      if (!updated) { res.status(404).json({ error: `no fact #${id}` }); return; }
+      if (patch.content) bumpStableContextGeneration();
+      res.json({ ok: true, fact: updated, supersededFactId: patch.content ? id : null });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Remember something new, from the phone. Routes through consolidateFact —
+   * the same dedup-aware path the desktop add box and the agent's own
+   * reflection use — never a blind insert: the outcome can be add, reinforce,
+   * supersede, or ignore.
+   */
+  router.post('/api/memory/facts', requireMobileSession, async (req, res) => {
+    const kindRaw = typeof req.body?.kind === 'string' ? req.body.kind : 'user';
+    const validKinds: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
+    const kind = (validKinds as string[]).includes(kindRaw) ? (kindRaw as ConsolidatedFactKind) : 'user';
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    if (!content) { res.status(400).json({ error: 'fact content required' }); return; }
+    try {
+      const { consolidateFact } = await import('../memory/reflection.js');
+      const { getFact } = await import('../memory/facts.js');
+      const outcome = await consolidateFact({
+        kind,
+        text: content.slice(0, 800),
+        trustLevel: 1,
+        authority: 'user',
+        sourceApp: 'Clementine Mobile',
+        sourceUri: 'clementine://mobile/memory/facts',
+      }, { sessionId: 'mobile:memory' });
+      const fact = outcome.factId ? getFact(outcome.factId) : null;
+      res.json({
+        fact,
+        consolidation: { action: outcome.action, supersededFactId: outcome.supersededFactId ?? null },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Who Clem knows — entity list + full dossier, same canonical sources as
+   * the desktop (listEntities extraction + getEntityMemoryDetail).
+   */
+  router.get('/api/memory/entities', requireMobileSession, async (req, res) => {
+    try {
+      const { listEntities } = await import('../memory/entity-list.js');
+      res.json(listEntities({
+        type: typeof req.query.type === 'string' ? req.query.type : undefined,
+        q: typeof req.query.q === 'string' ? req.query.q : undefined,
+        limit: clampInt(req.query.limit, 100, 1, 400),
+      }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get('/api/memory/entities/:id', requireMobileSession, async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) { res.status(400).json({ error: 'entity id must be a positive integer' }); return; }
+    try {
+      const { getEntityMemoryDetail } = await import('../memory/entity-memory.js');
+      res.json(getEntityMemoryDetail(id, {}));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(message === 'entity not found' ? 404 : 500).json({ error: message });
+    }
+  });
+
+  /**
    * The memory constellation, phone-sized. Same tested builder the desktop
    * console uses (buildMemoryGraph), with mobile-tuned defaults: fewer nodes,
    * semantic PCA layout and similarity edges on by default so the graph

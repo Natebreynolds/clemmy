@@ -555,6 +555,69 @@ export interface MemoryFact {
   pinned?: boolean;
 }
 
+/** Full fact detail — evidence, validity history, policy. Mirrors the
+ *  desktop fact card's data. */
+export interface MemoryFactDetail extends MemoryFact {
+  active?: boolean;
+  confidence?: number | null;
+  trustLevel?: number | null;
+  derivedFrom?: string | null;
+  supersededByFactId?: number | null;
+  utilityCount?: number | null;
+  impressionCount?: number | null;
+  evidence?: Array<{ id?: number; sourceUri?: string | null; snippet?: string | null; observedAt?: string | null; [k: string]: unknown }>;
+  validityIntervals?: Array<{ validFrom?: string | null; validTo?: string | null; content?: string | null; [k: string]: unknown }>;
+}
+
+export async function getFactDetail(id: number): Promise<{ fact: MemoryFactDetail; policy: Record<string, unknown> | null }> {
+  return api(`/m/api/memory/facts/${id}`);
+}
+
+export async function pinFact(id: number, pinned: boolean): Promise<{ ok: boolean; pinned: boolean }> {
+  return api(`/m/api/memory/facts/${id}/pin`, { method: 'POST', body: JSON.stringify({ pinned }) });
+}
+
+export async function forgetFact(id: number): Promise<{ ok: boolean }> {
+  return api(`/m/api/memory/facts/${id}/forget`, { method: 'POST' });
+}
+
+export async function restoreFact(id: number): Promise<{ ok: boolean }> {
+  return api(`/m/api/memory/facts/${id}/restore`, { method: 'POST' });
+}
+
+/** A content change SUPERSEDES the fact (new id, history preserved). */
+export async function correctFact(id: number, patch: { content?: string; importance?: number }): Promise<{ ok: boolean; fact: MemoryFact; supersededFactId: number | null }> {
+  return api(`/m/api/memory/facts/${id}`, { method: 'PATCH', body: JSON.stringify(patch) });
+}
+
+export async function addFact(input: { kind: MemoryFact['kind']; content: string }): Promise<{ fact: MemoryFact | null; consolidation: { action: string; supersededFactId: number | null } }> {
+  return api('/m/api/memory/facts', { method: 'POST', body: JSON.stringify(input) });
+}
+
+export interface MemoryEntity {
+  id: number;
+  entityType: string;
+  canonicalName: string;
+  aliases: string[];
+  lastSeenAt: string;
+  mentionCount: number;
+  factCount: number;
+  groundedFactCount: number;
+  observationCount: number;
+}
+
+export async function listEntities(options?: { type?: string; q?: string; limit?: number }): Promise<{ entities: MemoryEntity[]; total: number }> {
+  const params = new URLSearchParams();
+  if (options?.type) params.set('type', options.type);
+  if (options?.q) params.set('q', options.q);
+  params.set('limit', String(options?.limit ?? 100));
+  return api(`/m/api/memory/entities?${params.toString()}`);
+}
+
+export async function getEntityDetail(id: number): Promise<Record<string, unknown>> {
+  return api(`/m/api/memory/entities/${id}`);
+}
+
 export async function listFacts(kind?: MemoryFact['kind'], limit = 60): Promise<{ facts: MemoryFact[] }> {
   const params = new URLSearchParams();
   if (kind) params.set('kind', kind);

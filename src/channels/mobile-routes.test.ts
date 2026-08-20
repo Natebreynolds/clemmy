@@ -1544,6 +1544,84 @@ test('chat/send async mode: 202 on the durable claim, the run continues, replays
   }
 });
 
+test('mobile memory parity: detail carries evidence, mutations ride the canonical paths and bump the context generation', async () => {
+  resetMemoryDb();
+  const { stableContextGeneration } = await import('../runtime/stable-context-generation.js');
+  const { getFact } = await import('../memory/facts.js');
+  const fact = rememberFact({
+    kind: 'user',
+    content: 'Prefers concise summaries in the morning briefing.',
+    sourceUri: 'test://memory-parity',
+  });
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Memory parity phone');
+    const call = (path: string, init?: RequestInit) => fetch(`${h.url}${path}`, {
+      ...init,
+      headers: { 'content-type': 'application/json', cookie, ...(init?.headers ?? {}) },
+    });
+
+    // Detail: the full desktop enrichment, one fact at a time.
+    const detail = await call(`/m/api/memory/facts/${fact.id}`);
+    assert.equal(detail.status, 200);
+    const detailBody = await detail.json() as { fact: { id: number; content: string; evidence?: unknown[]; validityIntervals?: unknown[] } };
+    assert.equal(detailBody.fact.id, fact.id);
+    assert.ok(Array.isArray(detailBody.fact.evidence), 'evidence array present');
+    assert.ok(Array.isArray(detailBody.fact.validityIntervals), 'validity history present');
+
+    // Pin: canonical setFactPinned + generation bump (else the running
+    // agent's cached prompt keeps ignoring the pin).
+    const genBeforePin = stableContextGeneration();
+    const pin = await call(`/m/api/memory/facts/${fact.id}/pin`, { method: 'POST', body: JSON.stringify({ pinned: true }) });
+    assert.equal(pin.status, 200);
+    assert.equal((await pin.json() as { ok: boolean }).ok, true);
+    assert.ok(stableContextGeneration() > genBeforePin, 'pin bumps the stable-context generation');
+    assert.equal(getFact(fact.id)?.pinned, true);
+
+    // Correction: SUPERSEDES (new fact id, old one retired into the chain),
+    // never overwrites.
+    const patch = await call(`/m/api/memory/facts/${fact.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ content: 'Prefers concise summaries in the morning briefing, bullets only.' }),
+    });
+    assert.equal(patch.status, 200);
+    const patched = await patch.json() as { ok: boolean; fact: { id: number; pinned?: boolean }; supersededFactId: number | null };
+    assert.equal(patched.supersededFactId, fact.id, 'correction supersedes the original');
+    assert.notEqual(patched.fact.id, fact.id, 'replacement is a NEW fact');
+    assert.equal(patched.fact.pinned, true, 'the pin transfers to the replacement');
+
+    // Forget is soft — restore brings it back; both bump the generation.
+    const genBeforeForget = stableContextGeneration();
+    const forget = await call(`/m/api/memory/facts/${patched.fact.id}/forget`, { method: 'POST' });
+    assert.equal((await forget.json() as { ok: boolean }).ok, true);
+    assert.ok(stableContextGeneration() > genBeforeForget);
+    const restore = await call(`/m/api/memory/facts/${patched.fact.id}/restore`, { method: 'POST' });
+    assert.equal((await restore.json() as { ok: boolean }).ok, true);
+
+    // Add rides consolidateFact — the dedup-aware path, never a blind insert.
+    const add = await call('/m/api/memory/facts', {
+      method: 'POST',
+      body: JSON.stringify({ kind: 'user', content: 'Timezone is US Central for scheduling.' }),
+    });
+    assert.equal(add.status, 200);
+    const added = await add.json() as { fact: { id: number } | null; consolidation: { action: string } };
+    assert.ok(['add', 'reinforce', 'supersede'].includes(added.consolidation.action));
+
+    // Entities list + dossier are wired.
+    const entities = await call('/m/api/memory/entities?limit=10');
+    assert.equal(entities.status, 200);
+    const entitiesBody = await entities.json() as { entities: unknown[]; total: number };
+    assert.ok(Array.isArray(entitiesBody.entities));
+
+    // Anonymous callers get nothing.
+    const anon = await fetch(`${h.url}/m/api/memory/facts/${fact.id}/pin`, { method: 'POST' });
+    assert.equal(anon.status, 401);
+  } finally {
+    await h.close();
+    resetMemoryDb();
+  }
+});
+
 test('setPin enforces 8-64 char floor + allowed-char policy', async () => {
   const h = await startHarness();
   try {
