@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useState } from 'preact/hooks';
 import {
   getWorkflowRunEvents,
   listWorkflowRuns,
@@ -9,7 +9,9 @@ import {
   type WorkflowRunSummary,
 } from '../lib/api';
 import { RunControl } from '../components/RunControl';
+import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
+import { useScreenData } from '../lib/use-screen-data';
 
 /** Mirrors src/execution/workflow-run-cancellation.ts — anything else is live. */
 const TERMINAL_RUN_STATUSES = new Set([
@@ -17,43 +19,22 @@ const TERMINAL_RUN_STATUSES = new Set([
 ]);
 
 export function Workflows() {
-  const [workflows, setWorkflows] = useState<MobileWorkflow[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<MobileWorkflow | null>(null);
-
-  const refresh = useCallback(async () => {
-    try {
-      const result = await listWorkflows();
-      setWorkflows(result.workflows);
-      setError(null);
-    } catch (err) {
-      setError((err as Error).message ?? 'Failed to load workflows');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 10_000);
-    return () => clearInterval(id);
-  }, [refresh]);
+  const { data, loading, error, offline, refresh } = useScreenData(
+    listWorkflows,
+    { intervalMs: 10_000, disabled: selected !== null },
+  );
+  const workflows = data?.workflows ?? [];
 
   if (selected) {
-    return <WorkflowDetail workflow={selected} onBack={() => { setSelected(null); refresh(); }} />;
+    return <WorkflowDetail workflow={selected} onBack={() => { setSelected(null); void refresh(); }} />;
   }
 
   if (loading && workflows.length === 0) {
     return <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>;
   }
-  if (error && workflows.length === 0) {
-    return (
-      <div class="empty">
-        <p class="empty-title">Couldn't load flows</p>
-        <p class="empty-body">{error}</p>
-      </div>
-    );
+  if ((error || offline) && workflows.length === 0) {
+    return <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} />;
   }
   if (workflows.length === 0) {
     return (
@@ -67,6 +48,7 @@ export function Workflows() {
 
   return (
     <div>
+      <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData />
       {workflows.map((wf) => (
         <button key={wf.name} class="workflow-row" onClick={() => setSelected(wf)}>
           <div class="workflow-row-head">
@@ -94,47 +76,32 @@ interface WorkflowDetailProps {
 }
 
 function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
-  const [runs, setRuns] = useState<WorkflowRunSummary[]>([]);
-  const [runsLoading, setRunsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [triggering, setTriggering] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [selectedRun, setSelectedRun] = useState<WorkflowRunSummary | null>(null);
-
-  const refresh = useCallback(async () => {
-    try {
-      const result = await listWorkflowRuns(workflow.name, 20);
-      setRuns(result.runs);
-      setError(null);
-    } catch (err) {
-      setError((err as Error).message ?? 'Failed to load runs');
-    } finally {
-      setRunsLoading(false);
-    }
-  }, [workflow.name]);
-
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 8_000);
-    return () => clearInterval(id);
-  }, [refresh]);
+  const { data, loading: runsLoading, error, offline, refresh } = useScreenData(
+    () => listWorkflowRuns(workflow.name, 20),
+    { intervalMs: 8_000, disabled: selectedRun !== null },
+  );
+  const runs = data?.runs ?? [];
 
   async function trigger() {
     if (triggering) return;
     setTriggering(true);
     haptic('medium');
-    setError(null);
+    setActionError(null);
     try {
       await runWorkflow(workflow.name);
       // Refresh to surface the new queued run.
-      refresh();
+      void refresh();
     } catch (err) {
       const e = err as { status?: number; message?: string };
       if (e.status === 409 && e.message?.includes('REQUIRES_INPUT')) {
-        setError('This workflow needs input. Run it from the desktop app for now.');
+        setActionError('This workflow needs input. Run it from the desktop app for now.');
       } else if (e.status === 409 && e.message?.includes('DISABLED')) {
-        setError('This workflow is disabled. Enable it from the desktop app first.');
+        setActionError('This workflow is disabled. Enable it from the desktop app first.');
       } else {
-        setError(e.message ?? 'Failed to trigger workflow');
+        setActionError(e.message ?? 'Failed to trigger workflow');
       }
     } finally {
       setTriggering(false);
@@ -146,7 +113,7 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
       <WorkflowRunEvents
         workflowName={workflow.name}
         run={selectedRun}
-        onBack={() => { setSelectedRun(null); refresh(); }}
+        onBack={() => { setSelectedRun(null); void refresh(); }}
       />
     );
   }
@@ -168,7 +135,8 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
             {triggering ? 'Queuing…' : workflow.requiresInput ? 'Needs input — use desktop' : !workflow.enabled ? 'Disabled' : 'Run now'}
           </button>
         </div>
-        {error ? <div class="global-error">{error}</div> : null}
+        {actionError ? <div class="global-error">{actionError}</div> : null}
+        <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={runs.length > 0} />
         <div class="memory-section-head">Recent runs</div>
         {runsLoading && runs.length === 0 ? <div class="skeleton-stack" aria-hidden="true"><i /></div> : null}
         {!runsLoading && runs.length === 0 ? <p class="muted">Hasn’t run yet.</p> : null}
@@ -188,7 +156,7 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
                 {live ? (
                   <RunControl
                     target={{ kind: 'workflow', workflow: workflow.name, runId: run.id }}
-                    onChanged={refresh}
+                    onChanged={() => void refresh()}
                   />
                 ) : null}
               </article>
@@ -207,29 +175,11 @@ interface WorkflowRunEventsProps {
 }
 
 function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps) {
-  const [events, setEvents] = useState<WorkflowEventSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    async function refresh() {
-      try {
-        const result = await getWorkflowRunEvents(workflowName, run.id, 200);
-        if (!cancelled) {
-          setEvents(result.events);
-          setError(null);
-        }
-      } catch (err) {
-        if (!cancelled) setError((err as Error).message ?? 'Failed to load events');
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-    refresh();
-    const id = setInterval(refresh, 5_000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [workflowName, run.id]);
+  const { data, loading, error, offline, refresh } = useScreenData(
+    () => getWorkflowRunEvents(workflowName, run.id, 200),
+    { intervalMs: 5_000 },
+  );
+  const events = data?.events ?? [];
 
   return (
     <div class="workflow-detail">
@@ -243,8 +193,8 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
           {run.error ? <span class="memory-section-count" style="color:var(--accent-fail)">error</span> : null}
         </div>
         {loading && events.length === 0 ? <div class="skeleton-stack" aria-hidden="true"><i /></div> : null}
-        {!loading && events.length === 0 ? <p class="muted">No steps recorded yet.</p> : null}
-        {error ? <div class="global-error">{error}</div> : null}
+        {!loading && !error && !offline && events.length === 0 ? <p class="muted">No steps recorded yet.</p> : null}
+        <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={events.length > 0} />
         {events.map((ev, idx) => (
           <div key={idx} class={`workflow-event ${ev.error ? 'event-error' : ''}`}>
             <div class="workflow-event-head">

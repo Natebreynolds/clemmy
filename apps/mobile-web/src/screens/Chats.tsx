@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { listChatSessions, type ChatSession } from '../lib/api';
 import { Chat } from './Chat';
 import { relativeTime } from '../components/Approvals';
+import { ScreenNotice } from '../components/ScreenNotice';
+import { useScreenData } from '../lib/use-screen-data';
 
 interface Props {
   /** Home hands over a question to ask, or a thread to open. Consumed once. */
@@ -10,29 +12,16 @@ interface Props {
 }
 
 export function Chats({ handoff, onHandoffConsumed }: Props) {
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [composing, setComposing] = useState<{ draft?: string } | null>(null);
-
-  const refresh = useCallback(async () => {
-    try {
-      const result = await listChatSessions();
-      setSessions(result.sessions);
-      setError(null);
-    } catch (err) {
-      setError((err as Error).message ?? 'Failed to load sessions');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 8000);
-    return () => clearInterval(id);
-  }, [refresh]);
+  // The list keeps polling and wake-refreshing only while it is the visible
+  // surface — an open thread owns its own stream.
+  const listVisible = !composing && !selectedId;
+  const { data, loading, error, offline, refresh } = useScreenData(
+    listChatSessions,
+    { intervalMs: 8000, disabled: !listVisible },
+  );
+  const sessions = data?.sessions ?? [];
 
   // An ask typed on Home opens straight into a new chat with the text
   // already in the composer; a tapped thread opens that thread.
@@ -44,12 +33,12 @@ export function Chats({ handoff, onHandoffConsumed }: Props) {
   }, [handoff, onHandoffConsumed]);
 
   if (composing) {
-    return <Chat initialDraft={composing.draft} onBack={() => { setComposing(null); refresh(); }} />;
+    return <Chat initialDraft={composing.draft} onBack={() => { setComposing(null); void refresh(); }} />;
   }
 
   if (selectedId) {
     const session = sessions.find((s) => s.id === selectedId);
-    return <Chat sessionId={selectedId} initialTitle={session?.title ?? ''} onBack={() => { setSelectedId(null); refresh(); }} />;
+    return <Chat sessionId={selectedId} initialTitle={session?.title ?? ''} onBack={() => { setSelectedId(null); void refresh(); }} />;
   }
 
   return (
@@ -61,18 +50,13 @@ export function Chats({ handoff, onHandoffConsumed }: Props) {
         New chat
       </button>
 
+      <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={sessions.length > 0} />
+
       {loading && sessions.length === 0 ? (
         <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
       ) : null}
 
-      {!loading && error && sessions.length === 0 ? (
-        <div class="empty">
-          <p class="empty-title">Couldn't reach Clem</p>
-          <p class="empty-body">{error}</p>
-        </div>
-      ) : null}
-
-      {!loading && !error && sessions.length === 0 ? (
+      {!loading && !error && !offline && sessions.length === 0 ? (
         <div class="empty">
           <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
           <p class="empty-title">No conversations yet</p>

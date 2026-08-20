@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { listFacts, searchMemory, type MemoryFact, type MemoryHit } from '../lib/api';
 import { humanizeReasons } from '../lib/memory-reasons';
+import { ScreenNotice } from '../components/ScreenNotice';
+import { useScreenData } from '../lib/use-screen-data';
 
 type FactKindFilter = 'all' | MemoryFact['kind'];
 const KIND_OPTIONS: { value: FactKindFilter; label: string }[] = [
@@ -20,25 +22,18 @@ export function Memory() {
   const [hits, setHits] = useState<MemoryHit[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
-  const [facts, setFacts] = useState<MemoryFact[]>([]);
-  const [factsLoading, setFactsLoading] = useState(true);
-  const [factsError, setFactsError] = useState<string | null>(null);
   const [kindFilter, setKindFilter] = useState<FactKindFilter>('all');
 
-  const refreshFacts = useCallback(async () => {
-    setFactsLoading(true);
-    try {
-      const result = await listFacts(kindFilter === 'all' ? undefined : kindFilter, 60);
-      setFacts(result.facts);
-      setFactsError(null);
-    } catch (err) {
-      setFactsError((err as Error).message ?? 'Failed to load facts');
-    } finally {
-      setFactsLoading(false);
-    }
-  }, [kindFilter]);
-
-  useEffect(() => { refreshFacts(); }, [refreshFacts]);
+  const loadFacts = useCallback(
+    () => listFacts(kindFilter === 'all' ? undefined : kindFilter, 60),
+    [kindFilter],
+  );
+  const {
+    data: factsData, loading: factsLoading, error: factsError, offline: factsOffline, refresh: refreshFacts,
+  } = useScreenData(loadFacts);
+  const facts = factsData?.facts ?? [];
+  // The hook refreshes on wake/pull; a filter change is its own trigger.
+  useEffect(() => { void refreshFacts(); }, [kindFilter, refreshFacts]);
 
   // Search as you type. Every request carries a sequence number and late
   // replies are dropped, because search latency varies with query length —
@@ -97,14 +92,22 @@ export function Memory() {
           onClear={() => setQuery('')}
         />
       ) : (
-        <Browse
-          facts={facts}
-          loading={factsLoading}
-          error={factsError}
-          pinnedCount={pinnedCount}
-          kindFilter={kindFilter}
-          onKind={setKindFilter}
-        />
+        <>
+          <ScreenNotice
+            error={factsError}
+            offline={factsOffline}
+            onRetry={() => void refreshFacts()}
+            hasData={facts.length > 0}
+          />
+          <Browse
+            facts={facts}
+            loading={factsLoading}
+            error={null}
+            pinnedCount={pinnedCount}
+            kindFilter={kindFilter}
+            onKind={setKindFilter}
+          />
+        </>
       )}
     </div>
   );

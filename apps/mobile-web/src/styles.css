@@ -1034,6 +1034,44 @@ input, textarea { font: inherit; }
   .act-spinner { animation: none; border-top-color: var(--accent); }
 }
 
+/* ── screen notice (offline / load failure + retry) ─────────────── */
+/* One honest failure surface for every screen. Banner mode rides above
+   stale-but-usable data; full mode replaces an empty screen. */
+.screen-notice {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: var(--sp-2) var(--sp-3);
+  margin: var(--sp-2) 0;
+  font-size: var(--t-sm);
+  color: var(--fg-2);
+}
+.screen-notice-offline .screen-notice-text::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-warn);
+  margin-right: 7px;
+  vertical-align: 1px;
+}
+.screen-notice-text { flex: 1 1 auto; min-width: 0; }
+.screen-notice-retry {
+  flex: 0 0 auto;
+  background: var(--bg-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--fg);
+  font-size: var(--t-xs);
+  font-weight: 600;
+  padding: 5px 14px;
+}
+.screen-notice-retry:active { transform: scale(0.95); }
+
 /* ── connection pill ────────────────────────────────────────────── */
 /* Honest transport state in the header — never a modal, never a blank chat. */
 .conn-pill {

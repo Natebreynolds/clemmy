@@ -1,4 +1,5 @@
-import type { JSX } from 'preact';
+import type { JSX, ComponentChildren } from 'preact';
+import { Component } from 'preact';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { api, getAuthStatus, logout, pairDevice, type AuthStatus, type ChatSession } from './lib/api';
 import { CONNECTION_EVENT, connectionDoor, haptic, type ConnectionDoor } from './lib/native-bridge';
@@ -96,6 +97,8 @@ export function App() {
         <img class="login-mark" src="/m/clemmy.png" alt="" width="88" height="88" />
         <h1>Clementine</h1>
         <p class="error">{bootError}</p>
+        {/* A dead-end boot screen forces a force-quit; a retry is a fetch. */}
+        <button class="login-repair" onClick={() => void refreshAuth()}>Try again</button>
       </div>
     );
   }
@@ -143,19 +146,21 @@ export function App() {
       </header>
 
       <main class="app-main" key={tab}>
-        {tab === 'home' ? (
-          <Home
-            name={name}
-            onAsk={(draft) => goToChat({ draft })}
-            onOpenChat={(session) => goToChat({ session })}
-            onDecisionCount={setDecisions}
-          />
-        ) : tab === 'chats' ? (
-          <Chats handoff={handoff} onHandoffConsumed={() => setHandoff(null)} />
-        ) : tab === 'workflows' ? <Workflows />
-          : tab === 'spaces' ? <Workspaces />
-          : tab === 'memory' ? <Memory />
-          : <Activity />}
+        <ScreenBoundary tab={tab}>
+          {tab === 'home' ? (
+            <Home
+              name={name}
+              onAsk={(draft) => goToChat({ draft })}
+              onOpenChat={(session) => goToChat({ session })}
+              onDecisionCount={setDecisions}
+            />
+          ) : tab === 'chats' ? (
+            <Chats handoff={handoff} onHandoffConsumed={() => setHandoff(null)} />
+          ) : tab === 'workflows' ? <Workflows />
+            : tab === 'spaces' ? <Workspaces />
+            : tab === 'memory' ? <Memory />
+            : <Activity />}
+        </ScreenBoundary>
       </main>
 
       <nav class="dock" aria-label="Sections">
@@ -177,6 +182,35 @@ export function App() {
       </nav>
     </>
   );
+}
+
+/**
+ * One rendering bug on one screen must not blank the whole app — the dock
+ * stays, and the broken screen gets a recovery card. `key={tab}` on the
+ * boundary resets the error state when the user switches tabs, so a crash on
+ * Memory never follows them to Chats.
+ */
+class ScreenBoundary extends Component<{ tab: string; children: ComponentChildren }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError(): { failed: boolean } {
+    return { failed: true };
+  }
+  componentDidUpdate(previous: { tab: string }) {
+    if (previous.tab !== this.props.tab && this.state.failed) this.setState({ failed: false });
+  }
+  render() {
+    if (this.state.failed) {
+      return (
+        <div class="empty">
+          <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
+          <p class="empty-title">This screen hit a snag</p>
+          <p class="empty-body">The rest of the app is fine — try again or switch tabs.</p>
+          <button class="login-repair" onClick={() => this.setState({ failed: false })}>Try again</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 /**

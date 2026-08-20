@@ -11,59 +11,37 @@
  * the projecting (src/spaces/mobile-projection.ts) so the choices are
  * deterministic and testable rather than guessed in a component.
  */
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useState } from 'preact/hooks';
 import {
   getWorkspace,
   listWorkspaces,
   refreshWorkspace,
   type WorkspaceBreakdown,
-  type WorkspaceDetail,
   type WorkspaceRecord,
   type WorkspaceSummary,
 } from '../lib/api';
-import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
+import { haptic } from '../lib/native-bridge';
 import { relativeTime } from '../components/Approvals';
+import { ScreenNotice } from '../components/ScreenNotice';
+import { useScreenData } from '../lib/use-screen-data';
 
 export function Workspaces() {
-  const [spaces, setSpaces] = useState<WorkspaceSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
-
-  const refresh = useCallback(async () => {
-    try {
-      const result = await listWorkspaces();
-      setSpaces(result.workspaces.filter((w) => w.status !== 'archived'));
-      setError(null);
-    } catch (err) {
-      setError((err as Error).message ?? 'Failed to load workspaces');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 15_000);
-    const onPull = () => { void refresh(); };
-    window.addEventListener(REFRESH_EVENT, onPull);
-    return () => { clearInterval(id); window.removeEventListener(REFRESH_EVENT, onPull); };
-  }, [refresh]);
+  const { data, loading, error, offline, refresh } = useScreenData(
+    listWorkspaces,
+    { intervalMs: 15_000, disabled: openId !== null },
+  );
+  const spaces = (data?.workspaces ?? []).filter((w) => w.status !== 'archived');
 
   if (openId) {
-    return <WorkspaceDetailView id={openId} onBack={() => { setOpenId(null); refresh(); }} />;
+    return <WorkspaceDetailView id={openId} onBack={() => { setOpenId(null); void refresh(); }} />;
   }
 
   if (loading && spaces.length === 0) {
     return <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>;
   }
-  if (error && spaces.length === 0) {
-    return (
-      <div class="empty">
-        <p class="empty-title">Couldn't load workspaces</p>
-        <p class="empty-body">{error}</p>
-      </div>
-    );
+  if ((error || offline) && spaces.length === 0) {
+    return <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} />;
   }
   if (spaces.length === 0) {
     return (
@@ -84,6 +62,7 @@ export function Workspaces() {
 
   return (
     <div class="stack">
+      <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData />
       {live.length === 0 && empty.length > 0 ? (
         <p class="ws-none-yet">
           None of your workspaces have data yet. Refresh one on your Mac, or open it there to finish setting it up.
@@ -150,30 +129,17 @@ function EmptyWorkspaces({ spaces, onOpen, startIndex }: {
 }
 
 function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void }) {
-  const [detail, setDetail] = useState<WorkspaceDetail | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-
-  const load = useCallback(async () => {
-    try {
-      setDetail(await getWorkspace(id));
-      setError(null);
-    } catch (err) {
-      setError((err as Error).message ?? 'Failed to load workspace');
-    }
-  }, [id]);
-
-  useEffect(() => {
-    load();
-    const timer = setInterval(load, 60_000);
-    const onPull = () => { void load(); };
-    window.addEventListener(REFRESH_EVENT, onPull);
-    return () => { clearInterval(timer); window.removeEventListener(REFRESH_EVENT, onPull); };
-  }, [load]);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const { data: detail, error, offline, refresh: load } = useScreenData(
+    () => getWorkspace(id),
+    { intervalMs: 60_000 },
+  );
 
   async function pullFresh() {
     setRefreshing(true);
     haptic('medium');
+    setActionError(null);
     try {
       // The daemon starts the runners and returns immediately — a refresh can
       // take minutes, and holding a mobile connection open that long fails.
@@ -181,7 +147,7 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
       haptic('success');
     } catch (err) {
       haptic('error');
-      setError((err as Error).message ?? 'Refresh failed to start');
+      setActionError((err as Error).message ?? 'Refresh failed to start');
     } finally {
       // Let the poll above surface the new timestamp rather than pretending
       // the data is already back.
@@ -193,7 +159,9 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
     return (
       <div>
         <DetailHeader title="Workspace" onBack={onBack} />
-        {error ? <div class="global-error">{error}</div> : <div class="skeleton-stack" aria-hidden="true"><i /><i /></div>}
+        {error || offline
+          ? <ScreenNotice error={error} offline={offline} onRetry={() => void load()} />
+          : <div class="skeleton-stack" aria-hidden="true"><i /><i /></div>}
       </div>
     );
   }
@@ -216,6 +184,9 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
           {refreshing ? 'Refreshing…' : 'Refresh'}
         </button>
       </div>
+
+      {actionError ? <div class="global-error">{actionError}</div> : null}
+      <ScreenNotice error={error} offline={offline} onRetry={() => void load()} hasData />
 
       {/* A failed runner leaves yesterday's numbers looking current — say so
           before showing them, not after. */}

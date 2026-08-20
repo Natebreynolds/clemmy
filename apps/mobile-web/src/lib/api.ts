@@ -447,15 +447,6 @@ export async function fetchRecentChatEvents(
   return api(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/events/recent${params}`);
 }
 
-/** Wrap EventSource so callers get an unsubscribe and typed event payloads. */
-export interface ChatStreamHandlers {
-  onReplay?: (payload: { sessionId: string; sessionStatus: SessionStatus; events: ChatEvent[] }) => void;
-  onEvent?: (event: ChatEvent) => void;
-  /** Live text as the reply is written, before the durable event lands. */
-  onDelta?: (text: string) => void;
-  onError?: (err: Event) => void;
-}
-
 /**
  * EventSource cannot set request headers, so a stream cannot carry the device
  * proof directly. Instead we spend one proof-authenticated POST to mint a
@@ -473,60 +464,6 @@ async function mintStreamTicket(streamPath: string): Promise<string | null> {
   } catch {
     return null;
   }
-}
-
-export function subscribeChatStream(sessionId: string, handlers: ChatStreamHandlers, sinceSeq = 0): () => void {
-  const streamPath = `/m/api/chat/sessions/${encodeURIComponent(sessionId)}/stream`;
-  let es: EventSource | null = null;
-  let closed = false;
-
-  void (async () => {
-    const ticket = await mintStreamTicket(streamPath);
-    if (closed) return;
-    const params = new URLSearchParams();
-    if (sinceSeq > 0) params.set('sinceSeq', String(sinceSeq));
-    if (ticket) params.set('ticket', ticket);
-    const query = params.toString();
-    attach(new EventSource(`${streamPath}${query ? `?${query}` : ''}`, { withCredentials: true }));
-  })();
-
-  function attach(source: EventSource): void {
-    if (closed) { source.close(); return; }
-    es = source;
-    wire(source);
-  }
-
-
-  function wire(source: EventSource): void {
-    if (handlers.onReplay) {
-      source.addEventListener('replay', (ev) => {
-        try {
-          handlers.onReplay?.(JSON.parse((ev as MessageEvent).data));
-        } catch { /* ignore */ }
-      });
-    }
-    if (handlers.onEvent) {
-      source.addEventListener('event', (ev) => {
-        try {
-          handlers.onEvent?.(JSON.parse((ev as MessageEvent).data));
-        } catch { /* ignore */ }
-      });
-    }
-    if (handlers.onDelta) {
-      source.addEventListener('delta', (ev) => {
-        try {
-          const parsed = JSON.parse((ev as MessageEvent).data) as { text?: string };
-          if (typeof parsed.text === 'string') handlers.onDelta?.(parsed.text);
-        } catch { /* ignore */ }
-      });
-    }
-    if (handlers.onError) source.addEventListener('error', handlers.onError);
-  }
-
-  return () => {
-    closed = true;
-    es?.close();
-  };
 }
 
 /**

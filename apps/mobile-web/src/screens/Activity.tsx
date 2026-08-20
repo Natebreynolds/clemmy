@@ -1,48 +1,24 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
 import { isActiveRunStatus, listRecentRuns, type RunSummary } from '../lib/api';
 import { relativeTime } from '../components/Approvals';
 import { RunControl } from '../components/RunControl';
-import { REFRESH_EVENT } from '../lib/native-bridge';
+import { ScreenNotice } from '../components/ScreenNotice';
+import { useScreenData } from '../lib/use-screen-data';
 
 export function Activity() {
-  const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const refresh = useCallback(async () => {
-    try {
-      const { runs } = await listRecentRuns();
-      setRuns(runs);
-      setError(null);
-    } catch (err) {
-      setError((err as Error).message ?? 'Failed to load activity');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    refresh();
-    const interval = setInterval(refresh, 8000);
-    const onPull = () => { void refresh(); };
-    window.addEventListener(REFRESH_EVENT, onPull);
-    return () => {
-      clearInterval(interval);
-      window.removeEventListener(REFRESH_EVENT, onPull);
-    };
-  }, [refresh]);
+  const { data, loading, error, offline, refresh } = useScreenData(
+    () => listRecentRuns(),
+    { intervalMs: 8000 },
+  );
+  const runs = data?.runs ?? [];
 
   if (loading && runs.length === 0) {
     return <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>;
   }
-  if (error && runs.length === 0) {
-    return (
-      <div class="empty">
-        <p class="empty-title">Couldn't load activity</p>
-        <p class="empty-body">{error}</p>
-      </div>
-    );
-  }
+
+  const notice = <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={runs.length > 0} />;
+
+  if (runs.length === 0 && (error || offline)) return <div class="home">{notice}</div>;
+
   if (runs.length === 0) {
     return (
       <div class="empty">
@@ -58,11 +34,12 @@ export function Activity() {
 
   return (
     <div class="home">
+      {notice}
       {live.length > 0 ? (
         <section class="home-section">
           <h2 class="section-head">Happening now</h2>
           <div class="stack">
-            {live.map((run, i) => <RunCard key={run.id} run={run} index={i} live onChanged={refresh} />)}
+            {live.map((run, i) => <RunCard key={run.id} run={run} index={i} live onChanged={() => void refresh()} />)}
           </div>
         </section>
       ) : null}

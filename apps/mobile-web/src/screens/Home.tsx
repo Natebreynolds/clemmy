@@ -7,7 +7,7 @@
  * doing, what did she promise — and puts asking her one tap away at the top,
  * because talking to your assistant is the point of the app.
  */
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import {
   getReminders,
   listApprovals,
@@ -24,8 +24,10 @@ import {
 import { greetingName, timeGreeting } from '../lib/greeting';
 import { Decisions, relativeTime } from '../components/Approvals';
 import { PushPrompt } from '../components/PushPrompt';
-import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
+import { ScreenNotice } from '../components/ScreenNotice';
+import { haptic } from '../lib/native-bridge';
 import { RunControl } from '../components/RunControl';
+import { useScreenData } from '../lib/use-screen-data';
 
 const POLL_MS = 5000;
 interface Props {
@@ -35,45 +37,42 @@ interface Props {
   onDecisionCount: (n: number) => void;
 }
 
+interface HomeData {
+  approvals: ApprovalRow[];
+  plans: PlanProposalRow[];
+  reminders: ReminderItem[];
+  runs: RunSummary[];
+  sessions: ChatSession[];
+}
+
 export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
-  const [approvals, setApprovals] = useState<ApprovalRow[]>([]);
-  const [plans, setPlans] = useState<PlanProposalRow[]>([]);
-  const [reminders, setReminders] = useState<ReminderItem[]>([]);
-  const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState('');
-
-  const refresh = useCallback(async () => {
-    // Every section degrades on its own: one failing endpoint must not blank
-    // the whole home screen.
+  // Every section degrades on its own: one failing endpoint must not blank
+  // the whole home screen, and a section that failed THIS round keeps its
+  // last good rows. Only when everything fails does the screen say so.
+  const lastGood = useRef<HomeData>({ approvals: [], plans: [], reminders: [], runs: [], sessions: [] });
+  const loadHome = useCallback(async (): Promise<HomeData> => {
     const [a, p, r, runsResult, chats] = await Promise.all([
-      listApprovals().catch(() => null),
-      listPlanProposals().catch(() => null),
-      getReminders().catch(() => null),
-      listRecentRuns(8).catch(() => null),
-      listChatSessions().catch(() => null),
+      listApprovals().then((v) => ({ v }), (e) => ({ e })),
+      listPlanProposals().then((v) => ({ v }), (e) => ({ e })),
+      getReminders().then((v) => ({ v }), (e) => ({ e })),
+      listRecentRuns(8).then((v) => ({ v }), (e) => ({ e })),
+      listChatSessions().then((v) => ({ v }), (e) => ({ e })),
     ]);
-    if (a) setApprovals(a.approvals.filter((row) => row.status === 'pending'));
-    if (p) setPlans(p.proposals.filter((row) => row.status === 'pending'));
-    if (r) setReminders(r.items);
-    if (runsResult) setRuns(runsResult.runs);
-    if (chats) setSessions(chats.sessions);
-    setLoading(false);
-  }, []);
-
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, POLL_MS);
-    // The shell's pull-to-refresh pulls THIS data, not the page — a reload
-    // would throw away scroll position and re-run the whole bootstrap.
-    const onPull = () => { void refresh(); };
-    window.addEventListener(REFRESH_EVENT, onPull);
-    return () => {
-      clearInterval(id);
-      window.removeEventListener(REFRESH_EVENT, onPull);
+    const allFailed = [a, p, r, runsResult, chats].every((res) => 'e' in res);
+    if (allFailed) throw (a as { e: unknown }).e;
+    const merged: HomeData = {
+      approvals: 'v' in a ? a.v.approvals.filter((row) => row.status === 'pending') : lastGood.current.approvals,
+      plans: 'v' in p ? p.v.proposals.filter((row) => row.status === 'pending') : lastGood.current.plans,
+      reminders: 'v' in r ? r.v.items : lastGood.current.reminders,
+      runs: 'v' in runsResult ? runsResult.v.runs : lastGood.current.runs,
+      sessions: 'v' in chats ? chats.v.sessions : lastGood.current.sessions,
     };
-  }, [refresh]);
+    lastGood.current = merged;
+    return merged;
+  }, []);
+  const { data, loading, error, offline, refresh } = useScreenData(loadHome, { intervalMs: POLL_MS });
+  const { approvals, plans, reminders, runs, sessions } = data ?? lastGood.current;
 
   const decisionCount = approvals.length + plans.length;
   useEffect(() => { onDecisionCount(decisionCount); }, [decisionCount, onDecisionCount]);
@@ -115,6 +114,13 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
       </form>
 
       <PushPrompt />
+
+      <ScreenNotice
+        error={error}
+        offline={offline}
+        onRetry={() => void refresh()}
+        hasData={decisionCount + working.length + reminders.length + recentChats.length > 0}
+      />
 
       {decisionCount > 0 ? (
         <section class="home-section">
