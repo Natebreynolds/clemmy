@@ -42,6 +42,11 @@ final class WebViewModel: NSObject, ObservableObject {
         // A proxy holds the handler so WKUserContentController's strong
         // reference doesn't retain this model forever.
         config.userContentController.add(ScriptProxy(self), name: "clemHaptic")
+        // The web login screen's "Scan a new QR code" button: when the web
+        // session expires inside a paired shell, the page has no way to reach
+        // the native scanner — this is that way. The shell still confirms via
+        // the same dialog as shake-to-unpair before anything is cleared.
+        config.userContentController.add(ScriptProxy(self), name: "clemRepair")
         impactLight.prepare()
         impactMedium.prepare()
         notify.prepare()
@@ -266,6 +271,11 @@ private final class ScriptProxy: NSObject, WKScriptMessageHandler {
     }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "clemRepair" {
+            // The page asked for the scanner; the shell owns the decision.
+            NotificationCenter.default.post(name: .repairRequested, object: nil)
+            return
+        }
         guard message.name == "clemHaptic" else { return }
         // Only ever a short enum from our own bundle; anything else is ignored
         // rather than trusted.

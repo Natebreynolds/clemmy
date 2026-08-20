@@ -1,0 +1,9 @@
+{
+  "name": "@clem/chat-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Framework-agnostic chat transport + presentation engine shared by the desktop console and the mobile PWA. Pure TS, no React/Preact, no DOM types — transports and auth are injected by the consuming app.",
+  "main": "src/index.ts",
+  "types": "src/index.ts"
+}

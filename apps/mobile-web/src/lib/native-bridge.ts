@@ -48,6 +48,32 @@ export function haptic(kind: HapticKind = 'light'): void {
   } catch { /* not in the native shell */ }
 }
 
+/** True when the pinned native shell is hosting this page. */
+export function inNativeShell(): boolean {
+  return Boolean(window.webkit?.messageHandlers?.clemHaptic);
+}
+
+/**
+ * Ask the native shell to clear its pairing and show the scanner.
+ *
+ * The stranded state this fixes (live): the web session expires inside a
+ * PAIRED native app — the login screen says "scan the QR" but the shell,
+ * still holding a pairing, never shows its scanner; the only escape was the
+ * undiscoverable shake gesture. Returns false when there is no shell (plain
+ * browser) or the shell predates the handler, so the caller can fall back to
+ * instructions instead of a dead button.
+ */
+export function requestNativeRepair(): boolean {
+  try {
+    const handler = window.webkit?.messageHandlers?.clemRepair;
+    if (!handler) return false;
+    handler.postMessage('repair');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Fires when the shell reports a new connection door. */
 export const CONNECTION_EVENT = 'clem:connection';
 /** Fires when the shell's pull-to-refresh asks the page for fresh data. */

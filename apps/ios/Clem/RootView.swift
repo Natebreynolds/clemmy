@@ -153,6 +153,11 @@ private struct CommandCenterView: View {
             .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
                 confirmUnpair = true
             }
+            .onReceive(NotificationCenter.default.publisher(for: .repairRequested)) { _ in
+                // The web login screen's "Scan a new QR code" — same confirmed
+                // unpair as the shake gesture, just discoverable.
+                confirmUnpair = true
+            }
     }
 
     /// The reconnect ladder, cheapest and most private first:
@@ -198,6 +203,8 @@ private struct CommandCenterView: View {
 
 extension Notification.Name {
     static let deviceDidShake = Notification.Name("clem.deviceDidShake")
+    /// The web layer asked for the pairing scanner (login screen's re-pair button).
+    static let repairRequested = Notification.Name("clem.repairRequested")
 }
 
 extension UIWindow {

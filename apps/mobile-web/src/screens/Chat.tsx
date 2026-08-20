@@ -1,14 +1,34 @@
+/**
+ * The chat screen, rebuilt on the shared chat engine (@clem/chat-engine —
+ * the same transport/presentation core the desktop console is converging on).
+ *
+ * What the engine buys this screen over the old hand-rolled version:
+ *  - The stream survives reality: fresh single-use ticket per attempt,
+ *    poll-first recovery, resume on webview wake, late-completion watch.
+ *    (The old screen lost any reply that finished while the phone was
+ *    locked — one SSE, no error handler, no recovery.)
+ *  - Live token streaming and desktop-grade activity narration.
+ *  - Markdown replies (sanitized by construction — input is escaped before
+ *    any markup is added).
+ */
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
+  ChatEngine,
+  narrateActivity,
+  renderMarkdown,
+  type ActivityItem,
+  type ChatMessage,
+  type EngineSnapshot,
+} from '@clem/chat-engine';
+import {
   approvePlanProposal,
+  createChatStreamTransport,
   freshIdempotencyKey,
   getChatSession,
   rejectPlanProposal,
-  sendChatMessage,
-  subscribeChatStream,
-  type ChatEvent,
+  sendChatMessageAsync,
 } from '../lib/api';
-import { reduceStreamingText } from '../lib/streaming';
+import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 
 interface Props {
   sessionId?: string;
@@ -18,186 +38,83 @@ interface Props {
   onBack: () => void;
 }
 
-interface PendingEcho {
-  /** Local UUID used as the React key. */
-  id: string;
-  text: string;
-  state: 'sending' | 'failed';
-  error?: string;
-  idempotencyKey: string;
-  sentAt: number;
-}
-
 export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, onBack }: Props) {
-  const [sessionId, setSessionId] = useState<string | undefined>(initialSessionId);
-  const [events, setEvents] = useState<ChatEvent[]>([]);
-  const [pending, setPending] = useState<PendingEcho[]>([]);
+  const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
   const [title, setTitle] = useState(initialTitle ?? '');
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState<boolean>(Boolean(initialSessionId));
   const [draft, setDraft] = useState(initialDraft ?? '');
-  const [sending, setSending] = useState(false);
-  // Text arriving live from the model. Cleared the moment the durable event
-  // lands, so the finished message is always the persisted one, never this.
-  const [streaming, setStreaming] = useState('');
-  // Mirror for the SSE closure — onEvent fires outside the render cycle and
-  // must accumulate deltas without stale-state races.
-  const streamingRef = useRef('');
   const [planActing, setPlanActing] = useState<string | null>(null);
+  const [planOutcome, setPlanOutcome] = useState<Record<string, 'approved' | 'rejected' | undefined>>({});
+  const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Load + subscribe whenever sessionId changes (incl. when an empty
-  // "new chat" gets its server-assigned id after the first send).
-  useEffect(() => {
-    if (!sessionId) {
-      setEvents([]);
-      setLoading(false);
-      return;
-    }
-    let cancelled = false;
-    let unsubscribe: (() => void) | null = null;
-    let latestSeq = 0;
-
-    async function load() {
-      try {
-        const result = await getChatSession(sessionId!);
-        if (cancelled) return;
+  const engine = useMemo(() => new ChatEngine({
+    transport: createChatStreamTransport(),
+    sessionId: initialSessionId ?? null,
+    api: {
+      send: async ({ message, sessionId, idempotencyKey }) => {
+        const result = await sendChatMessageAsync({ message, sessionId, idempotencyKey });
+        return { sessionId: result.sessionId, accepted: result.accepted };
+      },
+      loadSession: async (sessionId) => {
+        const result = await getChatSession(sessionId);
         setTitle(result.session.title);
-        setEvents(result.events);
-        latestSeq = result.latestSeq;
-        unsubscribe = subscribeChatStream(sessionId!, {
-          onReplay: ({ events: replay }) => {
-            if (cancelled) return;
-            setEvents((current) => mergeEventsBySeq(current, replay));
-            for (const e of replay) latestSeq = Math.max(latestSeq, e.seq);
-          },
-          onDelta: (text) => {
-            streamingRef.current += text;
-            setStreaming(streamingRef.current);
-          },
-          onEvent: (event) => {
-            if (cancelled) return;
-            // Token deltas ride the public stream as `stream_token` rows (see
-            // lib/streaming.ts) — consumed into the provisional bubble, never
-            // merged into the transcript.
-            const frame = reduceStreamingText(streamingRef.current, event);
-            streamingRef.current = frame.streaming;
-            setStreaming(frame.streaming);
-            if (frame.consumed) {
-              latestSeq = Math.max(latestSeq, event.seq);
-              return;
-            }
-            setEvents((current) => mergeEventsBySeq(current, [event]));
-            latestSeq = Math.max(latestSeq, event.seq);
-            // When the server confirms a user message echo, drop the
-            // matching pending bubble.
-            if (event.type === 'user_input_received') {
-              const text = String(event.data.text ?? '').trim();
-              if (text) setPending((p) => p.filter((row) => row.text !== text || row.state !== 'sending'));
-            }
-          },
-        }, latestSeq);
-      } catch (err) {
-        if (!cancelled) setError((err as Error).message ?? 'Failed to load transcript');
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-    load();
-    return () => {
-      cancelled = true;
-      unsubscribe?.();
-    };
-  }, [sessionId]);
+        return { events: result.events, latestSeq: result.latestSeq };
+      },
+    },
+    newIdempotencyKey: freshIdempotencyKey,
+  }), [initialSessionId]);
 
-  const renderable = useMemo(() => filterAndCoalesce(events), [events]);
+  useEffect(() => {
+    const unsubscribe = engine.subscribe(setSnapshot);
+    if (initialSessionId) {
+      engine.open().catch((err) => setError((err as Error).message ?? 'Failed to load transcript'));
+    }
+    // Recovery triggers: the webview waking up (screen unlock, app switch
+    // back), the network returning, and the shell's pull-to-refresh. Each is
+    // cheap and idempotent — the engine polls a cursor catch-up and only
+    // reconnects when the stream is actually gone.
+    const onVisible = (): void => {
+      if (document.visibilityState === 'visible') engine.resume();
+    };
+    const onWake = (): void => engine.resume();
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('pageshow', onWake);
+    window.addEventListener('online', onWake);
+    window.addEventListener(REFRESH_EVENT, onWake);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('pageshow', onWake);
+      window.removeEventListener('online', onWake);
+      window.removeEventListener(REFRESH_EVENT, onWake);
+      unsubscribe();
+      engine.dispose();
+    };
+  }, [engine]);
+
+  const messages = snapshot?.messages ?? [];
+  const busy = snapshot?.busy ?? false;
+  const connection = snapshot?.connection ?? 'idle';
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [renderable.length, pending.length]);
+  }, [messages]);
 
   function autoresize(el: HTMLTextAreaElement) {
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 160) + 'px';
   }
 
-  async function submitDraft() {
+  function submitDraft() {
     const text = draft.trim();
-    if (!text || sending) return;
-    const id = freshIdempotencyKey();
-    const echo: PendingEcho = {
-      id,
-      text,
-      state: 'sending',
-      idempotencyKey: id,
-      sentAt: Date.now(),
-    };
-    setPending((current) => [...current, echo]);
-    streamingRef.current = '';
-    setStreaming('');
+    if (!text || busy) return;
     setDraft('');
-    setSending(true);
     if (textareaRef.current) {
       textareaRef.current.value = '';
       autoresize(textareaRef.current);
     }
-    try {
-      const result = await sendChatMessage({
-        message: text,
-        sessionId,
-        idempotencyKey: id,
-      });
-      // If we were in a "new chat" state, lock in the server-assigned
-      // sessionId — the effect above will re-subscribe SSE.
-      if (!sessionId && result.sessionId) {
-        setSessionId(result.sessionId);
-      }
-      // The SSE replay will surface the user_input_received event,
-      // which we listen for above and use to drop the pending echo.
-      // Belt-and-braces: also drop on success here in case the SSE
-      // isn't open yet.
-      setPending((current) => current.filter((row) => row.id !== id));
-    } catch (err) {
-      const message = (err as Error).message ?? 'Failed to send';
-      setPending((current) => current.map((row) =>
-        row.id === id ? { ...row, state: 'failed', error: message } : row,
-      ));
-    } finally {
-      setSending(false);
-      textareaRef.current?.focus();
-    }
-  }
-
-  async function retryPending(echo: PendingEcho) {
-    if (sending) return;
-    setPending((current) => current.map((row) =>
-      row.id === echo.id ? { ...row, state: 'sending', error: undefined } : row,
-    ));
-    setSending(true);
-    try {
-      const result = await sendChatMessage({
-        message: echo.text,
-        sessionId,
-        // SAME idempotency key — server caches the response.
-        idempotencyKey: echo.idempotencyKey,
-      });
-      if (!sessionId && result.sessionId) {
-        setSessionId(result.sessionId);
-      }
-      setPending((current) => current.filter((row) => row.id !== echo.id));
-    } catch (err) {
-      const message = (err as Error).message ?? 'Failed to send';
-      setPending((current) => current.map((row) =>
-        row.id === echo.id ? { ...row, state: 'failed', error: message } : row,
-      ));
-    } finally {
-      setSending(false);
-    }
-  }
-
-  function discardPending(echo: PendingEcho) {
-    setPending((current) => current.filter((row) => row.id !== echo.id));
+    haptic('light');
+    void engine.send(text);
   }
 
   async function actOnPlan(planProposalId: string, action: 'approve' | 'reject') {
@@ -207,22 +124,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     try {
       if (action === 'approve') await approvePlanProposal(planProposalId);
       else await rejectPlanProposal(planProposalId);
-      setEvents((current) => current.map((event) => {
-        if (
-          event.type === 'conversation_completed'
-          && event.data
-          && event.data.planProposalId === planProposalId
-        ) {
-          return {
-            ...event,
-            data: {
-              ...event.data,
-              planProposalStatus: action === 'approve' ? 'approved' : 'rejected',
-            },
-          };
-        }
-        return event;
-      }));
+      setPlanOutcome((prev) => ({ ...prev, [planProposalId]: action === 'approve' ? 'approved' : 'rejected' }));
+      haptic(action === 'approve' ? 'success' : 'warning');
     } catch (err) {
       setError((err as Error).message ?? `Failed to ${action} plan`);
     } finally {
@@ -234,27 +137,30 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     <div class="chat-shell">
       <div class="chat-header">
         <button class="chat-back" onClick={onBack} aria-label="Back">←</button>
-        <div class="chat-title">{title || (sessionId ? 'Conversation' : 'New chat')}</div>
+        <div class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</div>
+        {connection === 'recovering' || connection === 'connecting' ? (
+          <div class="conn-pill conn-recovering">reconnecting…</div>
+        ) : connection === 'detached' ? (
+          <div class="conn-pill conn-detached">catching up in the background</div>
+        ) : null}
       </div>
       <div class="chat-transcript" ref={scrollRef}>
         {error ? <div class="global-error">{error}</div> : null}
-        {loading && renderable.length === 0 && pending.length === 0 ? <div class="inbox-empty">Loading…</div> : null}
-        {!loading && renderable.length === 0 && pending.length === 0 ? (
-          <div class="inbox-empty">{sessionId ? 'Empty session.' : 'Type a message to start a new chat.'}</div>
+        {messages.length === 0 ? (
+          <div class="inbox-empty">
+            {initialSessionId && !snapshot ? 'Loading…' : snapshot?.sessionId ? 'Empty session.' : 'Type a message to start a new chat.'}
+          </div>
         ) : null}
-        {renderable.map((row) => (
-          <Bubble
-            key={row.key}
-            row={row}
-            planActing={row.planProposalId ? planActing === row.planProposalId : false}
+        {messages.map((message) => (
+          <MessageRow
+            key={message.id}
+            message={message}
+            planActing={planActing}
+            planOutcome={planOutcome}
             onPlanAction={actOnPlan}
+            onRetry={(id) => void engine.retry(id)}
+            onDiscard={(id) => engine.discard(id)}
           />
-        ))}
-        {streaming ? (
-          <div class="bubble bubble-assistant bubble-streaming">{streaming}</div>
-        ) : null}
-        {pending.map((echo) => (
-          <PendingBubble key={echo.id} echo={echo} onRetry={retryPending} onDiscard={discardPending} />
         ))}
       </div>
       <form class="chat-composer" onSubmit={(ev) => { ev.preventDefault(); submitDraft(); }}>
@@ -275,186 +181,123 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
               submitDraft();
             }
           }}
-          disabled={sending}
         />
         <button
           class="chat-send"
           type="submit"
-          disabled={sending || draft.trim().length === 0}
+          disabled={busy || draft.trim().length === 0}
           aria-label="Send"
         >
-          {sending ? '…' : '↑'}
+          {busy ? '…' : '↑'}
         </button>
       </form>
     </div>
   );
 }
 
-function mergeEventsBySeq(current: ChatEvent[], incoming: ChatEvent[]): ChatEvent[] {
-  if (incoming.length === 0) return current;
-  const bySeq = new Map<number, ChatEvent>();
-  for (const e of current) bySeq.set(e.seq, e);
-  for (const e of incoming) bySeq.set(e.seq, e);
-  return Array.from(bySeq.values()).sort((a, b) => a.seq - b.seq);
-}
-
-interface RenderableRow {
-  key: string;
-  kind: 'user' | 'assistant' | 'tool' | 'approval' | 'error' | 'note';
-  text: string;
-  subtitle?: string;
-  planProposalId?: string;
-  planProposalStatus?: 'pending' | 'approved' | 'rejected';
-  planProposalNeedsUserInput?: boolean;
-  at: number;
-}
-
-function filterAndCoalesce(events: ChatEvent[]): RenderableRow[] {
-  const rows: RenderableRow[] = [];
-  for (const event of events) {
-    const row = eventToRow(event);
-    if (row) rows.push(row);
-  }
-  return rows;
-}
-
-function eventToRow(event: ChatEvent): RenderableRow | null {
-  switch (event.type) {
-    case 'user_input_received': {
-      const text = String(event.data.text ?? '').trim();
-      if (!text) return null;
-      return { key: `${event.seq}`, kind: 'user', text, at: event.createdAt };
-    }
-    case 'conversation_completed': {
-      const text = String(event.data.reply ?? '').trim();
-      if (!text) return null;
-      const planProposalId = typeof event.data.planProposalId === 'string'
-        ? event.data.planProposalId
-        : undefined;
-      const statusRaw = typeof event.data.planProposalStatus === 'string'
-        ? event.data.planProposalStatus
-        : 'pending';
-      const planProposalStatus =
-        statusRaw === 'approved' || statusRaw === 'rejected' ? statusRaw : 'pending';
-      return {
-        key: `${event.seq}`,
-        kind: 'assistant',
-        text,
-        planProposalId,
-        planProposalStatus,
-        planProposalNeedsUserInput: event.data.planProposalNeedsUserInput === true,
-        at: event.createdAt,
-      };
-    }
-    case 'tool_called': {
-      const tool = String(event.data.tool ?? 'tool');
-      const preview = String(event.data.argsPreview ?? '');
-      return {
-        key: `${event.seq}`,
-        kind: 'tool',
-        text: tool,
-        subtitle: preview,
-        at: event.createdAt,
-      };
-    }
-    case 'approval_requested': {
-      const subject = String(event.data.subject ?? event.data.tool ?? 'approval');
-      return { key: `${event.seq}`, kind: 'approval', text: `Approval pending — ${subject}`, at: event.createdAt };
-    }
-    case 'approval_resolved': {
-      const decision = String(event.data.decision ?? 'resolved');
-      return { key: `${event.seq}`, kind: 'note', text: `Approval ${decision}`, at: event.createdAt };
-    }
-    case 'run_failed': {
-      const text = String(event.data.error ?? 'Run failed');
-      return { key: `${event.seq}`, kind: 'error', text, at: event.createdAt };
-    }
-    default:
-      return null;
-  }
-}
-
-function Bubble({
-  row,
-  planActing,
-  onPlanAction,
+function MessageRow({
+  message, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
 }: {
-  row: RenderableRow;
-  planActing?: boolean;
-  onPlanAction?: (id: string, action: 'approve' | 'reject') => void;
+  message: ChatMessage;
+  planActing: string | null;
+  planOutcome: Record<string, 'approved' | 'rejected' | undefined>;
+  onPlanAction: (id: string, action: 'approve' | 'reject') => void;
+  onRetry: (id: string) => void;
+  onDiscard: (id: string) => void;
 }) {
-  if (row.kind === 'user') {
+  if (message.role === 'user') {
     return (
-      <div class="bubble bubble-user">
-        <div class="bubble-text">{row.text}</div>
-      </div>
-    );
-  }
-  if (row.kind === 'assistant') {
-    return (
-      <div class="bubble bubble-assistant">
-        <div class="bubble-text">{row.text}</div>
-        {row.planProposalId && row.planProposalStatus === 'pending' && !row.planProposalNeedsUserInput ? (
-          <div class="plan-actions">
-            <button
-              class="approve"
-              disabled={planActing}
-              onClick={() => onPlanAction?.(row.planProposalId!, 'approve')}
-            >
-              {planActing ? '…' : 'Approve & Proceed'}
-            </button>
-            <button
-              class="reject"
-              disabled={planActing}
-              onClick={() => onPlanAction?.(row.planProposalId!, 'reject')}
-            >
-              {planActing ? '…' : 'Reject'}
-            </button>
+      <div class={`bubble bubble-user${message.pending ? ` pending pending-${message.pending}` : ''}`}>
+        <div class="bubble-text">{message.text}</div>
+        {message.pending === 'sending' ? <div class="pending-status">sending…</div> : null}
+        {message.pending === 'failed' ? (
+          <div class="pending-status pending-failed">
+            <span>failed — {message.pendingError ?? 'couldn’t reach your Mac'}</span>
+            <button class="pending-action" onClick={() => onRetry(message.id)}>retry</button>
+            <button class="pending-action" onClick={() => onDiscard(message.id)}>discard</button>
           </div>
         ) : null}
-        {row.planProposalId && row.planProposalStatus === 'pending' && row.planProposalNeedsUserInput ? (
-          <div class="plan-status">Reply with the missing detail before this can run.</div>
-        ) : null}
-        {row.planProposalId && row.planProposalStatus !== 'pending' ? (
-          <div class="plan-status">Plan {row.planProposalStatus}.</div>
-        ) : null}
       </div>
     );
   }
-  if (row.kind === 'tool') {
+
+  const thinking = message.status === 'thinking';
+  const activity = narrateActivity(message.activity ?? [], { live: thinking });
+  const planStatus = message.planProposalId
+    ? (planOutcome[message.planProposalId] ?? message.planProposalStatus ?? 'pending')
+    : undefined;
+
+  if (message.approval) {
     return (
-      <div class="bubble bubble-tool">
-        <span class="bubble-tool-tag">{row.text}</span>
-        {row.subtitle ? <span class="bubble-tool-args">{row.subtitle}</span> : null}
+      <div class="bubble bubble-approval">
+        Approval pending — {message.approval.subject}
+        {message.approval.reason ? <div class="approval-reason">{message.approval.reason}</div> : null}
       </div>
     );
   }
-  if (row.kind === 'approval') {
-    return <div class="bubble bubble-approval">{row.text}</div>;
-  }
-  if (row.kind === 'error') {
-    return <div class="bubble bubble-error">{row.text}</div>;
-  }
-  return <div class="bubble bubble-note">{row.text}</div>;
-}
 
-interface PendingBubbleProps {
-  echo: PendingEcho;
-  onRetry: (echo: PendingEcho) => void;
-  onDiscard: (echo: PendingEcho) => void;
-}
-
-function PendingBubble({ echo, onRetry, onDiscard }: PendingBubbleProps) {
   return (
-    <div class={`bubble bubble-user pending pending-${echo.state}`}>
-      <div class="bubble-text">{echo.text}</div>
-      {echo.state === 'sending' ? <div class="pending-status">sending…</div> : null}
-      {echo.state === 'failed' ? (
-        <div class="pending-status pending-failed">
-          <span>failed — {echo.error}</span>
-          <button class="pending-action" onClick={() => onRetry(echo)}>retry</button>
-          <button class="pending-action" onClick={() => onDiscard(echo)}>discard</button>
+    <div class={`bubble bubble-assistant${thinking ? ' bubble-thinking' : ''}${message.status === 'failed' ? ' bubble-failed' : ''}`}>
+      {activity.length > 0 ? (
+        <div class="activity-strip">
+          {activity.map((item) => <ActivityRow key={item.id} item={item} />)}
         </div>
+      ) : null}
+      {message.text ? (
+        // Safe by construction: renderMarkdown escapes ALL input before adding
+        // markup, refuses raw HTML, and only links http(s).
+        <div class="bubble-text bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text) }} />
+      ) : thinking && activity.length === 0 ? (
+        <div class="bubble-text bubble-ghost">Thinking…</div>
+      ) : null}
+      {message.planProposalId && planStatus === 'pending' && !message.planProposalNeedsUserInput ? (
+        <div class="plan-actions">
+          <button
+            class="approve"
+            disabled={planActing !== null}
+            onClick={() => onPlanAction(message.planProposalId!, 'approve')}
+          >
+            {planActing === message.planProposalId ? '…' : 'Approve & Proceed'}
+          </button>
+          <button
+            class="reject"
+            disabled={planActing !== null}
+            onClick={() => onPlanAction(message.planProposalId!, 'reject')}
+          >
+            {planActing === message.planProposalId ? '…' : 'Reject'}
+          </button>
+        </div>
+      ) : null}
+      {message.planProposalId && planStatus === 'pending' && message.planProposalNeedsUserInput ? (
+        <div class="plan-status">Reply with the missing detail before this can run.</div>
+      ) : null}
+      {message.planProposalId && planStatus !== 'pending' ? (
+        <div class="plan-status">Plan {planStatus}.</div>
+      ) : null}
+    </div>
+  );
+}
+
+function ActivityRow({ item }: { item: ActivityItem }) {
+  const icon = item.status === 'running' ? <span class="act-spinner" aria-label="running" />
+    : item.status === 'failed' ? <span class="act-mark act-fail">✗</span>
+      : item.status === 'interrupted' ? <span class="act-mark act-warn">–</span>
+        : <span class="act-mark act-ok">✓</span>;
+  return (
+    <div class={`activity-row act-${item.status}${item.tone ? ` tone-${item.tone}` : ''}`}>
+      {icon}
+      <span class="act-label">
+        {item.label}
+        {item.repeats && item.repeats > 1 ? <span class="act-repeats">×{item.repeats}</span> : null}
+      </span>
+      {item.batch ? (
+        <span class="act-batch">
+          {item.batch.done}/{item.batch.total}
+          {item.batch.failed > 0 ? ` · ${item.batch.failed} failed` : ''}
+          {item.batch.throttled ? ' · backing off' : ''}
+        </span>
+      ) : item.detail ? (
+        <span class="act-detail">{item.detail}</span>
       ) : null}
     </div>
   );

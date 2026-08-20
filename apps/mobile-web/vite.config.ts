@@ -1,11 +1,22 @@
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import preact from '@preact/preset-vite';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
 
 // Served by the Clementine daemon at /m/ — see src/channels/mobile-routes.ts.
 // All assets resolve relative to that mount.
 export default defineConfig({
   base: '/m/',
   plugins: [preact()],
+  resolve: {
+    alias: {
+      // Source-consumed shared package (no publish step): the chat transport +
+      // presentation engine shared with the desktop console.
+      '@clem/chat-engine': path.resolve(here, '../../packages/chat-engine/src/index.ts'),
+    },
+  },
   build: {
     target: 'es2022',
     outDir: 'dist',

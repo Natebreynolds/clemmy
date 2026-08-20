@@ -103,6 +103,13 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
   }
   // Any answer at all means the door is open again.
   if (connectionDoor() === 'offline') setConnectionDoor('direct');
+  // Session tokens rotate every ~12h and the proof signs over a fingerprint
+  // derived from the token. The rotation sets a new HttpOnly cookie the page
+  // can't read, so the daemon also announces the new fingerprint in a
+  // response header — fold it in or every later proof 401s (live: a paired
+  // phone bounced to the login screen every 12 hours).
+  const rotatedFp = res.headers.get('x-clem-session-fp');
+  if (rotatedFp) sessionFingerprint = rotatedFp;
   const text = await res.text();
   let body: unknown = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
@@ -411,6 +418,35 @@ export async function sendChatMessage(
   });
 }
 
+/**
+ * Async-accepted send: resolves on the durable claim (202) and lets the reply
+ * ride the event stream. A phone must never hold a fetch open across a whole
+ * turn — the webview suspends on lock and the connection dies with it while
+ * the accepted run keeps going.
+ */
+export async function sendChatMessageAsync(
+  input: { message: string; sessionId?: string | null; idempotencyKey: string },
+): Promise<{ accepted: boolean; sessionId: string; runId: string; sinceSeq: number }> {
+  return api('/m/api/chat/send', {
+    method: 'POST',
+    headers: { 'idempotency-key': input.idempotencyKey },
+    body: JSON.stringify({
+      message: input.message,
+      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      async: true,
+    }),
+  });
+}
+
+/** Cursor catch-up over plain fetch auth — the stream-death recovery path. */
+export async function fetchRecentChatEvents(
+  sessionId: string,
+  sinceSeq: number,
+): Promise<{ sessionId: string; sessionStatus: string; events: ChatEvent[]; latestSeq: number }> {
+  const params = sinceSeq > 0 ? `?sinceSeq=${sinceSeq}` : '';
+  return api(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/events/recent${params}`);
+}
+
 /** Wrap EventSource so callers get an unsubscribe and typed event payloads. */
 export interface ChatStreamHandlers {
   onReplay?: (payload: { sessionId: string; sessionStatus: SessionStatus; events: ChatEvent[] }) => void;
@@ -490,6 +526,60 @@ export function subscribeChatStream(sessionId: string, handlers: ChatStreamHandl
   return () => {
     closed = true;
     es?.close();
+  };
+}
+
+/**
+ * The chat-engine's stream transport.
+ *
+ * Every connect() mints a FRESH single-use ticket — the class this kills:
+ * EventSource's built-in retry re-uses the original URL, and a spent ticket
+ * 401s, so the browser's own reconnection was guaranteed dead after the
+ * first drop. The engine owns all retrying; this layer opens exactly one
+ * connection per call and reports the first error.
+ */
+export function createChatStreamTransport(): {
+  connect(opts: {
+    sessionId: string;
+    sinceSeq: number;
+    onReplay(payload: { events: ChatEvent[]; latestSeq?: number }): void;
+    onEvent(event: ChatEvent): void;
+    onError(): void;
+  }): Promise<{ close(): void }>;
+  fetchRecent(sessionId: string, sinceSeq: number): Promise<{ events: ChatEvent[]; latestSeq?: number }>;
+} {
+  return {
+    async connect(opts) {
+      const streamPath = `/m/api/chat/sessions/${encodeURIComponent(opts.sessionId)}/stream`;
+      const ticket = await mintStreamTicket(streamPath);
+      const params = new URLSearchParams();
+      if (opts.sinceSeq > 0) params.set('sinceSeq', String(opts.sinceSeq));
+      if (ticket) params.set('ticket', ticket);
+      const query = params.toString();
+      const source = new EventSource(`${streamPath}${query ? `?${query}` : ''}`, { withCredentials: true });
+      let settled = false;
+      source.addEventListener('replay', (ev) => {
+        try { opts.onReplay(JSON.parse((ev as MessageEvent).data)); } catch { /* ignore */ }
+      });
+      source.addEventListener('event', (ev) => {
+        try { opts.onEvent(JSON.parse((ev as MessageEvent).data)); } catch { /* ignore */ }
+      });
+      source.addEventListener('error', () => {
+        // Close immediately: letting EventSource retry its (now spent-ticket)
+        // URL just burns a 401 before dying anyway.
+        if (settled) return;
+        settled = true;
+        source.close();
+        opts.onError();
+      });
+      return {
+        close: () => {
+          settled = true;
+          source.close();
+        },
+      };
+    },
+    fetchRecent: (sessionId, sinceSeq) => fetchRecentChatEvents(sessionId, sinceSeq),
   };
 }
 
