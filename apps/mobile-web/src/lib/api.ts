@@ -660,11 +660,28 @@ export async function listWorkflowRuns(name: string, limit = 20): Promise<{ runs
   return api<{ runs: WorkflowRunSummary[] }>(`/m/api/workflows/${encodeURIComponent(name)}/runs?limit=${limit}`);
 }
 
-export async function runWorkflow(name: string): Promise<{ ok: true; runId: string; status: string }> {
+export async function runWorkflow(name: string, inputs?: Record<string, string>): Promise<{ ok: true; runId: string; status: string }> {
   return api<{ ok: true; runId: string; status: string }>(`/m/api/workflows/${encodeURIComponent(name)}/run`, {
     method: 'POST',
-    body: '{}',
+    body: JSON.stringify(inputs && Object.keys(inputs).length > 0 ? { inputs } : {}),
   });
+}
+
+/** The FULL workflow: plain-English summary, certified steps, inputs schema. */
+export interface WorkflowDetailInfo {
+  name: string;
+  description: string;
+  enabled: boolean;
+  schedule: string | null;
+  stepCount: number;
+  inputs: Array<{ key: string; description: string; required: boolean; example: string | null }>;
+  summary: string;
+  steps: Array<{ stepId: string; label: string; executor: string | null; effect: string | null; gated: boolean }>;
+  certification: { verdict: unknown; missingInputs: unknown } | null;
+}
+
+export async function getWorkflowDetail(name: string): Promise<WorkflowDetailInfo> {
+  return api(`/m/api/workflows/${encodeURIComponent(name)}`);
 }
 
 export interface WorkflowEventSummary {
@@ -675,6 +692,20 @@ export interface WorkflowEventSummary {
   error: string | null;
   meta: Record<string, unknown> | null;
   outputPreview: string | null;
+  /** Present only when the events were fetched with { full: true }. */
+  output?: string | null;
+}
+
+export async function getWorkflowRunEventsFull(name: string, runId: string, limit = 500): Promise<{
+  runId: string;
+  workflow: string;
+  status: string | null;
+  terminalOutcome: string | null;
+  events: WorkflowEventSummary[];
+}> {
+  return api(
+    `/m/api/workflows/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/events?limit=${limit}&full=1`,
+  );
 }
 
 export async function getWorkflowRunEvents(name: string, runId: string, limit = 200): Promise<{
@@ -787,6 +818,9 @@ export interface WorkspaceBreakdown {
 }
 
 export interface WorkspaceDetail extends WorkspaceSummary {
+  successCriteria?: string[];
+  invariants?: string[];
+  linkedWorkflows?: Array<{ name: string; description: string; enabled: boolean }>;
   sources: Array<{ id: string; ok: boolean; refreshedAt: string | null; error: string | null }>;
   projection: {
     recordPath: string | null;
@@ -808,6 +842,25 @@ export async function getWorkspace(id: string): Promise<WorkspaceDetail> {
 }
 
 /** Starts the runners; returns immediately (a refresh can take minutes). */
-export async function refreshWorkspace(id: string): Promise<{ ok: true; started: true }> {
-  return api<{ ok: true; started: true }>(`/m/api/workspaces/${encodeURIComponent(id)}/refresh`, { method: 'POST' });
+/**
+ * Refresh outcome: `done:false` means a long runner is still going (keep
+ * polling, the old behavior). `done:true` carries the desktop's triage —
+ * including the case that was invisible before: a refresh blocked on an
+ * approval (`pendingApprovalIds`), which the UI must say out loud instead of
+ * letting the timestamp silently never move.
+ */
+export interface WorkspaceRefreshOutcome {
+  ok: boolean;
+  done: boolean;
+  started?: boolean;
+  results?: Array<{ sourceId?: string; ok?: boolean; error?: string; pendingApprovalId?: string }>;
+  pendingApprovalIds?: string[];
+  failureMessage?: string | null;
+}
+
+export async function refreshWorkspace(id: string, sourceId?: string): Promise<WorkspaceRefreshOutcome> {
+  return api<WorkspaceRefreshOutcome>(`/m/api/workspaces/${encodeURIComponent(id)}/refresh`, {
+    method: 'POST',
+    body: JSON.stringify(sourceId ? { sourceId } : {}),
+  });
 }

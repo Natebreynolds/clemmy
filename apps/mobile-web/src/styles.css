@@ -1034,6 +1034,69 @@ input, textarea { font: inherit; }
   .act-spinner { animation: none; border-top-color: var(--accent); }
 }
 
+/* ── workflow detail: steps, inputs, run timeline ───────────────── */
+.wf-steps { margin: var(--sp-3) 0; }
+.wf-steps > summary { cursor: pointer; list-style: none; }
+.wf-summary { margin: var(--sp-2) 0; font-size: var(--t-sm); color: var(--fg-2); }
+.wf-step-list { margin: var(--sp-2) 0 0; padding-left: 1.4em; }
+.wf-step { margin: 6px 0; font-size: var(--t-sm); }
+.wf-step-label { color: var(--fg); }
+.wf-step-chips { margin-left: 8px; }
+.wf-chip {
+  display: inline-block;
+  font-size: var(--t-xs);
+  color: var(--fg-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-right: 4px;
+}
+.wf-chip-effect { color: var(--accent-warn); border-color: rgba(240, 180, 90, 0.35); }
+.wf-chip-gated { color: var(--accent); border-color: rgba(255, 138, 61, 0.35); }
+.wf-inputs { margin: var(--sp-3) 0; }
+.wf-input-row { display: block; margin: var(--sp-2) 0; }
+.wf-input-label { display: block; font-size: var(--t-sm); color: var(--fg-2); margin-bottom: 4px; }
+.wf-input-desc { color: var(--fg-3); }
+.wf-input-row .memory-add-input { width: 100%; }
+.wf-because { font-size: var(--t-sm); color: var(--fg-2); margin: var(--sp-2) 0; }
+.wf-run-step {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: var(--sp-2) var(--sp-3);
+  margin: var(--sp-2) 0;
+  background: var(--bg-1);
+}
+.wf-run-step > summary { cursor: pointer; list-style: none; display: flex; align-items: baseline; gap: 8px; }
+.wf-run-step-id { font-weight: 600; font-size: var(--t-sm); color: var(--fg); }
+.wf-run-step-meta { font-size: var(--t-xs); color: var(--fg-3); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-run-mark { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; align-self: center; background: var(--fg-3); }
+.wf-run-mark-done { background: var(--accent-2); }
+.wf-run-mark-failed { background: var(--accent-fail); }
+.wf-run-mark-running { background: var(--accent); }
+.wf-run-mark-awaiting_approval, .wf-run-mark-awaiting_input, .wf-run-mark-blocked { background: var(--accent-warn); }
+.wf-verdicts { margin: var(--sp-3) 0; }
+.wf-verdict { font-size: var(--t-sm); margin: 4px 0; }
+.wf-verdict-pass { color: var(--accent-2); }
+.wf-verdict-fail { color: var(--accent-fail); }
+.wf-verdict-reason { color: var(--fg-3); }
+.wf-raw-log { margin-top: var(--sp-4); }
+.wf-raw-log > summary { cursor: pointer; list-style: none; }
+
+/* ── workspace: refresh outcome, contract ───────────────────────── */
+.ws-refresh-note {
+  font-size: var(--t-sm);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-1);
+  padding: var(--sp-2) var(--sp-3);
+  margin: var(--sp-2) 0;
+  color: var(--fg-2);
+}
+.ws-refresh-approval { color: var(--accent-warn); border-color: rgba(240, 180, 90, 0.35); }
+.ws-refresh-failed { color: var(--accent-fail); border-color: rgba(240, 101, 90, 0.35); }
+.ws-contract { margin: var(--sp-2) 0; }
+.ws-contract-line { font-size: var(--t-sm); color: var(--fg-2); padding: 3px 0; }
+
 /* ── memory: tabs, add composer, detail, dossier ────────────────── */
 .memory-tabs {
   display: flex;

@@ -57,9 +57,18 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         return { sessionId: result.sessionId, accepted: result.accepted };
       },
       loadSession: async (sessionId) => {
-        const result = await getChatSession(sessionId);
-        setTitle(result.session.title);
-        return { events: result.events, latestSeq: result.latestSeq };
+        try {
+          const result = await getChatSession(sessionId);
+          setTitle(result.session.title);
+          return { events: result.events, latestSeq: result.latestSeq };
+        } catch (err) {
+          // Workspace threads use a STABLE session id (space-<slug>) that may
+          // not exist until the first message — an empty thread, not an error.
+          if ((err as { status?: number }).status === 404 && /^space-/.test(sessionId)) {
+            return { events: [], latestSeq: 0 };
+          }
+          throw err;
+        }
       },
     },
     newIdempotencyKey: freshIdempotencyKey,

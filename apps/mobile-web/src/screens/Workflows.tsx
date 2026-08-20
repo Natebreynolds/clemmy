@@ -1,6 +1,8 @@
 import { useState } from 'preact/hooks';
+import { renderMarkdown } from '@clem/chat-engine';
 import {
-  getWorkflowRunEvents,
+  getWorkflowDetail,
+  getWorkflowRunEventsFull,
   listWorkflowRuns,
   listWorkflows,
   runWorkflow,
@@ -12,6 +14,7 @@ import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
 import { useScreenData } from '../lib/use-screen-data';
+import { buildWorkflowRunDetail } from '../lib/workflow-run-detail';
 
 /** Mirrors src/execution/workflow-run-cancellation.ts — anything else is live. */
 const TERMINAL_RUN_STATUSES = new Set([
@@ -79,11 +82,22 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   const [triggering, setTriggering] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [selectedRun, setSelectedRun] = useState<WorkflowRunSummary | null>(null);
+  const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const { data, loading: runsLoading, error, offline, refresh } = useScreenData(
     () => listWorkflowRuns(workflow.name, 20),
     { intervalMs: 8_000, disabled: selectedRun !== null },
   );
   const runs = data?.runs ?? [];
+  // The FULL workflow — plain-English summary, certified steps, inputs
+  // schema. Loaded once (no interval): definitions don't change mid-view and
+  // certification is real work on the daemon.
+  const { data: info, error: infoError, offline: infoOffline, refresh: reloadInfo } = useScreenData(
+    () => getWorkflowDetail(workflow.name),
+    { disabled: selectedRun !== null },
+  );
+  const requiredMissing = (info?.inputs ?? [])
+    .filter((input) => input.required && !(inputValues[input.key] ?? '').trim())
+    .map((input) => input.key);
 
   async function trigger() {
     if (triggering) return;
@@ -91,13 +105,13 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
     haptic('medium');
     setActionError(null);
     try {
-      await runWorkflow(workflow.name);
+      await runWorkflow(workflow.name, inputValues);
       // Refresh to surface the new queued run.
       void refresh();
     } catch (err) {
       const e = err as { status?: number; message?: string };
       if (e.status === 409 && e.message?.includes('REQUIRES_INPUT')) {
-        setActionError('This workflow needs input. Run it from the desktop app for now.');
+        setActionError('This workflow needs input — fill the fields above first.');
       } else if (e.status === 409 && e.message?.includes('DISABLED')) {
         setActionError('This workflow is disabled. Enable it from the desktop app first.');
       } else {
@@ -126,13 +140,65 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
       </div>
       <div class="workflow-detail-body">
         {workflow.description ? <p class="workflow-desc">{workflow.description}</p> : null}
+        <ScreenNotice error={infoError} offline={infoOffline} onRetry={() => void reloadInfo()} hasData={Boolean(info)} />
+
+        {info?.steps?.length ? (
+          <details class="wf-steps">
+            <summary class="memory-section-head">
+              What it does · {info.steps.length} {info.steps.length === 1 ? 'step' : 'steps'}
+              {info.schedule ? ` · cron ${info.schedule}` : ''}
+            </summary>
+            {info.summary ? (
+              <div class="bubble-md wf-summary" dangerouslySetInnerHTML={{ __html: renderMarkdown(info.summary) }} />
+            ) : null}
+            <ol class="wf-step-list">
+              {info.steps.map((step) => (
+                <li key={step.stepId} class="wf-step">
+                  <span class="wf-step-label">{step.label || step.stepId}</span>
+                  <span class="wf-step-chips">
+                    {step.executor ? <span class="wf-chip">{step.executor}</span> : null}
+                    {step.effect === 'external' ? <span class="wf-chip wf-chip-effect">writes outside</span> : null}
+                    {step.gated ? <span class="wf-chip wf-chip-gated">needs approval</span> : null}
+                  </span>
+                </li>
+              ))}
+            </ol>
+          </details>
+        ) : null}
+
+        {info?.inputs?.length ? (
+          <div class="wf-inputs">
+            <div class="memory-section-head">Inputs</div>
+            {info.inputs.map((input) => (
+              <label key={input.key} class="wf-input-row">
+                <span class="wf-input-label">
+                  {input.key}{input.required ? '' : ' (optional)'}
+                  {input.description ? <span class="wf-input-desc"> — {input.description}</span> : null}
+                </span>
+                <input
+                  class="memory-add-input"
+                  value={inputValues[input.key] ?? ''}
+                  placeholder={input.example ?? ''}
+                  onInput={(ev) => {
+                    const value = (ev.currentTarget as HTMLInputElement).value;
+                    setInputValues((prev) => ({ ...prev, [input.key]: value }));
+                  }}
+                />
+              </label>
+            ))}
+          </div>
+        ) : null}
+
         <div class="workflow-actions">
           <button
             class="btn"
-            disabled={triggering || !workflow.enabled || workflow.requiresInput}
+            disabled={triggering || !workflow.enabled || requiredMissing.length > 0}
             onClick={trigger}
           >
-            {triggering ? 'Queuing…' : workflow.requiresInput ? 'Needs input — use desktop' : !workflow.enabled ? 'Disabled' : 'Run now'}
+            {triggering ? 'Queuing…'
+              : !workflow.enabled ? 'Disabled'
+                : requiredMissing.length > 0 ? `Needs: ${requiredMissing.join(', ')}`
+                  : 'Run now'}
           </button>
         </div>
         {actionError ? <div class="global-error">{actionError}</div> : null}
@@ -176,10 +242,13 @@ interface WorkflowRunEventsProps {
 
 function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps) {
   const { data, loading, error, offline, refresh } = useScreenData(
-    () => getWorkflowRunEvents(workflowName, run.id, 200),
+    () => getWorkflowRunEventsFull(workflowName, run.id, 500),
     { intervalMs: 5_000 },
   );
   const events = data?.events ?? [];
+  // The same pure reducer the desktop drawer uses — per-step status,
+  // duration, output, retries, item counts, tokens/cost, run verdicts.
+  const detail = buildWorkflowRunDetail(events as unknown as Parameters<typeof buildWorkflowRunDetail>[0]);
 
   return (
     <div class="workflow-detail">
@@ -189,26 +258,74 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
       </div>
       <div class="workflow-detail-body">
         <div class="memory-section-head">
-          <span>{run.status}</span>
+          <span>{data?.status ?? run.status}</span>
           {run.error ? <span class="memory-section-count" style="color:var(--accent-fail)">error</span> : null}
+          {typeof detail.tokensTotal === 'number' && detail.tokensTotal > 0
+            ? <span class="memory-section-count">{Math.round(detail.tokensTotal / 1000)}k tokens</span>
+            : null}
         </div>
+        {detail.summary?.because ? <p class="wf-because">{detail.summary.because}</p> : null}
+
         {loading && events.length === 0 ? <div class="skeleton-stack" aria-hidden="true"><i /></div> : null}
         {!loading && !error && !offline && events.length === 0 ? <p class="muted">No steps recorded yet.</p> : null}
         <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={events.length > 0} />
-        {events.map((ev, idx) => (
-          <div key={idx} class={`workflow-event ${ev.error ? 'event-error' : ''}`}>
-            <div class="workflow-event-head">
-              <span class="workflow-event-kind">{workflowEventLabel(ev)}</span>
-              {workflowEventDetail(ev) ? <span class="workflow-event-step">{workflowEventDetail(ev)}</span> : null}
-              <span class="workflow-event-time">{shortTime(ev.t)}</span>
-            </div>
-            {ev.error ? <div class="workflow-event-error">{ev.error}</div> : null}
-            {ev.outputPreview ? <pre class="workflow-event-output">{ev.outputPreview}</pre> : null}
-          </div>
+
+        {detail.steps.map((step) => (
+          <details key={step.stepId} class={`wf-run-step wf-run-${step.status}`}>
+            <summary class="wf-run-step-head">
+              <span class={`wf-run-mark wf-run-mark-${step.status}`} aria-hidden="true" />
+              <span class="wf-run-step-id">{step.stepId}</span>
+              <span class="wf-run-step-meta">
+                {step.status.replace(/_/g, ' ')}
+                {typeof step.durationMs === 'number' ? ` · ${formatDuration(step.durationMs)}` : ''}
+                {step.items.started > 0 ? ` · ${step.items.completed}/${step.items.started} items${step.items.failed ? ` (${step.items.failed} failed)` : ''}` : ''}
+                {step.retries > 0 ? ` · ${step.retries} ${step.retries === 1 ? 'retry' : 'retries'}` : ''}
+              </span>
+            </summary>
+            {step.error ? <div class="workflow-event-error">{step.error}</div> : null}
+            {step.skippedReason ? <div class="muted">{step.skippedReason}</div> : null}
+            {step.output ? <pre class="workflow-event-output">{step.output.slice(0, 4000)}</pre> : null}
+          </details>
         ))}
+
+        {detail.verdicts.length > 0 ? (
+          <div class="wf-verdicts">
+            {detail.verdicts.map((verdict, i) => (
+              <div key={i} class={`wf-verdict ${verdict.pass ? 'wf-verdict-pass' : 'wf-verdict-fail'}`}>
+                Verdict · {verdict.door.replace(/_/g, ' ')}: {verdict.pass ? 'passed' : 'not passed'}
+                {verdict.reason ? <span class="wf-verdict-reason"> — {verdict.reason}</span> : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {events.length > 0 ? (
+          <details class="wf-raw-log">
+            <summary class="memory-section-head">Full log · {events.length} events</summary>
+            {events.map((ev, idx) => (
+              <div key={idx} class={`workflow-event ${ev.error ? 'event-error' : ''}`}>
+                <div class="workflow-event-head">
+                  <span class="workflow-event-kind">{workflowEventLabel(ev)}</span>
+                  {workflowEventDetail(ev) ? <span class="workflow-event-step">{workflowEventDetail(ev)}</span> : null}
+                  <span class="workflow-event-time">{shortTime(ev.t)}</span>
+                </div>
+                {ev.error ? <div class="workflow-event-error">{ev.error}</div> : null}
+                {ev.outputPreview ? <pre class="workflow-event-output">{ev.outputPreview}</pre> : null}
+              </div>
+            ))}
+          </details>
+        ) : null}
       </div>
     </div>
   );
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${seconds % 60}s`;
 }
 
 function workflowEventLabel(ev: WorkflowEventSummary): string {

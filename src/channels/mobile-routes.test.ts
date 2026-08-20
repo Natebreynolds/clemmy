@@ -40,6 +40,7 @@ const {
   beginRunAttempt,
   claimHarnessChatRequest,
   createSession: createHarnessSession,
+  getSession: getHarnessSessionForTest,
   listEvents,
   recordRunAttemptUserInput,
   resetEventLog,
@@ -1620,6 +1621,67 @@ test('mobile memory parity: detail carries evidence, mutations ride the canonica
     await h.close();
     resetMemoryDb();
   }
+});
+
+test('workspace chat from the phone: space-<slug> session id binds workspace metadata, same as the desktop dock', async () => {
+  resetEventLog();
+  _clearIdempotencyForTests();
+  _clearMobileChatInFlightForTests();
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  const assistant = {
+    respond: async (req: { sessionId: string }) => ({ text: 'On it.', sessionId: req.sessionId }),
+  } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    const cookie = await loginMobile(h, 'Workspace chat phone');
+    const res = await fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, 'idempotency-key': 'mobile-space-chat-key' },
+      body: JSON.stringify({ message: 'what changed in this workspace today', sessionId: 'space-test-pipeline', async: true }),
+    });
+    assert.equal(res.status, 202);
+    const ack = await res.json() as { sessionId: string };
+    assert.equal(ack.sessionId, 'space-test-pipeline', 'the stable workspace thread id is honored');
+    const session = getHarnessSessionForTest('space-test-pipeline');
+    assert.ok(session, 'the workspace session was created on first message');
+    const metadata = (session!.metadata ?? {}) as Record<string, unknown>;
+    // The whole workspace binding is this metadata + the session id — losing
+    // it made a mobile workspace chat a contextless generic assistant.
+    assert.equal(metadata.source, 'workspace');
+    assert.equal(metadata.spaceSlug, 'test-pipeline');
+
+    // A plain chat keeps its mobile identity — the space rule must not leak.
+    const plain = await fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, 'idempotency-key': 'mobile-plain-chat-key' },
+      body: JSON.stringify({ message: 'hello there', async: true }),
+    });
+    assert.equal(plain.status, 202);
+    const plainAck = await plain.json() as { sessionId: string };
+    const plainSession = getHarnessSessionForTest(plainAck.sessionId);
+    assert.equal(((plainSession!.metadata ?? {}) as Record<string, unknown>).source, 'mobile');
+  } finally {
+    _setBridgeImplsForTests({});
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
+    await h.close();
+  }
+});
+
+test('workflow detail route is wired and session-gated', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Workflow detail phone');
+    const missing = await fetch(`${h.url}/m/api/workflows/does-not-exist`, { headers: { cookie } });
+    assert.equal(missing.status, 404);
+    const anon = await fetch(`${h.url}/m/api/workflows/does-not-exist`);
+    assert.equal(anon.status, 401);
+  } finally { await h.close(); }
 });
 
 test('setPin enforces 8-64 char floor + allowed-char policy', async () => {

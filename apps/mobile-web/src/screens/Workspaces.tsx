@@ -24,6 +24,7 @@ import { haptic } from '../lib/native-bridge';
 import { relativeTime } from '../components/Approvals';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
+import { Chat } from './Chat';
 
 export function Workspaces() {
   const [openId, setOpenId] = useState<string | null>(null);
@@ -131,28 +132,56 @@ function EmptyWorkspaces({ spaces, onOpen, startIndex }: {
 function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void }) {
   const [refreshing, setRefreshing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [refreshNote, setRefreshNote] = useState<{ kind: 'ok' | 'approval' | 'failed'; text: string } | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
   const { data: detail, error, offline, refresh: load } = useScreenData(
     () => getWorkspace(id),
-    { intervalMs: 60_000 },
+    { intervalMs: 60_000, disabled: chatOpen },
   );
 
   async function pullFresh() {
     setRefreshing(true);
     haptic('medium');
     setActionError(null);
+    setRefreshNote(null);
     try {
-      // The daemon starts the runners and returns immediately — a refresh can
-      // take minutes, and holding a mobile connection open that long fails.
-      await refreshWorkspace(id);
-      haptic('success');
+      const outcome = await refreshWorkspace(id);
+      if (!outcome.done) {
+        // A long runner outlived the wait window — keep polling for the new
+        // timestamp, exactly the old behavior.
+        setRefreshNote({ kind: 'ok', text: 'Refreshing — this one takes a while, numbers update when it lands.' });
+      } else if (outcome.ok) {
+        haptic('success');
+        setRefreshNote({ kind: 'ok', text: 'Refreshed.' });
+        await load();
+        setTimeout(() => setRefreshNote(null), 3500);
+      } else if ((outcome.pendingApprovalIds?.length ?? 0) > 0) {
+        // The previously-invisible case: the refresh is WAITING ON YOU, not
+        // slow. Approvals surface on Home under "Needs you".
+        haptic('warning');
+        setRefreshNote({ kind: 'approval', text: outcome.failureMessage ?? 'Approval needed — check your decisions on Home.' });
+      } else {
+        haptic('error');
+        setRefreshNote({ kind: 'failed', text: outcome.failureMessage ?? 'Refresh failed.' });
+      }
     } catch (err) {
       haptic('error');
       setActionError((err as Error).message ?? 'Refresh failed to start');
     } finally {
-      // Let the poll above surface the new timestamp rather than pretending
-      // the data is already back.
-      setTimeout(() => setRefreshing(false), 4000);
+      setRefreshing(false);
     }
+  }
+
+  if (chatOpen) {
+    // The SAME continuous thread the desktop's workspace dock uses — the
+    // stable space-<slug> session id is the entire binding.
+    return (
+      <Chat
+        sessionId={`space-${id}`}
+        initialTitle={detail?.title ? `Ask about ${detail.title}` : 'Ask about this workspace'}
+        onBack={() => { setChatOpen(false); void load(); }}
+      />
+    );
   }
 
   if (!detail) {
@@ -180,11 +209,15 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
           <FreshnessDot state={detail.freshness} />
           {freshnessLabel(detail)}
         </span>
+        <button class="btn-quiet" onClick={() => setChatOpen(true)}>Ask Clem</button>
         <button class="btn-quiet" disabled={refreshing} onClick={pullFresh}>
           {refreshing ? 'Refreshing…' : 'Refresh'}
         </button>
       </div>
 
+      {refreshNote ? (
+        <div class={`ws-refresh-note ws-refresh-${refreshNote.kind}`}>{refreshNote.text}</div>
+      ) : null}
       {actionError ? <div class="global-error">{actionError}</div> : null}
       <ScreenNotice error={error} offline={offline} onRetry={() => void load()} hasData />
 
@@ -246,6 +279,40 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
           </p>
         </div>
       )}
+
+      {(detail.successCriteria?.length || detail.invariants?.length) ? (
+        <section class="home-section">
+          <h2 class="section-head">The contract</h2>
+          {detail.successCriteria?.length ? (
+            <div class="ws-contract">
+              <div class="memory-section-head">What good looks like</div>
+              {detail.successCriteria.map((line) => <div key={line} class="ws-contract-line">{line}</div>)}
+            </div>
+          ) : null}
+          {detail.invariants?.length ? (
+            <div class="ws-contract">
+              <div class="memory-section-head">Never</div>
+              {detail.invariants.map((line) => <div key={line} class="ws-contract-line">{line}</div>)}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+
+      {detail.linkedWorkflows?.length ? (
+        <section class="home-section">
+          <h2 class="section-head">Flows that feed this</h2>
+          <div class="stack">
+            {detail.linkedWorkflows.map((wf) => (
+              <div key={wf.name} class="card">
+                <div class="min-w-0">
+                  <div class="card-title-sm truncate">{wf.name}{wf.enabled ? '' : ' · disabled'}</div>
+                  {wf.description ? <div class="card-when">{wf.description}</div> : null}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
     </div>
   );
 }

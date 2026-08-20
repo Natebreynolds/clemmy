@@ -413,6 +413,9 @@ interface MobileWorkflowRunSummary {
   finishedAt: string | null;
   source: string | null;
   error: string | null;
+  /** The run finished but is asking for a human — parity with the desktop's
+   *  run projection, where hiding this made a parked run look merely slow. */
+  needsAttention: boolean;
 }
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
@@ -463,6 +466,7 @@ function readMobileWorkflowRuns(): Map<string, MobileWorkflowRunSummary[]> {
         finishedAt: stringOrNull(raw.finishedAt) ?? stringOrNull(raw.completedAt),
         source: stringOrNull(raw.source),
         error: stringOrNull(raw.error),
+        needsAttention: raw.needsAttention === true,
       };
       const list = grouped.get(workflow) ?? [];
       list.push(summary);
@@ -1967,6 +1971,14 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const proposedSessionId = requestedSessionId ?? `sess-mob-${digest.slice(0, 32)}`;
     const inputHash = mobileChatPayloadHash(message, requestedSessionId);
 
+    // Workspace-scoped chat is a SESSION-ID CONVENTION (space-<slug>), not a
+    // payload field — same rule as the desktop dock. Recognizing it here is
+    // what makes "chat about this workspace" from the phone land in the SAME
+    // continuous thread the desktop uses, with the same workspace metadata.
+    const spaceSlug = requestedSessionId && /^space-[a-z0-9][a-z0-9-]*$/.test(requestedSessionId)
+      ? requestedSessionId.slice('space-'.length)
+      : null;
+
     try {
       // The receipt has a session FK, so create the deterministic session first
       // only on a genuinely new key. Replays recover its original durable id.
@@ -1978,7 +1990,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           channel: 'mobile',
           userId: ctx.record.deviceId,
           title: message.length > 80 ? `${message.slice(0, 77)}...` : message,
-          metadata: { source: 'mobile' },
+          metadata: spaceSlug ? { source: 'workspace', spaceSlug } : { source: 'mobile' },
         });
       }
       let requestClaim: ReturnType<typeof claimHarnessChatRequest>;
@@ -2003,6 +2015,21 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       if (cached.cached) {
         res.json(cached.value);
         return;
+      }
+
+      // Lane parity with the desktop dock: seed the workspace context primer
+      // (idempotent by prefix) so the gateway lane knows WHICH workspace this
+      // thread is about. The Claude SDK lane derives it from the session id on
+      // its own; without this, the orchestrator lane was a contextless generic
+      // assistant — the exact drift the primer was collapsed to prevent.
+      if (spaceSlug) {
+        try {
+          const { HarnessSession } = await import('../runtime/harness/session.js');
+          const { buildWorkspaceContextPrimer } = await import('../spaces/workspace-context.js');
+          const harnessSession = HarnessSession.load(sessionId);
+          const primer = buildWorkspaceContextPrimer(spaceSlug);
+          if (harnessSession && primer) harnessSession.setContextPrimer('[workspace-context]', primer);
+        } catch { /* best-effort primer */ }
       }
 
       let execution = mobileChatInFlight.get(requestId);
@@ -2422,6 +2449,75 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  /**
+   * The FULL workflow, one name at a time: schedule, inputs schema, a plain-
+   * English description of what it does, and the certified step list (label,
+   * executor, effect, approval-gated) from the same dry-run trace the desktop
+   * drawer renders. Certification is real synchronous work (~hundreds of ms),
+   * which is why it lives here — on the single-workflow detail — and must
+   * never be added to the list route (a certification-per-workflow list was a
+   * measured 11s event-loop stall on the desktop before it was memoized).
+   */
+  router.get('/api/workflows/:name', requireMobileSession, async (req, res) => {
+    const target = Array.isArray(req.params.name) ? req.params.name[0] : req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+    try {
+      const { certifyWorkflow } = await import('../execution/workflow-certification.js');
+      const { describeWorkflowPlainEnglish } = await import('../execution/workflow-describe.js');
+      let certification: Awaited<ReturnType<typeof certifyWorkflow>> | null = null;
+      try { certification = certifyWorkflow(entry.data); } catch { /* an uncertifiable workflow still has a definition to show */ }
+      let summary = '';
+      try { summary = describeWorkflowPlainEnglish(entry.data); } catch { /* best-effort prose */ }
+      const inputsSchema = Object.entries(entry.data.inputs ?? {}).map(([key, spec]) => ({
+        key,
+        description: typeof (spec as { description?: unknown })?.description === 'string'
+          ? (spec as { description: string }).description
+          : '',
+        required: (spec as { required?: unknown })?.required !== false,
+        example: typeof (spec as { example?: unknown })?.example === 'string'
+          ? (spec as { example: string }).example
+          : null,
+      }));
+      const certSteps = (certification as { steps?: unknown } | null)?.steps;
+      res.json({
+        name: entry.data.name,
+        description: entry.data.description ?? '',
+        enabled: entry.data.enabled !== false,
+        schedule: entry.data.trigger?.schedule ?? null,
+        stepCount: entry.data.steps.length,
+        inputs: inputsSchema,
+        summary,
+        steps: Array.isArray(certSteps)
+          ? (certSteps as Array<Record<string, unknown>>).map((step) => ({
+              stepId: typeof step.stepId === 'string' ? step.stepId : '',
+              label: typeof step.label === 'string' ? step.label : '',
+              executor: typeof step.executor === 'string' ? step.executor : null,
+              effect: typeof step.effect === 'string' ? step.effect : null,
+              gated: step.gated === true,
+            }))
+          : entry.data.steps.map((step) => {
+              const raw = step as unknown as Record<string, unknown>;
+              return {
+                stepId: typeof raw.id === 'string' ? raw.id : '',
+                label: typeof raw.label === 'string' ? raw.label : '',
+                executor: null,
+                effect: null,
+                gated: false,
+              };
+            }),
+        certification: certification
+          ? {
+              verdict: (certification as { verdict?: unknown }).verdict ?? null,
+              missingInputs: (certification as { missingInputs?: unknown }).missingInputs ?? [],
+            }
+          : null,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   router.post('/api/workflows/:name/run', requireMobileSession, (req, res) => {
     const target = Array.isArray(req.params.name) ? req.params.name[0] : req.params.name;
     const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
@@ -2430,14 +2526,27 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(409).json({ error: 'WORKFLOW_DISABLED' });
       return;
     }
-    if (Object.keys(entry.data.inputs ?? {}).length > 0) {
-      // Mobile v1 doesn't render an inputs form — block triggering and
-      // tell the client to use the desktop dashboard for now.
-      res.status(409).json({ error: 'WORKFLOW_REQUIRES_INPUT' });
+    // Inputs ride the body as strings, validated against the schema — the
+    // phone renders the same inputs the desktop form does. Missing required
+    // inputs are a 409 naming exactly what's missing, not a dead end.
+    const schema = entry.data.inputs ?? {};
+    const provided = (req.body?.inputs && typeof req.body.inputs === 'object' && !Array.isArray(req.body.inputs))
+      ? req.body.inputs as Record<string, unknown>
+      : {};
+    const inputs: Record<string, string> = {};
+    for (const [key, value] of Object.entries(provided)) {
+      if (!(key in schema)) continue;
+      if (typeof value === 'string' && value.trim()) inputs[key] = value.trim().slice(0, 2000);
+    }
+    const missing = Object.entries(schema)
+      .filter(([key, spec]) => (spec as { required?: unknown })?.required !== false && !inputs[key])
+      .map(([key]) => key);
+    if (missing.length > 0) {
+      res.status(409).json({ error: 'WORKFLOW_REQUIRES_INPUT', missing });
       return;
     }
     try {
-      const queued = queueWorkflowRun(entry.data.name, {}, { source: 'mobile', dedupe: false });
+      const queued = queueWorkflowRun(entry.data.name, inputs, { source: 'mobile', dedupe: false });
       res.json({ ok: true, runId: queued.id, status: 'queued' });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -2461,6 +2570,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     try {
       const events = readWorkflowEvents(entry.name, runId);
       const limit = clampInt(req.query.limit, 200, 1, 500);
+      // ?full=1 keeps each event's complete output — required by the shared
+      // per-step timeline reducer, which reads `output`, not a preview. Only
+      // the ONE run being viewed pays that weight; lists stay on previews.
+      const full = req.query.full === '1' || req.query.full === 'true';
       const tail = events.slice(-limit).map((ev) => ({
         t: ev.t,
         kind: ev.kind,
@@ -2468,10 +2581,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         itemKey: ev.itemKey ?? null,
         error: ev.error ?? null,
         meta: ev.meta ?? null,
-        // output can be huge — only ship a short preview to mobile.
+        // output can be huge — only ship a short preview to mobile lists.
         outputPreview: ev.output !== undefined
           ? truncateOutput(ev.output)
           : null,
+        ...(full && ev.output !== undefined ? { output: ev.output } : {}),
       }));
       // The run's own status rides along: without it the phone had to infer
       // "is this still going?" from the last event kind, which is wrong the
@@ -2548,18 +2662,36 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const { projectWorkspaceData, projectSourceHealth, shortenDiagnostic } = await import('../spaces/mobile-projection.js');
       const data = readData(id);
       const health = spaceStore.health(id);
+      // Workflows that feed this workspace — content scan, same rule as the
+      // desktop: the workflow's own text referencing the slug IS the link.
+      const linkedWorkflows = listWorkflows().flatMap((entry) => {
+        try {
+          if (!readFileSync(entry.filePath, 'utf-8').toLowerCase().includes(id.toLowerCase())) return [];
+          return [{
+            name: entry.data.name,
+            description: (entry.data.description ?? '').slice(0, 200),
+            enabled: entry.data.enabled !== false,
+          }];
+        } catch { return []; }
+      });
       res.json({
         id: record.id,
         title: record.title,
         status: record.status,
         objective: record.contract?.objective ?? null,
+        // The full contract, not just the objective — what "good" means for
+        // this workspace and what must never happen.
+        successCriteria: record.contract?.successCriteria ?? [],
+        invariants: record.contract?.invariants ?? [],
         updatedAt: record.updatedAt,
         lastRefreshedAt: record.lastRefreshedAt ?? null,
         freshness: health?.freshness.state ?? 'unknown',
+        counts: health?.counts ?? null,
         // Health issues quote runner stderr verbatim; unbounded, one of them
         // pushed the whole workspace off a phone screen.
         issues: (health?.issues ?? []).slice(0, 3).map((issue) => shortenDiagnostic(issue, 160)),
         sources: projectSourceHealth(data),
+        linkedWorkflows,
         projection: projectWorkspaceData(data),
       });
     } catch (err) {
@@ -2568,9 +2700,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   });
 
   /**
-   * Kick a refresh. Deliberately fire-and-forget: a runner can take five
-   * minutes, and holding a mobile connection open that long would time out
-   * on any real network. The phone polls the record for the new timestamp.
+   * Refresh a workspace's data — with the truth the desktop gets.
+   *
+   * The old route was fire-and-forget, which made a refresh blocked on a
+   * pinned-entrypoint APPROVAL indistinguishable from a successful one: the
+   * timestamp silently never moved (live defect). Now the route waits a
+   * bounded window — approval blocks and fast failures land inside it and
+   * come back as structured results with pendingApprovalIds, exactly the
+   * triage the desktop does. A genuinely long runner outlives the window and
+   * degrades to the old behavior: 202, keep polling. Accepts an optional
+   * per-source refresh ({ sourceId }) like the desktop.
    */
   router.post('/api/workspaces/:id/refresh', requireMobileSession, async (req, res) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -2580,12 +2719,41 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const record = spaceStore.get(id);
       if (!record || record.status === 'archived') { res.status(404).json({ error: 'NOT_FOUND' }); return; }
       const { refreshSpaceData } = await import('../spaces/runner.js');
-      void Promise.resolve()
-        .then(() => refreshSpaceData(id))
+      const sourceId = typeof req.body?.sourceId === 'string' && req.body.sourceId.trim()
+        ? req.body.sourceId.trim()
+        : undefined;
+      const refreshing = Promise.resolve()
+        .then(() => refreshSpaceData(id, sourceId))
         .catch((err) => {
           console.warn(`mobile workspace refresh failed for ${id}:`, err instanceof Error ? err.message : err);
+          return null;
         });
-      res.status(202).json({ ok: true, started: true });
+      const WINDOW_MS = 20_000;
+      const settled = await Promise.race([
+        refreshing.then((results) => ({ results })),
+        new Promise<{ timeout: true }>((resolve) => setTimeout(() => resolve({ timeout: true }), WINDOW_MS)),
+      ]);
+      if ('timeout' in settled) {
+        // Still running — the refresh continues; the phone polls the record.
+        res.status(202).json({ ok: true, started: true, done: false });
+        return;
+      }
+      const results = (settled.results ?? []) as Array<{ sourceId?: string; ok?: boolean; error?: string; pendingApprovalId?: string }>;
+      const failures = results.filter((r) => r.ok === false);
+      const pendingApprovalIds = [...new Set(
+        failures.map((r) => r.pendingApprovalId).filter((v): v is string => typeof v === 'string' && v.length > 0),
+      )];
+      res.json({
+        ok: failures.length === 0,
+        done: true,
+        results,
+        pendingApprovalIds,
+        failureMessage: failures.length === 0
+          ? null
+          : pendingApprovalIds.length > 0
+            ? 'Approval needed before this can refresh — it’s waiting in your decisions.'
+            : failures.map((r) => `${r.sourceId ?? 'source'}: ${r.error ?? 'refresh failed'}`).join('; ').slice(0, 300),
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
