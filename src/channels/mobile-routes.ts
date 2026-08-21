@@ -2511,6 +2511,74 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   });
 
   /**
+   * ONE RUN, as a thing you can look at.
+   *
+   * A run is the unit of work in this product, and until now it existed only
+   * as a row in a list: a title and a status. Everything that makes a run
+   * legible — what it is doing right now, how long it has been going, what it
+   * produced, what it changed in the outside world — was already in the event
+   * log and reachable by nobody. This serves it as a run, so leaving the app
+   * and coming back returns you to the work rather than to a list.
+   *
+   * The events are the same public projection the chat transport ships, so
+   * the client can reduce them with the same narration it already uses.
+   */
+  router.get('/api/runs/:sessionId', requireMobileSession, (req, res) => {
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    const session = harnessGetSession(sessionId);
+    if (!session) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+    try {
+      const ownEvents = harnessListEvents(session.id, { limit: 400 });
+      const bridged = collectBridgedWorkflowReplay(session.id, ownEvents);
+      const merged = [...ownEvents, ...bridged].sort((a, b) => a.seq - b.seq);
+      const shaped = projectHarnessEventsForPublic(merged.slice(-400)).map(serializeEventForMobile);
+
+      // What the run touched outside this machine, and what it left behind.
+      // These are the two questions a person actually has about finished
+      // work, and both are already in the ledger.
+      const receipts = shaped
+        .filter((ev) => ev.type.startsWith('external_write'))
+        .slice(-20)
+        .map((ev) => ({
+          at: ev.createdAt,
+          kind: ev.type,
+          tool: typeof ev.data.toolName === 'string' ? ev.data.toolName : (typeof ev.data.tool === 'string' ? ev.data.tool : null),
+          shapeKey: typeof ev.data.shapeKey === 'string' ? ev.data.shapeKey : null,
+          targets: Array.isArray(ev.data.targets) ? ev.data.targets.filter((t): t is string => typeof t === 'string') : [],
+          irreversible: typeof ev.data.irreversible === 'boolean' ? ev.data.irreversible : null,
+        }));
+      const deliverables = shaped
+        .filter((ev) => ev.type === 'deliverable_saved')
+        .slice(-20)
+        .map((ev) => ({
+          at: ev.createdAt,
+          name: typeof ev.data.name === 'string' ? ev.data.name : '',
+          dir: typeof ev.data.dir === 'string' ? ev.data.dir : null,
+          excerpt: typeof ev.data.excerpt === 'string' ? ev.data.excerpt.slice(0, 400) : null,
+        }))
+        .filter((row) => row.name);
+
+      const firstEvent = shaped[0];
+      const lastEvent = shaped[shaped.length - 1];
+      res.json({
+        id: session.id,
+        title: session.title,
+        status: session.status,
+        kind: session.kind,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        startedAt: firstEvent?.createdAt ?? null,
+        lastEventAt: lastEvent?.createdAt ?? null,
+        events: shaped,
+        receipts,
+        deliverables,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Everything Clementine has committed to do later, in one list: one-shot
    * reminders (timers) and armed prospective intentions. Read-only — the
    * phone surfaces them; managing them stays a conversation.

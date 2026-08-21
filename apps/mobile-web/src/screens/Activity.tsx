@@ -1,15 +1,22 @@
+import { useState } from 'preact/hooks';
 import { isActiveRunStatus, listRecentRuns, type RunSummary } from '../lib/api';
 import { relativeTime } from '../components/Approvals';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
+import { Run } from './Run';
 
 export function Activity() {
+  const [openRun, setOpenRun] = useState<string | null>(null);
   const { data, loading, error, offline, refresh } = useScreenData(
     () => listRecentRuns(),
-    { intervalMs: 8000 },
+    { intervalMs: 8000, disabled: openRun !== null },
   );
   const runs = data?.runs ?? [];
+
+  if (openRun) {
+    return <Run sessionId={openRun} onBack={() => { setOpenRun(null); void refresh(); }} />;
+  }
 
   if (loading && runs.length === 0) {
     return <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>;
@@ -39,7 +46,7 @@ export function Activity() {
         <section class="home-section">
           <h2 class="section-head">Happening now</h2>
           <div class="stack">
-            {live.map((run, i) => <RunCard key={run.id} run={run} index={i} live onChanged={() => void refresh()} />)}
+            {live.map((run, i) => <RunCard key={run.id} run={run} index={i} live onChanged={() => void refresh()} onOpen={setOpenRun} />)}
           </div>
         </section>
       ) : null}
@@ -47,7 +54,7 @@ export function Activity() {
         <section class="home-section">
           <h2 class="section-head">Earlier</h2>
           <div class="stack">
-            {done.map((run, i) => <RunCard key={run.id} run={run} index={i} />)}
+            {done.map((run, i) => <RunCard key={run.id} run={run} index={i} onOpen={setOpenRun} />)}
           </div>
         </section>
       ) : null}
@@ -55,22 +62,26 @@ export function Activity() {
   );
 }
 
-function RunCard({ run, index, live, onChanged }: {
+function RunCard({ run, index, live, onChanged, onOpen }: {
   run: RunSummary;
   index: number;
   live?: boolean;
   onChanged?: () => void;
+  onOpen?: (sessionId: string) => void;
 }) {
   return (
     <article class={`card rise ${live ? 'card-live' : ''}`} style={{ '--i': index }}>
       {live ? <span class="pulse-dot" aria-hidden="true" /> : null}
-      <div class="min-w-0">
+      {/* The row opens the run. A run is a thing you look at, not a status
+          line you read — the button wraps only the text so the stop control
+          beside it stays independently tappable. */}
+      <button class="run-open min-w-0" onClick={() => onOpen?.(run.sessionId)}>
         <div class="card-title-sm">{run.title || 'Untitled run'}</div>
         <div class="card-when">
           {live ? null : <span class={`status-dot status-${run.status}`} aria-hidden="true" />}
           {run.status.replace(/_/g, ' ')} · {relativeTime(run.updatedAt)}
         </div>
-      </div>
+      </button>
       {live && onChanged ? <RunControl target={{ kind: 'run', runId: run.id }} onChanged={onChanged} /> : null}
     </article>
   );

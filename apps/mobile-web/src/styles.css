@@ -1064,6 +1064,36 @@ input, textarea { font: inherit; }
   .act-spinner { animation: none; border-top-color: var(--accent); }
 }
 
+/* ── one run, as a thing you can look at ────────────────────────── */
+.run-status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+}
+.run-status-row .card-when { flex: 1 1 auto; min-width: 0; }
+.run-pulse { position: static; }
+.run-receipt {
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--line);
+}
+.run-receipt:last-child { border-bottom: none; }
+.run-receipt-what { font-size: var(--t-sm); color: var(--fg); }
+.run-excerpt {
+  margin: 6px 0 0;
+  padding: var(--sp-2);
+  background: var(--bg-1);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-2);
+  white-space: pre-wrap;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.run-reply { font-size: var(--t-body); line-height: 1.6; color: var(--fg); max-width: 68ch; }
+.run-timeline { padding-left: 0; }
+
 /* ── workflow detail: strategy first, mechanics on request ──────── */
 .wf-strategy { margin: var(--sp-3) 0; }
 /* Three facts answer "should I run this": when, how it has gone, what it

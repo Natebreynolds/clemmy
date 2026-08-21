@@ -325,6 +325,34 @@ export interface RunSummary {
   updatedAt: string;
 }
 
+/** One run as a readable object: what it did, what it touched, what it left. */
+export interface RunDetail {
+  id: string;
+  title: string;
+  status: string;
+  kind: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: number | null;
+  lastEventAt: number | null;
+  events: ChatEvent[];
+  /** External writes — what changed outside this machine. */
+  receipts: Array<{
+    at: number;
+    kind: string;
+    tool: string | null;
+    shapeKey: string | null;
+    targets: string[];
+    irreversible: boolean | null;
+  }>;
+  /** Files the run produced. */
+  deliverables: Array<{ at: number; name: string; dir: string | null; excerpt: string | null }>;
+}
+
+export async function getRun(sessionId: string): Promise<RunDetail> {
+  return api(`/m/api/runs/${encodeURIComponent(sessionId)}`);
+}
+
 /** One shared mobile classification so Home and Activity cannot drift. */
 export const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
   'running',
