@@ -520,6 +520,26 @@ test('workflow step route accepts the Claude SDK nested route marker and exact t
   }
 });
 
+test('workflow step route accepts Codex on the openai_agents_harness SDK transport', () => {
+  const home = buildFixtureHome();
+  try {
+    addWorkflowRouteMarker(home, 'workflow:run-codex:write', 'worker_model_routed', {
+      provider: 'codex',
+      modelId: 'gpt-5.4',
+      modelRoute: {
+        provider: 'codex',
+        effectiveModel: 'gpt-5.4',
+        transport: 'openai_agents_harness',
+      },
+    }, 'codex');
+    const checks = exactWorkflowStepRouteChecks(home, 'workflow:run-codex:write', 'codex', CODEX_MODEL);
+    assert.equal(checks.every((check) => check.pass), true);
+    assert.equal(checks[3]?.name, 'workflow step used openai_agents_harness');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('workflow step route preserves BYO identity for a gpt-shaped model on the harness transport', () => {
   const home = buildFixtureHome();
   try {
