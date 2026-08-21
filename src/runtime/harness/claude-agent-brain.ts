@@ -228,7 +228,6 @@ import { semanticPortParticipated } from '../semantic-boundary/semantic-disposit
 import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { requireKnownExpectedWorkContract } from './expected-work-contract.js';
 import {
-  actionExpectedWorkCarrierSelection,
   requireActionExpectedWorkActivation,
 } from './action-expected-work-boundary.js';
 import { resolveActionTaskState } from './action-task-state.js';
@@ -2017,10 +2016,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       });
     }
   }
-  const acceptedActionSurface = Boolean(actionExpectedWorkCarrierSelection({
-    sessionId,
-    sourceUserSeq: userInputEvent.seq,
-  }));
+  // Past the dispatch block this lane is conversation. An `act` sketch must
+  // not demand expected-work activation (live: calendar 500). Typed work
+  // already returned above.
+  const acceptedActionSurface = false;
   // The standard lane receives this provider-neutral requirement projection at
   // its capability-resolve node. Claude diverges before that node, so derive
   // the same bounded advisory projection here when the caller did not already
