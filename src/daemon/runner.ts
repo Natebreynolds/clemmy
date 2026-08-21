@@ -1784,6 +1784,13 @@ export async function startDaemon(
   options: StartDaemonOptions = {},
 ): Promise<void> {
   setDaemonRuntimePhase('daemon.boot.start', { build: describeBuild() });
+  try {
+    await configureHarnessRuntime();
+  } catch {
+    // Port install still proceeds; unavailable semantics block typed turns.
+  }
+  const { configureTypedExecutionRuntime } = await import('../runtime/semantic-boundary/configure-typed-execution-runtime.js');
+  configureTypedExecutionRuntime();
   // Surface exactly which build is running so a stale packaged bundle
   // can't masquerade as the latest src silently (see build-info.ts).
   logger.info({ build: getBuildInfo() }, `Clementine daemon build: ${describeBuild()}`);
