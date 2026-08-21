@@ -216,8 +216,8 @@ function MessageRow({
 }) {
   if (message.role === 'user') {
     return (
-      <div class={`bubble bubble-user${message.pending ? ` pending pending-${message.pending}` : ''}`}>
-        <div class="bubble-text">{message.text}</div>
+      <div class={`turn turn-user${message.pending ? ` pending pending-${message.pending}` : ''}`}>
+        <div class="user-said">{message.text}</div>
         {message.pending === 'sending' ? <div class="pending-status">sending…</div> : null}
         {message.pending === 'failed' ? (
           <div class="pending-status pending-failed">
@@ -238,26 +238,28 @@ function MessageRow({
 
   if (message.approval) {
     return (
-      <div class="bubble bubble-approval">
-        Approval pending — {message.approval.subject}
+      <div class="turn turn-approval">
+        <div class="approval-head">Waiting on you — {message.approval.subject}</div>
         {message.approval.reason ? <div class="approval-reason">{message.approval.reason}</div> : null}
       </div>
     );
   }
 
   return (
-    <div class={`bubble bubble-assistant${thinking ? ' bubble-thinking' : ''}${message.status === 'failed' ? ' bubble-failed' : ''}`}>
-      {activity.length > 0 ? (
-        <div class="activity-strip">
-          {activity.map((item) => <ActivityRow key={item.id} item={item} />)}
-        </div>
-      ) : null}
+    <div class={`turn turn-assistant${message.status === 'failed' ? ' turn-failed' : ''}`}>
+      {/* The work Clem did is ONE quiet line, not a stack of tool rows: while
+          she is working it narrates the current step, and once settled it
+          becomes a summary you can open. The reply is what the screen is for. */}
+      {activity.length > 0 ? <WorkLine activity={activity} live={thinking} /> : null}
       {message.text ? (
         // Safe by construction: renderMarkdown escapes ALL input before adding
         // markup, refuses raw HTML, and only links http(s).
-        <div class="bubble-text bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text) }} />
+        <div
+          class={`reply bubble-md${thinking ? ' reply-writing' : ''}`}
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text) }}
+        />
       ) : thinking && activity.length === 0 ? (
-        <div class="bubble-text bubble-ghost">Thinking…</div>
+        <div class="reply reply-ghost">Thinking…</div>
       ) : null}
       {message.planProposalId && planStatus === 'pending' && !message.planProposalNeedsUserInput ? (
         <div class="plan-actions">
@@ -285,6 +287,61 @@ function MessageRow({
       ) : null}
     </div>
   );
+}
+
+/**
+ * One line for everything Clem did this turn.
+ *
+ * Live, it says what is happening right now — a person watching wants the
+ * current beat, not a growing list. Settled, it collapses to how long the work
+ * took and how many steps it was, and opens on tap for anyone who wants the
+ * receipts. Failures are never hidden: if any step failed the line says so and
+ * starts open, because that is the one case where the detail IS the answer.
+ */
+function WorkLine({ activity, live }: { activity: ActivityItem[]; live: boolean }) {
+  const failed = activity.some((item) => item.status === 'failed');
+  const [open, setOpen] = useState(failed);
+  const running = activity.filter((item) => item.status === 'running');
+  const current = running[running.length - 1] ?? activity[activity.length - 1];
+  const elapsed = useElapsed(activity, live);
+
+  const summary = live
+    ? (current?.label ?? 'Working…')
+    : `${failed ? 'Ran into trouble · ' : ''}${elapsed ? `Worked ${elapsed} · ` : ''}${activity.length} ${activity.length === 1 ? 'step' : 'steps'}`;
+
+  return (
+    <div class={`work${open ? ' work-open' : ''}${failed ? ' work-failed' : ''}`}>
+      <button class="work-line" onClick={() => setOpen(!open)} aria-expanded={open}>
+        {live ? <span class="work-spinner" aria-hidden="true" /> : <span class="work-caret" aria-hidden="true">{open ? '⌄' : '›'}</span>}
+        <span class="work-summary">{summary}</span>
+        {live && elapsed ? <span class="work-elapsed">{elapsed}</span> : null}
+      </button>
+      {open ? (
+        <div class="work-detail">
+          {activity.map((item) => <ActivityRow key={item.id} item={item} />)}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Human elapsed for the turn, from the earliest step that carried a start. */
+function useElapsed(activity: ActivityItem[], live: boolean): string {
+  const startedAt = activity.reduce<number | undefined>((earliest, item) => (
+    item.startedAt && (earliest === undefined || item.startedAt < earliest) ? item.startedAt : earliest
+  ), undefined);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!live || startedAt === undefined) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [live, startedAt]);
+  if (startedAt === undefined) return '';
+  const seconds = Math.max(0, Math.round(((live ? now : Math.max(now, startedAt)) - startedAt) / 1000));
+  if (!live && seconds < 1) return '';
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${seconds % 60}s`;
 }
 
 function ActivityRow({ item }: { item: ActivityItem }) {

@@ -62,7 +62,10 @@
   --r-xl: 28px;
 
   --dock-height: 74px;
-  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  /* Smooth deceleration (ease-out-quint). Deliberately NO overshoot: things
+     arrive and settle, they do not bounce. It was once called --ease-spring,
+     which described motion this curve never had. */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
 
   --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.22);
   --shadow-lift: 0 12px 34px rgba(0, 0, 0, 0.55);
@@ -212,7 +215,7 @@ input, textarea { font: inherit; }
   font-weight: 700;
   font-family: var(--font-display);
   min-height: 38px;
-  transition: transform 0.14s var(--ease-spring), color 0.16s ease, border-color 0.16s ease;
+  transition: transform 0.14s var(--ease-out), color 0.16s ease, border-color 0.16s ease;
 }
 .btn-quiet:active { transform: scale(0.94); }
 .btn-resume { color: var(--accent-2); border-color: rgba(142, 201, 111, 0.35); }
@@ -228,7 +231,7 @@ input, textarea { font: inherit; }
   font-weight: 700;
   font-family: var(--font-display);
   min-height: 38px;
-  transition: transform 0.14s var(--ease-spring);
+  transition: transform 0.14s var(--ease-out);
 }
 .btn-stop-yes:active { transform: scale(0.94); }
 .run-control-error { font-size: var(--t-xs); color: var(--accent-fail); flex-basis: 100%; text-align: right; }
@@ -252,7 +255,7 @@ input, textarea { font: inherit; }
   background: var(--bg-2);
   color: var(--fg-3);
   padding: 0;
-  transition: transform 0.16s var(--ease-spring), color 0.16s ease, background 0.16s ease;
+  transition: transform 0.16s var(--ease-out), color 0.16s ease, background 0.16s ease;
 }
 .icon-btn:active { transform: scale(0.9); background: var(--bg-3); color: var(--fg-2); }
 .icon-btn svg { width: 17px; height: 17px; }
@@ -275,7 +278,7 @@ input, textarea { font: inherit; }
 /* Staggered entrance: content arrives in reading order rather than all at
    once, which is most of why the old screens felt inert. */
 .rise {
-  animation: rise-in 0.42s var(--ease-spring) backwards;
+  animation: rise-in 0.42s var(--ease-out) backwards;
   animation-delay: calc(var(--i, 0) * 45ms);
 }
 @keyframes rise-in {
@@ -359,7 +362,7 @@ input, textarea { font: inherit; }
   border: 1px solid var(--line-strong);
   border-radius: 999px;
   box-shadow: var(--shadow-card), 0 0 0 0 var(--accent-glow);
-  transition: border-color 0.22s ease, box-shadow 0.28s ease, transform 0.16s var(--ease-spring);
+  transition: border-color 0.22s ease, box-shadow 0.28s ease, transform 0.16s var(--ease-out);
 }
 .ask:focus-within {
   border-color: var(--line-hot);
@@ -388,7 +391,7 @@ input, textarea { font: inherit; }
   align-items: center;
   justify-content: center;
   box-shadow: 0 5px 16px rgba(240, 101, 17, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.3);
-  transition: transform 0.16s var(--ease-spring), filter 0.16s ease, opacity 0.2s ease;
+  transition: transform 0.16s var(--ease-out), filter 0.16s ease, opacity 0.2s ease;
 }
 .ask-send svg { width: 19px; height: 19px; }
 .ask-send:active { transform: scale(0.9); filter: brightness(0.95); }
@@ -412,7 +415,7 @@ input, textarea { font: inherit; }
   display: flex;
   align-items: center;
   gap: var(--sp-3);
-  transition: transform 0.16s var(--ease-spring), border-color 0.16s ease, background 0.16s ease;
+  transition: transform 0.16s var(--ease-out), border-color 0.16s ease, background 0.16s ease;
 }
 .card-tap:active {
   transform: scale(0.985);
@@ -520,7 +523,7 @@ input, textarea { font: inherit; }
   font-family: var(--font-display);
   font-size: var(--t-sm);
   font-weight: 700;
-  transition: transform 0.14s var(--ease-spring), filter 0.14s ease;
+  transition: transform 0.14s var(--ease-out), filter 0.14s ease;
 }
 .btn-approve {
   background: linear-gradient(180deg, var(--accent-hi), var(--accent-deep));
@@ -579,7 +582,7 @@ input, textarea { font: inherit; }
   border-radius: 999px;
   padding: 11px 20px;
   margin: var(--sp-2) 0 var(--sp-4);
-  transition: transform 0.14s var(--ease-spring), border-color 0.16s ease;
+  transition: transform 0.14s var(--ease-out), border-color 0.16s ease;
 }
 .btn-new svg { width: 16px; height: 16px; color: var(--accent); }
 .btn-new:active { transform: scale(0.96); border-color: var(--line-hot); }
@@ -612,7 +615,7 @@ input, textarea { font: inherit; }
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  animation: rise-in 0.5s var(--ease-spring);
+  animation: rise-in 0.5s var(--ease-out);
 }
 .empty-mark { opacity: 0.72; filter: saturate(0.9); margin-bottom: var(--sp-2); }
 .empty-title {
@@ -708,7 +711,7 @@ input, textarea { font: inherit; }
   background: transparent;
   border-radius: 999px;
   color: var(--fg-3);
-  transition: color 0.2s ease, background 0.24s var(--ease-spring), transform 0.14s var(--ease-spring);
+  transition: color 0.2s ease, background 0.24s var(--ease-out), transform 0.14s var(--ease-out);
 }
 .dock button:active { transform: scale(0.92); }
 .dock-icon { position: relative; display: block; line-height: 0; }
@@ -783,7 +786,7 @@ input, textarea { font: inherit; }
   font-size: var(--t-body);
   font-weight: 600;
   box-shadow: 0 5px 16px rgba(240, 101, 17, 0.3);
-  transition: transform 0.14s var(--ease-spring);
+  transition: transform 0.14s var(--ease-out);
 }
 .login-repair:active { transform: scale(0.95); }
 .login-pin {
@@ -816,7 +819,7 @@ input, textarea { font: inherit; }
   width: 100%;
   max-width: 300px;
   box-shadow: 0 6px 20px rgba(240, 101, 17, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.28);
-  transition: transform 0.14s var(--ease-spring), filter 0.14s ease;
+  transition: transform 0.14s var(--ease-out), filter 0.14s ease;
 }
 .btn:active { transform: scale(0.97); filter: brightness(0.94); }
 .btn:disabled { opacity: 0.45; box-shadow: none; }
@@ -838,7 +841,7 @@ input, textarea { font: inherit; }
   height: 38px;
   color: var(--fg-2);
   flex: 0 0 auto;
-  transition: transform 0.14s var(--ease-spring);
+  transition: transform 0.14s var(--ease-out);
 }
 .chat-back:active { transform: scale(0.9); }
 .chat-title {
@@ -856,41 +859,57 @@ input, textarea { font: inherit; }
   -webkit-overflow-scrolling: touch;
   display: flex;
   flex-direction: column;
-  gap: var(--sp-2);
-  padding: var(--sp-2) 0 var(--sp-3);
+  padding: var(--sp-3) 0 var(--sp-4);
 }
 
-.bubble {
-  max-width: 84%;
-  border-radius: var(--r-lg);
-  padding: 11px 15px;
-  font-size: var(--t-body);
-  line-height: 1.45;
-  word-break: break-word;
-  animation: bubble-in 0.34s var(--ease-spring);
-  box-shadow: var(--shadow-card);
+/* ── the transcript ─────────────────────────────────────────────────
+   Clem's reply is not a card. It is the page: full width, unboxed, set
+   at reading measure with air around it. Everything else on screen —
+   what she typed, what she did, what needs a decision — is deliberately
+   quieter than that text, because the answer is the product.           */
+.turn {
+  animation: turn-in 0.3s var(--ease-out);
 }
-@keyframes bubble-in {
-  from { opacity: 0; transform: translateY(8px) scale(0.97); }
+@keyframes turn-in {
+  from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
 }
-.bubble-user {
+@media (prefers-reduced-motion: reduce) {
+  .turn { animation: none; }
+}
+
+/* What you said: a small quiet pill, right-aligned. It is context for the
+   answer below it, so it never competes — no gradient, no shadow. */
+.turn-user {
   align-self: flex-end;
-  background: linear-gradient(160deg, var(--accent-hi), var(--accent-deep));
-  color: var(--on-accent);
-  border-bottom-right-radius: 7px;
-  font-weight: 500;
+  max-width: 82%;
+  margin: var(--sp-4) 0 var(--sp-3);
 }
-.bubble-assistant {
-  align-self: flex-start;
-  background: linear-gradient(180deg, rgba(255, 232, 200, 0.05), transparent 50%), var(--bg-2);
-  border: 1px solid var(--line);
-  border-bottom-left-radius: 7px;
+.user-said {
+  background: var(--bg-3);
+  color: var(--fg);
+  border-radius: 18px;
+  border-bottom-right-radius: 6px;
+  padding: 9px 14px;
+  font-size: var(--t-sm);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
-/* Live text, still being written. The trailing caret is the only signal that
-   distinguishes it from a finished message — the bubble deliberately looks
-   identical otherwise, so the text does not shift when the real one lands. */
-.bubble-streaming::after {
+
+.turn-assistant { margin-bottom: var(--sp-4); }
+.turn-failed .reply { color: var(--fg); }
+
+.reply {
+  font-size: var(--t-body);
+  line-height: 1.62;
+  color: var(--fg);
+  word-break: break-word;
+}
+.reply-ghost { color: var(--fg-3); }
+/* Live text, still being written: a caret is the only difference, so nothing
+   shifts when the finished reply lands. */
+.reply-writing::after {
   content: '';
   display: inline-block;
   width: 2px;
@@ -902,45 +921,60 @@ input, textarea { font: inherit; }
 }
 @keyframes bubble-caret { to { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) {
-  .bubble-streaming::after { animation: none; }
+  .reply-writing::after { animation: none; }
 }
 
-.bubble-note { align-self: center; background: transparent; color: var(--fg-3); font-size: var(--t-xs); padding: 2px 8px; box-shadow: none; }
-.bubble-error {
-  align-self: center;
-  background: var(--fail-soft);
-  border: 1px solid rgba(240, 101, 90, 0.35);
-  color: var(--accent-fail);
-  font-size: var(--t-sm);
-}
-.bubble-tool {
-  align-self: flex-start;
-  background: var(--bg-1);
-  border: 1px dashed var(--line-strong);
-  font-size: var(--t-xs);
-  color: var(--fg-2);
-  box-shadow: none;
-}
-.bubble-tool-tag { font-family: var(--font-mono); font-size: 11px; color: var(--accent); display: block; margin-bottom: 3px; }
-.bubble-tool-args {
-  font-family: var(--font-mono);
-  font-size: 11px;
+/* ── the work line ──────────────────────────────────────────────────
+   One line per turn for everything Clem did. Muted by default: it sits
+   above the reply the way a timestamp does, present but not loud.      */
+.work { margin-bottom: var(--sp-2); }
+.work-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 2px 0;
   color: var(--fg-3);
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 120px;
-  overflow-y: auto;
+  font-size: var(--t-xs);
+  text-align: left;
 }
-.bubble-approval {
-  align-self: stretch;
-  max-width: 100%;
-  background: var(--bg-1);
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--accent);
+.work-line:active { opacity: 0.6; }
+.work-summary { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.work-elapsed { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.work-caret { flex: 0 0 auto; width: 10px; text-align: center; }
+.work-failed .work-line { color: var(--accent-fail); }
+.work-spinner {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1.5px solid var(--line-strong);
+  border-top-color: var(--accent);
+  animation: act-spin 0.9s linear infinite;
 }
-.bubble-text { white-space: pre-wrap; }
+.work-detail {
+  margin-top: 6px;
+  padding-left: 17px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
 
-/* ── markdown inside assistant bubbles ──────────────────────────── */
+/* A decision Clem is waiting on. The one thing in the transcript allowed to
+   hold a surface, because it is the one thing that stops the work — but it
+   earns attention with a warm ground, not a slab and a stripe. */
+.turn-approval {
+  background: var(--accent-soft);
+  border-radius: var(--r-md);
+  padding: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+.approval-head { font-size: var(--t-sm); font-weight: 600; color: var(--fg); }
+.approval-reason { color: var(--fg-2); font-size: var(--t-sm); margin-top: 4px; }
+
+/* ── markdown inside a reply ────────────────────────────────────── */
 /* Replies carry markdown; the engine renders it sanitized. Spacing stays
    tight — a phone bubble is not a document page. */
 .bubble-md { white-space: normal; }
@@ -981,19 +1015,10 @@ input, textarea { font: inherit; }
 .bubble-md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 .bubble-md strong { font-weight: 700; }
 
-/* ── live activity strip ────────────────────────────────────────── */
-/* The "watch the work happen" rows inside the assistant bubble: one row per
-   narrated action, spinner while running, ✓/✗ once settled. */
-.activity-strip {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  margin-bottom: var(--sp-2);
-  padding-bottom: var(--sp-2);
-  border-bottom: 1px solid var(--line);
-  font-size: var(--t-sm);
-}
-.bubble-assistant .activity-strip:last-child { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
+/* ── activity rows ──────────────────────────────────────────────── */
+/* The receipts behind the work line: one row per narrated action, spinner
+   while running, ✓/✗ once settled. Only rendered when the turn is expanded
+   (or when something failed, where the detail IS the answer). */
 .activity-row {
   display: flex;
   align-items: baseline;
@@ -1248,25 +1273,8 @@ input, textarea { font: inherit; }
 }
 .conn-recovering { color: var(--accent-warn); border-color: rgba(240, 180, 90, 0.35); }
 
-.bubble-ghost { color: var(--fg-3); }
-.bubble-thinking .bubble-md::after,
-.bubble-thinking .bubble-text:not(.bubble-ghost)::after {
-  content: '';
-  display: inline-block;
-  width: 2px;
-  height: 1em;
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  background: var(--accent);
-  animation: bubble-caret 1s steps(2, start) infinite;
-}
-@media (prefers-reduced-motion: reduce) {
-  .bubble-thinking .bubble-md::after,
-  .bubble-thinking .bubble-text:not(.bubble-ghost)::after { animation: none; }
-}
-.bubble-failed { border-color: rgba(240, 101, 90, 0.4); }
-.approval-reason { color: var(--fg-3); font-size: var(--t-sm); margin-top: 4px; }
-
+/* The composer is a tool, not a headline: it holds the bottom of the screen
+   without drawing the eye off the transcript. */
 .chat-composer { flex: 0 0 auto; display: flex; gap: var(--sp-2); padding: var(--sp-3) 0 var(--sp-1); align-items: flex-end; }
 .chat-input {
   flex: 1;
@@ -1283,18 +1291,19 @@ input, textarea { font: inherit; }
 .chat-input:focus { border-color: var(--line-hot); box-shadow: 0 0 0 4px var(--accent-soft); }
 .chat-send {
   flex: 0 0 auto;
-  width: 46px;
-  height: 46px;
+  width: 44px;
+  height: 44px;
   border-radius: 50%;
   border: none;
-  background: linear-gradient(180deg, var(--accent-hi), var(--accent-deep));
+  /* Solid accent, no glow: the send button is the one warm mark on the
+     screen and it does not need a halo to be found. */
+  background: var(--accent);
   color: var(--on-accent);
   font-weight: 700;
-  box-shadow: 0 5px 16px rgba(240, 101, 17, 0.3);
-  transition: transform 0.14s var(--ease-spring);
+  transition: transform 0.14s var(--ease-out), opacity 0.16s ease;
 }
-.chat-send:active { transform: scale(0.9); }
-.chat-send:disabled { opacity: 0.35; box-shadow: none; }
+.chat-send:active { transform: scale(0.92); }
+.chat-send:disabled { opacity: 0.3; }
 
 /* ── memory ─────────────────────────────────────────────────────── */
 
@@ -1443,7 +1452,7 @@ input, textarea { font: inherit; }
   border-radius: var(--r-lg);
   padding: var(--sp-4);
   box-shadow: var(--shadow-lift);
-  animation: rise-in 0.26s var(--ease-spring);
+  animation: rise-in 0.26s var(--ease-out);
 }
 .node-sheet-type { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 4px; }
 .node-sheet-title { font-weight: 650; }
@@ -1469,7 +1478,7 @@ input, textarea { font: inherit; }
 
 /* ── workflows + activity ───────────────────────────────────────── */
 
-.workflow-row, .chat-row { width: 100%; text-align: left; transition: transform 0.16s var(--ease-spring), border-color 0.16s ease; }
+.workflow-row, .chat-row { width: 100%; text-align: left; transition: transform 0.16s var(--ease-out), border-color 0.16s ease; }
 .workflow-row:active, .chat-row:active { transform: scale(0.985); border-color: var(--line-strong); }
 .workflow-row-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-3); }
 .workflow-row-name, .chat-row-title { font-weight: 650; }
@@ -1542,7 +1551,7 @@ input, textarea { font: inherit; }
   font-weight: 700;
   font-family: var(--font-display);
   font-size: var(--t-sm);
-  transition: transform 0.14s var(--ease-spring);
+  transition: transform 0.14s var(--ease-out);
 }
 .approval-card .actions button:active, .plan-actions button:active { transform: scale(0.96); }
 .approve { background: linear-gradient(180deg, var(--accent-hi), var(--accent-deep)); color: var(--on-accent); }
@@ -1551,9 +1560,32 @@ input, textarea { font: inherit; }
 .plan-section { margin: var(--sp-3) 0; }
 .plan-section-title { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-3); margin-bottom: 4px; }
 .plan-status { font-size: var(--t-xs); color: var(--fg-2); }
-.pending-action { border-left: 3px solid var(--accent-warn); }
-.pending-status { font-size: var(--t-xs); color: var(--accent-warn); }
-.pending-status.pending-failed { color: var(--accent-fail); }
+/* A message that has not landed yet. It stays exactly where it will live,
+   just dimmed — nothing jumps when the server confirms it. */
+.turn-user.pending-sending .user-said { opacity: 0.55; }
+.turn-user.pending-failed .user-said { opacity: 0.85; }
+.pending-status {
+  font-size: var(--t-xs);
+  color: var(--fg-3);
+  text-align: right;
+  margin-top: 4px;
+}
+.pending-status.pending-failed {
+  color: var(--accent-fail);
+  display: flex;
+  justify-content: flex-end;
+  align-items: baseline;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.pending-action {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: var(--t-xs);
+  font-weight: 600;
+}
 
 /* ── push prompt ────────────────────────────────────────────────── */
 
