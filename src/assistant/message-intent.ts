@@ -243,8 +243,56 @@ function isShort(text: string): boolean {
   return text.trim().length <= 40;
 }
 
-export function classifyMessageIntent(message: string): IntentClassification {
-  const trimmed = message.trim();
+/** Interrogative wrappers that do not, by themselves, request retrieval.
+ *  "what is" / "who is" frame a question; they do not name a user system. */
+const GENERIC_QUESTION_FRAMES = new Set([
+  'what is', 'what was', 'what are', 'what were',
+  'who is', 'who was',
+]);
+
+const USER_OR_HOSTED_WORLD_RE =
+  /\b(?:i|i'm|i've|i'd|i'll|me|my|mine|we|we're|we've|we'd|our|ours|us)\b|\bfor the team\b|\b(?:the|this|our|my)\s+(?:team|inbox|calendar|pipeline|roster|accounts?|deals?)\b|\b(?:in|on|from|via|against|using)\s+[a-z][a-z0-9._-]{2,}\b|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|https?:\/\//i;
+
+/** A clock/calendar question points at the current runtime environment even
+ *  though it contains no first-person or provider noun. Treating it as a
+ *  closed-world fact compiles a zero-read direct reply and lets stale model
+ *  knowledge answer a freshness-sensitive ask without task-local evidence. */
+const CURRENT_ENVIRONMENT_QUESTION_RE =
+  /^(?:what\s+(?:time|day|date)\s+is\s+it|what(?:'s| is)\s+(?:the\s+)?(?:(?:current|local|today'?s)\s+)?(?:time|day|date))\??$/i;
+
+/** Third-person / demonstrative anaphora. Same structural class as I/we/my:
+ *  the sentence points at a referent already in play. It is not an English
+ *  operator list and it is not enough on its own to open the factory. */
+const DISCOURSE_REFERENT_RE = /\b(?:they|them|their|theirs|these|those)\b/i;
+
+export interface ClassifyMessageIntentOptions {
+  /** This session already compiled a retrieve/act (the user's hosted world
+   *  is open). A closed-world-looking question that still points at that
+   *  world continues the retrieve — it is not "what's 2x3". */
+  continueHostedWorld?: boolean;
+}
+
+/** True when the ask refers to the user's world or a hosted system, so the
+ *  turn may need retrieval or tools. Absence of a referent — not a list of
+ *  English operators — is what keeps "what's 2x3" and "15% of 80" off the
+ *  factory. */
+export function refersToUserOrHostedWorld(text: string): boolean {
+  const trimmed = text.trim();
+  return USER_OR_HOSTED_WORLD_RE.test(trimmed)
+    || CURRENT_ENVIRONMENT_QUESTION_RE.test(trimmed);
+}
+
+export function hasDiscourseReferent(text: string): boolean {
+  return DISCOURSE_REFERENT_RE.test(text.trim());
+}
+
+export function classifyMessageIntent(
+  message: string,
+  opts: ClassifyMessageIntentOptions = {},
+): IntentClassification {
+  // Discord/iOS often send curly apostrophes. Fold them so "What’s 2x3"
+  // and "what's 2x3" classify the same.
+  const trimmed = message.trim().replace(/[\u2018\u2019\u201B]/g, "'");
   if (!trimmed) {
     return { intent: 'casual', confidence: 0.9, reasons: ['empty message'] };
   }
@@ -368,6 +416,24 @@ export function classifyMessageIntent(message: string): IntentClassification {
     && !directReadPipelineAction
     && (lookup.count > 0 || action.count === 0)
   ) {
+    const retrievalCues = lookup.matched.filter((cue) => !GENERIC_QUESTION_FRAMES.has(cue));
+    const closedWorld = action.count === 0
+      && retrievalCues.length === 0
+      && !refersToUserOrHostedWorld(trimmed);
+    if (closedWorld) {
+      if (opts.continueHostedWorld === true && hasDiscourseReferent(trimmed)) {
+        return {
+          intent: 'lookup',
+          confidence: 0.75,
+          reasons: ['continues a hosted-world turn via a discourse referent'],
+        };
+      }
+      return {
+        intent: 'conversation',
+        confidence: 0.8,
+        reasons: ['closed-world question; no user or hosted-world referent'],
+      };
+    }
     return {
       intent: 'lookup',
       confidence: 0.7 + Math.min(0.2, lookup.count * 0.05),

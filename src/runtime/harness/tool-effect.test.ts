@@ -221,6 +221,10 @@ test('shell effects are behavioral: compute stays safe, sends/deploys are extern
     'npx tsc --noEmit',
     'ffmpeg -i a.mov b.mp4',
     'node scripts/render-preview.mjs',
+    'sf data query --json --query "SELECT COUNT(Id) cnt FROM Opportunity" 2>/dev/null',
+    'sf sobject describe --sobject Opportunity --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin))"',
+    'sf data query --json --query "SELECT SUM(Net_MRR__c) mrr FROM Opportunity WHERE IsWon = true AND CloseDate = THIS_WEEK" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin))"',
+    'echo ok 2>/dev/null',
   ]) {
     const effect = classifyRuntimeToolEffect('run_shell_command', { command });
     assert.equal(effect.effect, 'compute', command);

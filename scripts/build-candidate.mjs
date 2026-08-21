@@ -19,6 +19,16 @@ const result = spawnSync(process.execPath, [compiler, '--outDir', 'dist'], {
 if (result.error) throw result.error;
 if (result.status !== 0) process.exit(result.status ?? 1);
 
+const emitArtifacts = spawnSync(process.execPath, [
+  path.join(repoRoot, 'scripts', 'emit-implementation-artifacts.mjs'),
+  path.join(repoRoot, 'dist/runtime/harness/implementation-artifacts/emitted'),
+], {
+  cwd: repoRoot,
+  stdio: 'inherit',
+});
+if (emitArtifacts.error) throw emitArtifacts.error;
+if (emitArtifacts.status !== 0) process.exit(emitArtifacts.status ?? 1);
+
 const fingerprintAfter = fingerprintRuntimeSourceFromGit({ repoRoot, gitHead });
 if (fingerprintAfter !== fingerprintBefore) {
   throw new Error(

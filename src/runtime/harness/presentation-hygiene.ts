@@ -54,3 +54,14 @@ export function looksLikeCompactDecisionProtocol(value: string): boolean {
   );
   return done.test(text) && nextAction.test(text);
 }
+
+const LEADING_NEXT_ACTION_RE =
+  /^(?:["']?)next[\s_-]*action(?:["']?)\s*=\s*["']?(?:awaiting_user_input|awaiting_approval|awaiting_handoff_result|completed|abandoned)["']?\s*(?:—|--|-|:)?\s*/i;
+
+/** Peel a leaked `nextAction=…` prefix so the human sentence can stay public. */
+export function stripLeakedDecisionAssignment(value: string): string {
+  const text = value.trim();
+  if (!LEADING_NEXT_ACTION_RE.test(text)) return text;
+  const stripped = text.replace(LEADING_NEXT_ACTION_RE, '').trim();
+  return stripped || text;
+}

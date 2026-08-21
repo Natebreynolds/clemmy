@@ -63,6 +63,12 @@ export interface LeaseStorePort {
     now: number,
     work: () => Promise<void>,
   ): Promise<{ ok: boolean; reason?: string }>;
+  transactSync?(
+    key: string,
+    expected: { owner: string; fence: number } | { acquireOwner: string },
+    now: number,
+    work: () => void,
+  ): { ok: boolean; reason?: string; fence?: number };
 }
 
 export type AcquireResult =
@@ -90,6 +96,8 @@ export interface LeaseManager {
    * commit-window equivalent (beginCommit, then work).
    */
   commitWith(key: string, fence: number, work: () => Promise<void>): Promise<{ ok: boolean; reason?: string }>;
+  acquireWith(key: string, work: () => void): { ok: true; fence: number } | { ok: false; reason: string };
+  commitSync(key: string, fence: number, work: () => void): { ok: boolean; reason?: string };
 }
 
 export function createLeaseManager(input: {
@@ -161,6 +169,22 @@ export function createLeaseManager(input: {
       await work();
       return { ok: true };
     },
+    acquireWith(key, work) {
+      if (!store.transactSync) {
+        return { ok: false, reason: `acquireWith requires a synchronous lease transaction for "${key}"` };
+      }
+      const result = store.transactSync(key, { acquireOwner: owner }, clock(), work);
+      if (!result.ok || !result.fence) {
+        return { ok: false, reason: result.reason ?? `acquireWith failed for "${key}"` };
+      }
+      return { ok: true, fence: result.fence };
+    },
+    commitSync(key, fence, work) {
+      if (!store.transactSync) {
+        return { ok: false, reason: `commitSync requires a synchronous lease transaction for "${key}"` };
+      }
+      return store.transactSync(key, { owner, fence }, clock(), work);
+    },
     async beginCommit(key, fence) {
       // ONE conditional operation opens the commit window: verify owner +
       // fence + live, and CAS-bump the revision while extending the expiry.
@@ -198,13 +222,25 @@ export function createLeaseManager(input: {
 export function withNodeLeases(
   adapter: GraphJournalAdapter,
   manager: LeaseManager,
-  keyPrefix = 'node',
+  keyPrefix: string | ((nodeId: string) => string) = 'node',
 ): GraphJournalAdapter & { releaseAll(): Promise<void> } {
   const held = new Map<string, number>();
-  const keyOf = (nodeId: string): string => `${keyPrefix}:${nodeId}`;
+  const keyOf = typeof keyPrefix === 'function'
+    ? keyPrefix
+    : (nodeId: string): string => `${keyPrefix}:${nodeId}`;
   return {
     async append(entry: GraphJournalEntry): Promise<void> {
       if (entry.type === 'node_started') {
+        if (adapter.appendSync) {
+          const acquired = manager.acquireWith(keyOf(entry.nodeId), () => {
+            adapter.appendSync!(entry);
+          });
+          if (!acquired.ok) {
+            throw new Error(`lease unavailable for "${entry.nodeId}": ${acquired.reason}`);
+          }
+          held.set(entry.nodeId, acquired.fence);
+          return;
+        }
         const acquired = await manager.acquire(keyOf(entry.nodeId));
         if (!acquired.ok) {
           throw new Error(`lease unavailable for "${entry.nodeId}": ${acquired.reason}`);
@@ -218,10 +254,17 @@ export function withNodeLeases(
         if (fence === undefined) {
           throw new Error(`stale fence: settlement of "${entry.nodeId}" has no held lease in this activation`);
         }
-        // ONE conditional durable operation: the append runs inside the
-        // lease check (a storage transaction where available, else the
-        // commit-window equivalent) — a reclaim between check and append
-        // loses instead of admitting a late settlement.
+        if (adapter.appendSync) {
+          const committed = manager.commitSync(keyOf(entry.nodeId), fence, () => {
+            adapter.appendSync!(entry);
+          });
+          if (!committed.ok) {
+            throw new Error(`stale fence: settlement of "${entry.nodeId}" arrived after its lease was reclaimed — ${committed.reason}`);
+          }
+          held.delete(entry.nodeId);
+          await manager.release(keyOf(entry.nodeId), fence);
+          return;
+        }
         const committed = await manager.commitWith(keyOf(entry.nodeId), fence, async () => {
           await adapter.append(entry);
         });

@@ -16,6 +16,7 @@ import {
   type GoogleSheetsSheetTarget,
 } from './sheet-from-json-content-contract.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
+import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 
 /**
  * Durable artifact transactions for create-style tool calls.
@@ -88,6 +89,106 @@ export interface ArtifactVerificationIntent {
    * ambient cwd, or URL-only probe is deliberately insufficient. */
   resourceId: string;
   verificationShape: string;
+}
+
+export interface HostSealedArtifactContentContractV1 {
+  version: 1;
+  kind: 'host_sealed_artifact_content_v1';
+  acceptedTaskId: string;
+  graphId: string;
+  graphHash: string;
+  lineageNodeId: string;
+  createNodeId: string;
+  readbackNodeId: string;
+  lineageContentDigest: string;
+  intendedContentDigest: string;
+  createBindingDigest: string;
+  readbackBindingDigest: string;
+  createEffect: 'external_write' | 'local_write';
+  readbackEffect: 'read';
+}
+
+function canonicalHostArtifactJson(value: unknown): string {
+  if (value === undefined) return 'undefined';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalHostArtifactJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalHostArtifactJson(record[key])}`)
+    .join(',')}}`;
+}
+
+export function hostArtifactContentDigest(value: unknown): string {
+  return createHash('sha256').update(canonicalHostArtifactJson(value), 'utf8').digest('hex');
+}
+
+function boundedHostArtifactId(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 512
+    && !/\s/.test(value);
+}
+
+function digest64(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+
+function parseHostSealedArtifactContentContract(
+  value: unknown,
+): HostSealedArtifactContentContractV1 | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const allowed = new Set([
+    'version',
+    'kind',
+    'acceptedTaskId',
+    'graphId',
+    'graphHash',
+    'lineageNodeId',
+    'createNodeId',
+    'readbackNodeId',
+    'lineageContentDigest',
+    'intendedContentDigest',
+    'createBindingDigest',
+    'readbackBindingDigest',
+    'createEffect',
+    'readbackEffect',
+  ]);
+  if (Object.keys(record).length !== allowed.size
+    || Object.keys(record).some((key) => !allowed.has(key))) return null;
+  if (record.version !== 1 || record.kind !== 'host_sealed_artifact_content_v1') return null;
+  for (const key of ['acceptedTaskId', 'graphId', 'lineageNodeId', 'createNodeId', 'readbackNodeId'] as const) {
+    if (!boundedHostArtifactId(record[key])) return null;
+  }
+  for (const key of [
+    'graphHash',
+    'lineageContentDigest',
+    'intendedContentDigest',
+    'createBindingDigest',
+    'readbackBindingDigest',
+  ] as const) {
+    if (!digest64(record[key])) return null;
+  }
+  if (record.lineageContentDigest !== record.intendedContentDigest) return null;
+  if (record.createEffect !== 'external_write' && record.createEffect !== 'local_write') return null;
+  if (record.readbackEffect !== 'read') return null;
+  return record as unknown as HostSealedArtifactContentContractV1;
+}
+
+export function createHostSealedArtifactContentContract(
+  input: Omit<HostSealedArtifactContentContractV1, 'version' | 'kind'>,
+): HostSealedArtifactContentContractV1 {
+  const contract: HostSealedArtifactContentContractV1 = {
+    version: 1,
+    kind: 'host_sealed_artifact_content_v1',
+    ...input,
+  };
+  if (!parseHostSealedArtifactContentContract(contract)) {
+    throw new Error('host-sealed artifact content contract is invalid');
+  }
+  return contract;
 }
 
 export type ArtifactScopeLineageReason =
@@ -797,6 +898,7 @@ export function resolveArtifactRunScopeId(
           : verification?.status === 'pending'
             ? 'artifact_verification_continue'
           : terminalReason === 'awaiting_continue' || terminalReason === 'limit_exceeded'
+            || terminalReason === 'step_budget_parked' || terminalReason === 'sdk_step_budget_parked'
             ? 'manual_continue'
             : null;
     if (continuationReason) {
@@ -1611,6 +1713,203 @@ export type GeneratedArtifactReadbackAdmission =
     }
   | { status: 'unavailable'; reason: string };
 
+function hostReadbackResourceId(args: unknown): string | null {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+  const value = (args as Record<string, unknown>).resourceId;
+  return boundedHostArtifactId(value) ? value : null;
+}
+
+function hostLineageRecords(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const records = (value as { records?: unknown }).records;
+  return Array.isArray(records) ? records : null;
+}
+
+/**
+ * Provider-neutral counterpart to the mature provider-specific readback
+ * contracts below. Authority comes only from the frozen graph binding and the
+ * host-sealed content/lineage contract; semantic role labels and tool-name
+ * vocabulary never authorize this path.
+ */
+export function authorizeHostSealedArtifactReadback(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  contractId: string;
+  createLogicalToolCallId: string;
+  verificationRequirementId: string;
+  readToolName: string;
+  readArgs: unknown;
+}): GeneratedArtifactReadbackAdmission {
+  const requestedResourceId = hostReadbackResourceId(input.readArgs);
+  if (!requestedResourceId) {
+    return { status: 'unavailable', reason: 'host readback does not name one exact resource id' };
+  }
+  try {
+    ensureSchema();
+    const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+    if (loaded.status !== 'ok' || loaded.contract.contractId !== input.contractId) {
+      return { status: 'unavailable', reason: 'host readback has no exact frozen work contract' };
+    }
+    const db = openEventLog();
+    const rows = db.prepare(`
+      SELECT a.id AS artifact_id, a.run_scope_id, a.source_call_id,
+             a.resource_id, a.status, c.contract_json
+        FROM artifact_source_roots root
+        JOIN run_artifacts a
+          ON a.session_id = root.session_id
+         AND a.run_scope_id = root.root_scope_id
+        JOIN artifact_content_verifications c ON c.artifact_id = a.id
+       WHERE root.session_id = ? AND root.source_user_seq = ?
+         AND a.source_call_id = ? AND a.status = 'bound'
+         AND a.resource_id = ?
+    `).all(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.createLogicalToolCallId,
+      requestedResourceId,
+    ) as Array<{
+      artifact_id: string;
+      run_scope_id: string;
+      source_call_id: string;
+      resource_id: string;
+      status: string;
+      contract_json: string;
+    }>;
+    if (rows.length !== 1) {
+      return { status: 'unavailable', reason: 'host readback target is missing or ambiguous' };
+    }
+    const row = rows[0]!;
+    let rawContract: unknown;
+    try { rawContract = JSON.parse(row.contract_json); } catch {
+      return { status: 'unavailable', reason: 'host-sealed content contract is unreadable' };
+    }
+    const contract = parseHostSealedArtifactContentContract(rawContract);
+    if (!contract) return { status: 'unavailable', reason: 'host-sealed content contract is invalid' };
+    if (
+      contract.acceptedTaskId !== loaded.contract.acceptedTaskId
+      || contract.graphId !== loaded.contract.graphId
+      || contract.graphHash !== loaded.contract.graphHash
+      || contract.readbackNodeId !== input.verificationRequirementId
+      || `logical:${contract.createNodeId}` !== input.createLogicalToolCallId
+    ) return { status: 'unavailable', reason: 'host-sealed contract contradicts accepted graph identity' };
+
+    const createOperation = loaded.contract.operations.find((operation) => operation.id === contract.createNodeId);
+    const readbackOperation = loaded.contract.operations.find((operation) => operation.id === contract.readbackNodeId);
+    if (
+      !createOperation
+      || !readbackOperation
+      || createOperation.effect !== contract.createEffect
+      || readbackOperation.effect !== 'read'
+      || !createOperation.dependsOn.includes(contract.lineageNodeId)
+      || !createOperation.dataFrom.includes(contract.lineageNodeId)
+      || !readbackOperation.dependsOn.includes(contract.createNodeId)
+      || !declaredGeneratedArtifactVerificationEdge({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        contractId: input.contractId,
+        createLogicalToolCallId: input.createLogicalToolCallId,
+        verificationRequirementId: input.verificationRequirementId,
+      })
+    ) return { status: 'unavailable', reason: 'host-sealed contract does not preserve exact content lineage' };
+
+    const bindingRows = db.prepare(`
+      SELECT node_id, binding_json, binding_digest
+        FROM graph_node_bindings
+       WHERE session_id = ? AND source_user_seq = ? AND node_id IN (?, ?)
+    `).all(
+      input.sessionId,
+      input.sourceUserSeq,
+      contract.createNodeId,
+      contract.readbackNodeId,
+    ) as Array<{ node_id: string; binding_json: string; binding_digest: string }>;
+    if (bindingRows.length !== 2) {
+      return { status: 'unavailable', reason: 'host readback node bindings are incomplete' };
+    }
+    const createBindingRow = bindingRows.find((binding) => binding.node_id === contract.createNodeId);
+    const readbackBindingRow = bindingRows.find((binding) => binding.node_id === contract.readbackNodeId);
+    if (!createBindingRow || !readbackBindingRow) {
+      return { status: 'unavailable', reason: 'host readback node bindings are ambiguous' };
+    }
+    const createBinding = JSON.parse(createBindingRow.binding_json) as Record<string, unknown>;
+    const readbackBinding = JSON.parse(readbackBindingRow.binding_json) as Record<string, unknown>;
+    const readArgs = input.readArgs as Record<string, unknown>;
+    if (
+      createBindingRow.binding_digest !== contract.createBindingDigest
+      || readbackBindingRow.binding_digest !== contract.readbackBindingDigest
+      || createBinding.effect !== contract.createEffect
+      || readbackBinding.effect !== 'read'
+      || readbackBinding.toolName !== input.readToolName
+      || readArgs.capabilityId !== readbackBinding.capabilityId
+      || readArgs.schemaVersion !== readbackBinding.schemaVersion
+      || readArgs.schemaDigest !== readbackBinding.schemaDigest
+    ) return { status: 'unavailable', reason: 'host readback capability binding is not exact and read-only' };
+
+    const createSettlement = db.prepare(`
+      SELECT b.requirement_id, b.effect_kind, s.outcome_kind, s.continues_requirement
+        FROM expected_work_call_bindings b
+        JOIN logical_call_settlements s
+          ON s.session_id = b.session_id
+         AND s.source_user_seq = b.source_user_seq
+         AND s.logical_tool_call_id = b.logical_tool_call_id
+       WHERE b.session_id = ? AND b.source_user_seq = ?
+         AND b.logical_tool_call_id = ? AND b.contract_id = ?
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.createLogicalToolCallId,
+      input.contractId,
+    ) as {
+      requirement_id: string;
+      effect_kind: string;
+      outcome_kind: string;
+      continues_requirement: number;
+    } | undefined;
+    if (
+      !createSettlement
+      || createSettlement.requirement_id !== contract.createNodeId
+      || createSettlement.effect_kind !== contract.createEffect
+      || createSettlement.outcome_kind !== 'succeeded'
+      || createSettlement.continues_requirement !== 0
+    ) return { status: 'unavailable', reason: 'host create predecessor is not durably settled' };
+
+    const lineage = db.prepare(`
+      SELECT raw_payload_json
+        FROM durable_result_handles
+       WHERE session_id = ? AND source_user_seq = ?
+         AND logical_tool_call_id = ? AND scope_kind = 'authoritative'
+         AND raw_payload_json IS NOT NULL
+       ORDER BY rowid DESC LIMIT 1
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      `logical:${contract.lineageNodeId}`,
+    ) as { raw_payload_json: string } | undefined;
+    if (!lineage) return { status: 'unavailable', reason: 'host content lineage result is missing' };
+    let lineageValue: unknown;
+    try { lineageValue = JSON.parse(lineage.raw_payload_json); } catch {
+      return { status: 'unavailable', reason: 'host content lineage result is unreadable' };
+    }
+    const lineageRecords = hostLineageRecords(lineageValue);
+    if (!lineageRecords || hostArtifactContentDigest(lineageRecords) !== contract.lineageContentDigest) {
+      return { status: 'unavailable', reason: 'host content lineage digest does not match the sealed create input' };
+    }
+    return {
+      status: 'authorized',
+      artifactId: row.artifact_id,
+      runScopeId: row.run_scope_id,
+      createLogicalToolCallId: row.source_call_id,
+      contentContract: contract,
+      resourceId: row.resource_id,
+    };
+  } catch (error) {
+    return {
+      status: 'unavailable',
+      reason: String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 300),
+    };
+  }
+}
+
 /**
  * Connect a downstream exact-ID read to the one generated artifact created by
  * its declared predecessor. The locator is host-owned: it comes from the
@@ -1887,6 +2186,368 @@ export function verifyGeneratedArtifactContentFromToolResult(input: {
   }
 }
 
+/** Mark a host-sealed artifact verified only after an independent read-only
+ * capability returned the exact created id and byte-equivalent content. */
+export function verifyHostSealedArtifactContentFromReadback(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  verificationLogicalToolCallId: string;
+  readToolName: string;
+  readArgs: unknown;
+  returnedResourceId: string;
+  readContent: unknown;
+}): boolean {
+  try {
+    ensureSchema();
+    if (!boundedHostArtifactId(input.returnedResourceId)) return false;
+    if (inspectProviderEnvelope(input.readContent).verdict !== 'clean') return false;
+    const db = openEventLog();
+    const binding = db.prepare(`
+      SELECT contract_id, requirement_id, effect_kind
+        FROM expected_work_call_bindings
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.verificationLogicalToolCallId,
+    ) as { contract_id: string; requirement_id: string; effect_kind: string } | undefined;
+    if (!binding || binding.effect_kind !== 'read') return false;
+    const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+    if (loaded.status !== 'ok' || loaded.contract.contractId !== binding.contract_id) return false;
+    const operation = loaded.contract.operations.find((candidate) => candidate.id === binding.requirement_id);
+    if (!operation || operation.effect !== 'read') return false;
+    const createDependencies = operation.dependsOn.filter((dependencyId) => {
+      const dependency = loaded.contract.operations.find((candidate) => candidate.id === dependencyId);
+      return dependency?.effect === 'external_write' || dependency?.effect === 'local_write';
+    });
+    if (createDependencies.length !== 1) return false;
+    const createLogicalToolCallId = `logical:${createDependencies[0]}`;
+    const authorized = authorizeHostSealedArtifactReadback({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      contractId: binding.contract_id,
+      createLogicalToolCallId,
+      verificationRequirementId: binding.requirement_id,
+      readToolName: input.readToolName,
+      readArgs: input.readArgs,
+    });
+    if (authorized.status !== 'authorized' || authorized.resourceId !== input.returnedResourceId) return false;
+    const contract = parseHostSealedArtifactContentContract(authorized.contentContract);
+    if (!contract || hostArtifactContentDigest(input.readContent) !== contract.intendedContentDigest) return false;
+    const fingerprint = createHash('sha256').update(canonicalHostArtifactJson({
+      artifactId: authorized.artifactId,
+      verificationLogicalToolCallId: input.verificationLogicalToolCallId,
+      returnedResourceId: input.returnedResourceId,
+      readToolName: input.readToolName,
+      readArgs: input.readArgs,
+      contentDigest: contract.intendedContentDigest,
+      createBindingDigest: contract.createBindingDigest,
+      readbackBindingDigest: contract.readbackBindingDigest,
+    })).digest('hex');
+    const updated = db.prepare(`
+      UPDATE artifact_content_verifications
+         SET content_verified_at = COALESCE(content_verified_at, ?),
+             verification_logical_call_id = COALESCE(verification_logical_call_id, ?),
+             verification_fingerprint = COALESCE(verification_fingerprint, ?)
+       WHERE artifact_id = ?
+         AND create_logical_tool_call_id = ?
+         AND (verification_logical_call_id IS NULL OR verification_logical_call_id = ?)
+    `).run(
+      new Date().toISOString(),
+      input.verificationLogicalToolCallId,
+      fingerprint,
+      authorized.artifactId,
+      createLogicalToolCallId,
+      input.verificationLogicalToolCallId,
+    );
+    if (updated.changes !== 1) return false;
+    const persisted = db.prepare(`
+      SELECT verification_logical_call_id, verification_fingerprint
+        FROM artifact_content_verifications WHERE artifact_id = ?
+    `).get(authorized.artifactId) as {
+      verification_logical_call_id: string | null;
+      verification_fingerprint: string | null;
+    } | undefined;
+    return persisted?.verification_logical_call_id === input.verificationLogicalToolCallId
+      && persisted.verification_fingerprint === fingerprint;
+  } catch {
+    return false;
+  }
+}
+
+export type HostSealedArtifactDerivationVerification =
+  | {
+      status: 'verified';
+      artifactId: string;
+      lineageContentDigest: string;
+      verificationLogicalToolCallId: string;
+    }
+  | { status: 'unavailable'; reason: string };
+
+/**
+ * Re-prove, from current durable bytes, that one settled create consumed the
+ * exact result lineage declared by the frozen graph and that an independent
+ * read-only successor returned those same bytes from the exact created id.
+ *
+ * This deliberately knows nothing about provider names, tool-name vocabulary,
+ * artifact families, or semantic role labels. The only authority is the
+ * host-sealed node binding, expected-work DAG, scoped settlement/result handle,
+ * and content contract.
+ */
+export function verifyHostSealedArtifactDerivationForWrite(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  createLogicalToolCallId: string;
+  createdId: string;
+  intendedContentDigest: string;
+}): HostSealedArtifactDerivationVerification {
+  if (
+    !input.sessionId.trim()
+    || !Number.isSafeInteger(input.sourceUserSeq)
+    || input.sourceUserSeq <= 0
+    || !input.createLogicalToolCallId.trim()
+    || !boundedHostArtifactId(input.createdId)
+    || !digest64(input.intendedContentDigest)
+  ) return { status: 'unavailable', reason: 'exact derivation identity and content digest are required' };
+  try {
+    ensureSchema();
+    const db = openEventLog();
+    const rows = db.prepare(`
+      SELECT a.id AS artifact_id, a.resource_id, a.status,
+             c.contract_json, c.content_verified_at,
+             c.verification_logical_call_id, c.verification_fingerprint
+        FROM artifact_source_roots root
+        JOIN run_artifacts a
+          ON a.session_id = root.session_id
+         AND a.run_scope_id = root.root_scope_id
+        JOIN artifact_content_verifications c ON c.artifact_id = a.id
+       WHERE root.session_id = ? AND root.source_user_seq = ?
+         AND a.source_call_id = ? AND a.resource_id = ?
+    `).all(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.createLogicalToolCallId,
+      input.createdId,
+    ) as Array<{
+      artifact_id: string;
+      resource_id: string;
+      status: string;
+      contract_json: string;
+      content_verified_at: string | null;
+      verification_logical_call_id: string | null;
+      verification_fingerprint: string | null;
+    }>;
+    if (rows.length !== 1) {
+      return { status: 'unavailable', reason: 'sealed derivation artifact is missing or ambiguous' };
+    }
+    const row = rows[0]!;
+    if (
+      row.status !== 'bound'
+      || !row.content_verified_at
+      || !row.verification_logical_call_id
+      || !row.verification_fingerprint
+    ) return { status: 'unavailable', reason: 'sealed derivation artifact has no completed content proof' };
+
+    let rawContract: unknown;
+    try { rawContract = JSON.parse(row.contract_json); } catch {
+      return { status: 'unavailable', reason: 'sealed derivation contract is unreadable' };
+    }
+    const contract = parseHostSealedArtifactContentContract(rawContract);
+    if (
+      !contract
+      || `logical:${contract.createNodeId}` !== input.createLogicalToolCallId
+      || `logical:${contract.readbackNodeId}` !== row.verification_logical_call_id
+      || contract.intendedContentDigest !== input.intendedContentDigest
+      || contract.lineageContentDigest !== input.intendedContentDigest
+    ) return { status: 'unavailable', reason: 'sealed derivation contract contradicts the settled write' };
+
+    const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+    if (
+      loaded.status !== 'ok'
+      || loaded.contract.acceptedTaskId !== contract.acceptedTaskId
+      || loaded.contract.graphId !== contract.graphId
+      || loaded.contract.graphHash !== contract.graphHash
+    ) return { status: 'unavailable', reason: 'sealed derivation has no exact frozen graph authority' };
+    const operations = new Map(loaded.contract.operations.map((operation) => [operation.id, operation]));
+    const createOperation = operations.get(contract.createNodeId);
+    const lineageOperation = operations.get(contract.lineageNodeId);
+    const readbackOperation = operations.get(contract.readbackNodeId);
+    if (
+      !createOperation
+      || !lineageOperation
+      || !readbackOperation
+      || createOperation.effect !== contract.createEffect
+      || !createOperation.dependsOn.includes(contract.lineageNodeId)
+      || !createOperation.dataFrom.includes(contract.lineageNodeId)
+      || readbackOperation.effect !== 'read'
+      || !readbackOperation.dependsOn.includes(contract.createNodeId)
+    ) return { status: 'unavailable', reason: 'sealed derivation DAG edge is not exact' };
+
+    const ancestors = new Set<string>();
+    const pending = [contract.lineageNodeId];
+    while (pending.length > 0) {
+      const nodeId = pending.pop()!;
+      if (ancestors.has(nodeId)) continue;
+      const operation = operations.get(nodeId);
+      if (!operation || nodeId === contract.createNodeId || nodeId === contract.readbackNodeId) {
+        return { status: 'unavailable', reason: 'sealed derivation ancestor reference is invalid' };
+      }
+      ancestors.add(nodeId);
+      for (const dependencyId of new Set([...operation.dependsOn, ...operation.dataFrom])) {
+        if (!operations.has(dependencyId)) {
+          return { status: 'unavailable', reason: 'sealed derivation ancestor is missing from frozen work' };
+        }
+        pending.push(dependencyId);
+      }
+    }
+    if (![...ancestors].some((nodeId) => operations.get(nodeId)?.effect === 'read')) {
+      return { status: 'unavailable', reason: 'sealed derivation has no upstream source read' };
+    }
+
+    for (const nodeId of ancestors) {
+      const operation = operations.get(nodeId)!;
+      const logicalToolCallId = `logical:${nodeId}`;
+      const authority = db.prepare(`
+        SELECT b.requirement_id, b.effect_kind, b.tool_name, b.argument_digest,
+               s.outcome_kind, s.continues_requirement,
+               n.binding_json, n.binding_digest
+          FROM expected_work_call_bindings b
+          JOIN logical_call_settlements s
+            ON s.session_id = b.session_id
+           AND s.source_user_seq = b.source_user_seq
+           AND s.logical_tool_call_id = b.logical_tool_call_id
+          JOIN graph_node_bindings n
+            ON n.session_id = b.session_id
+           AND n.source_user_seq = b.source_user_seq
+           AND n.node_id = b.requirement_id
+         WHERE b.session_id = ? AND b.source_user_seq = ?
+           AND b.contract_id = ? AND b.logical_tool_call_id = ?
+      `).get(
+        input.sessionId,
+        input.sourceUserSeq,
+        loaded.contract.contractId,
+        logicalToolCallId,
+      ) as {
+        requirement_id: string;
+        effect_kind: string;
+        tool_name: string;
+        argument_digest: string;
+        outcome_kind: string;
+        continues_requirement: number;
+        binding_json: string;
+        binding_digest: string;
+      } | undefined;
+      if (!authority) return { status: 'unavailable', reason: `sealed derivation ancestor ${nodeId} is unsettled` };
+      let binding: Record<string, unknown>;
+      try { binding = JSON.parse(authority.binding_json) as Record<string, unknown>; } catch {
+        return { status: 'unavailable', reason: `sealed derivation binding ${nodeId} is unreadable` };
+      }
+      const bindingEffect = (binding.effect === 'none' || binding.effect === 'host_only')
+        ? 'compute'
+        : binding.effect;
+      if (
+        authority.requirement_id !== nodeId
+        || authority.effect_kind !== operation.effect
+        || authority.outcome_kind !== 'succeeded'
+        || authority.continues_requirement !== 0
+        || binding.nodeId !== nodeId
+        || binding.bindingDigest !== authority.binding_digest
+        || bindingEffect !== operation.effect
+        || binding.providerOperationId !== binding.toolName
+        || binding.logicalToolName !== authority.tool_name
+        || !digest64(authority.argument_digest)
+      ) return { status: 'unavailable', reason: `sealed derivation authority is not exact for ${nodeId}` };
+      const redeemed = redeemSuccessfulSettlementResultForHost({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId: contract.acceptedTaskId,
+        logicalToolCallId,
+      });
+      if (redeemed.status !== 'ok') {
+        return { status: 'unavailable', reason: `sealed derivation result is unavailable for ${nodeId}` };
+      }
+      if (nodeId === contract.lineageNodeId) {
+        const records = hostLineageRecords(redeemed.value.rawPayload);
+        if (!records || hostArtifactContentDigest(records) !== contract.lineageContentDigest) {
+          return { status: 'unavailable', reason: 'sealed derivation lineage bytes no longer match' };
+        }
+      }
+    }
+
+    const readbackBindingRow = db.prepare(`
+      SELECT binding_json, binding_digest
+        FROM graph_node_bindings
+       WHERE session_id = ? AND source_user_seq = ? AND node_id = ?
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      contract.readbackNodeId,
+    ) as { binding_json: string; binding_digest: string } | undefined;
+    if (!readbackBindingRow || readbackBindingRow.binding_digest !== contract.readbackBindingDigest) {
+      return { status: 'unavailable', reason: 'sealed derivation readback binding is missing' };
+    }
+    let readbackBinding: Record<string, unknown>;
+    try { readbackBinding = JSON.parse(readbackBindingRow.binding_json) as Record<string, unknown>; } catch {
+      return { status: 'unavailable', reason: 'sealed derivation readback binding is unreadable' };
+    }
+    if (
+      readbackBinding.effect !== 'read'
+      || typeof readbackBinding.toolName !== 'string'
+      || typeof readbackBinding.capabilityId !== 'string'
+      || typeof readbackBinding.schemaVersion !== 'string'
+      || typeof readbackBinding.schemaDigest !== 'string'
+    ) return { status: 'unavailable', reason: 'sealed derivation readback is not bound read-only' };
+    const authorized = authorizeHostSealedArtifactReadback({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      contractId: loaded.contract.contractId,
+      createLogicalToolCallId: input.createLogicalToolCallId,
+      verificationRequirementId: contract.readbackNodeId,
+      readToolName: readbackBinding.toolName,
+      readArgs: {
+        resourceId: input.createdId,
+        capabilityId: readbackBinding.capabilityId,
+        schemaVersion: readbackBinding.schemaVersion,
+        schemaDigest: readbackBinding.schemaDigest,
+      },
+    });
+    if (authorized.status !== 'authorized' || authorized.resourceId !== input.createdId) {
+      return { status: 'unavailable', reason: 'sealed derivation readback authorization no longer redeems' };
+    }
+    const readback = redeemSuccessfulSettlementResultForHost({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: contract.acceptedTaskId,
+      logicalToolCallId: row.verification_logical_call_id,
+    });
+    if (readback.status !== 'ok') {
+      return { status: 'unavailable', reason: 'sealed derivation readback result is unavailable' };
+    }
+    const raw = readback.value.rawPayload;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { status: 'unavailable', reason: 'sealed derivation readback result is malformed' };
+    }
+    const readbackValue = raw as { id?: unknown; content?: unknown };
+    if (
+      readbackValue.id !== input.createdId
+      || readbackValue.content === undefined
+      || inspectProviderEnvelope(readbackValue.content).verdict !== 'clean'
+      || hostArtifactContentDigest(readbackValue.content) !== input.intendedContentDigest
+    ) return { status: 'unavailable', reason: 'sealed derivation readback bytes no longer match' };
+    return {
+      status: 'verified',
+      artifactId: row.artifact_id,
+      lineageContentDigest: contract.lineageContentDigest,
+      verificationLogicalToolCallId: row.verification_logical_call_id,
+    };
+  } catch (error) {
+    return {
+      status: 'unavailable',
+      reason: String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 300),
+    };
+  }
+}
+
 export function generatedArtifactContentVerificationForTests(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -2079,13 +2740,13 @@ export function artifactReuseMessage(artifact: RunArtifact): string {
   if (artifact.status === 'bound') {
     const pointer = artifact.uri ?? artifact.resourceId ?? artifact.id;
     if (artifact.bindingVerifiedAt) {
-      return `Artifact slot ${artifact.slotKey} is already provider-verified and bound to ${pointer}. Reuse or update that resource; do not create another.`;
+      return `Artifact slot ${artifact.slotKey} is already provider-verified and bound to ${pointer}. Use that existing resource; do not create another. Update it only under a separately declared authorized operation or turn.`;
     }
     const repair = artifact.kind === 'site' && artifact.resourceId
-      ? ` Read it back exactly with netlify api getSite --data '{"site_id":"${artifact.resourceId}"}', then reuse or update it explicitly with --site ${artifact.resourceId}; do not run sites:create again.`
+      ? ` Read it back exactly with netlify api getSite --data '{"site_id":"${artifact.resourceId}"}', then reconcile this create claim to that existing site; do not run sites:create again. Update it only under a separately declared authorized operation or turn.`
       : artifact.kind === 'google_doc' && artifact.resourceId
-        ? ` Read it back with GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT using document_id=${artifact.resourceId}. Reuse or update document ${artifact.resourceId}; do not run document create again.`
-        : ' Verify that exact resource, then reuse or update it; do not create another.';
+        ? ` Read it back with GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT using document_id=${artifact.resourceId}. Reconcile this create claim to existing document ${artifact.resourceId}; do not run document create again. Update it only under a separately declared authorized operation or turn.`
+        : ' Verify that exact resource and reconcile the existing create claim; do not create another. Update it only under a separately declared authorized operation or turn.';
     return `Artifact slot ${artifact.slotKey} is already bound but not yet provider-verified: ${pointer}.${repair}`;
   }
   const attempt = artifact.sourceCallId ? `; provider attempt ${artifact.sourceCallId}` : '';

@@ -45,6 +45,10 @@ import {
 } from '../graph/operation-evidence-contract.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { isDeterministicImplicitRetrieveContract } from './expected-work-matcher.js';
+import {
+  loadSealedNodeBinding,
+  peekHostCapabilityCatalogFactory,
+} from './host-capability-catalog-factory.js';
 
 export const OBLIGATION_MANIFEST_VERSION = 1 as const;
 
@@ -96,6 +100,7 @@ function refinedEffect(operation: ResolvedOperationFact): RefinedEffectKind {
   // an irreversible external write until a narrower admin receipt exists.
   if (operation.effectKind === 'admin') return 'external_write';
   if (operation.effectKind === 'unknown') return 'none';
+  if (operation.effectKind === 'host_only') return 'compute';
   return operation.effectKind;
 }
 
@@ -171,6 +176,7 @@ export function compileObligationManifest(input: {
   const identity = durableGraph.identity;
   const frozen = frozenResolutionFor(identity.sessionId, identity.sourceUserSeq);
   const ledgerFacts = frozen.status === 'ok' ? frozen.operations : [];
+  const expectedWork = loadExpectedWorkContract(identity.sessionId, identity.sourceUserSeq);
   if (frozen.status === 'ambiguous') {
     errors.push(`frozen accepted-task resolution is ambiguous: ${frozen.reason}`);
   }
@@ -183,9 +189,8 @@ export function compileObligationManifest(input: {
   // every other read shape, including complete_set action contracts.
   let observationSufficientNodeId: string | null = null;
   try {
-    const frozen = loadExpectedWorkContract(identity.sessionId, identity.sourceUserSeq);
-    if (frozen.status === 'ok' && isDeterministicImplicitRetrieveContract(frozen.contract)) {
-      observationSufficientNodeId = frozen.contract.operations[0]!.id;
+    if (expectedWork.status === 'ok' && isDeterministicImplicitRetrieveContract(expectedWork.contract)) {
+      observationSufficientNodeId = expectedWork.contract.operations[0]!.id;
     }
   } catch { /* an unreadable contract keeps the strict historical obligation */ }
 
@@ -220,10 +225,36 @@ export function compileObligationManifest(input: {
       && operation.dispatchState === 'not_started'
     ) continue;
     const nodeId = `${operation.nodeId}/${operation.operationId}`;
+    // Accepted-task resolution groups a collect/construct family under its
+    // primary work node, while `operationId` retains the exact executable DAG
+    // node. Capability semantics must come from that executable node rather
+    // than from the shared write owner, otherwise every upstream read inherits
+    // the destination manifest.
+    const executableNode = graphNodes.get(operation.operationId) ?? parent;
+    const sealed = loadSealedNodeBinding(identity.sessionId, identity.sourceUserSeq, executableNode.id);
+    const producedOutputKinds = (
+      (sealed?.capabilityId
+        ? peekHostCapabilityCatalogFactory()?.get(sealed.capabilityId)
+        : undefined)
+      ?? peekHostCapabilityCatalogFactory()?.snapshot().find((entry) => (
+        entry.manifest?.operationId === operation.resolvedTool
+        || entry.toolName === operation.resolvedTool
+      ))
+    )?.manifest?.producedOutputKinds
+      ?? (executableNode.capabilityRole === 'source'
+        ? ['locator']
+        : executableNode.capabilityRole === 'collection'
+          || executableNode.capabilityRole === 'collect'
+          || executableNode.capabilityRole === 'readback'
+          ? ['records']
+          : undefined);
     const evidenceContract = operationEvidenceContract({
       resolvedTool: operation.resolvedTool,
       effectKind,
       reversibility: operation.reversibility,
+      producedOutputKinds,
+      finiteBound: durableGraph.classification.multiItem?.collectThenConstruct === true
+        || Number(durableGraph.classification.goalConstraints?.collection?.count) > 0,
     });
     const obligations = attachEvidenceObligations({
       effect: effectKind,
@@ -252,6 +283,26 @@ export function compileObligationManifest(input: {
   // may not derive from a source whose collection is still incomplete.
   const edges: ObligationEdge[] = [];
   const readNodes = nodes.filter((node) => node.effectKind === 'read');
+  const expectedOperations = expectedWork.status === 'ok'
+    ? new Map(expectedWork.contract.operations.map((operation) => [operation.id, operation]))
+    : null;
+  const isUpstreamRead = (sourceOperationId: string, writeOperationId: string): boolean => {
+    if (!expectedOperations) return true;
+    const visited = new Set<string>();
+    const pending = [writeOperationId];
+    while (pending.length > 0) {
+      const operationId = pending.pop()!;
+      if (visited.has(operationId)) continue;
+      visited.add(operationId);
+      const operation = expectedOperations.get(operationId);
+      if (!operation) continue;
+      for (const dependencyId of new Set([...operation.dependsOn, ...operation.dataFrom])) {
+        if (dependencyId === sourceOperationId) return true;
+        pending.push(dependencyId);
+      }
+    }
+    return false;
+  };
   for (const node of nodes) {
     const declared = new Set(node.obligations);
     for (const obligation of node.obligations) {
@@ -263,7 +314,8 @@ export function compileObligationManifest(input: {
         });
       }
       if (obligation === 'derivation_from_current_source') {
-        for (const source of readNodes) {
+        for (const source of readNodes.filter((candidate) =>
+          isUpstreamRead(candidate.operationId, node.operationId))) {
           const sourceObligation = source.obligations.includes('source_completeness')
             ? 'source_completeness' as const
             : source.obligations.includes('source_observed')

@@ -87,10 +87,27 @@ export function operationEvidenceContract(input: {
   resolvedTool: string;
   effectKind: string;
   reversibility: string;
+  producedOutputKinds?: readonly string[];
+  finiteBound?: boolean;
 }): OperationEvidenceContract {
   const parts = tokens(input.resolvedTool);
 
   if (input.effectKind === 'read') {
+    const produced = input.producedOutputKinds ?? [];
+    if (produced.includes('locator') && !produced.includes('records')) {
+      return {
+        mode: 'point_read',
+        requiresExhaustion: false,
+        requiresStaleReconciliation: false,
+      };
+    }
+    if (produced.includes('records') && input.finiteBound === true) {
+      return {
+        mode: 'finite_read',
+        requiresExhaustion: false,
+        requiresStaleReconciliation: false,
+      };
+    }
     // Default an unfamiliar read to collection semantics. Failing closed here
     // may ask the host to establish that no continuation remains; defaulting
     // to point semantics could silently bless page one of an unknown API.

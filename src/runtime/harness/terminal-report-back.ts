@@ -303,6 +303,7 @@ function emitTerminalReportBack(
     // Not "cancelled": the work is still running under a background owner, and
     // the report-back the user gets has to say which of those two happened.
     transferred: 'Chat run moved to the background',
+    uncertain: 'Chat run needs reconciliation',
   };
   const title = `${titlePrefix[facts.outcome]}: ${label}`;
   addNotification({

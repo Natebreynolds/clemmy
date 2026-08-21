@@ -57,6 +57,13 @@ export interface TaskContinuityPacket {
     kind: TaskContinuityPauseKind;
     question: string;
     options: string[];
+    slot?: {
+      goalId: string;
+      revision: number;
+      questionId: string;
+      slotKey: string;
+      predecessorRefs?: readonly string[];
+    };
   };
   capabilities: TaskContinuityCapabilityEvidence[];
   createdAt: string;
@@ -70,6 +77,13 @@ export interface TaskContinuityPacketInput {
     kind: TaskContinuityPauseKind;
     question: string;
     options?: readonly string[];
+    slot?: {
+      goalId: string;
+      revision: number;
+      questionId: string;
+      slotKey: string;
+      predecessorRefs?: readonly string[];
+    };
   };
   capabilities?: ReadonlyArray<{
     kind: string;
@@ -194,6 +208,7 @@ interface RawPacketRow {
   resolution_selected_option: string | null;
   resolution_active_task_input: string | null;
   resolution_semantic_input_hash: string | null;
+  pause_slot_json: string | null;
 }
 
 interface RawSourceRow {
@@ -270,6 +285,7 @@ function ensureSchema(db: Database.Database): void {
                                         'topic_changed', 'user_declined', 'no_longer_needed', 'invalidated'
                                       )),
       origin_audience_hash            TEXT,
+      pause_slot_json                 TEXT,
       consumer_audience_hash          TEXT,
       resolver_version                TEXT,
       resolution_disposition          TEXT,
@@ -369,6 +385,13 @@ function ensureSchema(db: Database.Database): void {
       SELECT RAISE(ABORT, 'task continuity frozen resolution is immutable');
     END;
   `);
+  const columns = new Set(
+    (db.prepare('PRAGMA table_info(task_continuity_packets)').all() as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!columns.has('pause_slot_json')) {
+    db.exec('ALTER TABLE task_continuity_packets ADD COLUMN pause_slot_json TEXT');
+  }
   initializedDatabases.add(db);
 }
 
@@ -755,17 +778,57 @@ function rowToPacket(db: Database.Database, row: RawPacketRow): TaskContinuityPa
   // rows and later mutation of event.data user/channel identity fail closed.
   if (!row.origin_audience_hash || row.origin_audience_hash !== acceptedAudienceHash(origin)) return null;
   if (createdAt.ms < Date.parse(origin.createdAt)) return null;
+  const slot = parsePauseSlotJson(row.pause_slot_json);
   return {
     version: TASK_CONTINUITY_PACKET_VERSION,
     packetId: row.packet_id,
     sessionId,
     originatingSourceUserSeq: sourceSeq,
     originatingSourceEventId: row.originating_source_event_id,
-    pause: { kind: row.pause_kind as TaskContinuityPauseKind, question, options },
+    pause: {
+      kind: row.pause_kind as TaskContinuityPauseKind,
+      question,
+      options,
+      ...(slot ? { slot } : {}),
+    },
     capabilities,
     createdAt: createdAt.iso,
     expiresAt: expiresAt.iso,
   };
+}
+
+function parsePauseSlotJson(raw: string | null): TaskContinuityPacket['pause']['slot'] | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as {
+      goalId?: unknown;
+      revision?: unknown;
+      questionId?: unknown;
+      slotKey?: unknown;
+      predecessorRefs?: unknown;
+    };
+    if (
+      typeof parsed.goalId !== 'string'
+      || !parsed.goalId
+      || !Number.isSafeInteger(parsed.revision)
+      || typeof parsed.questionId !== 'string'
+      || !parsed.questionId
+      || typeof parsed.slotKey !== 'string'
+      || !parsed.slotKey
+    ) return undefined;
+    const predecessorRefs = Array.isArray(parsed.predecessorRefs)
+      ? parsed.predecessorRefs.filter((ref): ref is string => typeof ref === 'string')
+      : undefined;
+    return {
+      goalId: parsed.goalId,
+      revision: parsed.revision as number,
+      questionId: parsed.questionId,
+      slotKey: parsed.slotKey,
+      ...(predecessorRefs && predecessorRefs.length > 0 ? { predecessorRefs } : {}),
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 function lookupResult(
@@ -892,8 +955,8 @@ export class TaskContinuityStore {
           packet_id, version, session_id,
           originating_source_user_seq, originating_source_event_id,
           pause_kind, pause_question, pause_options_json, capability_evidence_json,
-          created_at, expires_at, origin_audience_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          created_at, expires_at, origin_audience_hash, pause_slot_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         packetId,
         TASK_CONTINUITY_PACKET_VERSION,
@@ -907,6 +970,7 @@ export class TaskContinuityStore {
         now.iso,
         expiresAt.iso,
         acceptedAudienceHash(source),
+        input.pause.slot ? JSON.stringify(input.pause.slot) : null,
       );
       const row = db.prepare('SELECT * FROM task_continuity_packets WHERE packet_id = ?')
         .get(packetId) as RawPacketRow;

@@ -20,6 +20,9 @@ const COUNT_PLURAL_RE = /\b(\d{1,3}(?:,\d{3})+|\d+)\s+(?:[a-z][\w'-]+\s+){0,3}?(
 // Prefer that marked count over incidental numbers embedded in the modifier.
 const MARKED_COUNT_PLURAL_RE =
   /\b(?:these|those|each\s+of|every\s+one\s+of(?:\s+(?:the|these|those|my))?|all(?:\s+of)?(?:\s+(?:the|these|those|my))?|the\s+following|top|first|last|leading)\s+(\d{1,3}(?:,\d{3})+|\d+)\s+(?:[a-z0-9&/][\w&/'-]*\s+){0,3}?((?:people|men|women|children)|[a-z][a-z'-]*s)\b/i;
+/** Same marked count, but the noun may be singular: "last 5 facebook post". */
+const MARKED_COUNT_NOUN_RE =
+  /\b(?:these|those|each\s+of|every\s+one\s+of(?:\s+(?:the|these|those|my))?|all(?:\s+of)?(?:\s+(?:the|these|those|my))?|the\s+following|top|first|last|leading)\s+(\d{1,3}(?:,\d{3})+|\d+)\s+(?:[a-z0-9&/][\w&/'-]*\s+){0,3}?([a-z][a-z'-]{2,})\b/i;
 // Enumerated list lines (numbered / bulleted), e.g. a pasted firm list.
 const LIST_ITEM_RE = /^[ \t]*(?:\d+[.)]|[-*•–])\s+([^\r\n]+)$/gim;
 // Aggregate / single-collection retrieval, not N independent jobs.
@@ -61,6 +64,25 @@ const COUNTED_PARTS_SINGLE_CONTAINER_RE =
   /\b(?:\d{1,3}(?:,\d{3})+|\d+)\s+(?:[a-z][\w'-]+\s+){0,2}(?:sections|slides|chapters|parts|components|elements)\b[^.!?\n]{0,160}\b(?:in|inside|within|for|of)\s+(?:one|a|an|the|single)\s+[a-z][\w-]*/i;
 const ANAPHORIC_SINGLE_OUTPUT_PROPOSAL_RE =
   /\b(?:(?:combine|merge|consolidate|synthesi[sz]e|turn|convert|transform|write\s+up|distill)\s+(?:all\s+of\s+)?(?:them|those|these)\b[^.!?\n]{0,160}\b(?:into|as|to)\s+(?:one|a|an|single)\s+[a-z][\w-]*|(?:create|build|draft|write|produce|generate|compile|assemble|make)\s+(?:one|a|an|single)\s+[a-z][\w-]*[^.!?\n]{0,120}\b(?:from|using|with)\s+(?:them|those|these)\b)/i;
+/** Pronoun set landing in one determined container: "add them to a workbook". */
+const ANAPHORIC_ADD_TO_CONTAINER_RE =
+  /\b(?:add|put|place|save|drop)\s+(?:(?:all\s+of\s+)?(?:them|those|these)|it\s+all|all\s+of\s+it)\s+(?:in(?:to)?|to|on)\s+(?:a|an|one|the|my|our|single)\s+[a-z][\w-]*/i;
+/** Same container landing, with the set named as info/data rather than a pronoun. */
+const ANAPHORIC_INFO_TO_CONTAINER_RE =
+  /\b(?:add|put|place|save|drop)\s+(?:all\s+(?:of\s+)?(?:the\s+)?)?(?:info|information|data|details|results)\s+(?:in(?:to)?|to|on)\s+(?:a|an|one|the|my|our|single)\s+[a-z][\w-]*/i;
+/** Same landing, projecting an enumerated field list: "put the title, date, and link on a new workbook". */
+const FIELD_ITEM = String.raw`(?:the\s+)?(?!and\b|or\b)[a-z][a-z'-]+(?:s)?`;
+const FIELD_LIST_TO_CONTAINER_RE = new RegExp(
+  String.raw`\b(?:add|put|place|save|drop)\s+${FIELD_ITEM}(?:(?:\s*,\s*${FIELD_ITEM})+\s*,?\s+and\s+|\s+and\s+)${FIELD_ITEM}\s+(?:in(?:to)?|to|on)\s+(?:a|an|one|the|my|our|single)\s+[a-z][\w-]*`,
+  'i',
+);
+/** "return these fields for each" projects columns across one collected set;
+ * it does not ask for one independently delivered artifact per member. */
+const PER_ITEM_FIELD_PROJECTION_RE =
+  /\b(?:give|show|list|provide|return|include|capture|record)\b[^.!?\n]{0,180}\bfor\s+(?:each|every)\b/i;
+/** Count carried by a pronoun: "5 of them". The noun lives earlier in the ask. */
+const COUNT_OF_PRONOUN_RE =
+  /\b(\d{1,3}(?:,\d{3})+|\d+)\s+of\s+(?:them|those|these)\b/i;
 const TRAILING_EACH_OUTPUT_RE =
   /\b(?:one|a|an|single)\s+(?:[a-z][\w-]*\s+){0,3}[a-z][\w-]*\s+each\b/i;
 const STRUCTURAL_PER_ITEM_WORK_RE =
@@ -116,6 +138,12 @@ export interface MultiItemIntent {
    * prove cardinality, but not the identity of every accepted member. */
   exactMembers?: string[];
   carriedFromPrior?: boolean;
+  /**
+   * The counted set is the READ universe; the write is one artifact built
+   * from that set. Fan-out would freeze a per-item write and then refuse the
+   * real construct (one sheet / one report / one file).
+   */
+  collectThenConstruct?: boolean;
 }
 
 const NO_MULTI_ITEM: MultiItemIntent = Object.freeze({
@@ -198,6 +226,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
     let kind: string | null = null;
     let countIndex = -1;
     let countEndIndex = -1;
+    let weakCardinal = false;
     if (enumerated) {
       count = listedBodies.length;
     } else {
@@ -261,24 +290,99 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
           };
         }
       }
-      const picked = lastMarked ?? firstValid;
+      // A later destination-row echo does not replace the source universe:
+      // "top 5 restaurants ... create one Sheet containing those 5 rows"
+      // still names restaurants as the collected set. Treat an anaphoric
+      // rows/records/items count as a projection of the earlier equally sized
+      // concrete collection, not a second fan-out universe.
+      const destinationEcho = lastMarked
+        && firstValid
+        && lastMarked.index > firstValid.index
+        && lastMarked.n === firstValid.n
+        && COLLECTION_ITEM_NOUNS.has(lastMarked.noun)
+        && !COLLECTION_ITEM_NOUNS.has(firstValid.noun);
+      const picked = destinationEcho ? firstValid : (lastMarked ?? firstValid);
       if (picked) {
         count = picked.n;
         kind = picked.noun;
         countIndex = picked.index;
         countEndIndex = picked.end;
+      } else {
+        const markedNounRe = new RegExp(MARKED_COUNT_NOUN_RE.source, 'i');
+        const markedNoun = markedNounRe.exec(text);
+        if (markedNoun) {
+          const itemCount = Number.parseInt(markedNoun[1]!.replace(/,/g, ''), 10);
+          const noun = markedNoun[2]!.toLowerCase();
+          if (
+            Number.isSafeInteger(itemCount)
+            && itemCount >= 3
+            && !NON_ITEM_NOUNS.has(noun)
+            && !(noun.endsWith('s') && NON_ITEM_NOUNS.has(noun))
+          ) {
+            count = itemCount;
+            kind = noun;
+            const countOffset = markedNoun[0].indexOf(markedNoun[1]!);
+            countIndex = markedNoun.index + Math.max(0, countOffset);
+            countEndIndex = markedNoun.index + markedNoun[0].length;
+            weakCardinal = true;
+          }
+        }
+        if (count < 3) {
+          const pronounCount = COUNT_OF_PRONOUN_RE.exec(text);
+          if (pronounCount) {
+            const itemCount = Number.parseInt(pronounCount[1]!.replace(/,/g, ''), 10);
+            if (Number.isSafeInteger(itemCount) && itemCount >= 3) {
+              count = itemCount;
+              countIndex = pronounCount.index;
+              countEndIndex = pronounCount.index + pronounCount[0].length;
+              weakCardinal = true;
+            }
+          }
+        }
       }
     }
     if (count < 3) return NO_MULTI_ITEM;
     const explicitPerTarget = EXPLICIT_LIST_TARGET_RE.test(text)
       || explicitPerTargetForKind(text, kind)
       || TRAILING_EACH_OUTPUT_RE.test(text);
-    if (
-      (SOURCE_TO_SINGLE_OUTPUT_RE.test(text) || COUNTED_PARTS_SINGLE_CONTAINER_RE.test(text))
-      && !explicitPerTarget
-    ) {
-      return NO_MULTI_ITEM;
+    const singleContainer = SINGLE_PARENT_RE.exec(text);
+    const collectedSetPrecedesContainer = Boolean(
+      singleContainer
+      && countEndIndex > 0
+      && countEndIndex < singleContainer.index,
+    );
+    // "phone and rating for each, then create one workbook" describes the
+    // projection of one collection into one artifact. The broad `for each`
+    // detector is still authoritative everywhere else (especially "create one
+    // report for each" and explicit parallel work).
+    const projectionOnlyPerTarget = collectedSetPrecedesContainer
+      && PER_ITEM_FIELD_PROJECTION_RE.test(text)
+      && !EXPLICIT_PARALLEL_RE.test(actionText)
+      && !TRAILING_EACH_OUTPUT_RE.test(text);
+    const constructHasPerTargetOutput = explicitPerTarget && !projectionOnlyPerTarget;
+    const collectThenConstruct = !constructHasPerTargetOutput && (
+      SOURCE_TO_SINGLE_OUTPUT_RE.test(text)
+      || COUNTED_PARTS_SINGLE_CONTAINER_RE.test(text)
+      || ANAPHORIC_SINGLE_OUTPUT_PROPOSAL_RE.test(text)
+      || ANAPHORIC_ADD_TO_CONTAINER_RE.test(text)
+      || ANAPHORIC_INFO_TO_CONTAINER_RE.test(text)
+      || FIELD_LIST_TO_CONTAINER_RE.test(text)
+      || collectedSetPrecedesContainer
+    );
+    if (collectThenConstruct) {
+      return {
+        isMultiItem: false,
+        itemCount: count,
+        itemKind: kind,
+        sameShapeWork: false,
+        explicitParallelRequest: false,
+        collectThenConstruct: true,
+      };
     }
+    // Weak cardinality ("N of them", "last 5 post") only names a set for a
+    // container landing. Without that landing it is not enough to freeze
+    // per-item fan-out.
+    if (weakCardinal) return NO_MULTI_ITEM;
     const singleParent = SINGLE_PARENT_RE.exec(text);
     const parentToCount = singleParent && countIndex > singleParent.index
       ? text.slice(singleParent.index + singleParent[0].length, countIndex)

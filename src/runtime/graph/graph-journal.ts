@@ -39,8 +39,13 @@ export type SettlementClass =
   | 'infrastructure'
   /** Authority or policy refused the node before it could act. */
   | 'policy'
-  /** The run's cancellation signal stopped it. */
-  | 'cancelled';
+  /** The run's cancellation signal stopped it before a write could be proven. */
+  | 'cancelled'
+  /** The runner finished a write, then the run was cancelled — keep the
+   *  receipt, fire no success edges, do not redispatch. */
+  | 'completed_after_cancel'
+  /** Dispatch had started with no receipt when cancel landed — observe, never redispatch. */
+  | 'uncertain_after_cancel';
 
 /**
  * The activation opener (journal schema v4). One per activation, appended
@@ -147,4 +152,5 @@ export function validWave(value: unknown): value is number {
  */
 export interface GraphJournalAdapter {
   append(entry: GraphJournalEntry): Promise<void>;
+  appendSync?(entry: GraphJournalEntry): void;
 }

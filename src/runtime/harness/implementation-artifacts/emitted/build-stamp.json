@@ -1,0 +1,10 @@
+{
+  "implementationManifestDigest": "7447c237ee5f8a06ed307df0285c0f6b465d3540f9089a659cf59a1a2c5d8734",
+  "artifacts": {
+    "invoke": "db79930f18734c1ff7773eb6db1b932b731338ea1a5a3bad3afb3aaacc492711",
+    "reconcile": "61b3f84386ededf4572177f19891efe00a9b09bad9db885c1ac582297891ab78",
+    "observer": "543faf6aa11edde1af8bdd0a1c5795575d89f4cb35a26a5e11326086a8f0a9c3",
+    "transport": "d4bd4c04fab5ca4a0f8fdb7cb33318a8613f7a6a88614e0dac8a9f084a992da8",
+    "transportIsolated": "82f311cce8e88ae50c0aafe4c5760391c18920321738fa6f68a432452b6a3a8e"
+  }
+}

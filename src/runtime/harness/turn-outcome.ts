@@ -13,6 +13,11 @@
 import { parseNarratedEnvelope } from './envelope-narration.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { looksLikeCompactDecisionProtocol } from './presentation-hygiene.js';
+import {
+  defaultHoldForControlState,
+  isTypedControlStatus,
+  renderTypedControlState,
+} from './typed-control-state.js';
 
 // 'transferred' is deliberately its own status rather than a cancellation
 // carrying a note. A cancelled turn is work that STOPPED; a transferred turn is
@@ -20,7 +25,7 @@ import { looksLikeCompactDecisionProtocol } from './presentation-hygiene.js';
 // board, report-back, resume, and the sentence the user reads — acts on that
 // difference, so collapsing the two makes the taxonomy misstate the one fact it
 // exists to carry.
-export type TurnOutcomeStatus = 'done' | 'needs_input' | 'blocked' | 'failed' | 'cancelled' | 'transferred';
+export type TurnOutcomeStatus = 'done' | 'needs_input' | 'blocked' | 'failed' | 'cancelled' | 'transferred' | 'uncertain';
 
 export type TurnNeed =
   | { kind: 'input' }
@@ -113,6 +118,12 @@ export type TurnOutcome = TurnOutcomeBase & (
       presentation: Extract<PublicPresentation, { kind: 'blocked' }>;
     }
   | {
+      status: 'uncertain';
+      resumable: true;
+      needs?: never;
+      presentation: Extract<PublicPresentation, { kind: 'blocked' }>;
+    }
+  | {
       status: 'failed';
       resumable: false;
       needs?: never;
@@ -194,6 +205,27 @@ export function assertPublicPresentationText(value: string): string {
   return text;
 }
 
+/** Control states keep a host sentence when the optional author is empty or
+ *  unsafe. Answers, errors, and stops still fail closed — those are not
+ *  optional presentation. */
+function publicTextForOutcome(outcome: TurnOutcome): string {
+  try {
+    return assertPublicPresentationText(outcome.presentation.text);
+  } catch (error) {
+    if (isTypedControlStatus(outcome.status) && error instanceof UnsafePresentationError) {
+      return renderTypedControlState({
+        status: outcome.status,
+        hold: defaultHoldForControlState({
+          status: outcome.status,
+          ...(outcome.status === 'needs_input' ? { needs: outcome.needs } : {}),
+        }),
+        ...(outcome.status === 'needs_input' ? { needs: outcome.needs } : {}),
+      });
+    }
+    throw error;
+  }
+}
+
 function normalizeIdentity(identity: TurnIdentity): TurnIdentity {
   const sessionId = cleanRequired(identity.sessionId, 'identity.sessionId');
   if (!Number.isSafeInteger(identity.turn) || identity.turn < 0) {
@@ -250,7 +282,7 @@ export function presentationEventForOutcome(outcome: TurnOutcome): PresentationE
       `outcome.id must equal the canonical turn identity (${canonicalOutcomeId}).`,
     );
   }
-  const text = assertPublicPresentationText(outcome.presentation.text);
+  const text = publicTextForOutcome(outcome);
   const evidenceRefs = normalizeEvidenceRefs(outcome.evidenceRefs);
   const needs = outcome.status === 'needs_input' ? outcome.needs : undefined;
 
@@ -262,8 +294,9 @@ export function presentationEventForOutcome(outcome: TurnOutcome): PresentationE
         || (needs?.kind === 'approval' && outcome.presentation.kind === 'approval')
         || (needs?.kind === 'continue' && outcome.presentation.kind === 'continue')
       )
-      : outcome.status === 'blocked'
+      : outcome.status === 'blocked' || outcome.status === 'uncertain'
         ? outcome.presentation.kind === 'blocked' && needs === undefined
+          && (outcome.status !== 'uncertain' || outcome.resumable === true)
         : outcome.status === 'failed'
           ? outcome.presentation.kind === 'error' && outcome.resumable === false && needs === undefined
           : outcome.status === 'transferred'
@@ -305,7 +338,8 @@ function isTurnOutcomeStatus(value: unknown): value is TurnOutcomeStatus {
     || value === 'blocked'
     || value === 'failed'
     || value === 'cancelled'
-    || value === 'transferred';
+    || value === 'transferred'
+    || value === 'uncertain';
 }
 
 const PRESENTATION_KINDS: ReadonlySet<string> = new Set([
@@ -517,8 +551,11 @@ export function presentationEventFromCompletionData(value: unknown): Presentatio
         || (needs?.kind === 'approval' && raw.kind === 'approval' && approvalId !== undefined)
         || (needs?.kind === 'continue' && raw.kind === 'continue' && approvalId === undefined)
       )
-      : raw.status === 'blocked'
-        ? raw.kind === 'blocked' && needs === undefined && approvalId === undefined
+      : raw.status === 'blocked' || raw.status === 'uncertain'
+        ? raw.kind === 'blocked'
+          && needs === undefined
+          && approvalId === undefined
+          && (raw.status !== 'uncertain' || raw.resumable === true)
         : raw.status === 'failed'
           ? raw.kind === 'error' && raw.resumable === false && needs === undefined && approvalId === undefined
           : raw.status === 'transferred'

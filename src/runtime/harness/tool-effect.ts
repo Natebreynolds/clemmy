@@ -24,7 +24,7 @@ import {
  * prevents the exact drift that caused native sends to look harmless while
  * ordinary build/test/render shell calls looked like dangerous writes.
  */
-export type RuntimeToolEffect = 'read' | 'compute' | 'local_write' | 'external_write' | 'admin' | 'unknown';
+export type RuntimeToolEffect = 'read' | 'compute' | 'host_only' | 'local_write' | 'external_write' | 'admin' | 'unknown';
 
 export interface RuntimeToolEffectDecision {
   effect: RuntimeToolEffect;
@@ -263,6 +263,14 @@ function decodedToolArgs(args: unknown): unknown {
 export interface RuntimeEffectiveToolIdentity {
   toolName: string | null;
   args: unknown;
+  /** True when the peel ended at the trusted Composio gateway, so `args` is
+   *  that gateway's `{tool_slug, arguments}` carrier payload. Contract
+   *  canonicalization must peel it to the inner contract regardless of which
+   *  outer carrier (call_tool, work_call, direct) started the chain — keying
+   *  on the OUTER name digested the same provider call differently per
+   *  carrier, and that divergence is what poisoned the 2026-08-18 live
+   *  FIRECRAWL_SEARCH step. */
+  composioCarrier?: boolean;
 }
 
 /**
@@ -314,6 +322,7 @@ export function unwrapRuntimeEffectiveToolIdentity(
     return {
       toolName: typeof slug === 'string' && slug.trim() ? slug.trim() : tail,
       args,
+      composioCarrier: true,
     };
   }
 
@@ -384,7 +393,15 @@ function oneShellCommandMutatesLocalState(command: string): boolean {
   if (/(?:^|[;&|\n])\s*(?:sudo\s+)?git\s+(?:add|commit|merge|rebase|reset|clean|checkout|restore|branch|tag|stash)\b/i.test(unquoted)) return true;
   if (/(?:^|[;&|\n])\s*(?:npm|pnpm|yarn|pip|pip3|gem|cargo|brew)\s+(?:install|add|remove|uninstall|update|upgrade|link|unlink)\b/i.test(unquoted)) return true;
   if (/(?:^|[;&|\n])\s*sed\s+[^;&|\n]*\s-i(?:\s|$)/i.test(unquoted)) return true;
-  return /(^|[^>])>>?\s*[^&|]/.test(unquoted) || /(?:^|[;&|\n])\s*tee\b/i.test(unquoted);
+  // Stderr/stdout suppression is not a write. Live 2026-08-14: `sf data query
+  // … 2>/dev/null | python3 -c '…'` is a Salesforce read; the `2>` made the
+  // host label it local_write, so the retrieve contract never observed it.
+  const withoutNullRedirects = unquoted
+    .replace(/(?:\d+)?>>?\s*\/dev\/null\b/g, ' ')
+    .replace(/(?:\d+)?>>&\d+\b/g, ' ')
+    .replace(/(?:\d+)?>>&-/g, ' ');
+  return /(^|[^>])>>?\s*[^&|]/.test(withoutNullRedirects)
+    || /(?:^|[;&|\n])\s*tee\b/i.test(withoutNullRedirects);
 }
 
 function shellMutatesLocalState(command: string): boolean {
@@ -497,6 +514,15 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
   const isNamespaced = normalized.includes('__');
   const isClementineLocal = isClementineLocalNamespace(normalized);
   if (isNamespaced && !isClementineLocal) return classifyNativeMcp(toolName, args);
+
+  // A bare SCREAMING_SNAKE name is a Composio slug: tool_search hands the
+  // model slugs as exact reachable inner-tool names, and dispatch resolves
+  // them to the gateway. Effect authority must resolve them the same way —
+  // classifying the slug as 'unknown' made the finish-phase governor refuse
+  // the exact Sheets create its own advisory demanded (live 2026-08-18).
+  if (!isNamespaced && /^[A-Z0-9]+(?:_[A-Z0-9]+)+$/.test(normalized)) {
+    return classifyComposio({ tool_slug: normalized, arguments: args });
+  }
 
   return classifyRegistered(normalized)
     ?? { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
