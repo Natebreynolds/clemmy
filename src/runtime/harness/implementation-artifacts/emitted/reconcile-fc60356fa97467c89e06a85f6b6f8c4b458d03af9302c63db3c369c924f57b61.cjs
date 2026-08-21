@@ -55,18 +55,6 @@ var init_security = __esm({
 });
 
 // src/config.ts
-function realUserHome() {
-  try {
-    return import_node_os.default.userInfo().homedir;
-  } catch {
-    return import_node_os.default.homedir();
-  }
-}
-function isTestProcess() {
-  return Boolean(
-    process.env.NODE_TEST_CONTEXT || process.env.CLEMMY_TEST_ISOLATED_HOME === "1" || process.argv.includes("--test")
-  );
-}
 function parseEnvFile(envPath) {
   if (!(0, import_node_fs.existsSync)(envPath)) return {};
   const result = {};
@@ -84,16 +72,6 @@ function parseEnvFile(envPath) {
   }
   return result;
 }
-function envSearchPaths() {
-  if (process.env.CLEMMY_TEST_ISOLATED_HOME === "1") {
-    return [import_node_path.default.join(BASE_DIR, ".env")];
-  }
-  return [
-    import_node_path.default.join(PKG_DIR, ".env"),
-    import_node_path.default.join(process.cwd(), ".env"),
-    import_node_path.default.join(BASE_DIR, ".env")
-  ];
-}
 function getEnv(key, fallback = "") {
   return process.env[key] ?? env[key] ?? fallback;
 }
@@ -109,7 +87,11 @@ function normalizeWebhookHost(value) {
   return "127.0.0.1";
 }
 function getRuntimeEnv(key, fallback = "") {
-  const activeEnvFiles = envSearchPaths().filter((filePath, index, items) => (0, import_node_fs.existsSync)(filePath) && items.indexOf(filePath) === index);
+  const activeEnvFiles = [
+    import_node_path.default.join(PKG_DIR, ".env"),
+    import_node_path.default.join(process.cwd(), ".env"),
+    import_node_path.default.join(BASE_DIR, ".env")
+  ].filter((filePath, index, items) => (0, import_node_fs.existsSync)(filePath) && items.indexOf(filePath) === index);
   const currentEnv = Object.assign({}, ...activeEnvFiles.map((filePath) => parseEnvFile(filePath)));
   return process.env[key] ?? currentEnv[key] ?? fallback;
 }
@@ -143,7 +125,7 @@ function resolveDiscordEnabled(rawEnabled, hasToken) {
   if (raw === "false") return false;
   return hasToken;
 }
-var import_node_fs, import_node_os, import_node_path, import_node_url, __filename, __dirname, PKG_DIR, REAL_USER_HOME, REAL_DEFAULT_CLEMENTINE_HOME, DEFAULT_BASE_DIR, BASE_DIR, ACTIVE_ENV_FILES, env, agentsTracingDisabled, ASSISTANT_NAME, OWNER_NAME, OPENAI_API_KEY, AUTH_MODE, CODEX_AUTH_SOURCE_FILE, CODEX_EXECUTABLE, CODEX_INSTALL_PACKAGE, CODEX_SANDBOX_MODE, CODEX_USE_FULL_AUTO, VAULT_DIR, WEBHOOK_ENABLED, WEBHOOK_PORT, WEBHOOK_HOST, WEBHOOK_ALLOW_LAN, MOBILE_APP_PORT, MOBILE_APP_LISTENER_ENABLED, WEBHOOK_SECRET, WEBHOOK_SECRET_IS_STRONG, DISCORD_ENABLED_RAW, DISCORD_HARNESS_ENABLED, DISCORD_BOT_TOKEN, DISCORD_ENABLED, DISCORD_CLIENT_ID, DISCORD_REQUIRE_MENTION, DISCORD_DM_ALLOWED_USERS, DISCORD_ALLOWED_USERS, DISCORD_DM_POLL_INTERVAL_MS, DISCORD_ALLOWED_CHANNELS, DISCORD_PUSH_PROACTIVE_BRIEFS, SLACK_ENABLED_RAW, SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_ENABLED, SLACK_REQUIRE_MENTION, SLACK_ALLOWED_USERS, SLACK_ALLOWED_CHANNELS, SLACK_PROACTIVE_CHANNEL, LOCAL_MCP_ENABLED, MCP_AUTO_IMPORT_ENABLED, MCP_SERVERS_FILE, COMPOSIO_API_KEY, COMPOSIO_USER_ID;
+var import_node_fs, import_node_os, import_node_path, import_node_url, __filename, __dirname, PKG_DIR, DEFAULT_BASE_DIR, BASE_DIR, ACTIVE_ENV_FILES, env, agentsTracingDisabled, ASSISTANT_NAME, OWNER_NAME, OPENAI_API_KEY, AUTH_MODE, CODEX_AUTH_SOURCE_FILE, CODEX_EXECUTABLE, CODEX_INSTALL_PACKAGE, CODEX_SANDBOX_MODE, CODEX_USE_FULL_AUTO, VAULT_DIR, WEBHOOK_ENABLED, WEBHOOK_PORT, WEBHOOK_HOST, WEBHOOK_ALLOW_LAN, MOBILE_APP_PORT, MOBILE_APP_LISTENER_ENABLED, WEBHOOK_SECRET, WEBHOOK_SECRET_IS_STRONG, DISCORD_ENABLED_RAW, DISCORD_HARNESS_ENABLED, DISCORD_BOT_TOKEN, DISCORD_ENABLED, DISCORD_CLIENT_ID, DISCORD_REQUIRE_MENTION, DISCORD_DM_ALLOWED_USERS, DISCORD_ALLOWED_USERS, DISCORD_DM_POLL_INTERVAL_MS, DISCORD_ALLOWED_CHANNELS, DISCORD_PUSH_PROACTIVE_BRIEFS, SLACK_ENABLED_RAW, SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_ENABLED, SLACK_REQUIRE_MENTION, SLACK_ALLOWED_USERS, SLACK_ALLOWED_CHANNELS, SLACK_PROACTIVE_CHANNEL, LOCAL_MCP_ENABLED, MCP_AUTO_IMPORT_ENABLED, MCP_SERVERS_FILE, COMPOSIO_API_KEY, COMPOSIO_USER_ID;
 var init_config = __esm({
   "src/config.ts"() {
     "use strict";
@@ -155,16 +137,13 @@ var init_config = __esm({
     __filename = (0, import_node_url.fileURLToPath)(import_meta_url);
     __dirname = import_node_path.default.dirname(__filename);
     PKG_DIR = import_node_path.default.resolve(__dirname, "..");
-    REAL_USER_HOME = process.env.CLEMMY_REAL_USER_HOME || realUserHome();
-    REAL_DEFAULT_CLEMENTINE_HOME = import_node_path.default.resolve(import_node_path.default.join(REAL_USER_HOME, ".clementine-next"));
-    DEFAULT_BASE_DIR = process.env.CLEMENTINE_HOME || REAL_DEFAULT_CLEMENTINE_HOME;
-    if (isTestProcess() && import_node_path.default.resolve(DEFAULT_BASE_DIR) === REAL_DEFAULT_CLEMENTINE_HOME && process.env.CLEMMY_ALLOW_LIVE_HOME_TESTS !== "1") {
-      throw new Error(
-        "Refusing to bind BASE_DIR to the live Clementine home from a test process. Set CLEMENTINE_HOME to a unique temp directory before importing config, or set CLEMMY_ALLOW_LIVE_HOME_TESTS=1 for an explicit destructive test."
-      );
-    }
+    DEFAULT_BASE_DIR = process.env.CLEMENTINE_HOME || import_node_path.default.join(import_node_os.default.homedir(), ".clementine-next");
     BASE_DIR = DEFAULT_BASE_DIR;
-    ACTIVE_ENV_FILES = envSearchPaths().filter((filePath, index, items) => (0, import_node_fs.existsSync)(filePath) && items.indexOf(filePath) === index);
+    ACTIVE_ENV_FILES = [
+      import_node_path.default.join(PKG_DIR, ".env"),
+      import_node_path.default.join(process.cwd(), ".env"),
+      import_node_path.default.join(BASE_DIR, ".env")
+    ].filter((filePath, index, items) => (0, import_node_fs.existsSync)(filePath) && items.indexOf(filePath) === index);
     env = Object.assign({}, ...ACTIVE_ENV_FILES.map((filePath) => parseEnvFile(filePath)));
     agentsTracingDisabled = resolveOpenAiAgentsTracingDisabled(
       getEnv("OPENAI_AGENTS_DISABLE_TRACING", ""),
