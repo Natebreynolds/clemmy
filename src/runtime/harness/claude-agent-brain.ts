@@ -110,7 +110,12 @@ import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../..
 import { renderProvenSkillForPrompt } from '../../memory/skill-choice-store.js';
 import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput, projectCommandsLineForInput } from './context-packet.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
-import { PUBLIC_RUN_FAILURE_TEXT, publicReplyText } from './public-presentation.js';
+import {
+  PUBLIC_RUN_FAILURE_TEXT,
+  heldExecutionTextForInternalReason,
+  isHostAuthorityHeldReason,
+  publicReplyText,
+} from './public-presentation.js';
 import { finalizePreparedWorkflowDispatchForSource } from './loop.js';
 import {
   assessAcceptedSourceDelivery,
@@ -212,7 +217,14 @@ import {
   revokeDispatchLeaseBeforeRecovery,
   type DispatchRecoveryLedgerCheck,
 } from './dispatch-lease.js';
-import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
+import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
+import {
+  commitUnadmittedSemanticTurn,
+  recordAcceptedSourceGraph,
+} from './record-accepted-source-graph.js';
+import { dispatchAdmittedSource } from '../semantic-boundary/typed-source-dispatch.js';
+import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
+
 import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { requireKnownExpectedWorkContract } from './expected-work-contract.js';
 import {
@@ -1920,38 +1932,85 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       ...(request.runId ? { runId: request.runId } : {}),
     },
   }, { existingEventSeq: preRecordedUserInput?.seq, armRunInFlight: true });
-  recordTurnGraphShadow({
+  const graphEvent = await recordAcceptedSourceGraph({
     identity: {
       sessionId,
       turn: userInputEvent.turn,
       sourceUserSeq: userInputEvent.seq,
     },
     surface,
+    acceptedText: displayMessage,
     allowedToolNames: request.allowedToolNames,
     excludedToolNames: request.excludeToolNames,
     verifiedTaskContinuation: request.taskContinuation,
   });
+  const compiledGraph = turnGraphFromShadowEvent(graphEvent);
+  if (!compiledGraph) {
+    if (semanticPortParticipated(sessionId, userInputEvent.seq)) {
+      const refused = commitUnadmittedSemanticTurn({
+        sessionId,
+        turn: userInputEvent.turn,
+        sourceUserSeq: userInputEvent.seq,
+      });
+      return {
+        sessionId,
+        text: refused.text,
+        stoppedReason: 'error',
+      };
+    }
+    return {
+      sessionId,
+      text: 'The accepted turn could not be admitted for execution.',
+      stoppedReason: 'error',
+    };
+  }
   // Match the standard harness seam: no provider/model/tool work begins until
   // this exact source's hash-validated graph has durable cutover authority.
   // Re-entry from the bridge or a brain fallover observes the existing marker;
   // it never arms an independent task.
-  // Arm wherever a graph exists (all lanes persist the shadow now — the
-  // dispatch ledger and the lane-neutral carrier surface both require it;
-  // see the loop.ts twin for the live incident this closes). Contract and
-  // terminal scoping stay route-owned downstream.
-  // Unconditional (see the loop.ts twin): every lane persists the shadow, so
-  // a null graph event means persistence FAILED and the authority requirement
-  // fails the turn closed before any model call.
   {
     requireAcceptedTaskAuthority({
       sessionId,
       sourceUserSeq: userInputEvent.seq,
     });
+    const dispatched = await dispatchAdmittedSource({
+      sessionId,
+      turn: userInputEvent.turn,
+      sourceUserSeq: userInputEvent.seq,
+    });
+    if (dispatched.kind === 'blocked') {
+      return {
+        sessionId,
+        text: dispatched.text,
+        stoppedReason: 'error',
+      };
+    }
+    if (dispatched.kind === 'needs_input') {
+      return {
+        sessionId,
+        text: dispatched.text,
+        stoppedReason: 'awaiting-input',
+      };
+    }
+    if (dispatched.kind === 'typed') {
+      const ran = dispatched.result;
+      if (ran.status !== 'success' || !ran.artifactHandle) {
+        const raw = ran.error ?? 'Typed construct failed closed before publish.';
+        return {
+          sessionId,
+          text: isHostAuthorityHeldReason(raw)
+            ? heldExecutionTextForInternalReason(raw, ran.status === 'uncertain' ? 'uncertain' : 'blocked')
+            : raw,
+          stoppedReason: 'error',
+        };
+      }
+      return { sessionId, text: ran.artifactHandle, stoppedReason: 'success' };
+    }
     const expectedWork = requireKnownExpectedWorkContract({
       sessionId,
       sourceUserSeq: userInputEvent.seq,
     });
-    if (expectedWork.status === 'action_deferred') {
+    if (expectedWork.status === 'action_deferred' && dispatched.kind !== 'conversation') {
       requireActionExpectedWorkActivation({
         sessionId,
         sourceUserSeq: userInputEvent.seq,

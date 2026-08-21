@@ -219,7 +219,14 @@ import {
   startSettledPreflightConversationAuthor,
   type PreflightConversationPort,
 } from './preflight-conversation.js';
-import { recordTurnGraphShadow, turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
+import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
+import {
+  commitUnadmittedSemanticTurn,
+  recordAcceptedSourceGraph,
+} from './record-accepted-source-graph.js';
+import { dispatchAdmittedSource } from '../semantic-boundary/typed-source-dispatch.js';
+import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
+import { heldExecutionTextForInternalReason, isHostAuthorityHeldReason } from './public-presentation.js';
 // Lane wiring: the callable-surface oracle serves exact local schemas on this
 // lane (guardrail mandates are constructible only from proof).
 import '../../tools/callable-surface-registration.js';
@@ -3856,16 +3863,41 @@ export async function runConversation(
   // candidate remains armed while the bridge tries the next brain.
   const sourceUserSeq = acceptFreshConversationInput(options);
   const acceptedSource = acceptedUserEvent(options.sessionId, sourceUserSeq);
-  const graphEvent = recordTurnGraphShadow({
+  const acceptedText = typeof acceptedSource.data.text === 'string' ? acceptedSource.data.text : options.input;
+  const graphEvent = await recordAcceptedSourceGraph({
     identity: {
       sessionId: options.sessionId,
       turn: acceptedSource.turn,
       sourceUserSeq,
     },
     surface: 'direct',
+    acceptedText,
     verifiedTaskContinuation: options.taskContinuation,
   });
   const acceptedTurnGraph = turnGraphFromShadowEvent(graphEvent);
+  if (!acceptedTurnGraph) {
+    if (semanticPortParticipated(options.sessionId, sourceUserSeq)) {
+      const refused = commitUnadmittedSemanticTurn({
+        sessionId: options.sessionId,
+        turn: acceptedSource.turn,
+        sourceUserSeq,
+      });
+      return {
+        sessionId: options.sessionId,
+        status: 'failed',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        error: refused.text,
+      };
+    }
+    return {
+      sessionId: options.sessionId,
+      status: 'failed',
+      steps: 0,
+      lastTurn: acceptedSource.turn,
+      error: 'The accepted turn could not be admitted for execution.',
+    };
+  }
   // The route comes from the graph wherever one exists — the chat-only
   // forcing to 'direct_reply' left act-routed background sources armed but
   // never ACTIVATED (expected_work_required stayed 0), so every fan-out
@@ -3890,6 +3922,53 @@ export async function runConversation(
       sessionId: options.sessionId,
       sourceUserSeq,
     });
+    const dispatched = await dispatchAdmittedSource({
+      sessionId: options.sessionId,
+      turn: acceptedSource.turn,
+      sourceUserSeq,
+    });
+    if (dispatched.kind === 'blocked') {
+      return {
+        sessionId: options.sessionId,
+        status: 'failed',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        error: dispatched.text,
+      };
+    }
+    if (dispatched.kind === 'needs_input') {
+      return {
+        sessionId: options.sessionId,
+        status: 'awaiting_user_input',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        error: dispatched.text,
+      };
+    }
+    if (dispatched.kind === 'typed') {
+      const ran = dispatched.result;
+      if (ran.status !== 'success' || !ran.artifactHandle) {
+        return {
+          sessionId: options.sessionId,
+          status: 'failed',
+          steps: 0,
+          lastTurn: acceptedSource.turn,
+          error: (() => {
+            const raw = ran.error
+              ?? (ran.status === 'blocked' ? 'typed construct blocked before publish' : 'typed construct failed closed');
+            return isHostAuthorityHeldReason(raw)
+              ? heldExecutionTextForInternalReason(raw, ran.status === 'uncertain' ? 'uncertain' : 'blocked')
+              : raw;
+          })(),
+        };
+      }
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+      };
+    }
     const expectedWork = requireKnownExpectedWorkContract({
       sessionId: options.sessionId,
       sourceUserSeq,
@@ -3901,7 +3980,7 @@ export async function runConversation(
     // (live 2026-08-11 sweep: capability-reconnect 'prepare' and a cron step
     // both died ExpectedWorkBindingRequiredError on write_file).
     const workflowControllerOwned = getSession(options.sessionId)?.kind === 'workflow';
-    if (acceptedCapabilityRoute === 'act' && !workflowControllerOwned) {
+    if (acceptedCapabilityRoute === 'act' && !workflowControllerOwned && dispatched.kind !== 'conversation') {
       if (expectedWork.status !== 'action_deferred') {
         throw new BoundaryError({
           kind: 'state.read_corrupted',
@@ -9476,7 +9555,7 @@ export async function runConversationFromResume(opts: {
 }): Promise<RunConversationResult> {
   const sourceUserSeq = acceptResumeConversationInput(opts);
   const acceptedSource = acceptedUserEvent(opts.sessionId, sourceUserSeq);
-  const graphEvent = recordTurnGraphShadow({
+  const graphEvent = await recordAcceptedSourceGraph({
     identity: {
       sessionId: opts.sessionId,
       turn: acceptedSource.turn,
@@ -9485,6 +9564,29 @@ export async function runConversationFromResume(opts: {
     surface: 'approval_resume',
   });
   const acceptedTurnGraph = turnGraphFromShadowEvent(graphEvent);
+  if (!acceptedTurnGraph) {
+    if (semanticPortParticipated(opts.sessionId, sourceUserSeq)) {
+      const refused = commitUnadmittedSemanticTurn({
+        sessionId: opts.sessionId,
+        turn: acceptedSource.turn,
+        sourceUserSeq,
+      });
+      return {
+        sessionId: opts.sessionId,
+        status: 'failed',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        error: refused.text,
+      };
+    }
+    return {
+      sessionId: opts.sessionId,
+      status: 'failed',
+      steps: 0,
+      lastTurn: acceptedSource.turn,
+      error: 'The accepted turn could not be admitted for execution.',
+    };
+  }
   // Arm the RESUME source exactly like a fresh turn (loop.ts fresh-turn twin).
   // The parked source's armed authority is keyed to ITS seq and does not
   // transfer; without this, every approval resume (Discord/Slack button,
@@ -9496,15 +9598,57 @@ export async function runConversationFromResume(opts: {
       sessionId: opts.sessionId,
       sourceUserSeq,
     });
+    const resumeDispatched = await dispatchAdmittedSource({
+      sessionId: opts.sessionId,
+      turn: acceptedSource.turn,
+      sourceUserSeq,
+    });
+    if (resumeDispatched.kind === 'blocked') {
+      return {
+        sessionId: opts.sessionId,
+        status: 'failed',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        error: resumeDispatched.text,
+      };
+    }
+    if (resumeDispatched.kind === 'needs_input') {
+      return {
+        sessionId: opts.sessionId,
+        status: 'awaiting_user_input',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        error: resumeDispatched.text,
+      };
+    }
+    if (resumeDispatched.kind === 'typed') {
+      const ran = resumeDispatched.result;
+      if (ran.status !== 'success' || !ran.artifactHandle) {
+        return {
+          sessionId: opts.sessionId,
+          status: 'failed',
+          steps: 0,
+          lastTurn: acceptedSource.turn,
+          error: ran.error ?? 'typed construct failed closed',
+        };
+      }
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+      };
+    }
     const resumeExpectedWork = requireKnownExpectedWorkContract({
       sessionId: opts.sessionId,
       sourceUserSeq,
     });
-    const resumeRoute = acceptedTurnGraph?.classification.route ?? 'direct_reply';
+    const resumeRoute = acceptedTurnGraph.classification.route ?? 'direct_reply';
     if (
       resumeRoute === 'act'
       && resumeExpectedWork.status === 'action_deferred'
       && getSession(opts.sessionId)?.kind !== 'workflow'
+      && resumeDispatched.kind !== 'conversation'
     ) {
       requireActionExpectedWorkActivation({ sessionId: opts.sessionId, sourceUserSeq });
     }
