@@ -1989,6 +1989,7 @@ export async function runAdmittedTurnGraph(input: {
         ?? readbackFromArtifacts;
       if (!created || !readback) return { status: 'blocked', reason: 'publish requires create and readback' };
       if (testFault === 'before_publication') throw new Error('forced crash before publication');
+      const publishedText = readback.handle ?? created.handle ?? created.id;
       if (identity) {
         const committed = commitTurnOutcome({
           version: 2,
@@ -2004,9 +2005,9 @@ export async function runAdmittedTurnGraph(input: {
           },
           status: 'done',
           resumable: false,
-          presentation: { kind: 'answer', text: readback.handle ?? created.handle },
+          presentation: { kind: 'answer', text: publishedText },
           evidenceRefs: [
-            { kind: 'artifact', id: created.id, uri: readback.handle ?? created.handle },
+            { kind: 'artifact', id: created.id, uri: publishedText },
             { kind: 'external_receipt', id: created.receipt ?? created.id },
           ],
         }, { terminalJudgeDisposition: 'deliver' });

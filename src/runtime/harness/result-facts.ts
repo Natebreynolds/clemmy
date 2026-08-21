@@ -9,6 +9,7 @@
 import {
   inspectProviderEnvelope,
   providerRequestEchoKey,
+  providerResultBookkeepingKey,
 } from './provider-read-evidence.js';
 
 export type ResultCompleteness = 'complete' | 'partial' | 'unknown';
@@ -26,6 +27,95 @@ export interface RawResultHandleFacts {
   statusCode: number | null;
   /** Exact opaque provider cursor. Host-only; never render this to the model. */
   cursor: string | null;
+}
+
+export const LEGACY_ENVELOPE_LOG_ID_MAX_BYTES = 512;
+
+export type StoredEnvelopeMetadataReconciliation =
+  | {
+    matches: true;
+    metadata: Record<string, unknown> | null;
+    legacyRehydrated: boolean;
+  }
+  | { matches: false };
+
+function canonicalEnvelopeMetadata(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalEnvelopeMetadata).join(',')}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalEnvelopeMetadata(record[key])}`)
+    .join(',')}}`;
+}
+
+function storedEnvelopeMetadataIsExact(
+  storedJson: string | null,
+  rederived: Record<string, unknown> | null,
+): boolean {
+  if (storedJson === null) return rederived === null;
+  try {
+    return canonicalEnvelopeMetadata(JSON.parse(storedJson) as unknown)
+      === canonicalEnvelopeMetadata(rederived);
+  } catch {
+    return false;
+  }
+}
+
+function isNarrowLegacyEnvelopeMetadata(metadata: Record<string, unknown>): boolean {
+  const prototype = Object.getPrototypeOf(metadata);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  const allowedKeys = new Set(['successful', 'success', 'ok', 'logId']);
+  const ownKeys = Reflect.ownKeys(metadata);
+  if (ownKeys.some((key) => typeof key !== 'string' || !allowedKeys.has(key))) return false;
+
+  const successKeys = ['successful', 'success', 'ok'] as const;
+  const presentSuccessKeys = successKeys.filter((key) => (
+    Object.prototype.hasOwnProperty.call(metadata, key)
+  ));
+  if (presentSuccessKeys.length === 0) return false;
+  if (presentSuccessKeys.some((key) => metadata[key] !== true)) return false;
+  if (!Object.prototype.hasOwnProperty.call(metadata, 'logId')) return false;
+
+  const logId = metadata.logId;
+  return typeof logId === 'string'
+    && logId.trim().length > 0
+    && Buffer.byteLength(logId, 'utf8') <= LEGACY_ENVELOPE_LOG_ID_MAX_BYTES;
+}
+
+/**
+ * Reconcile immutable envelope metadata with facts re-derived from retained
+ * provider bytes. Exact equality is always authoritative. The sole historical
+ * exception is an absent stored projection from before root wrapper metadata
+ * was persisted; that exception is intentionally limited to a positive,
+ * bounded provider acknowledgement and never repairs conflicting stored data.
+ */
+export function reconcileStoredEnvelopeMetadata(input: {
+  storedJson: string | null;
+  rederived: Record<string, unknown> | null;
+  rawPayload: unknown;
+}): StoredEnvelopeMetadataReconciliation {
+  if (storedEnvelopeMetadataIsExact(input.storedJson, input.rederived)) {
+    return {
+      matches: true,
+      metadata: input.rederived,
+      legacyRehydrated: false,
+    };
+  }
+  if (
+    input.storedJson !== null
+    || input.rederived === null
+    || !isNarrowLegacyEnvelopeMetadata(input.rederived)
+    || inspectProviderEnvelope(input.rawPayload).verdict !== 'clean'
+  ) {
+    return { matches: false };
+  }
+  return {
+    matches: true,
+    metadata: input.rederived,
+    legacyRehydrated: true,
+  };
 }
 
 const CURSOR_KEYS = [
@@ -49,8 +139,9 @@ const HAS_MORE_KEYS = new Set([
 const EXPLICIT_COMPLETE_KEYS = new Set([
   'complete', 'iscomplete', 'completed', 'exhausted', 'islastpage',
 ]);
-const CURSOR_VALUE_KEYS = new Set([
-  'cursor', 'nextcursor', 'nextpagetoken', 'pagetoken', 'nexttoken',
+const CURRENT_CURSOR_VALUE_KEYS = new Set(['cursor', 'pagetoken']);
+const NEXT_CURSOR_VALUE_KEYS = new Set([
+  'nextcursor', 'nextpagetoken', 'nexttoken',
   'continuation', 'continuationtoken', 'nextlink', 'odatanextlink',
   'nextrecordsurl',
 ]);
@@ -58,8 +149,9 @@ const TOTAL_KEYS = new Set([
   'total', 'totalcount', 'totalrecords', 'totalitems', 'odatacount',
 ]);
 const RETURNED_KEYS = new Set([
-  'returned', 'returnedcount', 'itemsreturned', 'recordsreturned', 'pagesize',
+  'returned', 'returnedcount', 'itemsreturned', 'recordsreturned',
 ]);
+const PAGE_SIZE_KEYS = new Set(['pagesize', 'perpage']);
 const OFFSET_KEYS = new Set(['offset', 'start', 'startindex', 'skip']);
 const PAGE_KEYS = new Set(['page', 'pagenumber', 'currentpage']);
 const PAGE_COUNT_KEYS = new Set(['pagecount', 'totalpages', 'numpages']);
@@ -76,6 +168,10 @@ const REQUEST_ECHO_KEYS = new Set([
 interface PaginationInspection {
   completeness: ResultCompleteness;
   cursor: string | null;
+  /** The payload asserted a recognized pagination protocol but its fields
+   * contradicted that protocol (for example, a page returned more records
+   * than its own total). Unknown/absent pagination is not malformed. */
+  malformed: boolean;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -126,15 +222,6 @@ function booleanSignal(value: unknown): boolean | undefined {
   return undefined;
 }
 
-function nonnegativeNumber(value: unknown): number | undefined {
-  const numeric = typeof value === 'number'
-    ? value
-    : typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim())
-      ? Number(value.trim())
-      : Number.NaN;
-  return Number.isFinite(numeric) && numeric >= 0 ? numeric : undefined;
-}
-
 function nonnegativeSafeInteger(value: unknown): number | undefined {
   const numeric = typeof value === 'number'
     ? value
@@ -142,6 +229,65 @@ function nonnegativeSafeInteger(value: unknown): number | undefined {
       ? Number(value.trim())
       : Number.NaN;
   return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : undefined;
+}
+
+function inspectIntegerFields(
+  normalized: Map<string, unknown>,
+  keys: ReadonlySet<string>,
+): { present: boolean; value: number | undefined; malformed: boolean } {
+  let present = false;
+  let value: number | undefined;
+  let malformed = false;
+  for (const key of keys) {
+    if (!normalized.has(key)) continue;
+    present = true;
+    const candidate = nonnegativeSafeInteger(normalized.get(key));
+    if (candidate === undefined) {
+      malformed = true;
+      continue;
+    }
+    if (value !== undefined && value !== candidate) malformed = true;
+    value ??= candidate;
+  }
+  return { present, value, malformed };
+}
+
+function inspectOffsetFields(
+  normalized: Map<string, unknown>,
+): {
+  present: boolean;
+  value: number | undefined;
+  opaqueCursor: string | null;
+  malformed: boolean;
+} {
+  let present = false;
+  let value: number | undefined;
+  let opaqueCursor: string | null = null;
+  let malformed = false;
+  for (const key of OFFSET_KEYS) {
+    if (!normalized.has(key)) continue;
+    present = true;
+    const raw = normalized.get(key);
+    const candidate = nonnegativeSafeInteger(raw);
+    if (candidate !== undefined) {
+      if (opaqueCursor !== null || (value !== undefined && value !== candidate)) malformed = true;
+      value ??= candidate;
+      continue;
+    }
+    // Airtable and other cursor APIs call their opaque continuation token
+    // `offset`. Preserve those bytes as a cursor. Numeric-looking but invalid
+    // offsets (-1, fractions, overflow) remain malformed rather than being
+    // laundered into opaque continuation authority.
+    const trimmed = typeof raw === 'string' ? raw.trim() : '';
+    const numericLooking = /^[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)$/i.test(trimmed);
+    if (key === 'offset' && trimmed.length > 0 && !numericLooking) {
+      if (value !== undefined || (opaqueCursor !== null && opaqueCursor !== raw)) malformed = true;
+      opaqueCursor ??= raw as string;
+      continue;
+    }
+    malformed = true;
+  }
+  return { present, value, opaqueCursor, malformed };
 }
 
 function cursorValue(value: unknown): string | null {
@@ -159,7 +305,9 @@ function cursorValue(value: unknown): string | null {
 function inspectPagination(
   envelope: Record<string, unknown>,
   recordCount: number,
-  hasRecordCollection: boolean,
+  recordPath: string | null,
+  structuralCollectionPaths: readonly string[],
+  structuralCollectionHasValues: boolean,
 ): PaginationInspection {
   let nodes = 0;
   let sawPartial = false;
@@ -168,31 +316,64 @@ function inspectPagination(
   let explicitIncomplete = false;
   let malformedPagination = false;
   let cursor: string | null = null;
+  let sawNextTerminal = false;
+  const hasRecordCollection = recordPath !== null;
+  const collectionOwnerPaths = structuralCollectionPaths.map((path) => (
+    path === ''
+      ? []
+      : path.split('.').slice(0, -1).map(normalizedStructuralKey)
+  ));
+  const hasCollectionShape = collectionOwnerPaths.length > 0;
 
-  const markCursor = (value: unknown): void => {
+  const isCollectionAncestor = (path: readonly string[]): boolean => (
+    collectionOwnerPaths.some((ownerPath) => (
+      path.length <= ownerPath.length
+      && path.every((segment, index) => segment === ownerPath[index])
+    ))
+  );
+
+  const markNextCursor = (value: unknown): void => {
     const candidate = cursorValue(value);
     if (candidate !== null) {
+      if (sawNextTerminal || (cursor !== null && cursor !== candidate)) {
+        malformedPagination = true;
+        return;
+      }
       sawPartial = true;
       cursor ??= candidate;
     }
   };
 
-  const visit = (value: unknown, depth: number, parentKey: string): void => {
+  const markNextTerminal = (): void => {
+    if (cursor !== null) malformedPagination = true;
+    sawNextTerminal = true;
+    sawTerminal = true;
+  };
+
+  const visit = (
+    value: unknown,
+    depth: number,
+    parentKey: string,
+    path: readonly string[],
+    paginationScope: boolean,
+  ): void => {
     if (!value || typeof value !== 'object') return;
     nodes += 1;
     if (depth > PAGINATION_MAX_DEPTH || nodes > PAGINATION_MAX_NODES) {
-      sawPartial = true;
+      if (paginationScope) sawPartial = true;
       return;
     }
     if (Array.isArray(value)) {
-      for (const child of value.slice(0, PAGINATION_MAX_ENTRIES)) visit(child, depth + 1, parentKey);
-      if (value.length > PAGINATION_MAX_ENTRIES) sawPartial = true;
+      for (const child of value.slice(0, PAGINATION_MAX_ENTRIES)) {
+        visit(child, depth + 1, parentKey, path, paginationScope);
+      }
+      if (value.length > PAGINATION_MAX_ENTRIES && paginationScope) sawPartial = true;
       return;
     }
 
     const record = value as Record<string, unknown>;
     const entries = Object.entries(record);
-    if (entries.length > PAGINATION_MAX_ENTRIES) sawPartial = true;
+    if (entries.length > PAGINATION_MAX_ENTRIES && paginationScope) sawPartial = true;
     const normalized = new Map(entries.map(([key, child]) => [normalizedStructuralKey(key), child]));
 
     // Salesforce REST/CLI query pages use `{ totalSize, done, records }`
@@ -230,54 +411,126 @@ function inspectPagination(
     // OData defines continuation by the optional @odata.nextLink member. A
     // response carrying @odata.context is an OData envelope, so absence (or a
     // null value handled below) is positive terminal protocol evidence.
-    if (normalized.has('odatacontext') && !normalized.has('odatanextlink')) {
+    if (paginationScope && normalized.has('odatacontext') && !normalized.has('odatanextlink')) {
       sawTerminal = true;
     }
 
-    for (const key of EXPLICIT_COMPLETE_KEYS) {
-      if (!normalized.has(key)) continue;
-      const signal = booleanSignal(normalized.get(key));
-      if (signal === true) explicitComplete = true;
-      else if (signal === false) explicitIncomplete = true;
-    }
-
     let objectHasMore: boolean | undefined;
-    for (const key of HAS_MORE_KEYS) {
-      if (!normalized.has(key)) continue;
-      const signal = booleanSignal(normalized.get(key));
-      if (signal === true) {
-        objectHasMore = true;
-        sawPartial = true;
-      } else if (signal === false) {
-        objectHasMore ??= false;
-        sawTerminal = true;
+    if (paginationScope) {
+      for (const key of EXPLICIT_COMPLETE_KEYS) {
+        if (!normalized.has(key)) continue;
+        const signal = booleanSignal(normalized.get(key));
+        if (signal === true) explicitComplete = true;
+        else if (signal === false) explicitIncomplete = true;
+        else malformedPagination = true;
+      }
+      for (const key of HAS_MORE_KEYS) {
+        if (!normalized.has(key)) continue;
+        const signal = booleanSignal(normalized.get(key));
+        if (signal === true) {
+          objectHasMore = true;
+          sawPartial = true;
+        } else if (signal === false) {
+          objectHasMore ??= false;
+          sawTerminal = true;
+        } else malformedPagination = true;
       }
     }
 
-    const total = [...TOTAL_KEYS].map((key) => nonnegativeNumber(normalized.get(key)))
-      .find((value) => value !== undefined);
-    const returned = [...RETURNED_KEYS].map((key) => nonnegativeNumber(normalized.get(key)))
-      .find((value) => value !== undefined);
-    const offset = [...OFFSET_KEYS].map((key) => nonnegativeNumber(normalized.get(key)))
-      .find((value) => value !== undefined);
-    if (hasRecordCollection && total !== undefined) {
-      const window = returned ?? recordCount;
-      const start = offset ?? 0;
-      if (start + window < total) sawPartial = true;
-      else sawTerminal = true;
+    const pageRecordCount = recordCount;
+    const hasObservedCollectionValues = hasRecordCollection
+      ? pageRecordCount > 0
+      : structuralCollectionHasValues;
+    if (paginationScope) {
+      const totalField = inspectIntegerFields(normalized, TOTAL_KEYS);
+      const returnedField = inspectIntegerFields(normalized, RETURNED_KEYS);
+      const offsetField = inspectOffsetFields(normalized);
+      const pageSizeField = inspectIntegerFields(normalized, PAGE_SIZE_KEYS);
+      if (
+        (totalField.present && totalField.malformed)
+        || (returnedField.present && returnedField.malformed)
+        || (offsetField.present && offsetField.malformed)
+        || (pageSizeField.present && pageSizeField.malformed)
+      ) malformedPagination = true;
+      if (offsetField.opaqueCursor !== null) markNextCursor(offsetField.opaqueCursor);
+
+      const total = totalField.value;
+      const returned = returnedField.value;
+      const offset = offsetField.value;
+      const pageSize = pageSizeField.value;
+      // `returned` is an actual page count; `pageSize` is only a ceiling.
+      // Conflating the latter with the former used to turn a short first page
+      // into false exhaustion. Comparison with retained collection bytes is
+      // possible only when one exact projection was selected. Intrinsic
+      // protocol contradictions remain invalid even when several plausible
+      // arrays make projection ambiguous.
+      if (
+        hasRecordCollection
+        && returned !== undefined
+        && returned !== pageRecordCount
+      ) malformedPagination = true;
+      if (
+        hasRecordCollection
+        && pageSize !== undefined
+        && pageRecordCount > pageSize
+      ) malformedPagination = true;
+      if (total !== undefined) {
+        const start = offset ?? 0;
+        const protocolReturned = returned ?? (hasRecordCollection ? pageRecordCount : undefined);
+        if (protocolReturned !== undefined) {
+          if (
+            protocolReturned > total
+            || (protocolReturned > 0 && start > total)
+            || start + protocolReturned > total
+            || (hasRecordCollection && pageRecordCount > total)
+            || (hasRecordCollection && start + pageRecordCount > total)
+          ) {
+            malformedPagination = true;
+          } else if (start + protocolReturned < total) {
+            sawPartial = true;
+          } else {
+            sawTerminal = true;
+          }
+        } else if (hasObservedCollectionValues && offset !== undefined && offset > total) {
+          malformedPagination = true;
+        }
+      }
     }
 
-    const page = [...PAGE_KEYS].map((key) => nonnegativeNumber(normalized.get(key)))
-      .find((value) => value !== undefined);
-    const pageCount = [...PAGE_COUNT_KEYS].map((key) => nonnegativeNumber(normalized.get(key)))
-      .find((value) => value !== undefined);
-    if (hasRecordCollection && page !== undefined && pageCount !== undefined && pageCount > 0) {
-      const terminalPage = page === 0 ? page + 1 >= pageCount : page >= pageCount;
-      if (terminalPage) sawTerminal = true;
-      else sawPartial = true;
+    const pageField = paginationScope
+      ? inspectIntegerFields(normalized, PAGE_KEYS)
+      : { present: false, value: undefined, malformed: false };
+    const pageCountField = paginationScope
+      ? inspectIntegerFields(normalized, PAGE_COUNT_KEYS)
+      : { present: false, value: undefined, malformed: false };
+    if (
+      paginationScope
+      && ((pageField.present && pageField.malformed)
+        || (pageCountField.present && pageCountField.malformed))
+    ) malformedPagination = true;
+    if (
+      paginationScope
+      && pageField.present
+      && pageCountField.present
+      && !pageField.malformed
+      && !pageCountField.malformed
+    ) {
+      const page = pageField.value!;
+      const pageCount = pageCountField.value!;
+      if (page > pageCount || (pageCount === 0 && hasObservedCollectionValues)) {
+        malformedPagination = true;
+      } else if (pageCount > 0) {
+        const terminalPage = page === 0 ? page + 1 >= pageCount : page >= pageCount;
+        if (terminalPage) sawTerminal = true;
+        else sawPartial = true;
+      }
     }
 
-    if (objectHasMore === true && normalized.has('endcursor')) markCursor(normalized.get('endcursor'));
+    if (objectHasMore === true && normalized.has('endcursor')) {
+      const endCursor = normalized.get('endcursor');
+      if (cursorValue(endCursor) === null) malformedPagination = true;
+      else markNextCursor(endCursor);
+    }
 
     for (const [rawKey, child] of entries.slice(0, PAGINATION_MAX_ENTRIES)) {
       const key = normalizedStructuralKey(rawKey);
@@ -287,43 +540,154 @@ function inspectPagination(
       ) && Array.isArray(child);
       if (isRecordCollection) continue;
 
-      if (CURSOR_VALUE_KEYS.has(key)) {
+      if (paginationScope && NEXT_CURSOR_VALUE_KEYS.has(key)) {
         const candidate = cursorValue(child);
-        if (candidate !== null) markCursor(child);
+        if (candidate !== null) markNextCursor(child);
         else if (child === null || child === false || child === '') {
-          if (key !== 'cursor' && key !== 'pagetoken') sawTerminal = true;
-        }
-      } else if (key === 'next' && (PAGINATION_PARENT_KEYS.has(parentKey) || parentKey === '')) {
+          markNextTerminal();
+        } else malformedPagination = true;
+        continue;
+      }
+      if (paginationScope && CURRENT_CURSOR_VALUE_KEYS.has(key)) {
+        // `cursor` / `pageToken` commonly echo the current page position. They
+        // neither prove another page nor conflict with an explicit next token.
+        // Null is deliberately neutral; other malformed types fail closed.
+        if (
+          cursorValue(child) === null
+          && child !== null
+          && child !== ''
+        ) malformedPagination = true;
+        continue;
+      }
+      if (
+        paginationScope
+        && key === 'next'
+        && (PAGINATION_PARENT_KEYS.has(parentKey) || parentKey === '')
+      ) {
         const candidate = cursorValue(child);
-        if (candidate !== null) markCursor(child);
-        else if (child === null || child === false || child === '') sawTerminal = true;
+        if (candidate !== null) markNextCursor(child);
+        else if (child === null || child === false || child === '') markNextTerminal();
+        else malformedPagination = true;
+        continue;
       }
 
-      if (child && typeof child === 'object') visit(child, depth + 1, key);
+      if (child && typeof child === 'object') {
+        const childPath = [...path, key];
+        const childPaginationScope = isCollectionAncestor(childPath)
+          || (paginationScope && PAGINATION_PARENT_KEYS.has(key));
+        if (childPaginationScope) {
+          visit(child, depth + 1, key, childPath, childPaginationScope);
+        }
+      }
     }
   };
 
-  visit(envelope, 0, '');
-  if (sawPartial || explicitIncomplete) return { completeness: 'partial', cursor };
-  if (malformedPagination) return { completeness: 'unknown', cursor: null };
-  if (explicitComplete || sawTerminal) return { completeness: 'complete', cursor: null };
-  return { completeness: 'unknown', cursor: null };
+  visit(envelope, 0, '', [], hasCollectionShape);
+  if (malformedPagination) return { completeness: 'unknown', cursor: null, malformed: true };
+  if (sawPartial || explicitIncomplete) {
+    return { completeness: 'partial', cursor, malformed: false };
+  }
+  if (explicitComplete || sawTerminal) {
+    return { completeness: 'complete', cursor: null, malformed: false };
+  }
+  return { completeness: 'unknown', cursor: null, malformed: false };
 }
 
-function findRecords(envelope: Record<string, unknown>): { path: string; records: unknown[] } | null {
-  for (const key of RECORD_CONTAINERS) {
-    if (Array.isArray(envelope[key])) return { path: key, records: envelope[key] as unknown[] };
-  }
-  for (const container of ['data', 'result', 'payload']) {
-    const nested = asRecord(envelope[container]);
-    if (!nested) continue;
-    for (const key of RECORD_CONTAINERS) {
-      if (Array.isArray(nested[key])) {
-        return { path: `${container}.${key}`, records: nested[key] as unknown[] };
-      }
+interface RecordDiscovery {
+  found: { path: string; records: unknown[] } | null;
+  /** All structurally plausible collections, including ambiguous fallbacks.
+   * Pagination can scope to their owners without guessing which array should
+   * become the retained record projection. */
+  structuralCollectionPaths: string[];
+  structuralCollectionHasValues: boolean;
+  truncated: boolean;
+}
+
+function discoverRecords(envelope: Record<string, unknown>): RecordDiscovery {
+  // Provider-neutral bounded discovery. Provider wrappers are not uniformly
+  // one level deep, so collection and pagination interpretation must traverse
+  // the same structural envelope. Arrays are terminal candidates: never walk
+  // record elements and accidentally promote a business field's nested array
+  // into a second result collection.
+  const recognizedCandidates: Array<{ path: string; records: unknown[] }> = [];
+  const fallbackCandidates: Array<{ path: string; records: unknown[] }> = [];
+  const ignoredFallbackKeys = new Set([
+    'error', 'errors', 'warning', 'warnings', 'message', 'messages',
+    'log', 'logs', 'debug', 'meta', 'metadata',
+    ...PAGINATION_PARENT_KEYS,
+  ]);
+  let nodes = 0;
+  let truncated = false;
+  const visit = (
+    record: Record<string, unknown>,
+    path: readonly string[],
+    depth: number,
+  ): void => {
+    nodes += 1;
+    if (depth > PAGINATION_MAX_DEPTH || nodes > PAGINATION_MAX_NODES) {
+      truncated = true;
+      return;
     }
+    const entries = Object.entries(record);
+    if (entries.length > PAGINATION_MAX_ENTRIES) truncated = true;
+    for (const [rawKey, child] of entries.slice(0, PAGINATION_MAX_ENTRIES)) {
+      const key = normalizedStructuralKey(rawKey);
+      if (
+        ignoredFallbackKeys.has(key)
+        || REQUEST_ECHO_KEYS.has(key)
+        || providerResultBookkeepingKey(rawKey)
+      ) continue;
+
+      const childPath = [...path, rawKey];
+      if (Array.isArray(child)) {
+        const candidate = { path: childPath.join('.'), records: child };
+        const recognized = RECORD_CONTAINERS.some(
+          (container) => normalizedStructuralKey(container) === key,
+        );
+        (recognized ? recognizedCandidates : fallbackCandidates).push(candidate);
+        continue;
+      }
+      const nested = asRecord(child);
+      if (nested) visit(nested, childPath, depth + 1);
+    }
+  };
+  visit(envelope, [], 0);
+
+  // Known collection nouns remain the stronger projection signal. When more
+  // than one equally strong candidate exists, retain every structural path for
+  // pagination scoping but do not guess which bytes form the projection.
+  const candidates = recognizedCandidates.length > 0
+    ? recognizedCandidates
+    : fallbackCandidates;
+  return {
+    found: candidates.length === 1 ? candidates[0]! : null,
+    structuralCollectionPaths: candidates.map((candidate) => candidate.path),
+    structuralCollectionHasValues: candidates.some((candidate) => candidate.records.length > 0),
+    truncated,
+  };
+}
+
+/** Whether recognized pagination metadata contradicts its own protocol.
+ *
+ * This is intentionally distinct from `completeness === 'unknown'`: an
+ * opaque provider result with no pagination claims may still contain useful
+ * data, while an impossible total or malformed terminal flag must never
+ * become provisional dependency authority. */
+export function resultHasMalformedPagination(result: unknown): boolean {
+  try {
+    const envelope = asRecord(result);
+    if (!envelope) return false;
+    const discovery = discoverRecords(envelope);
+    return inspectPagination(
+      envelope,
+      discovery.found?.records.length ?? 0,
+      discovery.found?.path ?? null,
+      discovery.structuralCollectionPaths,
+      discovery.structuralCollectionHasValues,
+    ).malformed;
+  } catch {
+    return true;
   }
-  return null;
 }
 
 function envelopeMetadata(
@@ -466,8 +830,15 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
       };
     }
 
-    const found = findRecords(envelope);
-    const pagination = inspectPagination(envelope, found?.records.length ?? 0, found !== null);
+    const discovery = discoverRecords(envelope);
+    const found = discovery.found;
+    const pagination = inspectPagination(
+      envelope,
+      found?.records.length ?? 0,
+      found?.path ?? null,
+      discovery.structuralCollectionPaths,
+      discovery.structuralCollectionHasValues,
+    );
     const status = statusOf(envelope);
     const successful = envelope.successful ?? envelope.success ?? envelope.ok;
     const isError = typeof envelope.isError === 'boolean' ? envelope.isError : undefined;
@@ -488,9 +859,13 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
       recordPath: found?.path ?? null,
       recordCount: found?.records.length ?? 0,
       envelopeMeta: meta.value,
-      completeness: !success || meta.malformed || inspection.verdict !== 'clean'
+      completeness: !success || meta.malformed || pagination.malformed
         ? 'unknown'
-        : pagination.completeness,
+        : discovery.truncated
+          ? 'partial'
+          : inspection.verdict !== 'clean'
+            ? 'unknown'
+            : pagination.completeness,
       projectedRecords: boundedProjection(found?.records ?? []),
       statusCode: status,
       cursor: pagination.cursor,

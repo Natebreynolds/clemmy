@@ -7,6 +7,19 @@ export function providerRequestEchoKey(key: string): boolean {
   return /^(?:(?:original|submitted)?request(?:data|body|args|arguments|input|params|parameters|payload)?|submittedinput(?:data|body|args|arguments|params|parameters|payload)?|input|args|arguments|payload|params|parameters)$/.test(normalized);
 }
 
+const PROVIDER_RESULT_BOOKKEEPING_KEYS = new Set([
+  'error', 'errors', 'warning', 'warnings', 'message', 'messages',
+  'log', 'logs', 'debug', 'meta', 'metadata',
+]);
+
+/** Keys that cannot carry answer-bearing provider result content. Plain
+ * `payload` is exempt because it is also a common response envelope. */
+export function providerResultBookkeepingKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return PROVIDER_RESULT_BOOKKEEPING_KEYS.has(normalized)
+    || (normalized !== 'payload' && providerRequestEchoKey(key));
+}
+
 export function pruneProviderRequestEchoes(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(pruneProviderRequestEchoes);
   if (!value || typeof value !== 'object') return value;

@@ -157,6 +157,7 @@ export function isReadComputeSemanticRefusal(
     case 'work_already_satisfied':
     case 'work_evidence_incomplete':
     case 'work_effect_already_executed':
+    case 'work_attempt_budget_exhausted':
       return false;
   }
 }
