@@ -342,7 +342,7 @@ function Browse(props: {
           <div class="memory-fact-head">
             <span class={`fact-kind kind-${fact.kind}`}>{fact.kind}</span>
             {fact.pinned ? (
-              <span class="fact-pinned" title="pinned standing instruction">📌</span>
+              <PinIcon />
             ) : null}
             {typeof fact.importance === 'number' ? (
               <span class="fact-importance" title="importance">★ {fact.importance.toFixed(1)}</span>
@@ -401,7 +401,7 @@ function FactDetailView({ id, onBack, onOpenFact }: {
           <>
             <div class="memory-fact-head">
               <span class={`fact-kind kind-${fact.kind}`}>{fact.kind}</span>
-              {fact.pinned ? <span class="fact-pinned">📌 pinned</span> : null}
+              {fact.pinned ? <span class="fact-pinned"><PinIcon /> pinned</span> : null}
               {fact.active === false ? <span class="fact-historical">historical</span> : null}
               {typeof fact.importance === 'number' ? <span class="fact-importance">★ {fact.importance.toFixed(1)}</span> : null}
             </div>
@@ -629,6 +629,18 @@ function EntityDetailView({ id, onBack, onOpenFact }: {
         ) : null}
       </div>
     </div>
+  );
+}
+
+/** A drawn pin, not the emoji. Emoji as interface iconography renders
+ *  differently per platform, can't take the surrounding colour, and is one of
+ *  the giveaways of a generated interface. */
+function PinIcon() {
+  return (
+    <svg class="fact-pin-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-label="pinned">
+      <path d="M12 17v5" />
+      <path d="M9 10.5V4h6v6.5l2.5 3.5h-11L9 10.5Z" />
+    </svg>
   );
 }
 

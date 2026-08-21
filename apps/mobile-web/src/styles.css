@@ -67,8 +67,16 @@
      which described motion this curve never had. */
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
 
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.22);
-  --shadow-lift: 0 12px 34px rgba(0, 0, 0, 0.55);
+  /* Elevation is surface lightness plus a hairline, not a shadow.
+     On a warm near-black ground a drop shadow barely renders anyway — it
+     mostly adds a soft grey halo that reads as a sticker. Cards already
+     carry a 1px --line border and sit on a lighter surface, which is the
+     whole depth cue they need. --shadow-card is kept as a token (rather
+     than deleted at ~30 call sites) so the decision lives in ONE place.
+     Only a true overlay — a sheet floating over content the user can
+     still see — earns a real shadow. */
+  --shadow-card: none;
+  --shadow-lift: 0 16px 40px rgba(0, 0, 0, 0.5);
 
   color-scheme: dark;
 }
@@ -171,7 +179,6 @@ input, textarea { font: inherit; }
   height: 6px;
   border-radius: 50%;
   background: var(--accent-2);
-  box-shadow: 0 0 7px rgba(142, 201, 111, 0.9);
   animation: breathe 3.4s ease-in-out infinite;
 }
 @keyframes breathe {
@@ -183,7 +190,7 @@ input, textarea { font: inherit; }
 /* The pill carries three truths, and the color is the fastest read: local,
    remote-but-encrypted, or not reaching the Mac at all. */
 .conn-relay { color: var(--accent-hi); border-color: rgba(255, 138, 61, 0.3); }
-.conn-relay .conn-dot { background: var(--accent); box-shadow: 0 0 7px var(--accent-glow); }
+.conn-relay .conn-dot { background: var(--accent); }
 .conn-offline { color: var(--fg-3); }
 .conn-offline .conn-dot { background: var(--fg-3); box-shadow: none; animation: none; }
 
@@ -278,8 +285,8 @@ input, textarea { font: inherit; }
 /* Staggered entrance: content arrives in reading order rather than all at
    once, which is most of why the old screens felt inert. */
 .rise {
-  animation: rise-in 0.42s var(--ease-out) backwards;
-  animation-delay: calc(var(--i, 0) * 45ms);
+  animation: rise-in 0.24s var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 26ms);
 }
 @keyframes rise-in {
   from { opacity: 0; transform: translateY(10px) scale(0.995); }
@@ -293,8 +300,7 @@ input, textarea { font: inherit; }
   font-family: var(--font-display);
   font-size: var(--t-section);
   font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  letter-spacing: 0.01em;
   color: var(--fg-3);
   margin: 0 2px var(--sp-3);
 }
@@ -339,11 +345,11 @@ input, textarea { font: inherit; }
   letter-spacing: -0.03em;
   line-height: 1.08;
   margin: 0 0 var(--sp-2);
-  /* A warm gradient on the greeting only — the one piece of pure delight. */
-  background: linear-gradient(168deg, var(--fg) 30%, #ffcfa1 78%, var(--accent-hi));
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  /* Solid, not a gradient. Gradient text on a heading is decorative rather
+     than meaningful, and by 2026 it is one of the recognizable signatures of
+     a generated interface. The greeting earns its presence from scale and
+     the warmth already in --fg; it does not need to shimmer. */
+  color: var(--fg);
 }
 .home-status {
   margin: 0;
@@ -361,12 +367,11 @@ input, textarea { font: inherit; }
   background: linear-gradient(180deg, rgba(255, 232, 200, 0.05), transparent 60%), var(--bg-2);
   border: 1px solid var(--line-strong);
   border-radius: 999px;
-  box-shadow: var(--shadow-card), 0 0 0 0 var(--accent-glow);
   transition: border-color 0.22s ease, box-shadow 0.28s ease, transform 0.16s var(--ease-out);
 }
 .ask:focus-within {
   border-color: var(--line-hot);
-  box-shadow: var(--shadow-card), 0 0 0 4px var(--accent-soft), 0 10px 30px rgba(255, 138, 61, 0.16);
+  box-shadow: 0 0 0 4px var(--accent-soft);
 }
 .ask-input {
   flex: 1;
@@ -390,7 +395,6 @@ input, textarea { font: inherit; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 5px 16px rgba(240, 101, 17, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.3);
   transition: transform 0.16s var(--ease-out), filter 0.16s ease, opacity 0.2s ease;
 }
 .ask-send svg { width: 19px; height: 19px; }
@@ -481,7 +485,6 @@ input, textarea { font: inherit; }
   background: rgba(245, 185, 66, 0.14);
   font-family: var(--font-display);
   letter-spacing: 0.05em;
-  text-transform: uppercase;
 }
 
 .card-args {
@@ -528,7 +531,6 @@ input, textarea { font: inherit; }
 .btn-approve {
   background: linear-gradient(180deg, var(--accent-hi), var(--accent-deep));
   color: var(--on-accent);
-  box-shadow: 0 5px 16px rgba(240, 101, 17, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.26);
 }
 .btn-reject {
   flex: 0 0 auto;
@@ -599,9 +601,8 @@ input, textarea { font: inherit; }
   border-radius: 50%;
   margin-top: 7px;
   background: var(--accent);
-  box-shadow: 0 0 7px rgba(255, 138, 61, 0.6);
 }
-.upcoming-dot.intention { background: var(--accent-2); box-shadow: 0 0 7px rgba(142, 201, 111, 0.6); }
+.upcoming-dot.intention { background: var(--accent-2); }
 .upcoming-text { font-size: var(--t-sm); }
 .upcoming-more { font-size: var(--t-xs); color: var(--fg-3); padding: var(--sp-2) 0; }
 
@@ -615,7 +616,7 @@ input, textarea { font: inherit; }
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  animation: rise-in 0.5s var(--ease-out);
+  animation: rise-in 0.26s var(--ease-out);
 }
 .empty-mark { opacity: 0.72; filter: saturate(0.9); margin-bottom: var(--sp-2); }
 .empty-title {
@@ -785,7 +786,6 @@ input, textarea { font: inherit; }
   padding: 12px 22px;
   font-size: var(--t-body);
   font-weight: 600;
-  box-shadow: 0 5px 16px rgba(240, 101, 17, 0.3);
   transition: transform 0.14s var(--ease-out);
 }
 .login-repair:active { transform: scale(0.95); }
@@ -906,6 +906,10 @@ input, textarea { font: inherit; }
   line-height: 1.62;
   color: var(--fg);
   word-break: break-word;
+  /* Reading measure. A phone rarely exceeds it, but a large phone in
+     landscape — or the same component on a tablet — runs to 100+ characters
+     per line, which is where sustained reading falls apart. */
+  max-width: 68ch;
 }
 .reply-ghost { color: var(--fg-3); }
 /* Live text, still being written: a caret is the only difference, so nothing
@@ -1418,7 +1422,6 @@ input, textarea { font: inherit; }
 .memory-hit-kind {
   font-family: var(--font-mono);
   font-size: 10px;
-  text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--fg-3);
   border: 1px solid var(--line);
@@ -1467,7 +1470,8 @@ input, textarea { font: inherit; }
 .memory-fact-head { display: flex; gap: var(--sp-2); align-items: baseline; margin-top: var(--sp-3); }
 .memory-fact-meta { font-size: var(--t-xs); color: var(--fg-3); }
 .memory-fact-content { font-size: var(--t-sm); color: var(--fg-2); }
-.fact-pinned { color: var(--accent); font-size: var(--t-xs); }
+.fact-pinned { color: var(--accent); font-size: var(--t-xs); display: inline-flex; align-items: center; gap: 4px; }
+.fact-pin-icon { width: 13px; height: 13px; flex: 0 0 auto; }
 .fact-importance { font-family: var(--font-mono); font-size: var(--t-xs); color: var(--fg-3); }
 
 
@@ -1508,7 +1512,7 @@ input, textarea { font: inherit; }
   box-shadow: var(--shadow-lift);
   animation: rise-in 0.26s var(--ease-out);
 }
-.node-sheet-type { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 4px; }
+.node-sheet-type { font-size: 11px; font-weight: 600; letter-spacing: 0.01em; margin-bottom: 4px; }
 .node-sheet-title { font-weight: 650; }
 .node-sheet-body { font-size: var(--t-sm); color: var(--fg-2); margin-top: 6px; max-height: 110px; overflow-y: auto; }
 .node-sheet-actions { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
@@ -1541,8 +1545,7 @@ input, textarea { font: inherit; }
 .workflow-row-tag {
   font-size: 10px;
   font-weight: 800;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  letter-spacing: 0.01em;
   color: var(--accent-2);
   background: rgba(142, 201, 111, 0.13);
   border-radius: 7px;
@@ -1610,7 +1613,7 @@ input, textarea { font: inherit; }
 .reject { background: var(--bg-3); color: var(--fg-2); border: 1px solid var(--line-strong) !important; }
 .plan-card { border-left-color: var(--accent-warn); }
 .plan-section { margin: var(--sp-3) 0; }
-.plan-section-title { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-3); margin-bottom: 4px; }
+.plan-section-title { font-size: 11px; font-weight: 600; letter-spacing: 0.01em; color: var(--fg-3); margin-bottom: 4px; }
 .plan-status { font-size: var(--t-xs); color: var(--fg-2); }
 /* A message that has not landed yet. It stays exactly where it will live,
    just dimmed — nothing jumps when the server confirms it. */
@@ -1799,8 +1802,7 @@ input, textarea { font: inherit; }
 .ws-field { min-width: 0; }
 .ws-field dt {
   font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.01em;
   color: var(--fg-3);
   font-weight: 700;
 }
