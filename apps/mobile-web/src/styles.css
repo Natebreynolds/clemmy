@@ -451,19 +451,19 @@ input, textarea { font: inherit; }
 .card-note { font-size: var(--t-sm); color: var(--fg-2); margin: 0 0 var(--sp-2); }
 .card-warn { font-size: var(--t-sm); color: var(--accent-warn); margin: 0 0 var(--sp-2); }
 
-/* The accent rail: how a card says "this one is about you". */
-.card-approval, .card-plan { padding-left: calc(var(--sp-4) + 3px); }
-.card-approval::before, .card-plan::before, .card-live::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 14px;
-  bottom: 14px;
-  width: 3px;
-  border-radius: 0 3px 3px 0;
-  background: linear-gradient(180deg, var(--accent-hi), var(--accent-deep));
+/* How a card says "this one is about you": it warms the whole surface
+   rather than wearing a stripe down its edge. Same treatment as a decision
+   in the transcript (.turn-approval), so the two read as one idea — and a
+   live card already has its pulse dot, which is a truer signal than a rail
+   because it moves only while the work does. */
+.card-approval, .card-plan {
+  background: var(--accent-soft);
+  border-color: rgba(255, 138, 61, 0.22);
 }
-.card-plan::before { background: linear-gradient(180deg, #ffd98a, var(--accent-warn)); }
+.card-plan {
+  background: var(--warn-soft, rgba(240, 180, 90, 0.09));
+  border-color: rgba(240, 180, 90, 0.24);
+}
 
 .chip {
   display: inline-flex;
@@ -1522,8 +1522,6 @@ input, textarea { font: inherit; }
 .chat-new { margin: var(--sp-1) 0 var(--sp-4); }
 .unknown { color: var(--fg-3); }
 
-/* legacy approval markup (chat-embedded approvals) */
-.approval-card { border-left: 3px solid var(--accent); }
 .approval-card .head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); margin-bottom: 6px; }
 .approval-card .tool { font-family: var(--font-mono); font-size: 12px; color: var(--accent); background: var(--accent-soft); border-radius: 6px; padding: 2px 8px; }
 .approval-card .when { font-size: var(--t-xs); color: var(--fg-3); }
