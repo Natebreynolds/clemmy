@@ -1989,7 +1989,15 @@ export async function runAdmittedTurnGraph(input: {
         ?? readbackFromArtifacts;
       if (!created || !readback) return { status: 'blocked', reason: 'publish requires create and readback' };
       if (testFault === 'before_publication') throw new Error('forced crash before publication');
-      const publishedText = readback.handle ?? created.handle ?? created.id;
+      const publishedText = [readback.handle, created.handle, created.id]
+        .find((value): value is string => typeof value === 'string' && value.length > 0);
+      const createdId = typeof created.id === 'string' && created.id.length > 0 ? created.id : publishedText;
+      const receiptId = typeof created.receipt === 'string' && created.receipt.length > 0
+        ? created.receipt
+        : createdId;
+      if (!publishedText || !createdId || !receiptId) {
+        return { status: 'blocked', reason: 'publish requires create and readback' };
+      }
       if (identity) {
         const committed = commitTurnOutcome({
           version: 2,
@@ -2007,8 +2015,8 @@ export async function runAdmittedTurnGraph(input: {
           resumable: false,
           presentation: { kind: 'answer', text: publishedText },
           evidenceRefs: [
-            { kind: 'artifact', id: created.id, uri: publishedText },
-            { kind: 'external_receipt', id: created.receipt ?? created.id },
+            { kind: 'artifact', id: createdId, uri: publishedText },
+            { kind: 'external_receipt', id: receiptId },
           ],
         }, { terminalJudgeDisposition: 'deliver' });
         if (committed.presentation.status !== 'done') {
@@ -2024,7 +2032,7 @@ export async function runAdmittedTurnGraph(input: {
         }
       }
       published = true;
-      publishedHandle = readback.handle ?? created.handle;
+      publishedHandle = publishedText;
       rememberArtifact(node.id, 'publish', { handle: publishedHandle }, publishedHandle);
       return { status: 'completed', outputRef: publishedHandle };
     }
