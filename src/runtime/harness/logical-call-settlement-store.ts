@@ -46,7 +46,7 @@ export type LogicalCallSettlementLane =
   | 'native_mcp'
   | 'claude_sdk'
   | 'composio'
-  | 'code_mode'
+  | 'code_mode' // historical durable-row decoder; no active writer
   | 'byo';
 
 export interface CommitLogicalCallSettlementInput {
@@ -1052,6 +1052,24 @@ export function commitLogicalCallSettlement(
         const operationArgs = isTrustedComposioGateway(input.contract.toolName)
           ? normalizeCallableArguments(input.contract.args, contract.toolName).args
           : effective.args;
+        const baseOperationId = recovery.requirementId
+          ? `${recovery.requirementId}${workBinding?.universe_item_id
+            ? `:item:${sha256(workBinding.universe_item_id).slice(0, 16)}`
+            : ''}`
+          : identity.logicalToolCallId;
+        // A once-cardinality read may legitimately need several distinct
+        // bounded probes. Requirement identity belongs to the immutable work
+        // binding; observed-operation identity belongs to the actual call.
+        // Preserve the historical first-operation id for write/readback joins,
+        // then suffix only later observations of the same requirement.
+        const operationIdExists = Boolean(db.prepare(`
+          SELECT 1 FROM accepted_task_operations
+           WHERE session_id = ? AND source_user_seq = ? AND operation_id = ?
+           LIMIT 1
+        `).get(identity.sessionId, identity.sourceUserSeq, baseOperationId));
+        const observedOperationId = operationIdExists
+          ? `${baseOperationId.slice(0, 220)}:attempt:${sha256(identity.logicalToolCallId).slice(0, 16)}`
+          : baseOperationId;
         const operation = !expected.expectation.workNodeId
           ? { status: 'skipped_conversational' as const }
           : recordResolvedOperationInTransaction(db, {
@@ -1059,11 +1077,7 @@ export function commitLogicalCallSettlement(
           sourceUserSeq: identity.sourceUserSeq,
           turn: input.observer.turn,
           nodeId: expected.expectation.workNodeId,
-          operationId: recovery.requirementId
-            ? `${recovery.requirementId}${workBinding?.universe_item_id
-              ? `:item:${sha256(workBinding.universe_item_id).slice(0, 16)}`
-              : ''}`
-            : identity.logicalToolCallId,
+          operationId: observedOperationId,
           resolvedTool: canonicalToolName,
           args: operationArgs,
           logicalToolCallId: identity.logicalToolCallId,

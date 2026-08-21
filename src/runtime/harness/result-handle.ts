@@ -14,6 +14,7 @@ import { openEventLog } from './eventlog.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import {
   deriveResultHandleFactsFromRaw as derivePureResultHandleFactsFromRaw,
+  reconcileStoredEnvelopeMetadata,
   RESULT_PROJECTION_MAX_BYTES,
   RESULT_PROJECTION_MAX_RECORDS,
   type RawResultHandleFacts,
@@ -307,7 +308,10 @@ function legacyScope(options: ToResultHandleOptions): DurableScope {
   };
 }
 
-function rowToHandle(row: DurableResultRow): ResultHandle {
+function rowToHandle(
+  row: DurableResultRow,
+  verifiedFacts?: Pick<RawResultHandleFacts, 'envelopeMeta'>,
+): ResultHandle {
   let envelopeMeta: Record<string, unknown> | null = null;
   let projectedRecords: unknown[] = [];
   try {
@@ -322,6 +326,7 @@ function rowToHandle(row: DurableResultRow): ResultHandle {
     envelopeMeta = null;
     projectedRecords = [];
   }
+  if (verifiedFacts) envelopeMeta = verifiedFacts.envelopeMeta;
   return {
     handle: row.handle_id,
     success: row.success === 1,
@@ -680,14 +685,14 @@ function bufferMatches(stored: Buffer | null, expected: Buffer | null): boolean 
 }
 
 /** Re-derive every persisted projection and pagination fact from raw bytes. */
-function rawFactsMatch(
+function matchingRawFacts(
   db: EventLogDatabase,
   row: SettledResultRow,
   rawPayload: unknown,
-): boolean {
+): RawResultHandleFacts | null {
   const facts = derivePureResultHandleFactsFromRaw(rawPayload);
   const cursorBytes = facts.cursor === null ? null : Buffer.from(facts.cursor, 'utf8');
-  if (cursorBytes && cursorBytes.byteLength > RESULT_CURSOR_MAX_BYTES) return false;
+  if (cursorBytes && cursorBytes.byteLength > RESULT_CURSOR_MAX_BYTES) return null;
   const cursorDigest = cursorBytes ? sha256(cursorBytes) : null;
   const continuationRef = cursorDigest
     ? `cont_${sha256(`${row.handle_id}|${row.base_argument_digest}|${cursorDigest}`).slice(0, 24)}`
@@ -720,14 +725,19 @@ function rawFactsMatch(
   const expectedHandleId = `rh_${sha256(
     `${scopeSalt}|${row.argument_digest}|${row.raw_payload_sha256}`,
   ).slice(0, 32)}`;
+  const envelopeMetadata = reconcileStoredEnvelopeMetadata({
+    storedJson: row.envelope_meta_json,
+    rederived: facts.envelopeMeta,
+    rawPayload,
+  });
+  if (!envelopeMetadata.matches) return null;
 
-  return row.rejection_reason === null
+  const matches = row.rejection_reason === null
     && row.handle_id === expectedHandleId
     && row.raw_location === `tool_output:${row.handle_id}`
     && row.success === (facts.success ? 1 : 0)
     && row.record_path === facts.recordPath
     && row.record_count === facts.recordCount
-    && storedJsonMatches(row.envelope_meta_json, facts.envelopeMeta)
     && row.completeness === facts.completeness
     && storedJsonMatches(row.projected_records_json, facts.projectedRecords)
     && row.status_code === facts.statusCode
@@ -735,6 +745,9 @@ function rawFactsMatch(
     && row.cursor_sha256 === cursorDigest
     && row.continuation_ref === continuationRef
     && row.cursor_repeated === (priorCursor ? 1 : 0);
+  return matches
+    ? { ...facts, envelopeMeta: envelopeMetadata.metadata }
+    : null;
 }
 
 function crossingAuthorityMatches(
@@ -927,7 +940,8 @@ export function redeemSuccessfulSettlementResultForHost(input: {
     } catch {
       return { status: 'corrupt', reason: 'settlement result raw payload is not valid JSON' };
     }
-    if (!rawFactsMatch(db, row, rawPayload)) {
+    const verifiedFacts = matchingRawFacts(db, row, rawPayload);
+    if (verifiedFacts === null) {
       return { status: 'corrupt', reason: 'settlement result projections disagree with raw bytes' };
     }
     if (!crossingAuthorityMatches(db, row)) {
@@ -942,7 +956,7 @@ export function redeemSuccessfulSettlementResultForHost(input: {
         resultHandleId: row.handle_id,
         toolName: row.tool_name,
         outcomeKind: row.settlement_outcome_kind as 'succeeded' | 'empty_result',
-        handle: rowToHandle(row),
+        handle: rowToHandle(row, verifiedFacts),
         executionSite: row.dispatch_execution_site === 'host' ? 'host' : 'provider',
         rawPayload,
         rawPayloadJson: row.raw_payload_json,

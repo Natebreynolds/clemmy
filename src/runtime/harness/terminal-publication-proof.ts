@@ -15,7 +15,10 @@ import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { ObligationManifest } from './obligation-manifest.js';
 import { inspectProviderEnvelope } from './provider-read-evidence.js';
-import { deriveResultHandleFactsFromRaw } from './result-facts.js';
+import {
+  deriveResultHandleFactsFromRaw,
+  reconcileStoredEnvelopeMetadata,
+} from './result-facts.js';
 
 const MAX_DURABLE_CURSOR_BYTES = 65_536;
 
@@ -121,6 +124,82 @@ interface CrossingAuthorityRow {
   argument_digest: string;
 }
 
+interface SettledResultAuthorityRow {
+  accepted_task_id: string;
+  logical_state: string;
+  logical_tool_name: string;
+  logical_argument_digest: string;
+  execution_kind: string;
+  outcome_kind: string;
+  continues_requirement: number;
+  settlement_result_handle_id: string | null;
+  physical_crossing_count: number;
+  host_crossing_count: number | null;
+  physical_crossings_digest: string;
+  handle_id: string;
+  scope_kind: string;
+  handle_session_id: string | null;
+  handle_source_user_seq: number | null;
+  handle_accepted_task_id: string | null;
+  handle_logical_tool_call_id: string | null;
+  handle_physical_dispatch_id: string | null;
+  handle_tool_name: string;
+  handle_argument_digest: string;
+  continuation_chain_id: string;
+  base_argument_digest: string;
+  raw_location: string | null;
+  raw_payload_json: string | null;
+  raw_payload_sha256: string | null;
+  raw_byte_count: number;
+  rejection_reason: string | null;
+  success: number;
+  dispatch_state: string;
+  dispatch_execution_site: string | null;
+  dispatch_tool_name: string;
+  dispatch_argument_digest: string;
+  dispatch_ordinal: number;
+  final_dispatch_ordinal: number;
+}
+
+interface HostWriteReceiptAuthorityRow {
+  receipt_id: string;
+  kind: string;
+  receipt_session_id: string;
+  receipt_source_user_seq: number;
+  receipt_accepted_task_id: string;
+  manifest_id: string;
+  node_id: string;
+  obligation: string;
+  logical_tool_call_id: string;
+  physical_dispatch_id: string;
+  created_id: string;
+  handle: string;
+  provider_receipt: string;
+  intended_digest: string | null;
+  observed_digest: string | null;
+  semantic_digest: string;
+  mirror_session_id: string;
+  mirror_type: string;
+  mirror_data_json: string;
+}
+
+interface HostSealedContentContract {
+  version: 1;
+  kind: 'host_sealed_artifact_content_v1';
+  acceptedTaskId: string;
+  graphId: string;
+  graphHash: string;
+  lineageNodeId: string;
+  createNodeId: string;
+  readbackNodeId: string;
+  lineageContentDigest: string;
+  intendedContentDigest: string;
+  createBindingDigest: string;
+  readbackBindingDigest: string;
+  createEffect: 'external_write' | 'local_write';
+  readbackEffect: 'read';
+}
+
 function canonical(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -192,6 +271,216 @@ function exactCrossingAuthority(input: {
      ORDER BY ordinal
   `).all(...params) as CrossingAuthorityRow[];
   return { frozen, live };
+}
+
+function digest64(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+
+function boundedIdentity(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 512 && !/\s/.test(value);
+}
+
+function parseHostSealedContentContract(value: unknown): HostSealedContentContract | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const keys = [
+    'version', 'kind', 'acceptedTaskId', 'graphId', 'graphHash', 'lineageNodeId',
+    'createNodeId', 'readbackNodeId', 'lineageContentDigest', 'intendedContentDigest',
+    'createBindingDigest', 'readbackBindingDigest', 'createEffect', 'readbackEffect',
+  ];
+  if (Object.keys(record).length !== keys.length || Object.keys(record).some((key) => !keys.includes(key))) {
+    return null;
+  }
+  if (record.version !== 1 || record.kind !== 'host_sealed_artifact_content_v1') return null;
+  for (const key of ['acceptedTaskId', 'graphId', 'lineageNodeId', 'createNodeId', 'readbackNodeId'] as const) {
+    if (!boundedIdentity(record[key])) return null;
+  }
+  for (const key of [
+    'graphHash', 'lineageContentDigest', 'intendedContentDigest',
+    'createBindingDigest', 'readbackBindingDigest',
+  ] as const) {
+    if (!digest64(record[key])) return null;
+  }
+  if (
+    record.lineageContentDigest !== record.intendedContentDigest
+    || (record.createEffect !== 'external_write' && record.createEffect !== 'local_write')
+    || record.readbackEffect !== 'read'
+  ) return null;
+  return record as unknown as HostSealedContentContract;
+}
+
+function sealedBindingDigest(binding: Record<string, unknown>): string | null {
+  if (
+    !boundedIdentity(binding.nodeId)
+    || !boundedIdentity(binding.capabilityId)
+    || !boundedIdentity(binding.providerOperationId)
+    || !boundedIdentity(binding.logicalToolName)
+    || !boundedIdentity(binding.toolName)
+    || !boundedIdentity(binding.schemaVersion)
+    || !digest64(binding.schemaDigest)
+    || !digest64(binding.argumentDigest)
+    || typeof binding.effect !== 'string'
+  ) return null;
+  return sha256Bytes(JSON.stringify({
+    nodeId: binding.nodeId,
+    capabilityId: binding.capabilityId,
+    providerOperationId: binding.providerOperationId,
+    logicalToolName: binding.logicalToolName,
+    toolName: binding.toolName,
+    schemaVersion: binding.schemaVersion,
+    schemaDigest: binding.schemaDigest,
+    argumentDigest: binding.argumentDigest,
+    account: binding.account ?? null,
+    effect: binding.effect,
+    destination: binding.destination ?? null,
+  }));
+}
+
+function exactManifestOperationMapping(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  operationId: string;
+  logicalToolCallId: string;
+  resolvedTool: string;
+  effectKind: string;
+}): boolean {
+  const rows = input.db.prepare(`
+    SELECT operation_id, logical_tool_call_id, resolved_tool, effect_kind
+      FROM accepted_task_operations
+     WHERE session_id = ? AND source_user_seq = ?
+       AND operation_id = ? AND logical_tool_call_id = ?
+  `).all(
+    input.sessionId,
+    input.sourceUserSeq,
+    input.operationId,
+    input.logicalToolCallId,
+  ) as Array<{
+    operation_id: string;
+    logical_tool_call_id: string;
+    resolved_tool: string;
+    effect_kind: string;
+  }>;
+  if (rows.length !== 1) return false;
+  const row = rows[0]!;
+  return row.resolved_tool === input.resolvedTool
+    && row.effect_kind === input.effectKind
+    && Boolean(input.db.prepare(`
+      SELECT 1 FROM logical_tool_calls
+       WHERE session_id = ? AND source_user_seq = ?
+         AND logical_tool_call_id = ? AND accepted_task_id = ?
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.logicalToolCallId,
+      input.acceptedTaskId,
+    ));
+}
+
+function exactSuccessfulResult(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+}): { ok: true; row: SettledResultAuthorityRow; raw: unknown } | { ok: false; reason: string } {
+  const row = input.db.prepare(`
+    SELECT l.accepted_task_id, l.state AS logical_state,
+           l.tool_name AS logical_tool_name, l.argument_digest AS logical_argument_digest,
+           s.execution_kind, s.outcome_kind, s.continues_requirement,
+           s.result_handle_id AS settlement_result_handle_id,
+           s.physical_crossing_count, s.host_crossing_count, s.physical_crossings_digest,
+           h.handle_id, h.scope_kind, h.session_id AS handle_session_id,
+           h.source_user_seq AS handle_source_user_seq,
+           h.accepted_task_id AS handle_accepted_task_id,
+           h.logical_tool_call_id AS handle_logical_tool_call_id,
+           h.physical_dispatch_id AS handle_physical_dispatch_id,
+           h.tool_name AS handle_tool_name, h.argument_digest AS handle_argument_digest,
+           h.continuation_chain_id, h.base_argument_digest,
+           h.raw_location, h.raw_payload_json, h.raw_payload_sha256,
+           h.raw_byte_count, h.rejection_reason, h.success,
+           p.state AS dispatch_state, p.execution_site AS dispatch_execution_site,
+           p.tool_name AS dispatch_tool_name, p.argument_digest AS dispatch_argument_digest,
+           p.ordinal AS dispatch_ordinal,
+           (SELECT MAX(p2.ordinal) FROM physical_dispatches p2
+             WHERE p2.session_id = p.session_id
+               AND p2.source_user_seq = p.source_user_seq
+               AND p2.logical_tool_call_id = p.logical_tool_call_id) AS final_dispatch_ordinal
+      FROM logical_tool_calls l
+      JOIN logical_call_settlements s
+        ON s.session_id = l.session_id
+       AND s.source_user_seq = l.source_user_seq
+       AND s.logical_tool_call_id = l.logical_tool_call_id
+      JOIN durable_result_handles h ON h.handle_id = s.result_handle_id
+      JOIN physical_dispatches p
+        ON p.session_id = h.session_id
+       AND p.source_user_seq = h.source_user_seq
+       AND p.logical_tool_call_id = h.logical_tool_call_id
+       AND p.physical_dispatch_id = h.physical_dispatch_id
+     WHERE l.session_id = ? AND l.source_user_seq = ? AND l.logical_tool_call_id = ?
+  `).get(
+    input.sessionId,
+    input.sourceUserSeq,
+    input.logicalToolCallId,
+  ) as SettledResultAuthorityRow | undefined;
+  if (!row) return { ok: false, reason: 'settled result authority is missing' };
+  const hostExecution = row.execution_kind === 'local_execution' && row.dispatch_execution_site === 'host';
+  if (
+    row.accepted_task_id !== input.acceptedTaskId
+    || row.logical_state !== 'settled'
+    || (row.execution_kind !== 'provider_execution' && !hostExecution)
+    || !['succeeded', 'empty_result'].includes(row.outcome_kind)
+    || row.continues_requirement !== 0
+    || row.settlement_result_handle_id !== row.handle_id
+    || row.scope_kind !== 'authoritative'
+    || row.handle_session_id !== input.sessionId
+    || row.handle_source_user_seq !== input.sourceUserSeq
+    || row.handle_accepted_task_id !== input.acceptedTaskId
+    || row.handle_logical_tool_call_id !== input.logicalToolCallId
+    || row.logical_tool_name !== row.handle_tool_name
+    || row.logical_argument_digest !== row.handle_argument_digest
+    || row.success !== 1
+    || row.rejection_reason !== null
+    || row.dispatch_state !== 'returned'
+    || row.dispatch_tool_name !== row.handle_tool_name
+    || row.dispatch_argument_digest !== row.handle_argument_digest
+    || row.dispatch_ordinal !== row.final_dispatch_ordinal
+    || row.raw_location !== `tool_output:${row.handle_id}`
+    || row.raw_payload_json === null
+    || row.raw_payload_sha256 === null
+    || Buffer.byteLength(row.raw_payload_json, 'utf8') !== row.raw_byte_count
+    || sha256Bytes(row.raw_payload_json) !== row.raw_payload_sha256
+  ) return { ok: false, reason: 'settlement, crossing, and result handle are not exact' };
+  const crossings = exactCrossingAuthority(input);
+  const frozen = crossingProjection(crossings.frozen);
+  const live = crossingProjection(crossings.live);
+  const crossingCount = row.physical_crossing_count + (row.host_crossing_count ?? 0);
+  if (
+    crossings.frozen.length !== crossingCount
+    || crossings.live.length !== crossingCount
+    || crossings.live.some((crossing) => crossing.accepted_task_id !== input.acceptedTaskId)
+    || sha256Bytes(JSON.stringify(frozen)) !== row.physical_crossings_digest
+    || JSON.stringify(live) !== JSON.stringify(frozen)
+  ) return { ok: false, reason: 'settlement crossing snapshot is not exact' };
+  const expectedHandleId = `rh_${sha256Bytes([
+    row.handle_session_id,
+    row.handle_source_user_seq,
+    row.handle_accepted_task_id,
+    row.handle_logical_tool_call_id,
+    row.handle_physical_dispatch_id,
+    row.continuation_chain_id,
+  ].join('|') + `|${row.handle_argument_digest}|${row.raw_payload_sha256}`).slice(0, 32)}`;
+  if (row.handle_id !== expectedHandleId) return { ok: false, reason: 'result handle content address is invalid' };
+  let raw: unknown;
+  try { raw = JSON.parse(row.raw_payload_json); } catch {
+    return { ok: false, reason: 'settled result payload is unreadable' };
+  }
+  if (inspectProviderEnvelope(raw).verdict !== 'clean') {
+    return { ok: false, reason: 'settled result provider envelope is contradictory' };
+  }
+  return { ok: true, row, raw };
 }
 
 function recordAtPath(payload: unknown, recordPath: string | null): unknown[] | null {
@@ -343,8 +632,22 @@ function verifyReceipt(input: {
   const allowedModes: readonly string[] = input.obligation === 'source_observed'
     ? ['point_read', 'collection_read']
     : ['collection_read'];
+  const normalizedNodeMode = input.node.operationMode === 'finite_read'
+    ? 'collection_read'
+    : input.node.operationMode;
+  const operationMapped = exactManifestOperationMapping({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    operationId: input.node.operationId,
+    logicalToolCallId: row.receipt_logical_tool_call_id,
+    resolvedTool: input.node.resolvedTool,
+    effectKind: input.node.effectKind,
+  });
   if (
-    row.protocol_version !== 1
+    !operationMapped
+    || row.protocol_version !== 1
     || row.kind !== expectedKind
     || row.receipt_session_id !== input.sessionId
     || row.receipt_source_user_seq !== input.sourceUserSeq
@@ -353,8 +656,7 @@ function verifyReceipt(input: {
     || row.node_id !== input.node.nodeId
     || row.obligation !== input.obligation
     || !allowedModes.includes(row.operation_mode)
-    || row.operation_mode !== input.node.operationMode
-    || row.receipt_logical_tool_call_id !== input.node.operationId
+    || row.operation_mode !== normalizedNodeMode
     || row.receipt_tool_name !== input.node.resolvedTool
     || input.transition.physical_attempt_id !== row.receipt_physical_dispatch_id
     || (input.transition.logical_tool_call_id !== null
@@ -481,7 +783,11 @@ function verifyReceipt(input: {
     || row.handle_success !== (facts.success ? 1 : 0)
     || row.record_path !== facts.recordPath
     || row.record_count !== facts.recordCount
-    || !storedJsonMatches(row.envelope_meta_json, facts.envelopeMeta)
+    || !reconcileStoredEnvelopeMetadata({
+      storedJson: row.envelope_meta_json,
+      rederived: facts.envelopeMeta,
+      rawPayload,
+    }).matches
     || row.handle_completeness !== facts.completeness
     || !storedJsonMatches(row.projected_records_json, facts.projectedRecords)
     || row.status_code !== facts.statusCode
@@ -581,6 +887,491 @@ function verifyReceipt(input: {
   return { ok: true };
 }
 
+function exactSealedNodeAuthority(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  contractId: string;
+  nodeId: string;
+  expectedEffect: string;
+  expectedBindingDigest?: string;
+}): { ok: true; binding: Record<string, unknown>; logicalToolCallId: string }
+  | { ok: false; reason: string } {
+  const rows = input.db.prepare(`
+    SELECT n.binding_json, n.binding_digest,
+           b.logical_tool_call_id, b.requirement_id, b.effect_kind,
+           b.tool_name, b.argument_digest
+      FROM graph_node_bindings n
+      JOIN expected_work_call_bindings b
+        ON b.session_id = n.session_id
+       AND b.source_user_seq = n.source_user_seq
+       AND b.requirement_id = n.node_id
+     WHERE n.session_id = ? AND n.source_user_seq = ?
+       AND n.node_id = ? AND b.contract_id = ?
+  `).all(
+    input.sessionId,
+    input.sourceUserSeq,
+    input.nodeId,
+    input.contractId,
+  ) as Array<{
+    binding_json: string;
+    binding_digest: string;
+    logical_tool_call_id: string;
+    requirement_id: string;
+    effect_kind: string;
+    tool_name: string;
+    argument_digest: string;
+  }>;
+  if (rows.length !== 1) return { ok: false, reason: `node authority is missing or ambiguous for ${input.nodeId}` };
+  const row = rows[0]!;
+  let binding: Record<string, unknown>;
+  try { binding = JSON.parse(row.binding_json) as Record<string, unknown>; } catch {
+    return { ok: false, reason: `node binding is unreadable for ${input.nodeId}` };
+  }
+  const computedDigest = sealedBindingDigest(binding);
+  const bindingEffect = (binding.effect === 'none' || binding.effect === 'host_only')
+    ? 'compute'
+    : binding.effect;
+  if (
+    !computedDigest
+    || row.binding_digest !== computedDigest
+    || binding.bindingDigest !== computedDigest
+    || (input.expectedBindingDigest !== undefined && computedDigest !== input.expectedBindingDigest)
+    || binding.nodeId !== input.nodeId
+    || bindingEffect !== input.expectedEffect
+    || row.requirement_id !== input.nodeId
+    || row.effect_kind !== input.expectedEffect
+    || binding.providerOperationId !== binding.toolName
+    || binding.logicalToolName !== row.tool_name
+    || !digest64(row.argument_digest)
+  ) return { ok: false, reason: `node binding and expected-work authority disagree for ${input.nodeId}` };
+  return { ok: true, binding, logicalToolCallId: row.logical_tool_call_id };
+}
+
+function createdPayload(raw: unknown): {
+  id?: string;
+  handle?: string;
+  receipt?: string;
+} {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const record = raw as Record<string, unknown>;
+  const nested = record.created && typeof record.created === 'object' && !Array.isArray(record.created)
+    ? record.created as Record<string, unknown>
+    : record;
+  return {
+    ...(typeof nested.id === 'string' ? { id: nested.id } : {}),
+    ...(typeof nested.handle === 'string' ? { handle: nested.handle } : {}),
+    ...(typeof nested.receipt === 'string' ? { receipt: nested.receipt } : {}),
+  };
+}
+
+function recordsValue(raw: unknown): unknown[] | null {
+  if (Array.isArray(raw)) return raw;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const records = (raw as { records?: unknown }).records;
+  return Array.isArray(records) ? records : null;
+}
+
+function verifyHostSealedWriteReceipt(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  manifest: ObligationManifest;
+  node: ObligationManifest['nodes'][number];
+  obligation: string;
+  transition: TransitionRow;
+}): TerminalPublicationProofResult {
+  const receipt = input.db.prepare(`
+    SELECT w.receipt_id, w.kind,
+           w.session_id AS receipt_session_id,
+           w.source_user_seq AS receipt_source_user_seq,
+           w.accepted_task_id AS receipt_accepted_task_id,
+           w.manifest_id, w.node_id, w.obligation,
+           w.logical_tool_call_id, w.physical_dispatch_id,
+           w.created_id, w.handle, w.provider_receipt,
+           w.intended_digest, w.observed_digest, w.semantic_digest,
+           e.session_id AS mirror_session_id, e.type AS mirror_type,
+           e.data_json AS mirror_data_json
+      FROM host_write_receipts w
+      JOIN events e ON e.id = w.receipt_event_id
+     WHERE w.receipt_id = ?
+  `).get(input.transition.receipt_id) as HostWriteReceiptAuthorityRow | undefined;
+  if (!receipt) return { ok: false, status: 'conflict', reason: 'write receipt has no normalized authority row' };
+  const expectedKind = input.obligation === 'derivation_from_current_source' ? 'derivation'
+    : input.obligation === 'commit_effect' ? 'commit'
+      : input.obligation === 'verify_committed_readback' ? 'readback'
+        : null;
+  if (!expectedKind) {
+    return { ok: false, status: 'not_ready', reason: `write obligation ${input.obligation} has no sealed verifier` };
+  }
+  if (
+    receipt.kind !== expectedKind
+    || receipt.receipt_session_id !== input.sessionId
+    || receipt.receipt_source_user_seq !== input.sourceUserSeq
+    || receipt.receipt_accepted_task_id !== input.acceptedTaskId
+    || receipt.manifest_id !== input.manifest.manifestId
+    || receipt.node_id !== input.node.nodeId
+    || receipt.obligation !== input.obligation
+    || input.transition.physical_attempt_id !== receipt.physical_dispatch_id
+    || (input.transition.logical_tool_call_id !== null
+      && input.transition.logical_tool_call_id !== receipt.logical_tool_call_id)
+    || (input.transition.physical_dispatch_id !== null
+      && input.transition.physical_dispatch_id !== receipt.physical_dispatch_id)
+    || !digest64(receipt.intended_digest)
+    || receipt.observed_digest !== receipt.intended_digest
+  ) return { ok: false, status: 'conflict', reason: 'write transition and receipt identity disagree' };
+  if (!exactManifestOperationMapping({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    operationId: input.node.operationId,
+    logicalToolCallId: receipt.logical_tool_call_id,
+    resolvedTool: input.node.resolvedTool,
+    effectKind: input.node.effectKind,
+  })) return { ok: false, status: 'conflict', reason: 'write receipt is not the exact manifest operation' };
+
+  const body = {
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    manifestId: input.manifest.manifestId,
+    nodeId: input.node.nodeId,
+    obligation: input.obligation,
+    kind: receipt.kind,
+    createdId: receipt.created_id,
+    handle: receipt.handle,
+    providerReceipt: receipt.provider_receipt,
+    intendedDigest: receipt.intended_digest,
+    observedDigest: receipt.observed_digest,
+    logicalToolCallId: receipt.logical_tool_call_id,
+    physicalDispatchId: receipt.physical_dispatch_id,
+  };
+  const semanticDigest = digest(body);
+  if (
+    receipt.semantic_digest !== semanticDigest
+    || receipt.receipt_id !== `write-evidence:v1:${semanticDigest}`
+    || receipt.mirror_session_id !== input.sessionId
+    || receipt.mirror_type !== 'evidence_receipt'
+  ) return { ok: false, status: 'conflict', reason: 'write receipt address or mirror identity is invalid' };
+  try {
+    const mirror = JSON.parse(receipt.mirror_data_json) as Record<string, unknown>;
+    if (
+      mirror.protocolVersion !== 1
+      || mirror.receiptId !== receipt.receipt_id
+      || mirror.kind !== receipt.kind
+      || mirror.sourceUserSeq !== input.sourceUserSeq
+      || mirror.acceptedTaskId !== input.acceptedTaskId
+      || mirror.manifestId !== input.manifest.manifestId
+      || mirror.nodeId !== input.node.nodeId
+      || mirror.obligation !== input.obligation
+      || mirror.logicalToolCallId !== receipt.logical_tool_call_id
+      || mirror.physicalDispatchId !== receipt.physical_dispatch_id
+      || mirror.createdId !== receipt.created_id
+      || mirror.providerReceipt !== receipt.provider_receipt
+    ) return { ok: false, status: 'conflict', reason: 'write receipt mirror conflicts with its row' };
+  } catch {
+    return { ok: false, status: 'conflict', reason: 'write receipt mirror is unreadable' };
+  }
+
+  const createResult = exactSuccessfulResult({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    logicalToolCallId: receipt.logical_tool_call_id,
+  });
+  if (!createResult.ok) return { ok: false, status: 'conflict', reason: createResult.reason };
+  const created = createdPayload(createResult.raw);
+  if (
+    created.id !== receipt.created_id
+    || created.handle !== receipt.handle
+    || created.receipt !== receipt.provider_receipt
+    || !receipt.provider_receipt.trim()
+    || receipt.provider_receipt === `receipt:${receipt.created_id}`
+    || receipt.provider_receipt === digest(createResult.raw)
+    || receipt.provider_receipt === JSON.stringify(createResult.raw)
+    || createResult.row.handle_physical_dispatch_id !== receipt.physical_dispatch_id
+  ) return { ok: false, status: 'conflict', reason: 'write receipt does not match the exact returned create result' };
+
+  const artifactRows = input.db.prepare(`
+    SELECT a.id AS artifact_id, a.status, a.resource_id, a.uri, a.source_call_id,
+           c.contract_json, c.content_verified_at,
+           c.verification_logical_call_id, c.verification_fingerprint
+      FROM artifact_source_roots root
+      JOIN run_artifacts a
+        ON a.session_id = root.session_id AND a.run_scope_id = root.root_scope_id
+      JOIN artifact_content_verifications c ON c.artifact_id = a.id
+     WHERE root.session_id = ? AND root.source_user_seq = ?
+       AND a.source_call_id = ? AND a.resource_id = ?
+  `).all(
+    input.sessionId,
+    input.sourceUserSeq,
+    receipt.logical_tool_call_id,
+    receipt.created_id,
+  ) as Array<{
+    artifact_id: string;
+    status: string;
+    resource_id: string;
+    uri: string | null;
+    source_call_id: string;
+    contract_json: string;
+    content_verified_at: string | null;
+    verification_logical_call_id: string | null;
+    verification_fingerprint: string | null;
+  }>;
+  if (artifactRows.length !== 1) {
+    return { ok: false, status: 'conflict', reason: 'write artifact authority is missing or ambiguous' };
+  }
+  const artifact = artifactRows[0]!;
+  if (
+    artifact.status !== 'bound'
+    || artifact.uri !== receipt.handle
+    || !artifact.content_verified_at
+    || !artifact.verification_logical_call_id
+    || !artifact.verification_fingerprint
+  ) return { ok: false, status: 'not_ready', reason: 'write artifact has no complete exact-content proof' };
+  let contentContractRaw: unknown;
+  try { contentContractRaw = JSON.parse(artifact.contract_json); } catch {
+    return { ok: false, status: 'conflict', reason: 'write content contract is unreadable' };
+  }
+  const contentContract = parseHostSealedContentContract(contentContractRaw);
+  if (
+    !contentContract
+    || contentContract.acceptedTaskId !== input.acceptedTaskId
+    || `logical:${contentContract.createNodeId}` !== receipt.logical_tool_call_id
+    || `logical:${contentContract.readbackNodeId}` !== artifact.verification_logical_call_id
+    || contentContract.intendedContentDigest !== receipt.intended_digest
+    || contentContract.lineageContentDigest !== receipt.intended_digest
+  ) return { ok: false, status: 'conflict', reason: 'write content contract contradicts the receipt' };
+
+  const workRow = input.db.prepare(`
+    SELECT contract_id, graph_id, graph_hash, contract_json, accepted_task_id
+      FROM accepted_task_work_contracts
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(input.sessionId, input.sourceUserSeq) as {
+    contract_id: string;
+    graph_id: string;
+    graph_hash: string;
+    contract_json: string;
+    accepted_task_id: string;
+  } | undefined;
+  if (
+    !workRow
+    || workRow.accepted_task_id !== input.acceptedTaskId
+    || workRow.graph_id !== contentContract.graphId
+    || workRow.graph_hash !== contentContract.graphHash
+  ) return { ok: false, status: 'conflict', reason: 'write content contract has no exact frozen work authority' };
+  let work: { contractId?: unknown; operations?: unknown };
+  try { work = JSON.parse(workRow.contract_json) as { contractId?: unknown; operations?: unknown }; } catch {
+    return { ok: false, status: 'conflict', reason: 'frozen work contract is unreadable' };
+  }
+  if (work.contractId !== workRow.contract_id || !Array.isArray(work.operations)) {
+    return { ok: false, status: 'conflict', reason: 'frozen work contract identity is invalid' };
+  }
+  const operations = new Map<string, {
+    id: string;
+    effect: string;
+    dependsOn: string[];
+    dataFrom: string[];
+  }>();
+  for (const value of work.operations) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { ok: false, status: 'conflict', reason: 'frozen work operation is malformed' };
+    }
+    const operation = value as Record<string, unknown>;
+    if (
+      !boundedIdentity(operation.id)
+      || typeof operation.effect !== 'string'
+      || !Array.isArray(operation.dependsOn)
+      || operation.dependsOn.some((id) => !boundedIdentity(id))
+      || !Array.isArray(operation.dataFrom)
+      || operation.dataFrom.some((id) => !boundedIdentity(id))
+      || operations.has(operation.id)
+    ) return { ok: false, status: 'conflict', reason: 'frozen work operation authority is invalid' };
+    operations.set(operation.id, {
+      id: operation.id,
+      effect: operation.effect,
+      dependsOn: operation.dependsOn as string[],
+      dataFrom: operation.dataFrom as string[],
+    });
+  }
+  const createOperation = operations.get(contentContract.createNodeId);
+  const readbackOperation = operations.get(contentContract.readbackNodeId);
+  if (
+    !createOperation
+    || !readbackOperation
+    || createOperation.effect !== contentContract.createEffect
+    || !createOperation.dependsOn.includes(contentContract.lineageNodeId)
+    || !createOperation.dataFrom.includes(contentContract.lineageNodeId)
+    || readbackOperation.effect !== 'read'
+    || !readbackOperation.dependsOn.includes(contentContract.createNodeId)
+  ) return { ok: false, status: 'conflict', reason: 'write content lineage DAG is not exact' };
+  const createBinding = exactSealedNodeAuthority({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    contractId: workRow.contract_id,
+    nodeId: contentContract.createNodeId,
+    expectedEffect: contentContract.createEffect,
+    expectedBindingDigest: contentContract.createBindingDigest,
+  });
+  const readbackBinding = exactSealedNodeAuthority({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    contractId: workRow.contract_id,
+    nodeId: contentContract.readbackNodeId,
+    expectedEffect: 'read',
+    expectedBindingDigest: contentContract.readbackBindingDigest,
+  });
+  if (!createBinding.ok || !readbackBinding.ok) {
+    return {
+      ok: false,
+      status: 'conflict',
+      reason: !createBinding.ok ? createBinding.reason : readbackBinding.ok ? '' : readbackBinding.reason,
+    };
+  }
+  if (
+    createBinding.logicalToolCallId !== receipt.logical_tool_call_id
+    || readbackBinding.logicalToolCallId !== artifact.verification_logical_call_id
+  ) return { ok: false, status: 'conflict', reason: 'write and readback logical bindings are not exact' };
+
+  const ancestors = new Set<string>();
+  const pending = [contentContract.lineageNodeId];
+  while (pending.length > 0) {
+    const nodeId = pending.pop()!;
+    if (ancestors.has(nodeId)) continue;
+    const operation = operations.get(nodeId);
+    if (!operation || nodeId === contentContract.createNodeId || nodeId === contentContract.readbackNodeId) {
+      return { ok: false, status: 'conflict', reason: 'write lineage contains an invalid ancestor reference' };
+    }
+    ancestors.add(nodeId);
+    for (const dependencyId of new Set([...operation.dependsOn, ...operation.dataFrom])) {
+      if (!operations.has(dependencyId)) {
+        return { ok: false, status: 'conflict', reason: 'write lineage ancestor is missing' };
+      }
+      pending.push(dependencyId);
+    }
+  }
+  const upstreamReads = [...ancestors].filter((nodeId) => operations.get(nodeId)?.effect === 'read');
+  if (upstreamReads.length === 0) {
+    return { ok: false, status: 'not_ready', reason: 'write derivation has no upstream source read' };
+  }
+  for (const nodeId of ancestors) {
+    const operation = operations.get(nodeId)!;
+    const authority = exactSealedNodeAuthority({
+      db: input.db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      contractId: workRow.contract_id,
+      nodeId,
+      expectedEffect: operation.effect,
+    });
+    if (!authority.ok) return { ok: false, status: 'conflict', reason: authority.reason };
+    const result = exactSuccessfulResult({
+      db: input.db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: input.acceptedTaskId,
+      logicalToolCallId: authority.logicalToolCallId,
+    });
+    if (!result.ok) return { ok: false, status: 'conflict', reason: result.reason };
+    if (nodeId === contentContract.lineageNodeId) {
+      const lineage = recordsValue(result.raw);
+      if (!lineage || digest(lineage) !== contentContract.lineageContentDigest) {
+        return { ok: false, status: 'conflict', reason: 'write lineage bytes do not match the sealed digest' };
+      }
+    }
+  }
+  const writeManifestNodeId = input.node.nodeId;
+  for (const sourceOperationId of upstreamReads) {
+    const sourceNode = input.manifest.nodes.find((node) =>
+      node.operationId === sourceOperationId && node.effectKind === 'read');
+    if (!sourceNode || !input.manifest.edges.some((edge) =>
+      edge.fromNodeId === sourceNode.nodeId
+      && (edge.fromObligation === 'source_observed' || edge.fromObligation === 'source_completeness')
+      && edge.toNodeId === writeManifestNodeId
+      && edge.toObligation === 'derivation_from_current_source')) {
+      return { ok: false, status: 'conflict', reason: 'manifest omits an upstream source-to-derivation edge' };
+    }
+  }
+
+  const readback = exactSuccessfulResult({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    logicalToolCallId: artifact.verification_logical_call_id,
+  });
+  if (!readback.ok) return { ok: false, status: 'conflict', reason: readback.reason };
+  if (!readback.raw || typeof readback.raw !== 'object' || Array.isArray(readback.raw)) {
+    return { ok: false, status: 'conflict', reason: 'write readback result is malformed' };
+  }
+  const readbackValue = readback.raw as { id?: unknown; content?: unknown };
+  if (
+    readbackValue.id !== receipt.created_id
+    || readbackValue.content === undefined
+    || inspectProviderEnvelope(readbackValue.content).verdict !== 'clean'
+    || digest(readbackValue.content) !== receipt.observed_digest
+  ) return { ok: false, status: 'conflict', reason: 'write readback bytes do not match the exact created artifact' };
+  return { ok: true };
+}
+
+function verifySettledExecutionInTransaction(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+}): TerminalPublicationProofResult {
+  const operations = input.db.prepare(`
+    SELECT operation_id, logical_tool_call_id
+      FROM accepted_task_operations
+     WHERE session_id = ? AND source_user_seq = ?
+  `).all(input.sessionId, input.sourceUserSeq) as Array<{
+    operation_id: string;
+    logical_tool_call_id: string;
+  }>;
+  if (operations.length === 0) {
+    return { ok: false, status: 'not_ready', reason: 'execution-terminal proof has no accepted operations' };
+  }
+  for (const operation of operations) {
+    const state = input.db.prepare(`
+      SELECT l.accepted_task_id, l.state, s.outcome_kind, s.continues_requirement,
+             (SELECT COUNT(*) FROM physical_dispatches p
+               WHERE p.session_id = l.session_id
+                 AND p.source_user_seq = l.source_user_seq
+                 AND p.logical_tool_call_id = l.logical_tool_call_id
+                 AND p.state IN ('started','unknown')) AS open_dispatches
+        FROM logical_tool_calls l
+        JOIN logical_call_settlements s
+          ON s.session_id = l.session_id
+         AND s.source_user_seq = l.source_user_seq
+         AND s.logical_tool_call_id = l.logical_tool_call_id
+       WHERE l.session_id = ? AND l.source_user_seq = ? AND l.logical_tool_call_id = ?
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      operation.logical_tool_call_id,
+    ) as {
+      accepted_task_id: string;
+      state: string;
+      outcome_kind: string;
+      continues_requirement: number;
+      open_dispatches: number;
+    } | undefined;
+    if (
+      !state
+      || state.accepted_task_id !== input.acceptedTaskId
+      || state.state !== 'settled'
+      || !['succeeded', 'empty_result'].includes(state.outcome_kind)
+      || state.continues_requirement !== 0
+      || state.open_dispatches !== 0
+    ) return { ok: false, status: 'not_ready', reason: `accepted operation ${operation.operation_id} is not terminal` };
+  }
+  return { ok: true };
+}
+
 /** Verify every declared obligation and reject every undeclared transition. */
 export function verifyAcceptedTaskTerminalProofInTransaction(input: {
   db: Database.Database;
@@ -600,27 +1391,23 @@ export function verifyAcceptedTaskTerminalProofInTransaction(input: {
     `).all(input.sessionId, input.sourceUserSeq) as TransitionRow[];
     const declared = input.manifest.nodes.flatMap((node) => node.obligations
       .map((obligation) => ({ node, obligation })));
+    const receiptDeclared = declared.filter((entry) => entry.obligation !== 'execution_terminal');
     if (transitions.some((transition) => transition.manifest_id !== input.manifest.manifestId)) {
       return { ok: false, status: 'conflict', reason: 'proof transition names another manifest' };
     }
-    if (transitions.length > declared.length) {
+    const declaredKeys = new Set(receiptDeclared.map((entry) =>
+      `${entry.node.nodeId}|${entry.obligation}`));
+    if (transitions.some((transition) =>
+      !declaredKeys.has(`${transition.node_id}|${transition.obligation}`))) {
       return { ok: false, status: 'conflict', reason: 'duplicate or undeclared proof transitions exist' };
     }
-    if (transitions.length < declared.length) {
+    if (transitions.length > receiptDeclared.length) {
+      return { ok: false, status: 'conflict', reason: 'duplicate or undeclared proof transitions exist' };
+    }
+    if (transitions.length < receiptDeclared.length) {
       return { ok: false, status: 'not_ready', reason: 'one or more declared obligations are unsatisfied' };
     }
-    for (const entry of declared) {
-      if (
-        entry.node.effectKind !== 'read'
-        || !['point_read', 'collection_read'].includes(entry.node.operationMode)
-        || (entry.obligation !== 'source_observed' && entry.obligation !== 'source_completeness')
-      ) {
-        return {
-          ok: false,
-          status: 'not_ready',
-          reason: `obligation ${entry.node.nodeId}:${entry.obligation} has no normalized terminal verifier`,
-        };
-      }
+    for (const entry of receiptDeclared) {
       const matches = transitions.filter((transition) =>
         transition.node_id === entry.node.nodeId
         && transition.obligation === entry.obligation);
@@ -645,17 +1432,45 @@ export function verifyAcceptedTaskTerminalProofInTransaction(input: {
       ) {
         return { ok: false, status: 'conflict', reason: 'proof transition key or task identity is invalid' };
       }
-      const receipt = verifyReceipt({
+      const receipt = entry.node.effectKind === 'read'
+        && ['point_read', 'collection_read', 'finite_read'].includes(entry.node.operationMode)
+        && (entry.obligation === 'source_observed' || entry.obligation === 'source_completeness')
+        ? verifyReceipt({
+            db: input.db,
+            sessionId: input.sessionId,
+            sourceUserSeq: input.sourceUserSeq,
+            acceptedTaskId: input.acceptedTaskId,
+            manifestId: input.manifest.manifestId,
+            node: entry.node,
+            obligation: entry.obligation,
+            transition,
+          })
+        : (entry.node.effectKind === 'external_write' || entry.node.effectKind === 'local_write')
+          ? verifyHostSealedWriteReceipt({
+              db: input.db,
+              sessionId: input.sessionId,
+              sourceUserSeq: input.sourceUserSeq,
+              acceptedTaskId: input.acceptedTaskId,
+              manifest: input.manifest,
+              node: entry.node,
+              obligation: entry.obligation,
+              transition,
+            })
+          : {
+              ok: false as const,
+              status: 'not_ready' as const,
+              reason: `obligation ${entry.node.nodeId}:${entry.obligation} has no normalized terminal verifier`,
+            };
+      if (!receipt.ok) return receipt;
+    }
+    if (declared.some((entry) => entry.obligation === 'execution_terminal')) {
+      const execution = verifySettledExecutionInTransaction({
         db: input.db,
         sessionId: input.sessionId,
         sourceUserSeq: input.sourceUserSeq,
         acceptedTaskId: input.acceptedTaskId,
-        manifestId: input.manifest.manifestId,
-        node: entry.node,
-        obligation: entry.obligation,
-        transition,
       });
-      if (!receipt.ok) return receipt;
+      if (!execution.ok) return execution;
     }
     return { ok: true };
   } catch (error) {

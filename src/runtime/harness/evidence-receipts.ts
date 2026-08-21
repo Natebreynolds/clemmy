@@ -45,6 +45,7 @@ import {
   type SuccessfulSettlementResultEvidence,
 } from './result-handle.js';
 import { inspectProviderEnvelope } from './provider-read-evidence.js';
+import { verifyHostSealedArtifactDerivationForWrite } from './artifact-ledger.js';
 
 export const EVIDENCE_RECEIPT_EVENT = 'evidence_receipt' as const;
 
@@ -148,6 +149,12 @@ interface NormalizedReceiptRow {
 interface ReadReceiptFacts {
   kind: 'observation' | 'collection';
   obligation: 'source_observed' | 'source_completeness';
+  /**
+   * Receipt protocol v1 persists the physical read shape, while the accepted
+   * obligation manifest retains the finer finite-set semantic. A finite read
+   * is therefore serialized as a collection-shaped read whose obligation is
+   * `source_observed`, not as proof that the provider source was exhausted.
+   */
   operationMode: 'point_read' | 'collection_read';
   recordIdentities: string[];
   aggregateDigest: string;
@@ -190,8 +197,16 @@ function valueAtRecordPath(payload: unknown, path: string | null): unknown {
 
 function recordsFromResult(result: SuccessfulSettlementResultEvidence): unknown[] | null {
   const records = valueAtRecordPath(result.rawPayload, result.handle.recordPath);
-  if (!Array.isArray(records)) return result.handle.recordPath === null ? null : [];
-  return records;
+  if (Array.isArray(records)) return records;
+  if (Array.isArray(result.rawPayload)) return result.rawPayload;
+  if (
+    result.rawPayload
+    && typeof result.rawPayload === 'object'
+    && Array.isArray((result.rawPayload as { records?: unknown }).records)
+  ) {
+    return (result.rawPayload as { records: unknown[] }).records;
+  }
+  return result.handle.recordPath === null ? null : [];
 }
 
 function identitiesFromRecords(records: readonly unknown[]): string[] {
@@ -205,7 +220,11 @@ function readFacts(
   if (node.effectKind !== 'read') {
     return { ok: false, reason: 'manifest node is not a read and cannot mint read evidence' };
   }
-  if (node.operationMode !== 'point_read' && node.operationMode !== 'collection_read') {
+  if (
+    node.operationMode !== 'point_read'
+    && node.operationMode !== 'collection_read'
+    && node.operationMode !== 'finite_read'
+  ) {
     return { ok: false, reason: `read node has unsupported evidence mode '${node.operationMode}'` };
   }
   if (!result.handle.success) {
@@ -219,13 +238,25 @@ function readFacts(
   // source exhaustion — the manifest attached 'source_observed' for it, and a
   // provider with no completeness signal and no cursor can still discharge
   // that. Any node still owing 'source_completeness' keeps the strict gate.
-  const observationSufficient = node.operationMode === 'collection_read'
+  const observationSufficient = (
+    node.operationMode === 'collection_read'
+    || node.operationMode === 'finite_read'
+  )
     && node.obligations.includes('source_observed')
     && !node.obligations.includes('source_completeness');
   const records = recordsFromResult(result);
+  const locatorOnly = Boolean(
+    result.rawPayload
+    && typeof result.rawPayload === 'object'
+    && !Array.isArray(result.rawPayload)
+    && 'locator' in (result.rawPayload as object)
+    && !Array.isArray((result.rawPayload as { records?: unknown }).records),
+  );
   const recordIdentities = records === null
-    ? (node.operationMode === 'point_read' || observationSufficient ? [] : null)
-    : identitiesFromRecords(records);
+    ? (node.operationMode === 'point_read' || observationSufficient || locatorOnly ? [] : null)
+    : locatorOnly
+      ? []
+      : identitiesFromRecords(records);
   if (recordIdentities === null) {
     return { ok: false, reason: 'collection result exposes no durable record collection' };
   }
@@ -234,12 +265,22 @@ function readFacts(
   }
   const continuationOutstanding = result.handle.continuationRef !== null;
   const cursorRepeated = result.handle.continuationRepeated;
-  if (node.operationMode === 'collection_read') {
-    if (!observationSufficient && result.handle.completeness !== 'complete') {
+  // Exhaustion signals gate ONLY nodes that owe source_completeness. An
+  // observation node discharges on observation, by the manifest's own
+  // definition above — yet this gate refused provider-reported 'partial' and
+  // outstanding cursors for observation nodes too. A paged provider ALWAYS
+  // says partial on any mailbox bigger than one page, so "check my last
+  // Slack DM" answered correctly and then labeled the turn blocked (live
+  // 2026-08-20). Partial-ness and continuations stay recorded in the receipt
+  // facts below; they inform, they do not veto an obligation already met.
+  if (node.operationMode === 'collection_read' && !locatorOnly && !observationSufficient) {
+    const finiteReturnedSet = Array.isArray(records)
+      && records.length > 0
+      && result.handle.completeness === 'unknown'
+      && !continuationOutstanding
+      && !cursorRepeated;
+    if (result.handle.completeness !== 'complete' && !finiteReturnedSet) {
       return { ok: false, reason: `collection result is ${result.handle.completeness}, not complete` };
-    }
-    if (observationSufficient && result.handle.completeness === 'partial') {
-      return { ok: false, reason: 'the provider itself reported this collection result as partial' };
     }
     if (continuationOutstanding) {
       return { ok: false, reason: 'collection result still has an outstanding continuation' };
@@ -248,16 +289,25 @@ function readFacts(
       return { ok: false, reason: 'collection result repeated a prior cursor' };
     }
   }
+  const locatorObligation = node.obligations.includes('source_observed')
+    ? 'source_observed'
+    : node.obligations.includes('source_completeness')
+      ? 'source_completeness'
+      : 'source_observed';
   return {
     ok: true,
     facts: {
       kind: node.operationMode === 'point_read' || observationSufficient
         ? 'observation'
-        : 'collection',
+        : locatorOnly && locatorObligation === 'source_observed'
+          ? 'observation'
+          : 'collection',
       obligation: node.operationMode === 'point_read' || observationSufficient
         ? 'source_observed'
-        : 'source_completeness',
-      operationMode: node.operationMode,
+        : locatorOnly
+          ? locatorObligation
+          : 'source_completeness',
+      operationMode: node.operationMode === 'point_read' ? 'point_read' : 'collection_read',
       recordIdentities,
       aggregateDigest: digestOf(recordIdentities),
       completeness: result.handle.completeness,
@@ -266,6 +316,10 @@ function readFacts(
     },
   };
 }
+
+/** Unit seam: the observation-vs-exhaustion boundary above is behavior worth
+ * pinning without standing up a full manifest/authority fixture. */
+export const _readFactsForTest = readFacts;
 
 function authorityManifest(
   db: ReturnType<typeof openEventLog>,
@@ -998,6 +1052,43 @@ export function redeemEvidenceReceipt(
         ? { ok: true, receipt: { ...redeemed.receipt } as RedeemedReceipt['receipt'] }
         : redeemed;
     }
+    const writeRow = loadHostWriteReceiptRow(db, receiptId);
+    if (writeRow) {
+      if (expect.expectKind && writeRow.kind !== expect.expectKind) {
+        return { ok: false, reason: `receipt is a '${writeRow.kind}', not a '${expect.expectKind}'` };
+      }
+      if (expect.sourceUserSeq !== undefined && writeRow.source_user_seq !== expect.sourceUserSeq) {
+        return { ok: false, reason: 'receipt belongs to a different accepted task' };
+      }
+      if (expect.physicalAttemptId !== undefined && writeRow.physical_dispatch_id !== expect.physicalAttemptId) {
+        return { ok: false, reason: 'receipt belongs to a different physical attempt' };
+      }
+      const live = redeemHostWriteReceiptFacts({
+        sessionId,
+        sourceUserSeq: writeRow.source_user_seq,
+        acceptedTaskId: writeRow.accepted_task_id,
+        manifestId: writeRow.manifest_id,
+        nodeId: writeRow.node_id,
+        obligation: writeRow.obligation,
+        logicalToolCallId: writeRow.logical_tool_call_id,
+        kind: writeRow.kind,
+        createdId: writeRow.created_id,
+        providerReceipt: writeRow.provider_receipt,
+        intendedDigest: writeRow.intended_digest,
+        observedDigest: writeRow.observed_digest,
+      });
+      if (!live.ok) return { ok: false, reason: live.reason };
+      return {
+        ok: true,
+        receipt: {
+          kind: writeRow.kind,
+          receiptId: writeRow.receipt_id,
+          obligation: writeRow.obligation,
+          sourceUserSeq: writeRow.source_user_seq,
+          physicalAttemptId: writeRow.physical_dispatch_id,
+        } as RedeemedReceipt['receipt'],
+      };
+    }
     const armed = db.prepare(`
       SELECT 1 FROM accepted_task_authority
        WHERE session_id = ?
@@ -1051,6 +1142,486 @@ export function redeemEvidenceReceipt(
   }
 
   return { ok: true, receipt: receipt as RedeemedReceipt['receipt'] };
+}
+
+interface HostWriteReceiptRow {
+  receipt_id: string;
+  kind: EvidenceReceiptKind;
+  session_id: string;
+  source_user_seq: number;
+  accepted_task_id: string;
+  manifest_id: string;
+  node_id: string;
+  obligation: string;
+  logical_tool_call_id: string;
+  physical_dispatch_id: string;
+  created_id: string;
+  handle: string;
+  provider_receipt: string;
+  intended_digest: string | null;
+  observed_digest: string | null;
+  semantic_digest: string;
+}
+
+export interface HostWriteReceipt extends IssuedReceipt {
+  kind: 'commit' | 'readback' | 'derivation' | 'reconciliation' | 'send';
+  obligation: string;
+  manifestId: string;
+  nodeId: string;
+  logicalToolCallId: string;
+  physicalDispatchId: string;
+  createdId: string;
+  handle: string;
+  providerReceipt: string;
+}
+
+function ensureHostWriteReceiptTable(db: ReturnType<typeof openEventLog>): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS host_write_receipts (
+      receipt_id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL,
+      accepted_task_id TEXT NOT NULL,
+      manifest_id TEXT NOT NULL,
+      node_id TEXT NOT NULL,
+      obligation TEXT NOT NULL,
+      logical_tool_call_id TEXT NOT NULL,
+      physical_dispatch_id TEXT NOT NULL,
+      created_id TEXT NOT NULL,
+      handle TEXT NOT NULL,
+      provider_receipt TEXT NOT NULL,
+      intended_digest TEXT,
+      observed_digest TEXT,
+      semantic_digest TEXT NOT NULL,
+      receipt_event_id TEXT NOT NULL,
+      issued_at TEXT NOT NULL,
+      UNIQUE (session_id, source_user_seq, manifest_id, node_id, obligation)
+    );
+  `);
+}
+
+function loadHostWriteReceiptRow(
+  db: ReturnType<typeof openEventLog>,
+  receiptId: string,
+): HostWriteReceiptRow | undefined {
+  try {
+    ensureHostWriteReceiptTable(db);
+    return db.prepare('SELECT * FROM host_write_receipts WHERE receipt_id = ?')
+      .get(receiptId) as HostWriteReceiptRow | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function createdPayloadOf(raw: unknown): {
+  id?: string;
+  handle?: string;
+  receipt?: string;
+  writtenDigest?: string;
+} {
+  if (!raw || typeof raw !== 'object') return {};
+  const record = raw as Record<string, unknown>;
+  const nested = record.created && typeof record.created === 'object'
+    ? record.created as Record<string, unknown>
+    : record;
+  return {
+    ...(typeof nested.id === 'string' ? { id: nested.id } : {}),
+    ...(typeof nested.handle === 'string' ? { handle: nested.handle } : {}),
+    ...(typeof nested.receipt === 'string' ? { receipt: nested.receipt } : {}),
+    ...(typeof nested.writtenDigest === 'string' ? { writtenDigest: nested.writtenDigest } : {}),
+  };
+}
+
+function independentProviderReceipt(receipt: string | undefined, id: string, raw: unknown): receipt is string {
+  if (!receipt || !receipt.trim()) return false;
+  if (receipt === `receipt:${id}`) return false;
+  if (receipt === digestOf(raw) || receipt === JSON.stringify(raw)) return false;
+  return true;
+}
+
+function redeemHostWriteReceiptFacts(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  manifestId: string;
+  nodeId: string;
+  obligation: string;
+  logicalToolCallId: string;
+  kind: string;
+  createdId: string;
+  providerReceipt: string;
+  intendedDigest: string | null;
+  observedDigest: string | null;
+}): { ok: true } | { ok: false; reason: string } {
+  const created = redeemSuccessfulSettlementResultForHost({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    logicalToolCallId: input.logicalToolCallId,
+  });
+  if (created.status !== 'ok') {
+    return { ok: false, reason: `write settlement is no longer redeemable: ${created.reason}` };
+  }
+  const payload = createdPayloadOf(created.value.rawPayload);
+  if (payload.id !== input.createdId) {
+    return { ok: false, reason: 'created artifact id no longer matches the write receipt' };
+  }
+  if (!independentProviderReceipt(payload.receipt, input.createdId, created.value.rawPayload)
+    || payload.receipt !== input.providerReceipt) {
+    return { ok: false, reason: 'independent provider receipt no longer matches the write receipt' };
+  }
+  if (input.kind === 'readback' || input.kind === 'reconciliation' || input.kind === 'derivation') {
+    const intended = payload.writtenDigest ?? input.intendedDigest;
+    if (!intended || !input.observedDigest || intended !== input.observedDigest) {
+      return { ok: false, reason: 'readback content digest no longer matches the intended written artifact' };
+    }
+    const currentReadback = findReadbackDigest({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: input.acceptedTaskId,
+      createdId: input.createdId,
+      intendedDigest: intended,
+    });
+    if (!currentReadback || currentReadback.digest !== input.observedDigest) {
+      return { ok: false, reason: 'durable readback bytes no longer redeem the write receipt' };
+    }
+    if (input.kind === 'derivation') {
+      const sources = verifyManifestDerivationSources({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        manifestId: input.manifestId,
+        nodeId: input.nodeId,
+      });
+      if (!sources.ok) return sources;
+      const derivation = verifyHostSealedArtifactDerivationForWrite({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        createLogicalToolCallId: input.logicalToolCallId,
+        createdId: input.createdId,
+        intendedContentDigest: intended,
+      });
+      if (derivation.status !== 'verified') {
+        return { ok: false, reason: `sealed write derivation no longer redeems: ${derivation.reason}` };
+      }
+    }
+  }
+  return { ok: true };
+}
+
+function findReadbackDigest(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  createdId: string;
+  intendedDigest?: string;
+}): { digest: string; handle: string } | null {
+  const rows = openEventLog().prepare(`
+    SELECT logical_tool_call_id FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND outcome_kind = 'succeeded'
+  `).all(input.sessionId, input.sourceUserSeq) as Array<{ logical_tool_call_id: string }>;
+  for (const row of rows) {
+    const redeemed = redeemSuccessfulSettlementResultForHost({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: input.acceptedTaskId,
+      logicalToolCallId: row.logical_tool_call_id,
+    });
+    if (redeemed.status !== 'ok') continue;
+    const raw = redeemed.value.rawPayload;
+    if (!raw || typeof raw !== 'object') continue;
+    const record = raw as { id?: string; handle?: string; content?: unknown };
+    if (record.id !== input.createdId || record.content === undefined) continue;
+    const digest = digestOf(record.content);
+    if (input.intendedDigest && digest !== input.intendedDigest) continue;
+    return { digest, handle: typeof record.handle === 'string' ? record.handle : '' };
+  }
+  return null;
+}
+
+function verifyManifestDerivationSources(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  manifestId: string;
+  nodeId: string;
+}): { ok: true } | { ok: false; reason: string } {
+  try {
+    const db = openEventLog();
+    const state = authorityManifest(db, input, { issuing: false });
+    if (!state.ok) return { ok: false, reason: state.reason };
+    const node = state.manifest.nodes.find((entry) => entry.nodeId === input.nodeId);
+    if (!node || !node.obligations.includes('derivation_from_current_source')) {
+      return { ok: false, reason: 'manifest write does not declare derivation evidence' };
+    }
+    const prerequisites = state.manifest.edges.filter((edge) =>
+      edge.toNodeId === input.nodeId
+      && edge.toObligation === 'derivation_from_current_source'
+      && (edge.fromObligation === 'source_observed' || edge.fromObligation === 'source_completeness'));
+    if (prerequisites.length === 0) {
+      return { ok: false, reason: 'manifest derivation names no upstream source evidence' };
+    }
+    for (const dependency of prerequisites) {
+      const sourceObligation: 'source_observed' | 'source_completeness' =
+        dependency.fromObligation === 'source_completeness' ? 'source_completeness' : 'source_observed';
+      const transitions = db.prepare(`
+        SELECT receipt_id, physical_attempt_id
+          FROM obligation_transitions
+         WHERE session_id = ? AND source_user_seq = ? AND manifest_id = ?
+           AND node_id = ? AND obligation = ?
+      `).all(
+        input.sessionId,
+        input.sourceUserSeq,
+        input.manifestId,
+        dependency.fromNodeId,
+        sourceObligation,
+      ) as Array<{ receipt_id: string; physical_attempt_id: string }>;
+      if (transitions.length !== 1) {
+        return { ok: false, reason: `manifest source proof is missing or ambiguous for ${dependency.fromNodeId}` };
+      }
+      const transition = transitions[0]!;
+      const redeemed = redeemHostReadEvidenceReceipt(input.sessionId, transition.receipt_id, {
+        expectKind: sourceObligation === 'source_completeness' ? 'collection' : 'observation',
+        sourceUserSeq: input.sourceUserSeq,
+        manifestId: input.manifestId,
+        nodeId: dependency.fromNodeId,
+        obligation: sourceObligation,
+        physicalDispatchId: transition.physical_attempt_id,
+      });
+      if (!redeemed.ok) {
+        return { ok: false, reason: `manifest source proof no longer redeems: ${redeemed.reason}` };
+      }
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: boundedReason(error) };
+  }
+}
+
+/**
+ * Issue write-obligation receipts from durable construct facts only.
+ * Requires an exact created id, an independent provider receipt, and a
+ * content-digest-matched readback for reversible writes.
+ */
+export function issueHostWriteEvidenceForManifestNode(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  manifestId: string;
+  nodeId: string;
+}):
+  | { status: 'issued' | 'replayed'; receipts: HostWriteReceipt[] }
+  | { status: 'missing' | 'refused' | 'conflict' | 'storage_error'; reason: string } {
+  if (
+    !input.sessionId.trim()
+    || !Number.isSafeInteger(input.sourceUserSeq)
+    || input.sourceUserSeq <= 0
+    || !input.manifestId.trim()
+    || !input.nodeId.trim()
+  ) {
+    return { status: 'refused', reason: 'exact task and manifest-node identity is required' };
+  }
+  let mirrors: EventRow[] = [];
+  try {
+    const db = openEventLog();
+    const transaction = db.transaction(():
+      | { status: 'issued' | 'replayed'; receipts: HostWriteReceipt[] }
+      | { status: 'missing' | 'refused' | 'conflict' | 'storage_error'; reason: string } => {
+      ensureHostWriteReceiptTable(db);
+      const manifestState = authorityManifest(db, input, { issuing: true });
+      if (!manifestState.ok) {
+        return { status: manifestState.status, reason: manifestState.reason };
+      }
+      const node = manifestState.manifest.nodes.find((entry) => entry.nodeId === input.nodeId);
+      if (!node) return { status: 'refused', reason: 'manifest does not declare that node' };
+      if (node.effectKind !== 'external_write' && node.effectKind !== 'local_write') {
+        return { status: 'refused', reason: 'manifest node is not a write operation' };
+      }
+      const logicalToolCallId = logicalCallIdForManifestNode(db, input, node);
+      if (!logicalToolCallId) {
+        return { status: 'conflict', reason: 'manifest write has no unique accepted logical call' };
+      }
+      const created = redeemSuccessfulSettlementResultForHost({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId: manifestState.authority.accepted_task_id,
+        logicalToolCallId,
+      });
+      if (created.status !== 'ok') {
+        return {
+          status: created.status === 'storage_error' ? 'storage_error' : 'refused',
+          reason: `manifest write has no authoritative settled result: ${created.reason}`,
+        };
+      }
+      const payload = createdPayloadOf(created.value.rawPayload);
+      if (!payload.id || !payload.handle) {
+        return { status: 'refused', reason: 'write settlement is missing an exact created id and handle' };
+      }
+      if (!independentProviderReceipt(payload.receipt, payload.id, created.value.rawPayload)) {
+        return { status: 'refused', reason: 'write settlement did not return an independent provider receipt' };
+      }
+      let intendedDigest = payload.writtenDigest;
+      const readback = findReadbackDigest({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId: manifestState.authority.accepted_task_id,
+        createdId: payload.id,
+        ...(intendedDigest ? { intendedDigest } : {}),
+      });
+      if (node.obligations.includes('verify_committed_readback') && !readback) {
+        return { status: 'refused', reason: 'write has no content-digest-matched readback' };
+      }
+      if (node.obligations.includes('derivation_from_current_source')) {
+        const sources = verifyManifestDerivationSources(input);
+        if (!sources.ok) {
+          return { status: 'refused', reason: `write derivation source proof failed: ${sources.reason}` };
+        }
+        if (!readback) {
+          return { status: 'refused', reason: 'write derivation lacks an exact readback content digest' };
+        }
+        const derivation = verifyHostSealedArtifactDerivationForWrite({
+          sessionId: input.sessionId,
+          sourceUserSeq: input.sourceUserSeq,
+          createLogicalToolCallId: logicalToolCallId,
+          createdId: payload.id,
+          intendedContentDigest: intendedDigest ?? readback.digest,
+        });
+        if (derivation.status !== 'verified') {
+          return { status: 'refused', reason: `write derivation is not host-sealed: ${derivation.reason}` };
+        }
+        intendedDigest = derivation.lineageContentDigest;
+        if (readback.digest !== intendedDigest) {
+          return { status: 'refused', reason: 'write derivation and independent readback content differ' };
+        }
+      }
+      const receipts: HostWriteReceipt[] = [];
+      let replayed = 0;
+      for (const obligation of node.obligations) {
+        if (obligation === 'execution_terminal') continue;
+        const kind = OBLIGATION_RECEIPT_KIND[obligation];
+        if (!kind || kind === 'observation' || kind === 'collection') {
+          return { status: 'refused', reason: `write node declares unissuable obligation ${obligation}` };
+        }
+        const body = {
+          sessionId: input.sessionId,
+          sourceUserSeq: input.sourceUserSeq,
+          manifestId: input.manifestId,
+          nodeId: input.nodeId,
+          obligation,
+          kind,
+          createdId: payload.id,
+          handle: payload.handle,
+          providerReceipt: payload.receipt,
+          intendedDigest: intendedDigest ?? null,
+          observedDigest: readback?.digest ?? null,
+          logicalToolCallId,
+          physicalDispatchId: created.value.physicalDispatchId,
+        };
+        const semanticDigest = digestOf(body);
+        const receiptId = `write-evidence:v1:${semanticDigest}`;
+        const existing = db.prepare(`
+          SELECT * FROM host_write_receipts
+           WHERE session_id = ? AND source_user_seq = ?
+             AND manifest_id = ? AND node_id = ? AND obligation = ?
+        `).get(
+          input.sessionId,
+          input.sourceUserSeq,
+          input.manifestId,
+          input.nodeId,
+          obligation,
+        ) as HostWriteReceiptRow | undefined;
+        if (existing) {
+          if (existing.receipt_id !== receiptId || existing.semantic_digest !== semanticDigest) {
+            return { status: 'conflict', reason: `a different write receipt already owns ${obligation}` };
+          }
+          replayed += 1;
+          receipts.push({
+            receiptId: existing.receipt_id,
+            kind: existing.kind as HostWriteReceipt['kind'],
+            obligation: existing.obligation,
+            manifestId: existing.manifest_id,
+            nodeId: existing.node_id,
+            logicalToolCallId: existing.logical_tool_call_id,
+            physicalDispatchId: existing.physical_dispatch_id,
+            createdId: existing.created_id,
+            handle: existing.handle,
+            providerReceipt: existing.provider_receipt,
+          });
+          continue;
+        }
+        const mirror = insertInternalEventInTransaction(db, {
+          sessionId: input.sessionId,
+          turn: manifestState.manifest.identity.turn,
+          role: 'system',
+          type: EVIDENCE_RECEIPT_EVENT,
+          data: {
+            protocolVersion: HOST_RECEIPT_PROTOCOL_VERSION,
+            receiptId,
+            kind,
+            sourceUserSeq: input.sourceUserSeq,
+            acceptedTaskId: manifestState.authority.accepted_task_id,
+            manifestId: input.manifestId,
+            nodeId: input.nodeId,
+            obligation,
+            logicalToolCallId,
+            physicalDispatchId: created.value.physicalDispatchId,
+            createdId: payload.id,
+            providerReceipt: payload.receipt,
+          },
+        });
+        mirrors.push(mirror);
+        db.prepare(`
+          INSERT INTO host_write_receipts
+            (receipt_id, kind, session_id, source_user_seq, accepted_task_id,
+             manifest_id, node_id, obligation, logical_tool_call_id,
+             physical_dispatch_id, created_id, handle, provider_receipt,
+             intended_digest, observed_digest, semantic_digest,
+             receipt_event_id, issued_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          receiptId,
+          kind,
+          input.sessionId,
+          input.sourceUserSeq,
+          manifestState.authority.accepted_task_id,
+          input.manifestId,
+          input.nodeId,
+          obligation,
+          logicalToolCallId,
+          created.value.physicalDispatchId,
+          payload.id,
+          payload.handle,
+          payload.receipt,
+          intendedDigest ?? null,
+          readback?.digest ?? null,
+          semanticDigest,
+          mirror.id,
+          mirror.createdAt,
+        );
+        receipts.push({
+          receiptId,
+          kind: kind as HostWriteReceipt['kind'],
+          obligation,
+          manifestId: input.manifestId,
+          nodeId: input.nodeId,
+          logicalToolCallId,
+          physicalDispatchId: created.value.physicalDispatchId,
+          createdId: payload.id,
+          handle: payload.handle,
+          providerReceipt: payload.receipt,
+        });
+      }
+      return {
+        status: replayed === receipts.length && receipts.length > 0 ? 'replayed' : 'issued',
+        receipts,
+      };
+    });
+    const outcome = transaction.immediate();
+    if ((outcome.status === 'issued' || outcome.status === 'replayed') && mirrors.length > 0) {
+      for (const mirror of mirrors) publishCommittedInternalEvent(mirror);
+    }
+    return outcome;
+  } catch (error) {
+    return { status: 'storage_error', reason: boundedReason(error) };
+  }
 }
 
 /** Which receipt kind proves which obligation. */
