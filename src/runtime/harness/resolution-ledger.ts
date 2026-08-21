@@ -71,8 +71,25 @@ export type ExpectedTaskState =
   | { status: 'ambiguous'; reason: string };
 
 function workNodes(graph: TurnGraphIR): TurnGraphNode[] {
-  return graph.nodes.filter((node) =>
+  const nodes = graph.nodes.filter((node) =>
     node.kind === 'retrieve' || node.kind === 'execute' || node.kind === 'fanout');
+  // Collect-then-construct compiles prerequisite reads plus the construct
+  // write. Authority still names one primary work node: the write, not a
+  // transform/extract execute that precedes it.
+  if (graph.classification.multiItem.collectThenConstruct) {
+    const writes = nodes.filter((node) =>
+      node.kind === 'execute'
+      && (
+        node.capabilityRole === 'destination'
+        || node.capabilityRole === 'create'
+        || node.effect.kind === 'external_write'
+        || node.effect.kind === 'local_write'
+        || node.effect.kind === 'admin'
+      ));
+    if (writes.length === 1) return writes;
+    return nodes.filter((node) => node.kind === 'execute');
+  }
+  return nodes;
 }
 
 /** Load the one accepted-source graph and project only its authority fields. */
@@ -766,7 +783,36 @@ function hasUnsettledToolWorkInTransaction(
           (SELECT COUNT(*) FROM physical_dispatches
             WHERE session_id = ? AND source_user_seq = ? AND state = 'started') AS dispatch_n
       `).get(...identity, ...identity) as { logical_n: number; dispatch_n: number };
-  return row.logical_n > 0 || row.dispatch_n > 0;
+  if (row.dispatch_n > 0) return true;
+  if (row.logical_n === 0) return false;
+  // COMPLETED FAILURES ARE NOT IN-FLIGHT (live 2026-08-19 sess …707149:
+  // a bound workflow_update RETURNED ok:false, zero physical dispatches, its
+  // logical row stayed 'open' forever, and a turn whose goal was achieved by
+  // a different settled call was labeled blocked — "unsettled logical or
+  // physical work"). An open row is in-flight only while its call could
+  // still land: with NO started dispatch and a durable failure return, the
+  // attempt is over. Rows with a started dispatch keep blocking — that is
+  // the double-send protection and it stays absolute.
+  const openRows = db.prepare(`
+    SELECT logical_tool_call_id FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND state != 'settled'
+  `).all(...identity) as Array<{ logical_tool_call_id: string }>;
+  for (const open of openRows) {
+    const dispatched = db.prepare(`
+      SELECT 1 FROM physical_dispatches
+       WHERE session_id = ? AND logical_tool_call_id = ? LIMIT 1
+    `).get(expected.identity.sessionId, open.logical_tool_call_id);
+    if (dispatched) return true;
+    const failedReturn = db.prepare(`
+      SELECT 1 FROM events
+       WHERE session_id = ? AND type = 'tool_returned'
+         AND json_extract(data_json, '$.callId') = ?
+         AND json_extract(data_json, '$.ok') IN (0, 'false')
+       LIMIT 1
+    `).get(expected.identity.sessionId, open.logical_tool_call_id);
+    if (!failedReturn) return true;
+  }
+  return false;
 }
 
 /**
