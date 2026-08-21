@@ -142,28 +142,71 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
         {workflow.description ? <p class="workflow-desc">{workflow.description}</p> : null}
         <ScreenNotice error={infoError} offline={infoOffline} onRetry={() => void reloadInfo()} hasData={Boolean(info)} />
 
-        {info?.steps?.length ? (
-          <details class="wf-steps">
-            <summary class="memory-section-head">
-              What it does · {info.steps.length} {info.steps.length === 1 ? 'step' : 'steps'}
-              {info.schedule ? ` · cron ${info.schedule}` : ''}
-            </summary>
+        {/* The strategic read, before any mechanics: what it touches, whether
+            it can be trusted, and what "good" means for it. Deciding to run
+            something is answered by these three, never by a step list. */}
+        {info ? (
+          <section class="wf-strategy">
+            <div class="wf-facts">
+              <div class="wf-fact">
+                <div class="wf-fact-value">{whenLabel(info.schedule)}</div>
+                <div class="wf-fact-label">Runs</div>
+              </div>
+              {info.trackRecord ? (
+                <div class="wf-fact">
+                  <div class={`wf-fact-value ${info.trackRecord.succeeded === info.trackRecord.of ? 'wf-good' : info.trackRecord.succeeded === 0 ? 'wf-bad' : ''}`}>
+                    {info.trackRecord.succeeded}/{info.trackRecord.of}
+                  </div>
+                  <div class="wf-fact-label">Recent success</div>
+                </div>
+              ) : null}
+              <div class="wf-fact">
+                <div class={`wf-fact-value ${(info.effects?.writes ?? 0) + (info.effects?.sends ?? 0) > 0 ? 'wf-warn' : ''}`}>
+                  {touchLabel(info.effects)}
+                </div>
+                <div class="wf-fact-label">Touches</div>
+              </div>
+            </div>
+
+            {info.effects?.approvals?.length ? (
+              <div class="wf-approvals">
+                Pauses for your approval on {info.effects.approvals.length} {info.effects.approvals.length === 1 ? 'step' : 'steps'}
+              </div>
+            ) : null}
+
             {info.summary ? (
               <div class="bubble-md wf-summary" dangerouslySetInnerHTML={{ __html: renderMarkdown(info.summary) }} />
             ) : null}
-            <ol class="wf-step-list">
-              {info.steps.map((step) => (
-                <li key={step.stepId} class="wf-step">
-                  <span class="wf-step-label">{step.label || step.stepId}</span>
-                  <span class="wf-step-chips">
-                    {step.executor ? <span class="wf-chip">{step.executor}</span> : null}
-                    {step.effect === 'external' ? <span class="wf-chip wf-chip-effect">writes outside</span> : null}
-                    {step.gated ? <span class="wf-chip wf-chip-gated">needs approval</span> : null}
-                  </span>
-                </li>
-              ))}
-            </ol>
-          </details>
+
+            {info.qualityCriteria?.length ? (
+              <div class="wf-criteria">
+                <div class="memory-section-head">What counts as a good run</div>
+                {info.qualityCriteria.slice(0, 5).map((line) => (
+                  <div key={line} class="ws-contract-line">{line}</div>
+                ))}
+              </div>
+            ) : null}
+
+            {info.steps.length ? (
+              <details class="wf-steps">
+                <summary class="wf-steps-summary">
+                  {stepSpine(info.steps)} · {info.steps.length} {info.steps.length === 1 ? 'step' : 'steps'}
+                </summary>
+                <ol class="wf-step-list">
+                  {info.steps.map((step) => (
+                    <li key={step.stepId} class="wf-step">
+                      <span class="wf-step-label">{step.label || step.stepId}</span>
+                      <span class="wf-step-chips">
+                        {step.executor ? <span class="wf-chip">{step.executor}</span> : null}
+                        {step.effect === 'external' ? <span class="wf-chip wf-chip-effect">writes outside</span> : null}
+                        {step.gated ? <span class="wf-chip wf-chip-gated">needs approval</span> : null}
+                      </span>
+                    </li>
+                  ))}
+                </ol>
+              </details>
+            ) : null}
+          </section>
         ) : null}
 
         {info?.inputs?.length ? (
@@ -318,6 +361,51 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
       </div>
     </div>
   );
+}
+
+/** When it runs, in words. A cron string is not an answer to "when". */
+function whenLabel(schedule: string | null): string {
+  if (!schedule) return 'When asked';
+  const parts = schedule.trim().split(/\s+/);
+  if (parts.length < 5) return schedule;
+  const [minute, hour, dom, , dow] = parts;
+  const at = (): string => {
+    const h = Number(hour);
+    const m = Number(minute);
+    if (!Number.isFinite(h) || !Number.isFinite(m)) return schedule;
+    const suffix = h < 12 ? 'am' : 'pm';
+    const hour12 = h % 12 === 0 ? 12 : h % 12;
+    return m === 0 ? `${hour12}${suffix}` : `${hour12}:${String(m).padStart(2, '0')}${suffix}`;
+  };
+  if (hour.includes('*')) return 'Hourly';
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  if (dow !== '*' && !dow.includes('*')) {
+    const day = days[Number(dow)] ?? dow;
+    return `${day} ${at()}`;
+  }
+  if (dom !== '*' && !dom.includes('*')) return `Monthly ${at()}`;
+  return `Daily ${at()}`;
+}
+
+/** What it touches, as consequence rather than counts. */
+function touchLabel(effects?: { reads: number; writes: number; sends: number }): string {
+  if (!effects) return '—';
+  const out: string[] = [];
+  if (effects.sends > 0) out.push(`${effects.sends} send${effects.sends === 1 ? '' : 's'}`);
+  if (effects.writes > 0) out.push(`${effects.writes} write${effects.writes === 1 ? '' : 's'}`);
+  if (out.length === 0) return effects.reads > 0 ? 'Reads only' : 'Nothing outside';
+  return out.join(' · ');
+}
+
+/** The shape of the work in one line: "3 reads → 1 write". */
+function stepSpine(steps: Array<{ effect: string | null; gated: boolean }>): string {
+  const external = steps.filter((s) => s.effect === 'external').length;
+  const internal = steps.length - external;
+  const gated = steps.filter((s) => s.gated).length;
+  const spine = external > 0
+    ? `${internal} internal → ${external} external`
+    : `${internal} internal`;
+  return gated > 0 ? `${spine} · ${gated} gated` : spine;
 }
 
 function formatDuration(ms: number): string {

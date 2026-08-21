@@ -806,8 +806,10 @@ input, textarea { font: inherit; }
 }
 .login-pin:focus { border-color: var(--line-hot); box-shadow: 0 0 0 4px var(--accent-soft); }
 
+/* Solid accent, no gradient and no glow. A primary action is found because
+   it is the only warm thing on the screen, not because it is lit up. */
 .btn {
-  background: linear-gradient(180deg, var(--accent-hi), var(--accent-deep));
+  background: var(--accent);
   color: var(--on-accent);
   border: none;
   padding: 15px 24px;
@@ -818,11 +820,10 @@ input, textarea { font: inherit; }
   border-radius: var(--r-lg);
   width: 100%;
   max-width: 300px;
-  box-shadow: 0 6px 20px rgba(240, 101, 17, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.28);
-  transition: transform 0.14s var(--ease-out), filter 0.14s ease;
+  transition: transform 0.14s var(--ease-out), filter 0.14s ease, opacity 0.16s ease;
 }
 .btn:active { transform: scale(0.97); filter: brightness(0.94); }
-.btn:disabled { opacity: 0.45; box-shadow: none; }
+.btn:disabled { opacity: 0.4; }
 .btn:focus-visible, button:focus-visible, input:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -1059,9 +1060,51 @@ input, textarea { font: inherit; }
   .act-spinner { animation: none; border-top-color: var(--accent); }
 }
 
-/* ── workflow detail: steps, inputs, run timeline ───────────────── */
-.wf-steps { margin: var(--sp-3) 0; }
+/* ── workflow detail: strategy first, mechanics on request ──────── */
+.wf-strategy { margin: var(--sp-3) 0; }
+/* Three facts answer "should I run this": when, how it has gone, what it
+   touches. Numbers lead, labels follow — the reverse reads as a form. */
+.wf-facts {
+  display: flex;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.wf-fact {
+  flex: 1 1 0;
+  min-width: 0;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: var(--sp-2) var(--sp-3);
+}
+.wf-fact-value {
+  font-family: var(--font-display);
+  font-size: var(--t-sm);
+  font-weight: 700;
+  color: var(--fg);
+  /* These are short phrases, not just numbers ("Daily 7am", "Reads only").
+     Wrapping keeps them readable where an ellipsis destroyed the answer. */
+  line-height: 1.25;
+  word-break: break-word;
+}
+.wf-fact-value.wf-good { color: var(--accent-2); }
+.wf-fact-value.wf-warn { color: var(--accent-warn); }
+.wf-fact-value.wf-bad { color: var(--accent-fail); }
+.wf-fact-label { font-size: var(--t-xs); color: var(--fg-3); margin-top: 2px; }
+.wf-approvals {
+  font-size: var(--t-sm);
+  color: var(--accent-warn);
+  margin-bottom: var(--sp-2);
+}
+.wf-criteria { margin: var(--sp-3) 0; }
+.wf-steps { margin: var(--sp-3) 0 0; }
 .wf-steps > summary { cursor: pointer; list-style: none; }
+.wf-steps-summary {
+  font-size: var(--t-sm);
+  color: var(--fg-2);
+  cursor: pointer;
+  list-style: none;
+}
 .wf-summary { margin: var(--sp-2) 0; font-size: var(--t-sm); color: var(--fg-2); }
 .wf-step-list { margin: var(--sp-2) 0 0; padding-left: 1.4em; }
 .wf-step { margin: 6px 0; font-size: var(--t-sm); }

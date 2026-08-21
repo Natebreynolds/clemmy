@@ -703,6 +703,12 @@ export interface WorkflowDetailInfo {
   summary: string;
   steps: Array<{ stepId: string; label: string; executor: string | null; effect: string | null; gated: boolean }>;
   certification: { verdict: unknown; missingInputs: unknown } | null;
+  /** What this flow touches — the question behind "is it safe to run". */
+  effects?: { reads: number; writes: number; sends: number; approvals: string[]; tools: string[] };
+  /** The bar every run is judged against, in the workflow's own words. */
+  qualityCriteria?: string[];
+  /** How the last few runs actually went. */
+  trackRecord?: { succeeded: number; of: number } | null;
 }
 
 export async function getWorkflowDetail(name: string): Promise<WorkflowDetailInfo> {

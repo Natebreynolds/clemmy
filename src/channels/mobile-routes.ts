@@ -2607,6 +2607,20 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           ? (spec as { example: string }).example
           : null,
       }));
+      const dryRun = (certification as { dryRun?: Record<string, unknown> } | null)?.dryRun;
+      const effects = (dryRun?.effects ?? {}) as {
+        sends?: Array<{ stepId: string; detail: string }>;
+        writes?: Array<{ stepId: string; detail: string }>;
+        readSteps?: number;
+        toolsTouched?: string[];
+        approvals?: string[];
+      };
+      // The track record: what actually happened the last few times. A flow
+      // you are deciding whether to trust is answered by this, not by a
+      // step list.
+      const recent = (readMobileWorkflowRuns().get(entry.data.name) ?? []).slice(0, 10);
+      const settled = recent.filter((run) => run.terminalOutcome);
+      const succeeded = settled.filter((run) => run.terminalOutcome === 'succeeded').length;
       const certSteps = (certification as { steps?: unknown } | null)?.steps;
       res.json({
         name: entry.data.name,
@@ -2616,6 +2630,19 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         stepCount: entry.data.steps.length,
         inputs: inputsSchema,
         summary,
+        // What this flow TOUCHES — the question behind "is it safe to run".
+        effects: {
+          reads: typeof effects.readSteps === 'number' ? effects.readSteps : 0,
+          writes: effects.writes?.length ?? 0,
+          sends: effects.sends?.length ?? 0,
+          approvals: effects.approvals ?? [],
+          tools: (effects.toolsTouched ?? []).slice(0, 12),
+        },
+        // The bar each run is judged against, in the workflow's own words.
+        qualityCriteria: (dryRun?.qualityCriteria as string[] | undefined) ?? [],
+        trackRecord: settled.length > 0
+          ? { succeeded, of: settled.length }
+          : null,
         steps: Array.isArray(certSteps)
           ? (certSteps as Array<Record<string, unknown>>).map((step) => ({
               stepId: typeof step.stepId === 'string' ? step.stepId : '',
