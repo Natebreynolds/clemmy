@@ -18,7 +18,10 @@ import {
   loadAcceptedTaskAuthority,
   manifestAcceptedTaskAuthority,
 } from './accepted-task-authority.js';
-import { issueHostReadEvidenceForManifestNode } from './evidence-receipts.js';
+import {
+  issueHostReadEvidenceForManifestNode,
+  issueHostWriteEvidenceForManifestNode,
+} from './evidence-receipts.js';
 import {
   satisfyDeclaredObligation,
   satisfiedObligationsState,
@@ -536,16 +539,51 @@ export function prepareAcceptedTaskTerminal(input: {
     };
   }
 
-  // Deterministic V1 can contain only zero work or one read. Refuse any future
-  // effect shape until its host issuer exists; never improvise proof for it.
   for (const node of compiled.manifest.nodes) {
-    if (node.effectKind !== 'read') {
+    if (node.effectKind === 'read') {
+      const issued = issueHostReadEvidenceForManifestNode({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        manifestId: compiled.manifest.manifestId,
+        nodeId: node.nodeId,
+      });
+      if (issued.status !== 'issued' && issued.status !== 'replayed') {
+        const failure = issued as Exclude<typeof issued, { status: 'issued' | 'replayed' }>;
+        return {
+          status: failure.status === 'storage_error' ? 'storage_error'
+            : failure.status === 'conflict' ? 'conflict'
+              : 'needs_verification',
+          reason: failure.reason,
+        };
+      }
+      const request = {
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        manifestId: compiled.manifest.manifestId,
+        nodeId: node.nodeId,
+        obligation: issued.receipt.obligation,
+        receiptId: issued.receipt.receiptId,
+        physicalAttemptId: issued.receipt.physicalDispatchId,
+      };
+      const satisfied = satisfyDeclaredObligation(request);
+      if (!satisfied.ok && !exactSatisfactionAlreadyExists({
+        ...request,
+        physicalDispatchId: issued.receipt.physicalDispatchId,
+      })) {
+        return {
+          status: 'conflict',
+          reason: `host read evidence could not satisfy its exact obligation: ${boundedReason(satisfied.reason)}`,
+        };
+      }
+      continue;
+    }
+    if (node.effectKind !== 'external_write' && node.effectKind !== 'local_write') {
       return {
         status: 'needs_verification',
         reason: `no production evidence issuer exists for manifest effect ${node.effectKind}`,
       };
     }
-    const issued = issueHostReadEvidenceForManifestNode({
+    const issued = issueHostWriteEvidenceForManifestNode({
       sessionId: input.sessionId,
       sourceUserSeq: input.sourceUserSeq,
       manifestId: compiled.manifest.manifestId,
@@ -560,24 +598,26 @@ export function prepareAcceptedTaskTerminal(input: {
         reason: failure.reason,
       };
     }
-    const request = {
-      sessionId: input.sessionId,
-      sourceUserSeq: input.sourceUserSeq,
-      manifestId: compiled.manifest.manifestId,
-      nodeId: node.nodeId,
-      obligation: issued.receipt.obligation,
-      receiptId: issued.receipt.receiptId,
-      physicalAttemptId: issued.receipt.physicalDispatchId,
-    };
-    const satisfied = satisfyDeclaredObligation(request);
-    if (!satisfied.ok && !exactSatisfactionAlreadyExists({
-      ...request,
-      physicalDispatchId: issued.receipt.physicalDispatchId,
-    })) {
-      return {
-        status: 'conflict',
-        reason: `host read evidence could not satisfy its exact obligation: ${boundedReason(satisfied.reason)}`,
+    for (const receipt of issued.receipts) {
+      const request = {
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        manifestId: compiled.manifest.manifestId,
+        nodeId: node.nodeId,
+        obligation: receipt.obligation,
+        receiptId: receipt.receiptId,
+        physicalAttemptId: receipt.physicalDispatchId,
       };
+      const satisfied = satisfyDeclaredObligation(request);
+      if (!satisfied.ok && !exactSatisfactionAlreadyExists({
+        ...request,
+        physicalDispatchId: receipt.physicalDispatchId,
+      })) {
+        return {
+          status: 'conflict',
+          reason: `host write evidence could not satisfy its exact obligation: ${boundedReason(satisfied.reason)}`,
+        };
+      }
     }
   }
 
