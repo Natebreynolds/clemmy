@@ -134,11 +134,11 @@ export function projectCheckedSemantics(
       };
     case 'new_goal': {
       const clarifyingOpenSlots = proposal.goal !== null
-        && proposal.goal.openSlots.length > 0;
-      const underspecifiedWrite = workIsUnderspecifiedWrite(proposal.work);
+        && proposal.goal.openSlots.length > 0
+        && !proposal.work;
       return {
         ok: true,
-        projection: (clarifyingOpenSlots || underspecifiedWrite)
+        projection: clarifyingOpenSlots
           ? {
               kind: 'conversation',
               source,

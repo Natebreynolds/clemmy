@@ -30,9 +30,7 @@ function capabilityIdOf(identifier: string): string {
 }
 
 function destinationFamilyOf(carrier: string): string {
-  const value = carrier.trim().toLowerCase();
-  if (!value) return '';
-  return /sheet|workbook|excel|spreadsheet/.test(value) ? 'workbook' : value;
+  return carrier.trim().toLowerCase();
 }
 
 function descriptorFromHit(hit: CapabilityOperationHit): HostCapabilityDescriptorV1 {
@@ -96,7 +94,7 @@ export function catalogEntriesForAcceptedSource(input: {
   void input.objective;
   const selectedIds = new Set(
     provenCapabilityEntriesForTurn(input)
-      .filter((entry) => entry.kind === 'composio')
+      .filter((entry) => entry.kind === 'composio' || entry.kind === 'cli' || entry.kind === 'mcp')
       .map((entry) => capabilityIdOf(entry.identifier)),
   );
   const frozen = freezeCatalogSnapshotForSource({

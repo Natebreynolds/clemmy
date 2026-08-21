@@ -28,14 +28,45 @@ async function dispatchFor(text: string) {
   return dispatchAdmittedSource({ sessionId: sess.id, turn: 1, sourceUserSeq: source.seq });
 }
 
-test('an act-routed graph with no bound operations blocks instead of an untyped loop', async () => {
-  const dispatched = await dispatchFor('whats on my calendar for tomrrow');
-  assert.equal(dispatched.kind, 'blocked', JSON.stringify(dispatched).slice(0, 200));
+test('an unbound READ parks on the typed kernel instead of falling through to conversation', async () => {
+  const dispatched = await dispatchFor('whats on my roster for tomorrow');
+  assert.notEqual(dispatched.kind, 'conversation', JSON.stringify(dispatched).slice(0, 200));
+  assert.ok(
+    dispatched.kind === 'blocked' || dispatched.kind === 'needs_input',
+    JSON.stringify(dispatched).slice(0, 200),
+  );
 });
 
-test('an unbound retrieve also blocks instead of falling through', async () => {
+test('an unbound retrieve parks instead of falling through to conversation', async () => {
   const dispatched = await dispatchFor('what did casey say in the last email thread from acme');
-  assert.equal(dispatched.kind, 'blocked', JSON.stringify(dispatched).slice(0, 200));
+  assert.notEqual(dispatched.kind, 'conversation', JSON.stringify(dispatched).slice(0, 200));
+  assert.ok(
+    dispatched.kind === 'blocked' || dispatched.kind === 'needs_input',
+    JSON.stringify(dispatched).slice(0, 200),
+  );
+});
+
+test('a role-only sketch is not an executable typed graph', async () => {
+  const { typedGraphHasExecutableOperations } = await import('./typed-source-dispatch.js');
+  assert.equal(typedGraphHasExecutableOperations({
+    nodes: [{ capabilityRole: 'source' }, { capabilityRole: 'collection' }],
+  }), false);
+  assert.equal(typedGraphHasExecutableOperations({
+    nodes: [{ operationId: 'cap:store:upsert' }],
+  }), true);
+});
+
+test('an unbound write never falls through to the conversation loop', async () => {
+  const dispatched = await dispatchFor(
+    'put the top 5 records into a new workbook and share it with the team',
+  );
+  // North-star cutover: after participation, a write uses the kernel or parks.
+  // Conversation tools must not mint the crossing.
+  assert.notEqual(dispatched.kind, 'conversation', JSON.stringify(dispatched).slice(0, 200));
+  assert.ok(
+    dispatched.kind === 'blocked' || dispatched.kind === 'needs_input',
+    JSON.stringify(dispatched).slice(0, 200),
+  );
 });
 
 test('a conversation-routed graph dispatches conversation, not an action loop', async () => {
@@ -43,14 +74,41 @@ test('a conversation-routed graph dispatches conversation, not an action loop', 
   assert.ok(dispatched.kind === 'conversation' || dispatched.kind === 'blocked', dispatched.kind);
 });
 
-test('a failed semantic admission blocks — a checker cannot mint an untyped action loop', async () => {
+test('a failed semantic admission does not fall through to a read loop', async () => {
   const { recordSemanticDispositionOutcome } = await import('./semantic-disposition.js');
   const sess = createSession({ kind: 'chat' });
   const source = appendEvent({
     sessionId: sess.id, turn: 1, role: 'user',
-    type: 'user_input_received', data: { text: 'can you update my friday morning meeting dashboard please' },
+    type: 'user_input_received', data: { text: 'whats on my roster for tomorrow' },
   });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: sess.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
   recordSemanticDispositionOutcome(sess.id, source.seq, 'blocked');
   const dispatched = await dispatchAdmittedSource({ sessionId: sess.id, turn: 1, sourceUserSeq: source.seq });
-  assert.equal(dispatched.kind, 'blocked', JSON.stringify(dispatched).slice(0, 200));
+  assert.notEqual(dispatched.kind, 'conversation', JSON.stringify(dispatched).slice(0, 200));
+  assert.ok(
+    dispatched.kind === 'blocked' || dispatched.kind === 'needs_input',
+    JSON.stringify(dispatched).slice(0, 200),
+  );
+});
+
+test('a failed semantic admission does not fall through to a write loop', async () => {
+  const { recordSemanticDispositionOutcome } = await import('./semantic-disposition.js');
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id, turn: 1, role: 'user',
+    type: 'user_input_received',
+    data: { text: 'put the top 5 records into a new workbook and share it with the team' },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: sess.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
+  recordSemanticDispositionOutcome(sess.id, source.seq, 'blocked');
+  const dispatched = await dispatchAdmittedSource({ sessionId: sess.id, turn: 1, sourceUserSeq: source.seq });
+  assert.notEqual(dispatched.kind, 'conversation', JSON.stringify(dispatched).slice(0, 200));
+  assert.ok(
+    dispatched.kind === 'blocked' || dispatched.kind === 'needs_input',
+    JSON.stringify(dispatched).slice(0, 200),
+  );
 });

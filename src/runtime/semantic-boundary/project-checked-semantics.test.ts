@@ -129,7 +129,7 @@ test('new_goal with clarifying open-slots and no work projects as conversation',
   assert.deepEqual(proposedGraphFromProjection(projected.projection).nodes, [{ kind: 'compose_reply' }]);
 });
 
-test('underspecified named-existing writes project as conversation, not mint_goal', () => {
+test('underspecified named-existing writes stay mint_goal so dispatch can park, not conversation', () => {
   const host = buildTurnSemanticHostViewV1({
     sessionId: 'session-clarify',
     sourceUserSeq: 1,
@@ -173,7 +173,9 @@ test('underspecified named-existing writes project as conversation, not mint_goa
   const projected = projectCheckedSemantics(checked.checked);
   assert.equal(projected.ok, true);
   if (!projected.ok) return;
-  assert.equal(projected.projection.kind, 'conversation');
+  assert.equal(projected.projection.kind, 'mint_goal');
+  assert.equal(projected.projection.goal?.requestedEffect, 'external_write');
+  assert.ok((projected.projection.goal?.destinations?.length ?? 0) > 0);
 });
 
 test('new_goal projection takes construct from hash-bound work, not criterion ids', () => {

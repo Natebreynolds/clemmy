@@ -759,12 +759,30 @@ export async function runAdmittedTurnGraph(input: {
     } catch {
       // Prior handles are best-effort hydration through exact authority.
     }
-  } else {
-    for (const [nodeId, location] of Object.entries(handles)) {
-      const redeemed = redeemRawResult(location);
-      if (redeemed.status !== 'ok') continue;
-      const node = graph.nodes.find((candidate) => candidate.id === nodeId);
-      rememberArtifact(nodeId, node?.capabilityRole ?? '', redeemed.value, location);
+  }
+  for (const [nodeId, location] of Object.entries(handles)) {
+    if (artifacts.has(nodeId)) continue;
+    const redeemed = redeemRawResult(location);
+    if (redeemed.status !== 'ok') continue;
+    const node = graph.nodes.find((candidate) => candidate.id === nodeId);
+    rememberArtifact(nodeId, node?.capabilityRole ?? '', redeemed.value, location);
+  }
+  const verifyNode = graph.nodes.find((node) => node.kind === 'verify');
+  if (verifyNode && !artifacts.has(verifyNode.id)) {
+    const created = [...artifacts.values()].find((entry) => (
+      entry.role === 'destination' || entry.role === 'create'
+    ));
+    const readback = [...artifacts.values()].find((entry) => entry.role === 'readback');
+    const createdValue = created?.value as { id?: string; handle?: string; receipt?: string } | undefined;
+    const readbackValue = readback?.value as { id?: string; handle?: string; content?: unknown } | undefined;
+    if (
+      createdValue
+      && typeof createdValue.id === 'string'
+      && typeof createdValue.handle === 'string'
+      && readbackValue
+      && readbackValue.content !== undefined
+    ) {
+      rememberArtifact(verifyNode.id, 'verify', { ok: true, created: createdValue, readback: readbackValue });
     }
   }
 
@@ -1953,12 +1971,22 @@ export async function runAdmittedTurnGraph(input: {
         rememberArtifact(node.id, 'publish', { handle: publishedHandle }, publishedHandle);
         return { status: 'completed', outputRef: publishedHandle };
       }
+      const createdFromArtifacts = [...artifacts.values()]
+        .filter((entry) => entry.role === 'destination' || entry.role === 'create')
+        .map((entry) => entry.value as { id?: string; handle?: string; receipt?: string })
+        .find((value) => typeof value?.id === 'string' && typeof value.handle === 'string');
+      const readbackFromArtifacts = [...artifacts.values()]
+        .filter((entry) => entry.role === 'readback')
+        .map((entry) => entry.value as { handle?: string; content?: unknown; id?: string })
+        .find((value) => value && value.content !== undefined);
       const created = createdFrom(node.id)
-        ?? (verified?.value as { created?: { id: string; handle: string; receipt?: string } } | undefined)?.created;
+        ?? (verified?.value as { created?: { id: string; handle: string; receipt?: string } } | undefined)?.created
+        ?? createdFromArtifacts;
       const readback = incoming
         .map((prior) => prior.value as { handle?: string; content?: unknown; id?: string })
         .find((value) => value && value.content !== undefined)
-        ?? (verified?.value as { readback?: { handle: string; id: string; content?: unknown } } | undefined)?.readback;
+        ?? (verified?.value as { readback?: { handle: string; id: string; content?: unknown } } | undefined)?.readback
+        ?? readbackFromArtifacts;
       if (!created || !readback) return { status: 'blocked', reason: 'publish requires create and readback' };
       if (testFault === 'before_publication') throw new Error('forced crash before publication');
       if (identity) {
@@ -2294,7 +2322,10 @@ export async function runAdmittedTurnGraph(input: {
     && providerCalls.create === 0
     && !uncertain
     && (testFault !== null || (error ?? '').includes('forced crash'));
-  if (identity && terminalIdentity && !published && !leaseRejoin && !writeFreeIncomplete) {
+  const crashIncomplete = !published
+    && !uncertain
+    && (testFault !== null || (error ?? lastBlockReason).includes('forced crash'));
+  if (identity && terminalIdentity && !published && !leaseRejoin && !writeFreeIncomplete && !crashIncomplete) {
     const awaiting = error?.includes('needs_input') || result.paused.length > 0;
     try {
       commitTerminal(

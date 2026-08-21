@@ -92,7 +92,8 @@ test('REPLAY MACHINERY: the host compile core stays deterministic and byte-stabl
   const { canonicalProposalPayloadHash } = await import('./turn-semantic-proposal.js');
   const { hostCompileDigest } = await import('./host-authority.js');
   assert.equal(extractCollectCount(LIVE_TEXT), 5);
-  assert.equal(deriveDestinationFamily(LIVE_TEXT, ['workbook']), 'workbook');
+  assert.equal(deriveDestinationFamily('put the records in a workbook', ['workbook']), 'workbook');
+  assert.equal(deriveDestinationFamily(LIVE_TEXT, ['workbook']), null);
   const proposal = buildHostProposal({ acceptedText: LIVE_TEXT, count: 5, family: 'workbook' });
   const digestA = canonicalProposalPayloadHash(proposal);
   const digestB = canonicalProposalPayloadHash(buildHostProposal({ acceptedText: LIVE_TEXT, count: 5, family: 'workbook' }));

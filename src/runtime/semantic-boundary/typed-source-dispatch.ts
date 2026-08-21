@@ -4,7 +4,7 @@
  * construct-specific caller conditionals are not authority.
  */
 import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
-import { appendEvent, getSession, getTurnGraphEventForSource } from '../harness/eventlog.js';
+import { appendEvent, getTurnGraphEventForSource, listEvents } from '../harness/eventlog.js';
 import {
   commitUnadmittedSemanticTurn,
   commitUnsupportedTypedExecutionTurn,
@@ -25,67 +25,27 @@ import { describeGoalCatalogGap, selectGoalCatalog } from '../harness/connected-
 import { disposeGate } from '../gate-reason.js';
 import { commitTurnOutcome } from '../harness/delivery-committer.js';
 import { turnOutcomeId } from '../harness/turn-outcome.js';
-import { listEvents } from '../harness/eventlog.js';
 import { assessControlComplexity, generalSchedulerForbidden } from '../harness/control-complexity.js';
 import { runDirectNodeInvocation } from '../harness/direct-invocation.js';
 import { createHash } from 'node:crypto';
 
-/** Blocked copy for an admitted construct the CONNECTED registry cannot
- *  carry. Names the missing FAMILY from a fresh registry gap analysis; when
- *  the families exist and bind still failed, owns the defect instead of
- *  inventing a user chore. Commits the one blocked terminal. */
-function unboundConstructStop(
+function graphPromisesWrite(graph: { effectCeiling?: string }): boolean {
+  const ceiling = graph.effectCeiling;
+  return ceiling === 'external_write' || ceiling === 'local_write';
+}
+
+function graphPromisesUnknown(graph: { effectCeiling?: string }): boolean {
+  return graph.effectCeiling === 'unknown' || graph.effectCeiling === 'admin';
+}
+
+function stopUnboundWork(
   identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>,
-): Extract<TypedSourceDispatch, { kind: 'blocked' | 'needs_input' }> {
-  let text = 'I could not bind this plan to your connected apps — that is a defect on my side, not a missing connection. Nothing was started; I have logged it for repair.';
-  try {
-    const source = listEvents(identity.sessionId, {
-      sinceSeq: identity.sourceUserSeq - 1,
-      types: ['user_input_received'],
-      limit: 1,
-    }).find((event) => event.seq === identity.sourceUserSeq);
-    const objective = typeof source?.data.displayText === 'string' && source.data.displayText.trim()
-      ? source.data.displayText
-      : typeof source?.data.text === 'string' ? source.data.text : '';
-    const graph = turnGraphFromShadowEvent(getTurnGraphEventForSource(identity.sessionId, identity.sourceUserSeq));
-    const construct = graph?.classification.goalConstraints?.construct;
-    const hasDestination = Boolean(graph?.classification.goalConstraints?.destination)
-      || ((graph?.classification.goalConstraints?.destinations?.length ?? 0) > 0);
-    const connectionShaped = construct === 'collect_then_construct'
-      || (construct === 'single_act' && hasDestination);
-    const gaps = connectionShaped ? selectGoalCatalog(objective).gaps : [];
-    if (gaps.length > 0) {
-      const gate = disposeGate({
-        posture: 'authorized_reversible',
-        missingCredentialConnection: { capabilityId: `family:${gaps[0]}` },
-      });
-      if (gate.status === 'needs_input') {
-        const question = describeGoalCatalogGap(gaps);
-        parkDependencyRequest({
-          sessionId: identity.sessionId,
-          sourceUserSeq: identity.sourceUserSeq,
-          turn: identity.turn,
-          kind: 'connection_missing',
-          text: question,
-        });
-        commitTurnOutcome({
-          version: 2,
-          id: turnOutcomeId(identity),
-          identity: {
-            sessionId: identity.sessionId,
-            turn: identity.turn,
-            sourceUserSeq: identity.sourceUserSeq,
-          },
-          status: 'needs_input',
-          resumable: true,
-          needs: { kind: 'input' },
-          presentation: { kind: 'question', text: question },
-        });
-        return { kind: 'needs_input', text: question };
-      }
-      text = describeGoalCatalogGap(gaps);
-    }
-  } catch { /* the host-defect copy above remains honest */ }
+  graph: { effectCeiling?: string },
+): Extract<TypedSourceDispatch, { kind: 'blocked' }> {
+  const write = graphPromisesWrite(graph);
+  const text = write
+    ? 'I could not bind that change to an exact connected contract, so I stopped before changing anything. Connect the app or name the exact destination if you want me to continue.'
+    : 'I could not bind that to an exact connected contract, so I stopped before doing anything. Connect the app or name the exact contract if you want me to continue.';
   commitTurnOutcome({
     version: 2,
     id: turnOutcomeId(identity),
@@ -99,6 +59,103 @@ function unboundConstructStop(
     presentation: { kind: 'blocked', text },
   });
   return { kind: 'blocked', text };
+}
+
+function parkUnboundRead(
+  identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>,
+): Extract<TypedSourceDispatch, { kind: 'needs_input' }> {
+  const parked = parkDependencyRequest({
+    sessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+    turn: identity.turn,
+    kind: 'capability_contract_missing',
+  });
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity: {
+      sessionId: identity.sessionId,
+      turn: identity.turn,
+      sourceUserSeq: identity.sourceUserSeq,
+    },
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: parked.text },
+  });
+  return { kind: 'needs_input', text: parked.text };
+}
+
+/**
+ * After the semantic port participates, the turn stays on this kernel.
+ * Conversation is only converse-first (direct_reply) or a host-only sketch.
+ */
+function stopUnboundParticipated(
+  identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>,
+  graph: { effectCeiling?: string } | null,
+): Extract<TypedSourceDispatch, { kind: 'blocked' | 'needs_input' }> {
+  if (graph && (graphPromisesWrite(graph) || graphPromisesUnknown(graph))) {
+    return unboundConstructConnectionPark(identity) ?? stopUnboundWork(identity, graph);
+  }
+  return parkUnboundRead(identity);
+}
+
+/**
+ * Park only a real missing connection. Consequential writes never fall through
+ * to the conversation loop (north-star cutover: no fallback across cores).
+ */
+function unboundConstructConnectionPark(
+  identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>,
+): Extract<TypedSourceDispatch, { kind: 'needs_input' }> | null {
+  try {
+    const source = listEvents(identity.sessionId, {
+      sinceSeq: identity.sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    }).find((event) => event.seq === identity.sourceUserSeq);
+    const objective = typeof source?.data.displayText === 'string' && source.data.displayText.trim()
+      ? source.data.displayText
+      : typeof source?.data.text === 'string' ? source.data.text : '';
+    const graph = turnGraphFromShadowEvent(getTurnGraphEventForSource(identity.sessionId, identity.sourceUserSeq));
+    const construct = graph?.classification.goalConstraints?.construct;
+    const collection = graph?.classification.goalConstraints?.collection;
+    const hasDestination = Boolean(graph?.classification.goalConstraints?.destination)
+      || ((graph?.classification.goalConstraints?.destinations?.length ?? 0) > 0);
+    const connectionShaped = construct === 'collect_then_construct'
+      || (collection?.projection.length ?? 0) > 0
+      || (construct === 'single_act' && hasDestination);
+    const gaps = connectionShaped ? selectGoalCatalog(objective).gaps : [];
+    if (gaps.length === 0) return null;
+    const gate = disposeGate({
+      posture: 'authorized_reversible',
+      missingCredentialConnection: { capabilityId: `family:${gaps[0]}` },
+    });
+    if (gate.status !== 'needs_input') return null;
+    const question = describeGoalCatalogGap(gaps, { projection: collection?.projection });
+    parkDependencyRequest({
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+      turn: identity.turn,
+      kind: 'connection_missing',
+      text: question,
+    });
+    commitTurnOutcome({
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity: {
+        sessionId: identity.sessionId,
+        turn: identity.turn,
+        sourceUserSeq: identity.sourceUserSeq,
+      },
+      status: 'needs_input',
+      resumable: true,
+      needs: { kind: 'input' },
+      presentation: { kind: 'question', text: question },
+    });
+    return { kind: 'needs_input', text: question };
+  } catch {
+    return null;
+  }
 }
 
 export type TypedSourceDispatch =
@@ -119,7 +176,10 @@ const SUPPORTED_CONSTRUCTS = new Set([
 export function typedGraphHasExecutableOperations(graph: {
   nodes: ReadonlyArray<{ operationId?: string; capabilityRole?: string }>;
 }): boolean {
-  return graph.nodes.some((node) => Boolean(node.operationId || node.capabilityRole));
+  // A role stamp is a sketch. Typed dispatch starts only when a node is bound
+  // to an exact operation. Otherwise a participated turn parks or blocks —
+  // it does not enter another executor empty-handed.
+  return graph.nodes.some((node) => Boolean(node.operationId));
 }
 
 export async function dispatchAdmittedSource(
@@ -129,20 +189,8 @@ export async function dispatchAdmittedSource(
   if (!disposition || disposition.participation !== 'participated') {
     return { kind: 'conversation' };
   }
-  if (disposition.outcome === 'blocked' || disposition.outcome === 'unavailable') {
-    return { kind: 'blocked', text: commitUnadmittedSemanticTurn(identity).text };
-  }
   const event = getTurnGraphEventForSource(identity.sessionId, identity.sourceUserSeq);
   const graph = turnGraphFromShadowEvent(event);
-  if (!graph) {
-    return { kind: 'blocked', text: commitUnadmittedSemanticTurn(identity).text };
-  }
-  if (
-    getSession(identity.sessionId)?.kind === 'workflow'
-    || hostOnlySketchForSource(identity.sessionId, identity.sourceUserSeq)
-  ) {
-    return { kind: 'conversation' };
-  }
   const clarifying = clarifyingOpenSlotQuestionForSource(identity.sessionId, identity.sourceUserSeq);
   if (clarifying) {
     parkDependencyRequest({
@@ -174,27 +222,26 @@ export async function dispatchAdmittedSource(
     });
     return { kind: 'needs_input', text: clarifying };
   }
-  if (!typedGraphHasExecutableOperations(graph)) {
-    const route = graph.classification.route;
-    const constraints = graph.classification.goalConstraints;
-    const hasDestination = Boolean(constraints?.destination)
-      || (constraints?.destinations?.length ?? 0) > 0;
-    // An ADMITTED construct with a destination must RUN as a bound graph —
-    // never tool_search theater. Reaching here means the connected registry
-    // lacks a family or host bind failed. Name it honestly.
-    if (route === 'act' && constraints && constraints.construct !== 'none' && hasDestination) {
-      return unboundConstructStop(identity);
-    }
-    if (route === 'act' || route === 'retrieve') {
-      return unboundConstructStop(identity);
-    }
+  const conversationMode = graph?.classification.route === 'direct_reply'
+    || hostOnlySketchForSource(identity.sessionId, identity.sourceUserSeq);
+  if (disposition.outcome === 'blocked' || disposition.outcome === 'unavailable') {
+    if (conversationMode) return { kind: 'conversation' };
+    return stopUnboundParticipated(identity, graph);
+  }
+  if (!graph) {
+    return stopUnboundParticipated(identity, null);
+  }
+  if (conversationMode) {
     return { kind: 'conversation' };
+  }
+  if (!typedGraphHasExecutableOperations(graph)) {
+    return stopUnboundParticipated(identity, graph);
   }
   const construct = graph.classification.goalConstraints?.construct ?? 'none';
   if (!SUPPORTED_CONSTRUCTS.has(construct) && construct !== 'none') {
     return { kind: 'blocked', text: commitUnsupportedTypedExecutionTurn(identity).text };
   }
-  const executableCount = graph.nodes.filter((node) => Boolean(node.operationId || node.capabilityRole)
+  const executableCount = graph.nodes.filter((node) => Boolean(node.operationId)
     && (node.kind === 'retrieve' || node.kind === 'execute')).length;
   const sourceDigest = createHash('sha256').update(`${identity.sessionId}:${identity.sourceUserSeq}`).digest('hex');
   const complexity = assessControlComplexity({

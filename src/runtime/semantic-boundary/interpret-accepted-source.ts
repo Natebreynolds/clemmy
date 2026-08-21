@@ -14,7 +14,7 @@ import {
 } from './admit-turn-semantics.js';
 import type { AdmittedClampedSemanticsV1 } from '../graph/admitted-turn-semantics.js';
 import { buildTurnSemanticHostViewV1, type DurableSemanticSnapshotV1 } from './build-semantic-host-view.js';
-import { synthesizeConstructOperations } from './host-bind-operations.js';
+import { synthesizeCollectionReadOperations, synthesizeConstructOperations, synthesizeRetrieveOperation } from './host-bind-operations.js';
 import {
   TURN_SEMANTIC_CALL_PURPOSE,
   TURN_SEMANTIC_PLAN_GROUNDING_PURPOSE,
@@ -1044,8 +1044,49 @@ async function interpretOnce(input: {
   // CLOSED as blocked — never tool_search theater.
   const hostBindEmptyActOperations = (): void => {
     if (!admitted.ok) return;
-    if (admitted.clamped.route !== 'act') return;
     if ((admitted.clamped.operations?.length ?? 0) > 0) return;
+    const identity = {
+      sessionId: input.snapshot.sessionId,
+      sourceUserSeq: input.snapshot.sourceUserSeq,
+    };
+    const collection = synthesizeCollectionReadOperations({
+      construct: admitted.clamped.construct,
+      route: admitted.clamped.route,
+      effectCeiling: String(admitted.clamped.effectCeiling),
+      objective: input.snapshot.acceptedText,
+      count: admitted.clamped.collection?.count,
+      identity,
+    });
+    if (collection && collection.length > 0) {
+      admitted = {
+        ok: true,
+        clamped: { ...admitted.clamped, operations: collection },
+        source: admitted.source,
+        policyRevision: admitted.policyRevision,
+        payloadHash: admitted.payloadHash,
+        contextHash: admitted.contextHash,
+      } as typeof admitted;
+      return;
+    }
+    const retrieve = synthesizeRetrieveOperation({
+      construct: admitted.clamped.construct,
+      route: admitted.clamped.route,
+      effectCeiling: String(admitted.clamped.effectCeiling),
+      objective: input.snapshot.acceptedText,
+      identity,
+    });
+    if (retrieve && retrieve.length > 0) {
+      admitted = {
+        ok: true,
+        clamped: { ...admitted.clamped, operations: retrieve },
+        source: admitted.source,
+        policyRevision: admitted.policyRevision,
+        payloadHash: admitted.payloadHash,
+        contextHash: admitted.contextHash,
+      } as typeof admitted;
+      return;
+    }
+    if (admitted.clamped.route !== 'act') return;
     const hostBound = synthesizeConstructOperations({
       construct: admitted.clamped.construct,
       objective: input.snapshot.acceptedText,
@@ -1054,10 +1095,7 @@ async function interpretOnce(input: {
       effectCeiling: String(admitted.clamped.effectCeiling),
       count: admitted.clamped.collection?.count,
       fields: admitted.clamped.collection?.projection,
-      identity: {
-        sessionId: input.snapshot.sessionId,
-        sourceUserSeq: input.snapshot.sourceUserSeq,
-      },
+      identity,
     });
     if (!hostBound || hostBound.length === 0) return;
     admitted = {
@@ -1085,34 +1123,50 @@ async function interpretOnce(input: {
     || groundingReceipt?.overallVerdict === 'conflict'
     || validationIssue?.code === 'capability_grounding_conflict'
   );
-  if (genuineConflict) {
+  const unboundTypedWork = admitted.ok
+    && (admitted.clamped.operations?.length ?? 0) === 0
+    && admitted.clamped.route !== 'direct_reply'
+    && (
+      admitted.clamped.requestedEffect === 'read'
+      || admitted.clamped.requestedEffect === 'local_write'
+      || admitted.clamped.requestedEffect === 'external_write'
+      || admitted.clamped.requestedEffect === 'admin'
+      || admitted.clamped.route === 'retrieve'
+      || admitted.clamped.route === 'act'
+    );
+  if (genuineConflict || unboundTypedWork) {
     repairAttempted = true;
     try {
       const repaired = await input.port.interpret({
         purpose: TURN_SEMANTIC_CALL_PURPOSE,
         host,
         acceptedText: input.snapshot.acceptedText,
-        repairHint: JSON.stringify({
-          issues: admitted.ok ? [] : admitted.issues,
-          judge: judgeRecord
-            ? {
-                verdict: judgeRecord.verdict,
-                effect: judgeRecord.effect,
-                destinationPosture: judgeRecord.destinationPosture,
-                proposalDigest: judgeRecord.proposalDigest,
-              }
-            : null,
-          grounding: groundingReceipt
-            ? {
-                verdict: groundingReceipt.overallVerdict,
-                operations: groundingReceipt.operations.map((operation) => ({
-                  operationId: operation.operationId,
-                  verdict: operation.verdict,
-                  rationale: operation.rationale,
-                })),
-              }
-            : null,
-        }),
+        repairHint: JSON.stringify(unboundTypedWork
+          ? {
+              reason: 'exact_capability_unbound',
+              require: 'name work.operations[].capabilityRef from host.catalog.capabilities ids only',
+            }
+          : {
+              issues: admitted.ok ? [] : admitted.issues,
+              judge: judgeRecord
+                ? {
+                    verdict: judgeRecord.verdict,
+                    effect: judgeRecord.effect,
+                    destinationPosture: judgeRecord.destinationPosture,
+                    proposalDigest: judgeRecord.proposalDigest,
+                  }
+                : null,
+              grounding: groundingReceipt
+                ? {
+                    verdict: groundingReceipt.overallVerdict,
+                    operations: groundingReceipt.operations.map((operation) => ({
+                      operationId: operation.operationId,
+                      verdict: operation.verdict,
+                      rationale: operation.rationale,
+                    })),
+                  }
+                : null,
+            }),
       });
       proposalCalls += 1;
       modelResult = {
@@ -1351,10 +1405,11 @@ export function blockedPresentationForSemanticRecord(
 ): string {
   const issue = record?.validationIssue?.code ?? '';
   if (/capability|grounding|catalog|schema|account|provider|identity/i.test(issue)) {
-    return heldExecutionTextForInternalReason(issue, 'blocked');
+    const held = heldExecutionTextForInternalReason(issue, 'blocked');
+    if (held !== issue) return held;
   }
   if (!record || record.validationOutcome === 'model_failed') {
-    return 'I could not interpret this turn, so I stopped before using any tools. You can restate it.';
+    return 'I could not finish planning that, so I stopped before using any tools. You can restate it.';
   }
-  return 'I could not admit this turn\'s interpretation, so I stopped before using any tools. You can restate or continue.';
+  return 'I could not finish planning that, so I stopped before using any tools. You can restate or continue.';
 }

@@ -285,13 +285,23 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
 
 /** Human copy for a genuine connectivity gap, by FAMILY — never "connect the
  *  missing provider" when the provider is connected. */
-export function describeGoalCatalogGap(gaps: GoalCatalogSelection['gaps']): string {
+export function describeGoalCatalogGap(
+  gaps: GoalCatalogSelection['gaps'],
+  opts?: { projection?: readonly string[] },
+): string {
   const families: string[] = [];
-  if (gaps.includes('search')) families.push('a web search that can return the collection');
-  if (gaps.includes('row_create')) families.push('an app that can create the destination from the collected rows (for example a spreadsheet create)');
+  const fields = (opts?.projection ?? []).filter((role) => role.trim().length > 0);
+  if (gaps.includes('search')) {
+    families.push(fields.length > 0
+      ? `a collection that can return ${fields.join(', ')}`
+      : 'a collection that can return the requested records');
+  }
+  if (gaps.includes('row_create')) {
+    families.push('an app that can persist those records into the named destination');
+  }
   if (gaps.includes('readback')) families.push('a read-back on the created destination');
   return `I understood the task, but none of your connected apps provide ${families.join(' or ')}. `
-    + 'Connect one that does — I will continue this exact request. Nothing was started.';
+    + 'Connect or certify one that does — I will continue this exact request. Nothing was started.';
 }
 
 /**

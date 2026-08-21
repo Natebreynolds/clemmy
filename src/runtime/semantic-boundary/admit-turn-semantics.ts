@@ -282,25 +282,6 @@ export function admitTurnSemantics(
   }
   const clamped = clampProjection(projected.projection, host, authority);
   if ('issues' in clamped) {
-    if (clamped.issues.some((entry) => entry.code === 'write_not_aligned')) {
-      const conversation = clampProjection({
-        kind: 'conversation',
-        source: projected.projection.source,
-        relation: projected.projection.relation,
-        targetGoal: null,
-        parkPriorGoal: false,
-      }, host, authority);
-      if (!('issues' in conversation)) {
-        return {
-          ok: true,
-          source: { ...checked.checked.source },
-          policyRevision: host.policyRevision,
-          clamped: conversation.clamped,
-          payloadHash: checked.checked.payloadHash,
-          contextHash: checked.checked.contextHash,
-        };
-      }
-    }
     return { ok: false, issues: clamped.issues };
   }
   const dagIssues = validateOperationDag(clamped.clamped.operations, clamped.clamped.effectCeiling);

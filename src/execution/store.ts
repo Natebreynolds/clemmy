@@ -1858,6 +1858,32 @@ export class ExecutionStore {
  * compaction, crash mid-run), the record stays "active" forever and the
  * dashboard reports phantom in-flight work. Returns the number swept.
  */
+/**
+ * Close one abandoned execution by id through the same failed-transition
+ * publisher the stale/crash sweeps use. Returns false when the id is missing
+ * or already terminal.
+ */
+export function closeAbandonedExecution(executionId: string, reason: string): boolean {
+  let notice: FailedExecutionTransitionNotice | null = null;
+  const closed = executionsFileLock(() => {
+    const executions = loadExecutionsUnlocked();
+    const execution = executions.find((row) => row.id === executionId);
+    if (!execution) return false;
+    if (execution.status !== 'active' && execution.status !== 'blocked' && execution.status !== 'paused') {
+      return false;
+    }
+    notice = transitionToFailed(
+      execution,
+      reason,
+      `abandon-${Date.now()}`,
+    );
+    saveExecutionsUnlocked(executions);
+    return true;
+  });
+  if (notice) publishFailedExecutionTransition(notice);
+  return closed;
+}
+
 export function sweepStaleExecutions(staleAfterMs = 60 * 60 * 1000): number {
   // Route through the SAME failed-transition publisher as the crash and
   // stale-blocked sweeps. This sweep silently rewrote wedged work to

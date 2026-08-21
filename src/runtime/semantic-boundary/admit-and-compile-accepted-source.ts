@@ -86,15 +86,24 @@ function conversationShortCircuit(
     // or slot — it must pay full admission.
     const packet = peekTaskContinuityPacket({ sessionId: identity.sessionId });
     if (packet.status === 'available') return false;
-    // If the host can prove capability relevance from the text, the turn is
-    // likely work — pay admission so the proof can bind.
+    const continuesHostedWork = sessionHasPriorRetrieveOrAct(
+      identity.sessionId,
+      identity.sourceUserSeq,
+    );
+    const verdict = classifyMessageIntent(durableText, {
+      continueHostedWorld: continuesHostedWork,
+    });
+    // Closed-world talk skips the semantic port. A hosted-world retrieve still
+    // pays admission so connected capabilities can bind — skipping lookup is
+    // how a connected directory or store never gets used.
+    if (
+      !continuesHostedWork
+      && (verdict.intent === 'casual' || verdict.intent === 'conversation')
+      && verdict.confidence >= 0.8
+    ) return true;
     const resolution = resolveTurnCapabilities(durableText, { sessionId: identity.sessionId });
     if (resolution.entries.some((entry) => entry.status === 'proven')) return false;
-    const verdict = classifyMessageIntent(durableText, {
-      continueHostedWorld: sessionHasPriorRetrieveOrAct(identity.sessionId, identity.sourceUserSeq),
-    });
-    return (verdict.intent === 'casual' || verdict.intent === 'conversation')
-      && verdict.confidence >= 0.8;
+    return false;
   } catch {
     // The short-circuit is an optimization; any failure pays full admission.
     return false;
@@ -240,8 +249,8 @@ export async function prepareDurableAcceptedTurnCompile(
 
   // Conversation is the same kernel with catalog/planner skipped — not a
   // second action loop. Only a high-confidence closed-world greeting skips
-  // admission. Every other live source participates and either admits a
-  // plan, blocks, or asks. It never falls through to an untyped tool loop.
+  // admission. Every other live source participates. A checker that cannot
+  // admit a typed plan withholds typed authority; dispatch keeps tools.
   if (conversationShortCircuit(input.identity, durableText)) {
     recordSemanticParticipation(
       input.identity.sessionId,
@@ -254,12 +263,15 @@ export async function prepareDurableAcceptedTurnCompile(
   const session = getSession(input.identity.sessionId);
   if (!session) return { ok: false, reason: 'session is missing' };
 
-  recordSemanticParticipation(
-    input.identity.sessionId,
-    input.identity.sourceUserSeq,
-    'participated',
-  );
-
+  // PARTICIPATION IS STAMPED WHERE A PORT ACTUALLY TAKES THE TURN, not here.
+  // `recordSemanticParticipation` is a monotonic ratchet — it upgrades
+  // unparticipated→participated and never downgrades — so stamping before the
+  // port is known to exist made `semanticPortParticipated()` true even when NO
+  // port ever ran. That rendered the legacy-shadow degradation in
+  // admitAndCompileAcceptedSource unreachable for a missing port, and every
+  // non-greeting turn FAILED instead of falling back (407 suite failures on
+  // 'semantic port is unavailable'). An install whose semantic port fails to
+  // configure must still answer, so the stamp moved below the port check.
   const policy = snapshotTurnGraphPolicy(getProactivityPolicySnapshot());
   const policyRevision = sha256(JSON.stringify(policy));
   const userId = (session.userId ?? '').trim() || `user:${session.id}`;
@@ -345,6 +357,14 @@ export async function prepareDurableAcceptedTurnCompile(
   });
   const host = buildTurnSemanticHostViewV1(snapshot);
   if (host.source.audienceHash !== audienceHashOf({ audienceKey, userId, conversationKey })) {
+    // An audience mismatch is an INTEGRITY refusal, not a missing capability:
+    // it must stay durable and must never downgrade to the untyped lane. Stamp
+    // participation so the legacy fallback stays closed for exactly this case.
+    recordSemanticParticipation(
+      input.identity.sessionId,
+      input.identity.sourceUserSeq,
+      'participated',
+    );
     return { ok: false, reason: 'audience hash mismatch' };
   }
   const authority: HostSemanticAuthorityV1 = {
@@ -359,6 +379,15 @@ export async function prepareDurableAcceptedTurnCompile(
     recordSemanticDispositionOutcome(input.identity.sessionId, input.identity.sourceUserSeq, 'unavailable');
     return { ok: false, reason: 'semantic port is unavailable' };
   }
+
+  // A port exists and is about to take this turn: from here on the semantic
+  // lane owns the outcome, so a refusal below is durable and must not
+  // downgrade to the untyped lane.
+  recordSemanticParticipation(
+    input.identity.sessionId,
+    input.identity.sourceUserSeq,
+    'participated',
+  );
 
   const interpreted = await interpretAcceptedSource({
     snapshot,

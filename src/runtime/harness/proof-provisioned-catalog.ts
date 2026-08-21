@@ -102,11 +102,12 @@ export async function registerProofProvisionedCapabilities(identity: {
       const schema = getCachedToolSchema(slug) ?? await ensureToolSchema(slug);
       if (!isRecord(schema)) continue; // no frozen schema → no compiler → fail closed
       const effect: BoundNodeCapability['effect'] = entry.effectClass === 'write' ? 'external_write' : 'read';
+      const family = toolkitOf(slug);
       const advisoryRoles = effect === 'external_write'
         ? ['create', 'destination']
-        : writeToolkits.has(toolkitOf(slug))
+        : writeToolkits.has(family)
           ? ['readback']
-          : ['source', 'collection', 'collect'];
+          : ['source', 'collection', 'collect', 'lookup'];
       const schemaDigest = sha256(JSON.stringify(schema));
       const accountId = entry.accountIdentity?.trim() || 'runtime';
       const write = effect === 'external_write';
@@ -120,7 +121,7 @@ export async function registerProofProvisionedCapabilities(identity: {
         operationVersion: '1',
         definitionFingerprint: schemaDigest,
         effect,
-        ...(write ? { destination: { family: 'workbook', posture: 'create_new' as const } } : {}),
+        ...(write ? { destination: { family, posture: 'create_new' as const } } : {}),
         accountId,
         idempotency: { required: write, policy: write ? 'key_before_dispatch' : 'none' },
         reconciliation: { supported: write, policy: write ? 'exact_artifact' : 'none' },
@@ -153,7 +154,7 @@ export async function registerProofProvisionedCapabilities(identity: {
           : advisoryRoles.includes('readback')
             ? ['evidence', 'locator']
             : ['evidence', 'records'],
-        applicableDeliverableKinds: write ? ['evidence', 'workbook'] : ['evidence'],
+        applicableDeliverableKinds: write ? ['evidence', family] : ['evidence'],
       });
       const installed = store.install(manifest);
       if (!installed.ok) continue;
@@ -188,7 +189,7 @@ export async function registerProofProvisionedCapabilities(identity: {
         liveFingerprint: schemaDigest,
         manifest,
         account: accountId,
-        ...(write ? { destination: { family: 'workbook', posture: 'create_new' } } : {}),
+        ...(write ? { destination: { family, posture: 'create_new' } } : {}),
         ...(write
           ? {
               reconcile: async (input) => {

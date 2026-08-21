@@ -98,16 +98,33 @@ test('a greeting never reaches the semantic port and dispatches as conversation'
     'closed-world talk is the cheap mode of the one kernel, not an untyped action loop');
 });
 
-test('a hosted-world ask pays admission and never falls through to an untyped loop', async () => {
+test('a hosted-world retrieve pays admission so connected capabilities can bind', async () => {
   interpretCalls.length = 0;
-  const identity = acceptedTurn('whats on my calendar for tomrrow');
+  const identity = acceptedTurn('whats on my roster for tomorrow');
   const compiled = await admitAndCompileAcceptedSource({ identity, surface: 'dashboard' });
-  assert.ok(compiled.ok || interpretCalls.length > 0, 'action/retrieve participates instead of skipping');
+  assert.ok(compiled.ok || interpretCalls.length > 0, 'a hosted-world retrieve participates instead of skipping');
   const disposition = readSemanticDisposition(identity.sessionId, identity.sourceUserSeq);
   assert.equal(disposition?.participation, 'participated');
   const dispatched = await dispatchAdmittedSource(identity);
-  assert.notEqual(dispatched.kind, 'conversation', 'a calendar read is not a greeting');
-  assert.ok(dispatched.kind === 'typed' || dispatched.kind === 'blocked', JSON.stringify(dispatched).slice(0, 200));
+  assert.notEqual(dispatched.kind, 'conversation', `participated retrieve stays on the kernel: ${dispatched.kind}`);
+  assert.ok(
+    dispatched.kind === 'typed' || dispatched.kind === 'needs_input' || dispatched.kind === 'blocked',
+    `admission ran; unbound work parks: ${dispatched.kind}`,
+  );
+});
+
+test('an ACT still pays admission — the effect lane is unchanged', async () => {
+  interpretCalls.length = 0;
+  const identity = acceptedTurn('put the top 5 records into a new workbook and share it');
+  await admitAndCompileAcceptedSource({ identity, surface: 'dashboard' });
+  const disposition = readSemanticDisposition(identity.sessionId, identity.sourceUserSeq);
+  assert.equal(disposition?.participation, 'participated', 'a promised external write still admits');
+  const dispatched = await dispatchAdmittedSource(identity);
+  assert.notEqual(dispatched.kind, 'conversation', JSON.stringify(dispatched).slice(0, 200));
+  assert.ok(
+    dispatched.kind === 'typed' || dispatched.kind === 'needs_input' || dispatched.kind === 'blocked',
+    JSON.stringify(dispatched).slice(0, 200),
+  );
 });
 
 test('a discourse referent after a prior act turn pays admission', async () => {

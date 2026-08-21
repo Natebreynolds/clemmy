@@ -12,11 +12,13 @@ import type Database from 'better-sqlite3';
 import { armAcceptedTaskAuthority } from './accepted-task-authority.js';
 import {
   authorizeGeneratedArtifactReadback,
+  authorizeHostSealedArtifactReadback,
   generatedArtifactReadContentVerified,
   generatedArtifactWriteContentVerified,
 } from './artifact-ledger.js';
 import { compileGoogleSheetsSheetFromJsonContract } from './sheet-from-json-content-contract.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
+import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 import {
   canonicalExpectedWorkJson,
   expectedWorkDigest,
@@ -36,9 +38,12 @@ import {
   resolveExpectedWorkUniverseMembers,
   type ExpectedWorkUniverseSealCache,
 } from './expected-work-universe-seal.js';
-import { getSession, openEventLog } from './eventlog.js';
+import { appendEvent, getSession, getTurnGraphEventForSource, listEvents, openEventLog } from './eventlog.js';
+import { readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
 import { computeResultHasSubstance } from './expected-work-matcher.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
+import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
+import { REPAIR_ARGUMENTS_NEEDS_INPUT_TEXT } from './recovery-presentation-truth.js';
 import { detectMultiItemIntent } from './multi-item-intent.js';
 import {
   proveFiniteReadResultCoverage,
@@ -46,7 +51,7 @@ import {
   type FiniteReadStructuralProof,
 } from './read-evidence-refinement.js';
 import { inspectProviderEnvelope } from './provider-read-evidence.js';
-import { recordsAtRecordPath } from './result-facts.js';
+import { recordsAtRecordPath, resultHasMalformedPagination } from './result-facts.js';
 import {
   redeemedReadIsExhausted,
   redeemSuccessfulSettlementResultForHost,
@@ -118,6 +123,7 @@ export type ExpectedWorkAdmissionFailureKind =
   | 'work_already_satisfied'
   | 'work_evidence_incomplete'
   | 'work_effect_already_executed'
+  | 'work_attempt_budget_exhausted'
   | 'work_authority_unavailable';
 
 /** One line per contract operation: what is owed, what is settled, what
@@ -129,9 +135,13 @@ export interface ExpectedWorkPlanLine {
   effect: string;
   cardinality: string;
   dependsOn: string[];
+  /** Certified discharge — exhausted / sealed / verified. */
   settledInstances: number;
+  /** Clean redeemable data that has landed, including unexhausted collections. */
+  observedInstances: number;
   requiredInstances: number | 'unknown';
-  state: 'satisfied' | 'open' | 'blocked_on_dependency';
+  /** `data_in` is observed work that is not yet certified complete. */
+  state: 'satisfied' | 'data_in' | 'open' | 'blocked_on_dependency';
 }
 
 export type ExpectedWorkInvocationAdmission =
@@ -192,6 +202,26 @@ export function withExpectedWorkBinding<T>(
   return bindingStorage.run(binding, work);
 }
 
+/** The requirement a read/compute bypass dispatch was invoked to discharge.
+ *  The bypass exists so a checker verdict cannot veto a safe read, but
+ *  discarding the requirement the model named made the read's settlement
+ *  invisible to the dependency oracle: 55 clean settlements and a write
+ *  refused five times for a dependency that was factually complete (live
+ *  2026-08-18). The named requirement is a fact about the call; settlement
+ *  records it, and only the oracle decides what it is worth. */
+const unboundRequirementStorage = new AsyncLocalStorage<string>();
+
+export function currentUnboundWorkRequirementId(): string | undefined {
+  return unboundRequirementStorage.getStore();
+}
+
+export function withUnboundWorkRequirement<T>(
+  requirementId: string,
+  work: () => T,
+): T {
+  return unboundRequirementStorage.run(requirementId, work);
+}
+
 function boundedReason(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 300);
 }
@@ -199,6 +229,27 @@ function boundedReason(error: unknown): string {
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
   const allow = new Set(allowed);
   return Object.keys(value).every((key) => allow.has(key));
+}
+
+/** A finite response window attested by the provider's own input schema.
+ * This is provisional-read evidence only; it never claims source exhaustion. */
+function schemaBoundedCollectionWindow(args: unknown, schema: unknown): number | null {
+  if (
+    !args || typeof args !== 'object' || Array.isArray(args)
+    || !schema || typeof schema !== 'object' || Array.isArray(schema)
+  ) return null;
+  const properties = (schema as Record<string, unknown>).properties;
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return null;
+  const normalizedWindowKeys = new Set(['limit', 'maxresults', 'count', 'pagesize', 'maxitems', 'maxrecords']);
+  const matches = Object.entries(args as Record<string, unknown>).flatMap(([key, value]) => {
+    if (!normalizedWindowKeys.has(key.toLowerCase().replace(/[^a-z0-9]/g, ''))) return [];
+    const property = (properties as Record<string, unknown>)[key];
+    if (!property || typeof property !== 'object' || Array.isArray(property)) return [];
+    const type = (property as Record<string, unknown>).type;
+    if (type !== 'integer' && type !== 'number') return [];
+    return Number.isSafeInteger(value) && Number(value) > 0 ? [Number(value)] : [];
+  });
+  return matches.length === 1 ? matches[0]! : null;
 }
 
 export function validateExpectedWorkUniverseSelector(
@@ -284,6 +335,12 @@ function authorityActivationRow(
  *  and its agent surface mounts no work_call carrier — activation raised a
  *  wall with no door and 500'd plain step dispatch (live 2026-08-11 sweep).
  *  An unreadable session store keeps the act protocol (fail closed). */
+function typedWorkGraph(graph: { classification: { route?: string }; nodes: ReadonlyArray<{ kind?: string; operationId?: string }> }): boolean {
+  if (graph.classification.route === 'act') return true;
+  return graph.classification.route === 'retrieve'
+    && graph.nodes.some((node) => node.kind === 'retrieve' && Boolean(node.operationId));
+}
+
 function workflowControllerOwned(sessionId: string): boolean {
   try {
     return getSession(sessionId)?.kind === 'workflow';
@@ -303,7 +360,7 @@ export function activateActionExpectedWork(input: {
       reason: expected.reason,
     };
   }
-  if (expected.graph.classification.route !== 'act') {
+  if (!typedWorkGraph(expected.graph)) {
     return { status: 'not_action', reason: 'the exact persisted graph is not an action turn' };
   }
   if (workflowControllerOwned(input.sessionId)) {
@@ -361,7 +418,7 @@ export function actionExpectedWorkState(input: {
       reason: expected.reason,
     };
   }
-  if (expected.graph.classification.route !== 'act') return { status: 'not_action' };
+  if (!typedWorkGraph(expected.graph)) return { status: 'not_action' };
   if (workflowControllerOwned(input.sessionId)) return { status: 'not_action' };
   try {
     const row = authorityActivationRow(openEventLog(), input.sessionId, input.sourceUserSeq);
@@ -757,6 +814,15 @@ function dischargedRequirementSettlements(
     if (row.evidence_mode === 'point_read') return true;
     // Exhaustion has ONE authority, shared with the seal and the projector.
     if (row.evidence_mode === 'collection_read') {
+      const records = recordsAtRecordPath(
+        redeemed.value.rawPayload,
+        redeemed.value.handle.recordPath,
+      );
+      const hasSubstantiveCollectionData = records !== null
+        ? records.length === redeemed.value.handle.recordCount
+          && records.some((record) => computeResultHasSubstance(record))
+        : computeResultHasSubstance(redeemed.value.rawPayload);
+      if (!hasSubstantiveCollectionData) return false;
       // A complete requested response window is useful predecessor evidence,
       // but it is not provider exhaustion. Keep `complete_set` open for the
       // terminal judge and irreversible consumers unless this shared oracle
@@ -800,6 +866,129 @@ function dischargedRequirementSettlements(
     logical_tool_call_id: row.logical_tool_call_id,
     universe_item_id: row.universe_item_id,
   }));
+}
+
+/** Clean redeemable predecessor reads — data that has landed. Shared by the
+ *  dependency gate and the plan card so "data in" and "may proceed" cannot
+ *  disagree. This is not certified complete: a collection window can be
+ *  useful without proving provider exhaustion. */
+function isCleanRedeemablePredecessorRead(
+  contract: AcceptedTaskWorkContractV1,
+  logicalToolCallId: string,
+  evidenceBasis: string | null,
+): boolean {
+  const redeemed = redeemSuccessfulSettlementResultForHost({
+    sessionId: contract.identity.sessionId,
+    sourceUserSeq: contract.identity.sourceUserSeq,
+    acceptedTaskId: contract.acceptedTaskId,
+    logicalToolCallId,
+  });
+  if (redeemed.status !== 'ok') return false;
+  const records = recordsAtRecordPath(
+    redeemed.value.rawPayload,
+    redeemed.value.handle.recordPath,
+  );
+  // Substance is the bar, enumeration is not. When the handle recognized a
+  // record collection, every record fact must hold. A provider shape the
+  // deriver cannot enumerate (live 2026-08-18: Firecrawl's data.web array,
+  // Drive's data.files) still lands usable data — whole-payload substance
+  // keeps empty results out without demanding a recognizable collection key.
+  // Coverage/exhaustion claims still live only in the discharge oracle.
+  const recordsClean = records !== null
+    ? records.length === redeemed.value.handle.recordCount
+      && records.some((record) => computeResultHasSubstance(record))
+    : computeResultHasSubstance(redeemed.value.rawPayload);
+  // A provider-unknown collection is useful provisional data only when the
+  // accepted graph bounded the collection. This preserves the top-N staging
+  // lane without letting an arbitrary first page stand in for "all rows".
+  // Explicitly complete provider results do not need that provisional door.
+  const boundedOrComplete = redeemed.value.handle.completeness === 'complete'
+    || goalDeclaresBoundedCollection(contract)
+    || /^expected_complete_set:bounded_window=\d+$/.test(evidenceBasis ?? '');
+  return redeemed.value.handle.success
+    && recordsClean
+    // Unknown pagination is acceptable provisional data; internally
+    // contradictory pagination is not. The result-facts seam owns this
+    // provider-neutral distinction so a reversible successor cannot turn an
+    // impossible total into dependency authority.
+    && !resultHasMalformedPagination(redeemed.value.rawPayload)
+    && boundedOrComplete
+    && redeemed.value.handle.completeness !== 'partial'
+    && redeemed.value.handle.continuationRef === null
+    && !redeemed.value.handle.continuationRepeated
+    && inspectProviderEnvelope(redeemed.value.rawPayload).verdict === 'clean';
+}
+
+function goalDeclaresBoundedCollection(contract: AcceptedTaskWorkContractV1): boolean {
+  try {
+    const event = getTurnGraphEventForSource(
+      contract.identity.sessionId,
+      contract.identity.sourceUserSeq,
+    );
+    const count = turnGraphFromShadowEvent(event)
+      ?.classification.goalConstraints?.collection?.count;
+    return typeof count === 'number' && Number.isSafeInteger(count) && count > 0;
+  } catch {
+    return false;
+  }
+}
+
+function observedRequirementSettlements(
+  db: Database.Database,
+  contract: AcceptedTaskWorkContractV1,
+  requirementId: string,
+): Array<{ logical_tool_call_id: string; universe_item_id: string | null }> {
+  // Two evidence tiers, one truth. Bound rows are admission-time authority.
+  // Unbound rows are read settlements that named this requirement on a
+  // bypass dispatch — the data landed, the contract just never admitted the
+  // call. Readiness may consume both; discharge still requires bound rows.
+  // Without the second tier, a checker refusal on a safe read erased the
+  // read's existence and deadlocked its dependents forever (live 2026-08-18:
+  // sheet write refused 5x against 55 clean settlements).
+  const rows = db.prepare(`
+    SELECT b.logical_tool_call_id, b.universe_item_id, b.evidence_basis
+      FROM expected_work_call_bindings b
+      JOIN logical_call_settlements s
+        ON s.session_id = b.session_id
+       AND s.source_user_seq = b.source_user_seq
+       AND s.logical_tool_call_id = b.logical_tool_call_id
+     WHERE b.session_id = ? AND b.source_user_seq = ?
+       AND b.contract_id = ? AND b.requirement_id = ?
+       AND b.effect_kind = 'read'
+       AND s.outcome_kind = 'succeeded'
+       AND s.continues_requirement = 0
+     UNION
+    SELECT s.logical_tool_call_id, NULL AS universe_item_id, NULL AS evidence_basis
+      FROM logical_call_settlements s
+     WHERE s.session_id = ? AND s.source_user_seq = ?
+       AND s.requirement_id = ?
+       AND s.mutating = 0
+       AND s.outcome_kind = 'succeeded'
+       AND s.continues_requirement = 0
+       AND NOT EXISTS (
+         SELECT 1 FROM expected_work_call_bindings b
+          WHERE b.session_id = s.session_id
+            AND b.source_user_seq = s.source_user_seq
+            AND b.logical_tool_call_id = s.logical_tool_call_id
+       )
+  `).all(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.contractId,
+    requirementId,
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    requirementId,
+  ) as Array<{
+    logical_tool_call_id: string;
+    universe_item_id: string | null;
+    evidence_basis: string | null;
+  }>;
+  return rows.filter((row) => isCleanRedeemablePredecessorRead(
+    contract,
+    row.logical_tool_call_id,
+    row.evidence_basis,
+  ));
 }
 
 function dependencyReadyForCurrentOperation(
@@ -872,6 +1061,16 @@ function dependencyReadyForCurrentOperation(
         readArgs: currentArgs,
       });
       if (generated.status === 'authorized') return true;
+      const hostSealed = authorizeHostSealedArtifactReadback({
+        sessionId: contract.identity.sessionId,
+        sourceUserSeq: contract.identity.sourceUserSeq,
+        contractId: contract.contractId,
+        createLogicalToolCallId: predecessors[0]!.logical_tool_call_id,
+        verificationRequirementId: current.id,
+        readToolName: currentTool,
+        readArgs: currentArgs,
+      });
+      if (hostSealed.status === 'authorized') return true;
     }
   }
 
@@ -887,9 +1086,12 @@ function dependencyReadyForCurrentOperation(
     if (current.effect !== 'external_write') return false;
     try {
       const effect = classifyExternalWrite(currentTool, currentArgs);
-      return effect.external
-        && effect.mutating
-        && effect.reversibility === 'reversible';
+      if (effect.external && effect.mutating && effect.reversibility === 'reversible') return true;
+      if (effect.irreversible || !effect.mutating) return false;
+      // Goal posture constrains WHAT the turn wants, not WHAT this selected
+      // tool does. `create_new` cannot upgrade an unknown mutation into a
+      // reversible one; only documented operation semantics grant this path.
+      return false;
     } catch {
       return false;
     }
@@ -904,46 +1106,7 @@ function dependencyReadyForCurrentOperation(
     || current.cardinality.kind !== 'once'
   ) return false;
 
-  const provisionalRows = db.prepare(`
-    SELECT b.logical_tool_call_id, b.universe_item_id
-      FROM expected_work_call_bindings b
-      JOIN logical_call_settlements s
-        ON s.session_id = b.session_id
-       AND s.source_user_seq = b.source_user_seq
-       AND s.logical_tool_call_id = b.logical_tool_call_id
-     WHERE b.session_id = ? AND b.source_user_seq = ?
-       AND b.contract_id = ? AND b.requirement_id = ?
-       AND b.effect_kind = 'read'
-       AND s.outcome_kind = 'succeeded'
-       AND s.continues_requirement = 0
-  `).all(
-    contract.identity.sessionId,
-    contract.identity.sourceUserSeq,
-    contract.contractId,
-    dependency.id,
-  ) as Array<{ logical_tool_call_id: string; universe_item_id: string | null }>;
-  const cleanRedeemable = provisionalRows.filter((row) => {
-    const redeemed = redeemSuccessfulSettlementResultForHost({
-      sessionId: contract.identity.sessionId,
-      sourceUserSeq: contract.identity.sourceUserSeq,
-      acceptedTaskId: contract.acceptedTaskId,
-      logicalToolCallId: row.logical_tool_call_id,
-    });
-    if (redeemed.status !== 'ok') return false;
-    const records = recordsAtRecordPath(
-      redeemed.value.rawPayload,
-      redeemed.value.handle.recordPath,
-    );
-    return redeemed.value.handle.success
-      && records !== null
-      && records.length === redeemed.value.handle.recordCount
-      && records.some((record) => computeResultHasSubstance(record))
-      && redeemed.value.handle.completeness !== 'partial'
-      && redeemed.value.handle.continuationRef === null
-      && !redeemed.value.handle.continuationRepeated
-      && inspectProviderEnvelope(redeemed.value.rawPayload).verdict === 'clean';
-  });
-  return instancesReady(cleanRedeemable);
+  return instancesReady(observedRequirementSettlements(db, contract, dependency.id));
 }
 
 /**
@@ -1012,6 +1175,7 @@ function priorRequirementAllowsAdmission(
   universeItemId: string | undefined,
   currentTool: string,
   currentArgumentDigest: string,
+  currentInvocation: { tool: string; args: unknown },
 ): { ok: true } | {
   ok: false;
   reason: string;
@@ -1092,13 +1256,49 @@ function priorRequirementAllowsAdmission(
         retainedByLogicalToolCallId: exactRetained.logical_tool_call_id,
       };
     }
+    // Landed provisional data is not itself an attempt-budget refusal. Exact
+    // replays returned above, certified completeness returned as discharged,
+    // and malformed/empty/unbounded results never enter the observed oracle.
+    // A genuinely different clean query may therefore use the bounded
+    // READ_EXPLORATION_CEILING below instead of dying after its first window.
+  }
+  const settledAttempts = relevant.filter((row) => row.outcome_kind !== null);
+  if (settledAttempts.length >= 2) {
+    // VALUE-AWARE READ EXPLORATION (live 2026-08-18, third specimen of the
+    // class): "my search tool only allows one query per task pass" surfaced
+    // as a needs_input question — the harness making the USER do its budget
+    // accounting, the exact north-star violation. Collection legitimately
+    // takes several reads. A further read admits while every prior attempt
+    // settled cleanly AND the new call is genuinely different, under a
+    // bounded ceiling; the 2026-08-14 eight-search certainty loop stays
+    // bounded (and same-args replays never reach here — the retained-result
+    // branches above return the stored bytes instead). Writes keep the
+    // strict one-attempt-one-repair budget.
+    const READ_EXPLORATION_CEILING = 6;
+    if (
+      (operation.effect === 'read' || operation.effect === 'compute')
+      && settledAttempts.length < READ_EXPLORATION_CEILING
+      && settledAttempts.every((row) =>
+        row.outcome_kind === 'succeeded' || row.outcome_kind === 'empty_result')
+      && !settledAttempts.some((row) =>
+        row.tool_name === currentTool && row.argument_digest === currentArgumentDigest)
+    ) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      refusalKind: 'work_attempt_budget_exhausted',
+      reason: operation.effect === 'read' || operation.effect === 'compute'
+        ? 'this requirement\u2019s read exploration is exhausted; synthesize from the landed evidence or explain the precise blocker'
+        : 'this requirement already used its one attempt and one repair; further calls cannot advance the plan. Use landed data or explain the precise blocker',
+    };
   }
   const latest = relevant.at(-1)!;
   if (latest.outcome_kind === 'succeeded' || latest.outcome_kind === 'empty_result') {
     if (operation.effect === 'read' || operation.effect === 'compute') {
-      // Reads and computes are safe to retry when their normalized identity
-      // changes. The terminal discharge oracle remains strict, so a changed
-      // query can gather better evidence but cannot claim complete coverage.
+      // One hollow success may take exactly one different-args repair. A
+      // second try is the unrecoverable complete-set loop (live 2026-08-14:
+      // eight Firecrawl searches that could not certify the internet).
       return { ok: true };
     }
     return {
@@ -1111,10 +1311,35 @@ function priorRequirementAllowsAdmission(
   if (latest.outcome_kind === 'uncertain_write' || latest.requires_reconciliation === 1) {
     return { ok: false, reason: 'an uncertain mutation must be reconciled before any retry' };
   }
+  // `repair_arguments` authorizes a corrected attempt, not a byte-equivalent
+  // replay.  The binding digest is the frozen effective logical contract, so
+  // this comparison stays provider-neutral even when an outer carrier was
+  // refined to provider-ready arguments before binding.
+  if (
+    latest.recovery_action === 'repair_arguments'
+    && latest.tool_name === currentTool
+    && latest.argument_digest === currentArgumentDigest
+  ) {
+    return {
+      ok: false,
+      refusalKind: 'work_attempt_budget_exhausted',
+      reason: 'the prior invalid-argument outcome authorizes one repair only after the effective arguments change; an identical replay is not a repair',
+    };
+  }
   const sameCandidateRepair = latest.retry_same_candidate === 1
-    && latest.tool_name === currentTool;
-  const siblingRecovery = latest.eliminates_candidate === 1
-    && latest.tool_name !== currentTool;
+    && latest.tool_name === currentTool
+    && (
+      latest.recovery_action !== 'repair_arguments'
+      || latest.argument_digest !== currentArgumentDigest
+    );
+  // A read/compute that never produced evidence cannot seal the retrieve.
+  // Unknown and unsupported outcomes eliminate that candidate even when the
+  // settlement flag was left inert (live 2026-08-14: unknown MCP tool bound
+  // the set-read, then Firecrawl was refused as already satisfied).
+  const readNeverLanded = (operation.effect === 'read' || operation.effect === 'compute')
+    && (latest.outcome_kind === 'unknown' || latest.outcome_kind === 'unsupported_capability');
+  const siblingRecovery = latest.tool_name !== currentTool
+    && (latest.eliminates_candidate === 1 || readNeverLanded);
   if (!sameCandidateRepair && !siblingRecovery) {
     return {
       ok: false,
@@ -1122,6 +1347,111 @@ function priorRequirementAllowsAdmission(
     };
   }
   return { ok: true };
+}
+
+type ContinuationArgumentRepairProjection =
+  | { status: 'none' | 'changed' }
+  | { status: 'identical'; parentLogicalToolCallId: string }
+  | { status: 'unavailable'; reason: string };
+
+/**
+ * Compare B's proposed effective call against the repair-rejected call from A.
+ * Durable logical argument digests are intentionally accepted-task salted, so
+ * equality cannot be checked by comparing A's digest to B's digest directly.
+ * Recompute B's canonical effective contract with A's exact accepted-task salt;
+ * equal bytes then reproduce A's frozen digest without storing raw arguments or
+ * adding a provider-specific identity.
+ */
+function continuationArgumentRepairProjection(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  tool: string;
+  args: unknown;
+}): ContinuationArgumentRepairProjection {
+  try {
+    const graphEvent = getTurnGraphEventForSource(input.sessionId, input.sourceUserSeq);
+    if (!graphEvent || !turnGraphFromShadowEvent(graphEvent)) return { status: 'none' };
+    const lineage = graphEvent.data.taskContinuationLineage;
+    if (!lineage || typeof lineage !== 'object' || Array.isArray(lineage)) return { status: 'none' };
+    const row = lineage as Record<string, unknown>;
+    if (
+      row.consumingSourceUserSeq !== input.sourceUserSeq
+      || typeof row.parentSourceUserSeq !== 'number'
+      || !Number.isSafeInteger(row.parentSourceUserSeq)
+      || row.parentSourceUserSeq <= 0
+      || typeof row.parentAcceptedTaskId !== 'string'
+      || !row.parentAcceptedTaskId.trim()
+      || (row.disposition !== 'affirmed' && row.disposition !== 'selected' && row.disposition !== 'provided')
+    ) return { status: 'none' };
+
+    const consumed = readConsumedTaskContinuityPacket({
+      sessionId: input.sessionId,
+      consumingSourceUserSeq: input.sourceUserSeq,
+    });
+    if (
+      consumed.status !== 'consumed'
+      || consumed.packet.originatingSourceUserSeq !== row.parentSourceUserSeq
+      || consumed.packet.pause.kind !== 'clarification'
+      || consumed.packet.pause.question.replace(/\s+/g, ' ').trim().toLowerCase()
+        !== REPAIR_ARGUMENTS_NEEDS_INPUT_TEXT.replace(/\s+/g, ' ').trim().toLowerCase()
+    ) return { status: 'none' };
+
+    const latest = input.db.prepare(`
+      SELECT l.accepted_task_id, s.logical_tool_call_id
+        FROM logical_call_settlements s
+        JOIN logical_tool_calls l
+          ON l.session_id = s.session_id
+         AND l.source_user_seq = s.source_user_seq
+         AND l.logical_tool_call_id = s.logical_tool_call_id
+        JOIN accepted_task_resolutions r
+          ON r.session_id = s.session_id
+         AND r.source_user_seq = s.source_user_seq
+        JOIN events e ON e.id = s.settlement_event_id
+       WHERE s.session_id = ? AND s.source_user_seq = ?
+         AND s.business_call = 1
+         AND r.state != 'legacy_ambiguous'
+       ORDER BY e.seq DESC
+       LIMIT 1
+    `).get(input.sessionId, row.parentSourceUserSeq) as {
+      accepted_task_id: string;
+      logical_tool_call_id: string;
+    } | undefined;
+    if (!latest) return { status: 'none' };
+    if (latest.accepted_task_id !== row.parentAcceptedTaskId) {
+      return { status: 'unavailable', reason: 'continuation parent accepted-task identity is inconsistent' };
+    }
+    const redeemed = redeemDurableLogicalCallSettlementForHost({
+      sessionId: input.sessionId,
+      sourceUserSeq: row.parentSourceUserSeq,
+      acceptedTaskId: latest.accepted_task_id,
+      logicalToolCallId: latest.logical_tool_call_id,
+    });
+    if (redeemed.status !== 'ok') {
+      return { status: 'unavailable', reason: `continuation parent repair settlement is ${redeemed.status}` };
+    }
+    const prior = redeemed.settlement;
+    if (
+      !prior.recovery.businessCall
+      || prior.outcome.kind !== 'invalid_arguments'
+      || prior.outcome.directive.action !== 'repair_arguments'
+    ) return { status: 'none' };
+
+    const proposedAsParent = durableLogicalCallContract(
+      latest.accepted_task_id,
+      input.tool,
+      input.args,
+    );
+    if (!proposedAsParent) {
+      return { status: 'unavailable', reason: 'continuation repair arguments are not contractible' };
+    }
+    return proposedAsParent.toolName === prior.toolName
+      && proposedAsParent.argumentDigest === prior.argumentDigest
+      ? { status: 'identical', parentLogicalToolCallId: latest.logical_tool_call_id }
+      : { status: 'changed' };
+  } catch {
+    return { status: 'unavailable', reason: 'continuation repair authority could not be read' };
+  }
 }
 
 function bindingFromRow(row: Record<string, unknown>): ExpectedWorkCallBinding {
@@ -1237,12 +1567,20 @@ function planLinesFor(
   // the model a requirement was satisfied while the gate refused the work
   // waiting on it.
   const settledByRequirement = new Map<string, Set<string>>();
+  const observedByRequirement = new Map<string, Set<string>>();
   for (const operation of contract.operations) {
-    const set = new Set<string>();
+    const settled = new Set<string>();
     for (const row of dischargedRequirementSettlements(db, contract, operation.id)) {
-      set.add(row.universe_item_id ?? '');
+      settled.add(row.universe_item_id ?? '');
     }
-    settledByRequirement.set(operation.id, set);
+    settledByRequirement.set(operation.id, settled);
+    const observed = new Set<string>(settled);
+    if (operation.effect === 'read') {
+      for (const row of observedRequirementSettlements(db, contract, operation.id)) {
+        observed.add(row.universe_item_id ?? '');
+      }
+    }
+    observedByRequirement.set(operation.id, observed);
   }
   // Compute intrinsic completion independently from presentation order. The
   // canonical contract sorts operations by id for stable hashing, but ids do
@@ -1251,11 +1589,14 @@ function planLinesFor(
   // how the model happened to name operations.
   const intrinsic = new Map<string, {
     settled: number;
+    observed: number;
     required: number | 'unknown';
     done: boolean;
+    dataIn: boolean;
   }>();
   for (const operation of contract.operations) {
     const settled = settledByRequirement.get(operation.id)?.size ?? 0;
+    const observed = observedByRequirement.get(operation.id)?.size ?? 0;
     let required: number | 'unknown' = 1;
     if (operation.cardinality.kind !== 'once') {
       const universe = contract.universes.find((entry) =>
@@ -1274,33 +1615,121 @@ function planLinesFor(
         ? (operation.cardinality.kind === 'each' ? resolved.members.length : 1)
         : 'unknown';
     }
+    const done = typeof required === 'number' && settled >= required;
     intrinsic.set(operation.id, {
       settled,
+      observed,
       required,
-      done: typeof required === 'number' && settled >= required,
+      done,
+      dataIn: !done && observed > 0,
     });
   }
-  const satisfied = new Set(
-    [...intrinsic.entries()]
-      .filter(([, state]) => state.done)
-      .map(([requirementId]) => requirementId),
-  );
+  const byId = new Map(contract.operations.map((operation) => [operation.id, operation]));
+  const predecessorReady = (dependencyId: string, current: ExpectedWorkOperationV1): boolean => {
+    const depState = intrinsic.get(dependencyId);
+    if (!depState) return false;
+    if (depState.done) return true;
+    // Same once→once provisional path as the gate: data in unblocks the next
+    // step without certifying complete_set. Fan-out still needs a seal.
+    const dependency = byId.get(dependencyId);
+    return Boolean(
+      dependency
+      && dependency.effect === 'read'
+      && dependency.cardinality.kind === 'once'
+      && current.cardinality.kind === 'once'
+      && depState.dataIn,
+    );
+  };
   const lines: ExpectedWorkPlanLine[] = [];
   for (const operation of contract.operations) {
     const state = intrinsic.get(operation.id)!;
-    const { settled, required, done } = state;
-    const blocked = !done && operation.dependsOn.some((dep) => !satisfied.has(dep));
+    const { settled, observed, required, done, dataIn } = state;
+    const blocked = !done && operation.dependsOn.some((dep) => !predecessorReady(dep, operation));
     lines.push({
       requirementId: operation.id,
       effect: operation.effect,
       cardinality: operation.cardinality.kind,
       dependsOn: operation.dependsOn,
       settledInstances: settled,
+      observedInstances: observed,
       requiredInstances: required,
-      state: done ? 'satisfied' : blocked ? 'blocked_on_dependency' : 'open',
+      state: done ? 'satisfied' : blocked ? 'blocked_on_dependency' : dataIn ? 'data_in' : 'open',
     });
   }
   return lines;
+}
+
+/** Public plan card for one frozen contract. Same oracle as admission refusals. */
+export function expectedWorkPlanLines(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): ExpectedWorkPlanLine[] {
+  const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+  if (loaded.status !== 'ok') return [];
+  return planLinesFor(openEventLog(), loaded.contract);
+}
+
+const WORK_PROGRESS_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
+
+function publicWorkPlanDigest(lines: ExpectedWorkPlanLine[]): string {
+  return JSON.stringify(lines.map((line) => ({
+    id: line.requirementId,
+    effect: line.effect,
+    state: line.state,
+    settled: line.settledInstances,
+    observed: line.observedInstances,
+    required: line.requiredInstances === 'unknown' ? null : line.requiredInstances,
+    dependsOn: line.dependsOn.filter((dep) => WORK_PROGRESS_ID_RE.test(dep)),
+  })));
+}
+
+const seenUnsatisfiableRefusals = new Set<string>();
+
+function repeatedUnsatisfiableDependencyRefusal(
+  sessionId: string,
+  sourceUserSeq: number,
+  requirementId: string,
+  lines: ExpectedWorkPlanLine[],
+): boolean {
+  const key = `${sessionId}:${sourceUserSeq}:${requirementId}:${publicWorkPlanDigest(lines)}`;
+  if (seenUnsatisfiableRefusals.has(key)) return true;
+  seenUnsatisfiableRefusals.add(key);
+  if (seenUnsatisfiableRefusals.size > 2_048) {
+    const oldest = seenUnsatisfiableRefusals.values().next().value;
+    if (typeof oldest === 'string') seenUnsatisfiableRefusals.delete(oldest);
+  }
+  return false;
+}
+
+/** Project the host plan card onto the public activity bus. Deduped on digest
+ *  so a bind/settle storm does not replay an unchanged board. */
+export function publishExpectedWorkProgress(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): void {
+  try {
+    const lines = expectedWorkPlanLines(input);
+    if (lines.length === 0) return;
+    const payload = {
+      version: 1 as const,
+      sourceUserSeq: input.sourceUserSeq,
+      lines: JSON.parse(publicWorkPlanDigest(lines)) as Array<Record<string, unknown>>,
+    };
+    const digest = publicWorkPlanDigest(lines);
+    const prior = listEvents(input.sessionId, { types: ['expected_work_progress'] })
+      .filter((event) => event.data.sourceUserSeq === input.sourceUserSeq)
+      .at(-1);
+    if (prior && JSON.stringify(prior.data.lines) === digest) return;
+    appendEvent({
+      sessionId: input.sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'expected_work_progress',
+      data: payload,
+    });
+  } catch {
+    // Presentation never owns the turn.
+  }
 }
 
 /**
@@ -1413,6 +1842,11 @@ export function admitExpectedWorkInvocation(input: {
    * refine evidence only; logical identity and effect remain bound to args. */
   evidenceArgs?: unknown;
   evidenceInputSchema?: unknown;
+  /** Effect attested by the exact host-sealed graph-node binding. This is not
+   * caller authority: the admission boundary re-reads and matches the durable
+   * binding before using it. A pure `none` graph capability is represented as
+   * compute evidence because it executes work without granting a mutation. */
+  hostSealedEffect?: Exclude<RuntimeToolEffect, 'unknown'>;
 }): ExpectedWorkInvocationAdmission {
   const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
   let contract: AcceptedTaskWorkContractV1;
@@ -1467,7 +1901,26 @@ export function admitExpectedWorkInvocation(input: {
     reason: string,
   ): ExpectedWorkInvocationAdmission => {
     try {
-      return { status: 'refused', kind, reason, plan: planLinesFor(db, contract, sealCache) };
+      const plan = planLinesFor(db, contract, sealCache);
+      if (
+        kind === 'work_dependency_pending'
+        && plan.some((line) => line.state === 'data_in' || line.state === 'satisfied')
+        && plan.some((line) => line.state === 'blocked_on_dependency')
+        && repeatedUnsatisfiableDependencyRefusal(
+          contract.identity.sessionId,
+          contract.identity.sourceUserSeq,
+          input.requirementId,
+          plan,
+        )
+      ) {
+        return {
+          status: 'refused',
+          kind: 'work_attempt_budget_exhausted',
+          reason: `${reason}; the plan did not change — useful results cannot satisfy this graph`,
+          plan,
+        };
+      }
+      return { status: 'refused', kind, reason, plan };
     } catch {
       return refusal(kind, reason);
     }
@@ -1475,20 +1928,85 @@ export function admitExpectedWorkInvocation(input: {
   const operation = contract.operations.find((entry) => entry.id === input.requirementId);
   if (!operation) return refusedWithPlan('work_requirement_unknown', `requirement ${input.requirementId} is not in the frozen proposal`);
   if (actionTopologyRoleForRuntimeCall(input.tool, input.args) === 'control') {
-    return refusedWithPlan(
-      'work_effect_mismatch',
-      `requirement ${operation.id} is business work; a control call cannot discharge it`,
-    );
+    // A WRITE-capable control tool IS the business of its own domain (live
+    // 2026-08-19 sess-mt0kw772: workflow_schedule — sideEffect write, the
+    // exact tool for "run every 4 hours" — was refused here three times
+    // while the model hunted for a lane the harness would accept). The
+    // refusal's real target is read-only control chatter (history, focus,
+    // recall) claiming business credit; a durable control write falls
+    // through to the SAME effect-match checks below as any business call.
+    const controlEffect = classifyRuntimeToolEffect(input.tool, input.args);
+    const durableControlWrite = controlEffect.source === 'registry'
+      && (controlEffect.effect === 'local_write' || controlEffect.effect === 'external_write' || controlEffect.mutating);
+    if (!durableControlWrite) {
+      return refusedWithPlan(
+        'work_effect_mismatch',
+        `requirement ${operation.id} is business work; a control call cannot discharge it`,
+      );
+    }
   }
   const runtime = classifyRuntimeToolEffect(input.tool, input.args);
-  if (runtime.effect === 'unknown' || runtime.effect !== operation.effect) {
+  const sealedEffect = (() => {
+    if (!input.hostSealedEffect) return null;
+    if (!input.args || typeof input.args !== 'object' || Array.isArray(input.args)) return null;
+    const args = input.args as Record<string, unknown>;
+    if (args.nodeId !== operation.id) return null;
+    try {
+      const row = openEventLog().prepare(`
+        SELECT binding_json, binding_digest
+          FROM graph_node_bindings
+         WHERE session_id = ? AND source_user_seq = ? AND node_id = ?
+      `).get(input.sessionId, input.sourceUserSeq, operation.id) as {
+        binding_json: string;
+        binding_digest: string;
+      } | undefined;
+      if (!row) return null;
+      const binding = JSON.parse(row.binding_json) as Record<string, unknown>;
+      if (
+        binding.bindingDigest !== row.binding_digest
+        || binding.toolName !== input.tool
+        || binding.capabilityId !== args.capabilityId
+        || binding.schemaVersion !== args.schemaVersion
+        || binding.schemaDigest !== args.schemaDigest
+      ) return null;
+      const effect = binding.effect;
+      if ((effect === 'none' || effect === 'host_only') && input.hostSealedEffect === 'compute') {
+        return 'compute' as const;
+      }
+      return effect === input.hostSealedEffect ? input.hostSealedEffect : null;
+    } catch {
+      return null;
+    }
+  })();
+  const admittedEffect = input.hostSealedEffect ? sealedEffect : runtime.effect;
+  if (!admittedEffect || admittedEffect === 'unknown' || admittedEffect !== operation.effect) {
     return refusedWithPlan(
       'work_effect_mismatch',
-      `requirement ${operation.id} expects ${operation.effect}; the resolved call is ${runtime.effect}`,
+      `requirement ${operation.id} expects ${operation.effect}; the resolved call is ${admittedEffect ?? 'unsealed'}`,
     );
   }
   const logicalContract = durableLogicalCallContract(contract.acceptedTaskId, input.tool, input.args);
   if (!logicalContract) return refusedWithPlan('work_authority_unavailable', 'resolved logical call contract is unsafe');
+
+  const continuationRepair = continuationArgumentRepairProjection({
+    db: openEventLog(),
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    tool: input.tool,
+    args: input.args,
+  });
+  if (continuationRepair.status === 'identical') {
+    return refusedWithPlan(
+      'work_attempt_budget_exhausted',
+      'the durable parent outcome requires corrected arguments; this continuation reproduced the same effective call, so an identical replay is not a repair',
+    );
+  }
+  if (continuationRepair.status === 'unavailable') {
+    return refusedWithPlan(
+      'work_authority_unavailable',
+      `the continuation repair requirement cannot be verified: ${continuationRepair.reason}`,
+    );
+  }
 
   try {
     const evidenceArgs = input.evidenceArgs ?? input.args;
@@ -1567,6 +2085,7 @@ export function admitExpectedWorkInvocation(input: {
         input.universeItemId ?? undefined,
         logicalContract.toolName,
         logicalContract.argumentDigest,
+        { tool: input.tool, args: input.args },
       );
       if (!prior.ok) {
         // A SETTLED requirement instance is not an error: hand the carrier
@@ -1733,7 +2252,12 @@ export function admitExpectedWorkInvocation(input: {
           );
         }
         evidenceMode = refinement.mode;
-        evidenceBasis = refinement.basis;
+        const boundedWindow = operation.coverage === 'complete_set'
+          ? schemaBoundedCollectionWindow(evidenceArgs, evidenceInputSchema)
+          : null;
+        evidenceBasis = boundedWindow === null
+          ? refinement.basis
+          : `${refinement.basis}:bounded_window=${boundedWindow}`;
         if ('proof' in refinement) {
           const derivedSelector: ExpectedWorkUniverseSelectorV1 = {
             argumentPointer: refinement.proof.argumentPointer,
@@ -1863,8 +2387,18 @@ export function admitExpectedWorkInvocation(input: {
       };
       return { status: 'bound', binding, contract };
     });
-    return tx.immediate();
+    const result = tx.immediate();
+    publishExpectedWorkProgress({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+    });
+    return result;
   } catch (error) {
-    return refusedWithPlan('work_authority_unavailable', boundedReason(error));
+    const refused = refusedWithPlan('work_authority_unavailable', boundedReason(error));
+    publishExpectedWorkProgress({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+    });
+    return refused;
   }
 }

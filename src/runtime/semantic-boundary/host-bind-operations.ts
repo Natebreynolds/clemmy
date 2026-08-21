@@ -39,9 +39,11 @@ export interface HostBoundOperation {
 const ACT_CONSTRUCTS = new Set(['collect_then_construct', 'fanout', 'collect', 'single_act']);
 
 export function normalizedFamily(family: string | undefined): string {
-  const value = (family ?? '').trim().toLowerCase();
-  if (!value) return '';
-  return /sheet|workbook|excel|spreadsheet/.test(value) ? 'workbook' : value;
+  return (family ?? '').trim().toLowerCase();
+}
+
+function uniqueOf<T>(items: readonly T[]): T | null {
+  return items.length === 1 ? items[0]! : null;
 }
 
 function probeEnvelope(input: {
@@ -73,11 +75,147 @@ function hasRole(entry: RegisteredHostCapability, role: string): boolean {
   return entry.advisoryRoles?.includes(role) === true;
 }
 
+function compilesRead(
+  entry: RegisteredHostCapability,
+  role: string,
+  objective: string,
+  extras?: {
+    predecessors?: GraphNodeInvocationEnvelopeV1['predecessors'];
+    count?: number;
+    fields?: readonly string[];
+  },
+): boolean {
+  const schema = schemaOf(entry);
+  if (!schema) return false;
+  return compileProofProviderArgs({
+    schema,
+    role,
+    effect: 'read',
+    payload: undefined,
+    envelope: probeEnvelope({
+      objective,
+      count: extras?.count,
+      fields: extras?.fields,
+      predecessors: extras?.predecessors,
+    }),
+  }) !== null;
+}
+
 /**
- * Synthesize bound operations for an admitted act construct whose proposal
- * left operations empty. Returns null when the registered catalog cannot
- * carry the goal — the caller must fail closed, never fall to legacy.
+ * Unique attested read for this source. Zero or many matching reads refuse
+ * to bind (SELECT-1). Catalog order never chooses. Writes are not a retrieve.
  */
+export function synthesizeRetrieveOperation(goal: {
+  construct: string;
+  route?: string;
+  effectCeiling: string;
+  objective: string;
+  identity: { sessionId: string; sourceUserSeq: number };
+}): HostBoundOperation[] | null {
+  try {
+    const ceiling = goal.effectCeiling;
+    if (ceiling === 'external_write' || ceiling === 'local_write' || ceiling === 'admin') {
+      return null;
+    }
+    const retrieveShaped = goal.construct === 'none'
+      || goal.construct === 'single_act'
+      || goal.route === 'retrieve';
+    if (!retrieveShaped) return null;
+    const reads = catalogEntriesForAcceptedSource({
+      sessionId: goal.identity.sessionId,
+      sourceUserSeq: goal.identity.sourceUserSeq,
+      objective: goal.objective,
+    }).filter((entry) => (
+      entry.effect === 'read'
+      && (hasRole(entry, 'source') || hasRole(entry, 'lookup') || hasRole(entry, 'collection'))
+    ));
+    const lookups = reads.filter((entry) => hasRole(entry, 'lookup'));
+    const entry = uniqueOf(lookups)
+      ?? (lookups.length === 0 ? uniqueOf(reads) : null)
+      ?? uniqueOf(lookups.filter((candidate) => compilesRead(candidate, 'lookup', goal.objective)))
+      ?? uniqueOf(reads.filter((candidate) => compilesRead(candidate, 'lookup', goal.objective)));
+    if (!entry) return null;
+    return [{
+      id: 'op-retrieve',
+      role: 'lookup',
+      requestedEffect: 'read',
+      capabilityRef: entry.capabilityId,
+      dependsOn: [],
+      evidence: ['payload'],
+    }];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bounded collection read, then unique host inspect/transform when one exists.
+ * Zero or many matching collection reads refuse (SELECT-1). A missing unique
+ * transform still binds the collection; many transforms do not pick by order.
+ */
+export function synthesizeCollectionReadOperations(goal: {
+  construct: string;
+  route?: string;
+  effectCeiling: string;
+  objective: string;
+  count?: number;
+  identity: { sessionId: string; sourceUserSeq: number };
+}): HostBoundOperation[] | null {
+  try {
+    const ceiling = goal.effectCeiling;
+    if (ceiling === 'external_write' || ceiling === 'local_write' || ceiling === 'admin') {
+      return null;
+    }
+    const collectionShaped = (typeof goal.count === 'number' && goal.count >= 1)
+      || goal.construct === 'collect'
+      || goal.construct === 'collect_then_construct';
+    if (!collectionShaped) return null;
+    const entries = catalogEntriesForAcceptedSource({
+      sessionId: goal.identity.sessionId,
+      sourceUserSeq: goal.identity.sourceUserSeq,
+      objective: goal.objective,
+    });
+    const reads = entries.filter((entry) => (
+      entry.effect === 'read'
+      && (hasRole(entry, 'source') || hasRole(entry, 'collection') || hasRole(entry, 'collect'))
+    ));
+    const collections = reads.filter((entry) => hasRole(entry, 'collection') || hasRole(entry, 'collect'));
+    const source = uniqueOf(collections)
+      ?? (collections.length === 0 ? uniqueOf(reads) : null)
+      ?? uniqueOf(collections.filter((candidate) => compilesRead(candidate, 'collection', goal.objective)))
+      ?? uniqueOf(reads.filter((candidate) => compilesRead(candidate, 'collection', goal.objective)));
+    if (!source) return null;
+    const transforms = entries.filter((entry) => (
+      entry.effect === 'host_only'
+      && (hasRole(entry, 'transform') || hasRole(entry, 'extract') || hasRole(entry, 'inspect'))
+    ));
+    const operations: HostBoundOperation[] = [
+      {
+        id: 'op-collect',
+        role: 'collection',
+        requestedEffect: 'read',
+        capabilityRef: source.capabilityId,
+        dependsOn: [],
+        evidence: ['collection'],
+      },
+    ];
+    const transform = uniqueOf(transforms);
+    if (transform) {
+      operations.push({
+        id: 'op-transform',
+        role: 'transform',
+        requestedEffect: 'host_only',
+        capabilityRef: transform.capabilityId,
+        dependsOn: ['op-collect'],
+        evidence: ['lineage'],
+      });
+    }
+    return operations;
+  } catch {
+    return null;
+  }
+}
+
 export function synthesizeConstructOperations(goal: {
   construct: string;
   objective: string;
@@ -114,58 +252,13 @@ export function synthesizeConstructOperations(goal: {
     ];
     const wantedFamily = wantedFamilies[0] ?? '';
 
-    const searchRead = entries.find((entry) => {
-      if (entry.effect !== 'read' || !(hasRole(entry, 'source') || hasRole(entry, 'collection'))) return false;
-      const schema = schemaOf(entry);
-      if (!schema) return false;
-      return compileProofProviderArgs({
-        schema,
-        role: 'source',
-        effect: 'read',
-        payload: undefined,
-        envelope: probeEnvelope({ objective: goal.objective, count: goal.count, fields: goal.fields }),
-      }) !== null;
-    });
+    const searchRead = uniqueOf(entries.filter((entry) => (
+      entry.effect === 'read'
+      && (hasRole(entry, 'source') || hasRole(entry, 'collection'))
+      && compilesRead(entry, 'source', goal.objective, { count: goal.count, fields: goal.fields })
+    )));
 
-    const rowCreate = entries.find((entry) => {
-      if (entry.effect !== 'external_write' && entry.effect !== 'local_write') return false;
-      if (!(hasRole(entry, 'create') || hasRole(entry, 'destination'))) return false;
-      const entryFamily = normalizedFamily(entry.destination?.family ?? entry.manifest?.destination?.family);
-      if (wantedFamily && entryFamily && entryFamily !== wantedFamily) return false;
-      const schema = schemaOf(entry);
-      if (!schema) return false;
-      // The goal's collection must land in this write: the frozen schema has
-      // to accept the collected rows (an array member or a JSON-string member).
-      return compileProofProviderArgs({
-        schema,
-        role: 'create',
-        effect: 'external_write',
-        payload: [{ probe: 'row' }],
-        envelope: probeEnvelope({ objective: goal.objective, count: goal.count, fields: goal.fields }),
-      }) !== null;
-    });
-
-    const transform = entries.find((entry) => entry.effect === 'host_only'
-      && (hasRole(entry, 'transform') || hasRole(entry, 'extract')));
-
-    const readback = entries.find((entry) => {
-      if (entry.effect !== 'read' || !hasRole(entry, 'readback')) return false;
-      const schema = schemaOf(entry);
-      if (!schema) return false;
-      return compileProofProviderArgs({
-        schema,
-        role: 'readback',
-        effect: 'read',
-        payload: undefined,
-        envelope: probeEnvelope({
-          objective: goal.objective,
-          predecessors: [{ nodeId: 'probe-create', role: 'create', value: { id: 'probe-id' } }],
-        }),
-      }) !== null;
-    });
-
-    if (!searchRead || !rowCreate || !transform || !readback) return null;
-    const writeForFamily = (family: string) => entries.find((entry) => {
+    const createCompiles = (entry: RegisteredHostCapability, family: string): boolean => {
       if (entry.effect !== 'external_write' && entry.effect !== 'local_write') return false;
       if (!(hasRole(entry, 'create') || hasRole(entry, 'destination'))) return false;
       const entryFamily = normalizedFamily(entry.destination?.family ?? entry.manifest?.destination?.family);
@@ -179,7 +272,22 @@ export function synthesizeConstructOperations(goal: {
         payload: [{ probe: 'row' }],
         envelope: probeEnvelope({ objective: goal.objective, count: goal.count, fields: goal.fields }),
       }) !== null;
-    });
+    };
+    const rowCreate = uniqueOf(entries.filter((entry) => createCompiles(entry, wantedFamily)));
+
+    const transform = uniqueOf(entries.filter((entry) => entry.effect === 'host_only'
+      && (hasRole(entry, 'transform') || hasRole(entry, 'extract'))));
+
+    const readback = uniqueOf(entries.filter((entry) => (
+      entry.effect === 'read'
+      && hasRole(entry, 'readback')
+      && compilesRead(entry, 'readback', goal.objective, {
+        predecessors: [{ nodeId: 'probe-create', role: 'create', value: { id: 'probe-id' } }],
+      })
+    )));
+
+    if (!searchRead || !rowCreate || !transform || !readback) return null;
+    const writeForFamily = (family: string) => uniqueOf(entries.filter((entry) => createCompiles(entry, family)));
     const writeEffectOf = (entry: typeof rowCreate): HostBoundOperation['requestedEffect'] => (
       entry.effect === 'local_write' ? 'local_write' : 'external_write'
     );

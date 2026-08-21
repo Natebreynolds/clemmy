@@ -606,11 +606,42 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
   }
 
   if (route === 'retrieve') {
-    addNode({
-      kind: 'retrieve',
-      runner: { kind: 'tool' },
-      effect: routeEffect,
-    });
+    // A unique attested read already bound onto this source must compile as
+    // an executable retrieve node. The sketch retrieve (no operationId) is
+    // only for unbound reads, which dispatch may still answer in conversation.
+    const boundReads = (typed?.operations ?? []).filter((operation) => (
+      operation.requestedEffect === 'read'
+      && Boolean(operation.capabilityRef)
+    ));
+    if (boundReads.length > 0) {
+      for (const operation of boundReads) {
+        addNode({
+          id: operation.id,
+          kind: 'retrieve',
+          runner: { kind: 'tool' },
+          effect: {
+            kind: 'read',
+            certainty: 'exact',
+            reversibility: 'read_only',
+            idempotency: 'not_required',
+            receipt: 'evidence_ref',
+          },
+          operationId: operation.id,
+          capabilityRole: operation.role,
+          capabilities: [{
+            kind: 'tool',
+            resolution: 'explicit',
+            names: [operation.capabilityRef!],
+          }],
+        });
+      }
+    } else {
+      addNode({
+        kind: 'retrieve',
+        runner: { kind: 'tool' },
+        effect: routeEffect,
+      });
+    }
     addNode({
       kind: 'verify',
       runner: { kind: 'runtime' },

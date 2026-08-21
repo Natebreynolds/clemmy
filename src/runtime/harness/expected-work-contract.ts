@@ -15,11 +15,11 @@ import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { TurnGraphIR } from '../graph/turn-graph-ir.js';
 import { validateTurnGraph } from '../graph/turn-graph-compiler.js';
+import { assertAuthorityConsistency } from '../graph/accepted-goal.js';
 import { BoundaryError } from '../boundary-error.js';
 import { armAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { openEventLog } from './eventlog.js';
 import { expectedTaskFor } from './resolution-ledger.js';
-import { peekConnectedToolkits } from '../../integrations/composio/client.js';
 
 export const EXPECTED_WORK_CONTRACT_VERSION = 1 as const;
 export const EXPECTED_WORK_MAX_OPERATIONS = 32 as const;
@@ -105,6 +105,17 @@ export interface AcceptedTaskWorkContractV1 extends ExpectedWorkProposalV1 {
 export type ExpectedWorkProposalValidation =
   | { ok: true; proposal: ExpectedWorkProposalV1 }
   | { ok: false; errors: string[] };
+
+/**
+ * A collect-then-construct request with a communication effect has two
+ * distinct mutations: construct the artifact, then deliver its verified
+ * handle. The graph already carries both facts, so this boundary never needs
+ * provider names or another prose classifier to recognize the compound shape.
+ */
+export function requiresPostConstructCommunicationDelivery(graph: TurnGraphIR): boolean {
+  return graph.classification.multiItem.collectThenConstruct
+    && graph.classification.externalEffectKinds.includes('communication');
+}
 
 interface ContractRow {
   session_id: string;
@@ -485,6 +496,46 @@ export function compileDeterministicExpectedWorkProposal(
   if (graph.classification.route === 'direct_reply') {
     return { version: EXPECTED_WORK_CONTRACT_VERSION, operations: [], universes: [] };
   }
+  if (graph.classification.route === 'act' && graph.classification.multiItem.collectThenConstruct) {
+    // The V1 deterministic compiler owns only one construct write. Freezing
+    // that smaller topology would erase the later communication effect. A
+    // complete structured proposal must name and order both effects instead.
+    if (requiresPostConstructCommunicationDelivery(graph)) return null;
+    const retrieves = graph.nodes.filter((node) => node.kind === 'retrieve' && node.effect.kind === 'read');
+    const execute = graph.nodes.find((node) => node.kind === 'execute');
+    if (retrieves.length === 0 || !execute) return null;
+    const writeEffect = execute.effect.kind === 'local_write' || execute.effect.kind === 'admin'
+      ? execute.effect.kind
+      : 'external_write';
+    const readOps = retrieves.map((retrieve, index) => {
+      const prior = retrieves[index - 1];
+      return {
+        id: retrieve.id,
+        effect: 'read' as const,
+        // First read locates the source. A later read collects the set.
+        // resolved_operation so a source URL cannot seal the collection.
+        coverage: 'resolved_operation' as const,
+        dependsOn: prior ? [prior.id] : [],
+        dataFrom: prior ? [prior.id] : [],
+        cardinality: { kind: 'once' as const },
+      };
+    });
+    const lastReadId = retrieves[retrieves.length - 1]!.id;
+    return {
+      version: EXPECTED_WORK_CONTRACT_VERSION,
+      operations: [
+        ...readOps,
+        {
+          id: execute.id,
+          effect: writeEffect,
+          dependsOn: [lastReadId],
+          dataFrom: [lastReadId],
+          cardinality: { kind: 'once' },
+        },
+      ],
+      universes: [],
+    };
+  }
   if (graph.classification.route !== 'retrieve') return null;
   const reads = graph.nodes.filter((node) => node.kind === 'retrieve' && node.effect.kind === 'read');
   if (reads.length !== 1) return null;
@@ -688,19 +739,85 @@ export type FreezeExpectedWorkContractResult =
   | { status: 'fixed' | 'replayed'; contract: AcceptedTaskWorkContractV1 }
   | { status: 'planning_required' | 'invalid' | 'missing' | 'conflict' | 'storage_error'; reason: string };
 
+const COMPOUND_DELIVERY_TOPOLOGY_ERROR =
+  'a collect-then-construct communication must freeze exactly source read -> construct write -> verification read -> terminal external write';
+
+function hasOnlyDependency(operation: ExpectedWorkOperationV1, dependencyId: string): boolean {
+  return operation.dependsOn.length === 1 && operation.dependsOn[0] === dependencyId;
+}
+
+function hasOnlyDataSource(operation: ExpectedWorkOperationV1, sourceId: string): boolean {
+  return operation.dataFrom.length === 1 && operation.dataFrom[0] === sourceId;
+}
+
+/**
+ * V1 has no provider or semantic-operation roles, so the only honest complete
+ * compound contract is the exact four-stage DAG. The first write is defined
+ * structurally as construction; the verified readback is its sole successor;
+ * the final external write is delivery and consumes only that verification.
+ */
+function hasCompletePostConstructCommunicationTopology(
+  proposal: ExpectedWorkProposalV1,
+): boolean {
+  if (proposal.operations.length !== 4 || proposal.universes.length !== 0) return false;
+  if (proposal.operations.some((operation) => operation.cardinality.kind !== 'once')) return false;
+
+  const reads = proposal.operations.filter((operation) => operation.effect === 'read');
+  const writes = proposal.operations.filter((operation) => (
+    operation.effect === 'local_write' || operation.effect === 'external_write'
+  ));
+  if (reads.length !== 2 || writes.length !== 2) return false;
+
+  const terminalCandidates = writes.filter((operation) => (
+    operation.effect === 'external_write'
+    && !proposal.operations.some((candidate) => candidate.dependsOn.includes(operation.id))
+  ));
+  if (terminalCandidates.length !== 1) return false;
+  const terminal = terminalCandidates[0]!;
+  if (
+    terminal.dependsOn.length !== 1
+    || terminal.dataFrom.length !== 1
+    || terminal.dependsOn[0] !== terminal.dataFrom[0]
+  ) return false;
+
+  const verification = reads.find((operation) => operation.id === terminal.dependsOn[0]);
+  if (!verification || verification.dataFrom.length !== 0) return false;
+
+  const construct = writes.find((operation) => operation.id !== terminal.id);
+  if (!construct || !hasOnlyDependency(verification, construct.id)) return false;
+
+  const source = reads.find((operation) => operation.id !== verification.id);
+  if (!source || source.dependsOn.length !== 0 || source.dataFrom.length !== 0) return false;
+  if (!hasOnlyDependency(construct, source.id) || !hasOnlyDataSource(construct, source.id)) return false;
+
+  return hasOnlyDependency(terminal, verification.id)
+    && hasOnlyDataSource(terminal, verification.id);
+}
+
 function validateActionProposalForGraph(
   proposal: ExpectedWorkProposalV1,
   graph: TurnGraphIR,
 ): string[] {
   const errors: string[] = [];
-  if (graph.classification.route !== 'act') errors.push('explicit action contracts require an action graph');
+  const readOnlyRetrieve = graph.classification.route === 'retrieve'
+    && graph.effectCeiling === 'read'
+    && proposal.operations.every((operation) => operation.effect === 'read' || operation.effect === 'compute');
+  if (graph.classification.route !== 'act' && !readOnlyRetrieve) {
+    errors.push('explicit action contracts require an action graph');
+  }
   if (proposal.operations.length === 0) errors.push('an action contract cannot contain zero operations');
   // `tool_intent` is an admitted planning uncertainty, not an affirmative
   // mutation. Its model-owned proposal may legitimately resolve the unknown
   // topology to a read. A typed action (including every direct external
   // effect), however, cannot be weakened to observation-only work.
-  const affirmativeAction = graph.classification.messageIntent === 'action'
-    || graph.classification.externalEffectRequested;
+  // An admitted READ ceiling is the exception, not a weakening: the model
+  // authored read-only semantics, the judges entailed them, and the clamp
+  // sealed a read ceiling — a vocabulary intent classifier may not override
+  // that exact authority to refuse the single-read act (write ceilings stay
+  // protected by the explicit outcome checks below).
+  const affirmativeAction = (graph.classification.messageIntent === 'action'
+    || graph.classification.externalEffectRequested)
+    && graph.effectCeiling !== 'read';
   if (
     affirmativeAction
     && !proposal.operations.some((operation) => operation.effect !== 'read')
@@ -725,6 +842,21 @@ function validateActionProposalForGraph(
     && !proposal.operations.some((operation) => operation.effect === 'compute')
   ) errors.push('the accepted compute effect requires a compute outcome');
   if (
+    requiresPostConstructCommunicationDelivery(graph)
+    && !hasCompletePostConstructCommunicationTopology(proposal)
+  ) errors.push(COMPOUND_DELIVERY_TOPOLOGY_ERROR);
+  if (graph.classification.multiItem.collectThenConstruct) {
+    if (proposal.operations.some((operation) => (
+      operation.effect !== 'read' && operation.cardinality.kind !== 'once'
+    ))) {
+      errors.push('a collect-then-construct graph cannot freeze per-item writes');
+    }
+    if (!proposal.operations.some((operation) => (
+      operation.effect !== 'read' && operation.cardinality.kind === 'once'
+    ))) {
+      errors.push('a collect-then-construct graph requires one once-cardinality write');
+    }
+  } else if (
     graph.classification.multiItem.detected
     && !proposal.operations.some((operation) => operation.cardinality.kind !== 'once')
   ) errors.push('the accepted fanout shape requires an each-cardinality operation');
@@ -900,58 +1032,6 @@ function exactExpectedTask(input: {
   return expected;
 }
 
-/** Freeze conversation/retrieve without invoking any provider. */
-/**
- * A retrieve-routed ask with NO capability anchor is a conversational lookup:
- * the answer comes from knowledge, not from a read anyone can observe
- * ("what is 15 × 9?" classifies lookup → retrieve). Contracting a read for it
- * made done unpublishable on any lane whose reply used no settled read (live
- * 2026-08-11 canary: the committer replaced the correct answer with the
- * verification hold). The anchor test is runtime-derived — token overlap with
- * a CONNECTED toolkit slug/alias, never a name catalog — so "list my outlook
- * messages" with outlook connected still contracts its read and an unbacked
- * mailbox answer still cannot publish. Applied at FREEZE so the recorded
- * contract is the durable decision; discharge stays untouched.
- */
-function conversationalLookupWithoutCapabilityAnchor(input: {
-  sessionId: string;
-  sourceUserSeq: number;
-  graph: TurnGraphIR;
-}): boolean {
-  const classification = input.graph.classification as {
-    messageIntent?: unknown;
-    externalEffectRequested?: unknown;
-  };
-  if (classification.messageIntent === 'action' || classification.externalEffectRequested === true) {
-    return false;
-  }
-  try {
-    const source = openEventLog().prepare(`
-      SELECT data_json FROM events
-       WHERE session_id = ? AND seq = ? AND type = 'user_input_received'
-    `).get(input.sessionId, input.sourceUserSeq) as { data_json: string } | undefined;
-    if (!source) return false;
-    const text = String((JSON.parse(source.data_json) as { text?: unknown })?.text ?? '');
-    if (!text.trim()) return false;
-    const askTokens = new Set(text.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 3));
-    const toolkits = peekConnectedToolkits();
-    // An EMPTY registry proves nothing about the ask — without a single
-    // connected capability to test against, the read requirement stays.
-    if (toolkits.length === 0) return false;
-    for (const toolkit of toolkits) {
-      const toolkitTokens = [
-        ...String(toolkit.slug ?? '').toLowerCase().split(/[^a-z0-9]+/),
-        ...String(toolkit.alias ?? '').toLowerCase().split(/[^a-z0-9]+/),
-      ].filter((token) => token.length >= 3);
-      if (toolkitTokens.some((token) => askTokens.has(token))) return false;
-    }
-    return true;
-  } catch {
-    // An unreadable source or registry keeps the read requirement.
-    return false;
-  }
-}
-
 export function freezeDeterministicExpectedWorkContract(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -962,15 +1042,13 @@ export function freezeDeterministicExpectedWorkContract(input: {
   if (!proposal) {
     return { status: 'planning_required', reason: 'action topology requires one explicit bounded proposal' };
   }
-  if (
-    proposal.operations.length > 0
-    && expected.graph.classification.route === 'retrieve'
-    && conversationalLookupWithoutCapabilityAnchor({ ...input, graph: expected.graph })
-  ) {
-    proposal = { ...proposal, operations: [], universes: [] };
-  }
   const validated = validateExpectedWorkProposal(proposal);
   if (!validated.ok) return { status: 'invalid', reason: validated.errors.join('; ') };
+  const consistent = assertAuthorityConsistency({
+    graph: expected.graph,
+    contract: validated.proposal,
+  });
+  if (!consistent.ok) return { status: 'invalid', reason: consistent.reason };
   return freezePreparedContract({
     ...input,
     contract: buildContract({
@@ -986,9 +1064,9 @@ export type RequireKnownExpectedWorkContractResult =
   | { status: 'action_deferred' };
 
 /**
- * Staged production cutover. Direct and retrieve have exact host-known
- * topology, so they bind before provider construction. Actions deliberately
- * continue unchanged until the bounded planner seam can supply their topology;
+ * Staged production cutover. Direct, retrieve, and collect-then-construct
+ * acts have exact host-known topology, so they bind before provider
+ * construction. Other actions stay deferred until an explicit proposal;
  * this helper never guesses one and never calls a provider itself.
  */
 export function requireKnownExpectedWorkContract(input: {

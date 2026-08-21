@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   compileTurnGraph,
+  factorySkipForCompiledRoute,
   type CompileTurnGraphInput,
 } from './turn-graph-compiler.js';
 import type { TurnGraphPolicySnapshot } from './turn-graph-ir.js';
@@ -48,6 +49,45 @@ test('direct chat fast path omits context, capability, tool, fanout, and verifie
   ]);
   assert.equal(result.graph.effectCeiling, 'none');
   assert.equal(result.graph.nodes.some((node) => node.runner.kind === 'tool'), false);
+});
+
+test('factory skip is only the compiled direct_reply without an explicit allowlist', () => {
+  assert.equal(factorySkipForCompiledRoute('direct_reply', undefined), true);
+  assert.equal(factorySkipForCompiledRoute('direct_reply', []), false);
+  assert.equal(factorySkipForCompiledRoute('direct_reply', ['memory_search']), false);
+  assert.equal(factorySkipForCompiledRoute('retrieve', undefined), false);
+  assert.equal(factorySkipForCompiledRoute('act', undefined), false);
+});
+
+test('thanks and closed-world questions compile as direct_reply', () => {
+  for (const input of ['thanks', "what's 2x2", 'What’s 2x3', 'what is 15% of 80', 'what is sqrt(144)']) {
+    const result = compile(input);
+    assert.equal(result.validation.ok, true, result.validation.errors.join('\n'));
+    assert.equal(result.graph.classification.route, 'direct_reply', input);
+    assert.equal(result.graph.fastPath, 'direct_reply', input);
+    assert.equal(result.graph.effectCeiling, 'none', input);
+    assert.equal(result.graph.nodes.some((node) => node.kind === 'capability_resolve'), false, input);
+    assert.equal(result.graph.nodes.some((node) => node.kind === 'retrieve'), false, input);
+  }
+});
+
+test('a hosted-world follow-up compiles retrieve only when the session already opened that world', () => {
+  const alone = compile('what are they slack IDs');
+  assert.equal(alone.graph.classification.route, 'direct_reply');
+  assert.equal(factorySkipForCompiledRoute(alone.graph.classification.route, undefined), true);
+
+  const continued = compile('what are they slack IDs', {
+    signals: { continueHostedWorld: true },
+  });
+  assert.equal(continued.graph.classification.route, 'retrieve');
+  assert.equal(continued.graph.fastPath, 'single_retrieval');
+  assert.equal(factorySkipForCompiledRoute(continued.graph.classification.route, undefined), false);
+  assert.ok(continued.graph.nodes.some((node) => node.kind === 'retrieve'));
+
+  const mathAfterRetrieve = compile("what's 2x3", {
+    signals: { continueHostedWorld: true },
+  });
+  assert.equal(mathAfterRetrieve.graph.classification.route, 'direct_reply');
 });
 
 test('lookup compiles one bounded context/capability/retrieval/evidence path', () => {
@@ -111,6 +151,76 @@ test('an explicit tool invocation never inflates a read into an external communi
   assert.equal(result.graph.classification.externalEffectRequested, false);
   assert.deepEqual(result.graph.classification.externalEffectKinds, []);
   assert.notEqual(result.graph.effectCeiling, 'external_write');
+});
+
+/** Aggregate construct contract, shared by the collect-then-construct pins.
+ * One bounded source read returns the set; ONE execute creates/populates the
+ * artifact. True per-item jobs retain the separate fanout contract below. */
+function assertAggregateConstruct(result: ReturnType<typeof compile>): void {
+  assert.equal(result.validation.ok, true, result.validation.errors.join('\n'));
+  assert.equal(result.graph.classification.multiItem.collectThenConstruct, true);
+  assert.equal(result.graph.fastPath, 'single_action');
+  assert.equal(result.graph.nodes.filter((node) => node.kind === 'retrieve').length, 1,
+    'one aggregate source/read phase');
+  assert.equal(result.graph.nodes.some((node) => node.kind === 'fanout'), false,
+    'returned rows are not host-manufactured worker jobs');
+  assert.equal(result.graph.nodes.some((node) => node.kind === 'reduce'), false,
+    'an aggregate provider result needs no per-row reducer');
+  const executes = result.graph.nodes.filter((node) => node.kind === 'execute');
+  assert.equal(executes.length, 1, 'one create/populate artifact phase');
+  assert.equal(executes[0]?.effect.kind, 'external_write');
+}
+
+test('collect-then-construct compiles one aggregate read then one construct write', () => {
+  const result = compile(
+    'Find the top 5 widgets based on ratings and add them to a new workbook for me.',
+  );
+  assertAggregateConstruct(result);
+  assert.equal(result.graph.classification.multiItem.detected, false);
+});
+
+test('a second domain compiles the same aggregate shape: N accounts into one sheet', () => {
+  const result = compile(
+    'Find the top 12 accounts by renewal date and add them to a new google sheet for me.',
+  );
+  assertAggregateConstruct(result);
+});
+
+test('a find-lead with a singular counted noun still compiles collect-then-construct', () => {
+  const result = compile(
+    'Find the page for example.com and scrape their last 5 facebook post and put them in a new workbook for me.',
+  );
+  assert.equal(result.graph.classification.route, 'act');
+  assertAggregateConstruct(result);
+});
+
+test('a pronoun count landing in one container compiles collect-then-construct', () => {
+  const result = compile(
+    'Find the best widgets with the highest ratings 5 of them and put all the info in a workbook for me and give me the link.',
+  );
+  assertAggregateConstruct(result);
+});
+
+test('a find-lead field list landing in one container compiles collect-then-construct', () => {
+  const result = compile(
+    'Find the official blog for example.com, grab the last 5 blog post, and put the title, date, and link on a new workbook for me.',
+  );
+  assert.equal(result.graph.classification.route, 'act');
+  assertAggregateConstruct(result);
+});
+
+test('Pismo reviews into one sheet never compiles per-row fanout', () => {
+  const result = compile(
+    'Find me the top 5 restaurants in Pismo Beach CA based on Google reviews, give me the review count and phone number for each, and create a new Google Sheet.',
+  );
+  assert.equal(result.graph.classification.route, 'act');
+  assert.equal(result.graph.classification.externalEffectRequested, true);
+  assert.equal(result.graph.effectCeiling, 'external_write');
+  assert.deepEqual(result.graph.classification.goalConstraints?.collection?.projection, [
+    'review count',
+    'phone number',
+  ]);
+  assertAggregateConstruct(result);
 });
 
 test('conservative multi-item signal compiles bounded fanout, per-item execution, and reduce', () => {

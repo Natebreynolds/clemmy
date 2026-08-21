@@ -381,7 +381,7 @@ test('open-slots win over an empty work sketch and park a question, not a connec
   assert.match(dispatched.text, /who should receive the update/i);
 });
 
-test('a write with no destination admits as conversation, not illegal work', async () => {
+test('a write with no destination is refused, not a conversation loop', async () => {
   installTurnSemanticModelPort({
     async interpret() {
       return {
@@ -418,16 +418,16 @@ test('a write with no destination admits as conversation, not illegal work', asy
   });
   const identity = { sessionId: session.id, turn: 1, sourceUserSeq: source.seq };
   const compiled = await admitAndCompileAcceptedSource({ identity, surface: 'direct' });
-  assert.equal(compiled.ok, true, compiled.ok ? '' : compiled.reason);
+  assert.equal(compiled.ok, false, compiled.ok ? 'write with no destination must not admit' : compiled.reason);
   const dispatched = await dispatchAdmittedSource(identity);
-  assert.equal(dispatched.kind, 'needs_input', JSON.stringify(dispatched).slice(0, 300));
-  if (dispatched.kind !== 'needs_input') return;
-  assert.match(dispatched.text, /zephyr deal tracker/i);
-  assert.match(dispatched.text, /\?/);
-  assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).length, 1);
+  assert.notEqual(dispatched.kind, 'conversation', JSON.stringify(dispatched).slice(0, 300));
+  assert.ok(
+    dispatched.kind === 'blocked' || dispatched.kind === 'needs_input',
+    JSON.stringify(dispatched).slice(0, 300),
+  );
 });
 
-test('underspecified named-existing writes admit as conversation, not a connection gap', async () => {
+test('underspecified named-existing writes park a question, not a conversation loop', async () => {
   installTurnSemanticModelPort({
     async interpret() {
       return {
@@ -466,10 +466,8 @@ test('underspecified named-existing writes admit as conversation, not a connecti
   const compiled = await admitAndCompileAcceptedSource({ identity, surface: 'direct' });
   assert.equal(compiled.ok, true, compiled.ok ? '' : compiled.reason);
   assert.equal(readSemanticDisposition(session.id, source.seq)?.outcome, 'admitted');
-  if (compiled.ok) {
-    assert.equal(compiled.compiled.graph.classification.route, 'direct_reply');
-  }
   const dispatched = await dispatchAdmittedSource(identity);
+  assert.notEqual(dispatched.kind, 'conversation', JSON.stringify(dispatched).slice(0, 300));
   assert.equal(dispatched.kind, 'needs_input', JSON.stringify(dispatched).slice(0, 300));
   if (dispatched.kind !== 'needs_input') return;
   assert.doesNotMatch(dispatched.text, /none of your connected apps/i);

@@ -52,6 +52,7 @@ const {
   sweepStaleExecutions,
   sweepCrashedExecutions,
   sweepStaleBlockedExecutions,
+  closeAbandonedExecution,
 } = await import('./store.js');
 const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const { TASKS_FILE, ensureTasksFile, parseTasks } = await import('../tools/shared.js');
@@ -1712,6 +1713,38 @@ test('sweepStaleBlockedExecutions: active execution is NOT swept by the blocked 
   ]);
   const swept = sweepStaleBlockedExecutions();
   assert.equal(swept, 0);
+});
+
+test('closeAbandonedExecution fails one active row through the same publisher', async () => {
+  seedExecutions([
+    baseExecution({
+      id: 'orphan-draft',
+      title: 'Team activity recap draft',
+      objective: 'Draft a recap',
+      status: 'active',
+      updatedAt: nowMinusMinutes(10),
+      lastActivityAt: nowMinusMinutes(10),
+    }),
+    baseExecution({
+      id: 'keep-active',
+      title: 'Still working',
+      status: 'active',
+      updatedAt: nowMinusMinutes(1),
+      lastActivityAt: nowMinusMinutes(1),
+    }),
+  ]);
+  const { loadNotifications } = await import('../runtime/notifications.js');
+  const before = loadNotifications().length;
+  assert.equal(closeAbandonedExecution('orphan-draft', 'Abandoned: host closed an orphan draft with no typed terminal.'), true);
+  assert.equal(closeAbandonedExecution('orphan-draft', 'again'), false);
+  const after = readExecutions();
+  const closed = after.find((row) => row.id === 'orphan-draft');
+  const kept = after.find((row) => row.id === 'keep-active');
+  assert.equal(closed?.status, 'completed');
+  assert.match(String(closed?.blocker), /orphan draft/);
+  assert.equal(kept?.status, 'active');
+  const fresh = loadNotifications().slice(before);
+  assert.ok(fresh.some((n) => n.metadata?.executionId === 'orphan-draft'));
 });
 
 test('sweepStaleExecutions publishes a stopped notification for user-facing work (swallowed-state pin)', async () => {

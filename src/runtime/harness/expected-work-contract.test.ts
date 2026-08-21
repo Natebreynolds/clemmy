@@ -16,7 +16,9 @@ const shadow = await import('../graph/turn-graph-shadow.js');
 const capabilityCandidates = await import('../read-path/capability-candidates.js');
 const authority = await import('./accepted-task-authority.js');
 const contracts = await import('./expected-work-contract.js');
+const admission = await import('./expected-work-admission.js');
 const { discoveryGovernor } = await import('./discovery-governor.js');
+const composioClient = await import('../../integrations/composio/client.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -160,6 +162,34 @@ test('retrieve freezes one provider-neutral read without asserting point or coll
   );
 });
 
+test('retrieve authority never depends on literal overlap with an eventually resolved provider', async (t) => {
+  // Live 2026-08-19, source 68028: "What was my teams call volume today"
+  // correctly resolved to a Salesforce CLI read after graph admission. A
+  // nonempty registry containing unrelated toolkit names made the contract
+  // demote that retrieve to zero work before resolution, so the successful
+  // read was later condemned as unexpected business work and the correct
+  // answer was withheld. The accepted graph owns topology; provider names
+  // cannot erase it before capability resolution.
+  composioClient.__test__.setConnectedAccountsLoader(async () => [{
+    id: 'ca_unrelated',
+    status: 'ACTIVE',
+    toolkit: { slug: 'googlesheets' },
+  }]);
+  t.after(() => composioClient.__test__.setConnectedAccountsLoader(null));
+  await composioClient.listConnectedToolkits({ requireFresh: true });
+
+  const task = accept('What was my teams call volume today?');
+  assert.equal(task.graph.classification.route, 'retrieve');
+  const fixed = contracts.freezeDeterministicExpectedWorkContract(task);
+  assert.equal(fixed.status, 'fixed');
+  assert.equal(
+    fixed.status === 'fixed' && fixed.contract.operations.length,
+    1,
+    'an unrelated connected toolkit cannot turn a current-state retrieve into conversation',
+  );
+  assert.equal(fixed.status === 'fixed' && fixed.contract.operations[0]?.effect, 'read');
+});
+
 test('an arbitrary action requires an explicit validated proposal and exact replay survives restart', () => {
   const task = accept('Email alex@example.com with the update.');
   assert.equal(contracts.compileDeterministicExpectedWorkProposal(task.graph), null);
@@ -226,6 +256,76 @@ test('unknown tool planning may resolve to reads or writes, but an affirmative a
     weakened.status === 'invalid' ? weakened.reason : '',
     /cannot be weakened to read-only work/,
   );
+});
+
+test('collect-then-construct freezes one set read and one write, and refuses per-item writes', () => {
+  const pronounSet = accept(
+    'Find the best widgets with the highest ratings 5 of them and put all the info in a workbook for me and give me the link.',
+  );
+  assert.equal(pronounSet.graph.classification.multiItem.collectThenConstruct, true);
+  assert.equal(contracts.requireKnownExpectedWorkContract(pronounSet).status, 'bound');
+
+  const task = accept(
+    'Find the top 5 widgets based on ratings and add them to a new workbook for me.',
+  );
+  assert.equal(task.graph.classification.route, 'act');
+  assert.equal(task.graph.classification.multiItem.collectThenConstruct, true);
+  assert.ok(task.graph.nodes.some((node) => node.kind === 'retrieve'));
+  assert.ok(task.graph.nodes.some((node) => node.kind === 'execute'));
+
+  const proposal = contracts.compileDeterministicExpectedWorkProposal(task.graph);
+  assert.ok(proposal);
+  const reads = proposal.operations.filter((operation) => operation.effect === 'read');
+  const writes = proposal.operations.filter((operation) => operation.effect === 'external_write');
+  assert.equal(reads.length, 1, 'the counted source set is one aggregate read');
+  assert.equal(writes.length, 1);
+  assert.equal(reads[0]?.coverage, 'resolved_operation');
+  assert.equal(reads[0]?.cardinality.kind, 'once');
+  assert.equal(writes[0]?.cardinality.kind, 'once');
+  assert.ok(writes[0]?.dependsOn.includes(reads[reads.length - 1]!.id));
+
+  const fixed = contracts.freezeDeterministicExpectedWorkContract(task);
+  assert.equal(fixed.status, 'fixed');
+  assert.equal(fixed.status === 'fixed' && fixed.contract.plannerSource, 'deterministic');
+  assert.deepEqual(contracts.requireKnownExpectedWorkContract(task), {
+    status: 'bound',
+    contract: fixed.status === 'fixed' ? fixed.contract : undefined,
+  });
+  const activated = admission.activateActionExpectedWork(task);
+  assert.ok(activated.status === 'activated' || activated.status === 'replayed', JSON.stringify(activated));
+  assert.equal(admission.actionExpectedWorkState(task).status, 'required');
+
+  const eachWrite = contracts.freezeActionExpectedWorkContract({
+    ...task,
+    proposal: {
+      version: 1,
+      operations: [
+        {
+          id: 'read_source',
+          effect: 'read',
+          coverage: 'complete_set',
+          dependsOn: [],
+          dataFrom: [],
+          cardinality: { kind: 'once' },
+        },
+        {
+          id: 'write_per_record',
+          effect: 'external_write',
+          dependsOn: ['read_source'],
+          dataFrom: ['read_source'],
+          cardinality: { kind: 'each', universeId: 'widgets' },
+        },
+      ],
+      universes: [{
+        id: 'widgets',
+        seal: 'complete_source_receipt',
+        producedBy: 'read_source',
+        memberIdPointer: '/id',
+      }],
+    },
+  });
+  assert.equal(eachWrite.status, 'invalid');
+  assert.match(eachWrite.status === 'invalid' ? eachWrite.reason : '', /per-item writes/);
 });
 
 test('the staged production binder defers an action without guessing or poisoning it', () => {
@@ -634,10 +734,93 @@ test('source 50404 freezes the full restaurant to Sheet to verified email lineag
 
   assert.equal(task.graph.classification.route, 'act');
   assert.equal(task.graph.classification.externalEffectRequested, true);
+  assert.ok(task.graph.classification.externalEffectKinds.includes('communication'));
+  assert.equal(contracts.requiresPostConstructCommunicationDelivery(task.graph), true);
   assert.equal(task.graph.effectCeiling, 'external_write');
   assert.equal(contracts.compileDeterministicExpectedWorkProposal(task.graph), null,
     'the compound request cannot be reduced to the retrieve route\'s one read');
   assert.equal(contracts.freezeDeterministicExpectedWorkContract(task).status, 'planning_required');
+
+  const sourceRead: contracts.ExpectedWorkOperationV1 = {
+    id: 'fetch_restaurants', effect: 'read', coverage: 'complete_set',
+    dependsOn: [], dataFrom: [], cardinality: { kind: 'once' },
+  };
+  const constructWrite: contracts.ExpectedWorkOperationV1 = {
+    id: 'create_sheet', effect: 'external_write',
+    dependsOn: ['fetch_restaurants'], dataFrom: ['fetch_restaurants'],
+    cardinality: { kind: 'once' },
+  };
+  const verificationRead: contracts.ExpectedWorkOperationV1 = {
+    id: 'verify_sheet', effect: 'read', coverage: 'complete_set',
+    dependsOn: ['create_sheet'], dataFrom: ['create_sheet'],
+    cardinality: { kind: 'once' },
+  };
+  const terminalDelivery: contracts.ExpectedWorkOperationV1 = {
+    id: 'send_link', effect: 'external_write',
+    dependsOn: ['verify_sheet'], dataFrom: ['verify_sheet'],
+    cardinality: { kind: 'once' },
+  };
+  const proposal = (
+    operations: contracts.ExpectedWorkOperationV1[]
+  ): contracts.ExpectedWorkProposalV1 => ({ version: 1, operations, universes: [] });
+  const assertIncompleteRefused = (
+    label: string,
+    operations: contracts.ExpectedWorkOperationV1[],
+  ): void => {
+    const prepared = contracts.prepareActionExpectedWorkContract({
+      ...task,
+      proposal: proposal(operations),
+    });
+    assert.equal(prepared.status, 'invalid', `${label}: ${JSON.stringify(prepared)}`);
+    assert.match(
+      prepared.status === 'invalid' ? prepared.reason : '',
+      /source read -> construct write -> verification read -> terminal external write/,
+      label,
+    );
+    const frozen = contracts.freezeActionExpectedWorkContract({
+      ...task,
+      proposal: proposal(operations),
+    });
+    assert.equal(frozen.status, 'invalid', `${label}: an incomplete topology cannot freeze`);
+    assert.equal(
+      contracts.loadExpectedWorkContract(task.sessionId, task.sourceUserSeq).status,
+      'missing',
+      `${label}: refusal cannot leave contract authority behind`,
+    );
+  };
+
+  assertIncompleteRefused('one write', [sourceRead, constructWrite]);
+  assertIncompleteRefused('parallel delivery', [
+    sourceRead,
+    constructWrite,
+    verificationRead,
+    { ...terminalDelivery, dependsOn: ['fetch_restaurants'], dataFrom: ['fetch_restaurants'] },
+  ]);
+  assertIncompleteRefused('readback before construction', [
+    sourceRead,
+    { ...verificationRead, dependsOn: ['fetch_restaurants'], dataFrom: [] },
+    { ...constructWrite, dependsOn: ['verify_sheet'], dataFrom: ['verify_sheet'] },
+    { ...terminalDelivery, dependsOn: ['create_sheet'], dataFrom: ['create_sheet'] },
+  ]);
+  assertIncompleteRefused('missing readback', [
+    sourceRead,
+    constructWrite,
+    { ...terminalDelivery, dependsOn: ['create_sheet'], dataFrom: ['create_sheet'] },
+  ]);
+
+  const crossing = admission.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId: 'compound-incomplete-create',
+    proposal: proposal([sourceRead, constructWrite]),
+    requirementId: 'create_sheet',
+    tool: 'resource_create',
+    args: { title: 'Date night restaurants' },
+  });
+  assert.equal(crossing.status, 'refused');
+  assert.equal(crossing.status === 'refused' && crossing.kind, 'work_contract_invalid',
+    'the fused physical admission seam refuses before an incomplete contract can cross');
+  assert.equal(contracts.loadExpectedWorkContract(task.sessionId, task.sourceUserSeq).status, 'missing');
 
   const roleProjectionPromise = capabilityCandidates.resolveTurnCapabilityCandidates({
     userInput: request,
@@ -656,31 +839,7 @@ test('source 50404 freezes the full restaurant to Sheet to verified email lineag
 
   const frozen = contracts.freezeActionExpectedWorkContract({
     ...task,
-    proposal: {
-      version: 1,
-      operations: [
-        {
-          id: 'fetch_restaurants', effect: 'read', coverage: 'complete_set',
-          dependsOn: [], dataFrom: [], cardinality: { kind: 'once' },
-        },
-        {
-          id: 'create_sheet', effect: 'external_write',
-          dependsOn: ['fetch_restaurants'], dataFrom: ['fetch_restaurants'],
-          cardinality: { kind: 'once' },
-        },
-        {
-          id: 'verify_sheet', effect: 'read', coverage: 'complete_set',
-          dependsOn: ['create_sheet'], dataFrom: ['create_sheet'],
-          cardinality: { kind: 'once' },
-        },
-        {
-          id: 'send_link', effect: 'external_write',
-          dependsOn: ['verify_sheet'], dataFrom: ['verify_sheet'],
-          cardinality: { kind: 'once' },
-        },
-      ],
-      universes: [],
-    },
+    proposal: proposal([sourceRead, constructWrite, verificationRead, terminalDelivery]),
   });
   assert.equal(frozen.status, 'fixed', JSON.stringify(frozen));
   if (frozen.status !== 'fixed') return;
