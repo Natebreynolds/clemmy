@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chooseFields, flattenSparseRows, formatValue, humanizeKey, projectSourceHealth, projectWorkspaceData } from './mobile-projection.js';
+import { chooseFields, flattenSparseRows, formatValue, humanizeKey, projectSourceHealth, projectWorkspaceData, workspacePhonePresence } from './mobile-projection.js';
 
 test('counts are not money: `total*` alone never renders as dollars', () => {
   // Live bug: totalOpen (41 deals) rendered as "$41" beside totalOpenValue.
@@ -264,4 +264,18 @@ test('a runner-emitted nested _mobile block is honored (survives refresh by cons
   assert.equal(p.headline[0]?.label, 'Team calls');
   assert.equal(p.recordLabel, 'Reps');
   assert.equal(p.records[0]?.primary, 'Bobby');
+});
+
+test('phone presence: content decides by default, the owner overrides', () => {
+  // A real library is half drafts; they must not crowd the phone.
+  assert.equal(workspacePhonePresence({ rows: 0, hasSummary: false }).onPhone, false);
+  assert.equal(workspacePhonePresence({ rows: 0, hasSummary: false }).reason, 'empty-draft');
+  // Anything worth looking at shows without being asked.
+  assert.equal(workspacePhonePresence({ rows: 12, hasSummary: false }).onPhone, true);
+  assert.equal(workspacePhonePresence({ rows: 0, hasSummary: true }).onPhone, true);
+  // The two things content cannot know — both win over it.
+  assert.equal(workspacePhonePresence({ rows: 0, hasSummary: false, show: true }).onPhone, true);
+  assert.equal(workspacePhonePresence({ rows: 0, hasSummary: false, show: true }).reason, 'pinned');
+  assert.equal(workspacePhonePresence({ rows: 500, hasSummary: true, show: false }).onPhone, false);
+  assert.equal(workspacePhonePresence({ rows: 500, hasSummary: true, show: false }).reason, 'hidden');
 });

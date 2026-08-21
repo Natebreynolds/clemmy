@@ -16,6 +16,7 @@ import {
   getWorkspace,
   listWorkspaces,
   refreshWorkspace,
+  setWorkspaceMobile,
   type WorkspaceBreakdown,
   type WorkspaceRecord,
   type WorkspaceSummary,
@@ -54,19 +55,19 @@ export function Workspaces() {
     );
   }
 
-  // Workspaces with something to show come first; drafts and abandoned
-  // experiments fold away behind a disclosure. On a laptop an empty workspace
-  // is easy to scroll past — on a phone it crowds out the two or three that
-  // actually matter, which is exactly what a real library looks like.
-  const live = spaces.filter((s) => (s.rows ?? 0) > 0);
-  const empty = spaces.filter((s) => (s.rows ?? 0) === 0);
+  // The daemon decides what belongs here (content by default, the owner's
+  // answer when they gave one) so the phone, the desktop and Clem agree.
+  // Everything else folds away: on a laptop a dead draft is easy to scroll
+  // past, on a phone it crowds out the two or three that actually matter.
+  const live = spaces.filter((s) => s.onPhone ?? (s.rows ?? 0) > 0);
+  const empty = spaces.filter((s) => !(s.onPhone ?? (s.rows ?? 0) > 0));
 
   return (
     <div class="stack">
       <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData />
       {live.length === 0 && empty.length > 0 ? (
         <p class="ws-none-yet">
-          None of your workspaces have data yet. Refresh one on your Mac, or open it there to finish setting it up.
+          Nothing here has data yet. Open one below and ask Clem to set it up.
         </p>
       ) : null}
       {renderRows(live, 0)}
@@ -110,7 +111,7 @@ function EmptyWorkspaces({ spaces, onOpen, startIndex }: {
   return (
     <div class="ws-empty-group">
       <button class="link-btn" onClick={() => { haptic('light'); setOpen(!open); }}>
-        {open ? 'Hide' : `${spaces.length} with no data yet`}
+        {open ? 'Hide drafts' : `${spaces.length} ${spaces.length === 1 ? 'draft' : 'drafts'}`}
       </button>
       {open ? spaces.map((space, i) => (
         <button
@@ -121,7 +122,9 @@ function EmptyWorkspaces({ spaces, onOpen, startIndex }: {
         >
           <div class="min-w-0">
             <div class="card-title-sm truncate">{space.title}</div>
-            <div class="card-when">Not set up yet</div>
+            <div class="card-when">
+              {space.presence === 'hidden' ? 'Hidden from your phone' : 'Nothing to show yet'}
+            </div>
           </div>
         </button>
       )) : null}
@@ -129,14 +132,34 @@ function EmptyWorkspaces({ spaces, onOpen, startIndex }: {
   );
 }
 
+/**
+ * The asks that turn a broken workspace into a working one.
+ *
+ * A workspace with no registered data source cannot refresh — not "failed",
+ * cannot, structurally — and one whose runner never wrote a phone layout can
+ * only be guessed at. Both are Clem's work, not the user's, so the app hands
+ * her the exact request instead of leaving a button that fails or a screen
+ * that looks broken.
+ */
+const FIX_REFRESH_ASK = 'This workspace has no registered data source, so Refresh does nothing. '
+  + 'Please convert its refresh into a proper data-source runner on the workspace '
+  + '(so refreshes flow through observations and survive restarts), and have that runner '
+  + 'emit a `_mobile` block so the phone view stays current too.';
+
+const PHONE_LAYOUT_ASK = 'Please give this workspace a proper phone layout: have its data-source runner '
+  + 'emit a `_mobile` block with the two or three numbers worth seeing at a glance and the rows worth '
+  + 'scanning, so my phone stops guessing from the raw JSON.';
+
 function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void }) {
   const [refreshing, setRefreshing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [refreshNote, setRefreshNote] = useState<{ kind: 'ok' | 'approval' | 'failed'; text: string } | null>(null);
-  const [chatOpen, setChatOpen] = useState(false);
+  const [chatOpen, setChatOpen] = useState<{ draft?: string } | null>(null);
+  const [showPref, setShowPref] = useState<boolean | null | undefined>(undefined);
+  const [prefBusy, setPrefBusy] = useState(false);
   const { data: detail, error, offline, refresh: load } = useScreenData(
     () => getWorkspace(id),
-    { intervalMs: 60_000, disabled: chatOpen },
+    { intervalMs: 60_000, disabled: chatOpen !== null },
   );
 
   async function pullFresh() {
@@ -174,12 +197,15 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
 
   if (chatOpen) {
     // The SAME continuous thread the desktop's workspace dock uses — the
-    // stable space-<slug> session id is the entire binding.
+    // stable space-<slug> session id is the entire binding. A draft can ride
+    // along, so "fix this" arrives as a request Clem can act on rather than
+    // a blank box the user has to compose in.
     return (
       <Chat
         sessionId={`space-${id}`}
         initialTitle={detail?.title ? `Ask about ${detail.title}` : 'Ask about this workspace'}
-        onBack={() => { setChatOpen(false); void load(); }}
+        initialDraft={chatOpen.draft}
+        onBack={() => { setChatOpen(null); void load(); }}
       />
     );
   }
@@ -197,6 +223,28 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
 
   const failed = detail.sources.filter((s) => !s.ok);
   const { projection } = detail;
+  // 'no_sources' is the daemon's own freshness verdict — the workspace has
+  // nothing registered that could ever pull data.
+  const canRefresh = detail.freshness !== 'no_sources' && detail.sources.length > 0;
+  // Lots of rows and almost no summary means the phone is inferring a layout
+  // from raw JSON. That is when a runner-authored one is worth asking for.
+  const thinLayout = projection.total >= 8 && projection.headline.length <= 1;
+  const preference = showPref === undefined ? (detail.showPreference ?? null) : showPref;
+
+  async function setPresence(next: boolean | null): Promise<void> {
+    if (prefBusy) return;
+    setPrefBusy(true);
+    try {
+      const result = await setWorkspaceMobile(id, next);
+      setShowPref(result.showPreference);
+      haptic('success');
+    } catch (err) {
+      haptic('error');
+      setActionError((err as Error).message ?? 'Could not change this');
+    } finally {
+      setPrefBusy(false);
+    }
+  }
 
   return (
     <div>
@@ -209,11 +257,25 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
           <FreshnessDot state={detail.freshness} />
           {freshnessLabel(detail)}
         </span>
-        <button class="btn-quiet" onClick={() => setChatOpen(true)}>Ask Clem</button>
-        <button class="btn-quiet" disabled={refreshing} onClick={pullFresh}>
-          {refreshing ? 'Refreshing…' : 'Refresh'}
-        </button>
+        <button class="btn-quiet" onClick={() => setChatOpen({})}>Ask Clem</button>
+        {/* A workspace with no registered data source CANNOT refresh. Showing
+            the button anyway is the lie that made this screen feel broken:
+            nothing happened and nothing said why. */}
+        {canRefresh ? (
+          <button class="btn-quiet" disabled={refreshing} onClick={pullFresh}>
+            {refreshing ? 'Refreshing…' : 'Refresh'}
+          </button>
+        ) : null}
       </div>
+
+      {!canRefresh ? (
+        <div class="ws-refresh-note">
+          <div>This workspace has no data source, so it can’t refresh on its own.</div>
+          <button class="link-btn" onClick={() => setChatOpen({ draft: FIX_REFRESH_ASK })}>
+            Ask Clem to fix this →
+          </button>
+        </div>
+      ) : null}
 
       {refreshNote ? (
         <div class={`ws-refresh-note ws-refresh-${refreshNote.kind}`}>{refreshNote.text}</div>
@@ -279,6 +341,33 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
           </p>
         </div>
       )}
+
+      {thinLayout ? (
+        <div class="ws-refresh-note">
+          <div>Your phone is guessing this layout from the raw data.</div>
+          <button class="link-btn" onClick={() => setChatOpen({ draft: PHONE_LAYOUT_ASK })}>
+            Ask Clem for a phone layout →
+          </button>
+        </div>
+      ) : null}
+
+      {/* Phone presence, owned by you. Absent means the app decides by
+          content — which is right until it isn't. */}
+      <div class="ws-presence">
+        <span class="card-when">
+          {preference === true ? 'Always on your phone'
+            : preference === false ? 'Hidden from your phone'
+              : 'Shown when it has something'}
+        </span>
+        {preference === false ? (
+          <button class="btn-quiet" disabled={prefBusy} onClick={() => void setPresence(true)}>Show on phone</button>
+        ) : (
+          <button class="btn-quiet" disabled={prefBusy} onClick={() => void setPresence(false)}>Hide from phone</button>
+        )}
+        {preference !== null ? (
+          <button class="link-btn" disabled={prefBusy} onClick={() => void setPresence(null)}>Automatic</button>
+        ) : null}
+      </div>
 
       {(detail.successCriteria?.length || detail.invariants?.length) ? (
         <section class="home-section">

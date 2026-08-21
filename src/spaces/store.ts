@@ -327,8 +327,24 @@ export interface SpaceRecord {
   lastOpenedAt?: string;
   lastRefreshedAt?: string;
   recipe?: string;
+  /** How this workspace behaves on the phone. Absent = decide by content. */
+  mobile?: SpaceMobilePrefs;
   /** Non-persisted diagnostics from normalizing a hand-written space.json. */
   manifestErrors?: string[];
+}
+
+/**
+ * Phone presence, owned by the user (or by Clem on their behalf).
+ *
+ * A real library accumulates drafts and dead experiments — on a laptop they
+ * are easy to scroll past, on a phone they crowd out the two or three that
+ * matter. Content decides by default (nothing to show = not on the phone);
+ * this exists for the two cases content cannot know: "keep this one even
+ * when it is empty" and "never show me this one".
+ */
+export interface SpaceMobilePrefs {
+  /** true = always show · false = never show · absent = automatic. */
+  show?: boolean;
 }
 
 export type SpaceFreshnessState = 'no_sources' | 'fresh' | 'stale' | 'never_refreshed';
@@ -605,6 +621,10 @@ function normalizeManifest(raw: unknown, slug: string, fallbackTime: string): Sp
     lastOpenedAt: asStr(m.lastOpenedAt),
     lastRefreshedAt: asStr(m.lastRefreshedAt),
     recipe: asStr(m.recipe),
+    mobile: m.mobile && typeof m.mobile === 'object' && !Array.isArray(m.mobile)
+      && typeof (m.mobile as { show?: unknown }).show === 'boolean'
+      ? { show: (m.mobile as { show: boolean }).show }
+      : undefined,
   };
   manifestErrors.push(...workspaceIdentityErrors(rec.dataSources, rec.actions));
   if (manifestErrors.length > 0) rec.manifestErrors = manifestErrors;
@@ -840,6 +860,7 @@ export interface SaveSpaceInput {
   originSessionId?: string;
   focusId?: number | null;
   recipe?: string;
+  mobile?: SpaceMobilePrefs;
 }
 
 export class SpaceStore {
@@ -918,6 +939,7 @@ export class SpaceStore {
       lastOpenedAt: existing?.lastOpenedAt,
       lastRefreshedAt: existing?.lastRefreshedAt,
       recipe: input.recipe ?? existing?.recipe,
+      mobile: input.mobile ?? existing?.mobile,
     };
     ensureDir(dir);
     atomicWrite(manifestPath(input.id), JSON.stringify(persistableRecord(record), null, 2));

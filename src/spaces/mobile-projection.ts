@@ -294,6 +294,27 @@ function findBreakdowns(data: unknown): MobileWorkspaceBreakdown[] {
   return out.slice(0, MAX_BREAKDOWNS);
 }
 
+/**
+ * Does this workspace belong on the phone?
+ *
+ * One rule, decided on the daemon so every surface agrees and it can be
+ * tested. Content decides by default — a workspace with nothing to show is
+ * a draft, and a real library is half drafts — but an explicit preference
+ * always wins, because "keep this one, it fills in on Monday" and "never
+ * show me this" are things only the owner knows.
+ */
+export function workspacePhonePresence(input: {
+  show?: boolean;
+  rows: number;
+  hasSummary: boolean;
+  lastRefreshedAt?: string | null;
+}): { onPhone: boolean; reason: 'pinned' | 'hidden' | 'has-content' | 'empty-draft' } {
+  if (input.show === true) return { onPhone: true, reason: 'pinned' };
+  if (input.show === false) return { onPhone: false, reason: 'hidden' };
+  if (input.rows > 0 || input.hasSummary) return { onPhone: true, reason: 'has-content' };
+  return { onPhone: false, reason: 'empty-draft' };
+}
+
 export function projectWorkspaceData(data: unknown): MobileWorkspaceProjection {
   // A summary the workspace wrote for itself always beats one we guessed.
   const authored = readAuthoredProjection(data);

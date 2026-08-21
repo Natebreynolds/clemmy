@@ -833,6 +833,19 @@ export interface WorkspaceSummary {
   /** How many records the phone would show. 0 = nothing to look at yet. */
   rows?: number;
   hasSummary?: boolean;
+  /** Whether this belongs on the phone, decided by the daemon. */
+  onPhone?: boolean;
+  presence?: 'pinned' | 'hidden' | 'has-content' | 'empty-draft';
+  /** The owner's explicit answer, when they gave one. */
+  showPreference?: boolean | null;
+}
+
+/** Keep a workspace on the phone, banish it, or (null) go back to automatic. */
+export async function setWorkspaceMobile(id: string, show: boolean | null): Promise<{ ok: true; showPreference: boolean | null }> {
+  return api(`/m/api/workspaces/${encodeURIComponent(id)}/mobile`, {
+    method: 'POST',
+    body: JSON.stringify(show === null ? {} : { show }),
+  });
 }
 
 export interface WorkspaceField { label: string; value: string }

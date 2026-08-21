@@ -2744,7 +2744,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     try {
       const { spaceStore } = await import('../spaces/store.js');
       const { readData } = await import('../spaces/data-store.js');
-      const { projectWorkspaceData } = await import('../spaces/mobile-projection.js');
+      const { projectWorkspaceData, workspacePhonePresence } = await import('../spaces/mobile-projection.js');
       const spaces = spaceStore.list().map((record) => {
         const health = spaceStore.health(record.id);
         // Whether there is anything to LOOK at, decided here rather than
@@ -2759,6 +2759,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           rows = projection.total;
           hasSummary = projection.headline.length > 0;
         } catch { /* unreadable data reads as empty, which is the truth */ }
+        const presence = workspacePhonePresence({
+          show: record.mobile?.show,
+          rows,
+          hasSummary,
+          lastRefreshedAt: record.lastRefreshedAt ?? null,
+        });
         return {
           id: record.id,
           title: record.title,
@@ -2771,6 +2777,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           counts: health?.counts ?? null,
           rows,
           hasSummary,
+          // Whether this belongs on the phone, and whether the answer came
+          // from the owner or from the content.
+          onPhone: presence.onPhone,
+          presence: presence.reason,
+          showPreference: record.mobile?.show ?? null,
         };
       });
       res.json({ workspaces: spaces });
@@ -2822,6 +2833,28 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         linkedWorkflows,
         projection: projectWorkspaceData(data),
       });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Keep or banish a workspace from the phone. The owner's answer, stored on
+   * the workspace itself, so it holds for every surface and survives a
+   * refresh rebuilding the data underneath it.
+   */
+  router.post('/api/workspaces/:id/mobile', requireMobileSession, async (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const raw = (req.body ?? {}) as { show?: unknown };
+    // null/absent clears the preference and returns the workspace to the
+    // automatic, content-decides rule.
+    const show = typeof raw.show === 'boolean' ? raw.show : undefined;
+    try {
+      const { spaceStore, isValidSpaceSlug } = await import('../spaces/store.js');
+      if (!isValidSpaceSlug(id)) { res.status(400).json({ error: 'INVALID_ID' }); return; }
+      const updated = spaceStore.update(id, { mobile: show === undefined ? undefined : { show } });
+      if (!updated) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+      res.json({ ok: true, showPreference: updated.mobile?.show ?? null });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
