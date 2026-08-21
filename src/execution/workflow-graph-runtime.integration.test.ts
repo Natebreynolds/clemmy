@@ -666,8 +666,12 @@ test('Platform-49-derived scan pages 500 opaque records, finds a final-page delt
   let specialistStarts = 0;
   let conversationCalls = 0;
   let releaseSpecialists = (): void => {};
-  const bothStarted = new Promise<void>((resolve) => { releaseSpecialists = resolve; });
-  const fallback = setTimeout(releaseSpecialists, 1_000);
+  let rejectSpecialists = (_error: Error): void => {};
+  let specialistBarrierTimeout: ReturnType<typeof setTimeout> | undefined;
+  const bothStarted = new Promise<void>((resolve, reject) => {
+    releaseSpecialists = resolve;
+    rejectSpecialists = reject;
+  });
   const pagedOffsets: number[] = [];
   const specialistPrompts: string[] = [];
   const reducerPrompts: string[] = [];
@@ -704,7 +708,15 @@ test('Platform-49-derived scan pages 500 opaque records, finds a final-page delt
         activeSpecialists += 1;
         specialistStarts += 1;
         maxActiveSpecialists = Math.max(maxActiveSpecialists, activeSpecialists);
-        if (specialistStarts === 2) releaseSpecialists();
+        if (specialistStarts === 1) {
+          specialistBarrierTimeout = setTimeout(() => {
+            rejectSpecialists(new Error('timed out waiting for both scan specialists to enter the scheduler wave'));
+          }, 30_000);
+        }
+        if (specialistStarts === 2) {
+          clearTimeout(specialistBarrierTimeout);
+          releaseSpecialists();
+        }
         await bothStarted;
 
         let summary: string;
@@ -781,7 +793,7 @@ test('Platform-49-derived scan pages 500 opaque records, finds a final-page delt
     await processWorkflowRuns({ respond: async () => ({ text: 'legacy path must not run' }) } as never);
     assert.equal(conversationCalls, callsAfterCompletion, 'a completed recurring run is an exact no-op on the next poll');
   } finally {
-    clearTimeout(fallback);
+    clearTimeout(specialistBarrierTimeout);
     _setWorkflowHarnessLoopImplsForTests();
   }
 
