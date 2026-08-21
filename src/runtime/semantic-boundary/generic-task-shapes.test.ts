@@ -32,6 +32,7 @@ const {
 const { catalogEntriesForAcceptedSource } = await import('../harness/indexed-capability-catalog.js');
 const { synthesizeCollectionReadOperations, synthesizeConstructOperations } = await import('./host-bind-operations.js');
 const { compileProofProviderArgs } = await import('../harness/proof-provider-args.js');
+const { advisoryRolesForProofEntry } = await import('../harness/proof-provisioned-catalog.js');
 const { admitAndCompileAcceptedSource } = await import('./admit-and-compile-accepted-source.js');
 const { dispatchAdmittedSource } = await import('./typed-source-dispatch.js');
 const { installTurnSemanticModelPort } = await import('./turn-semantic-port-registry.js');
@@ -372,6 +373,134 @@ test('a repair interpret names the exact attested contract when unique bind miss
   assert.equal(dispatched.kind, 'typed', JSON.stringify(dispatched).slice(0, 400));
   if (dispatched.kind !== 'typed') return;
   assert.equal(dispatched.result.status, 'success', dispatched.result.error);
+});
+
+test('a named contract that grounding does not entail still gets one repair interpret', async () => {
+  clearProductionCapabilityPorts();
+  clearIndependentCapabilityObservations();
+  resetCatalog();
+  configureTypedExecutionRuntime();
+  rememberToolSchema(COLLECT_SLUG, READ_SCHEMA);
+  registerAttested({
+    slug: COLLECT_SLUG,
+    effect: 'read',
+    roles: ['collection'],
+    invoke: async () => ({ records: ROWS }),
+  });
+  const collect = peekHostCapabilityCatalogFactory()?.get(COLLECT_ID);
+  assert.ok(collect?.manifest);
+  peekCapabilityManifestStore()?.install(collect.manifest);
+  registerShippedTestPort(collect.manifest);
+  installIsolatedAttestedTransport(async (call) => {
+    assert.equal(call.operationId, COLLECT_SLUG);
+    return { records: ROWS };
+  });
+  let interpretCalls = 0;
+  let groundingCalls = 0;
+  installTurnSemanticModelPort({
+    async interpret(call) {
+      interpretCalls += 1;
+      return {
+        raw: fakeSemanticProposal({
+          relation: 'new_goal',
+          goal: {
+            objective: OBJECTIVE,
+            criteria: [{ id: 'c-set', statement: 'Four requested records are returned.' }],
+            openSlots: [],
+            candidates: [],
+          },
+          work: {
+            construct: 'single_act',
+            cardinality: { count: 4, fields: ['id'] },
+            destination: null,
+            requestedEffect: 'read',
+            operations: [{
+              id: 'op-collect',
+              role: 'collection',
+              requestedEffect: 'read',
+              capabilityRef: COLLECT_ID,
+              dependsOn: [],
+              evidence: ['collection'],
+            }],
+            deliverables: [{ id: 'result', kind: 'records' }],
+            evidenceRequirements: ['collection'],
+          },
+        }, call.host),
+        modelIdentity: 'fake-semantic/ground-repair',
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+      };
+    },
+    async judgeSourceEffect(call) {
+      return entailedSourceEffectJudge(call, 'fake-semantic/ground-repair-judge');
+    },
+    async judgePlanGrounding(call) {
+      groundingCalls += 1;
+      if (groundingCalls === 1) {
+        return {
+          verdict: 'uncertain',
+          operations: call.dag.operations.map((operation) => ({
+            operationId: operation.id,
+            verdict: 'uncertain' as const,
+            rationale: 'Role fit is sound: the named contract produces records.',
+          })),
+          modelIdentity: 'fake-semantic/ground-repair',
+          inputTokens: 1,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
+      }
+      return entailedPlanGroundingJudge(call, 'fake-semantic/ground-repair');
+    },
+  });
+  const identity = freshSource(OBJECTIVE);
+  recordAdmissionCapabilityResolution({
+    sessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+    acceptedInput: OBJECTIVE,
+    entries: [{
+      intent: 'collect',
+      kind: 'composio',
+      identifier: COLLECT_SLUG,
+      status: 'proven',
+      connection: 'active',
+      effectClass: 'read',
+    }],
+  });
+  const admitted = await admitAndCompileAcceptedSource({ identity, surface: 'direct' });
+  assert.equal(admitted.ok, true, JSON.stringify(admitted).slice(0, 300));
+  assert.equal(interpretCalls, 2, 'grounding miss must ask the model to name the attested contract again');
+  assert.equal(groundingCalls, 2);
+  if (!admitted.ok) return;
+  const dispatched = await dispatchAdmittedSource(identity);
+  assert.equal(dispatched.kind, 'typed', JSON.stringify(dispatched).slice(0, 400));
+  if (dispatched.kind !== 'typed') return;
+  assert.equal(dispatched.result.status, 'success', dispatched.result.error);
+});
+
+test('a sibling write in the same toolkit does not collapse reads to readback-only', () => {
+  const listRoles = advisoryRolesForProofEntry({
+    effect: 'read',
+    schema: {
+      type: 'object',
+      required: ['q'],
+      properties: { q: { type: 'string' }, limit: { type: 'integer' } },
+    },
+    siblingWriteInToolkit: true,
+  });
+  assert.ok(listRoles.includes('collection'), JSON.stringify(listRoles));
+  assert.ok(listRoles.includes('lookup'), JSON.stringify(listRoles));
+  const writeRoles = advisoryRolesForProofEntry({
+    effect: 'external_write',
+    schema: {
+      type: 'object',
+      required: ['body'],
+      properties: { body: { type: 'string' } },
+    },
+    siblingWriteInToolkit: true,
+  });
+  assert.deepEqual(writeRoles, ['create', 'destination']);
 });
 
 test('bounded collection read compiles exact operations and stays off conversation', async () => {

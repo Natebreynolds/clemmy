@@ -63,6 +63,49 @@ function toolkitOf(slug: string): string {
   return slug.split('_')[0]?.toLowerCase() ?? '';
 }
 
+function schemaKeys(schema: Record<string, unknown>): { required: string[]; properties: string[] } {
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((key): key is string => typeof key === 'string')
+    : [];
+  const properties = isRecord(schema.properties) ? Object.keys(schema.properties) : [];
+  return { required, properties };
+}
+
+function looksLikeIdentifier(key: string): boolean {
+  return /(?:^id$|_id$|id$|uri$|url$|handle$|ref$)/i.test(key);
+}
+
+function looksLikePage(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  return /^(limit|count|page|offset|cursor|top|skip|max_results|page_size|pagesize)$/.test(normalized);
+}
+
+/**
+ * Structural roles from the frozen schema. A sibling write in the same
+ * toolkit does not collapse every read to readback — that made unique
+ * retrieve bind miss every connected mailbox/calendar (live 2026-08-21).
+ */
+export function advisoryRolesForProofEntry(input: {
+  effect: 'read' | 'external_write';
+  schema: Record<string, unknown>;
+  siblingWriteInToolkit: boolean;
+}): string[] {
+  if (input.effect === 'external_write') return ['create', 'destination'];
+  const { required, properties } = schemaKeys(input.schema);
+  const keys = [...required, ...properties];
+  const pageShaped = keys.some(looksLikePage);
+  const idRequired = required.some(looksLikeIdentifier);
+  const roles: string[] = [];
+  if (pageShaped || !idRequired) {
+    roles.push('source', 'collection', 'collect');
+  }
+  roles.push('lookup');
+  if (input.siblingWriteInToolkit || idRequired) {
+    roles.push('readback');
+  }
+  return [...new Set(roles)];
+}
+
 export interface ProofProvisionResult {
   registered: string[];
 }
@@ -103,14 +146,14 @@ export async function registerProofProvisionedCapabilities(identity: {
       if (!isRecord(schema)) continue; // no frozen schema → no compiler → fail closed
       const effect: BoundNodeCapability['effect'] = entry.effectClass === 'write' ? 'external_write' : 'read';
       const family = toolkitOf(slug);
-      const advisoryRoles = effect === 'external_write'
-        ? ['create', 'destination']
-        : writeToolkits.has(family)
-          ? ['readback']
-          : ['source', 'collection', 'collect', 'lookup'];
+      const write = effect === 'external_write';
+      const advisoryRoles = advisoryRolesForProofEntry({
+        effect: write ? 'external_write' : 'read',
+        schema,
+        siblingWriteInToolkit: writeToolkits.has(family),
+      });
       const schemaDigest = sha256(JSON.stringify(schema));
       const accountId = entry.accountIdentity?.trim() || 'runtime';
-      const write = effect === 'external_write';
       const manifest: CapabilityManifestV1 = attachSemanticContract({
         version: 1,
         manifestId: capabilityId,
@@ -146,14 +189,18 @@ export async function registerProofProvisionedCapabilities(identity: {
         // destination family so a family-named deliverable stays admissible.
         acceptedInputKinds: write
           ? ['evidence', 'records']
-          : advisoryRoles.includes('readback')
-            ? ['evidence', 'created_resource']
-            : ['evidence'],
+          : (advisoryRoles.includes('collection') || advisoryRoles.includes('source') || advisoryRoles.includes('lookup'))
+            ? ['evidence']
+            : advisoryRoles.includes('readback')
+              ? ['evidence', 'created_resource']
+              : ['evidence'],
         producedOutputKinds: write
           ? ['evidence', 'created_resource']
-          : advisoryRoles.includes('readback')
-            ? ['evidence', 'locator']
-            : ['evidence', 'records'],
+          : (advisoryRoles.includes('collection') || advisoryRoles.includes('source') || advisoryRoles.includes('lookup'))
+            ? ['evidence', 'records']
+            : advisoryRoles.includes('readback')
+              ? ['evidence', 'locator']
+              : ['evidence', 'records'],
         applicableDeliverableKinds: write ? ['evidence', family] : ['evidence'],
       });
       const installed = store.install(manifest);

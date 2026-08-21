@@ -268,7 +268,7 @@ test('executable operations with a missing or empty catalog are blocked', () => 
   assert.equal(replay?.code, 'capability_catalog_empty');
 });
 
-test('top-level conflict with all operation verdicts entailed is blocked', () => {
+test('host overall follows operation verdicts, not a conflicting top-level label', () => {
   const descriptors = productionDescriptors();
   const operations = [
     { id: 'op-source', role: 'source', requestedEffect: 'read', capabilityRef: 'cap:host_lookup:source', dependsOn: [], evidence: ['payload'] },
@@ -288,9 +288,9 @@ test('top-level conflict with all operation verdicts entailed is blocked', () =>
     shownDescriptorDigest: shownDigest(descriptors, ['cap:host_lookup:source']),
     proposalDigest: sha256('proposal'),
   });
-  assert.equal(bound.ok, false);
-  if (bound.ok) return;
-  assert.equal(bound.issue.code, 'grounding_verdict_inconsistent');
+  assert.equal(bound.ok, true);
+  if (!bound.ok) return;
+  assert.equal(bound.receipt.overallVerdict, 'entailed');
 });
 
 test('grounding receipt or catalog/proposal digest tampering fails replay', () => {

@@ -297,23 +297,16 @@ export function bindPlanGroundingReceipt(input: {
       rationale: judged.rationale,
     });
   }
-  const derived = derivedPlanGroundingOverall(bound);
-  if (input.judged.verdict !== derived) {
-    return {
-      ok: false,
-      issue: {
-        code: 'grounding_verdict_inconsistent',
-        path: 'grounding.verdict',
-        message: 'grounding overall verdict is inconsistent with operation verdicts',
-      },
-    };
-  }
+  // Host owns overall. Per-operation verdicts are the only model-owned
+  // grounding bytes; a chatty top-level "conflict" beside entailed ops
+  // (live 2026-08-21 team-summary) is not authority.
+  const overallVerdict = derivedPlanGroundingOverall(bound);
   const withoutDigest = {
     modelIdentity: input.judged.modelIdentity,
     catalogSnapshotDigest: input.catalogSnapshotDigest,
     shownDescriptorDigest: input.shownDescriptorDigest,
     proposalDigest: input.proposalDigest,
-    overallVerdict: input.judged.verdict,
+    overallVerdict,
     operations: bound,
     inputTokens: input.judged.inputTokens,
     outputTokens: input.judged.outputTokens,

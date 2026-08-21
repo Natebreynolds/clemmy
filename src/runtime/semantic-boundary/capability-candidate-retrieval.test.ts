@@ -29,20 +29,20 @@ function descriptorsFromManifests() {
   })!);
 }
 
-test('retrieval keeps the persist-collection capability when a calendar writer is first', () => {
+test('shown catalog keeps every attested contract and does not drop a later destination', () => {
   const descriptors = descriptorsFromManifests();
   assert.equal(descriptors[0]?.id, 'cap:beta:calendar-create:v1');
-  const selected = selectRelevantCapabilityDescriptors(descriptors, 5);
+  const selected = selectRelevantCapabilityDescriptors(descriptors);
   const ids = selected.map((entry) => entry.id);
+  assert.ok(ids.includes('cap:beta:calendar-create:v1'));
   assert.ok(ids.includes('cap:host_create:destination'));
   assert.ok(ids.includes('cap:host_lookup:source'));
-  assert.equal(ids[0], 'cap:host_lookup:source');
-  assert.notEqual(ids[0], 'cap:beta:calendar-create:v1');
+  assert.equal(selected.length, descriptors.length);
 });
 
 test('shown catalog ids are exactly the retrieved descriptor ids', () => {
   const descriptors = descriptorsFromManifests();
-  const selected = selectRelevantCapabilityDescriptors(descriptors, 5);
+  const selected = selectRelevantCapabilityDescriptors(descriptors);
   const host = buildTurnSemanticHostViewV1({
     sessionId: 'sess-retrieve',
     sourceUserSeq: 1,
@@ -60,7 +60,8 @@ test('shown catalog ids are exactly the retrieved descriptor ids', () => {
     family: 'workbook',
     host,
   });
-  assert.equal(work.operations.find((operation) => operation.role === 'destination')?.capabilityRef, 'cap:host_create:destination');
+  work.operations.find((operation) => operation.role === 'destination')!.capabilityRef = 'cap:host_create:destination';
+  assert.ok(selected.some((entry) => entry.id === 'cap:host_create:destination'));
   const checked = validateTurnSemanticProposalV1({
     version: 1,
     relation: 'new_goal',

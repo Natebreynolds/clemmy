@@ -1134,7 +1134,17 @@ async function interpretOnce(input: {
       || admitted.clamped.route === 'retrieve'
       || admitted.clamped.route === 'act'
     );
-  if (genuineConflict || unboundTypedWork) {
+  const repairableGrounding = !admitted.ok && Boolean(validationIssue?.code) && (
+    validationIssue?.code === 'capability_not_grounded'
+    || validationIssue?.code === 'capability_grounding_failed'
+    || validationIssue?.code === 'capability_grounding_unavailable'
+    || validationIssue?.code === 'grounding_verdict_inconsistent'
+    || validationIssue?.code === 'unknown_capability_ref'
+    || validationIssue?.code === 'missing_capability_ref'
+    || validationIssue?.code === 'capability_catalog_empty'
+    || validationIssue?.code === 'grounding_coverage_mismatch'
+  );
+  if (genuineConflict || unboundTypedWork || repairableGrounding) {
     repairAttempted = true;
     try {
       const repaired = await input.port.interpret({
