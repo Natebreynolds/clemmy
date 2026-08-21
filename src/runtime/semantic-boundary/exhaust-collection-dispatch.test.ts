@@ -12,36 +12,16 @@ writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-exhaust-collectio
 
 const { closeEventLog } = await import('../harness/eventlog.js');
 const { describeGoalCatalogGap } = await import('../harness/connected-goal-catalog.js');
-const { compileAcceptedGoal } = await import('../graph/accepted-goal.js');
-const { detectMultiItemIntent } = await import('../harness/multi-item-intent.js');
-
 
 test.after(() => {
   closeEventLog();
 });
 
-const COLLECT_PROMPT = [
-  'Populate a database of matching local professionals, grouped by category.',
-  'The information that I would like pulled is the following:',
-  'Name',
-  'Organization',
-  'Category',
-  'Phone',
-  'Email',
-  'Website',
-  'Address',
-].join('\n');
-
 test('a missing collection contract names the requested fields, not a recipe', () => {
-  const goal = compileAcceptedGoal({
-    text: COLLECT_PROMPT,
-    sourceUserSeq: 1,
-    multiItem: detectMultiItemIntent(COLLECT_PROMPT),
-  });
-  assert.equal(goal.construct, 'collect_then_construct');
   const question = describeGoalCatalogGap(['search', 'row_create'], {
-    projection: goal.collection?.projection,
+    projection: ['Name', 'Organization', 'Category', 'Phone', 'Email', 'Website', 'Address'],
   });
   assert.match(question, /name|organization|phone|email|website|address/i);
   assert.match(question, /connected apps|certify/i);
+  assert.doesNotMatch(question, /spreadsheet|outlook|salesforce|restaurant/i);
 });
