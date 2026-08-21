@@ -526,7 +526,7 @@ test('workflow step route preserves BYO identity for a gpt-shaped model on the h
     addWorkflowRouteMarker(home, 'workflow:run-2:write', 'turn_model_routed', {
       provider: 'byo',
       model: 'gpt-shaped-private-model',
-      transport: 'openai_agents_harness',
+      transport: 'host_harness',
     }, 'byo');
     const byoExpected: ProofModelExpectation = {
       modelId: 'gpt-shaped-private-model', provider: 'byo', source: 'role-binding',

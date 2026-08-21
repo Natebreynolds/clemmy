@@ -75,7 +75,13 @@ export type EffectPhase =
   /** Refused before dispatch — never counts against idempotency. */
   | 'refused'
   /** Reservation released without dispatch (e.g. the call could not exist). */
-  | 'released';
+  | 'released'
+  /** Provider-proven cancellation of an accepted effect. */
+  | 'cancelled'
+  /** The write stands; the task was cancelled and must not grow. */
+  | 'completed_after_cancel'
+  /** Dispatch started, no receipt, cancel requested — observe, never redispatch. */
+  | 'uncertain_after_cancel';
 
 export interface EffectLedgerRow {
   effectId: string;
@@ -106,13 +112,35 @@ export function validateEffectTransition(
       ? { ok: true }
       : { ok: false, reason: `an effect begins at reserved or refused, not ${to}` };
   }
-  if (from === 'refused' || from === 'released' || from === 'checkpointed') {
+  if (
+    from === 'refused'
+    || from === 'released'
+    || from === 'checkpointed'
+    || from === 'cancelled'
+    || from === 'completed_after_cancel'
+    || from === 'uncertain_after_cancel'
+  ) {
     return { ok: false, reason: `${from} is terminal; nothing follows it` };
   }
   if (to === 'released') {
     return from === 'reserved'
       ? { ok: true }
       : { ok: false, reason: `only an undispatched reservation can be released; this effect is ${from}` };
+  }
+  if (to === 'uncertain_after_cancel') {
+    return from === 'dispatch_started'
+      ? { ok: true }
+      : { ok: false, reason: `uncertain_after_cancel is only the abort of an unreceipted dispatch; this effect is ${from}` };
+  }
+  if (to === 'cancelled') {
+    return from === 'provider_receipt' || from === 'observed' || from === 'committed'
+      ? { ok: true }
+      : { ok: false, reason: `provider-proven cancel requires an accepted effect; this effect is ${from}` };
+  }
+  if (to === 'completed_after_cancel') {
+    return from === 'provider_receipt' || from === 'observed' || from === 'committed'
+      ? { ok: true }
+      : { ok: false, reason: `completed_after_cancel requires a proven write; this effect is ${from}` };
   }
   const fromIndex = FORWARD.indexOf(from);
   const toIndex = FORWARD.indexOf(to);
@@ -145,7 +173,18 @@ export type EffectResumeDecision =
  * to dispatch, which is the structural difference between this and a prompt
  * asking recovery to be careful.
  */
-export function decideEffectResume(rows: readonly EffectLedgerRow[]): EffectResumeDecision {
+export function decideEffectResume(
+  rows: readonly EffectLedgerRow[],
+  options?: { cancelRequested?: boolean },
+): EffectResumeDecision {
+  const decision = decideEffectResumeUncancelled(rows);
+  if (options?.cancelRequested && decision.action === 'dispatch') {
+    return { action: 'stop', reason: 'cancel_requested: new dispatch is suppressed' };
+  }
+  return decision;
+}
+
+function decideEffectResumeUncancelled(rows: readonly EffectLedgerRow[]): EffectResumeDecision {
   if (rows.length === 0) return { action: 'dispatch' };
 
   // Validate the chain; an unlawful ledger is a stop, not a guess.
@@ -165,6 +204,7 @@ export function decideEffectResume(rows: readonly EffectLedgerRow[]): EffectResu
       // Reserved but never started: the reservation is this attempt's to use.
       return { action: 'dispatch' };
     case 'dispatch_started':
+    case 'uncertain_after_cancel':
       return {
         action: 'observe',
         reason: 'dispatch started with no provider receipt — the write may or may not exist; only observation can say',
@@ -178,10 +218,131 @@ export function decideEffectResume(rows: readonly EffectLedgerRow[]): EffectResu
     case 'observed':
     case 'committed':
     case 'checkpointed':
+    case 'cancelled':
+    case 'completed_after_cancel':
       return { action: 'settled', phase };
     default:
       return { action: 'stop', reason: `unrecognized ledger phase ${String(phase)}` };
   }
+}
+
+/**
+ * Phase-aware cancellation. The type has no `dispatch` arm: a cancelled
+ * effect cannot grow descendants or be retried. Late evidence uses
+ * `decideLateEvidenceAfterCancel`, which is audit-only.
+ */
+export type EffectCancelDecision =
+  | { report: 'cancelled'; action: 'release' }
+  | { report: 'cancelled'; action: 'cancel_provider' }
+  | { report: 'completed_after_cancel'; action: 'keep'; receiptRef?: string }
+  | { report: 'uncertain_after_cancel'; action: 'observe'; reason: string };
+
+export function decideEffectCancel(input: {
+  rows: readonly EffectLedgerRow[];
+  /** The provider's cancel contract proved the accepted write was undone. */
+  providerCancelProven?: boolean;
+}): EffectCancelDecision {
+  const resume = decideEffectResumeUncancelled(input.rows);
+  if (resume.action === 'dispatch') return { report: 'cancelled', action: 'release' };
+  if (resume.action === 'observe') {
+    return {
+      report: 'uncertain_after_cancel',
+      action: 'observe',
+      reason: resume.reason,
+    };
+  }
+  const receiptRef = resume.action === 'complete_commit'
+    ? resume.receiptRef
+    : [...input.rows].reverse().find((row) => row.ref)?.ref;
+  if (input.providerCancelProven) return { report: 'cancelled', action: 'cancel_provider' };
+  return { report: 'completed_after_cancel', action: 'keep', ...(receiptRef ? { receiptRef } : {}) };
+}
+
+/** Late callbacks may append exact audit evidence. They cannot redispatch or
+ *  reopen a cancelled effect. The decision type has no dispatch arm. */
+export function decideLateEvidenceAfterCancel(): {
+  action: 'audit_only';
+  mayRedispatch: false;
+  mayReactivate: false;
+} {
+  return { action: 'audit_only', mayRedispatch: false, mayReactivate: false };
+}
+
+// ── per-item batch resume (exactly-once finishing) ───────────────────────────
+
+export interface BatchItemLedger {
+  itemId: string;
+  rows: readonly EffectLedgerRow[];
+}
+
+export interface BatchResumePlan {
+  /** First dispatch only. Never a retry of a started or settled item. */
+  dispatch: string[];
+  /** Started with no receipt — observe, never redispatch. */
+  observe: string[];
+  /** Receipt in hand, local commit missing. */
+  completeCommit: Array<{ itemId: string; receiptRef: string }>;
+  /** Fully settled. Replay is free. */
+  settled: string[];
+  /** Unlawful or cancelled-suppressed. */
+  stop: Array<{ itemId: string; reason: string }>;
+}
+
+/**
+ * Per-item reconcile-before-redispatch. Each item is its own effect identity.
+ * The plan's `dispatch` list is structurally disjoint from observe / commit /
+ * settled / stop — a started write cannot appear there.
+ */
+export function decideBatchResume(
+  items: readonly BatchItemLedger[],
+  options?: { cancelRequested?: boolean },
+): BatchResumePlan {
+  const plan: BatchResumePlan = {
+    dispatch: [],
+    observe: [],
+    completeCommit: [],
+    settled: [],
+    stop: [],
+  };
+  const seen = new Set<string>();
+  for (const item of items) {
+    if (!item.itemId || seen.has(item.itemId)) {
+      plan.dispatch = plan.dispatch.filter((id) => id !== item.itemId);
+      plan.stop.push({ itemId: item.itemId || '(blank)', reason: 'duplicate or blank item identity' });
+      continue;
+    }
+    seen.add(item.itemId);
+    const decision = decideEffectResume(item.rows, options);
+    switch (decision.action) {
+      case 'dispatch':
+        plan.dispatch.push(item.itemId);
+        break;
+      case 'observe':
+        plan.observe.push(item.itemId);
+        break;
+      case 'complete_commit':
+        plan.completeCommit.push({ itemId: item.itemId, receiptRef: decision.receiptRef });
+        break;
+      case 'settled':
+        plan.settled.push(item.itemId);
+        break;
+      case 'stop':
+        plan.stop.push({ itemId: item.itemId, reason: decision.reason });
+        break;
+    }
+  }
+  return plan;
+}
+
+/** True if the plan would redispatch work that already started or settled. */
+export function batchPlanRedispatchesSettledWork(plan: BatchResumePlan): boolean {
+  const forbidden = new Set<string>([
+    ...plan.observe,
+    ...plan.completeCommit.map((entry) => entry.itemId),
+    ...plan.settled,
+    ...plan.stop.map((entry) => entry.itemId),
+  ]);
+  return plan.dispatch.some((itemId) => forbidden.has(itemId));
 }
 
 // ── approvals bind digests, not descriptions ─────────────────────────────────

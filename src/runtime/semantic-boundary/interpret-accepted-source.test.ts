@@ -1,0 +1,853 @@
+/** Run: npx tsx --test src/runtime/semantic-boundary/interpret-accepted-source.test.ts */
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { createHash } from 'node:crypto';
+
+const HOME = '/tmp/clem-semantic-interpret-test';
+process.env.CLEMENTINE_HOME = HOME;
+
+const { appendEvent, createSession, openEventLog, resetEventLog } = await import('../harness/eventlog.js');
+const { interpretAcceptedSource, readClaimLinkedSemanticInterpretation } = await import('./interpret-accepted-source.js');
+const { entailedPlanGroundingJudge, fakeSemanticProposal } = await import('./fake-semantic-model.js');
+const { buildTurnSemanticHostViewV1 } = await import('./build-semantic-host-view.js');
+const { productionCapabilityManifests } = await import('../harness/production-capability-catalog.js');
+const { capabilityManifestDigest } = await import('../harness/capability-manifest.js');
+const { hostDescriptorFromRegistered } = await import('./admit-and-compile-accepted-source.js');
+const { catalogSnapshotDigestFromDescriptors } = await import('./plan-grounding.js');
+import type { TurnSemanticModelPort } from './turn-semantic-model-port.js';
+import type { HostSemanticAuthorityV1 } from './admit-turn-semantics.js';
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function authority(host: { policyRevision: string; source: { audienceHash: string } }): HostSemanticAuthorityV1 {
+  return {
+    policyRevision: host.policyRevision,
+    audienceHash: host.source.audienceHash,
+    policyMaxCeiling: 'external_write',
+    allowedEffects: ['none', 'read', 'compute', 'host_only', 'unknown', 'local_write', 'external_write'],
+  };
+}
+
+const AUDIENCE = {
+  audienceKey: 'aud-1',
+  userId: 'user-1',
+  conversationKey: 'conv-1',
+} as const;
+
+function productionDescriptors() {
+  return productionCapabilityManifests().map((manifest) => {
+    const digest = capabilityManifestDigest(manifest);
+    return hostDescriptorFromRegistered({
+      capabilityId: manifest.manifestId,
+      toolName: manifest.operationId,
+      schemaVersion: manifest.operationVersion,
+      schemaDigest: manifest.definitionFingerprint,
+      effect: manifest.effect,
+      destination: manifest.destination,
+      account: manifest.accountId,
+      advisoryRoles: manifest.advisoryRoles,
+      manifestDigest: digest,
+      providerKind: manifest.providerKind,
+      liveFingerprint: manifest.definitionFingerprint,
+      manifest,
+      invoke: async () => ({}),
+    })!;
+  });
+}
+
+function constructCatalog() {
+  const capabilities = productionDescriptors();
+  return {
+    capabilities,
+    catalogSnapshotDigest: catalogSnapshotDigestFromDescriptors(capabilities),
+  };
+}
+
+function fakePort(calls: unknown[]): TurnSemanticModelPort {
+  return {
+    async interpret(call) {
+      calls.push(call.purpose);
+      const host = call.host;
+      return {
+        raw: fakeSemanticProposal('newConstruct', host),
+        modelIdentity: 'fake-semantic/test',
+        inputTokens: 12,
+        outputTokens: 34,
+        latencyMs: 5,
+      };
+    },
+    async judgeSourceEffect(call) {
+      return {
+        verdict: 'entailed',
+        effect: call.proposedEffect,
+        destinationPosture: call.proposedDestinationPosture,
+        proposalDigest: call.proposalDigest,
+        modelIdentity: 'fake-semantic/judge',
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+      };
+    },
+    async judgePlanGrounding(call) {
+      return entailedPlanGroundingJudge(call, 'fake-semantic/grounding');
+    },
+  };
+}
+
+test('one semantic call per source and exact replay reuses it', async () => {
+  resetEventLog();
+  const sessionId = 'sess-semantic-1';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const calls: unknown[] = [];
+  const first = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: fakePort(calls),
+    turn: 1,
+  });
+  const second = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: fakePort(calls),
+    turn: 1,
+  });
+  assert.equal(first.status, 'admitted');
+  assert.equal(second.status, 'admitted');
+  assert.equal(first.replayed, false);
+  assert.equal(second.replayed, true);
+  assert.equal(calls.length, 1);
+  if (first.status === 'admitted' && second.status === 'admitted') {
+    assert.equal(first.record.payloadHash, second.record.payloadHash);
+    assert.equal(first.record.purpose, 'turn_semantics');
+    assert.equal(first.record.modelIdentity, 'fake-semantic/test');
+  }
+});
+
+test('model failure keeps an open question instead of regex fallback', async () => {
+  resetEventLog();
+  const sessionId = 'sess-semantic-2';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 2,
+    acceptedText: 'maybe',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    resumableGoals: [{ goalId: 'goal-17', baseRevision: 4 }],
+    openQuestions: [{
+      questionId: 'question-3',
+      goalId: 'goal-17',
+      goalRevision: 4,
+      slotKey: 'resource-choice',
+      question: 'Which host should I use?',
+      options: [{ optionId: 'choice-a', label: 'Acme.io' }],
+      allowFreeText: false,
+    }],
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const failing: TurnSemanticModelPort = {
+    async interpret() {
+      throw new Error('model down');
+    },
+  };
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: failing,
+    turn: 1,
+  });
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.record.validationOutcome, 'model_failed');
+});
+
+test('concurrent interpretation produces one model call', async () => {
+  resetEventLog();
+  const sessionId = 'sess-semantic-3';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 3,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const calls: unknown[] = [];
+  const port = fakePort(calls);
+  const [a, b] = await Promise.all([
+    interpretAcceptedSource({ snapshot, authority: authority(host), port, turn: 1 }),
+    interpretAcceptedSource({ snapshot, authority: authority(host), port, turn: 1 }),
+  ]);
+  assert.equal(calls.length, 1);
+  assert.equal(a.status, 'admitted');
+  assert.equal(b.status, 'admitted');
+});
+
+test('replay fail-closes unless the complete persisted judge binding is exact', async () => {
+  const cases = [
+    {
+      name: 'source write decision',
+      mutate(identity: string, result: {
+        verdict: 'entailed' | 'conflict' | 'uncertain';
+        effect: string;
+        destinationPosture: 'create_new' | 'named_existing' | null;
+        proposalDigest: string;
+      }) {
+        const changed = { ...result, verdict: 'conflict' as const };
+        return { identity, result: changed, digest: judgeDigest(identity, changed) };
+      },
+    },
+    {
+      name: 'effect',
+      mutate(identity: string, result: {
+        verdict: 'entailed' | 'conflict' | 'uncertain';
+        effect: string;
+        destinationPosture: 'create_new' | 'named_existing' | null;
+        proposalDigest: string;
+      }) {
+        const changed = { ...result, effect: 'local_write' };
+        return { identity, result: changed, digest: judgeDigest(identity, changed) };
+      },
+    },
+    {
+      name: 'destination',
+      mutate(identity: string, result: {
+        verdict: 'entailed' | 'conflict' | 'uncertain';
+        effect: string;
+        destinationPosture: 'create_new' | 'named_existing' | null;
+        proposalDigest: string;
+      }) {
+        const changed = {
+          ...result,
+          destinationPosture: 'named_existing' as const,
+        };
+        return { identity, result: changed, digest: judgeDigest(identity, changed) };
+      },
+    },
+    {
+      name: 'digest',
+      mutate(identity: string, result: {
+        verdict: 'entailed' | 'conflict' | 'uncertain';
+        effect: string;
+        destinationPosture: 'create_new' | 'named_existing' | null;
+        proposalDigest: string;
+      }) {
+        return { identity, result, digest: '0'.repeat(64) };
+      },
+    },
+    {
+      name: 'identity',
+      mutate(_identity: string, result: {
+        verdict: 'entailed' | 'conflict' | 'uncertain';
+        effect: string;
+        destinationPosture: 'create_new' | 'named_existing' | null;
+        proposalDigest: string;
+      }) {
+        return { identity: 'forged-judge', result, digest: '0'.repeat(64) };
+      },
+    },
+  ] as const;
+
+  for (const [index, scenario] of cases.entries()) {
+    resetEventLog();
+    const sessionId = `sess-judge-replay-${index}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const snapshot = {
+      sessionId,
+      sourceUserSeq: 1,
+      acceptedText: 'find five widgets and put them in a workbook',
+      policyRevision: sha256('policy'),
+      ...AUDIENCE,
+      ...constructCatalog(),
+    };
+    const host = buildTurnSemanticHostViewV1(snapshot);
+    const calls: unknown[] = [];
+    const first = await interpretAcceptedSource({
+      snapshot,
+      authority: authority(host),
+      port: fakePort(calls),
+      turn: 1,
+    });
+    assert.equal(first.status, 'admitted', scenario.name);
+    if (first.status !== 'admitted') continue;
+    assert.ok(first.record.judgeIdentity, scenario.name);
+    assert.ok(first.record.judgeResult, scenario.name);
+    const mutation = scenario.mutate(first.record.judgeIdentity!, first.record.judgeResult!);
+    const linked = readClaimLinkedSemanticInterpretation(sessionId, 1);
+    assert.ok(linked, scenario.name);
+    openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?').run(
+      JSON.stringify({
+        ...first.record,
+        judgeIdentity: mutation.identity,
+        judgeResult: mutation.result,
+        judgeDigest: mutation.digest,
+      }),
+      linked!.eventId,
+    );
+    const replay = await interpretAcceptedSource({
+      snapshot,
+      authority: authority(host),
+      port: fakePort(calls),
+      turn: 1,
+    });
+    assert.equal(replay.status, 'blocked', scenario.name);
+    assert.equal(replay.replayed, true, scenario.name);
+    assert.equal(calls.length, 1, scenario.name);
+  }
+});
+
+test('unclaimed forged admitted event cannot be replayed', async () => {
+  resetEventLog();
+  const sessionId = 'sess-unclaimed-forge';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'turn_semantics_interpreted',
+    data: {
+      purpose: 'turn_semantics',
+      sourceUserSeq: 1,
+      inputHash: host.source.inputHash,
+      audienceHash: host.source.audienceHash,
+      policyRevision: host.policyRevision,
+      payloadHash: 'a'.repeat(64),
+      contextHash: 'b'.repeat(64),
+      modelIdentity: 'forged',
+      inputTokens: 1,
+      outputTokens: 1,
+      latencyMs: 1,
+      validationOutcome: 'admitted',
+      repairAttempted: false,
+      raw: fakeSemanticProposal('newConstruct', host),
+    },
+  });
+  assert.equal(readClaimLinkedSemanticInterpretation(sessionId, 1), null);
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: { async interpret() { throw new Error('must not treat the forged event as claimed'); } },
+    turn: 1,
+  });
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.record.validationOutcome, 'model_failed');
+});
+
+test('later unlinked interpretation is ignored on replay', async () => {
+  resetEventLog();
+  const sessionId = 'sess-unlinked-later';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const calls: unknown[] = [];
+  const first = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: fakePort(calls),
+    turn: 1,
+  });
+  assert.equal(first.status, 'admitted');
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'turn_semantics_interpreted',
+    data: {
+      ...first.record,
+      validationOutcome: 'invalid',
+      judgeResult: { verdict: 'conflict', effect: 'none', destinationPosture: null, proposalDigest: '0'.repeat(64) },
+    },
+  });
+  const replay = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: fakePort(calls),
+    turn: 1,
+  });
+  assert.equal(replay.status, 'admitted');
+  assert.equal(replay.replayed, true);
+  assert.equal(calls.length, 1);
+});
+
+test('wrong claim hash cannot replay the linked interpretation', async () => {
+  resetEventLog();
+  const sessionId = 'sess-wrong-claim-hash';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const first = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: fakePort([]),
+    turn: 1,
+  });
+  assert.equal(first.status, 'admitted');
+  openEventLog().prepare(
+    `UPDATE turn_semantics_claims SET input_hash = ? WHERE session_id = ? AND source_user_seq = ?`,
+  ).run('f'.repeat(64), sessionId, 1);
+  assert.equal(readClaimLinkedSemanticInterpretation(sessionId, 1), null);
+  const replay = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: { async interpret() { throw new Error('hash mismatch must not interpret again as admitted'); } },
+    turn: 1,
+  });
+  assert.equal(replay.status, 'blocked');
+});
+
+test('one bounded repair admits after a destination posture mismatch', async () => {
+  resetEventLog();
+  const sessionId = 'sess-repair-admit';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  let interprets = 0;
+  let judges = 0;
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret(call) {
+        interprets += 1;
+        const raw = fakeSemanticProposal('newConstruct', call.host);
+        if (interprets === 1 && raw.work?.destination) {
+          return {
+            raw: {
+              ...raw,
+              work: {
+                ...raw.work,
+                destination: { ...raw.work.destination, posture: 'named_existing' },
+              },
+            },
+            modelIdentity: 'repair-brain',
+            inputTokens: 100,
+            outputTokens: 40,
+            latencyMs: 2,
+          };
+        }
+        return {
+          raw,
+          modelIdentity: 'repair-brain',
+          inputTokens: 80,
+          outputTokens: 30,
+          latencyMs: 2,
+        };
+      },
+      async judgeSourceEffect(call) {
+        judges += 1;
+        if (call.proposedDestinationPosture !== 'create_new') {
+          return {
+            verdict: 'conflict',
+            effect: call.proposedEffect,
+            destinationPosture: 'create_new',
+            proposalDigest: call.proposalDigest,
+            modelIdentity: 'repair-judge',
+            inputTokens: 20,
+            outputTokens: 5,
+            latencyMs: 1,
+          };
+        }
+        return {
+          verdict: 'entailed',
+          effect: call.proposedEffect,
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'repair-judge',
+          inputTokens: 21,
+          outputTokens: 6,
+          latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        return entailedPlanGroundingJudge(call, 'repair-grounding');
+      },
+    },
+    turn: 1,
+  });
+  assert.equal(result.status, 'admitted');
+  assert.equal(interprets, 2);
+  assert.equal(judges, 2);
+  assert.equal(result.record.repairAttempted, true);
+  assert.equal(result.record.inputTokens, 222);
+  assert.equal(result.record.outputTokens, 82);
+});
+
+test('unresolved mismatch stays blocked after one repair and records tokens', async () => {
+  resetEventLog();
+  const sessionId = 'sess-repair-blocked';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  let interprets = 0;
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret(call) {
+        interprets += 1;
+        return {
+          raw: fakeSemanticProposal('newConstruct', call.host),
+          modelIdentity: 'blocked-brain',
+          inputTokens: 50,
+          outputTokens: 10,
+          latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        return entailedPlanGroundingJudge(call, 'blocked-grounding');
+      },
+      async judgeSourceEffect(call) {
+        return {
+          verdict: 'conflict',
+          effect: 'read',
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'blocked-judge',
+          inputTokens: 12,
+          outputTokens: 3,
+          latencyMs: 1,
+        };
+      },
+    },
+    turn: 1,
+  });
+  assert.equal(result.status, 'blocked');
+  assert.equal(interprets, 2);
+  assert.equal(result.record.repairAttempted, true);
+  assert.equal(result.record.validationOutcome, 'invalid');
+  assert.equal(result.record.inputTokens, 124);
+  assert.equal(result.record.outputTokens, 26);
+});
+
+test('whole-plan grounding is one call and persists an operation-keyed receipt', async () => {
+  resetEventLog();
+  const sessionId = 'sess-plan-ground';
+  createSession({ id: sessionId, kind: 'chat' });
+  const descriptors = productionDescriptors();
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    capabilities: descriptors,
+    catalogSnapshotDigest: sha256('catalog-1'),
+    ...AUDIENCE,
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  let groundingCalls = 0;
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret(call) {
+        return {
+          raw: fakeSemanticProposal('newConstruct', call.host),
+          modelIdentity: 'plan-brain',
+          inputTokens: 10,
+          outputTokens: 4,
+          latencyMs: 1,
+        };
+      },
+      async judgeSourceEffect(call) {
+        return {
+          verdict: 'entailed',
+          effect: call.proposedEffect,
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'plan-effect',
+          inputTokens: 2,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        groundingCalls += 1;
+        return entailedPlanGroundingJudge(call, 'plan-grounding');
+      },
+    },
+    turn: 1,
+  });
+  assert.equal(result.status, 'admitted');
+  assert.equal(groundingCalls, 1);
+  assert.equal(result.record.groundingJudgeCalls, 1);
+  assert.equal(result.record.proposalCalls, 1);
+  assert.equal(result.record.effectJudgeCalls, 1);
+  assert.equal(result.record.groundingOverallVerdict, 'entailed');
+  assert.ok((result.record.groundingVerdicts ?? []).length >= 4);
+  assert.ok(result.record.groundingReceiptDigest);
+  const replay = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret() { throw new Error('should not re-call'); },
+      async judgePlanGrounding() { throw new Error('should not re-judge'); },
+    },
+    turn: 1,
+  });
+  assert.equal(replay.status, 'admitted');
+  assert.equal(replay.replayed, true);
+});
+
+test('tampered grounding receipt blocks replay', async () => {
+  resetEventLog();
+  const sessionId = 'sess-ground-tamper';
+  createSession({ id: sessionId, kind: 'chat' });
+  const descriptors = productionDescriptors();
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    capabilities: descriptors,
+    catalogSnapshotDigest: sha256('catalog-1'),
+    ...AUDIENCE,
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const first = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret(call) {
+        return {
+          raw: fakeSemanticProposal('newConstruct', call.host),
+          modelIdentity: 'tamper-brain',
+          inputTokens: 4,
+          outputTokens: 2,
+          latencyMs: 1,
+        };
+      },
+      async judgeSourceEffect(call) {
+        return {
+          verdict: 'entailed',
+          effect: call.proposedEffect,
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'tamper-effect',
+          inputTokens: 1,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        return entailedPlanGroundingJudge(call, 'tamper-grounding');
+      },
+    },
+    turn: 1,
+  });
+  assert.equal(first.status, 'admitted');
+  const event = readClaimLinkedSemanticInterpretation(sessionId, 1);
+  assert.ok(event);
+  const row = openEventLog().prepare('SELECT data_json FROM events WHERE id = ?').get(event.eventId) as { data_json: string };
+  const data = JSON.parse(row.data_json) as { groundingVerdicts: Array<{ verdict: string }> };
+  data.groundingVerdicts[0]!.verdict = 'conflict';
+  openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?').run(JSON.stringify(data), event.eventId);
+  const replay = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret() { throw new Error('no interpret'); },
+    },
+    turn: 1,
+  });
+  assert.equal(replay.status, 'blocked');
+});
+
+test('wrong source capability is not grounded', async () => {
+  resetEventLog();
+  const sessionId = 'sess-wrong-source';
+  createSession({ id: sessionId, kind: 'chat' });
+  const descriptors = productionDescriptors();
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    capabilities: descriptors,
+    catalogSnapshotDigest: sha256('catalog-1'),
+    ...AUDIENCE,
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret(call) {
+        const raw = fakeSemanticProposal('newConstruct', call.host);
+        return {
+          raw: {
+            ...raw,
+            work: raw.work && {
+              ...raw.work,
+              operations: raw.work.operations.map((operation) => (
+                operation.role === 'source'
+                  ? { ...operation, capabilityRef: 'cap:host_lookup:collection' }
+                  : operation
+              )),
+            },
+          },
+          modelIdentity: 'wrong-source',
+          inputTokens: 4,
+          outputTokens: 2,
+          latencyMs: 1,
+        };
+      },
+      async judgeSourceEffect(call) {
+        return {
+          verdict: 'entailed',
+          effect: call.proposedEffect,
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'wrong-source-effect',
+          inputTokens: 1,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        return {
+          verdict: 'conflict',
+          operations: call.dag.operations.map((operation) => ({
+            operationId: operation.id,
+            verdict: operation.role === 'source' ? 'conflict' : 'entailed',
+            rationale: operation.role === 'source' ? 'source role is not a destination writer' : '',
+          })),
+          modelIdentity: 'wrong-source-grounding',
+          inputTokens: 1,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
+      },
+    },
+    turn: 1,
+  });
+  assert.equal(result.status, 'blocked');
+  assert.ok(
+    result.record.validationIssue?.operationId === 'op-source'
+    || result.record.validationIssue?.code === 'dag_kind_mismatch'
+    || result.record.validationIssue?.code === 'capability_not_grounded',
+    JSON.stringify(result.record.validationIssue),
+  );
+});
+
+test('malformed grounding retries the judge, not the proposer', async () => {
+  resetEventLog();
+  const sessionId = 'sess-ground-retry';
+  createSession({ id: sessionId, kind: 'chat' });
+  const descriptors = productionDescriptors();
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    capabilities: descriptors,
+    catalogSnapshotDigest: sha256('catalog-1'),
+    ...AUDIENCE,
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  let interprets = 0;
+  let groundings = 0;
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret(call) {
+        interprets += 1;
+        return {
+          raw: fakeSemanticProposal('newConstruct', call.host),
+          modelIdentity: 'retry-brain',
+          inputTokens: 4,
+          outputTokens: 2,
+          latencyMs: 1,
+        };
+      },
+      async judgeSourceEffect(call) {
+        return {
+          verdict: 'entailed',
+          effect: call.proposedEffect,
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'retry-effect',
+          inputTokens: 1,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        groundings += 1;
+        if (groundings === 1) return { verdict: 'entailed', operations: [], modelIdentity: 'retry-grounding', inputTokens: 1, outputTokens: 1, latencyMs: 1 };
+        return entailedPlanGroundingJudge(call, 'retry-grounding');
+      },
+    },
+    turn: 1,
+  });
+  assert.equal(result.status, 'admitted');
+  assert.equal(interprets, 1);
+  assert.equal(groundings, 2);
+});
+
+function judgeDigest(
+  judgeIdentity: string,
+  judgeResult: {
+    verdict: 'entailed' | 'conflict' | 'uncertain';
+    effect: string;
+    destinationPosture: 'create_new' | 'named_existing' | null;
+    proposalDigest: string;
+  },
+): string {
+  return sha256(JSON.stringify({
+    judgeIdentity,
+    verdict: judgeResult.verdict,
+    effect: judgeResult.effect,
+    destinationPosture: judgeResult.destinationPosture,
+    proposalDigest: judgeResult.proposalDigest,
+  }));
+}

@@ -1,0 +1,371 @@
+/**
+ * Atomic host boundary: validate → clamp → admit → compile.
+ *
+ * The sealer is not exported. Requested effects are never authority.
+ * Standing policy is a maximum ceiling, not a write mandate.
+ */
+import {
+  type AdmittedClampedSemanticsV1,
+  type AdmittedTurnSemantics,
+} from '../graph/admitted-turn-semantics.js';
+import type { TurnGraphAwaitInput, TurnGraphRoute } from '../graph/turn-graph-ir.js';
+import type { RuntimeToolEffect } from '../harness/tool-effect.js';
+import {
+  projectCheckedSemantics,
+  type SemanticProjectionV1,
+} from './project-checked-semantics.js';
+import {
+  isContextCheckedTurnSemanticProposalV1,
+  validateTurnSemanticProposalV1,
+  type TurnSemanticHostViewV1,
+  type TurnSemanticValidationIssue,
+} from './turn-semantic-proposal.js';
+import {
+  peekCapabilityManifestStore,
+  resolveCurrentSuccessorManifest,
+} from '../harness/capability-manifest-store.js';
+
+function bindCapabilityRefToSuccessor(capabilityRef: string): string {
+  const store = peekCapabilityManifestStore();
+  if (!store) return capabilityRef;
+  return resolveCurrentSuccessorManifest(store, capabilityRef)?.manifest.manifestId ?? capabilityRef;
+}
+
+export type { AdmittedTurnSemantics, AdmittedClampedSemanticsV1 } from '../graph/admitted-turn-semantics.js';
+
+const EFFECT_RANK: Record<string, number> = {
+  none: 0,
+  host_only: 1,
+  read: 1,
+  compute: 1,
+  unknown: 2,
+  local_write: 3,
+  external_write: 4,
+  admin: 5,
+};
+
+const WRITE_EFFECTS = new Set<RuntimeToolEffect>(['local_write', 'external_write', 'admin']);
+
+export interface HostSemanticAuthorityV1 {
+  policyRevision: string;
+  /** Independently loaded audience digest. Must match the host view. */
+  audienceHash: string;
+  /** Standing policy maximum. Never evidence that this source requested a write. */
+  policyMaxCeiling: RuntimeToolEffect | 'none';
+  allowedEffects: ReadonlyArray<RuntimeToolEffect | 'none'>;
+  /** Existing exact mandate on a resumable goal, if any. */
+  sourceMandate?: {
+    goalId: string;
+    revision: number;
+    effectCeiling: RuntimeToolEffect | 'none';
+  };
+}
+
+export type AdmitTurnSemanticsResult =
+  | {
+      ok: true;
+      source: AdmittedTurnSemantics['source'];
+      policyRevision: string;
+      clamped: AdmittedClampedSemanticsV1;
+      payloadHash: string;
+      contextHash: string;
+    }
+  | { ok: false; issues: TurnSemanticValidationIssue[] };
+
+function issue(
+  issues: TurnSemanticValidationIssue[],
+  code: string,
+  path: string,
+  message: string,
+): void {
+  issues.push({ code, path, message });
+}
+
+function rank(effect: string): number {
+  return EFFECT_RANK[effect] ?? EFFECT_RANK.unknown;
+}
+
+/** Shape-only alignment. The proposal's requestedEffect is not proof. */
+function writeAligned(projection: SemanticProjectionV1): boolean {
+  const work = projection.goal;
+  return Boolean(work && work.construct !== 'none' && work.destination);
+}
+
+function mandateAllowsWrite(authority: HostSemanticAuthorityV1, projection: SemanticProjectionV1): boolean {
+  const mandate = authority.sourceMandate;
+  if (!mandate || !WRITE_EFFECTS.has(mandate.effectCeiling as RuntimeToolEffect)) return false;
+  const target = projection.targetGoal;
+  return target !== null
+    && target.goalId === mandate.goalId
+    && target.baseRevision === mandate.revision;
+}
+
+/**
+ * Clamp a requested effect against independently loaded host authority.
+ * Unknown never becomes read by omission. An ordinary read is not refused
+ * merely because the prior host ceiling was unknown.
+ */
+export function clampRequestedEffect(
+  requested: RuntimeToolEffect | 'none',
+  authority: HostSemanticAuthorityV1,
+  projection: SemanticProjectionV1,
+): { effect: RuntimeToolEffect | 'none'; refuse?: string } {
+  if (requested === 'read') {
+    if (authority.allowedEffects.includes('read') || authority.allowedEffects.includes('unknown')) {
+      return { effect: 'read' };
+    }
+    return { effect: 'read' };
+  }
+  if (requested === 'none') return { effect: 'none' };
+  if (requested === 'compute') return { effect: 'compute' };
+  if (requested === 'host_only') return { effect: 'host_only' };
+  if (requested === 'unknown') return { effect: 'unknown' };
+  if (WRITE_EFFECTS.has(requested as RuntimeToolEffect)) {
+    const aligned = writeAligned(projection) || mandateAllowsWrite(authority, projection);
+    if (!aligned) return { effect: 'none', refuse: 'write_not_aligned' };
+    if (!authority.allowedEffects.includes(requested)) {
+      return { effect: requested, refuse: 'write_not_in_policy' };
+    }
+    if (rank(requested) > rank(authority.policyMaxCeiling)) {
+      return { effect: requested, refuse: 'effect_exceeds_policy' };
+    }
+    return { effect: requested };
+  }
+  return { effect: 'unknown' };
+}
+
+function routeFromClamped(clamped: Omit<AdmittedClampedSemanticsV1, 'route'>): TurnGraphRoute {
+  if (clamped.kind === 'conversation' || clamped.kind === 'keep_slot_open') return 'direct_reply';
+  if (clamped.construct !== 'none') return 'act';
+  if (
+    clamped.effectCeiling === 'external_write'
+    || clamped.effectCeiling === 'local_write'
+    || clamped.effectCeiling === 'admin'
+  ) return 'act';
+  if (clamped.effectCeiling === 'read') return 'retrieve';
+  return 'direct_reply';
+}
+
+function openSlotFromHost(
+  host: TurnSemanticHostViewV1,
+  projection: SemanticProjectionV1,
+): TurnGraphAwaitInput | undefined {
+  if (projection.kind !== 'keep_slot_open') return undefined;
+  const target = projection.targetGoal;
+  const question = host.openQuestions.find((candidate) => (
+    target !== null
+    && candidate.goalId === target.goalId
+    && candidate.goalRevision === target.baseRevision
+  ));
+  if (!question) return undefined;
+  return {
+    goalId: question.goalId,
+    revision: question.goalRevision,
+    questionId: question.questionId,
+    slotId: question.slotKey,
+    deliveredQuestion: question.question,
+    visibleOptions: question.options.map((option) => ({ ...option })),
+    predecessorRefs: target ? host.resumableGoals.find((goal) => (
+      goal.goalId === target.goalId && goal.baseRevision === target.baseRevision
+    ))?.settledEvidenceRefs : undefined,
+  };
+}
+
+function bindIdentity(
+  host: TurnSemanticHostViewV1,
+  authority: HostSemanticAuthorityV1,
+): TurnSemanticValidationIssue[] {
+  const issues: TurnSemanticValidationIssue[] = [];
+  if (host.policyRevision !== authority.policyRevision) {
+    issue(issues, 'policy_revision_mismatch', 'host.policyRevision', 'host view policy revision does not match independently loaded authority');
+  }
+  if (host.source.audienceHash !== authority.audienceHash) {
+    issue(issues, 'audience_mismatch', 'host.source.audienceHash', 'host audience does not match independently loaded audience identity');
+  }
+  return issues;
+}
+
+function clampProjection(
+  projection: SemanticProjectionV1,
+  host: TurnSemanticHostViewV1,
+  authority: HostSemanticAuthorityV1,
+): { clamped: AdmittedClampedSemanticsV1 } | { issues: TurnSemanticValidationIssue[] } {
+  const requested = projection.goal?.requestedEffect ?? 'none';
+  const clampedEffect = clampRequestedEffect(requested, authority, projection);
+  if (clampedEffect.refuse) {
+    return {
+      issues: [{
+        code: clampedEffect.refuse,
+        path: 'work.requestedEffect',
+        message: 'consequential effect requires typed goal alignment or an exact mandate',
+      }],
+    };
+  }
+  const inheritedGoal = host.resumableGoals.find((goal) => (
+    projection.targetGoal !== null
+    && goal.goalId === projection.targetGoal.goalId
+    && goal.baseRevision === projection.targetGoal.baseRevision
+  ));
+  const construct = projection.goal?.construct ?? 'none';
+  const slot = projection.slotAnswer;
+  const withoutRoute: Omit<AdmittedClampedSemanticsV1, 'route'> = {
+    kind: projection.kind,
+    construct,
+    ...(projection.goal?.collection ? { collection: projection.goal.collection } : {}),
+    ...(projection.goal?.destinations?.length
+      ? { destinations: projection.goal.destinations.map((entry) => ({ ...entry })) }
+      : {}),
+    ...(projection.goal?.destination ? { destination: projection.goal.destination } : {}),
+    effectCeiling: clampedEffect.effect,
+    requestedEffect: requested,
+    goalId: projection.targetGoal?.goalId
+      ?? (projection.kind === 'mint_goal'
+        ? `goal:${host.source.sessionId}:${host.source.sourceUserSeq}`
+        : inheritedGoal?.goalId),
+    revision: projection.kind === 'amend_revision'
+      ? (projection.targetGoal?.baseRevision ?? 0) + 1
+      : (projection.targetGoal?.baseRevision
+        ?? (projection.kind === 'mint_goal' ? 0 : inheritedGoal?.baseRevision)),
+    ...(openSlotFromHost(host, projection) ? { openSlot: openSlotFromHost(host, projection) } : {}),
+    ...(slot
+      ? {
+          slotAnswer: {
+            kind: slot.kind,
+            questionId: slot.questionId,
+            slotKey: slot.slotKey,
+            ...(slot.kind === 'option' ? { optionId: slot.optionId } : { value: slot.value }),
+          },
+        }
+      : {}),
+    ...(projection.goal?.operations?.length
+      ? {
+          operations: projection.goal.operations.map((operation) => ({
+            id: operation.id,
+            role: operation.role,
+            requestedEffect: operation.requestedEffect,
+            capabilityRef: bindCapabilityRefToSuccessor(operation.capabilityRef),
+            dependsOn: [...operation.dependsOn],
+            evidence: [...operation.evidence],
+          })),
+        }
+      : {}),
+    ...(projection.goal?.evidenceRequirements
+      ? { evidenceRequirements: [...projection.goal.evidenceRequirements] }
+      : {}),
+  };
+  return {
+    clamped: {
+      ...withoutRoute,
+      route: routeFromClamped(withoutRoute),
+    },
+  };
+}
+
+/**
+ * Validate, project, and clamp. Not durable authority.
+ */
+export function admitTurnSemantics(
+  raw: unknown,
+  host: TurnSemanticHostViewV1,
+  authority: HostSemanticAuthorityV1,
+): AdmitTurnSemanticsResult {
+  const identityIssues = bindIdentity(host, authority);
+  if (identityIssues.length > 0) return { ok: false, issues: identityIssues };
+  const checked = validateTurnSemanticProposalV1(raw, host);
+  if (!checked.ok) return checked;
+  if (!isContextCheckedTurnSemanticProposalV1(checked.checked)) {
+    return { ok: false, issues: [{ code: 'not_checked', path: '', message: 'validator did not return a checked envelope' }] };
+  }
+  const projected = projectCheckedSemantics(checked.checked);
+  if (!projected.ok) {
+    return { ok: false, issues: [{ code: 'projection_failed', path: '', message: projected.reason }] };
+  }
+  const clamped = clampProjection(projected.projection, host, authority);
+  if ('issues' in clamped) {
+    if (clamped.issues.some((entry) => entry.code === 'write_not_aligned')) {
+      const conversation = clampProjection({
+        kind: 'conversation',
+        source: projected.projection.source,
+        relation: projected.projection.relation,
+        targetGoal: null,
+        parkPriorGoal: false,
+      }, host, authority);
+      if (!('issues' in conversation)) {
+        return {
+          ok: true,
+          source: { ...checked.checked.source },
+          policyRevision: host.policyRevision,
+          clamped: conversation.clamped,
+          payloadHash: checked.checked.payloadHash,
+          contextHash: checked.checked.contextHash,
+        };
+      }
+    }
+    return { ok: false, issues: clamped.issues };
+  }
+  const dagIssues = validateOperationDag(clamped.clamped.operations, clamped.clamped.effectCeiling);
+  if (dagIssues.length > 0) return { ok: false, issues: dagIssues };
+  return {
+    ok: true,
+    source: { ...checked.checked.source },
+    policyRevision: host.policyRevision,
+    clamped: clamped.clamped,
+    payloadHash: checked.checked.payloadHash,
+    contextHash: checked.checked.contextHash,
+  };
+}
+
+function validateOperationDag(
+  operations: AdmittedClampedSemanticsV1['operations'],
+  effectCeiling: AdmittedClampedSemanticsV1['effectCeiling'],
+): TurnSemanticValidationIssue[] {
+  if (!operations || operations.length === 0) return [];
+  const issues: TurnSemanticValidationIssue[] = [];
+  const ids = operations.map((operation) => operation.id);
+  if (new Set(ids).size !== ids.length) {
+    issue(issues, 'duplicate_operation_id', 'work.operations', 'operation ids must be unique');
+  }
+  const known = new Set(ids);
+  for (const operation of operations) {
+    if (!operation.requestedEffect) {
+      issue(issues, 'missing_effect', `work.operations.${operation.id}`, 'each operation must declare an effect');
+    } else if (rank(operation.requestedEffect) > rank(effectCeiling)) {
+      issue(
+        issues,
+        'effect_exceeds_ceiling',
+        `work.operations.${operation.id}`,
+        'operation effect exceeds the admitted graph ceiling and cannot be relabeled',
+      );
+    }
+    for (const dep of operation.dependsOn) {
+      if (!known.has(dep)) {
+        issue(issues, 'unknown_dependency', `work.operations.${operation.id}`, `dependsOn references unknown operation ${dep}`);
+      }
+    }
+  }
+  const indegree = new Map(ids.map((id) => [id, 0]));
+  const outgoing = new Map(ids.map((id) => [id, [] as string[]]));
+  for (const operation of operations) {
+    for (const dep of operation.dependsOn) {
+      if (!known.has(dep)) continue;
+      outgoing.get(dep)?.push(operation.id);
+      indegree.set(operation.id, (indegree.get(operation.id) ?? 0) + 1);
+    }
+  }
+  const ready = [...indegree.entries()].filter(([, degree]) => degree === 0).map(([id]) => id);
+  let visited = 0;
+  while (ready.length > 0) {
+    const id = ready.shift() as string;
+    visited += 1;
+    for (const target of outgoing.get(id) ?? []) {
+      const next = (indegree.get(target) ?? 0) - 1;
+      indegree.set(target, next);
+      if (next === 0) ready.push(target);
+    }
+  }
+  if (visited !== ids.length) {
+    issue(issues, 'cyclic_operations', 'work.operations', 'proposed operations must be acyclic');
+  }
+  return issues;
+}
+

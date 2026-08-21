@@ -866,7 +866,7 @@ export function exactWorkflowStepRouteChecks(
   const expectedFamily: ServedModelFamily = brain === 'glm' ? 'byo' : brain;
   const expectedTransport = brain === 'claude'
     ? 'claude_agent_sdk_workflow_step'
-    : 'openai_agents_harness';
+    : 'host_harness';
   const evidence = workflowStepRouteEvidence(home, sessionId);
   const families = [...new Set(evidence.families)];
   const models = [...new Set(evidence.modelIds)];

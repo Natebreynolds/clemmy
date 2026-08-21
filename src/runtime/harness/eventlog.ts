@@ -235,6 +235,9 @@ export const EVENT_TYPES = [
   // chat source. Observational only: it cannot grant authority or alter the
   // active v3.6 execution path.
   'turn_graph_compiled',
+  // One tool-less semantic interpretation per accepted source. Telemetry and
+  // exact-replay of the admitted proposal; not a competing task store.
+  'turn_semantics_interpreted',
   // Fail-closed cutover marker for the Clem 4 evidence protocol. The graph
   // remains observational by itself; this row records that the host accepted
   // its exact identity as the authority contract before provider work began.
@@ -296,13 +299,12 @@ export const EVENT_TYPES = [
   'batch_progress',
   'batch_item_failed',
   'batch_completed',
-  // Code-mode program visibility (Track 4): clem.progress('…') narration lines
-  // from inside a running program, and ONE per-program summary {ok, rpcCalls,
-  // durationMs, completed/failed} — the adoption/efficiency measurement the
-  // code-mode mandate's DELETE-WHEN-VALIDATED note waits on.
+  // Historical program-executor visibility. These event names stay readable so
+  // old sessions render and migrate; no active control flow writes or consumes
+  // them as an execution surface.
   'codemode_progress',
   'codemode_program_summary',
-  // Provenance for a parked oversized program return: the child call ids that
+  // Historical provenance for a parked oversized program return: the child call ids that
   // produced it. The handle itself is recall-only and never evidence
   // authority; gates that refuse it read this record to name the real
   // evidence ids instead of looping the model (live 2026-08-12).
@@ -475,6 +477,11 @@ export const EVENT_TYPES = [
   // live "what Clem knows going in" frame and the graph's future admission
   // input. Carries {entries, registryAvailable, sourceUserSeq?}.
   'capability_resolution',
+  // Host work-plan card: one line per frozen expected-work operation, projected
+  // from the same oracle as admission refusals. Closed payload only
+  // {version, sourceUserSeq, lines[{id, effect, state, settled, observed,
+  // required, dependsOn}]} — no model prose. The strip humanizes ids.
+  'expected_work_progress',
   // Exact schema-backed capabilities surfaced by one governed discovery call.
   // This is restart-safe continuation evidence only: no query, arguments,
   // provider payload, or dispatch authority is stored. Carries
@@ -499,6 +506,18 @@ export const EVENT_TYPES = [
   // worked action turn looks evidence-free to store-driven terminal
   // adjudication and fails closed. Carries {sourceUserSeq, tools[]}.
   'sdk_tool_use_recorded',
+  // HOST TURN LOOP (2026-08-19): the host claimed the NEXT STEP of the SAME
+  // turn after a pipe/step ceiling. A step ceiling is a STEP ending, never a
+  // TURN ending; model-visible means logged, so the claim is a durable session
+  // fact — a banner or a fire-and-forget scheduler without this event is a
+  // stall, not a continue. Carries {sourceUserSeq, reason, attempt, cap, …}.
+  'next_step_claimed',
+  'turn_phase_timings',
+  'workflow_candidate_recorded',
+  'fanout_window_settled',
+  'dependency_request',
+  'connection_request',
+  'connection_request_satisfied',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);
@@ -815,8 +834,9 @@ const MIGRATIONS: EventLogMigration[] = [
   },
   {
     // Guardrail trackers are keyed by an EXECUTION SCOPE, not always by a real
-    // harness session id. Code mode, certified batches, and workers append
-    // `::codeMode`, `::batch:*`, or `::w:*` to the parent session. The v4 table
+    // harness session id. Nested dispatch, certified batches, and workers append
+    // `::nestedDispatch`, `::batch:*`, or `::w:*` to the parent session. Legacy
+    // databases may still contain the historical `::codeMode` suffix. The v4 table
     // incorrectly made that synthetic key a direct FK to sessions(id), so every
     // fifth scoped tool call failed to persist with FOREIGN KEY constraint
     // errors. Keep the scope isolated while anchoring its lifecycle to the real
@@ -4081,13 +4101,362 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     },
   },
+  {
+    /**
+     * Per-source semantic interpretation claim and exact slot identity on
+     * continuity packets. The claim table is CAS, not a semantic store.
+     */
+    version: 43,
+    sql: `
+      CREATE TABLE IF NOT EXISTS turn_semantics_claims (
+        session_id TEXT NOT NULL,
+        source_user_seq INTEGER NOT NULL,
+        owner TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        event_id TEXT,
+        PRIMARY KEY (session_id, source_user_seq)
+      );
+    `,
+    backfill: (db) => {
+      const table = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_continuity_packets'`,
+      ).get();
+      if (!table) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(task_continuity_packets)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!columns.has('pause_slot_json')) {
+        db.exec('ALTER TABLE task_continuity_packets ADD COLUMN pause_slot_json TEXT');
+      }
+    },
+  },
+  {
+    /**
+     * Fence semantic claims by owner token and bind the winning result.
+     * A stolen owner cannot persist after the row is replaced.
+     */
+    version: 44,
+    sql: `
+      CREATE TABLE IF NOT EXISTS graph_node_leases (
+        lease_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        fence INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        released INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS graph_journal_entries (
+        session_id TEXT NOT NULL,
+        source_user_seq INTEGER NOT NULL,
+        seq INTEGER NOT NULL,
+        entry_json TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq, seq)
+      );
+    `,
+    backfill: (db) => {
+      // Migration rehearsals and interrupted operators can legitimately leave
+      // the v44 columns in place while the schema_version row is absent. Raw
+      // ALTER statements would then make every subsequent open fail with a
+      // duplicate-column error. Structural inspection keeps the additive
+      // migration restart-safe without blessing or rewriting any old claim.
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(turn_semantics_claims)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      for (const name of ['input_hash', 'audience_hash', 'policy_revision'] as const) {
+        if (!columns.has(name)) {
+          db.exec(`ALTER TABLE turn_semantics_claims ADD COLUMN ${name} TEXT`);
+        }
+      }
+    },
+  },
+  {
+    /**
+     * Durable semantic participation, request-scoped catalog snapshots,
+     * exact node bindings, and trusted capability manifests. These used
+     * to be created ad-hoc at runtime; they are now a contiguous schema.
+     */
+    version: 45,
+    sql: `
+      CREATE TABLE IF NOT EXISTS turn_semantics_dispositions (
+        session_id TEXT NOT NULL,
+        source_user_seq INTEGER NOT NULL,
+        participation TEXT NOT NULL,
+        outcome TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq)
+      );
+      CREATE TABLE IF NOT EXISTS accepted_source_catalog_snapshots (
+        session_id TEXT NOT NULL,
+        source_user_seq INTEGER NOT NULL,
+        snapshot_digest TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq)
+      );
+      CREATE TABLE IF NOT EXISTS graph_node_bindings (
+        session_id TEXT NOT NULL,
+        source_user_seq INTEGER NOT NULL,
+        node_id TEXT NOT NULL,
+        binding_json TEXT NOT NULL,
+        binding_digest TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq, node_id)
+      );
+      CREATE TABLE IF NOT EXISTS capability_manifests (
+        manifest_id TEXT PRIMARY KEY,
+        digest TEXT NOT NULL,
+        manifest_json TEXT NOT NULL,
+        lifecycle TEXT NOT NULL,
+        installed_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    /**
+     * Persist the minted call-authority digest and provider-argument digest
+     * with every physical reservation. Replay and settlement must match them.
+     */
+    version: 46,
+    sql: `
+      CREATE TABLE IF NOT EXISTS physical_dispatch_authority (
+        session_id TEXT NOT NULL,
+        source_user_seq INTEGER NOT NULL,
+        physical_dispatch_id TEXT NOT NULL,
+        authority_digest TEXT NOT NULL,
+        provider_argument_digest TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq, physical_dispatch_id)
+      );
+    `,
+    backfill: (db) => {
+      const table = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'physical_dispatches'`,
+      ).get();
+      if (!table) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(physical_dispatches)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!columns.has('authority_digest')) {
+        db.exec('ALTER TABLE physical_dispatches ADD COLUMN authority_digest TEXT');
+      }
+      if (!columns.has('provider_argument_digest')) {
+        db.exec('ALTER TABLE physical_dispatches ADD COLUMN provider_argument_digest TEXT');
+      }
+    },
+  },
+  {
+    /**
+     * Persist reconstructable typed call-authority bytes with the reservation.
+     * A digest alone cannot be verified after restart.
+     */
+    version: 47,
+    sql: `
+      CREATE TABLE IF NOT EXISTS physical_dispatch_authority_payload (
+        session_id TEXT NOT NULL,
+        source_user_seq INTEGER NOT NULL,
+        physical_dispatch_id TEXT NOT NULL,
+        authority_digest TEXT NOT NULL,
+        provider_argument_digest TEXT NOT NULL,
+        authority_json TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq, physical_dispatch_id)
+      );
+    `,
+    backfill: (db) => {
+      const table = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'physical_dispatch_authority'`,
+      ).get();
+      if (!table) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(physical_dispatch_authority)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!columns.has('authority_json')) {
+        db.exec('ALTER TABLE physical_dispatch_authority ADD COLUMN authority_json TEXT');
+      }
+    },
+  },
+  {
+    /**
+     * Privacy-safe sealed authority: one digest, one crossing, no plaintext
+     * provider arguments. Schema 47 payload rows are not copied forward.
+     */
+    version: 48,
+    sql: `
+      CREATE TABLE IF NOT EXISTS physical_dispatch_authority_sealed (
+        session_id TEXT NOT NULL,
+        source_user_seq INTEGER NOT NULL,
+        physical_dispatch_id TEXT NOT NULL,
+        authority_digest TEXT NOT NULL,
+        provider_argument_digest TEXT NOT NULL,
+        observation_digest TEXT NOT NULL,
+        sealed_json TEXT NOT NULL,
+        byte_length INTEGER NOT NULL,
+        retention_class TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        argument_cipher TEXT,
+        PRIMARY KEY (session_id, source_user_seq, physical_dispatch_id)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS physical_dispatch_authority_sealed_digest
+        ON physical_dispatch_authority_sealed (authority_digest);
+    `,
+    backfill: (db) => {
+      ensureAuthorityPrivacySchema(db);
+    },
+  },
+  {
+    /**
+     * One consequential-crossing kernel. Provider-I/O ownership used to live in
+     * a runtime-created `graph_dispatch_io` table with its own state machine,
+     * so a reservation and its I/O claim could disagree about who owned the
+     * crossing. The claim belongs to the reservation it fences: these columns
+     * move it onto `physical_dispatches`, where the exact authority, argument
+     * digests and settlement already live.
+     *
+     * `io_claimed_at IS NULL` means unclaimed and therefore replayable by a
+     * legitimate lease takeover; non-NULL means provider I/O was claimed and
+     * recovery must reconcile rather than redispatch.
+     */
+    version: 49,
+    sql: '',
+    backfill: (db) => {
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(physical_dispatches)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!columns.size) return;
+      if (!columns.has('io_claimed_at')) db.exec('ALTER TABLE physical_dispatches ADD COLUMN io_claimed_at TEXT');
+      if (!columns.has('io_owner')) db.exec('ALTER TABLE physical_dispatches ADD COLUMN io_owner TEXT');
+      if (!columns.has('io_fence')) db.exec('ALTER TABLE physical_dispatches ADD COLUMN io_fence INTEGER');
+      if (!columns.has('io_revision')) db.exec('ALTER TABLE physical_dispatches ADD COLUMN io_revision INTEGER');
+
+      const legacy = db.prepare(
+        `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'graph_dispatch_io'`,
+      ).get() as { ok: number } | undefined;
+      if (!legacy) return;
+
+      // A claimed marker with no reservation would be a provider-I/O fact we
+      // cannot bind to an authority. That is corruption, not an upgrade: fail
+      // closed inside the migration transaction rather than discard it.
+      const orphaned = db.prepare(`
+        SELECT COUNT(*) AS n FROM graph_dispatch_io io
+         WHERE io.io_started = 1
+           AND NOT EXISTS (
+             SELECT 1 FROM physical_dispatches p
+              WHERE p.session_id = io.session_id
+                AND p.source_user_seq = io.source_user_seq
+                AND p.physical_dispatch_id = io.physical_dispatch_id
+           )
+      `).get() as { n: number };
+      if (orphaned.n > 0) {
+        throw new Error(
+          `schema v49 refuses to drop ${orphaned.n} claimed provider-I/O marker(s) with no physical reservation`,
+        );
+      }
+
+      db.exec(`
+        UPDATE physical_dispatches
+           SET io_claimed_at = COALESCE(io_claimed_at, started_at),
+               io_owner = COALESCE(
+                 io_owner,
+                 (SELECT io.io_owner FROM graph_dispatch_io io
+                   WHERE io.session_id = physical_dispatches.session_id
+                     AND io.source_user_seq = physical_dispatches.source_user_seq
+                     AND io.physical_dispatch_id = physical_dispatches.physical_dispatch_id)
+               ),
+               io_fence = COALESCE(
+                 io_fence,
+                 (SELECT io.io_fence FROM graph_dispatch_io io
+                   WHERE io.session_id = physical_dispatches.session_id
+                     AND io.source_user_seq = physical_dispatches.source_user_seq
+                     AND io.physical_dispatch_id = physical_dispatches.physical_dispatch_id)
+               ),
+               io_revision = COALESCE(
+                 io_revision,
+                 (SELECT io.io_revision FROM graph_dispatch_io io
+                   WHERE io.session_id = physical_dispatches.session_id
+                     AND io.source_user_seq = physical_dispatches.source_user_seq
+                     AND io.physical_dispatch_id = physical_dispatches.physical_dispatch_id)
+               )
+         WHERE EXISTS (
+           SELECT 1 FROM graph_dispatch_io io
+            WHERE io.session_id = physical_dispatches.session_id
+              AND io.source_user_seq = physical_dispatches.source_user_seq
+              AND io.physical_dispatch_id = physical_dispatches.physical_dispatch_id
+              AND io.io_started = 1
+         );
+
+        DROP TABLE graph_dispatch_io;
+      `);
+    },
+  },
 ];
+
+function ensureAuthorityPrivacySchema(db: Database.Database): void {
+  const sealed = db.prepare(
+    `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'physical_dispatch_authority_sealed'`,
+  ).get() as { ok: number } | undefined;
+  if (sealed) {
+    const columns = new Set(
+      (db.prepare('PRAGMA table_info(physical_dispatch_authority_sealed)').all() as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!columns.has('argument_cipher')) {
+      db.exec('ALTER TABLE physical_dispatch_authority_sealed ADD COLUMN argument_cipher TEXT');
+    }
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS capability_port_implementations (
+      invoke_port_id TEXT NOT NULL,
+      reconcile_port_id TEXT NOT NULL DEFAULT '',
+      implementation_digest TEXT NOT NULL,
+      recorded_at TEXT NOT NULL,
+      PRIMARY KEY (invoke_port_id, reconcile_port_id)
+    );
+    CREATE TABLE IF NOT EXISTS physical_dispatch_owner_fences (
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL,
+      physical_dispatch_id TEXT NOT NULL,
+      owner_fence TEXT NOT NULL,
+      PRIMARY KEY (session_id, source_user_seq, physical_dispatch_id)
+    );
+  `);
+  const scrub = (table: string): void => {
+    const exists = db.prepare(
+      `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?`,
+    ).get(table) as { ok: number } | undefined;
+    if (!exists) return;
+    const columns = new Set(
+      (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name),
+    );
+    if (!columns.has('authority_json')) return;
+    if (table === 'physical_dispatch_authority_payload') {
+      db.prepare(
+        `DELETE FROM physical_dispatch_authority_payload
+          WHERE authority_json LIKE '%canonicalArgs%'
+            AND authority_json NOT LIKE '%"argsRedacted":true%'`,
+      ).run();
+      return;
+    }
+    db.prepare(
+      `UPDATE physical_dispatch_authority SET authority_json = NULL
+        WHERE authority_json LIKE '%canonicalArgs%'`,
+    ).run();
+  };
+  scrub('physical_dispatch_authority_payload');
+  scrub('physical_dispatch_authority');
+}
 
 const newestMigrationVersion = MIGRATIONS[MIGRATIONS.length - 1]?.version ?? 0;
 if (newestMigrationVersion !== HARNESS_SCHEMA_VERSION) {
   throw new Error(
     `HARNESS_SCHEMA_VERSION=${HARNESS_SCHEMA_VERSION} does not match newest migration ${newestMigrationVersion}`,
   );
+}
+
+/** Production migration entry used by rehearsal. Callers must already bind CLEMENTINE_HOME. */
+export function applyHarnessMigrations(db: Database.Database): void {
+  runMigrations(db);
+  ensureAuthorityPrivacySchema(db);
 }
 
 function runMigrations(db: Database.Database): void {
@@ -4121,6 +4490,7 @@ export function openEventLog(): Database.Database {
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
     runMigrations(db);
+    ensureAuthorityPrivacySchema(db);
     cached = db;
     return db;
   } catch (error) {
@@ -4149,9 +4519,17 @@ export function closeEventLog(): void {
  * mkdtemp home) or the caller explicitly sets CLEMMY_ALLOW_EVENTLOG_RESET=1.
  * Protecting the store at the API, not by convention. */
 export function resetEventLog(): void {
-  const tmpRoot = os.tmpdir();
+  const tmpRoot = path.resolve(os.tmpdir());
   const resolved = path.resolve(HARNESS_DB_PATH);
-  const allowed = resolved.startsWith(path.resolve(tmpRoot) + path.sep)
+  const home = process.env.CLEMENTINE_HOME ? path.resolve(process.env.CLEMENTINE_HOME) : '';
+  const isolatedHome = process.env.CLEMMY_TEST_ISOLATED_HOME === '1';
+  const underTmp = resolved.startsWith(`${tmpRoot}${path.sep}`);
+  const underIsolatedHome = Boolean(home)
+    && resolved.startsWith(`${home}${path.sep}`)
+    && (home.startsWith(`${tmpRoot}${path.sep}`) || tmpRoot.startsWith(`${home}${path.sep}`) || isolatedHome);
+  const allowed = underTmp
+    || underIsolatedHome
+    || isolatedHome
     || resolved.startsWith('/tmp/')
     || resolved.startsWith('/private/tmp/')
     || process.env.CLEMMY_ALLOW_EVENTLOG_RESET === '1';
@@ -4298,6 +4676,18 @@ export function getSession(sessionId: string): SessionRow | null {
     | RawSessionRow
     | undefined;
   return row ? rowToSession(row) : null;
+}
+
+/** Stamp audience identity on a session that was created without one. */
+export function ensureSessionUserId(sessionId: string, userId: string): SessionRow | null {
+  const next = userId.trim();
+  if (!next) return getSession(sessionId);
+  const db = openEventLog();
+  db.prepare(
+    `UPDATE sessions SET user_id = ?, updated_at = ?
+      WHERE id = ? AND (user_id IS NULL OR trim(user_id) = '')`,
+  ).run(next, nowIso(), sessionId);
+  return getSession(sessionId);
 }
 
 function addListFilter(
@@ -7741,6 +8131,18 @@ export function reapStaleSessions(maxAgeDays?: number): number {
   // — those are explicit "hold onto this" signals from the Conversations
   // UI, stored additively in metadata_json. Without this guard a pinned
   // Discord/workflow conversation would silently vanish after the TTL.
+  const doomed = db.prepare(
+    `SELECT id FROM sessions
+      WHERE status IN ('completed','failed','cancelled')
+        AND updated_at < datetime('now', ?)
+        AND metadata_json NOT LIKE '%"pinned":true%'
+        AND metadata_json NOT LIKE '%"archived":true%'`,
+  ).all(`-${Math.floor(ttl)} days`) as Array<{ id: string }>;
+  for (const row of doomed) {
+    db.prepare(`DELETE FROM physical_dispatch_authority_sealed WHERE session_id = ?`).run(row.id);
+    db.prepare(`DELETE FROM physical_dispatch_authority_payload WHERE session_id = ?`).run(row.id);
+    db.prepare(`DELETE FROM physical_dispatch_authority WHERE session_id = ?`).run(row.id);
+  }
   const result = db
     .prepare(
       `DELETE FROM sessions

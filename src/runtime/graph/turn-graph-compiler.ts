@@ -15,7 +15,18 @@ import {
   detectMultiItemIntent,
   type MultiItemIntent,
 } from '../harness/multi-item-intent.js';
+import {
+  compileAcceptedGoal,
+  destinationsOf,
+  goalConstraintsOf,
+  type AcceptedGoalV1,
+} from './accepted-goal.js';
+import {
+  isAdmittedTurnSemantics,
+  type AdmittedTurnSemantics,
+} from './admitted-turn-semantics.js';
 import type { SessionKind } from '../harness/eventlog.js';
+import type { RuntimeToolEffect } from '../harness/tool-effect.js';
 import type { TurnIdentity } from '../harness/turn-outcome.js';
 import {
   TURN_GRAPH_COMPILER_VERSION,
@@ -23,6 +34,7 @@ import {
   TURN_GRAPH_POLICY_VERSION,
   type CompileTurnGraphResult,
   type TurnGraphAuthority,
+  type TurnGraphAwaitInput,
   type TurnGraphCapabilityRequirement,
   type TurnGraphEdge,
   type TurnGraphEffect,
@@ -37,10 +49,30 @@ import {
   type TurnGraphValidation,
 } from './turn-graph-ir.js';
 
+/** Typed semantic state the compiler may consume. Route, construct, count,
+ *  ceiling, and executable operations come only from this admitted state;
+ *  canonical descriptive effect kinds remain source-derived. */
+export interface CompileTurnGraphSemantics {
+  construct: AcceptedGoalV1['construct'];
+  effectCeiling: AcceptedGoalV1['effectCeiling'];
+  collection?: AcceptedGoalV1['collection'];
+  destinations?: AcceptedGoalV1['destinations'];
+  destination?: AcceptedGoalV1['destination'];
+  route?: TurnGraphRoute;
+  goalId?: string;
+  revision?: number;
+  /** When set, the compiled graph parks at this exact open slot. */
+  openSlot?: TurnGraphAwaitInput;
+  /** Shadow telemetry only. Does not grant authority. */
+  messageIntent?: IntentClassification['intent'];
+}
+
 export interface CompileTurnGraphInput {
   identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>;
-  /** Used transiently for deterministic classifiers and hashing. It is never
-   * copied into the graph or telemetry payload. */
+  /** Hashed into source.inputHash. When `admitted` is present, typed semantics
+   * own route, construct, count, ceiling, and completion. The host's canonical
+   * external-effect taxonomy may still project descriptive effect kinds from
+   * this exact hash-bound accepted source; those kinds grant no authority. */
   input: string;
   sessionKind: SessionKind;
   surface: TurnGraphSurface;
@@ -53,6 +85,48 @@ export interface CompileTurnGraphInput {
     intent?: IntentClassification;
     externalEffect?: ExternalEffectClassification;
     multiItem?: MultiItemIntent;
+    /** Prior retrieve/act in this session — see sessionContinuesHostedWorld. */
+    continueHostedWorld?: boolean;
+  };
+  /**
+   * Opaque host-admitted semantics. A plain structural object is rejected.
+   * When present, route/construct/ceiling come from this value — `input` is
+   * hashed only and must match the admitted source.
+   */
+  admitted?: AdmittedTurnSemantics;
+}
+
+function routeFromSemantics(semantics: CompileTurnGraphSemantics): TurnGraphRoute {
+  if (semantics.route) return semantics.route;
+  if (semantics.openSlot) return 'direct_reply';
+  if (semantics.construct !== 'none') return 'act';
+  if (
+    semantics.effectCeiling === 'external_write'
+    || semantics.effectCeiling === 'local_write'
+    || semantics.effectCeiling === 'admin'
+  ) return 'act';
+  if (semantics.effectCeiling === 'read') return 'retrieve';
+  return 'direct_reply';
+}
+
+function shadowIntentFromSemantics(semantics: CompileTurnGraphSemantics, route: TurnGraphRoute): IntentClassification {
+  if (semantics.messageIntent) {
+    return { intent: semantics.messageIntent, confidence: 1, reasons: ['typed_semantics'] };
+  }
+  if (route === 'direct_reply') return { intent: 'conversation', confidence: 1, reasons: ['typed_semantics'] };
+  if (route === 'retrieve') return { intent: 'lookup', confidence: 1, reasons: ['typed_semantics'] };
+  return { intent: 'action', confidence: 1, reasons: ['typed_semantics'] };
+}
+
+function multiItemFromSemantics(semantics: CompileTurnGraphSemantics): MultiItemIntent {
+  const count = semantics.collection?.count ?? 0;
+  return {
+    isMultiItem: semantics.construct === 'fanout',
+    itemCount: count,
+    itemKind: null,
+    sameShapeWork: false,
+    explicitParallelRequest: false,
+    collectThenConstruct: semantics.construct === 'collect_then_construct',
   };
 }
 
@@ -121,7 +195,11 @@ function noEffect(): TurnGraphEffect {
   };
 }
 
-function effectForRoute(route: TurnGraphRoute, externalEffectRequested: boolean): TurnGraphEffect {
+function effectForRoute(
+  route: TurnGraphRoute,
+  externalEffectRequested: boolean,
+  goalCeiling?: RuntimeToolEffect | 'none',
+): TurnGraphEffect {
   if (route === 'direct_reply') return noEffect();
   if (route === 'retrieve') {
     return {
@@ -132,8 +210,24 @@ function effectForRoute(route: TurnGraphRoute, externalEffectRequested: boolean)
       receipt: 'evidence_ref',
     };
   }
+  // An admitted act whose goal ceiling is READ keeps that exact authority.
+  // Widening it to 'unknown' erased what the semantic clamp sealed and made
+  // the single-read act unexecutable (the freeze then refused "read-only
+  // work" against a ceiling the admission never granted).
+  if (goalCeiling === 'read' && !externalEffectRequested) {
+    return {
+      kind: 'read',
+      certainty: 'exact',
+      reversibility: 'read_only',
+      idempotency: 'not_required',
+      receipt: 'evidence_ref',
+    };
+  }
+  const ceiling = goalCeiling === 'external_write' || goalCeiling === 'local_write' || goalCeiling === 'admin'
+    ? goalCeiling
+    : externalEffectRequested ? 'external_write' : 'unknown';
   return {
-    kind: externalEffectRequested ? 'external_write' : 'unknown',
+    kind: ceiling,
     certainty: 'ceiling',
     reversibility: 'unknown',
     idempotency: 'required_before_dispatch',
@@ -165,7 +259,12 @@ function routeFor(
   intent: IntentClassification,
   externalEffect: ExternalEffectClassification,
   memoryInstruction: boolean,
+  collectThenConstruct = false,
 ): TurnGraphRoute {
+  // A counted set landing in one container is a construct, even when the
+  // sentence opens with a find/lookup verb. Leaving it on retrieve froze a
+  // one-read contract and never compiled the write.
+  if (collectThenConstruct) return 'act';
   if (
     externalEffect.requested
     || intent.intent === 'action'
@@ -185,6 +284,16 @@ function routeFor(
   return 'direct_reply';
 }
 
+/** A compiled direct_reply is conversation-only. Callers that did not pass
+ *  an explicit allowlist must not assemble discovery, MCP, or a capability
+ *  hunt — compose_reply still runs the model, with zero tool authority. */
+export function factorySkipForCompiledRoute(
+  route: TurnGraphRoute | undefined,
+  allowedToolNames: readonly string[] | undefined,
+): boolean {
+  return route === 'direct_reply' && allowedToolNames === undefined;
+}
+
 function fastPathFor(
   route: TurnGraphRoute,
   multiItem: MultiItemIntent,
@@ -197,6 +306,11 @@ function fastPathFor(
   // serve a whole project inside one chat turn.
   if (projectShaped) return 'project';
   if (route === 'retrieve') return 'single_retrieval';
+  // A counted collection landing in ONE artifact is one aggregate source phase
+  // plus one construct phase. Per-item siblings belong only to a true fanout
+  // goal; labeling this fanout made the host manufacture N worker jobs after a
+  // provider had already returned the collection as one result.
+  if (multiItem.collectThenConstruct) return 'single_action';
   return multiItem.isMultiItem ? 'fanout_action' : 'single_action';
 }
 
@@ -319,15 +433,90 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
     throw new Error('Cannot compile a turn graph with an invalid turn number.');
   }
 
-  const intent = input.signals?.intent ?? classifyMessageIntent(input.input);
-  const externalEffect = input.signals?.externalEffect ?? classifyExternalEffectRequest(input.input);
-  const multiItem = input.signals?.multiItem ?? detectMultiItemIntent(input.input);
-  const projectShape = classifyProjectShape(input.input, intent);
-  // Work shape may choose an execution envelope only after intent has already
-  // selected the action route. It must never turn advice or a lookup into work.
-  const route = routeFor(intent, externalEffect, isExplicitMemoryInstruction(input.input));
-  const fastPath = fastPathFor(route, multiItem, projectShape.isProject);
-  const routeEffect = effectForRoute(route, externalEffect.requested);
+  if (input.admitted !== undefined && !isAdmittedTurnSemantics(input.admitted)) {
+    throw new Error('compileTurnGraph rejects unsealed semantics');
+  }
+  if (input.admitted) {
+    const admitted = input.admitted;
+    if (admitted.source.sessionId !== input.identity.sessionId) {
+      throw new Error('admitted semantics belong to a different session');
+    }
+    if (admitted.source.sourceUserSeq !== input.identity.sourceUserSeq) {
+      throw new Error('admitted semantics belong to a different accepted source');
+    }
+    if (admitted.source.inputHash !== sha256(input.input)) {
+      throw new Error('admitted semantics do not match the accepted input hash');
+    }
+  }
+  const typed = input.admitted?.clamped;
+  const acceptedGoal: AcceptedGoalV1 = typed
+    ? {
+        sourceUserSeq: input.identity.sourceUserSeq,
+        construct: typed.construct,
+        effectCeiling: typed.effectCeiling,
+        ...(typed.goalId ? { goalId: typed.goalId } : {}),
+        ...(typed.revision !== undefined ? { revision: typed.revision } : {}),
+        ...(typed.collection ? { collection: typed.collection } : {}),
+        ...(typed.destinations?.length
+          ? { destinations: typed.destinations.map((entry) => ({ ...entry })) }
+          : {}),
+        ...(typed.destination ? { destination: typed.destination } : {}),
+        ...(typed.evidenceRequirements ? { evidenceRequirements: [...typed.evidenceRequirements] } : {}),
+        route: typed.route,
+      }
+    : compileAcceptedGoal({
+        text: input.input,
+        sourceUserSeq: input.identity.sourceUserSeq,
+        multiItem: input.signals?.multiItem ?? detectMultiItemIntent(input.input),
+      });
+  const typedRoute = typed ? typed.route : acceptedGoal.route;
+  const intent = typed
+    ? shadowIntentFromSemantics(typed, typedRoute)
+    : (input.signals?.intent ?? classifyMessageIntent(input.input, {
+      continueHostedWorld: input.signals?.continueHostedWorld === true,
+    }));
+  const writeCeiling = acceptedGoal.effectCeiling === 'external_write'
+    || acceptedGoal.effectCeiling === 'local_write'
+    || acceptedGoal.effectCeiling === 'admin';
+  const externalEffect = typed
+    ? {
+        requested: writeCeiling,
+        // `input` is the exact accepted source proven by the admitted
+        // inputHash check above. Preserve the canonical provider-neutral
+        // effect kinds so downstream contracts cannot lose a later delivery
+        // merely because route/construct authority came from typed semantics.
+        kinds: classifyExternalEffectRequest(input.input).kinds,
+      }
+    : (input.signals?.externalEffect ?? classifyExternalEffectRequest(input.input));
+  const multiItem = typed
+    ? multiItemFromSemantics(typed)
+    : (input.signals?.multiItem ?? detectMultiItemIntent(input.input));
+  const projectShape = typed
+    ? { isProject: false, signals: [] as string[] }
+    : classifyProjectShape(input.input, intent);
+  const collectThenConstruct = multiItem.collectThenConstruct === true
+    || acceptedGoal.construct === 'collect_then_construct';
+  // Typed semantics own the route. Legacy compile may only WIDEN a find-lead
+  // construct to act + write; observation-only asks still use the classifier.
+  const route = typed
+    ? typedRoute
+    : (acceptedGoal.construct !== 'none' || acceptedGoal.effectCeiling === 'external_write'
+      ? 'act'
+      : routeFor(
+        intent,
+        externalEffect,
+        isExplicitMemoryInstruction(input.input),
+        collectThenConstruct,
+      ));
+  const fastPath = fastPathFor(route, {
+    ...multiItem,
+    collectThenConstruct,
+  }, projectShape.isProject);
+  const routeEffect = effectForRoute(
+    route,
+    externalEffect.requested || acceptedGoal.effectCeiling === 'external_write',
+    acceptedGoal.effectCeiling,
+  );
   const allowedToolNames = normalizedNames(input.allowedToolNames);
   const excludedToolNames = normalizedNames(input.excludedToolNames) ?? [];
   const policy = canonicalPolicy(input.policy);
@@ -346,17 +535,24 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
   const edges: TurnGraphEdge[] = [];
   let prior: TurnGraphNode | null = null;
   const addNode = (opts: {
+    id?: string;
     kind: TurnGraphNodeKind;
     runner: TurnGraphRunner;
     effect?: TurnGraphEffect;
     capabilities?: TurnGraphCapabilityRequirement[];
     evidence?: TurnGraphNode['evidence'];
     emitsTopology?: TurnGraphNode['emitsTopology'];
+    awaitInput?: TurnGraphAwaitInput;
+    operationId?: string;
+    capabilityRole?: string;
+    cardinality?: number;
+    requiredFields?: string[];
     edgeWhen?: TurnGraphEdge['when'];
+    connectPrior?: boolean;
   }): TurnGraphNode => {
     const effect = opts.effect ?? noEffect();
     const node: TurnGraphNode = {
-      id: `n${nodes.length}:${opts.kind}`,
+      id: opts.id ?? `n${nodes.length}:${opts.kind}`,
       kind: opts.kind,
       runner: opts.runner,
       effect,
@@ -364,9 +560,14 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
       capabilities: opts.capabilities ?? [],
       evidence: opts.evidence ?? { mode: 'none', kinds: [] },
       ...(opts.emitsTopology ? { emitsTopology: opts.emitsTopology } : {}),
+      ...(opts.awaitInput ? { awaitInput: opts.awaitInput } : {}),
+      ...(opts.operationId ? { operationId: opts.operationId } : {}),
+      ...(opts.capabilityRole ? { capabilityRole: opts.capabilityRole } : {}),
+      ...(opts.cardinality !== undefined ? { cardinality: opts.cardinality } : {}),
+      ...(opts.requiredFields ? { requiredFields: opts.requiredFields } : {}),
     };
     nodes.push(node);
-    if (prior) {
+    if (prior && opts.connectPrior !== false) {
       edges.push({
         id: `e${edges.length}:${prior.id}->${node.id}`,
         source: prior.id,
@@ -374,7 +575,7 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
         when: opts.edgeWhen ?? 'success',
       });
     }
-    prior = node;
+    if (opts.connectPrior !== false) prior = node;
     return node;
   };
 
@@ -416,7 +617,164 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
       evidence: { mode: 'any', kinds: ['tool_result', 'source', 'memory'] },
     });
   } else if (route === 'act') {
-    if (multiItem.isMultiItem) {
+    const workNodeIds: string[] = [];
+    // Host-bound operations arrive ALREADY injected into the admitted clamped
+    // semantics (prepareDurableAcceptedTurnCompile's bind pass) — one
+    // synthesis owner, so the destination binder and this branch see the same
+    // operations. An act construct that still has none compiles unbound and
+    // dispatch fails CLOSED as blocked.
+    const boundOperations = typed?.operations;
+    if (typed && boundOperations && boundOperations.length > 0) {
+      const headerPrior = nodes.at(-1) ?? null;
+      const byId = new Map<string, TurnGraphNode>();
+      for (const operation of boundOperations) {
+        const requested = operation.requestedEffect;
+        const write = requested === 'external_write'
+          || requested === 'local_write'
+          || requested === 'admin';
+        const ceilingRank = (
+          typed.effectCeiling === 'admin' ? 5
+            : typed.effectCeiling === 'external_write' ? 4
+              : typed.effectCeiling === 'local_write' ? 3
+                : typed.effectCeiling === 'unknown' ? 2
+                  : typed.effectCeiling === 'read'
+                    || typed.effectCeiling === 'compute'
+                    || typed.effectCeiling === 'host_only' ? 1
+                    : 0
+        );
+        const requestedRank = (
+          requested === 'admin' ? 5
+            : requested === 'external_write' ? 4
+              : requested === 'local_write' ? 3
+                : requested === 'unknown' ? 2
+                  : requested === 'read' || requested === 'compute' || requested === 'host_only' ? 1
+                    : 0
+        );
+        if (requestedRank > ceilingRank) {
+          throw new Error(`operation ${operation.id} exceeds the admitted effect ceiling`);
+        }
+        const opEffect = requested;
+        const kind: TurnGraphNodeKind = opEffect === 'read'
+          ? 'retrieve'
+          : operation.role === 'transform' || operation.role === 'extract'
+            ? 'execute'
+            : write && opEffect !== 'unknown'
+              ? 'execute'
+              : operation.role === 'readback'
+                ? 'retrieve'
+                : 'execute';
+        const effect: TurnGraphEffect = opEffect === 'read'
+          ? {
+              kind: 'read',
+              certainty: 'exact',
+              reversibility: 'read_only',
+              idempotency: 'not_required',
+              receipt: 'evidence_ref',
+            }
+          : write && opEffect !== 'unknown'
+            ? {
+                kind: opEffect,
+                certainty: 'ceiling',
+                reversibility: 'unknown',
+                idempotency: 'required_before_dispatch',
+                receipt: 'durable_effect_receipt',
+              }
+            : opEffect === 'compute' || opEffect === 'host_only'
+              ? {
+                  kind: opEffect,
+                  certainty: 'exact',
+                  reversibility: 'not_applicable',
+                  idempotency: 'not_required',
+                  receipt: 'evidence_ref',
+                }
+            : {
+                kind: opEffect === 'none' ? 'none' : 'unknown',
+                certainty: 'ceiling',
+                reversibility: 'unknown',
+                idempotency: 'not_required',
+                receipt: 'evidence_ref',
+              };
+        const node = addNode({
+          id: operation.id,
+          kind,
+          runner: (write && opEffect !== 'unknown') || opEffect === 'read' ? { kind: 'tool' } : { kind: 'runtime' },
+          effect,
+          operationId: operation.id,
+          capabilityRole: operation.role,
+          ...(operation.capabilityRef
+            ? {
+                capabilities: [{
+                  kind: 'tool' as const,
+                  resolution: 'explicit' as const,
+                  // Admission already resolved this opaque ref to the current
+                  // successor. The pure graph compiler emits it verbatim; it
+                  // never reaches back into mutable runtime manifest state.
+                  names: [operation.capabilityRef],
+                }],
+              }
+            : {}),
+          cardinality: operation.role === 'collection' ? typed.collection?.count : undefined,
+          requiredFields: operation.role === 'collection' ? typed.collection?.projection : undefined,
+          connectPrior: false,
+        });
+        byId.set(operation.id, node);
+        workNodeIds.push(node.id);
+      }
+      for (const operation of boundOperations) {
+        const node = byId.get(operation.id);
+        if (!node) continue;
+        if (operation.dependsOn.length === 0 && headerPrior) {
+          const already = edges.some((edge) => edge.source === headerPrior.id && edge.target === node.id);
+          if (!already) {
+            edges.push({
+              id: `e${edges.length}:${headerPrior.id}->${node.id}`,
+              source: headerPrior.id,
+              target: node.id,
+              when: 'success',
+            });
+          }
+        }
+        for (const dep of operation.dependsOn) {
+          if (!byId.has(dep)) {
+            warnings.push(`operation ${operation.id} depends on unknown ${dep}`);
+            continue;
+          }
+          const already = edges.some((edge) => edge.source === dep && edge.target === node.id);
+          if (already) continue;
+          edges.push({
+            id: `e${edges.length}:${dep}->${node.id}`,
+            source: dep,
+            target: node.id,
+            when: 'success',
+          });
+        }
+      }
+      const referenced = new Set(boundOperations.flatMap((operation) => operation.dependsOn));
+      const sinks = boundOperations.filter((operation) => !referenced.has(operation.id));
+      prior = (sinks.length > 0 ? byId.get(sinks[sinks.length - 1]!.id) : null) ?? [...byId.values()].at(-1) ?? headerPrior;
+    } else if (collectThenConstruct) {
+      // AGGREGATE CONSTRUCT: one source/read phase returns the bounded set and
+      // its projected fields; one execute creates and populates the single
+      // destination artifact. The runtime/tool may parallelize independent I/O
+      // inside the aggregate read, but the graph must not manufacture one
+      // worker or one destination write per returned row.
+      addNode({
+        kind: 'retrieve',
+        runner: { kind: 'tool' },
+        effect: {
+          kind: 'read',
+          certainty: 'exact',
+          reversibility: 'read_only',
+          idempotency: 'not_required',
+          receipt: 'evidence_ref',
+        },
+      });
+      addNode({
+        kind: 'execute',
+        runner: { kind: 'model', role: 'brain' },
+        effect: routeEffect,
+      });
+    } else if (multiItem.isMultiItem) {
       // G5a + E6.2: the fanout node is a PLANNER under a runtime-topology
       // contract. At execution it produces the canonical item manifest and
       // hands it to the DURABLE MANIFEST ADAPTER
@@ -455,16 +813,36 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
         effect: routeEffect,
       });
     }
-    addNode({
+    const verifyNode = addNode({
       kind: 'verify',
       runner: { kind: 'runtime' },
       evidence: externalEffect.requested
         ? { mode: 'all', kinds: ['external_receipt'] }
         : { mode: 'any', kinds: ['tool_result', 'artifact', 'external_receipt'] },
+      connectPrior: workNodeIds.length > 0 ? false : undefined,
     });
+    if (workNodeIds.length > 0) {
+      for (const sourceId of workNodeIds) {
+        if (edges.some((edge) => edge.source === sourceId && edge.target === verifyNode.id)) continue;
+        edges.push({
+          id: `e${edges.length}:${sourceId}->${verifyNode.id}`,
+          source: sourceId,
+          target: verifyNode.id,
+          when: 'success',
+        });
+      }
+      prior = verifyNode;
+    }
   }
 
   if (route === 'direct_reply') {
+    if (typed?.openSlot) {
+      addNode({
+        kind: 'await_input',
+        runner: { kind: 'human' },
+        awaitInput: typed.openSlot,
+      });
+    }
     addNode({
       kind: 'compose_reply',
       runner: { kind: 'model', role: 'reply_composer' },
@@ -485,6 +863,29 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
       runner: { kind: 'model', role: 'reply_composer' },
       edgeWhen: 'evidence_sufficient',
     });
+    let blockedSource = verifyNode.id;
+    let blockedWhen: TurnGraphEdge['when'] = 'evidence_insufficient';
+    if (typed?.openSlot) {
+      const awaitInputNode: TurnGraphNode = {
+        id: `n${nodes.length}:await_input`,
+        kind: 'await_input',
+        runner: { kind: 'human' },
+        effect: noEffect(),
+        authority: authorityFor(input.identity.sourceUserSeq, noEffect()),
+        capabilities: [],
+        evidence: { mode: 'none', kinds: [] },
+        awaitInput: typed.openSlot,
+      };
+      nodes.push(awaitInputNode);
+      edges.push({
+        id: `e${edges.length}:${verifyNode.id}->${awaitInputNode.id}`,
+        source: verifyNode.id,
+        target: awaitInputNode.id,
+        when: 'evidence_insufficient',
+      });
+      blockedSource = awaitInputNode.id;
+      blockedWhen = 'success';
+    }
     const composeBlocked: TurnGraphNode = {
       id: `n${nodes.length}:compose_blocked`,
       kind: 'compose_blocked',
@@ -496,10 +897,10 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
     };
     nodes.push(composeBlocked);
     edges.push({
-      id: `e${edges.length}:${verifyNode.id}->${composeBlocked.id}`,
-      source: verifyNode.id,
+      id: `e${edges.length}:${blockedSource}->${composeBlocked.id}`,
+      source: blockedSource,
       target: composeBlocked.id,
-      when: 'evidence_insufficient',
+      when: blockedWhen,
     });
     // ONE publish node — the one-public-committer invariant as structure —
     // with an explicit ANY-join: the two verdict routes converge here and
@@ -555,15 +956,27 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
       messageIntent: intent.intent,
       confidence: Number(Math.max(0, Math.min(1, intent.confidence)).toFixed(3)),
       route,
-      externalEffectRequested: externalEffect.requested,
+      // The accepted goal is typed authority. A find-led construct can evade
+      // the surface verb taxonomy while still carrying a create-new external
+      // destination; never publish a read-only classification beside that
+      // write ceiling.
+      externalEffectRequested: externalEffect.requested
+        || acceptedGoal.effectCeiling === 'external_write',
       projectShaped: projectShape.isProject,
       projectSignals: [...projectShape.signals].sort(),
       externalEffectKinds,
       multiItem: {
         detected: multiItem.isMultiItem,
-        itemCount: multiItem.itemCount,
+        itemCount: Math.max(multiItem.itemCount, acceptedGoal.collection?.count ?? 0),
         explicitParallelRequest: multiItem.explicitParallelRequest,
+        collectThenConstruct,
       },
+      ...(acceptedGoal.construct !== 'none' || acceptedGoal.collection || destinationsOf(acceptedGoal).length > 0
+        ? { goalConstraints: goalConstraintsOf(acceptedGoal) }
+        : {}),
+      ...(acceptedGoal.goalId
+        ? { goalIdentity: { goalId: acceptedGoal.goalId, revision: acceptedGoal.revision ?? 0 } }
+        : {}),
     },
     fastPath,
     effectCeiling: routeEffect.kind,
