@@ -55,6 +55,8 @@ export interface CapabilityResolutionEntry {
   failureReason?: string;
   /** Effect evidence used to keep read/write memory from crossing asks. */
   effectClass?: 'read' | 'write' | 'unknown';
+  /** CLI/MCP invoke hint when the matcher already resolved a command. */
+  command?: string;
   /** Private continuity pointer. Persisted for the runtime resolver but never
    * rendered to the model or projected onto the public event plane. */
   verifiedReadOrigin?: VerifiedReadCapabilityOrigin;
@@ -83,6 +85,32 @@ function bindResolutionInput(
 ): CapabilityResolution {
   resolutionInputByResult.set(resolution, input);
   return resolution;
+}
+
+/** Test-only: bind a fixture resolution to its accepted input so
+ *  authoritativeForTask provenance behaves as the real resolver's output. */
+export const _bindResolutionInputForTest = bindResolutionInput;
+
+/**
+ * Record a HOST-selected admission catalog as this source's authoritative
+ * resolution. The entries come from the connected-registry enumeration (see
+ * connected-goal-catalog.ts) — real connectivity, schema-grounded selection —
+ * and the binding to the exact accepted input is what lets
+ * authoritativeForTask hold, so host-bind is never starved on turn one of a
+ * fresh session (live 2026-08-19 sess-mt05r35h).
+ */
+export function recordAdmissionCapabilityResolution(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedInput: string;
+  entries: CapabilityResolutionEntry[];
+}): void {
+  if (input.entries.length === 0) return;
+  const resolution = bindResolutionInput(
+    { entries: input.entries, registryAvailable: true },
+    input.acceptedInput,
+  );
+  recordCapabilityResolution(input.sessionId, resolution, input.sourceUserSeq);
 }
 
 function normalizeAuthorityInput(value: unknown): string | null {
@@ -225,6 +253,7 @@ export function resolveTurnCapabilities(
         connection: connectionStateFor(m.kind, m.identifier, registry, registryAvailable),
         ...(m.accountIdentity ? { accountIdentity: m.accountIdentity } : {}),
         ...(m.effectClass ? { effectClass: m.effectClass } : {}),
+        ...(m.command ? { command: m.command } : {}),
         ...(m.verifiedReadOrigin ? { verifiedReadOrigin: m.verifiedReadOrigin } : {}),
       });
     }
@@ -364,6 +393,69 @@ export function recordCapabilityResolution(
 }
 
 /**
+ * Consume the turn's proven resolution at the DECISION POINT.
+ *
+ * The resolver proves capabilities before the model speaks, but until now the
+ * proof was only rendered as context prose — execution never read it. A model
+ * that named the proven Composio identifier verbatim was refused as
+ * "not reachable" and had to re-derive the carrier through failed calls (live
+ * 2026-08-18: the host proved OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW with an
+ * active connection and prepared arguments, then charged the model three
+ * refusals to rediscover it).
+ *
+ * This maps a requested target back onto that proof: when the exact identifier
+ * was PROVEN for this source with a connection that is not missing, the call
+ * belongs on the composio carrier. It grants nothing — the carrier's full gate
+ * chain (effect classification, confirm-first, grounding, settlement) still
+ * owns safety; this only stops the harness refusing its own knowledge.
+ */
+export function provenComposioSlugForTurn(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  requestedTarget: string;
+}): { slug: string } | null {
+  const wanted = input.requestedTarget.trim().toUpperCase();
+  if (!/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(wanted)) return null;
+  // Proof scope: this session, at or before this source. The exact-source-only
+  // rule made every PAID CONTINUATION turn unreachable-by-remap — live
+  // 2026-08-18 sess-msz8m5vg seq 58306 ("FIRECRAWL_SEARCH is not a deferred
+  // callable tool on this turn's surface") and sess-msz2h3zi seq 58040: the
+  // reply turn had no own-source resolution yet, so a PROVEN slug bounced.
+  // The remap only rewrites the carrier; admission, effect, and once-guards
+  // still govern the call. Cross-SESSION remap stays forbidden.
+  if (!Number.isSafeInteger(input.sourceUserSeq)) return null;
+  try {
+    // listEvents({desc:true}) hands rows back in chronological order (desc
+    // only changes which rows a LIMIT keeps), so walk the array from the end:
+    // newest resolution first.
+    const events = listEvents(input.sessionId, { types: ['capability_resolution'] });
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const event = events[i];
+      const seq = event.data.sourceUserSeq;
+      if (!Number.isSafeInteger(seq) || (seq as number) > (input.sourceUserSeq as number)) continue;
+      // Internal verification retries record themselves as non-authoritative;
+      // they may not authorize the carrier remap.
+      if (event.data.authoritativeForTask === false) continue;
+      const entries = Array.isArray(event.data.entries) ? event.data.entries as CapabilityResolutionEntry[] : [];
+      for (const entry of entries) {
+        if (
+          entry.kind === 'composio'
+          && entry.status === 'proven'
+          && entry.connection !== 'missing'
+          && typeof entry.identifier === 'string'
+          && entry.identifier.trim().toUpperCase() === wanted
+        ) {
+          return { slug: entry.identifier.trim() };
+        }
+      }
+      // Only the newest authoritative resolution for this source decides.
+      break;
+    }
+  } catch { /* an unreadable ledger refuses nothing new — the caller keeps its refusal */ }
+  return null;
+}
+
+/**
  * Render the resolution as a DATA block for the model. Facts first, then the
  * deterministic floor. Empty resolution renders nothing — no prompt tax on
  * turns with no capability history.
@@ -391,7 +483,12 @@ export function renderCapabilityResolutionForContext(
         : e.connection === 'unknown' ? 'connection unverified'
           : null;
     if (e.status === 'proven') {
-      lines.push(`✓ proven execution path: ${e.kind}:${e.identifier}`
+      const invoke = e.kind === 'cli'
+        ? '; invoke via run_shell_command'
+        : e.kind === 'mcp'
+          ? `; invoke the namespaced tool ${e.identifier}`
+          : '';
+      lines.push(`✓ proven execution path: ${e.kind}:${e.identifier}${invoke}`
         + `; learned intent label (metadata only, NOT callable): ${JSON.stringify(e.intent)}`
         + `${e.accountIdentity ? ` (${e.accountIdentity})` : ''}${conn ? ` [${conn}]` : ''}`);
     } else {
@@ -400,9 +497,16 @@ export function renderCapabilityResolutionForContext(
         + `${e.failureReason ? `; ${e.failureReason}` : ''}${e.failedAt ? ')' : ''}${conn ? ` [${conn}]` : ''}`);
     }
   }
+  const hasCli = resolution.entries.some((entry) => entry.kind === 'cli' && entry.status === 'proven');
+  const hasComposio = resolution.entries.some((entry) => entry.kind === 'composio' && entry.status === 'proven');
   lines.push(
-    'Execution rule: for a proven composio path, call composio_execute_tool with the exact identifier as tool_slug. '
-    + 'Never pass the learned intent label to call_tool, and never rediscover the same proven capability. ',
+    hasCli
+      ? 'Execution rule: for a proven cli path, call run_shell_command with that command. Do not rediscover via Composio or MCP. '
+      : hasComposio
+        ? 'Execution rule: for a proven composio path, call composio_execute_tool with the exact identifier as tool_slug. '
+        : 'Execution rule: invoke the proven identifier directly. ',
+    'Never pass the learned intent label to call_tool. These rows are inventory, not a bound how — '
+    + 'an unmatched or unreachable proven path does not close discovery. ',
     'Floor: a previously-failed path must be re-verified with a cheap probe before you rely on it '
     + 'or ask for a go-ahead that assumes it — and say so. A toolkit with no active connection must be '
     + 'surfaced to the user, never worked around silently. A capability not listed is an unresolved requirement: '
@@ -418,5 +522,82 @@ function renderContractRecall(focusInput: string): string | null {
     return renderLearnedContracts(recallLearnedContracts(focusInput));
   } catch {
     return null;
+  }
+}
+
+/**
+ * PROVISION FROM PROOF. The turn's own host-verified resolution entries,
+ * readable as capability supply for semantic admission.
+ *
+ * Live 2026-08-18 (sess-msywj8qp): the typed catalog was unprovisioned on the
+ * live home (production packs refuse: identity_mismatch), so semantic
+ * admission recorded "No host capabilities were supplied, so no operations
+ * could be bound" — while THIS event, one read away, held proven
+ * FIRECRAWL_SEARCH / GOOGLEDRIVE_LIST_FILES entries with live prepared
+ * commands. Proof the host already produced for this exact accepted source is
+ * capability supply; the brain must not rediscover it through tool_search.
+ *
+ * Scope guard: per accepted source only (same rule as
+ * provenComposioSlugForTurn) — a prior turn's proof is not this turn's
+ * authority. previously_failed entries are returned separately so the caller
+ * can decide whether a stale cross-session failure still hides a slug.
+ */
+export function provenCapabilityEntriesForTurn(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+}): CapabilityResolutionEntry[] {
+  if (!Number.isSafeInteger(input.sourceUserSeq)) return [];
+  try {
+    // SUPPLY, not authority. Semantic admission runs BEFORE this turn's
+    // resolver (live 2026-08-18 second breaker: ops=0 because the exact-source
+    // proof did not exist yet at admission time), so descriptor supply may
+    // draw on the session's LATEST authoritative resolution at or before this
+    // source. Call authority stays strictly per accepted source
+    // (provenComposioSlugForTurn) — supplying a candidate for citation grants
+    // nothing: every actual call still crosses admission, effect, and
+    // once-guards.
+    const events = listEvents(input.sessionId, { types: ['capability_resolution'] });
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const event = events[i]!;
+      const seq = event.data.sourceUserSeq;
+      if (Number.isSafeInteger(seq) && (seq as number) > (input.sourceUserSeq as number)) continue;
+      if (event.data.authoritativeForTask === false) continue;
+      const entries = Array.isArray(event.data.entries)
+        ? event.data.entries as CapabilityResolutionEntry[]
+        : [];
+      return entries.filter((entry) =>
+        entry.status === 'proven'
+        && entry.connection !== 'missing'
+        && typeof entry.identifier === 'string'
+        && entry.identifier.trim().length > 0);
+    }
+    // Every Discord prompt opens a FRESH session (live 2026-08-18 breaker 3:
+    // within-session supply always starved on turn one), so follow the same
+    // prior-session trail the context builder already walks: the
+    // cross_session_prefix row this session recorded at accept time. Still
+    // supply, never authority — and only sessions the host itself linked.
+    const prefix = [...listEvents(input.sessionId, { types: ['cross_session_prefix'] })].at(-1);
+    const priorSessionIds = Array.isArray(prefix?.data.priorSessionIds)
+      ? (prefix!.data.priorSessionIds as string[]).slice(0, 4)
+      : [];
+    for (const priorSessionId of priorSessionIds) {
+      const priorEvents = listEvents(priorSessionId, { types: ['capability_resolution'] });
+      for (let i = priorEvents.length - 1; i >= 0; i -= 1) {
+        const event = priorEvents[i]!;
+        if (event.data.authoritativeForTask === false) continue;
+        const entries = Array.isArray(event.data.entries)
+          ? event.data.entries as CapabilityResolutionEntry[]
+          : [];
+        const proven = entries.filter((entry) =>
+          entry.status === 'proven'
+          && entry.connection !== 'missing'
+          && typeof entry.identifier === 'string'
+          && entry.identifier.trim().length > 0);
+        if (proven.length > 0) return proven;
+      }
+    }
+    return [];
+  } catch {
+    return [];
   }
 }

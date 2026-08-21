@@ -27,7 +27,10 @@ import {
   type PresentationEvent,
 } from './turn-outcome.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
-import { looksLikeCompactDecisionProtocol } from './presentation-hygiene.js';
+import {
+  looksLikeCompactDecisionProtocol,
+  stripLeakedDecisionAssignment,
+} from './presentation-hygiene.js';
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 import {
   isSettledReadReplayReturnData,
@@ -59,6 +62,93 @@ const SAFE_TERMINAL_FALLBACK = 'I finished the turn, but the final reply was not
 export const PUBLIC_RUN_FAILURE_TEXT = 'Something went wrong on that turn. Please try again; the technical details are available in the activity log.';
 export const PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT =
   'I could not start this turn because no model runtime is connected. Open Settings > Models, connect a model, and try again.';
+
+export type PublicHeldKind = 'blocked' | 'uncertain';
+
+export interface PublicHeldExecutionInput {
+  kind: PublicHeldKind;
+  cause:
+    | 'provider_identity'
+    | 'schema'
+    | 'account'
+    | 'observation'
+    | 'reconciliation'
+    | 'settlement'
+    | 'unsupported_write'
+    | 'semantic';
+  providerCallOccurred: boolean;
+  externalChangePossible: boolean;
+  retrySafe: boolean;
+  willResumeAutomatically: boolean;
+}
+
+export function publicHeldExecutionText(input: PublicHeldExecutionInput): string {
+  const call = input.providerCallOccurred
+    ? 'A provider call was already reserved or started.'
+    : 'No provider call was made.';
+  const change = input.externalChangePossible
+    ? 'An external change may already exist, so I will not guess and will not write again.'
+    : 'No external change was made.';
+  const retry = input.retrySafe
+    ? 'A retry is safe once the missing account, capability, or schema is ready.'
+    : 'A retry is not safe until this crossing is reconciled or marked complete.';
+  const resume = input.willResumeAutomatically
+    ? 'I will resume automatically when that recovery finishes.'
+    : 'I will wait for you before trying again.';
+  const next = input.cause === 'account'
+    ? 'Next: reconnect the exact account for this capability.'
+    : input.cause === 'schema' || input.cause === 'provider_identity'
+      ? 'Next: approve or provision the current capability identity.'
+      : input.cause === 'reconciliation' || input.cause === 'unsupported_write'
+        ? 'Next: verify the artifact, then tell me whether to continue.'
+        : input.cause === 'observation'
+          ? 'Next: reconnect the provider so I can observe the live operation and account.'
+          : input.cause === 'settlement'
+            ? 'Next: wait for recovery, or ask me to inspect the reserved crossing.'
+            : 'Next: restate the request, or approve the capability if one is missing.';
+  const lead = input.kind === 'uncertain'
+    ? 'I stopped because I cannot prove whether that work finished.'
+    : 'I stopped before finishing because the host could not authorize the next step.';
+  return `${lead} ${call} ${change} ${retry} ${resume} ${next}`;
+}
+
+const HOST_AUTHORITY_HELD_RE =
+  /observ|account|schema|fingerprint|binary_drift|provider|capability|identity_mismatch|manifest|live lease|reconcil|settle|storage_error|unsupported.?write|independent_observation/i;
+
+/** True when the stop is host authority/recovery, not a semantic or contract refuse. */
+export function isHostAuthorityHeldReason(reason: string): boolean {
+  return HOST_AUTHORITY_HELD_RE.test(reason ?? '');
+}
+
+/** Map an internal held/recovery reason onto user-facing copy. Never leaks
+ *  digests, account IDs, or "could not interpret" for host-authority stops. */
+export function heldExecutionTextForInternalReason(
+  reason: string,
+  kind: PublicHeldKind = /uncertain|reconcil/i.test(reason) ? 'uncertain' : 'blocked',
+): string {
+  if (!isHostAuthorityHeldReason(reason)) return reason;
+  const text = reason ?? '';
+  const cause: PublicHeldExecutionInput['cause'] =
+    /account|live lease|reconnect/i.test(text) ? 'account'
+      : /schema|fingerprint|definition|binary_drift/i.test(text) ? 'schema'
+        : /provider|capability|identity_mismatch|manifest|port/i.test(text) ? 'provider_identity'
+          : /observ/i.test(text) ? 'observation'
+            : /reconcil|unsupported.?write/i.test(text)
+              ? (/unsupported.?write/i.test(text) ? 'unsupported_write' : 'reconciliation')
+              : /settle|storage_error|conflict/i.test(text) ? 'settlement'
+                : 'semantic';
+  const providerCallOccurred = /reserved|started|provider (?:call|outcome|crossing)|reconcil|settle/i.test(text);
+  const externalChangePossible = kind === 'uncertain'
+    || /provider outcome is unknown|already reserved|external change/i.test(text);
+  return publicHeldExecutionText({
+    kind,
+    cause,
+    providerCallOccurred,
+    externalChangePossible,
+    retrySafe: !externalChangePossible && cause !== 'reconciliation' && cause !== 'settlement',
+    willResumeAutomatically: cause === 'settlement',
+  });
+}
 
 const PUBLIC_CONVERSATION_PREAMBLE_KEYS = new Set([
   'version',
@@ -159,7 +249,7 @@ function projectReplyText(value: unknown, fallback: string, depth: number): stri
     const record = value as Record<string, unknown>;
     return projectReplyText(record.reply, fallback, depth + 1);
   }
-  const candidate = text(value);
+  const candidate = stripLeakedDecisionAssignment(text(value) ?? '');
   if (!candidate) return fallback;
 
   // Preserve the compatibility contract for a whole legacy JSON decision that
@@ -205,6 +295,7 @@ function selected(data: Record<string, unknown>, keys: readonly string[]): Recor
 }
 
 const PUBLIC_WORKFLOW_RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/;
+const PUBLIC_WORK_REQUIREMENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
 const PUBLIC_SHA256_DIGEST_RE = /^[a-f0-9]{64}$/;
 
 export interface PublicAsyncWorkDispatchedData extends Record<string, unknown> {
@@ -499,7 +590,7 @@ function publicDispatchSlug(data: Record<string, unknown>): string {
   return PUBLIC_DISPATCH_SLUG_RE.test(candidate) ? candidate : '';
 }
 
-/** call_tool / code-mode wrap an inner tool; the WRAPPER name ("call tool") is
+/** call_tool and other host carriers wrap an inner tool; the WRAPPER name ("call tool") is
  *  all the strip could show, so a page of anonymous "call tool" rows hid what
  *  was actually happening (live 2026-08-07: write_file + sf data query rendered
  *  as identical blank rows, so the user could not see progress or steer). The
@@ -510,7 +601,7 @@ function publicDispatchSlug(data: Record<string, unknown>): string {
 const PUBLIC_INNER_TOOL_RE = /^[a-z][a-z0-9_]{1,48}$/;
 function publicInnerTool(data: Record<string, unknown>): string {
   const wrapper = firstString(data.tool, data.toolName, data.name);
-  if (wrapper !== 'call_tool' && wrapper !== 'run_tool_program') return '';
+  if (wrapper !== 'call_tool') return '';
   const inner = firstString(data.effectiveTool);
   return inner && PUBLIC_INNER_TOOL_RE.test(inner) ? inner : '';
 }
@@ -565,10 +656,10 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       const text = typeof data.text === 'string' ? data.text : '';
       return text ? { text } : null;
     }
-    // The compiled turn plan, as a SHAPE summary only (2026-08-07, "see the
-    // graph"): route + fast-path + node count let the chat strip show "Plan:
-    // fan-out action · 11 steps" at turn start. Hashes, policy internals, and
-    // the graph body stay private.
+    // The compiled turn plan, as a SHAPE summary only: route + fast-path +
+    // node count. The chat header uses route/fast-path to name the kind of
+    // work ("Looking this up…"); node count is not user-facing. Hashes,
+    // policy internals, and the graph body stay private.
     case 'turn_graph_compiled': {
       const fastPath = typeof data.fastPath === 'string' ? data.fastPath : '';
       const route = typeof data.route === 'string' ? data.route : '';
@@ -670,7 +761,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'step_started':
       return selected(data, ['step', 'stepId', 'title']);
     case 'conversation_limit_exceeded':
-      return selected(data, ['reason', 'steps', 'maxSteps', 'maxTurns', 'maxWallClockMs', 'transport']);
+      return selected(data, ['reason', 'steps', 'maxSteps', 'maxTurns', 'maxWallClockMs', 'transport', 'autoResumed', 'autoResumeAttempt']);
     case 'worker_started':
     case 'worker_result':
     case 'worker_capped':
@@ -687,7 +778,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         ...selected(data, ['shapeKey', 'toolName', 'tool', 'callId', 'call_id', 'preDispatch']),
         targets: stringList(data.targets, 25),
       };
-    case 'codemode_program_summary':
+    case 'codemode_program_summary': // historical event presentation
       return selected(data, ['ok', 'rpcCalls', 'durationMs', 'completed', 'failed']);
     case 'capability_resolution': {
       // Typed "what Clem knows going in" frame. Bounded and sanitized: the
@@ -714,10 +805,67 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       if (entries.length === 0) return null;
       return { entries };
     }
+    case 'expected_work_progress': {
+      // Host plan card only. Requirement ids are mechanical; the UI humanizes
+      // them. Extra keys and unknown states fail closed.
+      const sourceUserSeq = data.sourceUserSeq;
+      if (
+        data.version !== 1
+        || !Number.isSafeInteger(sourceUserSeq)
+        || Number(sourceUserSeq) <= 0
+      ) return null;
+      const rawLines = Array.isArray(data.lines) ? data.lines.slice(0, 32) : [];
+      const lines = rawLines.flatMap((raw) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+        const line = raw as Record<string, unknown>;
+        const id = firstString(line.id);
+        const effect = firstString(line.effect);
+        const state = firstString(line.state);
+        if (!PUBLIC_WORK_REQUIREMENT_ID_RE.test(id)) return [];
+        if (
+          effect !== 'read' && effect !== 'compute' && effect !== 'local_write'
+          && effect !== 'external_write' && effect !== 'admin'
+        ) return [];
+        if (
+          state !== 'satisfied' && state !== 'data_in' && state !== 'open'
+          && state !== 'blocked_on_dependency'
+        ) return [];
+        const settled = Number.isSafeInteger(line.settled) && Number(line.settled) >= 0
+          ? Number(line.settled)
+          : 0;
+        const observed = Number.isSafeInteger(line.observed) && Number(line.observed) >= 0
+          ? Number(line.observed)
+          : 0;
+        const required = line.required === null
+          ? null
+          : Number.isSafeInteger(line.required) && Number(line.required) >= 0
+            ? Number(line.required)
+            : null;
+        const dependsOn = Array.isArray(line.dependsOn)
+          ? line.dependsOn
+            .filter((dep): dep is string => typeof dep === 'string' && PUBLIC_WORK_REQUIREMENT_ID_RE.test(dep))
+            .slice(0, 32)
+          : [];
+        return [{ id, effect, state, settled, observed, required, dependsOn }];
+      });
+      if (lines.length === 0) return null;
+      return { version: 1, sourceUserSeq: Number(sourceUserSeq), lines };
+    }
     case 'verdict_recorded':
       return selected(data, ['door', 'pass', 'failedOpen', 'selfJudge', 'criteriaMet', 'criteriaTotal']);
-    case 'heartbeat':
-      return selected(data, ['kind']);
+    case 'heartbeat': {
+      // A progress check-in's `message` is the HOST-COMPOSED ledger line
+      // (composeRunProgressLine — plan/evidence/collection facts, no model
+      // prose, no arguments). Projecting it is what lets Discord and the
+      // desktop feed say "plan 1/3 steps underway · 25-item collection"
+      // instead of an unchanging "Still working" (live 2026-08-18
+      // sess-msywj8qp: 13 ledger heartbeats, zero reached a surface). Other
+      // heartbeat kinds keep the kind-only projection.
+      const base = selected(data, ['kind']);
+      if (data.kind !== 'progress_check_in') return base;
+      const message = firstString(data.message).slice(0, 300);
+      return { ...base, ...(message ? { message } : {}) };
+    }
     case 'turn_started':
     case 'turn_ended':
     case 'plan_drafted':

@@ -38,6 +38,7 @@ import {
   type AcceptedSourceSettlementAudit,
 } from './accepted-source-settlement-audit.js';
 import { workEvidenceForAcceptedSource, type WorkEvidenceRef } from './work-manifest.js';
+import { constrainNeedsInputPresentationForRecovery } from './recovery-presentation-truth.js';
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -85,6 +86,12 @@ const DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
   // cancellation: the id names who is still running it, so clients can link the
   // turn to live work instead of showing it as abandoned.
   'transferredToTaskId',
+  // Never-resting ceiling checkpoint: the bridge reads these off the terminal
+  // to re-enter on the same spine a human `continue` uses. Without them the
+  // park would be visually honest and functionally stranded.
+  'autoResume',
+  'autoResumeAttempt',
+  'autoResumeCap',
 ]);
 const WARM_DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
   'artifactId',
@@ -484,6 +491,8 @@ function legacyReason(presentation: PresentationEvent): string {
       return 'cancelled';
     case 'transferred':
       return 'transferred';
+    case 'uncertain':
+      return 'reconciliation_required';
   }
 }
 
@@ -611,10 +620,14 @@ function presentationFromLegacyWinner(event: EventRow, proposed: PresentationEve
       kind = 'question';
       needs = { kind: 'input' };
     }
-  } else if (/awaiting_continue|limit_exceeded|max_turn|max_step|token_budget/.test(reason)) {
-    status = 'needs_input';
-    kind = 'continue';
-    needs = { kind: 'continue' };
+  } else if (/awaiting_continue|limit_exceeded|max_turn|max_step|token_budget|budget_parked/.test(reason)) {
+    // Budget parks — legacy ask-shaped rows included — replay as
+    // blocked+resumable, never as a manufactured "reply continue" ask.
+    // gate-reason.ts is the only author of needs_input; a ceiling is the
+    // harness's own checkpoint and re-entry is the host's job (2026-08-18).
+    status = 'blocked';
+    kind = 'blocked';
+    needs = undefined;
     resumable = true;
   } else if (event.data.awaitingUser === true || /awaiting_(?:user|input|reply)|needs_input/.test(reason)) {
     status = 'needs_input';
@@ -634,6 +647,14 @@ function presentationFromLegacyWinner(event: EventRow, proposed: PresentationEve
     kind = 'stopped';
     needs = undefined;
     resumable = false;
+  } else if (reason === 'budget_checkpoint_auto_resume') {
+    // A never-resting ceiling checkpoint: parked blocked + resumable with the
+    // bridge re-entering on its own. Rewriting it to needs_input would hand the
+    // harness's bookkeeping to the user; dropping resumable would strand it.
+    status = 'blocked';
+    kind = 'blocked';
+    needs = undefined;
+    resumable = true;
   } else if (/fail|error|no_structured|exhaust/.test(reason)) {
     status = 'failed';
     kind = 'error';
@@ -715,6 +736,25 @@ function assertPersistedPresentationOwnership(
   }
 }
 
+function repairArgumentsNeedsInputOutcome(
+  outcome: Extract<TurnOutcome, { status: 'needs_input' }>,
+  text: string,
+): Extract<TurnOutcome, { status: 'needs_input' }> {
+  // A repair choice is ordinary user input.  Do not preserve a model-proposed
+  // approval/continue edge (or its opaque id) after durable settlement says
+  // the actual choice is repair-or-stop.
+  return {
+    version: 2,
+    id: outcome.id,
+    identity: outcome.identity,
+    ...(outcome.evidenceRefs ? { evidenceRefs: outcome.evidenceRefs } : {}),
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text },
+  };
+}
+
 /**
  * Commit exactly one final public presentation for a logical user turn.
  *
@@ -734,6 +774,23 @@ export function commitTurnOutcome(
    * durable publication invariant can still send it back to the hold. */
   let disclosedInsteadOfHeld = false;
   let disclosureDetail: { reason?: string; missing?: readonly string[] } = {};
+  if (outcome.status === 'needs_input') {
+    const recoveryPresentation = constrainNeedsInputPresentationForRecovery({
+      sessionId: requested.identity.sessionId,
+      sourceUserSeq: requested.identity.sourceUserSeq,
+      proposedText: requested.text,
+    });
+    if (recoveryPresentation.constrained) {
+      effectiveOutcome = repairArgumentsNeedsInputOutcome(outcome, recoveryPresentation.text);
+      // The durable directive replaced any approval/continue edge with an
+      // ordinary repair-or-stop question. Compatibility readers still inspect
+      // `reason`, so it must describe the same edge as the typed projection.
+      effectiveOptions = {
+        ...options,
+        legacyReason: 'awaiting_user_input',
+      };
+    }
+  }
   // An immutable expected-work contract is the staged cut-over marker. Before
   // publishing `done`, derive the manifest and redeem host evidence from the
   // exact settled calls. Historical/action-deferred sources retain their

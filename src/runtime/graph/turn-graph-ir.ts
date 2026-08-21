@@ -113,6 +113,20 @@ export interface TurnGraphEvidenceRequirement {
   kinds: TurnEvidenceKind[];
 }
 
+/** Canonical open-slot bytes owned by an await_input node. A later reply is a
+ *  distinct accepted-source audit event that must settle or amend this same
+ *  root goal — it does not mint a sibling goal. */
+export interface TurnGraphAwaitInput {
+  goalId: string;
+  revision: number;
+  questionId: string;
+  slotId: string;
+  deliveredQuestion: string;
+  visibleOptions: ReadonlyArray<{ optionId: string; label: string }>;
+  candidateRefs?: readonly string[];
+  predecessorRefs?: readonly string[];
+}
+
 export interface TurnGraphNode {
   id: string;
   kind: TurnGraphNodeKind;
@@ -125,6 +139,13 @@ export interface TurnGraphNode {
   authority: TurnGraphAuthority;
   capabilities: TurnGraphCapabilityRequirement[];
   evidence: TurnGraphEvidenceRequirement;
+  /** Present only on await_input. Packet bytes are copied from this tuple. */
+  awaitInput?: TurnGraphAwaitInput;
+  /** Stable admitted operation identity. */
+  operationId?: string;
+  capabilityRole?: string;
+  cardinality?: number;
+  requiredFields?: string[];
   /**
    * The runtime-topology CONTRACT for a planner node (Clem 4 G5a).
    *
@@ -204,7 +225,49 @@ export interface TurnGraphIR {
       detected: boolean;
       itemCount: number;
       explicitParallelRequest: boolean;
+      /** Counted set is read once; the write is one artifact from that set. */
+      collectThenConstruct: boolean;
     };
+    /** Durable goal shape. No request prose. Cardinality, projection, and
+     *  destinations survive compilation as evidence requirements. */
+    goalConstraints?: {
+      construct: 'none' | 'collect_then_construct' | 'fanout' | 'single_act';
+      collection?: { count: number; projection: string[] };
+      evidenceRequirements?: readonly string[];
+      destinations?: Array<{
+        posture: 'create_new' | 'named_existing';
+        family: string;
+        handleRequired: boolean;
+        binding?: {
+          manifestId: string;
+          manifestDigest: string;
+          accountId: string;
+          operationId: string;
+          schemaVersion: string;
+          definitionFingerprint: string;
+          effect: string;
+          posture: 'create_new' | 'named_existing';
+        };
+      }>;
+      /** Projection of destinations[0]. Not a second authority field. */
+      destination?: {
+        posture: 'create_new' | 'named_existing';
+        family: string;
+        handleRequired: boolean;
+        binding?: {
+          manifestId: string;
+          manifestDigest: string;
+          accountId: string;
+          operationId: string;
+          schemaVersion: string;
+          definitionFingerprint: string;
+          effect: string;
+          posture: 'create_new' | 'named_existing';
+        };
+      };
+    };
+    /** Root goal identity that outlives one sourceUserSeq. */
+    goalIdentity?: { goalId: string; revision: number };
   };
   fastPath: TurnGraphFastPath;
   effectCeiling: RuntimeToolEffect | 'none';

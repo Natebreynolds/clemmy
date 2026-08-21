@@ -24,6 +24,14 @@ import {
   validateTurnGraph,
 } from './turn-graph-compiler.js';
 import type {
+  AdmittedTurnSemantics,
+  DurableAcceptedTurnGraphPersistenceTicket,
+} from './admitted-turn-semantics.js';
+import {
+  inspectDurableAcceptedTurnGraphPersistenceTicket,
+  isAdmittedTurnSemantics,
+} from './admitted-turn-semantics.js';
+import type {
   TurnGraphIR,
   TurnGraphPolicySnapshot,
   TurnGraphSurface,
@@ -41,6 +49,12 @@ export interface RecordTurnGraphShadowInput {
   verifiedTaskContinuation?: TaskContinuationContext;
   /** Injection seam for callers/tests that already captured the policy. */
   policy?: TurnGraphPolicySnapshot | ProactivityPolicySnapshot;
+  /** Opaque admitted semantics. When present, compile is typed-only. */
+  admitted?: AdmittedTurnSemantics;
+  /** Precompiled graph from compileAdmittedTurn. Persisted as-is. */
+  graph?: TurnGraphIR;
+  /** Unforgeable binding from the durable semantic compiler. */
+  persistenceTicket?: DurableAcceptedTurnGraphPersistenceTicket;
 }
 
 interface TaskContinuationLineage {
@@ -55,6 +69,21 @@ interface TaskContinuationLineage {
 // Keep the graph reader off attempt-identity's dispatch-ledger module cycle.
 // This is the accepted-task protocol's public deterministic identity formula;
 // production pins compare it to acceptedTaskIdFor at the authority boundary.
+export function sessionHasPriorRetrieveOrAct(sessionId: string, beforeSourceUserSeq: number): boolean {
+  if (!sessionId.trim() || !Number.isSafeInteger(beforeSourceUserSeq) || beforeSourceUserSeq <= 0) {
+    return false;
+  }
+  return listEvents(sessionId, { types: ['turn_graph_compiled'] }).some((event) => {
+    const source = event.data?.sourceUserSeq;
+    const route = event.data?.route;
+    return typeof source === 'number'
+      && Number.isSafeInteger(source)
+      && source > 0
+      && source < beforeSourceUserSeq
+      && (route === 'retrieve' || route === 'act');
+  });
+}
+
 function lineageAcceptedTaskId(sessionId: string, sourceUserSeq: number): string {
   return `task:${sessionId}#${sourceUserSeq}`;
 }
@@ -168,7 +197,15 @@ export function turnGraphFromShadowEvent(event: EventRow | null): TurnGraphIR | 
     ) return null;
   }
   const validation = validateTurnGraph(graph);
-  return validation.ok ? graph : null;
+  if (!validation.ok) return null;
+  const cloned = structuredClone(graph);
+  const freeze = (value: unknown): void => {
+    if (!value || typeof value !== 'object') return;
+    for (const child of Object.values(value as Record<string, unknown>)) freeze(child);
+    Object.freeze(value);
+  };
+  freeze(cloned);
+  return cloned;
 }
 
 function acceptedSource(identity: RecordTurnGraphShadowInput['identity']): EventRow | null {
@@ -239,6 +276,23 @@ function isGraphPolicy(value: RecordTurnGraphShadowInput['policy']): value is Tu
   return Boolean(value && 'version' in value && value.version === 'turn-policy-v1');
 }
 
+function suppliedGraphMatchesAcceptedSource(input: {
+  graph: TurnGraphIR;
+  identity: RecordTurnGraphShadowInput['identity'];
+  graphId: string;
+  sourceText: string;
+}): boolean {
+  const validation = validateTurnGraph(input.graph);
+  return validation.ok
+    && input.graph.identity.sessionId === input.identity.sessionId
+    && input.graph.identity.turn === input.identity.turn
+    && input.graph.identity.sourceUserSeq === input.identity.sourceUserSeq
+    && input.graph.graphId === input.graphId
+    && input.graph.source.inputHash === createHash('sha256')
+      .update(input.sourceText, 'utf8')
+      .digest('hex');
+}
+
 /**
  * Compile and persist the observational graph for one exact accepted chat turn.
  *
@@ -279,6 +333,13 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
       ? continuationLineageFor(input.identity.sessionId, verifiedContinuation)
       : undefined;
     const graphId = `turn-graph:v1:${input.identity.sourceUserSeq}`;
+    const durablePersistence = input.graph && input.persistenceTicket
+      ? inspectDurableAcceptedTurnGraphPersistenceTicket({
+          ticket: input.persistenceTicket,
+          graph: input.graph,
+        })
+      : null;
+    if (input.persistenceTicket && !durablePersistence) return null;
     const prior = getTurnGraphEventForSource(
       input.identity.sessionId,
       input.identity.sourceUserSeq,
@@ -290,12 +351,43 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
       if (lineage && (!priorLineage || !sameContinuationLineage(lineage, priorLineage))) {
         return null;
       }
-      return turnGraphFromShadowEvent(prior)
-        && prior.turn === source.turn
-        && prior.parentEventId === source.id
-        && prior.data.graphId === graphId
-        ? prior
-        : null;
+      const priorGraph = turnGraphFromShadowEvent(prior);
+      if (
+        !priorGraph
+        || prior.turn !== source.turn
+        || prior.parentEventId !== source.id
+        || prior.data.graphId !== graphId
+      ) return null;
+
+      // A typed admit/compile caller supplies the exact graph it intends to
+      // persist. Reusing an older graph solely because it shares the source
+      // identity can otherwise resurrect a legacy regex-derived action graph
+      // after the semantic model has classified the same source as
+      // conversation (or vice versa). Exact graph equality is therefore part
+      // of replay authority for precompiled turns. Ordinary legacy observers
+      // still dedupe their first graph without recompiling on another surface.
+      if (input.graph) {
+        if (!suppliedGraphMatchesAcceptedSource({
+          graph: input.graph,
+          identity: input.identity,
+          graphId,
+          sourceText,
+        })) return null;
+        if (durablePersistence) {
+          if (
+            prior.data.semanticProvenanceDigest
+              !== durablePersistence.semanticProvenanceDigest
+          ) return null;
+        } else if (input.graph.compiler.graphHash !== priorGraph.compiler.graphHash) {
+          return null;
+        }
+      } else if (input.admitted) {
+        // Admitted semantics must arrive through the atomic precompile seam;
+        // accepting an opaque admission beside a pre-existing legacy graph
+        // provides no graph hash with which to prove equivalence.
+        return null;
+      }
+      return prior;
     }
 
     const text = graphSemanticText(
@@ -308,15 +400,43 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
       ? input.policy
       : snapshotTurnGraphPolicy(input.policy ?? getProactivityPolicySnapshot());
     const startedAt = performance.now();
-    const compiled = compileTurnGraph({
-      identity: input.identity,
-      input: text,
-      sessionKind: session.kind,
-      surface: input.surface ?? 'direct',
-      policy,
-      allowedToolNames: input.allowedToolNames,
-      excludedToolNames: input.excludedToolNames,
-    });
+    if (input.admitted !== undefined && !isAdmittedTurnSemantics(input.admitted)) {
+      return null;
+    }
+    const compiled = input.graph
+      ? {
+          graph: input.graph,
+          validation: suppliedGraphMatchesAcceptedSource({
+            graph: input.graph,
+            identity: input.identity,
+            graphId,
+            sourceText,
+          })
+            ? validateTurnGraph(input.graph)
+            : {
+                ok: false,
+                errors: ['Precompiled graph does not match the exact accepted source.'],
+                warnings: [],
+                nodeCount: input.graph.nodes.length,
+                edgeCount: input.graph.edges.length,
+              },
+        }
+      : compileTurnGraph({
+          identity: input.identity,
+          input: text,
+          sessionKind: session.kind,
+          surface: input.surface ?? 'direct',
+          policy,
+          allowedToolNames: input.allowedToolNames,
+          excludedToolNames: input.excludedToolNames,
+          ...(input.admitted ? { admitted: input.admitted } : {}),
+          signals: {
+            continueHostedWorld: sessionHasPriorRetrieveOrAct(
+              input.identity.sessionId,
+              input.identity.sourceUserSeq,
+            ),
+          },
+        });
     if (!compiled.validation.ok) return null;
     const compileMs = Number((performance.now() - startedAt).toFixed(3));
     const graph = compiled.graph;
@@ -347,6 +467,9 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
         authorityRequirements,
         capabilityKinds,
         warnings: compiled.validation.warnings,
+        ...(durablePersistence ? {
+          semanticProvenanceDigest: durablePersistence.semanticProvenanceDigest,
+        } : {}),
         ...(lineage ? { taskContinuationLineage: lineage } : {}),
         graph,
       },
