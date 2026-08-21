@@ -47,6 +47,10 @@ final class WebViewModel: NSObject, ObservableObject {
         // the native scanner — this is that way. The shell still confirms via
         // the same dialog as shake-to-unpair before anything is cleared.
         config.userContentController.add(ScriptProxy(self), name: "clemRepair")
+        // The page hands over a short-lived origin-handoff token while it is
+        // on the LAN; the shell keeps it so the next relay-origin load can
+        // establish a session there. See loadHome().
+        config.userContentController.add(ScriptProxy(self), name: "clemHandoff")
         impactLight.prepare()
         impactMedium.prepare()
         notify.prepare()
@@ -117,7 +121,30 @@ final class WebViewModel: NSObject, ObservableObject {
     }
 
     func loadHome() {
-        if let url = pairing.homeURL { load(url) }
+        guard let url = pairing.homeURL else { return }
+        // Cookies and the page's device key are per-ORIGIN, so arriving at the
+        // relay door means arriving with no credential — and pairing there is
+        // refused by design (it is a LAN ceremony). The shell is the only
+        // thing that survives the origin switch, so it carries a LAN-minted,
+        // single-use handoff token across and spends it here. Without this,
+        // off-LAN access is a deadlock: the app reaches the Mac and then sits
+        // on a sign-in screen only home wifi can satisfy.
+        if isRelayOrigin(pairing.origin), let handoff = OriginHandoffStore.take() {
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            var items = components?.queryItems ?? []
+            items.append(URLQueryItem(name: "adopt", value: handoff))
+            components?.queryItems = items
+            if let adoptURL = components?.url {
+                load(adoptURL)
+                return
+            }
+        }
+        load(url)
+    }
+
+    private func isRelayOrigin(_ origin: String) -> Bool {
+        guard let relay = pairing.relayOrigin else { return false }
+        return origin == relay
     }
 
     /// Bonjour found the Mac at a new address: persist and reload.
@@ -261,6 +288,28 @@ enum CertificatePin {
     }
 }
 
+/// The one credential that must survive an origin switch.
+///
+/// In memory only, single use, and it refuses an expired token — the page
+/// mints a fresh one on every LAN visit, so there is never a reason to keep
+/// one on disk.
+enum OriginHandoffStore {
+    private static var token: String?
+    private static var expiresAt: Date?
+
+    static func park(token newToken: String, expiresAtMs: Double) {
+        token = newToken
+        expiresAt = Date(timeIntervalSince1970: expiresAtMs / 1000)
+    }
+
+    /// Returns the token once, and only while it is still valid.
+    static func take() -> String? {
+        defer { token = nil; expiresAt = nil }
+        guard let token, let expiresAt, expiresAt > Date() else { return nil }
+        return token
+    }
+}
+
 /// Breaks the retain cycle WKUserContentController would otherwise create by
 /// holding its message handler strongly for the life of the configuration.
 private final class ScriptProxy: NSObject, WKScriptMessageHandler {
@@ -271,6 +320,16 @@ private final class ScriptProxy: NSObject, WKScriptMessageHandler {
     }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "clemHandoff" {
+            // Opaque single-use token + its expiry. Held only in memory: it is
+            // short-lived by design and a fresh one is minted on every LAN
+            // visit, so persisting it would widen the window for no gain.
+            guard let body = message.body as? [String: Any],
+                  let token = body["token"] as? String,
+                  let expiresAt = body["expiresAt"] as? Double else { return }
+            OriginHandoffStore.park(token: token, expiresAtMs: expiresAt)
+            return
+        }
         if message.name == "clemRepair" {
             // The page asked for the scanner; the shell owns the decision.
             NotificationCenter.default.post(name: .repairRequested, object: nil)

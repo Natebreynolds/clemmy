@@ -54,6 +54,27 @@ export function inNativeShell(): boolean {
 }
 
 /**
+ * Park an origin-handoff token with the native shell.
+ *
+ * The shell is the only thing that survives an origin switch: cookies and the
+ * device key are per-origin, so when the app moves to the relay door it needs
+ * a credential the page itself cannot carry. The web layer mints the token on
+ * the LAN (where trust was established) and hands it over; the shell appends
+ * it as `?adopt=` when it loads the relay origin. Absent shell = no-op, and
+ * the token simply expires unused.
+ */
+export function parkOriginHandoff(token: string, expiresAt: number): boolean {
+  try {
+    const handler = window.webkit?.messageHandlers?.clemHandoff;
+    if (!handler) return false;
+    handler.postMessage({ token, expiresAt });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Ask the native shell to clear its pairing and show the scanner.
  *
  * The stranded state this fixes (live): the web session expires inside a

@@ -141,6 +141,13 @@ export function restrictDirectAppIngressToMobile(req: Request, res: Response, ne
   //                   defending it; remote access rides the device-bound key
   //                   established at pairing, and the phone itself is gated
   //                   by Face ID.
+  //
+  // /m/auth/origin-adopt is deliberately NOT here: it is how a phone that
+  // paired on the LAN establishes its session at the relay ORIGIN (cookies
+  // and device keys are per-origin, so without it off-LAN access is a
+  // deadlock). Its token can only be minted by an already-authenticated
+  // request on a LAN door, so the trust decision still happens at home.
+  // Minting — /m/auth/origin-handoff — stays LAN-only, enforced at the route.
   if (req.clemIngress === 'relay' && RELAY_FORBIDDEN_PATHS.has(req.path)) {
     res.status(404).type('text/plain').send('Not found');
     return;

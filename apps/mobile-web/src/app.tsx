@@ -1,8 +1,17 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { Component } from 'preact';
 import { useCallback, useEffect, useState } from 'preact/hooks';
-import { api, getAuthStatus, logout, pairDevice, type AuthStatus, type ChatSession } from './lib/api';
-import { CONNECTION_EVENT, connectionDoor, haptic, type ConnectionDoor } from './lib/native-bridge';
+import {
+  adoptOriginSession,
+  api,
+  getAuthStatus,
+  logout,
+  mintOriginHandoff,
+  pairDevice,
+  type AuthStatus,
+  type ChatSession,
+} from './lib/api';
+import { CONNECTION_EVENT, connectionDoor, haptic, parkOriginHandoff, type ConnectionDoor } from './lib/native-bridge';
 import { Login } from './screens/Login';
 import { Home } from './screens/Home';
 import { Activity } from './screens/Activity';
@@ -56,6 +65,57 @@ export function App() {
       .then((who) => setName(who.name ?? ''))
       .catch(() => setName(''));
   }, [authStatus?.authenticated]);
+
+  // ORIGIN ADOPTION — the credential handoff that makes off-LAN access work.
+  //
+  // A cookie and the device key belong to ONE origin. The phone establishes
+  // them at home on the LAN origin; the relay door is a different origin and
+  // starts with nothing, and pairing there is refused by design. So the shell
+  // carries a LAN-minted handoff token across and hands it to this page as
+  // `?adopt=`; spending it mints the same device's session at this origin.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('adopt');
+    if (!token) return;
+    let cancelled = false;
+    const cleanUrl = () => {
+      const clean = `${window.location.pathname}${window.location.hash || ''}`;
+      window.history.replaceState(null, '', clean || '/m/');
+    };
+    void (async () => {
+      try {
+        await adoptOriginSession(token);
+        if (cancelled) return;
+        cleanUrl();
+        await refreshAuth();
+      } catch {
+        // A spent or expired handoff is not an error the user can act on
+        // remotely — fall through to the normal unauthenticated screen.
+        if (cancelled) return;
+        cleanUrl();
+        await refreshAuth();
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [refreshAuth]);
+
+  // While authenticated on the LAN, keep a fresh handoff parked with the
+  // shell, so leaving the house never finds an expired one.
+  useEffect(() => {
+    if (!authStatus?.authenticated) return;
+    if (door === 'relay') return; // already remote — this origin can't mint
+    let cancelled = false;
+    const park = async (): Promise<void> => {
+      try {
+        const handoff = await mintOriginHandoff();
+        if (!cancelled) parkOriginHandoff(handoff.token, handoff.expiresAt);
+      } catch { /* best effort — absence just means re-pair on the next LAN visit */ }
+    };
+    void park();
+    // Refresh well inside the token's lifetime.
+    const timer = setInterval(() => { void park(); }, 5 * 60_000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [authStatus?.authenticated, door]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);

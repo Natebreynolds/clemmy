@@ -84,7 +84,12 @@ test('relay E2E: pinned TLS passes through untouched; routes and IP survive; pai
   app.get('/m/ping', (req, res) => {
     res.json({ ok: true, ingress: req.clemIngress, clientIp: relayClientIp(req) ?? null });
   });
+  // Stubs so the assertions below test the INGRESS GUARD rather than route
+  // absence: a 404 from a missing route would pass a "is it blocked?" check
+  // for the wrong reason, and silently stop protecting anything.
   app.post('/m/auth/pair', (_req, res) => res.json({ paired: true }));
+  app.post('/m/auth/login', (_req, res) => res.json({ loggedIn: true }));
+  app.post('/m/auth/origin-adopt', (_req, res) => res.json({ adopted: true }));
   app.get('/admin', (_req, res) => res.json({ admin: true }));
 
   const relayListener = await startRelayInternalListener(app, {
@@ -159,6 +164,14 @@ test('relay E2E: pinned TLS passes through untouched; routes and IP survive; pai
     assert.equal(admin.status, 404, 'non-/m/* is refused on the relay door');
     const pair = await request('/m/auth/pair', 'POST');
     assert.equal(pair.status, 404, 'pairing is refused over the relay — it is a LAN ceremony');
+    const login = await request('/m/auth/login', 'POST');
+    assert.equal(login.status, 404, 'the PIN box is not reachable from the internet');
+    // Origin adoption MUST remain reachable here: it is the only way a phone
+    // that paired on the LAN can hold a session at this (different) origin,
+    // and its token can only be minted by an authenticated LAN request. If a
+    // future path-guard change 404s this, off-LAN access silently deadlocks.
+    const adopt = await request('/m/auth/origin-adopt', 'POST');
+    assert.notEqual(adopt.status, 404, 'origin adoption must be reachable over the relay');
 
     // TOFU: a second daemon claiming the same pairId with a different token
     // is refused.

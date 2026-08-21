@@ -633,6 +633,60 @@ function consumeStreamTicket(ticket: string, deviceId: string, pathname: string)
 }
 
 /**
+ * Origin handoff — how a phone that paired on the LAN can also be itself at
+ * the relay origin.
+ *
+ * A web session cookie and the device key in IndexedDB are per-ORIGIN. The
+ * phone pairs at `https://<lan-ip>:8421` and holds its credential there; the
+ * relay door is a DIFFERENT origin (`https://<pairId>.<base>:<port>`), so the
+ * browser presents nothing there — and pairing is refused over the relay
+ * because it is a LAN ceremony. Off-LAN access was therefore a deadlock: the
+ * one credential the phone could establish remotely was the one credential
+ * remote callers may not establish (live: the app reached the relay and sat
+ * on a login screen that could not be satisfied from anywhere but home).
+ *
+ * The handoff breaks it without weakening the ceremony. The token is minted
+ * ONLY by an already-authenticated request on a LAN door — the trust decision
+ * still happens at home, in person — and is single-use with a short TTL. It
+ * is then redeemable at the relay origin to mint a second session for the
+ * SAME device, so the phone keeps one identity in the device list. A remote
+ * attacker without a token gains nothing; a token that leaks is one device
+ * session, expiring in minutes, revocable from the desktop like any other.
+ */
+const ORIGIN_HANDOFF_TTL_MS = 10 * 60_000;
+const originHandoffs = new Map<string, { deviceId: string; deviceLabel?: string; expiresAt: number }>();
+
+function mintOriginHandoff(deviceId: string, deviceLabel?: string): { token: string; expiresAt: number } {
+  const now = Date.now();
+  for (const [key, value] of originHandoffs) {
+    if (value.expiresAt <= now) originHandoffs.delete(key);
+  }
+  // One live handoff per device: minting a fresh one retires the old, so a
+  // token left unused on a previous LAN visit cannot be redeemed later.
+  for (const [key, value] of originHandoffs) {
+    if (value.deviceId === deviceId) originHandoffs.delete(key);
+  }
+  const token = randomBytes(32).toString('base64url');
+  const expiresAt = now + ORIGIN_HANDOFF_TTL_MS;
+  originHandoffs.set(token, { deviceId, deviceLabel, expiresAt });
+  return { token, expiresAt };
+}
+
+function consumeOriginHandoff(token: string): { deviceId: string; deviceLabel?: string } | null {
+  const entry = originHandoffs.get(token);
+  if (!entry) return null;
+  // Single use, whatever the outcome.
+  originHandoffs.delete(token);
+  if (entry.expiresAt <= Date.now()) return null;
+  return { deviceId: entry.deviceId, deviceLabel: entry.deviceLabel };
+}
+
+/** Test seam: a fresh process starts with no outstanding handoffs. */
+export function _clearOriginHandoffsForTests(): void {
+  originHandoffs.clear();
+}
+
+/**
  * Distributed-brute-force alarm: a one-shot notification the moment a failure
  * tips the global counter into lockdown.
  *
@@ -1049,6 +1103,80 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       expiresAt: record.expiresAt,
       binding: record.binding,
       sessionFingerprint: sessionFingerprint(token),
+    });
+  });
+
+  /**
+   * Mint an origin handoff. LAN doors only — the whole point is that the
+   * authorization happened at home. Requires a live authenticated session
+   * (and its device proof), so only a phone that already paired can ask.
+   */
+  router.post('/auth/origin-handoff', requireMobileSession, (req, res) => {
+    if (req.clemIngress === 'relay') {
+      res.status(403).json({ error: 'LAN_ONLY' });
+      return;
+    }
+    const ctx = req.mobileSession!;
+    const handoff = mintOriginHandoff(ctx.record.deviceId, ctx.record.deviceLabel);
+    res.json(handoff);
+  });
+
+  /**
+   * Redeem an origin handoff at the origin that needs a session (the relay
+   * door). Anonymous by necessity — the browser has nothing else to present
+   * here — so the token IS the credential, and it is rate-limited on the same
+   * budget as pairing.
+   */
+  router.post('/auth/origin-adopt', async (req, res) => {
+    const ip = clientIp(req);
+    const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+    if (!token) {
+      res.status(400).json({ error: 'HANDOFF_TOKEN_REQUIRED' });
+      return;
+    }
+    const adoptOpts = { ...stateOpts, scope: 'pair' as const };
+    const gate = checkAttempt(ip, adoptOpts);
+    if (!gate.allowed) {
+      res.status(429)
+        .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
+        .json({ error: 'LOCKED_OUT', retryAfterMs: gate.retryAfterMs });
+      return;
+    }
+    const handoff = consumeOriginHandoff(token);
+    if (!handoff) {
+      const decision = await recordFailure(ip, adoptOpts);
+      await notifyGlobalLockdown('pair', decision);
+      if (!decision.allowed) {
+        res.status(429)
+          .set('Retry-After', String(Math.ceil(decision.retryAfterMs / 1000)))
+          .json({
+            error: decision.globalLocked ? 'GLOBAL_LOCKED_OUT' : 'LOCKED_OUT',
+            retryAfterMs: decision.retryAfterMs,
+          });
+        return;
+      }
+      res.status(401).json({ error: 'INVALID_HANDOFF' });
+      return;
+    }
+    await recordSuccess(ip, adoptOpts);
+    const { token: sessionToken, record } = await createSession(
+      {
+        deviceLabel: handoff.deviceLabel,
+        devicePublicKeyJwk: readDeviceKeyFromBody(req),
+        ip,
+        // Same device identity as the LAN session: one phone, one row in the
+        // device list, revocable as one thing.
+        deviceId: handoff.deviceId,
+      },
+      stateOpts,
+    );
+    setSessionCookie(req, res, sessionToken);
+    res.json({
+      deviceId: record.deviceId,
+      deviceLabel: record.deviceLabel,
+      expiresAt: record.expiresAt,
+      binding: record.binding,
+      sessionFingerprint: sessionFingerprint(sessionToken),
     });
   });
 

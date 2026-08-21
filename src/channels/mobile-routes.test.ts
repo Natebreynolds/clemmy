@@ -29,6 +29,7 @@ const {
   createMobileRouter,
   MOBILE_SESSION_COOKIE,
   _clearMobileChatInFlightForTests,
+  _clearOriginHandoffsForTests,
 } = await import('./mobile-routes.js');
 const { _clearIdempotencyForTests } = await import('../runtime/idempotency.js');
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-presentation.js');
@@ -1682,6 +1683,67 @@ test('workflow detail route is wired and session-gated', async () => {
     const anon = await fetch(`${h.url}/m/api/workflows/does-not-exist`);
     assert.equal(anon.status, 401);
   } finally { await h.close(); }
+});
+
+test('origin handoff: LAN-minted, single-use, adopts the SAME device at the relay origin', async () => {
+  // The deadlock this breaks: cookies + device keys are per-origin, so the
+  // relay door starts with no credential — and pairing there is refused
+  // because it is a LAN ceremony. Without a handoff, off-LAN access is
+  // impossible for a phone that paired at home (live defect).
+  _clearOriginHandoffsForTests();
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Handoff phone');
+
+    // Mint on the LAN door, authenticated.
+    const mint = await fetch(`${h.url}/m/auth/origin-handoff`, { method: 'POST', headers: { cookie } });
+    assert.equal(mint.status, 200);
+    const handoff = await mint.json() as { token: string; expiresAt: number };
+    assert.ok(handoff.token && handoff.token.length >= 32, 'a real token');
+    assert.ok(handoff.expiresAt > Date.now(), 'not already expired');
+
+    // Anonymous callers cannot mint one.
+    const anonMint = await fetch(`${h.url}/m/auth/origin-handoff`, { method: 'POST' });
+    assert.equal(anonMint.status, 401);
+
+    // Redeem it WITHOUT the LAN cookie — this is the whole point: a different
+    // origin presents nothing, and the token alone establishes the session.
+    const adopt = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: handoff.token }),
+    });
+    assert.equal(adopt.status, 200);
+    const adopted = await adopt.json() as { deviceId: string; sessionFingerprint: string };
+    assert.ok(adopted.sessionFingerprint, 'the adopted session can sign proofs');
+    const adoptedCookie = extractCookie(adopt.headers.get('set-cookie'));
+    assert.ok(adoptedCookie, 'a session cookie is set for this origin');
+
+    // Same device identity — one phone, one row in the device list.
+    const whoLan = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const whoRelay = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie: adoptedCookie! } });
+    assert.equal(whoLan.status, 200);
+    assert.equal(whoRelay.status, 200, 'the adopted session actually works');
+
+    // Single use: the same token cannot mint a second session.
+    const replay = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: handoff.token }),
+    });
+    assert.equal(replay.status, 401);
+
+    // Garbage is refused.
+    const bogus = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'not-a-real-handoff-token-value-000000' }),
+    });
+    assert.ok(bogus.status === 401 || bogus.status === 429, `unexpected ${bogus.status}`);
+  } finally {
+    _clearOriginHandoffsForTests();
+    await h.close();
+  }
 });
 
 test('setPin enforces 8-64 char floor + allowed-char policy', async () => {

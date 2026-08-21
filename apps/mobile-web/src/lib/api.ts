@@ -39,6 +39,9 @@ function isPreAuthPath(path: string): boolean {
     || clean === '/m/auth/pair'
     || clean === '/m/auth/logout'
     || clean === '/m/auth/device-key'
+    // Adoption establishes the credential at a new origin — there is nothing
+    // to sign with yet, exactly like pairing.
+    || clean === '/m/auth/origin-adopt'
     || clean === '/m/push/vapid-key';
 }
 
@@ -192,6 +195,28 @@ export async function pairDevice(pairToken: string, deviceLabel?: string): Promi
   return adoptSession(await api<LoginResponse>('/m/auth/pair', {
     method: 'POST',
     body: JSON.stringify({ pairToken, deviceLabel, devicePublicKeyJwk }),
+  }));
+}
+
+/**
+ * Ask this (LAN) origin for a handoff token that the app can spend at the
+ * relay origin. Cheap, single-use, short-lived — minted on every LAN visit so
+ * a fresh one is always waiting when the phone leaves the house.
+ */
+export async function mintOriginHandoff(): Promise<{ token: string; expiresAt: number }> {
+  return api('/m/auth/origin-handoff', { method: 'POST' });
+}
+
+/**
+ * Spend a handoff token at THIS origin (the relay door) to establish the
+ * session the browser cannot carry across origins. Same device identity, so
+ * the phone stays one row in the desktop's device list.
+ */
+export async function adoptOriginSession(token: string): Promise<LoginResponse> {
+  const devicePublicKeyJwk = await devicePublicKeyOrUndefined();
+  return adoptSession(await api<LoginResponse>('/m/auth/origin-adopt', {
+    method: 'POST',
+    body: JSON.stringify({ token, devicePublicKeyJwk }),
   }));
 }
 
