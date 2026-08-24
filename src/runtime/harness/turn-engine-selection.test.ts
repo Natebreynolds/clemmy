@@ -15,11 +15,20 @@ afterEach(() => {
   else process.env[TURN_ENGINE_ENV_KEY] = original;
 });
 
-test('fresh chat defaults to production host_v1 while non-chat retains legacy ownership', () => {
+// ONE LOOP, EVERY CARRIER. How work was SENT OFF must not decide which
+// reasoning engine runs it: a workflow step, a cron occurrence and a chat turn
+// differ in context, not in engine. Before this, 15 of 1,121+ real turns ever
+// reached the host loop, and four scheduled workflows blocked in one batch on
+// the lane chat had already left behind.
+test('every fresh carrier selects the host engine, not just chat', () => {
   delete process.env[TURN_ENGINE_ENV_KEY];
-  assert.equal(selectTurnEngine({ sessionKind: 'chat' }), 'host_v1');
-  assert.equal(selectTurnEngine({ sessionKind: 'workflow' }), 'legacy_sdk');
-  assert.equal(selectTurnEngine({ sessionKind: 'execution' }), 'legacy_sdk');
+  for (const sessionKind of ['chat', 'workflow', 'execution', 'cron', 'background']) {
+    assert.equal(
+      selectTurnEngine({ sessionKind }),
+      'host_v1',
+      `${sessionKind} must not be routed to a second reasoning engine`,
+    );
+  }
 });
 
 test('fresh interactive configuration rejects legacy, unknown, and blank values', () => {
@@ -35,11 +44,14 @@ test('fresh interactive configuration rejects legacy, unknown, and blank values'
   }
 });
 
-test('invalid fresh configuration cannot disturb non-chat or persisted resume ownership', () => {
-  assert.equal(selectTurnEngine({
-    sessionKind: 'execution',
-    configuredValue: 'future-engine',
-  }), 'legacy_sdk');
+test('invalid fresh configuration is rejected on every carrier, and cannot disturb persisted resume ownership', () => {
+  // An unusable engine name must fail loudly on a workflow exactly as it does
+  // on chat -- silently downgrading a carrier to the legacy owner is how the
+  // fork got reintroduced by accident before.
+  assert.throws(
+    () => selectTurnEngine({ sessionKind: 'execution', configuredValue: 'future-engine' }),
+    InvalidFreshTurnEngineError,
+  );
   assert.equal(selectTurnEngine({
     sessionKind: 'chat',
     persistedState: 'legacy_sdk',
@@ -47,18 +59,18 @@ test('invalid fresh configuration cannot disturb non-chat or persisted resume ow
   }), 'legacy_sdk');
 });
 
-test('the host canary selects only fresh interactive chat', () => {
+test('host_v1_read_only applies to every carrier', () => {
   process.env[TURN_ENGINE_ENV_KEY] = 'host_v1_read_only';
-  assert.equal(selectTurnEngine({ sessionKind: 'chat' }), 'host_v1_read_only');
-  assert.equal(selectTurnEngine({ sessionKind: 'workflow' }), 'legacy_sdk');
-  assert.equal(selectTurnEngine({ sessionKind: 'execution' }), 'legacy_sdk');
+  for (const sessionKind of ['chat', 'workflow', 'execution']) {
+    assert.equal(selectTurnEngine({ sessionKind }), 'host_v1_read_only');
+  }
 });
 
-test('production host_v1 selects only fresh interactive chat', () => {
+test('host_v1 applies to every carrier', () => {
   process.env[TURN_ENGINE_ENV_KEY] = 'host_v1';
-  assert.equal(selectTurnEngine({ sessionKind: 'chat' }), 'host_v1');
-  assert.equal(selectTurnEngine({ sessionKind: 'workflow' }), 'legacy_sdk');
-  assert.equal(selectTurnEngine({ sessionKind: 'execution' }), 'legacy_sdk');
+  for (const sessionKind of ['chat', 'workflow', 'execution']) {
+    assert.equal(selectTurnEngine({ sessionKind }), 'host_v1');
+  }
 });
 
 test('persisted interruption state owns resume selection across flag changes', () => {
@@ -82,4 +94,23 @@ test('persisted interruption state owns resume selection across flag changes', (
     persistedState: 'host_v1_read_only',
     configuredValue: 'host_v1',
   }), 'host_v1_read_only');
+});
+
+// legacy_sdk survives only as a persisted resume identity. A turn serialized by
+// the old engine must still resume through it -- on any carrier -- but nothing
+// may SELECT it fresh.
+test('legacy_sdk is resume-only and reachable on no fresh carrier', () => {
+  delete process.env[TURN_ENGINE_ENV_KEY];
+  for (const sessionKind of ['chat', 'workflow', 'execution']) {
+    assert.equal(
+      selectTurnEngine({ sessionKind, persistedState: 'legacy_sdk' }),
+      'legacy_sdk',
+      'a turn the legacy engine serialized must resume through it',
+    );
+    assert.notEqual(
+      selectTurnEngine({ sessionKind }),
+      'legacy_sdk',
+      'no fresh carrier may select the legacy engine',
+    );
+  }
 });
