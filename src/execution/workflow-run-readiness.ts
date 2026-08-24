@@ -144,7 +144,43 @@ export function checkWorkflowRunReadiness(
 
 const RESOURCE_PROBE_TIMEOUT_MS = 8_000;
 const SAFE_ACCOUNT_SELECTOR = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}$/;
-const SALESFORCE_AUTH_MISSING = /namedorgnotfounderror|orgnotfounderror|noauthinfo(?:found)?error|no authorization information found|no authorization found|not authenticated|authorize (?:this|an|the) org|authentication (?:has )?(?:expired|is invalid|was revoked)|(?:access|refresh) token (?:has )?(?:expired|is invalid|was revoked)|invalid_grant/i;
+const ACCOUNT_AUTH_MISSING = /namedorgnotfounderror|orgnotfounderror|noauthinfo(?:found)?error|no authorization information found|no authorization found|not authenticated|authorize (?:this|an|the) org|authentication (?:has )?(?:expired|is invalid|was revoked)|(?:access|refresh) token (?:has )?(?:expired|is invalid|was revoked)|invalid_grant/i;
+
+/**
+ * A local credential STORE refused to release a credential that exists. This is
+ * not the same failure as "no credential on this machine", and it does not have
+ * the same remedy: signing in again cannot fix a store the process cannot read.
+ */
+const ACCOUNT_CREDENTIAL_STORE_UNREADABLE = /keychain|keyring|secretservice|libsecret|wincred|credential (?:store|manager)|passphrase|could not (?:be )?decrypt|decryption failed|auth file .{0,40}(?:is )?invalid/i;
+
+/**
+ * Read-only account probes, one entry per CLI.
+ *
+ * Authentication is irreducibly vendor-shaped — there is no generic way to ask
+ * an arbitrary binary "is this account usable". What CAN be kept out of the
+ * kernel is the CONTROL FLOW: this table is data, the loop below is vendor-free,
+ * and adding a CLI never edits readiness logic or user-facing copy.
+ */
+interface AccountProbeAdapter {
+  /** Per-account read. Must not mutate anything. */
+  probeArgs: (account: string) => string[];
+  /**
+   * Read-only enumeration consulted ONLY when the per-account probe comes back
+   * negative. Some CLIs report a per-account lookup as "not found" whether the
+   * credential is absent or merely unreadable; the enumeration is where the
+   * distinguishing evidence surfaces.
+   */
+  disambiguateArgs?: () => string[];
+}
+
+const ACCOUNT_PROBE_ADAPTERS: Record<string, AccountProbeAdapter> = {
+  sf: {
+    probeArgs: (account) => ['org', 'display', '--target-org', account, '--json'],
+    disambiguateArgs: () => ['org', 'list', '--json'],
+  },
+};
+
+type AccountProbeVerdict = 'authenticated' | 'not_authenticated' | 'credential_unreadable' | 'unknown';
 
 function requiredResourceReadiness(
   def: WorkflowDefinition,
@@ -159,7 +195,8 @@ function requiredResourceReadiness(
     const cli = resource.cli?.trim().toLowerCase();
     if (!cli) continue;
     const resourceId = resource.id?.trim() || fallbackId;
-    if (cli !== 'sf') {
+    const adapter = ACCOUNT_PROBE_ADAPTERS[cli];
+    if (!adapter) {
       warnings.push(resourceProbeItem({
         resourceId,
         cli,
@@ -177,7 +214,7 @@ function requiredResourceReadiness(
         resourceId,
         cli,
         status: 'unknown',
-        reason: `Required Salesforce account resource "${resourceId}" cannot be safely probed because its account selector is missing or invalid.`,
+        reason: `Required account "${resourceId}" (${cli}) cannot be safely probed because its account selector is missing or invalid.`,
         detail: 'account selector was not passed to the CLI',
         stepIds,
       }));
@@ -187,8 +224,8 @@ function requiredResourceReadiness(
     let probe: WorkflowResourceProbeResult;
     try {
       probe = runner({
-        command: 'sf',
-        args: ['org', 'display', '--target-org', account, '--json'],
+        command: cli,
+        args: adapter.probeArgs(account),
         timeoutMs: RESOURCE_PROBE_TIMEOUT_MS,
       });
     } catch (error) {
@@ -196,7 +233,7 @@ function requiredResourceReadiness(
         resourceId,
         cli,
         status: 'unknown',
-        reason: `Required Salesforce account "${account}" could not be confirmed before the run.`,
+        reason: `Required account "${account}" (${cli}) could not be confirmed before the run.`,
         detail: conciseProbeDetail(error instanceof Error ? error.message : String(error)),
         stepIds,
       }));
@@ -215,29 +252,83 @@ function requiredResourceReadiness(
         .filter((value): value is string => typeof value === 'string' && Boolean(value.trim()))
         .join(': ')
       : '';
-    const missing = Boolean(payload && SALESFORCE_AUTH_MISSING.test(payloadMessage));
-    const detail = conciseProbeDetail(
+    let detail = conciseProbeDetail(
       probe.error?.message
         ?? (payloadMessage
           || probe.stderr
           || probe.stdout
-          || `sf exited ${String(probe.status)}`),
+          || `${cli} exited ${String(probe.status)}`),
     );
+
+    // A negative per-account probe is ambiguous on some CLIs: an absent
+    // credential and one the local store refuses to decrypt produce the SAME
+    // "not found" error. Asserting "signed out" from that is a guess, and a
+    // confident wrong remedy is worse than an honest unknown — the user is sent
+    // to re-authorize something that was never signed out, and the real cause
+    // (an unreadable credential store) goes unmentioned. Consult the
+    // enumeration, which is where the distinguishing evidence lives.
+    let verdict: AccountProbeVerdict = ACCOUNT_AUTH_MISSING.test(payloadMessage)
+      ? 'not_authenticated'
+      : 'unknown';
+    if (ACCOUNT_CREDENTIAL_STORE_UNREADABLE.test(`${payloadMessage} ${probe.stderr}`)) {
+      verdict = 'credential_unreadable';
+    } else if (verdict === 'not_authenticated' && adapter.disambiguateArgs) {
+      try {
+        const enumeration = runner({
+          command: cli,
+          args: adapter.disambiguateArgs(),
+          timeoutMs: RESOURCE_PROBE_TIMEOUT_MS,
+        });
+        const haystack = `${enumeration.stdout} ${enumeration.stderr}`;
+        if (
+          haystack.includes(account)
+          && ACCOUNT_CREDENTIAL_STORE_UNREADABLE.test(haystack)
+        ) {
+          verdict = 'credential_unreadable';
+          detail = conciseProbeDetail(
+            storeFailureEvidence(haystack, account) ?? detail,
+          );
+        }
+      } catch {
+        // The enumeration is corroboration only. If it cannot run, keep the
+        // per-account verdict rather than downgrading a real block to unknown.
+      }
+    }
+
     const item = resourceProbeItem({
       resourceId,
       cli,
-      status: missing ? 'missing' : 'unknown',
-      reason: missing
-        ? `Required Salesforce account "${account}" is signed out or missing.`
-        : `Required Salesforce account "${account}" could not be confirmed before the run.`,
+      status: verdict === 'unknown' ? 'unknown' : 'missing',
+      reason: verdict === 'credential_unreadable'
+        ? `Required account "${account}" (${cli}) is stored on this machine but its credential store refused to release it. Signing in again will not help until the store can be read.`
+        : verdict === 'not_authenticated'
+          ? `Required account "${account}" (${cli}) is signed out or missing.`
+          : `Required account "${account}" (${cli}) could not be confirmed before the run.`,
       detail,
       stepIds,
     });
-    if (missing) blockers.push(item);
-    else warnings.push(item);
+    if (verdict === 'unknown') warnings.push(item);
+    else blockers.push(item);
   }
 
   return { blockers, warnings };
+}
+
+/**
+ * Pull the store-level failure line out of a CLI enumeration so the user reads
+ * the real cause rather than the per-account lookup's misleading "not found".
+ */
+function storeFailureEvidence(haystack: string, account: string): string | undefined {
+  for (const line of haystack.split(/\r?\n/)) {
+    const text = line.trim();
+    if (!text) continue;
+    if (text.includes(account) && ACCOUNT_CREDENTIAL_STORE_UNREADABLE.test(text)) return text;
+  }
+  const fallback = haystack
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => ACCOUNT_CREDENTIAL_STORE_UNREADABLE.test(line));
+  return fallback || undefined;
 }
 
 function resourceProbeItem(input: {
@@ -247,6 +338,8 @@ function resourceProbeItem(input: {
   reason: string;
   detail: string;
   stepIds: string[];
+  /** The exact read-only command that produced this evidence, when known. */
+  probeName?: string;
 }): WorkflowToolReadinessItem {
   return {
     kind: 'cli',
@@ -256,7 +349,7 @@ function resourceProbeItem(input: {
     stepIds: input.stepIds,
     evidence: [{
       kind: 'cli_command',
-      name: input.cli === 'sf' ? 'sf org display' : input.cli,
+      name: input.probeName ?? input.cli,
       status: input.status,
       detail: conciseProbeDetail(input.detail),
     }],

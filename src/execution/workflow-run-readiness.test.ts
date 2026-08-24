@@ -252,11 +252,74 @@ test('required Salesforce account blocks a Friday-shaped run when fresh org disp
   assert.equal(readiness.blockers[0]?.status, 'missing');
   assert.match(readiness.blockers[0]?.reason ?? '', /signed out or missing/i);
   assert.match(readiness.message, /was not queued/);
-  assert.deepEqual(calls, [{
-    command: 'sf',
-    args: ['org', 'display', '--target-org', 'ops@example.test', '--json'],
-    timeoutMs: 8_000,
-  }]);
+  // A negative per-account lookup is corroborated against the enumeration
+  // before a cause is asserted; here it reports nothing, so "signed out" stands.
+  assert.deepEqual(calls, [
+    {
+      command: 'sf',
+      args: ['org', 'display', '--target-org', 'ops@example.test', '--json'],
+      timeoutMs: 8_000,
+    },
+    {
+      command: 'sf',
+      args: ['org', 'list', '--json'],
+      timeoutMs: 8_000,
+    },
+  ]);
+});
+
+// An absent credential and one the local store refuses to decrypt produce the
+// SAME per-account "not found" error. Asserting "signed out" from that sends the
+// user to re-authorize an account that was never signed out, while the real
+// cause goes unmentioned. Observed live: `sf org display` returned
+// NamedOrgNotFoundError while the auth file existed and the macOS keychain had
+// refused it, so the remedy Clem gave could not have worked.
+test('a credential the local store refuses to release is not reported as signed out', () => {
+  const readiness = checkWorkflowRunReadiness(
+    workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
+    FRIDAY_SHAPE_SLUG,
+    {
+      resourceProbeRunner: (request) => {
+        if (request.args.includes('display')) {
+          return {
+            status: 1,
+            stdout: JSON.stringify({
+              status: 1,
+              name: 'NamedOrgNotFoundError',
+              message: 'No authorization information found for ops@example.test.',
+            }),
+            stderr: '',
+          };
+        }
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            status: 0,
+            result: { other: [], nonScratchOrgs: [] },
+            warnings: [
+              'The auth file for ops@example.test is invalid. Due to: Command failed with response:\n - security: SecKeychainItemCreateFromContent (<default>): The user name or passphrase you entered is not correct.\n',
+            ],
+          }),
+          stderr: '',
+        };
+      },
+    },
+  );
+
+  assert.equal(readiness.ok, false);
+  assert.equal(readiness.blockers.length, 1);
+  assert.equal(readiness.blockers[0]?.status, 'missing');
+  assert.doesNotMatch(
+    readiness.blockers[0]?.reason ?? '',
+    /signed out/i,
+    'the account is present — telling the user to sign in again is the wrong remedy',
+  );
+  assert.match(readiness.blockers[0]?.reason ?? '', /credential store refused/i);
+  assert.match(
+    readiness.blockers[0]?.evidence?.[0]?.detail ?? '',
+    /keychain|passphrase/i,
+    'the real store-level failure must reach the user, not the misleading lookup error',
+  );
 });
 
 test('fresh successful Salesforce org display lets the required account pass', () => {
