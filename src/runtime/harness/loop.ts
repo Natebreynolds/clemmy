@@ -10152,6 +10152,15 @@ export async function runConversationFromResume(opts: {
   maxRunTokens?: number;
   makeRunner?: () => Runner;
   runRunner?: RunRunnerFn;
+  /**
+   * The engine this resumed turn runs on. A resume is the SAME turn continuing,
+   * so it must not silently drop to a different owner than the one that accepted
+   * the work: before this existed, every approval resume compiled a semantic
+   * graph unconditionally and could end `blocked` on a turn the user had just
+   * approved. Omitted means the caller has no opinion and the accepted-turn
+   * boundary decides, exactly as a fresh turn does.
+   */
+  turnEngine?: TurnEngineMode;
   /** Test injection for promise-shaped completion verification (defaults to judgeObjectiveComplete). */
   judgeFn?: ObjectiveJudgeFn;
   /** Test injection for the sealed terminal presentation repair. */
@@ -10169,7 +10178,17 @@ export async function runConversationFromResume(opts: {
   }
   const sourceUserSeq = acceptResumeConversationInput(opts);
   const acceptedSource = acceptedUserEvent(opts.sessionId, sourceUserSeq);
-  const graphEvent = await recordAcceptedSourceGraph({
+  // A resume continues a turn the user already approved. Give it the same
+  // ownership rule a fresh turn gets: when the host engine owns it, skip the
+  // semantic compile exactly as runConversation does at its own seam. Compiling
+  // here unconditionally meant an approved write could still come back
+  // "I could not finish planning that" -- and on a scheduled owner there is
+  // nobody to restate it to.
+  const resumeSessionKind = getSession(opts.sessionId)?.kind ?? '';
+  const resumeTurnEngine: TurnEngineMode = opts.turnEngine
+    ?? selectTurnEngine({ sessionKind: resumeSessionKind });
+  const resumeHostOwns = opts.runRunner === undefined && isHostTurnEngine(resumeTurnEngine);
+  const graphEvent = resumeHostOwns ? null : await recordAcceptedSourceGraph({
     identity: {
       sessionId: opts.sessionId,
       turn: acceptedSource.turn,
@@ -10178,7 +10197,10 @@ export async function runConversationFromResume(opts: {
     surface: 'approval_resume',
   });
   const acceptedTurnGraph = turnGraphFromShadowEvent(graphEvent);
-  if (!acceptedTurnGraph) {
+  // Same shape as runConversation's seam: "no admitted graph" is the host
+  // engine's NORMAL state, not a refusal. Only a lane that actually asked the
+  // semantic port to participate can be refused by it.
+  if (!resumeHostOwns && !acceptedTurnGraph) {
     const refused = commitUnadmittedSemanticTurn({
       sessionId: opts.sessionId,
       turn: acceptedSource.turn,
@@ -10198,8 +10220,13 @@ export async function runConversationFromResume(opts: {
   // mobile approve, console, drain — seven callers) ran its tool dispatches
   // with the expected-work wall silently open: assertExpectedWorkLogicalAdmission
   // returns when no authority row exists (sweep-confirmed 2026-08-11).
-  let resumeCapabilityRoute = acceptedTurnGraph.classification.route ?? 'direct_reply';
-  {
+  let resumeCapabilityRoute = acceptedTurnGraph?.classification.route ?? 'direct_reply';
+  // The typed dispatcher consumes an admitted graph. When the host engine owns
+  // this resume there is no graph by design, so this whole block is skipped --
+  // the mirror of runConversation's own `if (!hostOwnsFreshTurn)` guard. Running
+  // it with a null graph is what made an approved resume able to come back
+  // blocked.
+  if (!resumeHostOwns) {
     requireAcceptedTaskAuthority({
       sessionId: opts.sessionId,
       sourceUserSeq,
