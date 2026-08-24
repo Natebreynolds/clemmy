@@ -12053,6 +12053,32 @@ async function processOneRunFile(
           outcome: 'blocked',
           detail: message,
         });
+        // Same reason as the harness-blocked branch: a run rejected at preflight
+        // is a failed occurrence. Returning here without recording it is why an
+        // unrunnable workflow could fail every scheduled fire indefinitely with
+        // a flat streak and no escalation.
+        if (definitionResolution.definitionSource !== 'compiled_snapshot') {
+          try {
+            const outcome = recordWorkflowOutcome(workflow.data.name, false, preflight.summary);
+            if (outcome?.justEscalated) {
+              addNotification({
+                id: `workflow-${workflow.data.name}-escalated`,
+                kind: 'workflow',
+                title: `Workflow needs you: ${workflow.data.name}`,
+                body: `"${workflow.data.name}" has now failed ${outcome.consecutiveFailures} times in a row. Latest: ${preflight.summary}`,
+                createdAt: new Date().toISOString(),
+                read: false,
+                metadata: {
+                  workflow: workflow.data.name,
+                  runId: run.id,
+                  status: 'escalated',
+                  consecutiveFailures: outcome.consecutiveFailures,
+                  needsAttention: true,
+                },
+              });
+            }
+          } catch { /* ledger bookkeeping must never mask the refusal itself */ }
+        }
         logger.warn(
           { workflow: workflow.data.name, runId: run.id, errors: preflight.errors },
           'Workflow run rejected before start: preflight failed',
@@ -13281,6 +13307,43 @@ async function processOneRunFile(
           },
         });
         markRunNotified(filePath);
+        // A blocked run is a FAILED occurrence and must enter the ledger.
+        // Without this the streak never advances, escalation never fires, and
+        // the same step blocks again on the next schedule with nothing learned:
+        // live 2026-08-24, five scheduled runs blocked (scorpion-facebook-trends,
+        // platform-49-slack-channel-review, daily-standup-email, morning-briefing,
+        // weekly-review) and NONE reached workflow-failure-ledger.json, whose
+        // newest entry was the day before. `escalated: true` on weekly-review
+        // was 7 failures old and stale.
+        //
+        // compiled_snapshot is excluded for the same reason the two existing
+        // call sites exclude it: a compiled projection is not the user's
+        // authored workflow and must not move their streak.
+        if (definitionResolution.definitionSource !== 'compiled_snapshot') {
+          try {
+            const outcome = recordWorkflowOutcome(workflow.data.name, false, error.reason);
+            // justEscalated is computed by the ledger and was discarded at BOTH
+            // pre-existing call sites, which is why crossing the threshold has
+            // never been visible to anyone. Surface it exactly once.
+            if (outcome?.justEscalated) {
+              addNotification({
+                id: `workflow-${workflow.data.name}-escalated`,
+                kind: 'workflow',
+                title: `Workflow needs you: ${workflow.data.name}`,
+                body: `"${workflow.data.name}" has now failed ${outcome.consecutiveFailures} times in a row. Latest: ${error.reason}`,
+                createdAt: finishedAt,
+                read: false,
+                metadata: {
+                  workflow: workflow.data.name,
+                  runId: run.id,
+                  status: 'escalated',
+                  consecutiveFailures: outcome.consecutiveFailures,
+                  needsAttention: true,
+                },
+              });
+            }
+          } catch { /* ledger bookkeeping must never mask the block itself */ }
+        }
         finishRun(run.id, {
           status: 'blocked',
           message: detail,

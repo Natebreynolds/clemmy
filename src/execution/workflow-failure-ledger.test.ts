@@ -79,3 +79,49 @@ test('workflows are tracked independently', () => {
 });
 
 test.after(() => { fs.rmSync(TMP_HOME, { recursive: true, force: true }); });
+
+// REGRESSION PIN (live 2026-08-24): five scheduled runs blocked in one day
+// (scorpion-facebook-trends, platform-49-slack-channel-review,
+// daily-standup-email, morning-briefing, weekly-review) and NONE reached this
+// ledger -- the runner's blocked and preflight-rejected branches both returned
+// before either recordWorkflowOutcome call site. The streak stayed frozen at a
+// week-old value, so escalation never fired and the same steps blocked again on
+// the next schedule with nothing learned.
+//
+// This pins the ledger contract those branches now depend on: a blocked
+// occurrence is a FAILURE, the streak advances, and justEscalated fires exactly
+// once at the threshold -- not on every subsequent failure -- so a caller can
+// notify the user once instead of every fire.
+test('a repeated blocked occurrence escalates exactly once and resets on success', () => {
+  const wf = 'pin-blocked-escalates-once';
+  const reason = 'blocked at step "assess_goals": semantic model failed';
+
+  const first = recordWorkflowOutcome(wf, false, reason);
+  assert.equal(first.consecutiveFailures, 1);
+  assert.equal(first.justEscalated, false, 'one failure is not an escalation');
+
+  const second = recordWorkflowOutcome(wf, false, reason);
+  assert.equal(second.consecutiveFailures, 2);
+  assert.equal(second.justEscalated, false);
+
+  // CLEMENTINE_WORKFLOW_ESCALATE_AFTER is 3 for this file.
+  const third = recordWorkflowOutcome(wf, false, reason);
+  assert.equal(third.consecutiveFailures, 3);
+  assert.equal(third.justEscalated, true, 'crossing the threshold must surface once');
+
+  const fourth = recordWorkflowOutcome(wf, false, reason);
+  assert.equal(fourth.consecutiveFailures, 4);
+  assert.equal(
+    fourth.justEscalated,
+    false,
+    'already-escalated must not re-fire, or the user is notified on every scheduled failure',
+  );
+
+  // The last error is retained so the notification can name the real cause
+  // rather than a generic "workflow failed".
+  assert.equal(getConsecutiveFailures(wf), 4);
+
+  const recovered = recordWorkflowOutcome(wf, true);
+  assert.equal(recovered.consecutiveFailures, 0, 'a clean run clears the streak');
+  assert.equal(getConsecutiveFailures(wf), 0);
+});
