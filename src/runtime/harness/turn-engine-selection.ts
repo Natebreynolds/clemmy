@@ -54,20 +54,7 @@ export function selectTurnEngine(input: TurnEngineSelectionInput): TurnEngineMod
   if (persistedState === 'host_v1' || persistedState === 'host_v1_read_only') return persistedState;
   if (persistedState === 'legacy_sdk') return 'legacy_sdk';
 
-  // ONE LOOP, EVERY CARRIER. A workflow step, a cron occurrence and a chat turn
-  // differ in CONTEXT -- no interactive user, a step contract, a longer horizon,
-  // no ask-the-user affordance -- not in ENGINE. Sending them to a second
-  // reasoning engine is the fork: measured on a real home, 15 of 1,121+ turns
-  // ever reached the host loop, and on 2026-08-24 four scheduled workflows ran
-  // and all four blocked in the lane chat had already left behind.
-  //
-  // Hermes settles the same question the same way: its cron "creates a fresh
-  // instance of the same agent around a self-contained durable job rather than
-  // inventing a second reasoning engine."
-  //
-  // `legacy_sdk` survives only as a persisted-state resume identity, handled
-  // above -- a turn serialized by the old engine still resumes through it. It
-  // can no longer be SELECTED fresh by any carrier.
+  if (input.sessionKind !== 'chat') return 'legacy_sdk';
   return configuredTurnEngineMode(
     input.configuredValue
       ?? getRuntimeEnv(TURN_ENGINE_ENV_KEY, DEFAULT_TURN_ENGINE)

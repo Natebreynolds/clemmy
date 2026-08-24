@@ -4186,18 +4186,9 @@ export async function runConversation(
   // chat-shaped sessions; allowing an omitted option to consult the process
   // environment would silently move those owners off their durable path.
   const frozenTurnEngine: TurnEngineMode = options.turnEngine ?? 'legacy_sdk';
-  // The engine is the caller's declared choice; the SESSION KIND no longer gates
-  // it. A workflow step that selected the host engine at its bridge must
-  // actually get the host engine here, or it takes the host label and the legacy
-  // path -- the worst of both. What a non-chat owner does differently is
-  // context, not engine (see turn-engine-selection).
-  //
-  // The `?? 'legacy_sdk'` default above still stands, and deliberately: internal
-  // recovery callers (goal-resume, orphan-tool-reports) drive runConversation
-  // directly on chat-shaped sessions and pass no engine. They keep their durable
-  // path until they are moved explicitly rather than by omission.
   const hostOwnsFreshTurn = options.runRunner === undefined
-    && isHostTurnEngine(frozenTurnEngine);
+    && isHostTurnEngine(frozenTurnEngine)
+    && sessionKind === 'chat';
   // The host engine is the ordinary-chat owner. Seal that ownership before the
   // semantic port participates, then compile exactly one durable graph. The
   // graph describes accepted work; it does not transfer execution to the
