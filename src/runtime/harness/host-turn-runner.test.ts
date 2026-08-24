@@ -5665,3 +5665,70 @@ test('a post-admission surface drift poisons the exact host root before the next
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 0,
     'the runner cannot publish a competing terminal while its owner still holds lifecycle');
 });
+
+// ─── A remedy must always be retryable ───────────────────────────────────────
+//
+// Two no-effect refusals of the same frame retire it, and the retired set used
+// to be rebuilt from the WHOLE conversation. Because history outlives a turn, a
+// frame retired once stayed retired forever: the model was refused before it
+// could act, and was told to "choose another available capability" with no path
+// back. Observed live — Clem named the exact fix for a signed-out account, the
+// user performed it and said so, and the next turn refused without probing.
+//
+// The guard itself is correct and stays. Only its scope changes: a new user
+// message is new evidence, so refusals accumulate within the turn that earned
+// them.
+test('a retired frame is retryable after the user speaks again', async () => {
+  const { HOST_CAPABILITY_UNAVAILABLE_TEXT } = await import('./host-turn-runner.js');
+  const fixtureTool = () => ({
+    type: 'function' as const,
+    name: 'missing_owner_fixture',
+    description: 'ownership boundary fixture',
+    parameters: { type: 'object', properties: {} },
+    needsApproval: async () => false,
+    invoke: async () => 'must not run',
+  });
+
+  // Turn 1: the same frame refused twice, then proposed a third time — the
+  // retirement path the guard exists for.
+  const firstModel = stubModel([
+    [toolCall('retire-1', 'missing_owner_fixture', {})],
+    [toolCall('retire-2', 'missing_owner_fixture', {})],
+    [toolCall('retire-3', 'missing_owner_fixture', {})],
+    [textMsg('unreachable once retired')],
+  ]);
+  const first = await productionHostRunRunner(
+    throwingRunner() as never,
+    { model: firstModel, tools: [fixtureTool()] } as never,
+    [{ type: 'message', role: 'user', content: 'run the update' }] as never,
+    { maxTurns: 6 },
+  );
+  assert.equal(
+    first.finalOutput,
+    HOST_CAPABILITY_UNAVAILABLE_TEXT,
+    'the anti-thrash guard must still retire a frame refused twice inside one turn',
+  );
+
+  // Turn 2: the user acts on the advice and says so. The same frame must be
+  // attempted again rather than refused from history.
+  const secondModel = stubModel([
+    [toolCall('after-remedy', 'missing_owner_fixture', {})],
+    [textMsg('tried again after the user remediated')],
+  ]);
+  const second = await productionHostRunRunner(
+    throwingRunner() as never,
+    { model: secondModel, tools: [fixtureTool()] } as never,
+    [
+      ...first.history,
+      { type: 'message', role: 'user', content: 'it should be reconnected' },
+    ] as never,
+    { maxTurns: 6 },
+  );
+  assert.notEqual(
+    second.finalOutput,
+    HOST_CAPABILITY_UNAVAILABLE_TEXT,
+    'a refusal earned before the user spoke must not pre-refuse the turn after it',
+  );
+  assert.equal(second.finalOutput, 'tried again after the user remediated');
+  assert.ok(secondModel.calls() >= 2, 'the model must be reached, not short-circuited from history');
+});

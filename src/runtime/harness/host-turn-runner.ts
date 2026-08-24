@@ -788,11 +788,39 @@ function hostToolDispositionOutput(item: AgentInputItem): HostToolDispositionOut
   return marker as HostToolDispositionOutput;
 }
 
+/**
+ * Anti-thrash evidence about the CURRENT request — never a permanent verdict
+ * on a capability.
+ *
+ * These counts used to be read from the WHOLE conversation. Two refusals retire
+ * a frame (see recordZeroCrossingRefusal), and history outlives a turn, so a
+ * frame retired once stayed retired for the rest of the conversation. The model
+ * was then refused before it could act, and the refusal text told the user to
+ * "choose another available capability" — with no path back.
+ *
+ * That makes a remedy structurally unusable. Observed live: Clem correctly
+ * reported a signed-out account and named the fix; the user performed it and
+ * said so; the next turn refused without probing anything, because the frame
+ * had already been retired by the turn that produced the advice.
+ *
+ * A new user message is new evidence: it may have reconnected an account,
+ * granted a scope, or corrected an argument. Counting refusals that predate it
+ * would judge the new world by the old one. Refusals therefore accumulate only
+ * within the turn that earned them — the guard still stops a model looping on a
+ * dead call, and the user can always unblock it by acting.
+ */
 function priorZeroCrossingRefusalCounts(
   history: readonly AgentInputItem[],
 ): Map<string, number> {
   const counts = new Map<string, number>();
-  for (const item of history) {
+  let start = 0;
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    if ((history[index] as { role?: unknown }).role === 'user') {
+      start = index;
+      break;
+    }
+  }
+  for (const item of history.slice(start)) {
     const marker = hostToolDispositionOutput(item);
     if (
       marker?.disposition === 'refused_pre_dispatch'
