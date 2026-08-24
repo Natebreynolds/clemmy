@@ -395,6 +395,10 @@ export type BuiltinCapabilityAdmissionResult =
       reason?: string;
     };
 
+import { durableLogicalCallContract } from '../runtime/harness/logical-call-contract.js';
+
+const CALL_TOOL_CARRIER_NAME = 'call_tool';
+
 export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeContextValue> {
   const defaultSurface = resolveToolSurface({
     surface: 'orchestrator_call_tool',
@@ -460,6 +464,41 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // ambient counter itself — otherwise a model looping on failing
       // call_tool invocations would burn ZERO tool budget and lose the
       // deterministic runaway ceiling.
+      // Identity for a refusal raised BEFORE the resolver refines the contract.
+      //
+      // It must describe the CARRIER, not the requested inner tool. Until
+      // authorizeResolvedLogicalCallContract runs, the logical call is still
+      // admitted under call_tool's own bytes; settling it against the inner
+      // name and args contradicts that contract and poisons the call
+      // ("logical call contract is unsafe") instead of closing it. That is why
+      // the original settle was guarded on the resolved target at all — the
+      // guard was right about the identity and wrong only about skipping the
+      // settlement entirely.
+      const earlyRefusalTarget = (): ResolvedCarrierTarget | undefined => {
+        const ctx = harnessRunContextStorage.getStore();
+        const logicalToolCallId = currentLogicalCall()?.logicalToolCallId;
+        if (!ctx?.sessionId || !logicalToolCallId) return undefined;
+        // A contract that cannot be READ cannot be settled against. The digest
+        // unwraps a carrier to its inner operation, so a payload malformed at
+        // the carrier envelope itself has no readable contract — settling it
+        // poisons the call instead of closing it. Those refusals keep the old
+        // behavior; the recoverable case this fixes is an inner tool whose
+        // arguments parse fine and are merely WRONG.
+        const carrierArgs = { name, args_json };
+        if (!durableLogicalCallContract(
+          currentLogicalCall()?.acceptedTaskId ?? '',
+          CALL_TOOL_CARRIER_NAME,
+          carrierArgs,
+        )) return undefined;
+        return {
+          sessionId: ctx.sessionId,
+          ...(Number.isSafeInteger(ctx.sourceUserSeq) ? { sourceUserSeq: ctx.sourceUserSeq } : {}),
+          ...(Number.isSafeInteger(ctx.turn) ? { turn: ctx.turn } : {}),
+          logicalToolCallId,
+          targetName: CALL_TOOL_CARRIER_NAME,
+          targetArgs: carrierArgs,
+        };
+      };
       const refuse = (
         payload: Record<string, unknown>,
         classification: 'invalid_arguments' | 'policy_denial' = 'invalid_arguments',
@@ -478,9 +517,26 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           JSON.stringify(payload),
           typeof payload.error === 'string' ? payload.error : 'call_tool_refused',
         );
-        if (resolvedRefusalTarget) {
+        // EVERY pre-dispatch refusal settles its logical call, not just the
+        // ones late enough to have resolved a target.
+        //
+        // The host declares this carrier `nested_owned`: the inner call owns
+        // the settlement and the host ADOPTS it. On the success path the inner
+        // tool's own bracket writes that row. A refusal never reaches the inner
+        // tool, so nothing wrote one — and `resolvedRefusalTarget` is assigned
+        // only after target resolution, leaving eleven of twelve refusal sites
+        // settling nothing. The host then failed closed with "nested-owned
+        // logical settlement is missing" and killed the whole turn.
+        //
+        // Every observed instance was the model sending a wrong argument NAME —
+        // exactly the recoverable mistake this carrier documents as "returns
+        // the schema and an error and makes NO change". Instead of a corrective
+        // the user got a dead turn, and the schema the model needed to fix
+        // itself was discarded with it.
+        const settlementTarget = resolvedRefusalTarget ?? earlyRefusalTarget();
+        if (settlementTarget) {
           settleResolvedCarrierRefusal({
-            resolved: resolvedRefusalTarget,
+            resolved: settlementTarget,
             lane: options.resolvedRefusalLane ?? 'agents_runner',
             refusal,
             classification,

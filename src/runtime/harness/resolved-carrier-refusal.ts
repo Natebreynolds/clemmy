@@ -12,6 +12,7 @@
 import { ExternalWritePreDispatchError } from './external-write-admission.js';
 import { settleToolAttempt, type SettleToolAttemptInput } from './attempt-settlement.js';
 import { classifyRuntimeToolEffect } from './tool-effect.js';
+import { actionTopologyRoleForRuntimeCall } from './tool-effect.js';
 
 export interface ResolvedCarrierTarget {
   sessionId: string;
@@ -48,7 +49,15 @@ export function settleResolvedCarrierRefusal(input: {
     callId: resolved.logicalToolCallId,
     args: resolved.targetArgs,
     mutating: effect === 'local_write' || effect === 'external_write' || effect === 'admin',
-    businessCall: input.businessCall ?? true,
+    // Match the rule the settling bracket uses for an ordinary call. The host
+    // freezes mutating/businessCall before invoking, then ADOPTS the inner
+    // settlement and refuses any row that disagrees — so a refusal that simply
+    // assumed "business" turned a correct, recoverable refusal of a CONTROL
+    // tool into a lane-ending authority conflict. A pre-dispatch refusal has no
+    // bracket outcome, so the bracket's discovery term is vacuously satisfied
+    // and the role alone decides.
+    businessCall: input.businessCall
+      ?? actionTopologyRoleForRuntimeCall(resolved.targetName, resolved.targetArgs) === 'business',
     ...(refusedByThrow ? { thrown: input.refusal } : { result: input.refusal }),
     signals: {
       preDispatch: true,
