@@ -10,6 +10,41 @@ The result is drift, wasted tokens, inconsistent behavior per surface, and a lea
 
 What's **already right** (don't touch): the multi-agent / fan-out execution topology, the shared learning *store* (tool-choices remember + recall work on every path), the tool-agnostic substrate (search / recall / skill_read / $PATH / MCP), and the Phase-0 reliability just shipped (wall-clock recovery, honest report-back, between-turn checkpoint).
 
+## What actually differentiates this — protect and demonstrate it
+
+Stated because it was missing, and because the strongest thing in the tree has
+never been shown to anyone. Grounded in the reference harnesses' own
+documentation (2026-08-24 corpus review), not in our own claims about them.
+
+**Durable settlement and external-write truth.** Task identity spans
+continuations, brain fallover, MCP child processes, and daemon restarts, and the
+write-evidence lifecycle guarantees a process crash can never leave a paid write
+crossing without its reservation. The comparison harnesses say plainly that they
+cannot do this: one documents "no journaling or resume — scripts, child progress,
+and intermediate values are not checkpointed, so a process restart cannot
+continue a run"; on whether a write landed it hands the judgment back — "decide
+whether to retry from the tool semantics… do not retry blindly." The other
+documents no cross-restart state at all. This is the one place in the corpus
+where a competitor's own docs concede the gap.
+
+**Addressable results after compaction.** A collapsed tool result stays
+retrievable by call id from durable storage, byte-exact. The comparison harnesses
+truncate or summarize and say so: one writes "[old tool output cleared to save
+context space]", the other states replay "cannot reconstruct canonical
+intermediate values."
+
+Neither claim is worth anything undemonstrated. The acceptance shape is a demo,
+not a doc: kill the daemon mid-write, restart, resume the same task, prove
+exactly-once, and answer "did it actually send" from the ledger.
+
+Corollary for sequencing: gating machinery is not the moat. ~13k lines of gating
+added between v3.14 and 2026-08-24 produced exactly one budget that ever fired,
+whose measured effects were denying 44% of broad discovery and capping a
+nine-requirement task at eight. Effort belongs on proving what only this harness
+can do.
+
+---
+
 ## Target shape — layers, not forks
 
 ```
@@ -56,6 +91,31 @@ machine; it is not a second execution path. At the provider boundary, only a
 current fenced reservation derived from the canonical graph lease and sealed
 call authority permits I/O. A catalog match, role, name, replayed row, result
 handle, or model/checker verdict is never separate permission.
+
+The converse is equally binding, and was learned the expensive way (2026-08-24,
+measured on a production home): **an absent catalog match, role, name, or proof
+is never separate PROHIBITION.** A gate may refuse what a caller did wrong; it
+may not refuse a caller for what the host failed to disclose. Concretely, all of
+these were the same defect: `plan_task` demanded a `capabilityRef` from a
+catalog that held none, while its own text forbade inventing one (16 calls, 16
+refusals, zero successes ever); a discovery gate demanded an unresolved
+`role_key` that the caller could no longer see; a readiness probe reported an
+account as "signed out" when the credential existed and only the local store was
+unreadable, sending the user to repair something that was never broken. In each
+case no action available to the model or the user could satisfy the gate. When a
+required fact is missing, the host states what is missing and what would satisfy
+it — and, wherever the fact is host-owned, supplies it rather than demanding it.
+
+A bound must be enforced by the cheapest mechanism that achieves it, and a
+refusal is not cheap. A refused call has already been paid for in full: the model
+spent the tokens to make it, gets nothing usable back, and reformulates. Measured
+on the same home, the only budget in the harness that ever fired denied 44% of
+broad discovery and produced turns of 41 calls with 37 denials — spending tokens
+to prevent work. Bound cost with deduplication, replay of an existing claim,
+coercion to a host-owned key, and result-size limits. Where a true ceiling is
+warranted it is turn-scoped, high, always on, and stops the turn cleanly — never
+a per-call refusal the caller must recover from.
+
 
 Rigor scales with consequence; orchestration scales with breadth and duration:
 

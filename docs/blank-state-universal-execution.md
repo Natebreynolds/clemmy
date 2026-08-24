@@ -541,6 +541,21 @@ Discovery proceeds progressively:
 
 Discovery MUST be bounded by catalog calls, manifest count, schema bytes, time, and model tokens. It MUST NOT silently widen to every installed tool after a failed shortlist.
 
+The bound is on COST, not on permission, and the mechanism matters. Refusing a
+discovery call does not reduce any of the five quantities above: the catalog call
+was already issued, the model tokens were already spent, and the caller responds
+by reformulating and asking again. Enforced as refusals this rule inverts itself
+— measured 2026-08-24 on a production home, the discovery budget denied 266 of
+610 broad attempts (44%), produced single turns of 41 calls with 37 denials, and
+capped a task with nine frozen requirements at eight, so the ninth requirement
+was permanently undiscoverable.
+
+Bound discovery by: one claim per subject per epoch; replay of that claim for a
+repeat; coercion of an unknown or already-resolved subject to a host-owned key
+rather than a refusal; schema-byte and result-size limits; and — where a real
+ceiling is needed — a turn-scoped, always-on cap that stops the turn cleanly.
+Do not bound it by refusing calls that have already been paid for.
+
 Only adapter-owned, pre-attested catalog/schema/health operations qualify as `ControlPlaneDiscovery`. A model-selected business tool cannot label itself “metadata” to bypass node authority. Control-plane network use and provider cost remain budgeted and auditable even when no business data is accessed.
 
 ### 7.3 Carrier rules
