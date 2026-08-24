@@ -304,3 +304,40 @@ test('wrapped discovery timeout settles the durable claim as timed_out', async (
   // Transient, so the slot stays where it is and the same call can be retried.
   assert.equal(state?.policy.epoch, 0);
 });
+
+// ─── A refusal must name the value that would satisfy it ─────────────────────
+//
+// The role-scoped denial told callers to "use the exact unresolved role_key
+// shown in the current capability card". That is only followable while the card
+// is still in view; a caller that has lost it must guess a host-owned
+// identifier, and every wrong guess is refused again under a different reason
+// (role_required -> role_not_unresolved -> role_resolved). Measured on the real
+// home: 27 role-key refusals across 50 discovery denials.
+//
+// This file already records the same lesson from 2026-08-14 — "THE DENIAL IS
+// CORRECT; THE OLD INSTRUCTION WAS NOT FOLLOWABLE HERE" — which named the right
+// door but still not the right key.
+test('a role-scoped discovery denial names the admissible role keys', () => {
+  const denial = new DiscoveryBudgetDeniedError(
+    'broad_discovery',
+    'tool_search',
+    'role_required',
+    ['clause-0:write', 'clause-0:unknown'],
+  );
+  assert.match(denial.message, /clause-0:write/, 'the caller must be told what it may cite');
+  assert.match(denial.message, /clause-0:unknown/);
+});
+
+test('a role-scoped denial with no unresolved role says so instead of demanding one', () => {
+  const denial = new DiscoveryBudgetDeniedError(
+    'broad_discovery',
+    'tool_search',
+    'role_required',
+    [],
+  );
+  assert.match(
+    denial.message,
+    /no unresolved requirement role/i,
+    'demanding a key that cannot exist is the failure this pin exists to prevent',
+  );
+});

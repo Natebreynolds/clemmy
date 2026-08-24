@@ -1436,4 +1436,26 @@ export class DiscoveryGovernor {
   }
 }
 
+/**
+ * The exact unresolved role keys a broad discovery may cite, for THIS accepted
+ * task. A refusal that says "use the exact unresolved role_key shown in the
+ * current capability card" is only followable if the caller can still see that
+ * card; when it cannot, the model has to guess a host-owned identifier and gets
+ * refused three different ways (role_required, role_not_unresolved,
+ * role_resolved). Naming the admissible keys turns the guess into a fact.
+ *
+ * Read-only and failure-tolerant: a diagnostic can never be the reason a
+ * refusal fails to reach its caller.
+ */
+export function unresolvedDiscoveryRoleKeys(key: DiscoveryTaskKey): string[] {
+  try {
+    return rawRoles(openEventLog(), key)
+      .filter((row) => row.resolved !== 1)
+      .map((row) => row.role_key)
+      .filter((roleKey): roleKey is string => typeof roleKey === 'string' && roleKey.length > 0);
+  } catch {
+    return [];
+  }
+}
+
 export const discoveryGovernor = new DiscoveryGovernor();

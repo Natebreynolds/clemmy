@@ -8,7 +8,7 @@ import {
   type DiscoveryAttemptOutcome,
   type DiscoveryCategory,
   type DiscoveryDecision,
-} from './discovery-governor.js';
+  unresolvedDiscoveryRoleKeys,} from './discovery-governor.js';
 
 /**
  * One exact tool, one key; one unresolved requirement, one broad key.
@@ -310,6 +310,8 @@ export class DiscoveryBudgetDeniedError extends Error {
     public readonly category: DiscoveryCategory,
     public readonly surface: DiscoveryCallClassification['surface'],
     public readonly reason: string,
+    /** Exact role keys this task will admit, named so the caller need not guess. */
+    public readonly admissibleRoleKeys: readonly string[] = [],
   ) {
     // THE DENIAL IS CORRECT; THE OLD INSTRUCTION WAS NOT FOLLOWABLE HERE.
     // `tool_search` is deliberately the ONE broker that transports a requirement
@@ -334,7 +336,18 @@ export class DiscoveryBudgetDeniedError extends Error {
             ? 'That role is not an unresolved requirement of this accepted task. Use a listed unresolved role_key or the already-resolved path.'
             : 'Use the capability or prior search result already resolved for this task; do not issue another broad search.'
       : 'Use the schema already returned for this task, correct the call from its validation error, or report the specific blocker; do not re-fetch schema again.';
-    super(`discovery budget denied (${reason}) on ${surface}. ${corrective}`);
+    // Name the admissible keys. The corrective above points at "the current
+    // capability card", which is only followable while that card is still in
+    // view; a caller that has lost it must guess a host-owned identifier, and
+    // every wrong guess is refused again under a different reason. Listing the
+    // exact keys costs nothing and makes the refusal actionable on its own.
+    const namedRoles = admissibleRoleKeys.length > 0
+      && (reason === 'role_required' || reason === 'role_not_unresolved')
+      ? ` Unresolved role_key values for this task: ${admissibleRoleKeys.slice(0, 12).join(', ')}.`
+      : admissibleRoleKeys.length === 0 && reason === 'role_required'
+        ? ' This task currently has no unresolved requirement role, so no broad search can be admitted for it; use what is already resolved or report the blocker.'
+        : '';
+    super(`discovery budget denied (${reason}) on ${surface}. ${corrective}${namedRoles}`);
     this.name = 'DiscoveryBudgetDeniedError';
   }
 }
@@ -437,6 +450,12 @@ export function admitDiscoveryBoundary(
       classification.category,
       classification.surface,
       decision.reason,
+      validTaskIdentity(input.sessionId, input.sourceUserSeq)
+        ? unresolvedDiscoveryRoleKeys({
+            sessionId: input.sessionId,
+            sourceUserSeq: input.sourceUserSeq as number,
+          })
+        : [],
     );
     terminalizeDiscoveryDenial(input, classification, denial);
     throw denial;
