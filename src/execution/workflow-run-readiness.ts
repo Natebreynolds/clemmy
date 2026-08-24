@@ -7,6 +7,7 @@ import { listSkills } from '../memory/skill-store.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { listWorkspaceProjects } from '../tools/shared.js';
 import { readCachedScan } from '../runtime/cli-discovery.js';
+import { mergedSpawnEnv } from '../runtime/spawn-env.js';
 import { getSavedClis } from '../runtime/saved-clis.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
 import { listMcpServerHealth, slugifyServerName } from '../runtime/mcp-namespace-shim.js';
@@ -263,12 +264,18 @@ function resourceProbeItem(input: {
 }
 
 function runWorkflowResourceProbe(request: WorkflowResourceProbeRequest): WorkflowResourceProbeResult {
+  // The readiness probe MUST run a CLI in the same environment the executor
+  // will use. Discovery (cli-discovery) and execution (computer-tools) both
+  // spawn through mergedSpawnEnv; this seam did not, so a probe could resolve
+  // a different binary — or none — than the run it is gating, and report a
+  // reachable capability as missing.
   const result = spawnSync(request.command, [...request.args], {
     encoding: 'utf8',
     shell: false,
     timeout: request.timeoutMs,
     maxBuffer: 1024 * 1024,
     windowsHide: true,
+    env: mergedSpawnEnv(),
   });
   return {
     status: result.status,

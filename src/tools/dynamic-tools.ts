@@ -5,6 +5,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
+import { mergedSpawnEnv } from '../runtime/spawn-env.js';
 import { textResult } from './shared.js';
 
 function dynamicToolName(file: string): string {
@@ -88,10 +89,11 @@ export function registerDynamicTools(server: McpServer): void {
             cwd: BASE_DIR,
             encoding: 'utf-8',
             timeout: 30_000,
-            env: {
-              ...process.env,
-              CLEMENTINE_HOME: BASE_DIR,
-            },
+            // Same augmented PATH every other CLI seam uses: a packaged .app
+            // launch inherits a minimal PATH, so a raw process.env here
+            // resolves a different set of binaries than the tools the model
+            // calls directly.
+            env: mergedSpawnEnv({ CLEMENTINE_HOME: BASE_DIR }),
           });
           return textResult(result.trim() || '(no output)');
         } catch (error) {

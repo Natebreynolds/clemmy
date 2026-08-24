@@ -3,11 +3,14 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { augmentPath, mergedSpawnEnv, userManagedExecutableDirs } from './spawn-env.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 test('augmentPath prepends Homebrew + the running node binary dir', () => {
   const out = augmentPath('/usr/bin:/bin');
@@ -182,4 +185,64 @@ test('mergedSpawnEnv honors explicit npm cache overrides', () => {
     if (previousLower === undefined) delete process.env.npm_config_cache;
     else process.env.npm_config_cache = previousLower;
   }
+});
+
+// ─── Carrier pin: one environment at EVERY CLI seam ──────────────────────────
+//
+// A capability gate must run a CLI in the same environment as the executor it
+// gates. Discovery decided `sf` existed and the model could run it, but the
+// workflow readiness probe spawned with a raw `process.env` — so on a packaged
+// .app launch (minimal inherited PATH) the probe could resolve a different
+// binary, or none, and report a reachable account as missing. The user is then
+// sent to repair something that was never broken.
+//
+// Two categories, deliberately different:
+//   * CREDENTIAL-BEARING seams (discovery, execution, readiness, dynamic tools)
+//     must share mergedSpawnEnv so they agree on what is reachable.
+//   * SANDBOXED COMPUTE probes (code certification) scrub the environment on
+//     purpose — a syntax check on user-authored code must not inherit secrets.
+//     They still need augmentPath so the interpreter itself resolves.
+//
+// This is a sweep, not a single-case regression: the class recurs whenever a
+// NEW seam is added, so the rule is enforced against the tree.
+test('every credential-bearing CLI seam spawns through mergedSpawnEnv', () => {
+  const CREDENTIAL_SEAMS = [
+    'src/tools/computer-tools.ts',
+    'src/tools/dynamic-tools.ts',
+    'src/execution/workflow-run-readiness.ts',
+    'src/runtime/cli-discovery.ts',
+  ];
+  const offenders: string[] = [];
+  for (const file of CREDENTIAL_SEAMS) {
+    const absolute = path.join(HERE, '..', '..', file);
+    if (!existsSync(absolute)) {
+      offenders.push(`${file}: missing — update this pin if the seam moved`);
+      continue;
+    }
+    const source = readFileSync(absolute, 'utf-8');
+    if (!/mergedSpawnEnv\s*\(/.test(source)) {
+      offenders.push(`${file}: spawns a CLI without mergedSpawnEnv()`);
+      continue;
+    }
+    // A seam that still hands a child the ambient environment defeats the
+    // shared PATH even when it imports the helper elsewhere in the file.
+    if (/env:\s*\{\s*\.\.\.process\.env/.test(source)) {
+      offenders.push(`${file}: still spreads raw process.env into a child`);
+    }
+  }
+  assert.deepEqual(offenders, [], `CLI seams must share one spawn environment:\n${offenders.join('\n')}`);
+});
+
+test('the sandboxed code-certification probe scrubs its env but still resolves via augmentPath', () => {
+  const source = readFileSync(
+    path.join(HERE, '..', 'execution', 'workflow-code-certification.ts'),
+    'utf-8',
+  );
+  assert.match(source, /augmentPath\s*\(/, 'interpreter resolution must use the shared PATH augmentation');
+  assert.match(source, /scrubbedChildEnv\s*\(/, 'a syntax check on user code must not inherit the ambient environment');
+  assert.doesNotMatch(
+    source,
+    /mergedSpawnEnv\s*\(/,
+    'certification must stay scrubbed — mergedSpawnEnv would hand user-authored code the full environment',
+  );
 });
