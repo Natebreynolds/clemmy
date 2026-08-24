@@ -120,3 +120,35 @@ test('UI-correctness defect 1: a deliberate PRESET SWITCH still resets omitted f
   const long = saveHarnessBudgetSettings({ preset: 'long' });
   assert.notEqual(long.maxConversationSteps, 999, 'a preset switch legitimately resets omitted fields');
 });
+
+// ─── Supervised-unlimited is the DEFAULT ─────────────────────────────────────
+//
+// A run stops for a terminal outcome, a user-owned gate, a user stop, or zero
+// progress — never because a ceiling was reached while the work was still
+// going. The old default shipped a 120-minute wall clock and a 40-turn ceiling
+// to every new install, so a long agentic task ended on the clock rather than
+// on the work.
+test('the default preset is supervised-unlimited', async () => {
+  const { getHarnessBudgetSettings } = await import('./budget-settings.js');
+  // resetBudgetEnv blanks the key; a blank is "unset" to presetFromEnv, while
+  // deleting it would let a previously PERSISTED preset in this fixture home
+  // answer instead of the built-in default under test. The unlimited preset's
+  // own shape (no wall clock, no token ceiling) is pinned separately above.
+  resetBudgetEnv();
+  assert.equal(getHarnessBudgetSettings().preset, 'unlimited');
+});
+
+test('an explicit preset still wins — the caps remain selectable', async () => {
+  const { getHarnessBudgetSettings } = await import('./budget-settings.js');
+  const previous = process.env.HARNESS_BUDGET_PRESET;
+  resetBudgetEnv();
+  process.env.HARNESS_BUDGET_PRESET = 'standard';
+  try {
+    const budget = getHarnessBudgetSettings();
+    assert.equal(budget.preset, 'standard');
+    assert.ok(budget.maxRunTokens > 0, 'a user who asks for a ceiling still gets one');
+  } finally {
+    if (previous === undefined) delete process.env.HARNESS_BUDGET_PRESET;
+    else process.env.HARNESS_BUDGET_PRESET = previous;
+  }
+});

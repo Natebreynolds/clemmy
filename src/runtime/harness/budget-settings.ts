@@ -104,7 +104,7 @@ export const HARNESS_BUDGET_PRESETS = Object.freeze([
 ] satisfies Array<{ id: HarnessBudgetPreset; label: string; description: string }>);
 
 function presetFromEnv(raw: string): HarnessBudgetPreset {
-  return raw === 'long' || raw === 'unlimited' || raw === 'standard' ? raw : 'standard';
+  return raw === 'long' || raw === 'unlimited' || raw === 'standard' ? raw : 'unlimited';
 }
 
 function intEnv(key: string, fallback: number, min: number, max: number): number {
@@ -121,7 +121,17 @@ function boolEnv(key: string, fallback: boolean): boolean {
 }
 
 export function getHarnessBudgetSettings(): HarnessBudgetRuntime {
-  const preset = presetFromEnv(getRuntimeEnv(ENV_KEYS.preset, 'standard'));
+  // Supervised-unlimited is the DEFAULT, not an opt-in. A run stops for a
+  // terminal outcome, a user-owned gate, a user stop, or zero progress — never
+  // because a ceiling was reached while the work was still going. 'standard'
+  // and 'long' remain selectable for anyone who wants a hard cap, and every
+  // ENV key below still overrides.
+  //
+  // The old default shipped a 120-minute wall clock and a 40-turn ceiling to
+  // every new install, so a long agentic task ended on the clock rather than on
+  // the work. This home had already been switched to unlimited by hand; nobody
+  // else's had.
+  const preset = presetFromEnv(getRuntimeEnv(ENV_KEYS.preset, 'unlimited'));
   const defaults = PRESETS[preset];
   const maxConversationWallMinutes = intEnv(
     ENV_KEYS.maxConversationWallMinutes,
