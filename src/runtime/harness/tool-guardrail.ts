@@ -369,12 +369,19 @@ export function buildFanoutRecoveryMessage(opts: {
   args: unknown;
   distinct: number;
   fanoutBlockAt: number;
+  /** Refusals actually issued in this scope with no successful fan-out since. */
+  refusalCount?: number;
   /** The prescribable batching route, if one is PROVEN available. Omitted =
    *  legacy callers; null = the refusal keeps the behavioral constraint and
    *  names NO tool (an un-followable instruction is worse than none). */
   mandate?: MandatedAlternative | null;
 }): string {
   const { toolName, slug, args, distinct, fanoutBlockAt } = opts;
+  // ACTUAL refusals, not distinct items. This used to be `distinct -
+  // fanoutBlockAt`, so a model with 25 items to read was told it had "already
+  // been refused 19x" the first time it was refused — and the number grew with
+  // the size of its job rather than with anything it did wrong.
+  const refusalCount = opts.refusalCount ?? 0;
   // An omitted mandate renders the no-tool refusal — the message must never
   // fabricate a prescription the oracle did not prove.
   const mandate = opts.mandate ?? null;
@@ -384,7 +391,7 @@ export function buildFanoutRecoveryMessage(opts: {
   try { exampleArgs = JSON.stringify(innerArgs ?? {}).slice(0, 160); } catch { exampleArgs = '{...}'; }
   // Refusal-count escalation (derived from the tracked set — zero new state):
   // after 2+ ignored refusals, a harder stop for families that ride through one.
-  const refusals = distinct - fanoutBlockAt;
+
   // ESCALATION OVER BLOCKING. A refusal repeated identically is not a stronger
   // refusal, it is a deadlock — live 2026-08-09 issued the same one for six
   // minutes while the model kept trying and the user watched nothing happen.
@@ -395,10 +402,10 @@ export function buildFanoutRecoveryMessage(opts: {
   // A RUBRIC, not a script (the voiceMessage contract): what must be true —
   // name what already succeeded, name what is blocked, offer the alternative,
   // ask. The words are hers.
-  const escalate = refusals >= 2
-    ? `You have already been refused ${refusals}× for this, so STOP retrying and CHECK IN WITH THE USER instead. `
+  const escalate = refusalCount >= 2
+    ? `You have already been refused ${refusalCount}× for this, so STOP retrying and CHECK IN WITH THE USER instead. `
       + `In your own words: say which items you already completed, say plainly that the remaining ones are blocked this way, `
-      + `offer to try a different route (a batch program, a list-and-match, or whatever fits), and ask whether to continue. `
+      + `offer to try a different route (issuing them together in one response, a list-and-match, or whatever fits), and ask whether to continue. `
       + `Do not restate this instruction and do not mention harnesses or guardrails — just ask them. `
     : '';
   const header =
@@ -752,6 +759,12 @@ interface ScopeSignals {
   redirectFailures: number;
   /** Fan-out refusals issued in this scope with no successful fan-out since. */
   fanoutRefusals: number;
+  /** The tool the ladder is currently refusing. A SUCCESSFUL call of this tool
+   *  is the prescribed recovery working, which satisfies the ladder just as a
+   *  successful redirect does. Without it the only thing that could ever
+   *  satisfy the ladder was `run_worker` — the recovery it stopped prescribing
+   *  when the program surface was subtracted (2026-08-20). */
+  fannedTool?: string;
 }
 const scopeSignals = new Map<string, ScopeSignals>();
 const MAX_SCOPE_SIGNALS = 200;
@@ -776,9 +789,6 @@ function signalsFor(scopeId: string): ScopeSignals {
  *  forcing a batch program costs more than it saves (live: ~300-byte Slack
  *  user records refused as if they were page-sized payloads). */
 const FANOUT_EXPENSIVE_RESULT_BYTES = 4_000;
-/** Identical fan-out refusals before the turn ends instead of refusing again. */
-const FANOUT_REFUSAL_TERMINAL_AT = 3;
-
 const FANOUT_REDIRECT_TOOLS = /^run_worker$/i;
 
 function resultLooksFailed(result: unknown): boolean {
@@ -801,6 +811,14 @@ export function noteGuardrailObservedCost(
       if (resultLooksFailed(result)) entry.redirectFailures += 1;
       else entry.fanoutRefusals = 0; // the redirect worked; the ladder is satisfied
       return;
+    }
+    // The prescribed recovery is now the model's OWN parallel calls of the
+    // fanned tool. When one of those succeeds the ladder's demand has been met,
+    // exactly as a working redirect meets it. Only `run_worker` used to count,
+    // so a model that complied with the CURRENT instruction was never credited
+    // for it and the escalation kept climbing.
+    if (entry.fannedTool && entry.fannedTool === toolName && !resultLooksFailed(result)) {
+      entry.fanoutRefusals = 0;
     }
     const size = typeof result === 'string'
       ? result.length
@@ -1085,7 +1103,12 @@ export function evaluateToolCall(
     ) {
       fanoutBlock = buildFanoutRecoveryMessage({
         toolName, slug, args, distinct, fanoutBlockAt: effectiveBlockAt, mandate: null,
+        refusalCount: signals?.fanoutRefusals ?? 0,
       });
+      // Remember WHAT is being fanned, so a successful call of that same tool
+      // can satisfy the ladder. The prescribed recovery is parallel calls of
+      // this tool; nothing was crediting the model for making them.
+      if (signals) signals.fannedTool = toolName;
       // (3) The deadlock is broken by RELEASE, not by a turn-kill: once the
       // prescribed program has failed twice, condition (2) lifts this block and
       // the path that was working resumes. A fanout-refused READ must never

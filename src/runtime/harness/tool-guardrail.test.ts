@@ -570,13 +570,29 @@ test('buildFanoutRecoveryMessage: the parallel recovery carries the literal arg 
 });
 
 test('buildFanoutRecoveryMessage: escalation prefix appears only at refusals >= 2', () => {
-  const first = buildFanoutRecoveryMessage({ toolName: 'composio_execute_tool', slug: 'X_LIST', args: {}, distinct: 6, fanoutBlockAt: 6 });
-  assert.doesNotMatch(first, /already been refused/i, 'first refusal (distinct == blockAt) has no escalation prefix');
-  const third = buildFanoutRecoveryMessage({ toolName: 'composio_execute_tool', slug: 'X_LIST', args: {}, distinct: 8, fanoutBlockAt: 6 });
+  const first = buildFanoutRecoveryMessage({ toolName: 'composio_execute_tool', slug: 'X_LIST', args: {}, distinct: 6, fanoutBlockAt: 6, refusalCount: 0 });
+  assert.doesNotMatch(first, /already been refused/i, 'first refusal has no escalation prefix');
+  const third = buildFanoutRecoveryMessage({ toolName: 'composio_execute_tool', slug: 'X_LIST', args: {}, distinct: 8, fanoutBlockAt: 6, refusalCount: 2 });
   // The escalation still appears only at >= 2. What it ESCALATES TO changed
   // (2026-08-09): a repeated refusal now hands the decision to the user rather
   // than restating a harder stop, which is what deadlocked a live turn.
   assert.match(third, /already been refused 2×/i, 'refusals >= 2 → escalation prefix');
+});
+
+// The count must be REFUSALS, not the size of the job. It used to be derived as
+// `distinct - fanoutBlockAt`, so a model with 25 items to read was told it had
+// "already been refused 19x" the first time it was ever refused — a number that
+// grew with the work in front of it rather than with anything it did wrong.
+test('buildFanoutRecoveryMessage: the escalation counts refusals, not distinct items', () => {
+  const manyItems = buildFanoutRecoveryMessage({
+    toolName: 'composio_execute_tool', slug: 'X_LIST', args: {},
+    distinct: 25, fanoutBlockAt: 6, refusalCount: 0,
+  });
+  assert.doesNotMatch(
+    manyItems,
+    /already been refused/i,
+    'a large job is not a repeated refusal',
+  );
 });
 
 test('fanoutBlock: ON → re-polling the SAME id is never blocked (identical args = one distinct)', () => {
@@ -1181,12 +1197,12 @@ test('a repeated fan-out refusal escalates to the USER instead of restating itse
   // decision to the person rather than keep deciding autonomously. Live
   // 2026-08-09 restated the same refusal for six minutes instead.
   const first = buildFanoutRecoveryMessage({
-    toolName: 'composio_execute_tool', slug: SLACK, args: {}, distinct: 7, fanoutBlockAt: 6,
+    toolName: 'composio_execute_tool', slug: SLACK, args: {}, distinct: 7, fanoutBlockAt: 6, refusalCount: 0,
   });
   assert.doesNotMatch(first, /CHECK IN WITH THE USER/i, 'the FIRST refusal should still teach the batch path');
 
   const repeated = buildFanoutRecoveryMessage({
-    toolName: 'composio_execute_tool', slug: SLACK, args: {}, distinct: 8, fanoutBlockAt: 6,
+    toolName: 'composio_execute_tool', slug: SLACK, args: {}, distinct: 8, fanoutBlockAt: 6, refusalCount: 2,
   });
   assert.match(repeated, /CHECK IN WITH THE USER/i, 'a repeated refusal must hand the decision back');
   assert.match(repeated, /which items you already completed/i, 'the check-in must report partial progress');
