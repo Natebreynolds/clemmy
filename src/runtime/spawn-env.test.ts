@@ -246,3 +246,61 @@ test('the sandboxed code-certification probe scrubs its env but still resolves v
     'certification must stay scrubbed — mergedSpawnEnv would hand user-authored code the full environment',
   );
 });
+
+// ─── User-declared CLI environment ───────────────────────────────────────────
+//
+// A global CLI's credentials often depend on environment (which profile, which
+// config, which credential store), and Clem had no way to set any of it: the
+// daemon's .env is read through getEnv() and never reaches process.env, so it
+// never reached a child CLI. Handing children the whole daemon environment is
+// not an option — it carries Clementine's own secrets — so the surface is
+// explicit and separate.
+test('user-declared cli-env reaches spawned CLIs, but never overrides PATH', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-cli-env-'));
+  const previousHome = process.env.CLEMENTINE_HOME;
+  process.env.CLEMENTINE_HOME = home;
+  try {
+    mkdirSync(path.join(home, 'state'), { recursive: true });
+    writeFileSync(
+      path.join(home, 'state', 'cli-env.json'),
+      JSON.stringify({
+        SOME_CLI_PROFILE: 'work',
+        SOME_CLI_NUMERIC: 7,
+        PATH: '/attacker/bin',
+        'not a valid key': 'ignored',
+      }),
+      'utf-8',
+    );
+    const env = mergedSpawnEnv();
+    assert.equal(env.SOME_CLI_PROFILE, 'work');
+    assert.equal(env.SOME_CLI_NUMERIC, '7', 'scalars are coerced so config stays forgiving');
+    assert.equal(env['not a valid key'], undefined);
+    assert.doesNotMatch(
+      env.PATH ?? '',
+      /^\/attacker\/bin/,
+      'PATH is refused here — every CLI seam depends on the augmentation',
+    );
+    // An explicit per-call override still wins over a user declaration.
+    assert.equal(mergedSpawnEnv({ SOME_CLI_PROFILE: 'override' }).SOME_CLI_PROFILE, 'override');
+  } finally {
+    if (previousHome === undefined) delete process.env.CLEMENTINE_HOME;
+    else process.env.CLEMENTINE_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a malformed cli-env file is ignored rather than breaking every CLI spawn', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-cli-env-bad-'));
+  const previousHome = process.env.CLEMENTINE_HOME;
+  process.env.CLEMENTINE_HOME = home;
+  try {
+    mkdirSync(path.join(home, 'state'), { recursive: true });
+    writeFileSync(path.join(home, 'state', 'cli-env.json'), '{ this is not json', 'utf-8');
+    const env = mergedSpawnEnv();
+    assert.ok(env.PATH, 'a broken config must not take the spawn environment down with it');
+  } finally {
+    if (previousHome === undefined) delete process.env.CLEMENTINE_HOME;
+    else process.env.CLEMENTINE_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import os from 'node:os';
-import { accessSync, mkdirSync, readdirSync, statSync, constants as fsConstants } from 'node:fs';
+import { accessSync, mkdirSync, readdirSync, readFileSync, statSync, constants as fsConstants } from 'node:fs';
 
 function existingDirectory(candidate: string): boolean {
   try {
@@ -142,6 +142,67 @@ export function augmentPath(existing: string | undefined): string {
   return [...prepend, ...existingParts].join(path.delimiter);
 }
 
+
+/**
+ * User-declared environment for the CLIs Clem spawns.
+ *
+ * A global CLI's credentials frequently depend on environment, not just files:
+ * which profile to assume, which config to read, which credential store to use.
+ * Clem had no supported way to set any of it. The daemon's own .env is parsed
+ * into a private object and read through getEnv() — it never reaches
+ * process.env, so it never reached a child CLI either, and handing children the
+ * whole daemon environment is not an option (it carries Clementine's own
+ * secrets).
+ *
+ * So the surface is explicit and separate: state/cli-env.json, owned by the
+ * user, applied to every CLI spawn. Vendor-neutral by construction — teaching
+ * Clem about a new CLI's environment is a config edit, never a code change.
+ *
+ * PATH is refused: every CLI seam depends on the augmentation below, and a
+ * silent override here would reintroduce the "binary not installed" class it
+ * exists to prevent.
+ */
+const CLI_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+let cliEnvCache: { file: string; mtimeMs: number; values: Record<string, string> } | undefined;
+
+export function userDeclaredCliEnv(): Record<string, string> {
+  let file: string;
+  try {
+    const base = process.env.CLEMENTINE_HOME?.trim() || path.join(os.homedir(), '.clementine-next');
+    file = path.join(base, 'state', 'cli-env.json');
+  } catch {
+    return {};
+  }
+  let mtimeMs: number;
+  try {
+    mtimeMs = statSync(file).mtimeMs;
+  } catch {
+    cliEnvCache = undefined;
+    return {};
+  }
+  // Keyed on path AND mtime: CLEMENTINE_HOME moves between runs (and in tests),
+  // so an mtime-only key can serve one home's values to another.
+  if (cliEnvCache?.file === file && cliEnvCache.mtimeMs === mtimeMs) return cliEnvCache.values;
+  const values: Record<string, string> = {};
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf-8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (!CLI_ENV_KEY.test(key)) continue;
+        if (key.toUpperCase() === 'PATH') continue;
+        if (typeof value === 'string') values[key] = value;
+        else if (typeof value === 'number' || typeof value === 'boolean') values[key] = String(value);
+      }
+    }
+  } catch {
+    // A malformed file must not make every CLI spawn fail. It is ignored, and
+    // the user still sees the underlying command's own error.
+    return {};
+  }
+  cliEnvCache = { file, mtimeMs, values };
+  return values;
+}
+
 /**
  * Build a child-process env that inherits the parent environment but with
  * an augmented PATH, so binaries resolve on a packaged `.app` launch.
@@ -169,5 +230,7 @@ export function mergedSpawnEnv(extra: Record<string, string> = {}): Record<strin
   // uppercase default.
   const npmCache = isolatedNpmCache({ ...env, ...extra });
   if (npmCache) env.NPM_CONFIG_CACHE = npmCache;
-  return { ...env, ...extra };
+  // User declarations win over the inherited environment (that is the point of
+  // declaring them) but never over an explicit per-call override.
+  return { ...env, ...userDeclaredCliEnv(), ...extra };
 }
