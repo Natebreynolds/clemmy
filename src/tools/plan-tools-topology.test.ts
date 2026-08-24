@@ -75,3 +75,26 @@ test('fresh plan schema has one topology and capability-only bindings', () => {
     bindings: valid.bindings.slice(0, 1),
   }).success, false, 'partial binding coverage crossed the plan boundary');
 });
+
+// ─── A door that cannot open must not be offered ─────────────────────────────
+//
+// Every plan_task binding must carry a capabilityRef, and admission refuses any
+// ref the host did not disclose. With an empty catalog the schema demands a
+// value the description explicitly forbids inventing, and the gate rejects it
+// unconditionally — there is no action the model can take that succeeds.
+//
+// Measured on the real home before this pin: 16 plan_task calls, 16
+// `plan_not_admitted` refusals, zero successes; one turn burned six consecutive
+// attempts before falling back to the direct route that worked all along.
+test('plan_task is not offered when the host disclosed no citable capability', async () => {
+  const { buildPlanTaskTool } = await import('./plan-tools.js');
+  const identity = { sessionId: 'plan-empty-catalog', sourceUserSeq: 1 };
+  const emptyCatalog = buildPlanTaskTool({
+    planning: { authority: Object.freeze({}), identity, capabilities: [], digest: 'empty' },
+  } as never) as unknown as { isEnabled?: () => Promise<boolean> };
+  assert.equal(
+    await emptyCatalog.isEnabled?.(),
+    false,
+    'an empty planning catalog makes every possible proposal inadmissible',
+  );
+});

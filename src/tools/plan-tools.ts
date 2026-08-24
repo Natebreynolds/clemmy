@@ -325,7 +325,21 @@ export function buildPlanTaskTool(input: {
       `Exact host planning catalog: ${planningCatalogText(input.planning.capabilities)}`,
     ].join(' '),
     parameters: PlanTaskInputSchema,
-    isEnabled: async () => !actionExpectedWorkRequired(input.planning.identity),
+    // A plan can only be admitted against a capability the host DISCLOSED:
+    // every binding must carry a capabilityRef, and admission refuses any ref
+    // outside the catalog. With an empty catalog the schema demands a value the
+    // description forbids inventing and the gate rejects unconditionally — the
+    // model cannot comply by any action available to it. Measured on the real
+    // home: 16 plan_task calls, 16 `plan_not_admitted` refusals, zero
+    // successes, six consecutive attempts inside a single turn before the model
+    // gave up and took the direct route that worked all along.
+    //
+    // So don't offer the door when it cannot open. This removes wasted model
+    // calls, not capability: the catalog is populated from provisioned
+    // capabilities, and when there are none there is nothing plan_task could
+    // have frozen.
+    isEnabled: async () => input.planning.capabilities.length > 0
+      && !actionExpectedWorkRequired(input.planning.identity),
     execute: async (args) => executePlanTask(args as PlanTaskInput, input.planning),
   });
 }
