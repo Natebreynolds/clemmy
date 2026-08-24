@@ -149,17 +149,17 @@ test('one physical broad call is admitted, settled, replay-safe, and a second is
   });
   assert.equal(replay?.replay, true);
 
-  assert.throws(() => admitDiscoveryBoundary({
+  // A second broad look through another surface rides the same claim. It is
+  // admitted rather than softly denied — the caller already paid for the call,
+  // and the refusal only bought a retry through yet another door.
+  const secondSurface = admitDiscoveryBoundary({
     ...key,
     toolName: 'local_cli_list',
     input: { filter: 'gh' },
     callId: 'provider-broad-2',
-  }), (error: unknown) => {
-    assert.ok(error instanceof DiscoveryBudgetDeniedError);
-    assert.equal(error.reason, 'category_budget_exhausted');
-    assert.match(error.message, /do not issue another broad search/i);
-    return true;
   });
+  assert.ok(secondSurface, 'a second surface rides the claim already held');
+  assert.equal(secondSurface.replay, true, 'and spends no additional claim');
 
   assert.equal(
     discoveryGovernor.getTaskState(key)?.claims.broad_discovery?.outcome,
@@ -225,9 +225,16 @@ test('execute-only discovery stays conservatively charged and denies before a se
   const first = await withHarnessRunContext(ctx, () => wrapped.execute!({ query: 'outlook unread mail' }));
   assert.equal(first, 'provider result');
   assert.equal(claimObservedInsideExecute, true);
+  // THE DELIBERATE TRADE. A second, DIFFERENT search now reaches the provider
+  // instead of being refused. It costs one provider call; refusing it cost a
+  // model call that had already been paid for, returned nothing usable, and
+  // left the second subject ('gmail') permanently unsearchable — so the model
+  // reformulated and asked again. Measured across the real home, that loop is
+  // where the discovery budget spent most of its tokens.
   const second = await withHarnessRunContext(ctx, () => wrapped.execute!({ query: 'gmail unread mail' }));
-  assert.equal(providerCalls, 1);
-  assert.match(String(second), /^Tool call refused by harness: discovery budget denied/);
+  assert.equal(providerCalls, 2, 'the second search actually runs');
+  assert.equal(second, 'provider result');
+  assert.doesNotMatch(String(second), /refused by harness/);
   assert.equal(
     discoveryGovernor.getTaskState(key)?.claims.broad_discovery?.outcome,
     'succeeded',
@@ -278,9 +285,13 @@ test('SDK-local validation is free, then the first validated discovery is atomic
     'succeeded',
   );
 
-  const denied = await invoke(JSON.stringify({ query: 'gmail unread mail' }), 'sdk-extra');
-  assert.match(String(denied), /^Tool call refused by harness: discovery budget denied/);
-  assert.equal(providerCalls, 1, 'a denied validated call must not enter execute/provider code');
+  // The test's real subject is the ORDER — invalid input never charges a claim,
+  // and the claim exists before provider code runs. Both still hold above. A
+  // further valid search is no longer refused for being the second one.
+  const extra = await invoke(JSON.stringify({ query: 'gmail unread mail' }), 'sdk-extra');
+  assert.equal(extra, 'provider result for gmail unread mail');
+  assert.doesNotMatch(String(extra), /refused by harness/);
+  assert.equal(providerCalls, 2, 'both validated searches reach provider code; the invalid ones never did');
   assert.equal(ctx.counter.calls, 4, 'ordinary tool-attempt accounting is unchanged');
 });
 

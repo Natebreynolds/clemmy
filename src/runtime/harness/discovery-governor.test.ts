@@ -120,13 +120,17 @@ test('novel task receives one broad discovery and a separate one-shot schema ref
   assert.equal(broad.reason, 'novel_discovery_admitted');
   assert.equal(broad.consumedBudget, true);
 
+  // A second look is ADMITTED and spends no additional budget. Refusing it
+  // never saved the call — the model had already paid for it — and only bought
+  // a reformulated retry, which is the thrash the cap existed to prevent.
   const extraBroad = governor.admit({
     ...key,
     category: 'broad_discovery',
     callId: 'broad-2',
   });
-  assert.equal(extraBroad.admitted, false);
-  assert.equal(extraBroad.reason, 'category_budget_exhausted');
+  assert.equal(extraBroad.admitted, true);
+  assert.equal(extraBroad.reason, 'subject_replay');
+  assert.equal(extraBroad.consumedBudget, false, 'a replay must not spend a second claim');
 
   const refresh = governor.admit({
     ...key,
@@ -137,13 +141,16 @@ test('novel task receives one broad discovery and a separate one-shot schema ref
   assert.equal(refresh.reason, 'schema_refresh_admitted');
   assert.equal(refresh.telemetry.eventData.allowance, 1);
 
+  // Same for a repeated schema refresh: the allowance is spent once, and the
+  // repeat replays it instead of being refused.
   const extraRefresh = governor.admit({
     ...key,
     category: 'exact_schema_refresh',
     callId: 'refresh-2',
   });
-  assert.equal(extraRefresh.admitted, false);
-  assert.equal(extraRefresh.reason, 'category_budget_exhausted');
+  assert.equal(extraRefresh.admitted, true);
+  assert.equal(extraRefresh.reason, 'subject_replay');
+  assert.equal(extraRefresh.consumedBudget, false);
 });
 
 test('same call-id replay is free and a failed claim remains spent after daemon restart', () => {
@@ -183,13 +190,19 @@ test('same call-id replay is free and a failed claim remains spent after daemon 
   assert.equal(replay.claim?.outcome, 'failed');
   assert.equal(replay.telemetry.eventData.priorOutcome, 'failed');
 
+  // A FAILED claim no longer forecloses the retry. A provider failure is
+  // exactly when another attempt is legitimate, and refusing it does not save
+  // the call the model already made — it only forces a reformulated one. The
+  // claim keeps its recorded failure; the retry simply replays it for free.
   const retryWithNewCall = restarted.admit({
     ...key,
     category: 'broad_discovery',
     callId: 'provider-call-2',
   });
-  assert.equal(retryWithNewCall.admitted, false);
-  assert.equal(retryWithNewCall.reason, 'category_budget_exhausted');
+  assert.equal(retryWithNewCall.admitted, true);
+  assert.equal(retryWithNewCall.reason, 'subject_replay');
+  assert.equal(retryWithNewCall.consumedBudget, false, 'the claim is still spent exactly once');
+  assert.equal(retryWithNewCall.claim?.outcome, 'failed', 'the failure stays on the record');
 
   const settlementReplay = restarted.settle({
     ...key,
@@ -224,13 +237,17 @@ test('known tasks may spend the independent exact-schema-refresh slot once', () 
   });
   assert.equal(timedOut.recorded, true);
 
+  // A timeout is the canonical retryable outcome; refusing the second attempt
+  // stranded the task on a transient provider failure. The slot is still spent
+  // once and the timeout stays on the record.
   const second = governor.admit({
     ...key,
     category: 'exact_schema_refresh',
     callId: 'schema-drift-2',
   });
-  assert.equal(second.admitted, false);
-  assert.equal(second.reason, 'category_budget_exhausted');
+  assert.equal(second.admitted, true);
+  assert.equal(second.reason, 'subject_replay');
+  assert.equal(second.consumedBudget, false);
   assert.equal(second.claim?.outcome, 'timed_out');
 });
 
@@ -282,10 +299,17 @@ test('concurrent daemon processes atomically elect one broad-discovery winner', 
   const decisions = await Promise.all(
     Array.from({ length: 6 }, (_, index) => childAdmission(moduleUrl, key, `race-${index}`)),
   );
-  assert.equal(decisions.filter((decision) => decision.admitted).length, 1);
-  assert.equal(decisions.filter((decision) => decision.consumedBudget).length, 1);
+  // THE INVARIANT IS ATOMICITY, NOT REFUSAL: exactly one process may create the
+  // claim. The losers of that race are handed the existing claim rather than
+  // refused — they have already paid for their call.
   assert.equal(
-    decisions.filter((decision) => decision.reason === 'category_budget_exhausted').length,
+    decisions.filter((decision) => decision.consumedBudget).length,
+    1,
+    'exactly one process may spend the claim',
+  );
+  assert.equal(decisions.filter((decision) => decision.admitted).length, 6);
+  assert.equal(
+    decisions.filter((decision) => decision.reason === 'subject_replay').length,
     5,
   );
   assert.equal(governor.getTaskState(key)?.claims.broad_discovery?.outcome, 'pending');

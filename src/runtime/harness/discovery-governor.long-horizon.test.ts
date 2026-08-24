@@ -184,11 +184,16 @@ test('long horizon: restart and continuations do not repay discovery; a new acce
       consumedBudget: false,
       reason: 'same_call_replay',
     },
+    // THE INVARIANT IS "DOES NOT REPAY", NOT "IS REFUSED": consumedBudget stays
+    // false across restarts and continuations, so a long horizon can never mint
+    // itself a fresh allowance. The continuation is now admitted as a replay of
+    // the claim it already owns — refusing it never saved the call, and only
+    // bought a reformulated retry.
     broadContinuation: {
-      admitted: false,
-      replay: false,
+      admitted: true,
+      replay: true,
       consumedBudget: false,
-      reason: 'category_budget_exhausted',
+      reason: 'subject_replay',
     },
     exactReplay: {
       admitted: true,
@@ -197,10 +202,10 @@ test('long horizon: restart and continuations do not repay discovery; a new acce
       reason: 'same_call_replay',
     },
     exactContinuation: {
-      admitted: false,
-      replay: false,
+      admitted: true,
+      replay: true,
       consumedBudget: false,
-      reason: 'category_budget_exhausted',
+      reason: 'subject_replay',
     },
     claimCount: 2,
     broadOutcome: 'succeeded',

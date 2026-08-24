@@ -1811,7 +1811,7 @@ test('agentic schema-on-demand keeps local-runtime-only tools deferred even when
   assert.equal(acquired?.bound.includes('workspace_roots'), true);
 });
 
-test('Claude direct discovery admits one bounded task slot and denies a second broad search', async () => {
+test('Claude direct discovery keeps one task claim while admitting a second broad search', async () => {
   const { discoveryGovernor } = await import('./discovery-governor.js');
   const session = eventlog.createSession({ kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -1892,9 +1892,10 @@ test('Claude direct discovery admits one bounded task slot and denies a second b
     localMcpToolUniverse: ['tool_search', 'workspace_roots'],
   });
 
-  assert.deepEqual(verdicts.map((verdict) => verdict.behavior), ['allow', 'deny']);
-  assert.match(verdicts[1]?.message ?? '', /category_budget_exhausted/,
-    'Claude receives the same provider-neutral bounded-discovery denial as every other lane');
+  // The Claude lane behaves like every other lane: a second broad search is
+  // admitted and rides the claim the task already owns. Refusing it never
+  // recovered the model call that had already been spent.
+  assert.deepEqual(verdicts.map((verdict) => verdict.behavior), ['allow', 'allow']);
   const state = discoveryGovernor.getTaskState({
     sessionId: session.id,
     sourceUserSeq: source.seq,
@@ -1905,11 +1906,11 @@ test('Claude direct discovery admits one bounded task slot and denies a second b
     eventlog.listEvents(session.id, { types: ['discovery_governor_decision'] }).length,
     2,
   );
-  // Only the admitted search settles an outcome; the denied search performs
-  // no catalog/provider work and therefore cannot mint a nominal result.
+  // Both searches now do real work and settle, against the ONE claim the task
+  // owns — that shared claim, not a refusal, is what bounds discovery.
   assert.equal(
     eventlog.listEvents(session.id, { types: ['discovery_governor_outcome'] }).length,
-    1,
+    2,
   );
 });
 

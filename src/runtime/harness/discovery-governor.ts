@@ -120,13 +120,16 @@ export type DiscoveryAdmissionReason =
   | 'novel_discovery_admitted'
   | 'schema_refresh_admitted'
   | 'same_call_replay'
+  /** A second look at a subject already claimed this epoch. Admitted: the model
+   *  has already paid for the call, and refusing only buys a reformulated
+   *  retry. */
+  | 'subject_replay'
   /** A prior epoch was closed by new evidence; this epoch has its own budget. */
   | 'new_evidence_admitted'
   | 'task_not_initialized'
   | 'role_required'
   | 'role_not_unresolved'
-  | 'role_resolved'
-  | 'category_budget_exhausted';
+  | 'role_resolved';
 
 export interface DiscoveryGovernorMetric {
   name: 'discovery_governor_decisions_total';
@@ -183,7 +186,8 @@ export interface DiscoveryAdmittedDecision extends DiscoveryDecisionBase {
   reason:
     | 'novel_discovery_admitted'
     | 'schema_refresh_admitted'
-    | 'same_call_replay';
+    | 'same_call_replay'
+    | 'subject_replay';
 }
 
 export interface DiscoveryDeniedDecision extends DiscoveryDecisionBase {
@@ -192,8 +196,7 @@ export interface DiscoveryDeniedDecision extends DiscoveryDecisionBase {
     | 'task_not_initialized'
     | 'role_required'
     | 'role_not_unresolved'
-    | 'role_resolved'
-    | 'category_budget_exhausted';
+    | 'role_resolved';
 }
 
 export type DiscoveryDecision = DiscoveryAdmittedDecision | DiscoveryDeniedDecision;
@@ -298,8 +301,6 @@ export const MAX_DISCOVERY_EPOCHS = 4;
  * discovery remains a small control surface. Each admitted claim is still
  * keyed by one exact frozen role; this ceiling prevents an oversized role
  * projection from turning into an unbounded provider-search fan-out. */
-export const MAX_ROLE_SCOPED_DISCOVERY_CLAIMS = 8;
-
 export interface DiscoveryEvidenceRecord {
   outcome: DiscoveryEvidenceOutcome;
   kind: DiscoveryEvidenceKind;
@@ -1182,43 +1183,33 @@ export class DiscoveryGovernor {
       ) as RawClaimRow | undefined;
       const existing = rawExisting ? rowToClaim(rawExisting) : null;
       if (existing) {
-        const replay = existing.callId === callId;
+        // A REPEAT IS A REPLAY, NOT A REFUSAL.
+        //
+        // A second look at the same subject used to be denied
+        // (category_budget_exhausted). The denial does not save the call — the
+        // model already paid full input tokens to make it — and it does not end
+        // the search: the model reformulates and asks again. Measured on the
+        // real home, that loop is the thrash the budget existed to prevent.
+        // One turn issued 41 discovery calls of which 37 were denied; another
+        // 16 with 14 denied. Across every turn since 08-10: 610 attempts, 266
+        // denied, and 66% of turns wanted more than the single look the
+        // non-role-scoped cap allowed.
+        //
+        // So the repeat is admitted and marked as a replay of the claim that
+        // already exists. The ledger is unchanged — one claim per subject, same
+        // epoch, same role accounting — only the refusal is gone.
         return buildDecision({
           key,
           category: input.category,
           subject,
           callId,
-          admitted: replay,
-          reason: replay ? 'same_call_replay' : 'category_budget_exhausted',
-          replay,
+          admitted: true,
+          reason: existing.callId === callId ? 'same_call_replay' : 'subject_replay',
+          replay: true,
           consumedBudget: false,
           policy,
           claim: existing,
         });
-      }
-
-      if (input.category === 'broad_discovery') {
-        const spent = db.prepare(`
-          SELECT COUNT(*) AS count
-            FROM discovery_governor_claims
-           WHERE session_id = ? AND source_user_seq = ?
-             AND epoch = ? AND category = 'broad_discovery'
-        `).get(key.sessionId, key.sourceUserSeq, policy.epoch) as { count: number };
-        const cap = policy.roleScoped ? MAX_ROLE_SCOPED_DISCOVERY_CLAIMS : 1;
-        if (spent.count >= cap) {
-          return buildDecision({
-            key,
-            category: input.category,
-            subject,
-            callId,
-            admitted: false,
-            reason: 'category_budget_exhausted',
-            replay: false,
-            consumedBudget: false,
-            policy,
-            claim: null,
-          });
-        }
       }
 
       const admittedAt = new Date().toISOString();
@@ -1239,15 +1230,17 @@ export class DiscoveryGovernor {
       ) as RawClaimRow;
       const claim = rowToClaim(rawClaim);
       if (inserted.changes !== 1) {
-        const replay = claim.callId === callId;
+        // Lost the insert race: another call claimed this subject concurrently.
+        // Same reasoning as the repeat above — the caller has already paid for
+        // this call, so hand it the existing claim rather than refusing it.
         return buildDecision({
           key,
           category: input.category,
           subject,
           callId,
-          admitted: replay,
-          reason: replay ? 'same_call_replay' : 'category_budget_exhausted',
-          replay,
+          admitted: true,
+          reason: claim.callId === callId ? 'same_call_replay' : 'subject_replay',
+          replay: true,
           consumedBudget: false,
           policy,
           claim,

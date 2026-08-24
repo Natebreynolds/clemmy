@@ -120,16 +120,18 @@ test('distinct unresolved roles each get one slot while synonyms and carriers sh
   assert.equal(first.subject, sourceRole);
   settleDiscoveryBoundary(first, 'succeeded');
 
-  assert.throws(() => admitDiscoveryBoundary({
+  // A synonym carrier for the SAME role shares that role's claim instead of
+  // minting a second one. It is admitted rather than refused: the caller has
+  // already paid for the call, and refusing it only bought a retry through a
+  // different door.
+  const synonym = admitDiscoveryBoundary({
     ...key,
     toolName: 'ToolSearch',
     input: { query: `[role:${sourceRole}] locate something that retrieves the records` },
     callId: 'source-search-synonym',
-  }), (error: unknown) => {
-    assert.ok(error instanceof DiscoveryBudgetDeniedError);
-    assert.equal(error.reason, 'category_budget_exhausted');
-    return true;
   });
+  assert.ok(synonym, 'a synonym carrier rides the claim its role already owns');
+  assert.equal(synonym.subject, sourceRole, 'synonyms share one role claim');
 
   const second = admitDiscoveryBoundary({
     ...key,
@@ -204,14 +206,17 @@ test('distinct unresolved roles each get one slot while synonyms and carriers sh
       .sort(),
     [destinationRole, sourceRole].sort(),
   );
+  // A restart replays the claim this role already owns; it never mints a second
+  // one. "Does not repay" is the invariant, not "is refused".
   const afterRestart = restarted.admit({
     ...key,
     category: 'broad_discovery',
     subject: sourceRole,
     callId: 'source-after-restart',
   });
-  assert.equal(afterRestart.admitted, false);
-  assert.equal(afterRestart.reason, 'category_budget_exhausted');
+  assert.equal(afterRestart.admitted, true);
+  assert.equal(afterRestart.reason, 'subject_replay');
+  assert.equal(afterRestart.consumedBudget, false, 'a restart must not repay discovery');
 });
 
 test('an all-resolved role projection has zero broad slots without disabling exact schema repair', () => {
@@ -438,8 +443,14 @@ test('a builtins-only broker leaves the legacy discovery path reachable', () => 
     subject: 'model-invented-before-role-policy',
     callId: 'legacy-external-search-2',
   });
-  assert.equal(sameTaskSecondRole.admitted, false, 'legacy role-shaped text cannot mint another slot');
-  assert.equal(sameTaskSecondRole.reason, 'category_budget_exhausted');
+  // The protection is that invented role-shaped text cannot mint an EXTRA
+  // claim: a legacy task forces every broad subject to the same empty key, so
+  // the second call rides the claim already held. It is admitted — refusing it
+  // never saved the call — but it spends nothing and adds no slot.
+  assert.equal(sameTaskSecondRole.subject, '', 'legacy role-shaped text cannot mint another slot');
+  assert.equal(sameTaskSecondRole.consumedBudget, false, 'no second slot is spent');
+  assert.equal(sameTaskSecondRole.admitted, true);
+  assert.equal(sameTaskSecondRole.reason, 'subject_replay');
 });
 
 test('missing requirement projection never masquerades as all-resolved', () => {

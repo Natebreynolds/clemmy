@@ -139,11 +139,13 @@ test('scenario 3/4: a failed candidate reopens discovery instead of closing the 
   assert.equal(first.admitted, true);
   governor.settle({ ...key, category: 'broad_discovery', callId: 'search-1', outcome: 'succeeded' });
 
-  // Same task, no new evidence: repeating the search is still refused. That
-  // invariant is the reason discovery is bounded at all.
+  // Same task, no new evidence: the repeat replays the claim already held
+  // rather than minting a second one. The bound is on CLAIMS, not on calls —
+  // refusing the call never un-spent it.
   const repeat = governor.admit({ ...key, category: 'broad_discovery', callId: 'search-2' });
-  assert.equal(repeat.admitted, false);
-  assert.equal(repeat.reason, 'category_budget_exhausted');
+  assert.equal(repeat.admitted, true);
+  assert.equal(repeat.reason, 'subject_replay');
+  assert.equal(repeat.consumedBudget, false);
 
   // The candidate that search produced turns out not to support the operation.
   const evidence = governor.recordEvidence({
@@ -179,12 +181,15 @@ test('scenario 3: repairing a DIFFERENT tool never spends the first tool schema 
   });
   assert.equal(second.admitted, true, 'a different tool has its own schema budget');
 
-  // The same tool twice in one epoch is still refused.
+  // The same tool twice in one epoch replays its existing claim: the point of
+  // this scenario is that a DIFFERENT tool keeps its own budget, and that still
+  // holds above. Re-asking for the same schema mints nothing new.
   const repeat = governor.admit({
     ...key, category: 'exact_schema_refresh', subject: 'OUTLOOK_SEND_MAIL', callId: 'schema-3',
   });
-  assert.equal(repeat.admitted, false);
-  assert.equal(repeat.reason, 'category_budget_exhausted');
+  assert.equal(repeat.admitted, true);
+  assert.equal(repeat.reason, 'subject_replay');
+  assert.equal(repeat.consumedBudget, false);
 });
 
 // ── Scenario 11/12: cold correctness, and what a receipt may change ───────────

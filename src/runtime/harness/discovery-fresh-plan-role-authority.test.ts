@@ -113,33 +113,31 @@ test('fresh-plan authority preserves one exact claim per frozen unresolved role'
   }
 });
 
-test('role-scoped broad search has an eight-claim ceiling even with more frozen roles', () => {
+// Every frozen role gets its look. The old eight-claim ceiling meant a task
+// with nine real requirements could never discover the ninth — the requirement
+// existed, the model knew it was unresolved, and no action could reach it.
+// Distinct roles are bounded by the task's own frozen requirements, so this
+// needs no separate cap; repeats of a role it already claimed are free replays.
+test('every frozen unresolved role gets its own broad search', () => {
   const roles = Array.from({ length: 9 }, (_, index) => ({ roleKey: `clause-${index}:unknown` }));
   const key = acceptedTask('nine-live-roles', roles);
-  for (let index = 0; index < 8; index += 1) {
-    assert.ok(admitDiscoveryBoundary({
-      ...key,
-      toolName: 'tool_search',
-      input: { query: `find requirement ${index}`, role_key: roles[index]!.roleKey, limit: 8 },
-      callId: `fresh-role-${index}`,
-      freshPlanCatalogDisclosure: true,
-    }));
+  for (let index = 0; index < 9; index += 1) {
+    assert.ok(
+      admitDiscoveryBoundary({
+        ...key,
+        toolName: 'tool_search',
+        input: { query: `find requirement ${index}`, role_key: roles[index]!.roleKey, limit: 8 },
+        callId: `fresh-role-${index}`,
+        freshPlanCatalogDisclosure: true,
+      }),
+      `role ${index} must be discoverable`,
+    );
   }
-  assert.throws(() => admitDiscoveryBoundary({
-    ...key,
-    toolName: 'tool_search',
-    input: { query: 'find ninth requirement', role_key: roles[8]!.roleKey, limit: 8 },
-    callId: 'fresh-role-8',
-    freshPlanCatalogDisclosure: true,
-  }), (error: unknown) => {
-    assert.ok(error instanceof DiscoveryBudgetDeniedError);
-    assert.equal(error.reason, 'category_budget_exhausted');
-    return true;
-  });
   assert.equal(
     discoveryGovernor.getTaskState(key)?.epochClaims
       .filter((claim) => claim.category === 'broad_discovery').length,
-    8,
+    9,
+    'one claim per distinct role, no more and no fewer',
   );
 });
 
