@@ -61,7 +61,10 @@ import {
   revokeDispatchLeaseBeforeRecovery,
   type DispatchLeaseRef,
 } from './dispatch-lease.js';
+import pino from 'pino';
 import { getSession, isKillRequested, openEventLog } from './eventlog.js';
+
+const hostTurnLogger = pino({ name: 'clementine.harness.host-turn-runner' });
 import {
   ModelStreamStalledError,
   modelFirstByteStallMs,
@@ -2361,6 +2364,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         invocationEntered: observation.invocationEntered,
       };
     } catch (error) {
+      // The terminal a user sees for this path says the technical details are
+      // in the activity log. They were not: the error was carried on the
+      // attempt, used to choose a disposition, and then dropped. A turn could
+      // fail with no recoverable account of why, anywhere.
+      hostTurnLogger.error(
+        {
+          tool: call.name,
+          callId: call.callId,
+          invocationEntered: observation.invocationEntered,
+          err: error instanceof Error
+            ? { message: error.message, stack: error.stack }
+            : { message: String(error) },
+        },
+        'host tool call failed',
+      );
       return {
         status: 'failed',
         error,
