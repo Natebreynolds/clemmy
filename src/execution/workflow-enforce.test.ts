@@ -846,3 +846,75 @@ test('workflowNeedsCreationTest: true when any step is a testable read, false ot
     false,
   );
 });
+
+// REGRESSION PIN: auto-repair must never MULTIPLY an effect.
+// Adding forEach turns one crossing into N -- one per item -- so on a
+// write/send step this repair would silently fan out an irreversible effect the
+// user never approved (N emails, N posts, N rows) purely because an upstream
+// happened to return an array.
+test('autoRepair never adds forEach to an effectful step', () => {
+  // Same shape as the T2.4 fixture that this repair was written for -- only the
+  // consumer's side-effect class varies, which is exactly what is under test.
+  const producer = { id: 'gather', prompt: 'gather the prospect list', output: { type: 'array', min_items: { '': 1 } } };
+  const consumerPrompt = 'For each of the 25 prospects, scrape their site and draft a summary one by one.';
+  const build = (sideEffect?: string) => wf({
+    steps: [
+      producer,
+      {
+        id: 'work',
+        prompt: consumerPrompt,
+        dependsOn: ['gather'],
+        ...(sideEffect ? { sideEffect } : {}),
+      },
+    ],
+  } as never);
+
+  // READ is the case this repair exists for -- it still fans out.
+  assert.equal(
+    autoRepairWorkflowDefinition(build('read')).def.steps[1].forEach,
+    'gather',
+    'a read step over one array upstream should still gain forEach',
+  );
+
+  // SEND and WRITE must never be fanned out: that turns one approved crossing
+  // into N unapproved ones.
+  assert.equal(
+    autoRepairWorkflowDefinition(build('send')).def.steps[1].forEach,
+    undefined,
+    'auto-repair must never fan out a send step into N irreversible crossings',
+  );
+  assert.equal(
+    autoRepairWorkflowDefinition(build('write')).def.steps[1].forEach,
+    undefined,
+    'auto-repair must never fan out a write step',
+  );
+});
+
+// REGRESSION PIN: pinning a goal ARMS goal-judging, and a missed goal is
+// recorded as a run FAILURE. Doing that immediately before a scheduled run
+// could fail a long-working workflow against criteria the host invented and the
+// user never set -- and now that blocked/failed runs persist and escalate, it
+// would notify them about it too. Pinning is an AUTHORING repair.
+test('autoRepair pins a goal while authoring but never on the pre-run path', () => {
+  const def = wf({
+    description: 'Audit a website and produce a report URL with rows of findings.',
+    steps: [{ id: 'deliver', prompt: 'Create a report URL and return rows of findings for the audit.' }],
+  });
+
+  const authored = autoRepairWorkflowDefinition(def, false);
+  assert.ok(authored.def.goal?.objective, 'authoring still pins a goal');
+  assert.ok(authored.repairs.some((r) => /Pinned a workflow goal/.test(r)));
+
+  const preRun = autoRepairWorkflowDefinition(def, true);
+  assert.equal(preRun.def.goal?.objective, undefined, 'pre-run must not arm goal-judging');
+  assert.equal(
+    preRun.repairs.some((r) => /Pinned a workflow goal/.test(r)),
+    false,
+  );
+
+  // Structural repairs are unaffected by the pre-run flag.
+  assert.ok(
+    preRun.def.steps[0].output && Object.keys(preRun.def.steps[0].output).length > 0,
+    'pre-run still applies structural repairs like output contracts',
+  );
+});

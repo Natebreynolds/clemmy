@@ -11970,6 +11970,10 @@ async function processOneRunFile(
         ? { ok: true as const, def: workflow.data, repairs: [] as string[] }
         : prepareWorkflowForWrite(workflow.data, {
           exactSendCommittedReplayStepIds: committedReplayStepIds,
+          // Pre-run: structural repairs still apply, but authoring-only ones
+          // (pinning a goal, which arms goal-judging) must not change how an
+          // already-scheduled run is judged.
+          preRun: true,
         });
       if (prep.ok && prep.repairs.length > 0) {
         let repairAuthorized = false;

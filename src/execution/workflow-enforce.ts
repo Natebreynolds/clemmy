@@ -584,7 +584,13 @@ function forEachSourceStepId(expr: string | undefined): string | null {
   return /^[a-zA-Z0-9_-]+$/.test(raw) ? raw : null;
 }
 
-export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowAutoRepair {
+export function autoRepairWorkflowDefinition(
+  def: WorkflowDefinition,
+  /** True when this runs immediately before a scheduled run rather than while
+   *  the user is authoring. Repairs that CHANGE how a run is judged (pinning a
+   *  goal) are authoring-only; structural repairs still apply either way. */
+  preRun = false,
+): WorkflowAutoRepair {
   const repairs: string[] = [];
   const steps = def.steps.map((s) => ({
     ...s,
@@ -704,6 +710,22 @@ export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowA
       return Boolean(out && (out.type === 'array' || (out.min_items && Object.keys(out.min_items).length > 0)));
     });
     if (arrayUpstreams.length !== 1) continue;
+    // NEVER auto-fan-out an effectful step. Adding forEach turns ONE crossing
+    // into N -- one per item -- so on a write/send step this repair would
+    // silently multiply an irreversible effect the user never approved (N
+    // emails, N posts, N rows) purely because an upstream happened to return an
+    // array. Fanning out a READ is safe and is the case this repair was written
+    // for; everything else keeps today's advisory and stays the author's call.
+    const fanoutClass = classifyStepSideEffect({
+      ...(step.prompt ? { prompt: step.prompt } : {}),
+      ...(step.sideEffect ? { sideEffect: step.sideEffect } : {}),
+      ...(step.allowedTools ? { allowedTools: step.allowedTools } : {}),
+      ...(step.usesSkill ? { usesSkill: step.usesSkill } : {}),
+      ...(step.call?.tool ? { call: { tool: step.call.tool } } : {}),
+    });
+    // Only a proven READ fans out automatically. 'unknown' is excluded too --
+    // an unclassifiable step is exactly the one not to multiply silently.
+    if (fanoutClass !== 'read') continue;
     step.forEach = arrayUpstreams[0];
     repairs.push(
       `Added forEach: "${arrayUpstreams[0]}" to step "${step.id}" — its prompt is multi-item work, and "${arrayUpstreams[0]}" produces the array; the runner now fans out per item (bounded concurrency, per-item resume) instead of running the whole list serially in one context.`,
@@ -733,8 +755,18 @@ export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowA
     repairs.push(`Hardened live research output contract for step "${step.id}" with source-backed evidence keys.`);
   }
   const synthesisLooksDeliverable = textMentionsDeliverable(def.synthesis?.prompt ?? '');
+  // Pin a goal only while a workflow is being AUTHORED, never on the pre-run
+  // path. Pinning arms goal-judging, and a missed goal is recorded as a run
+  // FAILURE -- so pinning immediately before a scheduled run could fail a
+  // long-working workflow against success criteria the host invented and the
+  // user never set. That was silent before; now that blocked/failed occurrences
+  // persist and escalate, it would also notify them about it.
+  //
+  // `enabled` is NOT the right discriminator here: a user can legitimately
+  // author an enabled workflow and should still get a pinned goal.
   if (
-    !repairedGoal?.objective
+    !preRun
+    && !repairedGoal?.objective
     && contractProposal.proposedGoal
     && (contractProposal.proposedStepOutputs.length > 0 || synthesisLooksDeliverable)
   ) {
@@ -825,9 +857,11 @@ export function prepareWorkflowForWrite(
   opts: {
     allowDisabledExactSendDraft?: boolean;
     exactSendCommittedReplayStepIds?: ReadonlySet<string>;
+    /** Set by the runner's pre-run repair. Suppresses authoring-only repairs. */
+    preRun?: boolean;
   } = {},
 ): WorkflowWritePrep {
-  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def, opts.preRun === true);
   const check = checkWorkflowForWrite(repaired, opts);
   return { def: repaired, ok: check.ok, errors: check.errors, warnings: check.warnings, repairs };
 }
