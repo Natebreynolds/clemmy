@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -8,27 +8,97 @@ import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_TEST_TARGETS,
   isolatedTestArgs,
+  TEST_ISOLATION_PRELOAD,
 } from './run-tests-isolated-args.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const runnerPath = path.join(repoRoot, 'scripts', 'run-tests-isolated.mjs');
 
+/**
+ * Environment for spawning the runner from inside a test.
+ *
+ * NODE_TEST_CONTEXT must not be inherited: Node reads it as "you are already a
+ * test child", so the nested runner reports through a serializer channel that
+ * has no listener, executes NO test files, and exits 0. A nested run that only
+ * asserts on the exit status then passes without ever running its fixture.
+ */
+function nestedRunnerEnv() {
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  return env;
+}
+
 test('isolated test runner retains source-only defaults when only reporter options are forwarded', () => {
   assert.deepEqual(
     isolatedTestArgs(['--test-reporter=dot']),
-    ['--test', '--test-reporter=dot', ...DEFAULT_TEST_TARGETS],
+    ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-reporter=dot', ...DEFAULT_TEST_TARGETS],
   );
   assert.deepEqual(
     isolatedTestArgs(['--test-reporter', 'dot']),
-    ['--test', '--test-reporter', 'dot', ...DEFAULT_TEST_TARGETS],
+    ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-reporter', 'dot', ...DEFAULT_TEST_TARGETS],
   );
 });
 
 test('isolated test runner preserves an explicit targeted test without adding the full suite', () => {
   assert.deepEqual(
     isolatedTestArgs(['--test-reporter=spec', 'apps/desktop/src/workspace-navigation-policy.test.ts']),
-    ['--test', '--test-reporter=spec', 'apps/desktop/src/workspace-navigation-policy.test.ts'],
+    ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-reporter=spec', 'apps/desktop/src/workspace-navigation-policy.test.ts'],
   );
+});
+
+test('repository test scripts route through the isolated runner', () => {
+  const packageJson = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  const scripts = packageJson.scripts ?? {};
+  for (const name of ['test', 'test:prospective', 'test:public-hygiene', 'test:release-assets', 'test:release-closure', 'proof:selftest', 'journeys', 'test:measurement']) {
+    assert.match(
+      String(scripts[name] ?? ''),
+      /run-tests-isolated\.mjs/,
+      `${name} must use the isolated test runner`,
+    );
+    assert.doesNotMatch(
+      String(scripts[name] ?? ''),
+      /(?:^|\s)(?:npx\s+)?(?:tsx|node)\s+--test(?:\s|$)/,
+      `${name} must not invoke node/tsx --test directly`,
+    );
+  }
+});
+
+test('concurrently executed test files never share a home', () => {
+  // The runner used to pin one CLEMENTINE_HOME for the whole run, which
+  // disabled the preload's per-process minting. Files execute concurrently, so
+  // they then contended on the same SQLite databases and a failure moved
+  // between runs — a suite in that state cannot gate a release. Two files
+  // reporting the same home is the exact regression.
+  const fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-runner-home-isolation-'));
+  const reportPath = path.join(fixtureDir, 'homes.txt');
+  for (const name of ['alpha', 'beta']) {
+    writeFileSync(path.join(fixtureDir, `${name}.test.mjs`), `
+      import { test } from 'node:test';
+      import { appendFileSync } from 'node:fs';
+
+      test('${name} records the home it was given', () => {
+        appendFileSync(${JSON.stringify(reportPath)}, process.env.CLEMENTINE_HOME + '\\n');
+      });
+    `);
+  }
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [runnerPath, path.join(fixtureDir, 'alpha.test.mjs'), path.join(fixtureDir, 'beta.test.mjs')],
+      { cwd: repoRoot, env: nestedRunnerEnv(), encoding: 'utf8' },
+    );
+    assert.equal(
+      result.status,
+      0,
+      `isolated runner failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    );
+    const homes = readFileSync(reportPath, 'utf8').split('\n').filter(Boolean);
+    assert.equal(homes.length, 2, 'both fixture files ran');
+    assert.notEqual(homes[0], homes[1], 'each test file process minted its own home');
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
 });
 
 test('isolated test runner contains home, provider, and nested temp state', () => {
@@ -45,7 +115,16 @@ test('isolated test runner contains home, provider, and nested temp state', () =
       assert.equal(process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS, '1');
       assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1');
       assert.match(process.env.CLEMENTINE_HOME ?? '', /clementine-test-home-/);
-      assert.equal(os.tmpdir(), path.join(process.env.CLEMENTINE_HOME, 'tmp'));
+      // Temp stays one level ABOVE the per-process home on purpose: macOS caps
+      // a unix socket path at 104 bytes and tsx opens its IPC pipe under
+      // TMPDIR, so nesting temp inside each home truncates that path and makes
+      // unrelated subprocesses collide. Both still live in the one disposable
+      // tree the runner tears down.
+      const disposableRoot = path.dirname(os.tmpdir());
+      assert.ok(
+        process.env.CLEMENTINE_HOME.startsWith(disposableRoot + path.sep),
+        \`home \${process.env.CLEMENTINE_HOME} escaped the disposable tree \${disposableRoot}\`,
+      );
       assert.equal(process.env.TMPDIR, os.tmpdir());
       assert.equal(process.env.TMP, os.tmpdir());
       assert.equal(process.env.TEMP, os.tmpdir());
@@ -56,7 +135,7 @@ test('isolated test runner contains home, provider, and nested temp state', () =
     const result = spawnSync(process.execPath, [runnerPath, fixturePath], {
       cwd: repoRoot,
       env: {
-        ...process.env,
+        ...nestedRunnerEnv(),
         CLEMMY_LOCAL_EMBEDDINGS: 'on',
       },
       encoding: 'utf8',
@@ -65,6 +144,13 @@ test('isolated test runner contains home, provider, and nested temp state', () =
       result.status,
       0,
       `isolated runner failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    );
+    // Exit status alone is not evidence: a nested run that executes zero files
+    // also exits 0. Prove the fixture's assertions actually ran.
+    assert.match(
+      String(result.stdout),
+      /^# pass 1$/m,
+      `fixture did not run\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     );
   } finally {
     rmSync(fixtureDir, { recursive: true, force: true });

@@ -342,3 +342,38 @@ test('access-only proof auth fails before dispatch unless it covers the full mod
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
+
+// ── Sibling-grant survival (live 2026-08-18: a Codex native login rewrote
+// auth.json whole and silently dropped the connected xAI grant; the routine
+// refresh would have kept dropping it on every rotation). Every Codex writer
+// must MERGE — a Codex login/refresh/import may never sign the user out of
+// another provider. ──
+
+test('a Codex token refresh preserves a connected xAI grant', async () => {
+  const { saveXaiOAuthTokens, getStoredXaiOAuthTokens } = await import('./auth-store.js');
+  writeStoredAuth(tenMinAgo(), 'RT_before');
+  saveXaiOAuthTokens({ accessToken: 'XAI_AT', refreshToken: 'XAI_RT' });
+  __setRefreshTokenImplForTests(async () => ({
+    accessToken: 'AT_rotated',
+    refreshToken: 'RT_rotated',
+    idToken: 'ID_rotated',
+    accountId: 'acct',
+    lastRefresh: new Date().toISOString(),
+  }));
+  const result = await refreshStoredNativeOAuth({ force: true });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(storedRefreshToken(), 'RT_rotated', 'the rotation itself landed');
+  const xai = getStoredXaiOAuthTokens();
+  assert.ok(xai, 'the xAI grant survives the Codex rotation');
+  assert.equal(xai.accessToken, 'XAI_AT');
+});
+
+test('importing Codex CLI auth preserves a connected xAI grant', async () => {
+  const { saveXaiOAuthTokens, getStoredXaiOAuthTokens, importCodexCliAuth } = await import('./auth-store.js');
+  saveXaiOAuthTokens({ accessToken: 'XAI_AT2', refreshToken: 'XAI_RT2' });
+  writeCliAuth('RT_cli_import');
+  const result = importCodexCliAuth(CLI_AUTH_FILE);
+  assert.equal(result.ok, true, result.message);
+  assert.equal(storedRefreshToken(), 'RT_cli_import');
+  assert.ok(getStoredXaiOAuthTokens(), 'the xAI grant survives the CLI import');
+});

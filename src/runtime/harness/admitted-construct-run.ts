@@ -22,7 +22,12 @@ import type { TurnGraphIR, TurnGraphNode } from '../graph/turn-graph-ir.js';
 import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 import { evaluateGoalEvidence } from '../graph/goal-evidence.js';
 import { admitConstructPublish, admitConstructWrite } from '../graph/collect-construct-vertical.js';
-import { redeemRawResult, toResultHandle, type ResultHandleAuthority } from './result-handle.js';
+import {
+  redeemAuthoritativeResultPayload,
+  redeemRawResult,
+  toResultHandle,
+  type ResultHandleAuthority,
+} from './result-handle.js';
 import { expectedTaskFor } from './resolution-ledger.js';
 import {
   admitLogicalCall,
@@ -47,8 +52,17 @@ import {
   verifyHostSealedArtifactContentFromReadback,
 } from './artifact-ledger.js';
 import { commitTurnOutcome } from './delivery-committer.js';
-import { heldExecutionTextForInternalReason, isHostAuthorityHeldReason } from './public-presentation.js';
-import { turnOutcomeId, type TurnOutcome } from './turn-outcome.js';
+import {
+  PUBLIC_RUN_FAILURE_TEXT,
+  heldExecutionTextForInternalReason,
+  isHostAuthorityHeldReason,
+} from './public-presentation.js';
+import {
+  turnOutcomeId,
+  type PresentationEvent,
+  type TurnOutcome,
+} from './turn-outcome.js';
+import { renderTypedControlState } from './typed-control-state.js';
 import { appendEvent, getTurnGraphEventForSource, listEvents, openEventLog } from './eventlog.js';
 import {
   bindAdmittedNodeCapability,
@@ -74,7 +88,7 @@ import {
 } from './capability-manifest.js';
 import { peekCapabilityManifestStore, resolveCapabilityManifestStore } from './capability-manifest-store.js';
 import { mintResolvedCallAuthority, type ResolvedCallAuthorityV1 } from './resolved-call-authority.js';
-import { canonicalLogicalToolName } from './logical-call-contract.js';
+import { canonicalLogicalToolName, durableLogicalCallContract } from './logical-call-contract.js';
 import { readClaimLinkedSemanticInterpretation } from '../semantic-boundary/interpret-accepted-source.js';
 import { requirePhysicalDispatchGrounding } from './physical-dispatch-grounding.js';
 import { buildGraphNodeInvocationEnvelope } from './graph-node-envelope.js';
@@ -108,13 +122,40 @@ export interface ConstructProviderPorts {
 }
 
 export interface ConstructRunResult {
-  status: 'success' | 'blocked' | 'failed' | 'uncertain';
+  status: 'success' | 'blocked' | 'failed' | 'uncertain' | 'held';
   providerCalls: { sourceRead: number; collectionRead: number; transform: number; create: number; readback: number };
   artifactHandle?: string;
   createdId?: string;
   handles: Record<string, string>;
   published?: boolean;
+  /** Exact public winner committed for this accepted source. Internal failure
+   * detail remains in `error`; callers render only this durable projection. */
+  terminal?: PresentationEvent;
+  /** A nonterminal host-owned state. No chat response may be synthesized from
+   * this value: a peer or restart recovery still owns the accepted source. */
+  hold?: {
+    owner: 'host';
+    wake: 'peer' | 'recovery';
+    reason: 'peer_in_progress' | 'recovery_pending';
+  };
   error?: string;
+}
+
+function safeTypedTerminalText(
+  status: 'blocked' | 'failed' | 'uncertain' | 'needs_input',
+  internalReason = '',
+): string {
+  if (status === 'failed') return PUBLIC_RUN_FAILURE_TEXT;
+  if (status === 'needs_input') {
+    return 'This task is paused at a safe checkpoint. Tell me to continue when you are ready.';
+  }
+  if (status === 'uncertain') {
+    return renderTypedControlState({ status: 'uncertain' });
+  }
+  if (isHostAuthorityHeldReason(internalReason)) {
+    return heldExecutionTextForInternalReason(internalReason, 'blocked');
+  }
+  return 'I could not safely complete and verify every required step, so I stopped without reporting the task as done. The technical details are available in the activity log.';
 }
 
 export type AdmittedGraphRunFault =
@@ -479,6 +520,368 @@ function authorityFromRow(row: {
   };
 }
 
+export interface HydratedReturnedConstructArtifact {
+  nodeId: string;
+  role: string;
+  rawLocation: string;
+  value: unknown;
+}
+
+/**
+ * Rebuild graph artifact records from exact returned-call authority after a
+ * restart. A returned crossing may legitimately precede its logical
+ * settlement, so this path uses returned-handle authority without promoting
+ * it into settlement authority. Exact retained bytes (inline or spill) own the
+ * artifact-record digest and length.
+ */
+export function hydrateReturnedConstructArtifacts(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  graph: {
+    compiler: { graphHash: string };
+    nodes: ReadonlyArray<{ id: string; capabilityRole?: string }>;
+  };
+}): HydratedReturnedConstructArtifact[] {
+  try {
+    const db = openEventLog();
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS graph_artifact_records (
+        ref TEXT PRIMARY KEY,
+        record_json TEXT NOT NULL
+      );
+    `);
+    const rows = db.prepare(`
+      SELECT logical_tool_call_id, raw_location, session_id, source_user_seq,
+             accepted_task_id, physical_dispatch_id, tool_name, argument_digest
+        FROM durable_result_handles
+       WHERE session_id = ? AND source_user_seq = ? AND accepted_task_id = ?
+         AND scope_kind = 'authoritative' AND raw_location IS NOT NULL
+    `).all(input.sessionId, input.sourceUserSeq, input.acceptedTaskId) as Array<{
+      logical_tool_call_id: string;
+      raw_location: string;
+      session_id: string;
+      source_user_seq: number;
+      accepted_task_id: string;
+      physical_dispatch_id: string;
+      tool_name: string;
+      argument_digest: string;
+    }>;
+    const hydrated: HydratedReturnedConstructArtifact[] = [];
+    for (const row of rows) {
+      const authority = authorityFromRow(row);
+      if (!authority) continue;
+      const redeemed = redeemAuthoritativeResultPayload({
+        kind: 'returned_handle',
+        rawLocation: row.raw_location,
+        authority,
+      });
+      if (redeemed.status !== 'ok') continue;
+      const nodeId = row.logical_tool_call_id.startsWith('logical:')
+        ? row.logical_tool_call_id.slice('logical:'.length)
+        : row.logical_tool_call_id;
+      const role = input.graph.nodes.find((node) => node.id === nodeId)?.capabilityRole ?? '';
+      const existing = db.prepare(
+        'SELECT record_json FROM graph_artifact_records WHERE ref = ?',
+      ).get(row.raw_location) as { record_json: string } | undefined;
+      let existingReadable = false;
+      if (existing) {
+        try {
+          JSON.parse(existing.record_json);
+          existingReadable = true;
+        } catch {
+          existingReadable = false;
+        }
+      }
+      if (!existingReadable) {
+        const record: ArtifactRecord = {
+          ref: row.raw_location,
+          contentDigest: redeemed.value.rawPayloadSha256,
+          storeId: 'durable_result_handles',
+          storeContract: 'durable_result_handles@1',
+          byteLength: redeemed.value.rawByteCount,
+          mediaType: 'application/json',
+          scopeDigest: sha256(input.sessionId),
+          producedBy: {
+            admissionDigest: input.graph.compiler.graphHash,
+            nodeId,
+            attemptId: row.physical_dispatch_id,
+          },
+          commitId: row.physical_dispatch_id,
+        };
+        db.prepare(
+          'INSERT OR REPLACE INTO graph_artifact_records (ref, record_json) VALUES (?, ?)',
+        ).run(record.ref, JSON.stringify(record));
+      }
+      hydrated.push({
+        nodeId,
+        role,
+        rawLocation: row.raw_location,
+        value: redeemed.value.rawPayload,
+      });
+    }
+    return hydrated;
+  } catch {
+    return [];
+  }
+}
+
+export type AdoptReturnedConstructResult =
+  | {
+      status: 'adopted';
+      value: unknown;
+      rawLocation: string;
+      resultHandleId: string;
+    }
+  | { status: 'unavailable'; reason: string };
+
+export type RedeemedSettledConstructResult =
+  | {
+      status: 'ok';
+      value: unknown;
+      rawLocation: string;
+      resultHandleId: string;
+      argumentDigest: string;
+    }
+  | { status: 'unavailable'; reason: string };
+
+/** Redeem only the handle named by the immutable logical settlement. */
+export function redeemSettledConstructResult(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+  toolName: string;
+  args: unknown;
+}): RedeemedSettledConstructResult {
+  const requestedContract = durableLogicalCallContract(
+    input.acceptedTaskId,
+    input.toolName,
+    input.args,
+  );
+  if (!requestedContract) {
+    return { status: 'unavailable', reason: 'settled invocation arguments are not canonicalizable' };
+  }
+  let logical: { tool_name: string; argument_digest: string } | undefined;
+  try {
+    logical = openEventLog().prepare(`
+      SELECT tool_name, argument_digest FROM logical_tool_calls
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.logicalToolCallId,
+    ) as typeof logical;
+  } catch (error) {
+    return { status: 'unavailable', reason: `settled logical owner is unreadable (${String(error)})` };
+  }
+  if (
+    !logical
+    || logical.tool_name !== requestedContract.toolName
+    || logical.argument_digest !== requestedContract.argumentDigest
+  ) {
+    return { status: 'unavailable', reason: 'settled logical call does not own the requested tool and arguments' };
+  }
+  const redeemed = redeemAuthoritativeResultPayload({
+    kind: 'successful_settlement',
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    logicalToolCallId: input.logicalToolCallId,
+  });
+  if (redeemed.status !== 'ok' || redeemed.value.toolName !== requestedContract.toolName) {
+    return {
+      status: 'unavailable',
+      reason: `settlement-named result is unavailable (${redeemed.status})`,
+    };
+  }
+  return {
+    status: 'ok',
+    value: redeemed.value.rawPayload,
+    rawLocation: redeemed.value.rawLocation,
+    resultHandleId: redeemed.value.resultHandleId,
+    argumentDigest: requestedContract.argumentDigest,
+  };
+}
+
+/**
+ * Close the crash window between a verified returned crossing/result handle
+ * and its logical settlement. The returned bytes are only recovery material:
+ * callers receive them after the exact handle has been named by the durable
+ * settlement and redeemed again through that settlement.
+ */
+export function adoptReturnedConstructResult(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+  physicalDispatchId: string;
+  rawLocation: string;
+  toolName: string;
+  args: unknown;
+  canonicalArgumentDigest: string;
+  executionKind: 'provider_execution' | 'local_execution';
+  mutating: boolean;
+  requirementId: string;
+  turn: number;
+}): AdoptReturnedConstructResult {
+  const requestedContract = durableLogicalCallContract(
+    input.acceptedTaskId,
+    input.toolName,
+    input.args,
+  );
+  let owner: {
+    logical_accepted_task_id: string;
+    logical_tool_name: string;
+    logical_argument_digest: string;
+    logical_state: string;
+    dispatch_accepted_task_id: string;
+    dispatch_tool_name: string;
+    dispatch_argument_digest: string;
+    dispatch_state: string;
+  } | undefined;
+  try {
+    owner = openEventLog().prepare(`
+      SELECT l.accepted_task_id AS logical_accepted_task_id,
+             l.tool_name AS logical_tool_name,
+             l.argument_digest AS logical_argument_digest,
+             l.state AS logical_state,
+             p.accepted_task_id AS dispatch_accepted_task_id,
+             p.tool_name AS dispatch_tool_name,
+             p.argument_digest AS dispatch_argument_digest,
+             p.state AS dispatch_state
+        FROM logical_tool_calls l
+        JOIN physical_dispatches p
+          ON p.session_id = l.session_id
+         AND p.source_user_seq = l.source_user_seq
+         AND p.logical_tool_call_id = l.logical_tool_call_id
+       WHERE l.session_id = ? AND l.source_user_seq = ?
+         AND l.logical_tool_call_id = ? AND p.physical_dispatch_id = ?
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      input.logicalToolCallId,
+      input.physicalDispatchId,
+    ) as typeof owner;
+  } catch (error) {
+    return {
+      status: 'unavailable',
+      reason: `returned crossing authority could not be read (${String(error)})`,
+    };
+  }
+  if (
+    !requestedContract
+    || !owner
+    || owner.logical_accepted_task_id !== input.acceptedTaskId
+    || owner.dispatch_accepted_task_id !== input.acceptedTaskId
+    || owner.logical_tool_name !== requestedContract.toolName
+    || owner.dispatch_tool_name !== requestedContract.toolName
+    || owner.logical_argument_digest !== requestedContract.argumentDigest
+    || owner.dispatch_argument_digest !== requestedContract.argumentDigest
+    || input.canonicalArgumentDigest !== requestedContract.argumentDigest
+    || (owner.logical_state !== 'open' && owner.logical_state !== 'settled')
+    || owner.dispatch_state !== 'returned'
+  ) {
+    return { status: 'unavailable', reason: 'returned crossing does not own the exact task, tool, and arguments' };
+  }
+  const returned = redeemAuthoritativeResultPayload({
+    kind: 'returned_handle',
+    rawLocation: input.rawLocation,
+    authority: {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: input.acceptedTaskId,
+      logicalToolCallId: input.logicalToolCallId,
+      physicalDispatchId: input.physicalDispatchId,
+      toolName: input.toolName,
+      args: input.args,
+      canonicalArgumentDigest: input.canonicalArgumentDigest,
+    },
+  });
+  if (returned.status !== 'ok') {
+    return {
+      status: 'unavailable',
+      reason: `returned result authority is unavailable (${returned.status}: ${returned.reason})`,
+    };
+  }
+  if (
+    returned.value.acceptedTaskId !== input.acceptedTaskId
+    || returned.value.logicalToolCallId !== input.logicalToolCallId
+    || returned.value.physicalDispatchId !== input.physicalDispatchId
+    || returned.value.toolName !== input.toolName
+    || returned.value.rawLocation !== input.rawLocation
+  ) {
+    return { status: 'unavailable', reason: 'returned result identity contradicts the recovery request' };
+  }
+
+  const committed = commitLogicalCallSettlement({
+    identity: {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: input.acceptedTaskId,
+      logicalToolCallId: input.logicalToolCallId,
+    },
+    contract: { toolName: input.toolName, args: input.args },
+    execution: { kind: input.executionKind },
+    result: { payload: returned.value.rawPayload },
+    outcome: {
+      kind: 'succeeded',
+      evidence: 'nominal',
+      providerStatus: 'ok',
+      directive: {
+        action: 'settle',
+        retrySameCandidate: false,
+        eliminatesCandidate: false,
+        opensDiscoveryEpoch: false,
+        requiresReconciliation: false,
+      },
+    },
+    recovery: {
+      businessCall: true,
+      mutating: input.mutating,
+      requirementId: input.requirementId,
+    },
+    observer: { lane: 'agents_runner', turn: input.turn },
+  });
+  if (committed.status !== 'committed' && committed.status !== 'replayed') {
+    return {
+      status: 'unavailable',
+      reason: `returned result could not be adopted (${committed.status}: ${committed.reason})`,
+    };
+  }
+  if (committed.settlement.resultHandleId !== returned.value.resultHandleId) {
+    return { status: 'unavailable', reason: 'logical settlement named a different result handle' };
+  }
+
+  const settled = redeemAuthoritativeResultPayload({
+    kind: 'successful_settlement',
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    logicalToolCallId: input.logicalToolCallId,
+  });
+  if (settled.status !== 'ok') {
+    return {
+      status: 'unavailable',
+      reason: `adopted settlement result is unavailable (${settled.status}: ${settled.reason})`,
+    };
+  }
+  if (
+    settled.value.resultHandleId !== returned.value.resultHandleId
+    || settled.value.rawLocation !== returned.value.rawLocation
+    || settled.value.rawPayloadSha256 !== returned.value.rawPayloadSha256
+    || settled.value.rawByteCount !== returned.value.rawByteCount
+  ) {
+    return { status: 'unavailable', reason: 'adopted settlement does not name the exact returned bytes' };
+  }
+  return {
+    status: 'adopted',
+    value: settled.value.rawPayload,
+    rawLocation: settled.value.rawLocation,
+    resultHandleId: settled.value.resultHandleId,
+  };
+}
+
 function loadVerifiedAdmittedGraph(identity: {
   sessionId: string;
   turn: number;
@@ -605,6 +1008,26 @@ export async function runAdmittedTurnGraph(input: {
   let publishedHandle: string | undefined;
   let commitError: string | undefined;
   const identity = input.identity;
+  let committedTerminal: PresentationEvent | undefined;
+  const terminalIdentity = identity ? {
+    sessionId: identity.sessionId,
+    turn: identity.turn,
+    sourceUserSeq: identity.sourceUserSeq,
+  } : undefined;
+  const commitTerminal = (
+    outcome: TurnOutcome,
+    options?: Parameters<typeof commitTurnOutcome>[1],
+  ): PresentationEvent | undefined => {
+    if (!identity) return undefined;
+    try {
+      const committed = commitTurnOutcome(outcome, options);
+      committedTerminal = committed.presentation;
+      return committed.presentation;
+    } catch (error) {
+      commitError = error instanceof Error ? error.message : String(error);
+      return undefined;
+    }
+  };
   const frozenCatalog = identity
     ? freezeCatalogSnapshotForSource({
         sessionId: identity.sessionId,
@@ -612,11 +1035,34 @@ export async function runAdmittedTurnGraph(input: {
       })
     : null;
   if (frozenCatalog && !frozenCatalog.ok && frozenCatalog.reason !== 'missing_factory') {
+    lastBlockReason = `catalog_snapshot:${frozenCatalog.reason}`;
+    if (terminalIdentity) {
+      commitTerminal({
+        version: 2,
+        id: turnOutcomeId(terminalIdentity),
+        identity: terminalIdentity,
+        status: 'blocked',
+        resumable: false,
+        presentation: {
+          kind: 'blocked',
+          text: safeTypedTerminalText('blocked', lastBlockReason),
+        },
+      });
+    }
+    if (identity && !committedTerminal) {
+      return {
+        status: 'held',
+        providerCalls,
+        handles,
+        hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+      };
+    }
     return {
       status: 'blocked',
       providerCalls,
       handles,
-      error: `catalog_snapshot:${frozenCatalog.reason}`,
+      terminal: committedTerminal,
+      error: lastBlockReason,
     };
   }
   const catalog = (frozenCatalog && frozenCatalog.ok ? frozenCatalog.catalog : undefined)
@@ -709,55 +1155,20 @@ export async function runAdmittedTurnGraph(input: {
   };
 
   if (identity && acceptedTaskId) {
-    try {
-      const priorRows = openEventLog().prepare(
-        `SELECT logical_tool_call_id, raw_location, session_id, source_user_seq,
-                accepted_task_id, physical_dispatch_id, tool_name, argument_digest, raw_payload_json
-           FROM durable_result_handles
-          WHERE session_id = ? AND source_user_seq = ? AND scope_kind = 'authoritative'
-            AND raw_location IS NOT NULL`,
-      ).all(identity.sessionId, identity.sourceUserSeq) as Array<{
-        logical_tool_call_id: string;
-        raw_location: string;
-        session_id: string;
-        source_user_seq: number;
-        accepted_task_id: string;
-        physical_dispatch_id: string;
-        tool_name: string;
-        argument_digest: string;
-        raw_payload_json: string | null;
-      }>;
-      for (const row of priorRows) {
-        const nodeId = row.logical_tool_call_id.startsWith('logical:')
-          ? row.logical_tool_call_id.slice('logical:'.length)
-          : row.logical_tool_call_id;
-        const authority = authorityFromRow(row);
-        const redeemed = redeemRawResult(row.raw_location, authority);
-        if (redeemed.status !== 'ok') continue;
-        const value = redeemed.value;
-        if (!handles[nodeId]) handles[nodeId] = row.raw_location;
-        const node = graph.nodes.find((candidate) => candidate.id === nodeId);
-        rememberArtifact(nodeId, node?.capabilityRole ?? '', value, row.raw_location);
-        if (row.raw_payload_json && !loadArtifactRecord(row.raw_location)) {
-          persistArtifactRecord({
-            ref: row.raw_location,
-            contentDigest: sha256(row.raw_payload_json),
-            storeId: 'durable_result_handles',
-            storeContract: 'durable_result_handles@1',
-            byteLength: Buffer.byteLength(row.raw_payload_json, 'utf8'),
-            mediaType: 'application/json',
-            scopeDigest: sha256(identity.sessionId),
-            producedBy: {
-              admissionDigest: admissionRef.digest,
-              nodeId,
-              attemptId: row.physical_dispatch_id,
-            },
-            commitId: row.physical_dispatch_id,
-          });
-        }
-      }
-    } catch {
-      // Prior handles are best-effort hydration through exact authority.
+    const hydrated = hydrateReturnedConstructArtifacts({
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+      acceptedTaskId,
+      graph,
+    });
+    for (const artifact of hydrated) {
+      if (!handles[artifact.nodeId]) handles[artifact.nodeId] = artifact.rawLocation;
+      rememberArtifact(
+        artifact.nodeId,
+        artifact.role,
+        artifact.value,
+        artifact.rawLocation,
+      );
     }
   }
   for (const [nodeId, location] of Object.entries(handles)) {
@@ -785,17 +1196,6 @@ export async function runAdmittedTurnGraph(input: {
       rememberArtifact(verifyNode.id, 'verify', { ok: true, created: createdValue, readback: readbackValue });
     }
   }
-
-  const commitTerminal = (outcome: TurnOutcome): void => {
-    if (!identity) return;
-    commitTurnOutcome(outcome);
-  };
-
-  const terminalIdentity = identity ? {
-    sessionId: identity.sessionId,
-    turn: identity.turn,
-    sourceUserSeq: identity.sourceUserSeq,
-  } : undefined;
 
   const requireExactWorkBinding = (inputBinding: {
     logicalToolCallId: string;
@@ -1237,7 +1637,22 @@ export async function runAdmittedTurnGraph(input: {
       if (committed.status !== 'committed' && committed.status !== 'replayed') {
         throw new Error(`reconciliation_required: recovered logical call could not settle (${committed.status})`);
       }
-      return value;
+      const adopted = redeemAuthoritativeResultPayload({
+        kind: 'successful_settlement',
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        acceptedTaskId,
+        logicalToolCallId,
+      });
+      if (
+        adopted.status !== 'ok'
+        || adopted.value.resultHandleId !== resultHandle.handle
+        || adopted.value.rawLocation !== resultHandle.rawLocation
+      ) {
+        throw new Error('reconciliation_required: recovered result did not become exact settlement authority');
+      }
+      rememberArtifact(node.id, role, adopted.value.rawPayload, adopted.value.rawLocation);
+      return adopted.value.rawPayload;
     };
     const priorState = logicalCallAuthorityState({
       sessionId: identity.sessionId,
@@ -1246,53 +1661,31 @@ export async function runAdmittedTurnGraph(input: {
       logicalToolCallId,
     });
     if (priorState.status === 'settled') {
-      const logical = openEventLog().prepare(`
-        SELECT argument_digest FROM logical_tool_calls
-         WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
-      `).get(identity.sessionId, identity.sourceUserSeq, logicalToolCallId) as {
-        argument_digest: string;
-      } | undefined;
+      const redeemed = redeemSettledConstructResult({
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        acceptedTaskId,
+        logicalToolCallId,
+        toolName: binding.toolName,
+        args,
+      });
+      if (redeemed.status !== 'ok') {
+        throw new Error(`settled logical call has no exact authoritative result: ${redeemed.reason}`);
+      }
       requireExactWorkBinding({
         logicalToolCallId,
         requirementId: node.id,
         toolName: binding.toolName,
-        argumentDigest: logical?.argument_digest ?? '',
+        argumentDigest: redeemed.argumentDigest,
       });
-      const returned = physicalCrossingsForLogicalCall(
-        identity.sessionId,
-        identity.sourceUserSeq,
-        logicalToolCallId,
-      ).find((crossing) => crossing.outcome === 'returned');
-      const row = openEventLog().prepare(
-        `SELECT raw_location, physical_dispatch_id, tool_name, raw_payload_json
-           FROM durable_result_handles
-          WHERE session_id = ? AND source_user_seq = ?
-            AND logical_tool_call_id = ?
-            AND raw_location IS NOT NULL
-          ORDER BY rowid DESC LIMIT 1`,
-      ).get(identity.sessionId, identity.sourceUserSeq, logicalToolCallId) as {
-        raw_location: string;
-        physical_dispatch_id: string;
-        tool_name: string;
-        raw_payload_json: string | null;
-      } | undefined;
-      const existing = handles[node.id] ?? row?.raw_location;
-      if (existing) {
-        const redeemed = redeemRawResult(existing, {
-          sessionId: identity.sessionId,
-          sourceUserSeq: identity.sourceUserSeq,
-          acceptedTaskId,
-          logicalToolCallId,
-          physicalDispatchId: returned?.physicalDispatchId ?? row?.physical_dispatch_id ?? '',
-          toolName: binding.toolName,
-          args,
-        });
-        if (redeemed.status === 'ok') {
-          rememberArtifact(node.id, role, redeemed.value, existing);
-          return redeemed.value;
-        }
-      }
-      throw new Error('settled logical call has no authoritative result');
+      handles[node.id] = redeemed.rawLocation;
+      rememberArtifact(
+        node.id,
+        role,
+        redeemed.value,
+        redeemed.rawLocation,
+      );
+      return redeemed.value;
     }
     const admitted = admitLogicalCall({
       identity: {
@@ -1344,15 +1737,27 @@ export async function runAdmittedTurnGraph(input: {
     if (returned) {
       const existing = handles[node.id];
       if (existing) {
-        const redeemed = redeemRawResult(existing, {
+        const adopted = adoptReturnedConstructResult({
           sessionId: identity.sessionId,
           sourceUserSeq: identity.sourceUserSeq,
           acceptedTaskId,
           logicalToolCallId,
           physicalDispatchId: returned.physicalDispatchId,
+          rawLocation: existing,
           toolName: binding.toolName,
+          args,
+          canonicalArgumentDigest: admitted.identity.argumentDigest,
+          executionKind: hostOnly ? 'local_execution' : 'provider_execution',
+          mutating: mutate,
+          requirementId: node.id,
+          turn: identity.turn,
         });
-        if (redeemed.status === 'ok') return redeemed.value;
+        if (adopted.status === 'adopted') {
+          handles[node.id] = adopted.rawLocation;
+          rememberArtifact(node.id, role, adopted.value, adopted.rawLocation);
+          return adopted.value;
+        }
+        throw new Error(`replayed returned dispatch could not be adopted: ${adopted.reason}`);
       }
       throw new Error('replayed dispatch has a returned crossing but no authoritative result');
     }
@@ -1419,17 +1824,36 @@ export async function runAdmittedTurnGraph(input: {
     if (crossing.status !== 'inserted') {
       if (crossing.status === 'replayed') {
         const existing = handles[node.id];
-        if (existing) {
-          const redeemed = redeemRawResult(existing, {
+        const replayedReturned = physicalCrossingsForLogicalCall(
+          identity.sessionId,
+          identity.sourceUserSeq,
+          logicalToolCallId,
+        ).find((candidate) => (
+          candidate.physicalDispatchId === crossing.identity.physicalDispatchId
+          && candidate.outcome === 'returned'
+        ));
+        if (existing && replayedReturned) {
+          const adopted = adoptReturnedConstructResult({
             sessionId: identity.sessionId,
             sourceUserSeq: identity.sourceUserSeq,
             acceptedTaskId,
             logicalToolCallId,
             physicalDispatchId: crossing.identity.physicalDispatchId,
+            rawLocation: existing,
             toolName: binding.toolName,
             args,
+            canonicalArgumentDigest: admitted.identity.argumentDigest,
+            executionKind: hostOnly ? 'local_execution' : 'provider_execution',
+            mutating: mutate,
+            requirementId: node.id,
+            turn: identity.turn,
           });
-          if (redeemed.status === 'ok') return redeemed.value;
+          if (adopted.status === 'adopted') {
+            handles[node.id] = adopted.rawLocation;
+            rememberArtifact(node.id, role, adopted.value, adopted.rawLocation);
+            return adopted.value;
+          }
+          throw new Error(`replayed returned crossing could not be adopted: ${adopted.reason}`);
         }
         if (physicalIoClaimed({
           sessionId: identity.sessionId,
@@ -1722,10 +2146,28 @@ export async function runAdmittedTurnGraph(input: {
         if (!claim.acquired) {
           if (claim.artifact.resourceId && claim.artifact.uri && claim.artifact.status === 'bound') {
             const existing = handles[node.id];
-            const redeemed = existing ? redeemRawResult(existing) : null;
-            const reused = redeemed?.status === 'ok'
-              ? redeemed.value as { id?: string; handle?: string; receipt?: string }
-              : null;
+            let reused: { id?: string; handle?: string; receipt?: string } | null = null;
+            if (identity && acceptedTaskId) {
+              const settled = redeemAuthoritativeResultPayload({
+                kind: 'successful_settlement',
+                sessionId: identity.sessionId,
+                sourceUserSeq: identity.sourceUserSeq,
+                acceptedTaskId,
+                logicalToolCallId: `logical:${node.id}`,
+              });
+              if (settled.status === 'ok') {
+                reused = settled.value.rawPayload as {
+                  id?: string;
+                  handle?: string;
+                  receipt?: string;
+                };
+              }
+            } else if (existing) {
+              const legacy = redeemRawResult(existing);
+              if (legacy.status === 'ok') {
+                reused = legacy.value as { id?: string; handle?: string; receipt?: string };
+              }
+            }
             if (
               !reused
               || reused.id !== claim.artifact.resourceId
@@ -1741,9 +2183,29 @@ export async function runAdmittedTurnGraph(input: {
             return { status: 'completed', outputRef: handles[node.id] };
           }
           if (handles[node.id]) {
-            const redeemed = redeemRawResult(handles[node.id]);
-            if (redeemed.status === 'ok') {
-              rememberArtifact(node.id, role, redeemed.value, handles[node.id]);
+            let value: unknown;
+            let redeemed = false;
+            if (identity && acceptedTaskId) {
+              const settled = redeemAuthoritativeResultPayload({
+                  kind: 'successful_settlement',
+                  sessionId: identity.sessionId,
+                  sourceUserSeq: identity.sourceUserSeq,
+                  acceptedTaskId,
+                  logicalToolCallId: `logical:${node.id}`,
+                });
+              if (settled.status === 'ok') {
+                value = settled.value.rawPayload;
+                redeemed = true;
+              }
+            } else {
+              const legacy = redeemRawResult(handles[node.id]);
+              if (legacy.status === 'ok') {
+                value = legacy.value;
+                redeemed = true;
+              }
+            }
+            if (redeemed) {
+              rememberArtifact(node.id, role, value, handles[node.id]);
               return { status: 'completed', outputRef: handles[node.id] };
             }
           }
@@ -1954,6 +2416,7 @@ export async function runAdmittedTurnGraph(input: {
               ? [{ kind: 'artifact', id: handle, uri: handle }]
               : [{ kind: 'source', id: contentDigestOf(retrieved ?? text) }],
           }, { terminalJudgeDisposition: 'deliver' });
+          committedTerminal = committed.presentation;
           if (committed.presentation.status !== 'done') {
             const detail = String(
               committed.event.data.verificationDetail
@@ -1967,7 +2430,7 @@ export async function runAdmittedTurnGraph(input: {
           }
         }
         published = true;
-        publishedHandle = text;
+        publishedHandle = committedTerminal?.text ?? text;
         rememberArtifact(node.id, 'publish', { handle: publishedHandle }, publishedHandle);
         return { status: 'completed', outputRef: publishedHandle };
       }
@@ -2019,6 +2482,7 @@ export async function runAdmittedTurnGraph(input: {
             { kind: 'external_receipt', id: receiptId },
           ],
         }, { terminalJudgeDisposition: 'deliver' });
+        committedTerminal = committed.presentation;
         if (committed.presentation.status !== 'done') {
           const detail = String(
             committed.event.data.verificationDetail
@@ -2032,7 +2496,7 @@ export async function runAdmittedTurnGraph(input: {
         }
       }
       published = true;
-      publishedHandle = publishedText;
+      publishedHandle = committedTerminal?.text ?? publishedText;
       rememberArtifact(node.id, 'publish', { handle: publishedHandle }, publishedHandle);
       return { status: 'completed', outputRef: publishedHandle };
     }
@@ -2156,10 +2620,27 @@ export async function runAdmittedTurnGraph(input: {
         identity: terminalIdentity,
         status: 'blocked',
         resumable: false,
-        presentation: { kind: 'blocked', text: lastBlockReason },
+        presentation: {
+          kind: 'blocked',
+          text: safeTypedTerminalText('blocked', lastBlockReason),
+        },
       });
     }
-    return { status: 'blocked', providerCalls, handles, error: lastBlockReason };
+    if (identity && !committedTerminal) {
+      return {
+        status: 'held',
+        providerCalls,
+        handles,
+        hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+      };
+    }
+    return {
+      status: 'blocked',
+      providerCalls,
+      handles,
+      terminal: committedTerminal,
+      error: lastBlockReason,
+    };
   }
 
   if (identity && expected?.status === 'ok') {
@@ -2190,7 +2671,34 @@ export async function runAdmittedTurnGraph(input: {
       }
     } catch (error) {
       lastBlockReason = error instanceof Error ? error.message : String(error);
-      return { status: 'blocked', providerCalls, handles, error: lastBlockReason };
+      if (terminalIdentity) {
+        commitTerminal({
+          version: 2,
+          id: turnOutcomeId(terminalIdentity),
+          identity: terminalIdentity,
+          status: 'blocked',
+          resumable: false,
+          presentation: {
+            kind: 'blocked',
+            text: safeTypedTerminalText('blocked', lastBlockReason),
+          },
+        });
+      }
+      if (identity && !committedTerminal) {
+        return {
+          status: 'held',
+          providerCalls,
+          handles,
+          hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+        };
+      }
+      return {
+        status: 'blocked',
+        providerCalls,
+        handles,
+        terminal: committedTerminal,
+        error: lastBlockReason,
+      };
     }
   }
 
@@ -2242,10 +2750,24 @@ export async function runAdmittedTurnGraph(input: {
         identity: terminalIdentity,
         status: 'failed',
         resumable: false,
-        presentation: { kind: 'error', text: lastBlockReason },
+        presentation: { kind: 'error', text: safeTypedTerminalText('failed', lastBlockReason) },
       });
     }
-    return { status: 'failed', providerCalls, handles, error: lastBlockReason };
+    if (identity && !committedTerminal) {
+      return {
+        status: 'held',
+        providerCalls,
+        handles,
+        hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+      };
+    }
+    return {
+      status: 'failed',
+      providerCalls,
+      handles,
+      terminal: committedTerminal,
+      error: lastBlockReason,
+    };
   }
   const journal = identity
     ? durableJournal(identity)
@@ -2336,58 +2858,73 @@ export async function runAdmittedTurnGraph(input: {
     && (testFault !== null || (error ?? lastBlockReason).includes('forced crash'));
   if (identity && terminalIdentity && !published && !leaseRejoin && !writeFreeIncomplete && !crashIncomplete) {
     const awaiting = error?.includes('needs_input') || result.paused.length > 0;
-    try {
-      commitTerminal(
-        awaiting
+    commitTerminal(
+      awaiting
+        ? {
+            version: 2,
+            id: turnOutcomeId(terminalIdentity),
+            identity: terminalIdentity,
+            status: 'needs_input',
+            resumable: true,
+            needs: { kind: 'continue' },
+            presentation: {
+              kind: 'continue',
+              text: safeTypedTerminalText('needs_input', error),
+            },
+          }
+        : uncertain
           ? {
               version: 2,
               id: turnOutcomeId(terminalIdentity),
               identity: terminalIdentity,
-              status: 'needs_input',
+              status: 'uncertain',
               resumable: true,
-              needs: { kind: 'continue' },
-              presentation: { kind: 'continue', text: error ?? 'awaiting input' },
-            }
-          : uncertain
-            ? {
-                version: 2,
-                id: turnOutcomeId(terminalIdentity),
-                identity: terminalIdentity,
-                status: 'uncertain',
-                resumable: true,
-                presentation: {
-                  kind: 'blocked',
-                  text: isHostAuthorityHeldReason(error ?? '')
-                    ? heldExecutionTextForInternalReason(error ?? 'reconciliation required', 'uncertain')
-                    : (error ?? 'reconciliation required'),
-                },
-              }
-          : result.failed.length > 0
-            ? {
-                version: 2,
-                id: turnOutcomeId(terminalIdentity),
-                identity: terminalIdentity,
-                status: 'failed',
-                resumable: false,
-                presentation: { kind: 'error', text: error ?? 'graph failed' },
-              }
-            : {
-                version: 2,
-                id: turnOutcomeId(terminalIdentity),
-                identity: terminalIdentity,
-                status: 'blocked',
-                resumable: false,
-                presentation: {
-                  kind: 'blocked',
-                  text: isHostAuthorityHeldReason(error ?? '')
-                    ? heldExecutionTextForInternalReason(error ?? 'graph blocked', 'blocked')
-                    : (error ?? 'graph blocked'),
-                },
+              presentation: {
+                kind: 'blocked',
+                text: safeTypedTerminalText('uncertain', error),
               },
-      );
-    } catch (caught) {
-      commitError = caught instanceof Error ? caught.message : String(caught);
-    }
+            }
+        : result.failed.length > 0
+          ? {
+              version: 2,
+              id: turnOutcomeId(terminalIdentity),
+              identity: terminalIdentity,
+              status: 'failed',
+              resumable: false,
+              presentation: {
+                kind: 'error',
+                text: safeTypedTerminalText('failed', error),
+              },
+            }
+          : {
+              version: 2,
+              id: turnOutcomeId(terminalIdentity),
+              identity: terminalIdentity,
+              status: 'blocked',
+              resumable: false,
+              presentation: {
+                kind: 'blocked',
+                text: safeTypedTerminalText('blocked', error),
+              },
+            },
+    );
+  }
+  const hold = identity && !published
+    ? leaseRejoin
+      ? { owner: 'host' as const, wake: 'peer' as const, reason: 'peer_in_progress' as const }
+      : writeFreeIncomplete || crashIncomplete || !committedTerminal
+        ? { owner: 'host' as const, wake: 'recovery' as const, reason: 'recovery_pending' as const }
+        : undefined
+    : undefined;
+  if (hold) {
+    return {
+      status: 'held',
+      providerCalls,
+      createdId: created?.id,
+      handles,
+      published: false,
+      hold,
+    };
   }
   return {
     status: success
@@ -2402,6 +2939,7 @@ export async function runAdmittedTurnGraph(input: {
     createdId: created?.id,
     handles,
     published: success,
+    ...(committedTerminal ? { terminal: committedTerminal } : {}),
     ...(!success || commitError
       ? { error: commitError ?? error ?? `graph status ${result.status}` }
       : {}),

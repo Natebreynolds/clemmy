@@ -315,7 +315,7 @@ test('cancellation stops dispatch at the next boundary, and a post-abort outcome
   assert.deepEqual(result.cancelled, ['a'], 'cancellation is not a coherent node status');
   const aTrace = result.trace.find((t) => t.nodeId === 'a');
   assert.equal(aTrace?.status, 'cancelled');
-  assert.match(aTrace?.reason ?? '', /cancelled/);
+  assert.match(aTrace?.reason ?? '', /cancel/);
 });
 
 // ── budgets and time ─────────────────────────────────────────────────────────

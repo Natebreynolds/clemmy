@@ -78,6 +78,9 @@ test('an explicitly supplied tool_intent signal cannot be collapsed to a read', 
 test('conversation, prohibitions, and non-request action mentions stay direct and effect-free', () => {
   for (const input of [
     'hello',
+    'thanks',
+    "what's 2x2",
+    'what is 15% of 80',
     'ping',
     'hmm interesting',
     'No, do not send it.',

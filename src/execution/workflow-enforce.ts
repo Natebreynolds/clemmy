@@ -60,6 +60,7 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
       subgraph: s.subgraph,
       deterministic: s.deterministic,
       call: s.call,
+      invocationPlan: s.invocationPlan,
       usesSkill: s.usesSkill,
       allowedTools: s.allowedTools,
       requiresApproval: s.requiresApproval,

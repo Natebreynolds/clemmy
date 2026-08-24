@@ -20,6 +20,7 @@ const {
   formatComposioToolOutput,
   formatComposioExecuteOutput,
   detectComposioFailure,
+  canonicalComposioSettlementResult,
   composioDispatchErrorProvesNoCommit,
   composioFailureProvesNoCommit,
   composioThrownErrorOutput,
@@ -443,6 +444,7 @@ test('strict preferred identity selects only its exact active account and carrie
       connectionId: 'ca_exact_work',
       identity: 'work@example.com',
       schemaFingerprint: schemaCache.liveComposioSchemaFingerprint(slug),
+      providerInputSchemaDigest: exact.providerInputSchemaDigest,
     });
 
     const absent = await resolveComposioDispatch(slug, {}, undefined, {
@@ -786,6 +788,81 @@ test('detectComposioFailure: a 5-digit API "Ok" status code (DataForSEO 20000) i
   assert.equal(detectComposioFailure({ data: { status_code: 500 } }).failed, true);
   // An authoritative successful:true envelope wins even over an in-range code.
   assert.equal(detectComposioFailure({ successful: true, data: { status_code: 404 } }).failed, false);
+});
+
+test('DataForSEO nested task failure overrides Composio outer success before settlement or learning', () => {
+  const rejected = {
+    successful: true,
+    error: null,
+    data: {
+      status_code: 20000,
+      status_message: 'Ok.',
+      tasks_error: 1,
+      tasks: [{
+        id: '08200616-1049-0066-0000-5fd9554c7793',
+        result: null,
+        result_count: 0,
+        status_code: 40501,
+        status_message: "Invalid Field: 'location_name'.",
+      }],
+    },
+  };
+  const verdict = detectComposioFailure(rejected);
+  assert.deepEqual(verdict, {
+    failed: true,
+    notConnected: false,
+    summary: "Invalid Field: 'location_name'.",
+    notFound: false,
+    providerCode: 40501,
+    providerStatus: 400,
+    provesNoCommit: true,
+  });
+  assert.equal(composioFailureProvesNoCommit(rejected), true);
+
+  const canonical = canonicalComposioSettlementResult(rejected) as Record<string, unknown>;
+  assert.equal(canonical.successful, false, 'the settlement reducer must not see outer successful:true');
+  assert.equal(canonical.status, 400, 'the provider adapter maps exact invalid-field rejection to argument repair');
+  assert.equal(canonical.provider_error_code, 40501);
+  assert.equal(canonical.provider_rejected_before_effect, true);
+  assert.equal((canonical.data as Record<string, unknown>).tasks_error, 1, 'raw provider evidence is retained');
+
+  const output = formatComposioExecuteOutput(rejected, {
+    toolSlug: 'DATAFORSEO_CREATE_SERP_GOOGLE_MAPS_TASK',
+  });
+  assert.match(output, /\[provider-dispatch:rejected\]/);
+  assert.match(output, /rejected this request before creating/i);
+  assert.match(output, /choose another equivalent provider candidate/i);
+  assert.doesNotMatch(output, /MAY already exist|uncertain/i);
+});
+
+test('DataForSEO nested task-get 404 is a failed read and cannot mint success evidence', () => {
+  const missing = {
+    successful: true,
+    error: null,
+    data: {
+      status_code: 20000,
+      status_message: 'Ok.',
+      tasks_error: 1,
+      tasks: [{
+        id: '08200616-1049-0066-0000-5fd9554c7793',
+        result: null,
+        result_count: 0,
+        status_code: 40401,
+        status_message: 'Task Not Found.',
+      }],
+    },
+  };
+  const verdict = detectComposioFailure(missing);
+  assert.equal(verdict.failed, true);
+  assert.equal(verdict.notFound, true);
+  assert.equal(verdict.providerCode, 40401);
+  assert.equal(verdict.providerStatus, 404);
+  assert.equal(verdict.provesNoCommit, undefined);
+
+  const canonical = canonicalComposioSettlementResult(missing) as Record<string, unknown>;
+  assert.equal(canonical.successful, false);
+  assert.equal(canonical.status, 404);
+  assert.match(String(canonical.error), /Task Not Found/);
 });
 
 test('detectComposioFailure: flags the NOT-FOUND (wrong table/record/object) case distinctly', () => {
@@ -1264,7 +1341,7 @@ test('fan-out advisory inside a WORKFLOW step recommends forEach, NOT run_worker
   assert.ok(!/run_worker once per item/.test(advice!), 'must NOT tell a workflow step to use the blocklisted run_worker');
 });
 
-test('code-mode Composio batches keep every successful payload parseable and free of in-band advisories', async () => {
+test('nested-dispatch Composio batches keep every successful payload parseable and free of in-band advisories', async () => {
   const { runComposioExecuteForTestInSession } = await import('./composio-tools.js');
   const anchor = anchorAcceptedTask('read the sheet ranges in one program');
   const sid = anchor.sessionId;
@@ -1279,7 +1356,7 @@ test('code-mode Composio batches keep every successful payload parseable and fre
       sourceUserSeq: anchor.sourceUserSeq,
       turn: anchor.turn,
       counter: new ToolCallsCounter(100),
-      codeMode: true,
+      nestedDispatch: true,
     },
     async () => {
       for (let i = 1; i <= 4; i += 1) {
@@ -1594,7 +1671,12 @@ test('data-quality checkpoint: an autonomous run with hollow reads is confronted
     const checkpointText = (checkpointOut as unknown as InstanceType<typeof ExternalWritePreDispatchResult>).output;
     match(checkpointText, /DATA-QUALITY CHECKPOINT/);
     match(checkpointText, /APIFY_GET_DATASET_ITEMS: 3\/3 reads returned empty/);
-    match(checkpointText, /ask_user_question/);
+    // RESTART-GATE (2026-08-18): the checkpoint no longer instructs a user
+    // ask — a hollow read is the model's problem to fix (retry a different
+    // shape) or label honestly, never search bookkeeping for the user.
+    doesNotMatch(checkpointText, /ask_user_question/);
+    match(checkpointText, /do NOT ask the user/i);
+    match(checkpointText, /unverified \(tool returned empty\)/);
 
     // Deliberate second attempt proceeds (autonomy redirected, never dead-ended).
     const second = await withAnchoredRunContext(anchor, () => runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid));

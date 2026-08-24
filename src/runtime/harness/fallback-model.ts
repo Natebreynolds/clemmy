@@ -289,7 +289,7 @@ function modelResponseHasActivity(response: { output?: unknown[] } | undefined):
   return Array.isArray(output) && output.some((item) => modelItemHasActivity(item, 'response.output_item.done'));
 }
 
-function streamEventHasActionableContent(event: StreamEvent): boolean {
+export function streamEventHasActionableContent(event: StreamEvent): boolean {
   if (event.type === 'output_text_delta') return nonEmptyString(event.delta);
   if (event.type === 'model') return genericModelEventHasActionableContent(event.event);
   if (event.type === 'response_done') {
@@ -298,7 +298,7 @@ function streamEventHasActionableContent(event: StreamEvent): boolean {
   return false;
 }
 
-function streamEventHasModelActivity(event: StreamEvent): boolean {
+export function streamEventHasModelActivity(event: StreamEvent): boolean {
   if (streamEventHasActionableContent(event)) return true;
   if (event.type === 'model') return genericModelEventHasActivity(event.event);
   if (event.type === 'response_done') return modelResponseHasActivity(event.response);
@@ -654,6 +654,13 @@ export function reviveDeadBrains(label?: string): void {
   persistSilentBrains();
 }
 
+/** The brain the user explicitly pinned as THE brain (Settings → Models).
+ *  Auth trouble on it is the user's credential edge, never a silent switch. */
+function isUserPinnedBrain(label: string): boolean {
+  const pinned = (getRuntimeEnv('BYO_BRAIN_MODEL_ID', '') || '').trim();
+  return pinned.length > 0 && label === pinned;
+}
+
 /** True when this error is the auth class that should stick. */
 function isAuthDeadReason(err: unknown): boolean {
   const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
@@ -706,7 +713,12 @@ export class FallbackModel implements Model {
       throw new Error('fallback chain has no provider compatible with this request');
     }
     const exclusionReason = (target: FallbackTarget): string | null => {
-      if (isBrainAuthDead(target.label)) return 'preselected-auth-dead';
+      // GROK STAYS GROK (live 2026-08-19 daemon 32025): the brain the USER
+      // pinned is never silently skipped for a rescue brain on an auth
+      // cooldown — try it (a refreshed grant may have revived it); if its
+      // auth genuinely fails again, the catch below surfaces one honest
+      // reconnect edge instead of a silent brain steal.
+      if (isBrainAuthDead(target.label) && !isUserPinnedBrain(target.label)) return 'preselected-auth-dead';
       if (isBrainRateLimited(target.label)) return 'preselected-rate-limited';
       if (isBrainSilenced(target.label)) return 'preselected-silent-cooldown';
       return null;
@@ -780,6 +792,16 @@ export class FallbackModel implements Model {
         this.rememberRunSilent(chain[i].label, err);
         recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
         markBrainRateLimited(chain[i].label, err);
+        // An auth failure on the USER-PINNED brain is a credential edge the
+        // user owns — surface it; never silently substitute a brain they did
+        // not choose (live 2026-08-19: grok-4.6 401 → codex:rescue steal).
+        if (!callerAborted && isAuthDeadReason(err) && isUserPinnedBrain(chain[i].label)) {
+          const detail = err instanceof Error ? err.message : String(err);
+          throw new Error(
+            `${chain[i].label} could not authenticate (${detail.slice(0, 200)}). `
+            + 'Reconnect it (Settings → Models) and resend — I will not switch to a different brain you did not choose.',
+          );
+        }
         if (!callerAborted && this.isFalloverReason(err) && !isLast) {
           falloverReason = this.falloverReason(err);
           this.logFallover(chain, i, err);

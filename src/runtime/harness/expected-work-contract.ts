@@ -11,80 +11,46 @@
  * Write effects are requested outcomes, not permission. Runtime tool
  * admission, approval and effect classification remain dispatch authority.
  */
-import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { TurnGraphIR } from '../graph/turn-graph-ir.js';
 import { validateTurnGraph } from '../graph/turn-graph-compiler.js';
 import { assertAuthorityConsistency } from '../graph/accepted-goal.js';
+import {
+  WORK_TOPOLOGY_MAX_OPERATIONS,
+  WORK_TOPOLOGY_MAX_UNIVERSE_MEMBERS,
+  WORK_TOPOLOGY_MAX_UNIVERSES,
+  WORK_TOPOLOGY_VERSION,
+  canonicalWorkTopologyJson,
+  isBoundedWorkTopologyJsonPointer,
+  resolveWorkTopologyJsonPointer,
+  validateWorkTopology,
+  workTopologyDigest,
+  workTopologySha256,
+  type WorkTopologyCardinalityV1,
+  type WorkTopologyCoverageV1,
+  type WorkTopologyEffectV1,
+  type WorkTopologyOperationV1,
+  type WorkTopologyUniverseV1,
+  type WorkTopologyV1,
+} from '../graph/work-topology.js';
 import { BoundaryError } from '../boundary-error.js';
 import { armAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { openEventLog } from './eventlog.js';
 import { expectedTaskFor } from './resolution-ledger.js';
 
-export const EXPECTED_WORK_CONTRACT_VERSION = 1 as const;
-export const EXPECTED_WORK_MAX_OPERATIONS = 32 as const;
-export const EXPECTED_WORK_MAX_UNIVERSES = 16 as const;
-export const EXPECTED_WORK_MAX_UNIVERSE_MEMBERS = 2_048 as const;
+export const EXPECTED_WORK_CONTRACT_VERSION = WORK_TOPOLOGY_VERSION;
+export const EXPECTED_WORK_MAX_OPERATIONS = WORK_TOPOLOGY_MAX_OPERATIONS;
+export const EXPECTED_WORK_MAX_UNIVERSES = WORK_TOPOLOGY_MAX_UNIVERSES;
+export const EXPECTED_WORK_MAX_UNIVERSE_MEMBERS = WORK_TOPOLOGY_MAX_UNIVERSE_MEMBERS;
 
-export type ExpectedWorkEffectV1 =
-  | 'read'
-  | 'compute'
-  | 'local_write'
-  | 'external_write'
-  | 'admin';
-export type ExpectedWorkCoverageV1 =
-  | 'single'
-  /** One bounded caller-selected set, not proof that the whole provider source
-   * was exhausted. The exact requested members are bound at dispatch. */
-  | 'accepted_set'
-  | 'complete_set'
-  /** The graph knows one read is owed, while the resolved operation and its
-   * arguments decide whether point evidence or collection exhaustion applies. */
-  | 'resolved_operation';
-
-export type ExpectedWorkCardinalityV1 =
-  | { kind: 'once' }
-  | { kind: 'each'; universeId: string }
-  /** One provider call covers the complete finite accepted universe. */
-  | { kind: 'set'; universeId: string };
-
-export interface ExpectedWorkOperationV1 {
-  id: string;
-  effect: ExpectedWorkEffectV1;
-  /** Reads state whether one answer or the complete source is owed. */
-  coverage?: ExpectedWorkCoverageV1;
-  dependsOn: string[];
-  /** Structural data lineage. Every entry must also be a dependency. */
-  dataFrom: string[];
-  cardinality: ExpectedWorkCardinalityV1;
-}
-
-export type ExpectedWorkUniverseV1 =
-  | {
-      id: string;
-      seal: 'accepted_input';
-      members: string[];
-    }
-  | {
-      id: string;
-      seal: 'complete_source_receipt';
-      producedBy: string;
-      /**
-       * Where one member's id lives inside ONE producer record. The host seals
-       * this universe from the producer read's settled complete result, so it
-       * must know which field carries member identity before that result
-       * exists; declaring it per consumer call would let whichever consumer
-       * dispatched first decide the universe. Empty pointer means the record
-       * itself is the id.
-       */
-      memberIdPointer: string;
-    };
-
-export interface ExpectedWorkProposalV1 {
-  version: typeof EXPECTED_WORK_CONTRACT_VERSION;
-  operations: ExpectedWorkOperationV1[];
-  universes: ExpectedWorkUniverseV1[];
-}
+/** Backward-compatible names. The types and runtime grammar have one owner in
+ * runtime/graph/work-topology.ts. */
+export type ExpectedWorkEffectV1 = WorkTopologyEffectV1;
+export type ExpectedWorkCoverageV1 = WorkTopologyCoverageV1;
+export type ExpectedWorkCardinalityV1 = WorkTopologyCardinalityV1;
+export type ExpectedWorkOperationV1 = WorkTopologyOperationV1;
+export type ExpectedWorkUniverseV1 = WorkTopologyUniverseV1;
+export type ExpectedWorkProposalV1 = WorkTopologyV1;
 
 export type ExpectedWorkPlannerSourceV1 = 'deterministic' | 'structured_model';
 
@@ -99,6 +65,9 @@ export interface AcceptedTaskWorkContractV1 extends ExpectedWorkProposalV1 {
   graphEventId: string;
   graphId: string;
   graphHash: string;
+  /** Digest of the normalized operations+universes value. Older durable rows
+   * predate this field; every newly frozen contract includes it. */
+  topologyHash?: string;
   plannerSource: ExpectedWorkPlannerSourceV1;
 }
 
@@ -143,46 +112,12 @@ interface AuthorityContractRow {
   revision: number;
 }
 
-const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
-const MEMBER_PATTERN = /^\S(?:[\s\S]{0,254}\S)?$/;
-
 function plainRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
-/** One bounded RFC 6901 pointer. The empty pointer addresses the whole value. */
-export function isBoundedJsonPointer(value: unknown): value is string {
-  return typeof value === 'string'
-    && value.length <= 512
-    && (value === '' || value.startsWith('/'))
-    && !/(?:~(?![01]))/.test(value);
-}
-
-function pointerSegment(segment: string): string {
-  return segment.replace(/~1/g, '/').replace(/~0/g, '~');
-}
-
-/** Resolve a bounded pointer against untrusted data. Absence is never a value. */
-export function resolveJsonPointer(
-  value: unknown,
-  pointer: string,
-): { ok: true; value: unknown } | { ok: false } {
-  if (pointer === '') return { ok: true, value };
-  let current = value;
-  for (const rawSegment of pointer.slice(1).split('/')) {
-    const segment = pointerSegment(rawSegment);
-    if (Array.isArray(current)) {
-      if (!/^(?:0|[1-9][0-9]*)$/.test(segment)) return { ok: false };
-      const index = Number(segment);
-      if (!Number.isSafeInteger(index) || index >= current.length) return { ok: false };
-      current = current[index];
-      continue;
-    }
-    if (!current || typeof current !== 'object' || !(segment in current)) return { ok: false };
-    current = (current as Record<string, unknown>)[segment];
-  }
-  return { ok: true, value: current };
-}
+export const isBoundedJsonPointer = isBoundedWorkTopologyJsonPointer;
+export const resolveJsonPointer = resolveWorkTopologyJsonPointer;
 
 function exactKeys(
   value: Record<string, unknown>,
@@ -196,296 +131,15 @@ function exactKeys(
   }
 }
 
-function validId(value: unknown, label: string, errors: string[]): value is string {
-  if (typeof value !== 'string' || !ID_PATTERN.test(value)) {
-    errors.push(`${label} must be a bounded stable id`);
-    return false;
-  }
-  return true;
-}
-
-/**
- * Meaning-preserving repair of the two proposal shapes a planner reliably
- * writes, both of which state their intent unambiguously:
- *
- *   - `coverage` on a non-read. Coverage is READ vocabulary ("how much of the
- *     source did you see"); on a write it says nothing. Drop it.
- *   - `dataFrom` naming an operation absent from `dependsOn`. Deriving data
- *     from X IS depending on X — the two lists cannot honestly disagree, so
- *     take the union. For a READ, which originates data rather than deriving
- *     it, the same entries become pure ordering dependencies.
- *
- * Refusing these cost entire runs: a fan-out worker spent its whole budget
- * re-proposing against `coverage is only valid for reads` and `dataFrom X
- * must also be a dependency`, never made a single business call, and reported
- * it could not verify anything (live 2026-08-12). Every downstream invariant
- * is unchanged — dataFrom ⊆ dependsOn and reads-derive-nothing now hold by
- * construction instead of by rejection. Anything genuinely ambiguous (a bad
- * effect, a malformed cardinality, a coverage/cardinality contradiction) is
- * still refused with its exact reason.
- */
-function normalizeProposedOperation(raw: Record<string, unknown>): Record<string, unknown> {
-  const next: Record<string, unknown> = { ...raw };
-  if (next.effect !== 'read' && Object.prototype.hasOwnProperty.call(next, 'coverage')) {
-    delete next.coverage;
-  }
-  const asIds = (value: unknown): string[] | null => (Array.isArray(value)
-    ? value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
-    : null);
-  const dataFrom = asIds(next.dataFrom);
-  if (!dataFrom || dataFrom.length === 0) return next;
-  const dependsOn = asIds(next.dependsOn);
-  // A malformed dependsOn must still surface its own error, not be replaced.
-  if (next.dependsOn !== undefined && dependsOn === null) return next;
-  const union = [...new Set([...(dependsOn ?? []), ...dataFrom])];
-  next.dependsOn = union;
-  if (next.effect === 'read') next.dataFrom = [];
-  return next;
-}
-
-function stringList(value: unknown, label: string, errors: string[]): string[] | null {
-  if (!Array.isArray(value)) {
-    errors.push(`${label} must be an array`);
-    return null;
-  }
-  const result: string[] = [];
-  for (const [index, entry] of value.entries()) {
-    if (!validId(entry, `${label}[${index}]`, errors)) continue;
-    result.push(entry);
-  }
-  if (new Set(result).size !== result.length) errors.push(`${label} contains duplicate ids`);
-  return [...result].sort();
-}
-
-export function canonicalExpectedWorkJson(value: unknown): string {
-  if (value === null || typeof value === 'boolean' || typeof value === 'number') {
-    return JSON.stringify(value);
-  }
-  if (typeof value === 'string') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalExpectedWorkJson).join(',')}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record)
-    .filter((key) => record[key] !== undefined)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${canonicalExpectedWorkJson(record[key])}`)
-    .join(',')}}`;
-}
-
-export function expectedWorkDigest(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
-function hasCycle(operations: readonly ExpectedWorkOperationV1[]): boolean {
-  const byId = new Map(operations.map((operation) => [operation.id, operation]));
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  const visit = (id: string): boolean => {
-    if (visiting.has(id)) return true;
-    if (visited.has(id)) return false;
-    visiting.add(id);
-    const operation = byId.get(id);
-    for (const dependency of operation?.dependsOn ?? []) {
-      if (visit(dependency)) return true;
-    }
-    visiting.delete(id);
-    visited.add(id);
-    return false;
-  };
-  return operations.some((operation) => visit(operation.id));
-}
+export const canonicalExpectedWorkJson = canonicalWorkTopologyJson;
+export const expectedWorkDigest = workTopologySha256;
 
 /** Validate and canonicalize an untrusted planner proposal. */
 export function validateExpectedWorkProposal(value: unknown): ExpectedWorkProposalValidation {
-  const errors: string[] = [];
-  if (!plainRecord(value)) return { ok: false, errors: ['proposal must be an object'] };
-  exactKeys(value, ['version', 'operations', 'universes'], 'proposal', errors);
-  if (value.version !== EXPECTED_WORK_CONTRACT_VERSION) errors.push('proposal version must be 1');
-  if (!Array.isArray(value.operations)) errors.push('proposal operations must be an array');
-  if (!Array.isArray(value.universes)) errors.push('proposal universes must be an array');
-  const rawOperations = Array.isArray(value.operations) ? value.operations : [];
-  const rawUniverses = Array.isArray(value.universes) ? value.universes : [];
-  if (rawOperations.length > EXPECTED_WORK_MAX_OPERATIONS) {
-    errors.push(`proposal exceeds ${EXPECTED_WORK_MAX_OPERATIONS} operations`);
-  }
-  if (rawUniverses.length > EXPECTED_WORK_MAX_UNIVERSES) {
-    errors.push(`proposal exceeds ${EXPECTED_WORK_MAX_UNIVERSES} universes`);
-  }
-
-  const operations: ExpectedWorkOperationV1[] = [];
-  for (const [index, rawProposed] of rawOperations.entries()) {
-    const label = `operation[${index}]`;
-    if (!plainRecord(rawProposed)) {
-      errors.push(`${label} must be an object`);
-      continue;
-    }
-    const raw = normalizeProposedOperation(rawProposed);
-    exactKeys(raw, ['id', 'effect', 'coverage', 'dependsOn', 'dataFrom', 'cardinality'], label, errors);
-    const idOk = validId(raw.id, `${label}.id`, errors);
-    const effectOk = raw.effect === 'read'
-      || raw.effect === 'compute'
-      || raw.effect === 'local_write'
-      || raw.effect === 'external_write'
-      || raw.effect === 'admin';
-    if (!effectOk) errors.push(`${label}.effect is invalid`);
-    const hasCoverage = Object.prototype.hasOwnProperty.call(raw, 'coverage');
-    const coverageOk = raw.coverage === 'single'
-      || raw.coverage === 'accepted_set'
-      || raw.coverage === 'complete_set'
-      || raw.coverage === 'resolved_operation';
-    if (raw.effect === 'read' && !coverageOk) errors.push(`${label}.coverage is required for reads`);
-    if (raw.effect !== 'read' && hasCoverage) errors.push(`${label}.coverage is only valid for reads`);
-    const dependsOn = stringList(raw.dependsOn, `${label}.dependsOn`, errors);
-    const dataFrom = stringList(raw.dataFrom, `${label}.dataFrom`, errors);
-    if (!plainRecord(raw.cardinality)) {
-      errors.push(`${label}.cardinality must be an object`);
-      continue;
-    }
-    const cardinality = raw.cardinality;
-    if (cardinality.kind === 'once') {
-      exactKeys(cardinality, ['kind'], `${label}.cardinality`, errors);
-    } else if (cardinality.kind === 'each' || cardinality.kind === 'set') {
-      exactKeys(cardinality, ['kind', 'universeId'], `${label}.cardinality`, errors);
-      validId(cardinality.universeId, `${label}.cardinality.universeId`, errors);
-    } else {
-      errors.push(`${label}.cardinality.kind is invalid`);
-    }
-    if (!idOk || !effectOk || !dependsOn || !dataFrom) continue;
-    if (raw.effect === 'read' && dataFrom.length > 0) {
-      errors.push(`${label}.dataFrom is not valid for a source read`);
-    }
-    for (const source of dataFrom) {
-      if (!dependsOn.includes(source)) errors.push(`${label}.dataFrom ${source} must also be a dependency`);
-    }
-    if (
-      raw.effect === 'read'
-      && (
-        (raw.coverage === 'accepted_set' && cardinality.kind !== 'set')
-        || (cardinality.kind === 'set' && raw.coverage !== 'accepted_set')
-        || (raw.coverage === 'complete_set' && cardinality.kind !== 'once')
-        || (cardinality.kind === 'each' && raw.coverage !== 'single')
-      )
-    ) {
-      errors.push(`${label}.coverage and cardinality describe different read sets`);
-    }
-    if (cardinality.kind !== 'once' && cardinality.kind !== 'each' && cardinality.kind !== 'set') continue;
-    operations.push({
-      id: String(raw.id),
-      effect: raw.effect as ExpectedWorkEffectV1,
-      ...(raw.effect === 'read' && coverageOk
-        ? { coverage: raw.coverage as ExpectedWorkCoverageV1 }
-        : {}),
-      dependsOn,
-      dataFrom,
-      cardinality: cardinality.kind === 'once'
-        ? { kind: 'once' }
-        : { kind: cardinality.kind, universeId: String(cardinality.universeId) },
-    });
-  }
-
-  const universes: ExpectedWorkUniverseV1[] = [];
-  for (const [index, raw] of rawUniverses.entries()) {
-    const label = `universe[${index}]`;
-    if (!plainRecord(raw)) {
-      errors.push(`${label} must be an object`);
-      continue;
-    }
-    const idOk = validId(raw.id, `${label}.id`, errors);
-    if (raw.seal === 'accepted_input') {
-      exactKeys(raw, ['id', 'seal', 'members'], label, errors);
-      if (!Array.isArray(raw.members) || raw.members.length === 0) {
-        errors.push(`${label}.members must contain at least one accepted item`);
-        continue;
-      }
-      if (raw.members.length > EXPECTED_WORK_MAX_UNIVERSE_MEMBERS) {
-        errors.push(`${label}.members exceeds ${EXPECTED_WORK_MAX_UNIVERSE_MEMBERS}`);
-      }
-      const members: string[] = [];
-      for (const [memberIndex, member] of raw.members.entries()) {
-        if (typeof member !== 'string' || !MEMBER_PATTERN.test(member)) {
-          errors.push(`${label}.members[${memberIndex}] must be a bounded nonblank id`);
-        } else {
-          members.push(member);
-        }
-      }
-      if (new Set(members).size !== members.length) errors.push(`${label}.members contains duplicates`);
-      if (idOk) {
-        universes.push({ id: String(raw.id), seal: 'accepted_input', members: [...members].sort() });
-      }
-    } else if (raw.seal === 'complete_source_receipt') {
-      exactKeys(raw, ['id', 'seal', 'producedBy', 'memberIdPointer'], label, errors);
-      const producerOk = validId(raw.producedBy, `${label}.producedBy`, errors);
-      const memberIdPointer = raw.memberIdPointer;
-      if (!isBoundedJsonPointer(memberIdPointer)) {
-        errors.push(`${label}.memberIdPointer must be a bounded RFC 6901 pointer into one source record`);
-      } else if (idOk && producerOk) {
-        universes.push({
-          id: String(raw.id),
-          seal: 'complete_source_receipt',
-          producedBy: String(raw.producedBy),
-          memberIdPointer,
-        });
-      }
-    } else {
-      exactKeys(raw, ['id', 'seal', 'members', 'producedBy', 'memberIdPointer'], label, errors);
-      errors.push(`${label}.seal is invalid`);
-    }
-  }
-
-  const operationIds = new Set<string>();
-  for (const operation of operations) {
-    if (operationIds.has(operation.id)) errors.push(`duplicate operation id ${operation.id}`);
-    operationIds.add(operation.id);
-  }
-  const universeIds = new Set<string>();
-  for (const universe of universes) {
-    if (universeIds.has(universe.id)) errors.push(`duplicate universe id ${universe.id}`);
-    if (operationIds.has(universe.id)) errors.push(`id ${universe.id} is shared by an operation and universe`);
-    universeIds.add(universe.id);
-  }
-  const byOperation = new Map(operations.map((operation) => [operation.id, operation]));
-  for (const operation of operations) {
-    for (const dependency of operation.dependsOn) {
-      if (!byOperation.has(dependency)) errors.push(`${operation.id} depends on missing operation ${dependency}`);
-      if (dependency === operation.id) errors.push(`${operation.id} cannot depend on itself`);
-    }
-    for (const source of operation.dataFrom) {
-      if (!byOperation.has(source)) errors.push(`${operation.id} reads data from missing operation ${source}`);
-    }
-    if (operation.cardinality.kind !== 'once' && !universeIds.has(operation.cardinality.universeId)) {
-      errors.push(`${operation.id} references missing universe ${operation.cardinality.universeId}`);
-    }
-  }
-  if (hasCycle(operations)) errors.push('operation dependencies must be acyclic');
-
-  for (const universe of universes) {
-    const consumers = operations.filter((operation) =>
-      operation.cardinality.kind !== 'once' && operation.cardinality.universeId === universe.id);
-    if (consumers.length === 0) errors.push(`universe ${universe.id} has no cardinality consumer`);
-    if (universe.seal === 'complete_source_receipt') {
-      const producer = byOperation.get(universe.producedBy);
-      if (
-        !producer
-        || producer.effect !== 'read'
-        || producer.coverage !== 'complete_set'
-        || producer.cardinality.kind !== 'once'
-      ) {
-        errors.push(`universe ${universe.id} requires one complete-set source-read producer`);
-      }
-      if (consumers.some((consumer) => consumer.id === universe.producedBy)) {
-        errors.push(`universe ${universe.id} cannot be produced by its own each-cardinality consumer`);
-      }
-    }
-  }
-
-  if (errors.length > 0) return { ok: false, errors: [...new Set(errors)].sort() };
-  return {
-    ok: true,
-    proposal: {
-      version: EXPECTED_WORK_CONTRACT_VERSION,
-      operations: [...operations].sort((left, right) => left.id.localeCompare(right.id)),
-      universes: [...universes].sort((left, right) => left.id.localeCompare(right.id)),
-    },
-  };
+  const validated = validateWorkTopology(value);
+  return validated.ok
+    ? { ok: true, proposal: validated.topology }
+    : validated;
 }
 
 /** The only topologies V1 can derive without another reasoning result. */
@@ -507,14 +161,23 @@ export function compileDeterministicExpectedWorkProposal(
     const writeEffect = execute.effect.kind === 'local_write' || execute.effect.kind === 'admin'
       ? execute.effect.kind
       : 'external_write';
+    const countedCollection = graph.classification.goalConstraints?.collection;
     const readOps = retrieves.map((retrieve, index) => {
       const prior = retrieves[index - 1];
+      const collectsAcceptedSet = index === retrieves.length - 1
+        && (countedCollection?.count ?? 0) > 0;
       return {
         id: retrieve.id,
         effect: 'read' as const,
-        // First read locates the source. A later read collects the set.
-        // resolved_operation so a source URL cannot seal the collection.
-        coverage: 'resolved_operation' as const,
+        // Locator reads remain unresolved: a source URL cannot seal the
+        // collection. The final aggregate read for an accepted counted
+        // collect-then-construct goal is different. The graph already owns
+        // the immutable set cardinality/projection, so this requirement must
+        // bind as collection evidence instead of escaping through the
+        // unbound-read fallback.
+        coverage: collectsAcceptedSet
+          ? 'complete_set' as const
+          : 'resolved_operation' as const,
         dependsOn: prior ? [prior.id] : [],
         dataFrom: prior ? [prior.id] : [],
         cardinality: { kind: 'once' as const },
@@ -561,6 +224,7 @@ function contractMaterial(contract: Omit<AcceptedTaskWorkContractV1, 'contractId
     graphEventId: contract.graphEventId,
     graphId: contract.graphId,
     graphHash: contract.graphHash,
+    ...(contract.topologyHash ? { topologyHash: contract.topologyHash } : {}),
     plannerSource: contract.plannerSource,
     operations: contract.operations,
     universes: contract.universes,
@@ -579,6 +243,7 @@ function buildContract(input: {
     graphEventId: input.expected.expectation.graphEventId,
     graphId: input.expected.expectation.graphId,
     graphHash: input.expected.expectation.graphHash,
+    topologyHash: workTopologyDigest(input.proposal),
     plannerSource: input.plannerSource,
     operations: input.proposal.operations,
     universes: input.proposal.universes,
@@ -594,7 +259,7 @@ function validateContractValue(value: unknown): AcceptedTaskWorkContractV1 | nul
   const errors: string[] = [];
   exactKeys(value, [
     'version', 'contractId', 'identity', 'acceptedTaskId', 'graphEventId',
-    'graphId', 'graphHash', 'plannerSource', 'operations', 'universes',
+    'graphId', 'graphHash', 'topologyHash', 'plannerSource', 'operations', 'universes',
   ], 'contract', errors);
   if (!plainRecord(value.identity)) return null;
   exactKeys(value.identity, ['sessionId', 'sourceUserSeq', 'turn'], 'contract.identity', errors);
@@ -607,6 +272,9 @@ function validateContractValue(value: unknown): AcceptedTaskWorkContractV1 | nul
   if (typeof value.graphHash !== 'string' || !/^[a-f0-9]{64}$/.test(value.graphHash)) {
     errors.push('contract.graphHash is invalid');
   }
+  if (value.topologyHash !== undefined && (
+    typeof value.topologyHash !== 'string' || !/^[a-f0-9]{64}$/.test(value.topologyHash)
+  )) errors.push('contract.topologyHash is invalid');
   if (value.plannerSource !== 'deterministic' && value.plannerSource !== 'structured_model') {
     errors.push('contract.plannerSource is invalid');
   }
@@ -616,6 +284,11 @@ function validateContractValue(value: unknown): AcceptedTaskWorkContractV1 | nul
     universes: value.universes,
   });
   if (!proposal.ok) errors.push(...proposal.errors);
+  if (
+    proposal.ok
+    && value.topologyHash !== undefined
+    && value.topologyHash !== workTopologyDigest(proposal.proposal)
+  ) errors.push('contract.topologyHash does not match the normalized topology');
   if (errors.length > 0 || !proposal.ok) return null;
   const body: Omit<AcceptedTaskWorkContractV1, 'contractId'> = {
     version: EXPECTED_WORK_CONTRACT_VERSION,
@@ -628,6 +301,7 @@ function validateContractValue(value: unknown): AcceptedTaskWorkContractV1 | nul
     graphEventId: String(value.graphEventId),
     graphId: String(value.graphId),
     graphHash: String(value.graphHash),
+    ...(typeof value.topologyHash === 'string' ? { topologyHash: value.topologyHash } : {}),
     plannerSource: value.plannerSource as ExpectedWorkPlannerSourceV1,
     operations: proposal.proposal.operations,
     universes: proposal.proposal.universes,
@@ -1054,6 +728,45 @@ export function freezeDeterministicExpectedWorkContract(input: {
     contract: buildContract({
       proposal: validated.proposal,
       plannerSource: 'deterministic',
+      expected,
+    }),
+  });
+}
+
+/**
+ * Freeze the exact normalized topology already hash-bound into the graph that
+ * the foreground model authored through plan_task. No second compiler may
+ * project a smaller once-only DAG and erase explicit each/set cardinality.
+ */
+export function freezePrimaryModelExpectedWorkContract(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): FreezeExpectedWorkContractResult {
+  const expected = exactExpectedTask(input);
+  if ('status' in expected && expected.status !== 'ok') return expected;
+  const graphTopology = expected.graph.workTopology;
+  if (!graphTopology) {
+    return {
+      status: 'planning_required',
+      reason: 'the foreground plan graph has no exact accepted work topology',
+    };
+  }
+  const validated = validateExpectedWorkProposal(graphTopology.topology);
+  if (!validated.ok) return { status: 'invalid', reason: validated.errors.join('; ') };
+  const topologyHash = workTopologyDigest(validated.proposal);
+  if (topologyHash !== graphTopology.topologyHash) {
+    return { status: 'invalid', reason: 'the foreground plan topology does not match its graph-bound digest' };
+  }
+  const consistent = assertAuthorityConsistency({
+    graph: expected.graph,
+    contract: validated.proposal,
+  });
+  if (!consistent.ok) return { status: 'invalid', reason: consistent.reason };
+  return freezePreparedContract({
+    ...input,
+    contract: buildContract({
+      proposal: validated.proposal,
+      plannerSource: 'structured_model',
       expected,
     }),
   });

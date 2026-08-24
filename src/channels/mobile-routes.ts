@@ -20,6 +20,7 @@
 
 import express from 'express';
 import { existsSync, readFileSync } from 'node:fs';
+import pino from 'pino';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PKG_DIR } from '../config.js';
@@ -81,6 +82,10 @@ import {
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import {
+  claimSessionForAcceptedSource,
+  resolveAcceptedSourceIngressLineage,
+} from '../runtime/harness/accepted-source-session-branch.js';
+import {
   projectHarnessEventsForPublic,
   publicUserInputText,
   PUBLIC_RUN_FAILURE_TEXT,
@@ -131,6 +136,11 @@ import { attachSessionViewer } from '../runtime/harness/session-viewers.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { runConversationFromResume } from '../runtime/harness/loop.js';
+import { buildContinueInput, isContinueCompletionReason } from '../runtime/harness/continue-directive.js';
+import {
+  projectForegroundWorkingNowSnapshot,
+  projectWorkingNowSnapshot,
+} from '../dashboard/activity-projection.js';
 
 export const MOBILE_SESSION_COOKIE = 'clem_mobile_session';
 const COOKIE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -144,6 +154,27 @@ interface ChatSendResponse {
   stoppedReason?: string;
   turnsUsed?: number;
   route?: AssistantRouteDiagnostics;
+}
+
+export type MobileTypedChatControl =
+  | { kind: 'formal_approval'; decision: 'approve' | 'reject'; approvalId: string }
+  | { kind: 'session_control'; command: 'cancel' | 'new' | 'continue' };
+
+/** Exact reserved forms are host controls, never ordinary model prompts. Bare
+ * or conversationally ambiguous language deliberately does not classify. */
+export function classifyMobileTypedChatControl(message: string): MobileTypedChatControl | null {
+  const formal = message.trim().match(/^(approve|reject)\s+(apr-[A-Za-z0-9-]+)$/i);
+  if (formal) {
+    return {
+      kind: 'formal_approval',
+      decision: formal[1].toLowerCase() as 'approve' | 'reject',
+      approvalId: formal[2],
+    };
+  }
+  const session = message.trim().match(/^\/?(cancel|new|continue)$/i);
+  return session
+    ? { kind: 'session_control', command: session[1].toLowerCase() as 'cancel' | 'new' | 'continue' }
+    : null;
 }
 
 const mobileChatInFlight = new Map<string, Promise<GatewayResponse>>();
@@ -160,6 +191,10 @@ function mobileChatPayloadHash(message: string, requestedSessionId: string | nul
   return createHash('sha256')
     .update(JSON.stringify({ message, requestedSessionId }))
     .digest('hex');
+}
+
+function mobileFreshSessionId(runId: string): string {
+  return `sess-mob-${createHash('sha256').update('mobile-new\0').update(runId).digest('hex').slice(0, 32)}`;
 }
 
 /** Test-only process restart seam; durable receipts and terminals remain. */
@@ -735,9 +770,53 @@ declare module 'express-serve-static-core' {
   }
 }
 
+const mobileDoorLog = pino({ name: 'clementine-next.mobile-door' });
+
 export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   const router = express.Router();
   const stateOpts = deps.stateDir ? { stateDir: deps.stateDir } : undefined;
+
+  // Every request through the phone's door, with the reason it was refused.
+  //
+  // A live pairing (2026-08-22) minted a session and the phone then went
+  // silent, and the daemon log held NOTHING about any of it — not the pair,
+  // not the follow-up, not a refusal. The failing hop could not be named from
+  // the outside, only guessed at, and the guesses were wrong: the obvious
+  // suspect (token rotation revoking the device chain) was ruled out only by
+  // noticing the session was still generation 0.
+  //
+  // Deliberately narrow: method, path, status, and the typed error code the
+  // route already chose. No token, no cookie, no body, no device key — the
+  // point is to name the hop, and a door log that carries credentials is a
+  // worse problem than the one it solves.
+  router.use((req, res, next) => {
+    const startedAt = Date.now();
+    // Every refusal in this router already answers `{ error: CODE }`. Reading
+    // the code here rather than annotating each site means a refusal added
+    // later is logged without anyone remembering to instrument it.
+    let refusal: string | undefined;
+    const json = res.json.bind(res);
+    res.json = (body: unknown) => {
+      const code = (body as { error?: unknown } | null)?.error;
+      if (typeof code === 'string') refusal = code;
+      return json(body);
+    };
+    res.on('finish', () => {
+      try {
+        if (res.statusCode < 400 && req.path.startsWith('/assets/')) return;
+        mobileDoorLog[res.statusCode >= 400 ? 'warn' : 'info']({
+          method: req.method,
+          path: req.path,
+          status: res.statusCode,
+          ingress: req.clemIngress ?? 'direct',
+          deviceId: req.mobileSession?.record.deviceId,
+          refusal,
+          ms: Date.now() - startedAt,
+        }, 'mobile door');
+      } catch { /* logging must never break the door */ }
+    });
+    next();
+  });
   // A restarted daemon cannot still own its prior mobile approval executor.
   // Retire only this process-scoped run family; live owners in this process
   // keep the same owner id and are left untouched.
@@ -805,16 +884,36 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
     let record = await validateSession(token, stateOpts);
     if (!record) {
-      // A token we retired is being presented past its grace. The legitimate
-      // client always holds the newest one, so this means the value leaked and
-      // two parties hold session material. We cannot tell which caller is the
-      // owner, so the safe move is to kill the whole device chain and make
-      // both re-authenticate.
+      // A token we retired is being presented past its grace.
+      //
+      // The original reading was that only a leak explains this, because "the
+      // legitimate client always holds the newest one" — but that is only true
+      // of a client that was AWAKE to receive it. Rotation is committed
+      // server-side mid-request (below), and the grace that follows is 30
+      // seconds, sized in its own comment for "an in-flight request or a
+      // reconnecting SSE stream". A phone is neither: iOS suspends the webview
+      // on lock, so the response carrying the new token can be dropped and the
+      // device wakes minutes later still holding the old one. Punishing that
+      // with a whole-chain revocation is how a paired phone ends up back at
+      // "scan the QR" with no way forward.
+      //
+      // The device key is the discriminator the token alone cannot be. A
+      // stolen cookie cannot sign — the private key is non-extractable in the
+      // phone's keystore — so a valid proof over the RETIRED token proves this
+      // is the device that fell behind, not a second party holding material.
+      // It re-authenticates; it does not lose its chain. Absent or invalid
+      // proof keeps the original, destructive reading.
       const reuse = await detectTokenReuse(token, stateOpts);
       if (reuse.reused) {
+        const provedItself = reuse.record.binding === 'key'
+          && (await verifySessionProof(req, token, reuse.record).catch(() => ({ ok: false as const }))).ok;
+        res.clearCookie(MOBILE_SESSION_COOKIE, { path: '/', secure: mobileCookieSecure(req), sameSite: 'lax' });
+        if (provedItself) {
+          res.status(401).json({ error: 'SESSION_STALE' });
+          return;
+        }
         await revokeSessionByDeviceId(reuse.deviceId, stateOpts).catch(() => undefined);
         await notifySessionReuse(reuse.deviceId);
-        res.clearCookie(MOBILE_SESSION_COOKIE, { path: '/', secure: mobileCookieSecure(req), sameSite: 'lax' });
         res.status(401).json({ error: 'SESSION_REVOKED' });
         return;
       }
@@ -824,7 +923,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
 
     if (record.binding === 'key' && deviceKeyRequired()) {
-      const verdict = await verifySessionProof(req, token, record);
+      const verdict = await verifySessionProof(req, token, record, now);
       if (!verdict.ok) {
         // Budgeted separately from PIN and pairing: a client failing this many
         // signature checks is broken or hostile, but it must never be able to
@@ -832,6 +931,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         await recordFailure(clientIp(req), { ...stateOpts, scope: 'proof' });
         res.status(401).json({ error: 'BAD_DEVICE_PROOF', reason: verdict.reason });
         return;
+      }
+      if (verdict.convergedSessionFingerprint) {
+        res.setHeader('x-clem-session-fp', verdict.convergedSessionFingerprint);
       }
     } else if (deviceKeyRequired() && needsDeviceUpgrade(record, now)) {
       // A migrated v1 session that never bound a key within its grace. Fails to
@@ -886,7 +988,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     req: express.Request,
     token: string,
     record: MobileSessionRecord,
-  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    now = Date.now(),
+  ): Promise<
+    | { ok: true; convergedSessionFingerprint?: string }
+    | { ok: false; reason: string }
+  > {
     if (!record.devicePublicKeyJwk) return { ok: false, reason: 'NO_DEVICE_KEY' };
 
     const ticket = typeof req.query.ticket === 'string' ? req.query.ticket : '';
@@ -900,15 +1006,42 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const proof = typeof header === 'string' ? header : '';
     if (!proof) return { ok: false, reason: 'PROOF_REQUIRED' };
 
-    const result = await verifyDeviceProof({
+    const currentFingerprint = sessionFingerprint(token);
+    const verifyForFingerprint = (expectedFingerprint: string) => verifyDeviceProof({
       proof,
-      publicKeyJwk: record.devicePublicKeyJwk,
+      publicKeyJwk: record.devicePublicKeyJwk!,
       method: req.method,
       // req.path is router-relative; proofs are signed over the full path the
       // client actually requested.
       path: req.originalUrl.split('?')[0] ?? req.path,
-      sessionFingerprint: sessionFingerprint(token),
+      sessionFingerprint: expectedFingerprint,
+      now,
     });
+
+    let result = await verifyForFingerprint(currentFingerprint);
+    if (!result.ok && result.reason === 'SESSION_MISMATCH') {
+      const tokenHash = createHash('sha256').update(token).digest('hex');
+      const previousHash = record.previousTokenHash;
+      const previousValidUntil = Date.parse(record.previousTokenValidUntil ?? '');
+      const canUsePreviousFingerprint = tokenHash === record.tokenHash
+        && typeof previousHash === 'string'
+        && /^[a-f0-9]{64}$/.test(previousHash)
+        && Number.isFinite(previousValidUntil)
+        && previousValidUntil > now;
+
+      if (canUsePreviousFingerprint) {
+        // A browser applies Set-Cookie globally. During token rotation, a
+        // parallel request may therefore arrive with the NEW cookie even
+        // though it signed its proof moments earlier with the OLD fingerprint.
+        // The stored hash is the immediately retired token only, and its grace
+        // is bounded; all other proof checks still run below against that one
+        // derived fingerprint.
+        result = await verifyForFingerprint(previousHash.slice(0, 32));
+        if (result.ok) {
+          return { ok: true, convergedSessionFingerprint: currentFingerprint };
+        }
+      }
+    }
     return result.ok ? { ok: true } : { ok: false, reason: result.reason };
   }
 
@@ -1467,10 +1600,66 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  router.get('/api/automation-pilot/workspace-choosers', requireMobileSession, async (_req, res) => {
+    try {
+      const {
+        automationPilotWorkspaceChooserSurface,
+        listAutomationPilotWorkspaceChoosers,
+      } = await import('../execution/automation-pilot-workspace-destination-authority.js');
+      const choosers = listAutomationPilotWorkspaceChoosers({ status: 'pending', limit: 100 })
+        .map(automationPilotWorkspaceChooserSurface);
+      res.json({ choosers, count: choosers.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post('/api/automation-pilot/workspace-choosers/:id/resolve', requireMobileSession, async (req, res) => {
+    try {
+      const {
+        automationPilotWorkspaceChooserSurface,
+        resolveAutomationPilotWorkspaceChooser,
+      } = await import('../execution/automation-pilot-workspace-destination-authority.js');
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const chooserId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      const result = resolveAutomationPilotWorkspaceChooser({
+        chooserId,
+        expectedChooserRevision: typeof body.chooserRevision === 'number' ? body.chooserRevision : Number.NaN,
+        expectedChooserDigest: typeof body.chooserDigest === 'string' ? body.chooserDigest : '',
+        choiceId: typeof body.choiceId === 'string' ? body.choiceId : '',
+        actorRef: 'human.mobile',
+      });
+      if (!result.ok) {
+        const status = result.code === 'workspace_chooser_missing'
+          ? 404
+          : result.code === 'workspace_chooser_request_invalid' ? 400 : 409;
+        res.status(status).json({ error: result.code, message: result.reason });
+        return;
+      }
+      setImmediate(() => {
+        void import('../execution/automation-pilot-production-convergence.js')
+          .then(({ reconcileAutomationPilotProductionConvergence }) => (
+            reconcileAutomationPilotProductionConvergence()
+          ))
+          .catch(() => {
+            // Durable advancement state is retried by daemon boot/tick convergence.
+          });
+      });
+      res.json({
+        ok: true,
+        status: result.projection.status,
+        chooser: automationPilotWorkspaceChooserSurface(result.projection),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   async function resolveMobileApproval(
     res: express.Response,
     id: string,
     decision: 'approve' | 'reject',
+    options: { acceptedRunId?: string } = {},
   ): Promise<void> {
     const existing = approvalRegistry.get(id);
     if (!existing) {
@@ -1483,7 +1672,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       });
       return;
     }
-    const runId = mobileApprovalRunId(id, decision);
+    const runId = options.acceptedRunId ?? mobileApprovalRunId(id, decision);
+    const typedChatPayload = (message: string): ChatSendResponse => ({
+      sessionId: existing.sessionId,
+      runId,
+      reply: message,
+    });
     const replayAttempt = getLatestRunAttemptByRunId(existing.sessionId, runId);
     const auditResolution: approvalRegistry.ApprovalResolution = decision === 'reject' ? 'rejected' : 'approved';
     const replayTerminal = replayAttempt?.sourceUserSeq
@@ -1499,6 +1693,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           if (replayTerminal.presentation.status === 'failed') {
             res.status(500).json({ error: 'APPROVAL_RESUME_FAILED', message: PUBLIC_RUN_FAILURE_TEXT });
           } else {
+            if (options.acceptedRunId) {
+              res.json(typedChatPayload(replayTerminal.presentation.text));
+              return;
+            }
             res.json({
               ok: true,
               approvalId: id,
@@ -1551,6 +1749,13 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         const terminal = exactMobileApprovalTerminal(existing.sessionId, latest.sourceUserSeq);
         if (terminal) {
           res.setHeader('Idempotent-Replay', '1');
+          const terminalMessage = terminal.presentation.status === 'failed'
+            ? PUBLIC_RUN_FAILURE_TEXT
+            : terminal.presentation.text;
+          if (options.acceptedRunId && terminal.presentation.status !== 'failed') {
+            res.json(typedChatPayload(terminalMessage));
+            return;
+          }
           res.json({
             ok: terminal.presentation.status !== 'failed',
             approvalId: id,
@@ -1568,6 +1773,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         approvalId: id,
         sessionId: existing.sessionId,
         status: 'already-processing',
+        ...(options.acceptedRunId ? typedChatPayload(`Approval ${id} is already processing.`) : {}),
       });
       return;
     }
@@ -1647,6 +1853,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         metadata: { approvalId: id, decision, queuedTaskId: queued.id },
       });
       settleMobileApprovalAttempt(approvalAttempt);
+      if (options.acceptedRunId) {
+        res.json(typedChatPayload(text));
+        return;
+      }
       res.json({
         ok: true,
         approvalId: id,
@@ -1690,6 +1900,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         metadata: { approvalId: id, decision, status },
       });
       settleMobileApprovalAttempt(approvalAttempt);
+      if (options.acceptedRunId) {
+        res.json(typedChatPayload(message));
+        return;
+      }
       res.json({
         ok: true,
         approval: serializeApprovalForMobile(resolvedRow),
@@ -1723,7 +1937,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       resolvedRow = result.row;
     }
 
-    res.status(202).json({
+    const resumingMessage = `${decision === 'approve' ? 'Approved' : 'Rejected'} ${id}; resuming the exact request.`;
+    if (options.acceptedRunId) {
+      res.status(202).json(typedChatPayload(resumingMessage));
+    } else res.status(202).json({
       ok: true,
       approval: serializeApprovalForMobile(resolvedRow),
       sessionId,
@@ -1736,9 +1953,13 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       }, Math.floor(MOBILE_APPROVAL_LEASE_MS / 3));
       leaseHeartbeat.unref?.();
       try {
-        const agent = await buildOrchestratorAgentForApprovalResume({ sessionId, allowToolJit: true });
         await runConversationFromResume({
-          agent,
+          buildAgent: (identity) => buildOrchestratorAgentForApprovalResume({
+            sessionId: identity.sessionId,
+            sourceUserSeq: identity.sourceUserSeq,
+            acceptedRoute: identity.route,
+            allowToolJit: true,
+          }),
           sessionId,
           approvalId: id,
           decision,
@@ -1808,6 +2029,148 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     await resolveMobileApproval(res, id, 'reject');
   });
+
+  async function executeMobileLocalSessionControl(input: {
+    res: express.Response;
+    command: 'cancel' | 'new';
+    message: string;
+    deviceId: string;
+    runId: string;
+    idempotencyScope: string;
+    idempotencyKey: string;
+    targetSessionId: string;
+  }): Promise<void> {
+    const replay = getLatestRunAttemptByRunId(input.targetSessionId, input.runId);
+    if (replay?.sourceUserSeq) {
+      const terminal = exactMobileApprovalTerminal(input.targetSessionId, replay.sourceUserSeq);
+      if (terminal) {
+        const sessionId = input.command === 'new'
+          ? mobileFreshSessionId(input.runId)
+          : input.targetSessionId;
+        const payload: ChatSendResponse = {
+          sessionId,
+          runId: input.runId,
+          reply: terminal.presentation.text,
+        };
+        input.res.setHeader('Idempotent-Replay', '1');
+        rememberIdempotent(input.idempotencyScope, input.idempotencyKey, payload);
+        input.res.json(payload);
+        return;
+      }
+    }
+
+    const executionClaim = claimRunAttemptLease({
+      sessionId: input.targetSessionId,
+      runId: input.runId,
+      ownerId: MOBILE_APPROVAL_LEASE_OWNER,
+      leaseMs: MOBILE_APPROVAL_LEASE_MS,
+    });
+    if (!executionClaim.attempt) {
+      input.res.status(500).json({ error: 'MOBILE_CONTROL_ACCEPT_FAILED', message: PUBLIC_RUN_FAILURE_TEXT });
+      return;
+    }
+    if (!executionClaim.claimed) {
+      input.res.status(202).json({
+        accepted: true,
+        sessionId: input.targetSessionId,
+        runId: input.runId,
+        status: 'already-processing',
+      });
+      return;
+    }
+
+    const attempt = executionClaim.attempt;
+    let source: HarnessEventRow;
+    try {
+      source = recordRunAttemptUserInput(attempt, {
+        turn: 0,
+        role: 'user',
+        data: {
+          text: input.message,
+          displayText: input.message,
+          source: 'mobile_control',
+          command: input.command,
+          runId: input.runId,
+          attemptId: attempt.attemptId,
+        },
+      }, { armRunInFlight: true });
+    } catch (err) {
+      console.error('mobile session control acceptance failed:', err);
+      settleMobileApprovalAttempt(attempt, 'failed');
+      input.res.status(500).json({ error: 'MOBILE_CONTROL_ACCEPT_FAILED', message: PUBLIC_RUN_FAILURE_TEXT });
+      return;
+    }
+
+    try {
+      let responseSessionId = input.targetSessionId;
+      let reply: string;
+      if (input.command === 'cancel') {
+        let cancelledApprovals = 0;
+        for (const row of approvalRegistry.listPending({ sessionId: input.targetSessionId, status: 'pending' })) {
+          if (approvalRegistry.resolve(row.approvalId, 'cancelled_by_user', 'mobile-chat-control').ok) {
+            cancelledApprovals += 1;
+          }
+        }
+        const session = HarnessSession.load(input.targetSessionId);
+        session?.clearInterruptState();
+        reply = cancelledApprovals > 0
+          ? `Cancelled this conversation and abandoned ${cancelledApprovals} pending approval${cancelledApprovals === 1 ? '' : 's'}.`
+          : 'Cancelled this conversation.';
+        commitMobileApprovalTerminal({
+          source,
+          text: reply,
+          status: 'done',
+          reason: 'mobile_session_cancelled',
+        });
+        session?.markStatus('cancelled');
+      } else {
+        responseSessionId = mobileFreshSessionId(input.runId);
+        if (!harnessGetSession(responseSessionId)) {
+          createHarnessChatSession({
+            id: responseSessionId,
+            kind: 'chat',
+            channel: 'mobile',
+            userId: input.deviceId,
+            title: 'Fresh conversation',
+            metadata: {
+              source: 'mobile',
+              ingressProvider: 'mobile',
+              channelId: responseSessionId,
+              userId: input.deviceId,
+            },
+          });
+        }
+        for (const row of approvalRegistry.listPending({ sessionId: input.targetSessionId, status: 'pending' })) {
+          if (!approvalRegistry.isFormalApprovalSurface(row)) {
+            approvalRegistry.resolve(row.approvalId, 'cancelled_by_user', 'mobile-new-session');
+          }
+        }
+        reply = 'Fresh conversation ready.';
+        commitMobileApprovalTerminal({
+          source,
+          text: reply,
+          status: 'done',
+          reason: 'mobile_new_session',
+        });
+      }
+      settleMobileApprovalAttempt(attempt);
+      const payload: ChatSendResponse = { sessionId: responseSessionId, runId: input.runId, reply };
+      rememberIdempotent(input.idempotencyScope, input.idempotencyKey, payload);
+      input.res.json(payload);
+    } catch (err) {
+      console.error('mobile session control failed:', err);
+      try {
+        commitMobileApprovalTerminal({
+          source,
+          text: PUBLIC_RUN_FAILURE_TEXT,
+          status: 'failed',
+          reason: 'mobile_session_control_failed',
+        });
+      } catch { /* the accepted source remains the durable retry fence */ }
+      settleMobileApprovalAttempt(attempt, 'failed');
+      input.res.status(500).json({ error: 'MOBILE_CONTROL_FAILED', message: PUBLIC_RUN_FAILURE_TEXT });
+    }
+  }
 
   // ─── Web Push ───────────────────────────────────────────────────
   //
@@ -2111,32 +2474,145 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // The receipt has a session FK, so create the deterministic session first
       // only on a genuinely new key. Replays recover its original durable id.
       const priorReceipt = getHarnessChatRequestReceipt(requestId);
-      if (!priorReceipt && !harnessGetSession(proposedSessionId)) {
+      const typedControl = classifyMobileTypedChatControl(message);
+      if (typedControl?.kind === 'formal_approval') {
+        const approval = approvalRegistry.get(typedControl.approvalId);
+        if (!approval || !approvalRegistry.isFormalApprovalSurface(approval)) {
+          await resolveMobileApproval(res, typedControl.approvalId, typedControl.decision);
+          return;
+        }
+        let approvalClaim: ReturnType<typeof claimHarnessChatRequest>;
+        try {
+          approvalClaim = claimHarnessChatRequest({
+            requestId,
+            sessionId: approval.sessionId,
+            runId,
+            inputHash,
+            sinceSeq: harnessLatestEventSeq(approval.sessionId),
+          });
+        } catch (err) {
+          console.warn('mobile typed approval idempotency conflict:', err);
+          res.status(409).json({ error: 'IDEMPOTENCY_KEY_CONFLICT' });
+          return;
+        }
+        if (!approvalClaim.inserted) res.setHeader('Idempotent-Replay', '1');
+        await resolveMobileApproval(res, typedControl.approvalId, typedControl.decision, {
+          acceptedRunId: approvalClaim.receipt.runId,
+        });
+        return;
+      }
+      const priorLineage = requestedSessionId
+        ? resolveAcceptedSourceIngressLineage({
+          sessionId: requestedSessionId,
+          provider: 'mobile',
+          scopeId: null,
+          audienceId: ctx.record.deviceId,
+        })
+        : null;
+      if (typedControl?.kind === 'session_control' && (!requestedSessionId || !priorLineage)) {
+        res.status(409).json({
+          error: 'MOBILE_CONTROL_TARGET_UNAVAILABLE',
+          command: typedControl.command,
+          message: 'Open the exact mobile conversation you want to control, then try again.',
+        });
+        return;
+      }
+      const validatedMount = priorLineage?.validatedMount ?? (spaceSlug ? {
+        version: 1 as const,
+        kind: 'workspace' as const,
+        rootSessionId: `space-${spaceSlug}`,
+        workspaceSlug: spaceSlug,
+      } : undefined);
+      const conversationId = priorLineage?.conversationId ?? proposedSessionId;
+      if (!typedControl && !priorReceipt && !harnessGetSession(proposedSessionId)) {
         createHarnessChatSession({
           id: proposedSessionId,
           kind: 'chat',
           channel: 'mobile',
           userId: ctx.record.deviceId,
           title: message.length > 80 ? `${message.slice(0, 77)}...` : message,
-          metadata: spaceSlug ? { source: 'workspace', spaceSlug } : { source: 'mobile' },
+          metadata: {
+            source: spaceSlug ? 'workspace' : 'mobile',
+            ingressProvider: 'mobile',
+            channelId: conversationId,
+            userId: ctx.record.deviceId,
+            ...(spaceSlug ? { spaceSlug } : {}),
+            ...(validatedMount ? { __session_mount: validatedMount } : {}),
+          },
         });
       }
-      let requestClaim: ReturnType<typeof claimHarnessChatRequest>;
+      let requestClaim: ReturnType<typeof claimSessionForAcceptedSource> | ReturnType<typeof claimHarnessChatRequest>;
+      let selectedSessionId: string | null = null;
       try {
-        requestClaim = claimHarnessChatRequest({
-          requestId,
-          sessionId: proposedSessionId,
-          runId,
-          inputHash,
-          sinceSeq: harnessLatestEventSeq(proposedSessionId),
-        });
+        // requestId is a SHA-256 binding of the authenticated device id and
+        // provider key. A pre-v60 receipt therefore already proves this mobile
+        // audience even when its old session metadata lacks channelId. Reclaim
+        // it before preview/classification; new receipts use the atomic selector.
+        if (typedControl?.kind === 'session_control') {
+          const selectedClaim = claimSessionForAcceptedSource({
+            kind: 'bound_control',
+            targetSessionId: proposedSessionId,
+            entrySessionId: proposedSessionId,
+            durableSourceId: runId,
+            continuity: {
+              provider: 'mobile',
+              scopeId: null,
+              conversationId,
+              audienceId: ctx.record.deviceId,
+            },
+            receipt: { requestId, runId, inputHash },
+          });
+          requestClaim = selectedClaim;
+          selectedSessionId = selectedClaim.selection.sessionId;
+        } else if (priorReceipt) {
+          requestClaim = claimHarnessChatRequest({
+            requestId,
+            sessionId: priorReceipt.sessionId,
+            runId: priorReceipt.runId,
+            inputHash,
+            sinceSeq: priorReceipt.sinceSeq,
+          });
+        } else {
+          const selectedClaim = claimSessionForAcceptedSource({
+            kind: 'ordinary',
+            entrySessionId: proposedSessionId,
+            durableSourceId: runId,
+            continuity: {
+              provider: 'mobile',
+              scopeId: null,
+              conversationId,
+              audienceId: ctx.record.deviceId,
+            },
+            ...(validatedMount ? { validatedMount } : {}),
+            receipt: { requestId, runId, inputHash },
+          });
+          requestClaim = selectedClaim;
+          selectedSessionId = selectedClaim.selection.sessionId;
+        }
       } catch (err) {
         console.warn('mobile idempotency key conflict:', err);
         res.status(409).json({ error: 'IDEMPOTENCY_KEY_CONFLICT' });
         return;
       }
       const { sessionId } = requestClaim.receipt;
+      if (selectedSessionId && selectedSessionId !== sessionId) {
+        throw new Error('mobile receipt was not claimed on the pre-accepted session');
+      }
       if (!requestClaim.inserted) res.setHeader('Idempotent-Replay', '1');
+
+      if (typedControl?.kind === 'session_control' && typedControl.command !== 'continue') {
+        await executeMobileLocalSessionControl({
+          res,
+          command: typedControl.command,
+          message,
+          deviceId: ctx.record.deviceId,
+          runId: requestClaim.receipt.runId,
+          idempotencyScope: scope,
+          idempotencyKey,
+          targetSessionId: sessionId,
+        });
+        return;
+      }
 
       // Validate the durable key binding before consulting this optimization.
       const cached = lookupIdempotent<ChatSendResponse>(scope, idempotencyKey);
@@ -2145,25 +2621,33 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         return;
       }
 
-      // Lane parity with the desktop dock: seed the workspace context primer
-      // (idempotent by prefix) so the gateway lane knows WHICH workspace this
-      // thread is about. The Claude SDK lane derives it from the session id on
-      // its own; without this, the orchestrator lane was a contextless generic
-      // assistant — the exact drift the primer was collapsed to prevent.
-      if (spaceSlug) {
-        try {
-          const { HarnessSession } = await import('../runtime/harness/session.js');
-          const { buildWorkspaceContextPrimer } = await import('../spaces/workspace-context.js');
-          const harnessSession = HarnessSession.load(sessionId);
-          const primer = buildWorkspaceContextPrimer(spaceSlug);
-          if (harnessSession && primer) harnessSession.setContextPrimer('[workspace-context]', primer);
-        } catch { /* best-effort primer */ }
+      // Session composition seeds identity primers onto the Codex snapshot so
+      // a phone dock and a desktop dock mount the same live workspace.
+      try {
+        const { applySessionMountPrimers, composeSessionFromStore } = await import('../runtime/harness/session-composition.js');
+        applySessionMountPrimers(sessionId, composeSessionFromStore(sessionId));
+      } catch { /* best-effort primer */ }
+
+      let executionMessage = message;
+      if (typedControl?.kind === 'session_control' && typedControl.command === 'continue') {
+        const lastCompletion = harnessListEvents(sessionId, {
+          types: ['conversation_completed'],
+          desc: true,
+          limit: 1,
+        })[0];
+        const reason = typeof lastCompletion?.data.reason === 'string' ? lastCompletion.data.reason : undefined;
+        if (reason && isContinueCompletionReason(reason)) {
+          const lastDecisionSummary = typeof lastCompletion?.data.lastDecisionSummary === 'string'
+            ? lastCompletion.data.lastDecisionSummary
+            : undefined;
+          executionMessage = buildContinueInput(lastDecisionSummary);
+        }
       }
 
       let execution = mobileChatInFlight.get(requestId);
       if (!execution) {
         const started = new ClementineGateway(deps.assistant).handleMessage({
-          message,
+          message: executionMessage,
           sessionId,
           userId: ctx.record.deviceId,
           channel: 'mobile',
@@ -2505,6 +2989,29 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const limit = clampInt(req.query.limit, 20, 1, 50);
     try {
       res.json({ runs: deps.listRecentRuns(limit) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * The foreground-chat running-task affordance reads the SAME durable,
+   * server-owned projection as the console. This is only the mobile-authenticated
+   * spelling of that snapshot: no mobile reducer, recency guess, or prose is
+   * introduced here. The Working Now gate also remains server-owned.
+   */
+  router.get('/api/activity/v2', requireMobileSession, (_req, res) => {
+    try {
+      const snapshot = projectForegroundWorkingNowSnapshot(
+        projectWorkingNowSnapshot({ limit: 100 }),
+      );
+      const entries = snapshot.entries;
+      res.json({
+        schemaVersion: snapshot.schemaVersion,
+        observedAt: snapshot.observedAt,
+        entries,
+        snapshots: entries,
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import {
   listEvents,
@@ -9,6 +10,15 @@ import {
   uncompensatedExternalWriteEvents,
   withExternalWriteAdmissionLock,
 } from './external-write-admission.js';
+import {
+  durableLogicalCallContract,
+  type DurableLogicalCallRecoveryMaterial,
+} from './logical-call-contract.js';
+import {
+  openCanonicalArguments,
+  sealCanonicalArguments,
+} from './authority-argument-seal.js';
+import type { RuntimeToolEffect } from './tool-effect.js';
 
 /**
  * Authority for one physical provider/Runner attempt. Cancellation remains
@@ -26,6 +36,42 @@ export interface DispatchLeaseRef {
    * a transport outlives its wrapper. */
   parentScopeId?: string;
   parentLeaseId?: string;
+  /** Exact accepted-call owner for a host-owned per-call child generation.
+   * These three fields are all-or-none: run/model leases remain unbound, while
+   * a call lease can authorize physical rows only for this immutable tuple. */
+  sourceUserSeq?: number;
+  acceptedTaskId?: string;
+  logicalToolCallId?: string;
+}
+
+export interface DispatchCallRecoveryContract {
+  effect: RuntimeToolEffect;
+  businessCall: boolean;
+  material: DurableLogicalCallRecoveryMaterial;
+  turn?: number;
+}
+
+const RECOVERABLE_EFFECTS = new Set<RuntimeToolEffect>([
+  'read',
+  'compute',
+  'host_only',
+  'local_write',
+  'external_write',
+  'admin',
+  'unknown',
+]);
+
+const dispatchLeaseStorage = new AsyncLocalStorage<DispatchLeaseRef>();
+
+/** Install the exact physical-admission generation without importing the much
+ * larger harness context into provider adapters. */
+export function runWithDispatchLease<T>(lease: DispatchLeaseRef, work: () => T): T {
+  return dispatchLeaseStorage.run(lease, work);
+}
+
+/** Current exact physical-admission generation, when a host owns one. */
+export function currentDispatchLease(): DispatchLeaseRef | undefined {
+  return dispatchLeaseStorage.getStore();
 }
 
 export type DispatchRecoveryLedgerBaseline =
@@ -57,7 +103,80 @@ export function activateDispatchLease(input: {
   scopeId: string;
   runAttemptId?: string;
   parentLease?: DispatchLeaseRef;
+  sourceUserSeq?: number;
+  acceptedTaskId?: string;
+  logicalToolCallId?: string;
+  /** Required for an exact call-bound generation. These frozen bytes are the
+   * only semantics restart recovery may use; recovery never consults a current
+   * registry or infers effect from the tool name. */
+  recovery?: DispatchCallRecoveryContract;
 }): DispatchLeaseRef {
+  const boundFieldCount = [
+    input.sourceUserSeq,
+    input.acceptedTaskId,
+    input.logicalToolCallId,
+  ].filter((value) => value !== undefined).length;
+  if (boundFieldCount !== 0 && boundFieldCount !== 3) {
+    throw new Error('Dispatch call-lease identity must be supplied as one complete tuple.');
+  }
+  if ((boundFieldCount === 3) !== (input.recovery !== undefined)) {
+    throw new Error('Dispatch call-lease recovery contract must accompany the exact call tuple.');
+  }
+  if (
+    boundFieldCount === 3
+    && (
+      !Number.isSafeInteger(input.sourceUserSeq)
+      || (input.sourceUserSeq ?? 0) <= 0
+      || typeof input.acceptedTaskId !== 'string'
+      || !input.acceptedTaskId.trim()
+      || typeof input.logicalToolCallId !== 'string'
+      || input.logicalToolCallId !== input.logicalToolCallId.trim()
+      || input.logicalToolCallId.length < 1
+      || input.logicalToolCallId.length > 512
+    )
+  ) throw new Error('Dispatch call-lease identity is invalid.');
+  let recoveryArgumentCipher: string | null = null;
+  if (input.recovery) {
+    const material = input.recovery.material;
+    if (
+      !RECOVERABLE_EFFECTS.has(input.recovery.effect)
+      || typeof input.recovery.businessCall !== 'boolean'
+      || !material.toolName.trim()
+      || !/^[a-f0-9]{64}$/.test(material.argumentDigest)
+      || !material.args
+      || typeof material.args !== 'object'
+      || Array.isArray(material.args)
+      || (input.recovery.turn !== undefined
+        && (!Number.isSafeInteger(input.recovery.turn) || input.recovery.turn <= 0))
+    ) throw new Error('Dispatch call-lease recovery contract is invalid.');
+    const recomputed = durableLogicalCallContract(
+      input.acceptedTaskId as string,
+      material.toolName,
+      material.args,
+    );
+    if (
+      !recomputed
+      || recomputed.toolName !== material.toolName
+      || recomputed.argumentDigest !== material.argumentDigest
+    ) throw new Error('Dispatch call-lease recovery contract conflicts with its logical material.');
+    recoveryArgumentCipher = sealCanonicalArguments({ args: material.args });
+    const reopened = openCanonicalArguments(recoveryArgumentCipher);
+    const reopenedArgs = reopened?.args;
+    const reopenedContract = durableLogicalCallContract(
+      input.acceptedTaskId as string,
+      material.toolName,
+      reopenedArgs,
+    );
+    if (
+      !reopened
+      || !reopenedArgs
+      || typeof reopenedArgs !== 'object'
+      || Array.isArray(reopenedArgs)
+      || !reopenedContract
+      || reopenedContract.toolName !== material.toolName
+      || reopenedContract.argumentDigest !== material.argumentDigest
+    ) throw new Error('Dispatch call-lease recovery arguments are not reconstructable.');
+  }
   if (input.parentLease) {
     if (input.parentLease.sessionId !== input.sessionId) {
       throw new Error('Dispatch lease parent must belong to the same session.');
@@ -73,21 +192,38 @@ export function activateDispatchLease(input: {
       parentScopeId: input.parentLease.scopeId,
       parentLeaseId: input.parentLease.leaseId,
     } : {}),
+    ...(boundFieldCount === 3 ? {
+      sourceUserSeq: input.sourceUserSeq as number,
+      acceptedTaskId: input.acceptedTaskId as string,
+      logicalToolCallId: input.logicalToolCallId as string,
+    } : {}),
   };
   openEventLog().prepare(`
     INSERT INTO run_dispatch_leases
       (
         scope_id, session_id, lease_id, run_attempt_id,
         parent_scope_id, parent_lease_id,
+        source_user_seq, accepted_task_id, logical_tool_call_id,
+        recovery_effect, recovery_business_call, recovery_tool_name,
+        recovery_argument_digest, recovery_argument_cipher, recovery_turn,
         activated_at, revoked_at
       )
-    VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
     ON CONFLICT(scope_id) DO UPDATE SET
       session_id = excluded.session_id,
       lease_id = excluded.lease_id,
       run_attempt_id = excluded.run_attempt_id,
       parent_scope_id = excluded.parent_scope_id,
       parent_lease_id = excluded.parent_lease_id,
+      source_user_seq = excluded.source_user_seq,
+      accepted_task_id = excluded.accepted_task_id,
+      logical_tool_call_id = excluded.logical_tool_call_id,
+      recovery_effect = excluded.recovery_effect,
+      recovery_business_call = excluded.recovery_business_call,
+      recovery_tool_name = excluded.recovery_tool_name,
+      recovery_argument_digest = excluded.recovery_argument_digest,
+      recovery_argument_cipher = excluded.recovery_argument_cipher,
+      recovery_turn = excluded.recovery_turn,
       activated_at = excluded.activated_at,
       revoked_at = NULL
   `).run(
@@ -97,6 +233,15 @@ export function activateDispatchLease(input: {
     lease.runAttemptId ?? null,
     lease.parentScopeId ?? null,
     lease.parentLeaseId ?? null,
+    lease.sourceUserSeq ?? null,
+    lease.acceptedTaskId ?? null,
+    lease.logicalToolCallId ?? null,
+    input.recovery?.effect ?? null,
+    input.recovery ? (input.recovery.businessCall ? 1 : 0) : null,
+    input.recovery?.material.toolName ?? null,
+    input.recovery?.material.argumentDigest ?? null,
+    recoveryArgumentCipher,
+    input.recovery?.turn ?? null,
     new Date().toISOString(),
   );
   return lease;
@@ -207,6 +352,9 @@ export function isDispatchLeaseCurrent(lease: DispatchLeaseRef | undefined): boo
            lease.parent_lease_id,
            lease.revoked_at,
            lease.run_attempt_id,
+           lease.source_user_seq,
+           lease.accepted_task_id,
+           lease.logical_tool_call_id,
            attempt.attempt_id,
            attempt.session_id AS attempt_session_id,
            attempt.finished_at AS attempt_finished_at
@@ -224,12 +372,16 @@ export function isDispatchLeaseCurrent(lease: DispatchLeaseRef | undefined): boo
     parent_lease_id: string | null;
     revoked_at: string | null;
     run_attempt_id: string | null;
+    source_user_seq: number | null;
+    accepted_task_id: string | null;
+    logical_tool_call_id: string | null;
     attempt_id: string | null;
     attempt_session_id: string | null;
     attempt_finished_at: string | null;
   };
   let scopeId = lease.scopeId;
   let leaseId = lease.leaseId;
+  let first = true;
   const seen = new Set<string>();
   while (true) {
     const lineageKey = `${scopeId}\0${leaseId}`;
@@ -237,6 +389,14 @@ export function isDispatchLeaseCurrent(lease: DispatchLeaseRef | undefined): boo
     seen.add(lineageKey);
     const row = lookup.get(scopeId, lease.sessionId, leaseId) as LeaseRow | undefined;
     if (!row || row.revoked_at !== null) return false;
+    if (
+      first
+      && (
+        row.source_user_seq !== (lease.sourceUserSeq ?? null)
+        || row.accepted_task_id !== (lease.acceptedTaskId ?? null)
+        || row.logical_tool_call_id !== (lease.logicalToolCallId ?? null)
+      )
+    ) return false;
     if (
       row.run_attempt_id !== null
       && (
@@ -247,6 +407,7 @@ export function isDispatchLeaseCurrent(lease: DispatchLeaseRef | undefined): boo
     ) return false;
     if (row.parent_scope_id === null && row.parent_lease_id === null) return true;
     if (!row.parent_scope_id || !row.parent_lease_id) return false;
+    first = false;
     scopeId = row.parent_scope_id;
     leaseId = row.parent_lease_id;
   }
@@ -277,6 +438,27 @@ export function parseDispatchLease(value: string | undefined): DispatchLeaseRef 
       || !parsed.leaseId
       || (parsed.runAttemptId !== undefined && typeof parsed.runAttemptId !== 'string')
       || (
+        parsed.sourceUserSeq !== undefined
+        && (!Number.isSafeInteger(parsed.sourceUserSeq) || parsed.sourceUserSeq <= 0)
+      )
+      || (
+        parsed.acceptedTaskId !== undefined
+        && (typeof parsed.acceptedTaskId !== 'string' || !parsed.acceptedTaskId.trim())
+      )
+      || (
+        parsed.logicalToolCallId !== undefined
+        && (
+          typeof parsed.logicalToolCallId !== 'string'
+          || parsed.logicalToolCallId !== parsed.logicalToolCallId.trim()
+          || parsed.logicalToolCallId.length < 1
+          || parsed.logicalToolCallId.length > 512
+        )
+      )
+      || ([parsed.sourceUserSeq, parsed.acceptedTaskId, parsed.logicalToolCallId]
+        .filter((entry) => entry !== undefined).length !== 0
+        && [parsed.sourceUserSeq, parsed.acceptedTaskId, parsed.logicalToolCallId]
+          .filter((entry) => entry !== undefined).length !== 3)
+      || (
         parsed.parentScopeId !== undefined
         && (typeof parsed.parentScopeId !== 'string' || !parsed.parentScopeId)
       )
@@ -297,6 +479,15 @@ export function parseDispatchLease(value: string | undefined): DispatchLeaseRef 
         parentScopeId: parsed.parentScopeId,
         parentLeaseId: parsed.parentLeaseId,
       } : {}),
+      ...(parsed.sourceUserSeq !== undefined
+        && parsed.acceptedTaskId
+        && parsed.logicalToolCallId
+        ? {
+            sourceUserSeq: parsed.sourceUserSeq,
+            acceptedTaskId: parsed.acceptedTaskId,
+            logicalToolCallId: parsed.logicalToolCallId,
+          }
+        : {}),
     };
   } catch (cause) {
     throw new Error(

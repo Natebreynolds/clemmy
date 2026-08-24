@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { getToolOutput, TOOL_OUTPUT_MAX_BYTES } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { textResult } from './shared.js';
-import { parseShellToolOutput } from './code-mode-tool.js';
+import { parseShellToolOutput } from './inner-dispatch.js';
 import { extractCompleteJsonObjects, extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { describeJsonShape, resolveDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';

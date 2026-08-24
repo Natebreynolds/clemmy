@@ -47,7 +47,13 @@ const PRESETS: Record<HarnessBudgetPreset, HarnessBudgetSettings> = {
     toolCallsPerTurn: 40,
     maxParallelWorkers: 6,
     checkInMinutes: 10,
-    autoContinueOnLimit: false,
+    // NEVER-RESTING (2026-08-18, live restart test): a ceiling is the harness
+    // reaching a checkpoint, not the work reaching an end. Every preset
+    // auto-resumes; a run stops only for a terminal Outcome, a user-owned
+    // gate, a user stop, or zero progress. The old standard=false default
+    // turned the first step budget into a dead stop the user had to notice.
+    // HARNESS_AUTO_CONTINUE_ON_LIMIT=off remains the kill switch.
+    autoContinueOnLimit: true,
     maxRunTokens: 10_000_000,
   },
   long: {

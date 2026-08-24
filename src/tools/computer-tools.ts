@@ -165,6 +165,27 @@ function oneShellCommandNeedsApproval(rawCommand: unknown): boolean {
     /(^|[\s;&|])(eval|exec|source|\.)\s/,
     /(^|[\s;&|])history\s+-c/,
     /(^|[\s;&|])(crontab|launchd)\s+-r/,
+    // Windows (cmd.exe / PowerShell) destructive shapes — win32 only, so mac
+    // approval behavior stays byte-identical (POSIX `rename` etc. never newly
+    // gate there). run_shell_command uses shell:true, which is cmd.exe on
+    // win32 — without these, `del /f /s` and `Remove-Item -Recurse -Force`
+    // auto-approved while their POSIX twins gated (readiness sweep 2026-08-20).
+    ...(process.platform === 'win32' ? [
+      /(^|[\s;&|])(del|erase)\s+(\/[a-z]\s+)*.*\/(f|s|q)\b/i,
+      /(^|[\s;&|])(rd|rmdir)\s+.*\/s\b/i,
+      /(^|[\s;&|])remove-item\b/i,
+      /(^|[\s;&|])(move|ren|rename)\s+/i,
+      /(^|[\s;&|])(reg)\s+(add|delete|import)\b/i,
+      /(^|[\s;&|])(sc)\s+(create|delete|config|stop|start)\b/i,
+      /(^|[\s;&|])schtasks\b/i,
+      /(^|[\s;&|])taskkill\b/i,
+      /(^|[\s;&|])(net)\s+(user|localgroup|share|stop|start)\b/i,
+      /(^|[\s;&|])(setx|reg\.exe)\b/i,
+      /(^|[\s;&|])(stop|start|restart)-service\b/i,
+      /(^|[\s;&|])set-(itemproperty|executionpolicy|service)\b/i,
+      /(^|[\s;&|])new-(item|service|scheduledtask)\b/i,
+      /(^|[\s;&|])(icacls|takeown|attrib)\b/i,
+    ] : []),
   ];
 
   return DANGER_PATTERNS.some((re) => re.test(stripped));
@@ -650,6 +671,19 @@ export function assertCommandAllowed(command: string): void {
     /\bmkfs\b/,
     /\bchmod\s+-r\s+777\s+(\/|\$home|~)/,
     /\bchown\s+-r\s+.*\s+(\/|\$home|~)/,
+    // Windows catastrophic shapes — win32 only (the hard wall mirrors the
+    // platform whose shell actually executes the string).
+    ...(process.platform === 'win32' ? [
+      /\bformat\s+[a-z]:/,
+      /\bdel\s+(\/[fsqa]\s+)*([a-z]:\\|\\\\|%systemroot%|%windir%|%userprofile%\\?$)/,
+      /\b(rd|rmdir)\s+\/s\s+(\/q\s+)?([a-z]:\\?$|%systemroot%|%windir%|%userprofile%\\?$)/,
+      /\bremove-item\b.*-recurse\b.*\s(\$env:userprofile|\$env:systemroot|[a-z]:\\?)(\s|$)/,
+      /\bvssadmin\s+delete\b/,
+      /\bbcdedit\b/,
+      /\bcipher\s+\/w/,
+      /\breg\s+delete\s+hklm/,
+      /\bwmic\s+.*\bdelete\b/,
+    ] : []),
   ];
   if (denied.some((pattern) => pattern.test(normalized))) {
     throw new ShellPolicyDenialError('Command denied by Clementine safety policy.');
@@ -842,7 +876,8 @@ function resolveShellPathToken(token: string, cwd: string): string | null {
   if (!cleaned || cleaned.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(cleaned)) return null;
   const expanded = cleaned
     .replace(/^\$\{HOME\}(?=\/|$)/, os.homedir())
-    .replace(/^\$HOME(?=\/|$)/, os.homedir());
+    .replace(/^\$HOME(?=\/|$)/, os.homedir())
+    .replace(/^%USERPROFILE%(?=[\\/]|$)/i, os.homedir());
   if (expanded.includes('*') || expanded.includes('?') || expanded.includes('$(') || expanded.includes('`')) return null;
   const homeExpanded = expandHome(expanded);
   return path.isAbsolute(homeExpanded) ? path.resolve(homeExpanded) : path.resolve(cwd, homeExpanded);
@@ -1115,7 +1150,15 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
     const timeout = setTimeout(() => {
       if (settled) return;
       settled = true;
-      child.kill('SIGTERM');
+      if (process.platform === 'win32' && child.pid) {
+        // shell:true wraps the real command in cmd.exe; SIGTERM kills only the
+        // wrapper and orphans the grandchild. taskkill /T fells the tree.
+        try {
+          spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+        } catch { child.kill('SIGTERM'); }
+      } else {
+        child.kill('SIGTERM');
+      }
       reject(new ShellCommandExecutionError(
         `Command timed out after ${timeoutMs}ms.`,
         classifyShellExecutionOutcome({ command, externalMutation, stdout, stderr, timedOut: true }),

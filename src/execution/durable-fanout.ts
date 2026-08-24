@@ -31,6 +31,8 @@ import Database from 'better-sqlite3';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
 import { updateLinkedFocusAction } from '../memory/focus.js';
+import { addNotification } from '../runtime/notifications.js';
+import { appendEvent } from '../runtime/harness/eventlog.js';
 import {
   admitWorkDisposition,
   dispositionToDurableWork,
@@ -667,6 +669,7 @@ export function scheduleDurableFanout(planId: string): ScheduledFanout | null {
       if (window.status !== 'claimed') {
         database.prepare("UPDATE windows SET status = 'done', updated_at = ? WHERE plan_id = ? AND window_index = ?")
           .run(now(), planId, window.windowIndex);
+        reportWindowSettled(planId, window.windowIndex);
       }
       skippedWindows.push(window.windowIndex);
       continue;
@@ -689,6 +692,9 @@ export function scheduleDurableFanout(planId: string): ScheduledFanout | null {
       // notification. The plan owns every user-visible message.
       internal: true,
       source: plan.route.source ?? 'gateway',
+      // ONE LOOP, MANY BRAINS: the window runs on the fleet's model while the
+      // master keeps its own brain (honorModel now true for 'background').
+      ...(plan.durable.workerModel ? { model: plan.durable.workerModel } : {}),
     });
     database.prepare(`
       UPDATE windows SET worker_task_id = ?, run_session_id = ?, updated_at = ?
@@ -712,6 +718,42 @@ export function scheduleDurableFanout(planId: string): ScheduledFanout | null {
  * (recordFanoutReducerOutcome), and a failed reduction is retryable under
  * the same bounded lease.
  */
+
+/** ONE LOOP, MANY BRAINS — per-completion report-back: each settled window
+ *  pings the user (compact, deduped by window id) and wakes the origin
+ *  session so a master turn can fold results as they land. Additive only:
+ *  delivery failures never touch plan state, and internal plans without an
+ *  origin route stay silent as before if lookups fail. */
+function reportWindowSettled(planId: string, windowIndex: number): void {
+  try {
+    const plan = loadFanoutPlan(planId);
+    if (!plan) return;
+    const total = plan.durable.windows.length;
+    addNotification({
+      id: `fanout:${planId}:window:${windowIndex}`,
+      kind: 'execution',
+      title: `${plan.objective} — ${windowIndex + 1}/${total} done`,
+      body: `Window ${windowIndex + 1} of ${total} settled${plan.durable.workerModel ? ` on ${plan.durable.workerModel}` : ''}. Remaining windows continue; the final summary arrives when everything lands.`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { planId, windowIndex, kind: 'fanout_window_settled' },
+    });
+  } catch { /* report-back must never break settlement */ }
+  try {
+    const plan = loadFanoutPlan(planId);
+    const originSessionId = plan?.originSessionId;
+    if (originSessionId) {
+      appendEvent({
+        sessionId: originSessionId,
+        turn: 0,
+        role: 'system',
+        type: 'fanout_window_settled',
+        data: { planId, windowIndex },
+      });
+    }
+  } catch { /* wake is best-effort */ }
+}
+
 export function maybeAdmitFanoutReducer(
   planId: string,
   options: { owner?: string } = {},
@@ -834,6 +876,7 @@ export function reconcileDurableFanout(input: {
       if (open.length === 0) {
         database.prepare("UPDATE windows SET status = 'done', updated_at = ? WHERE plan_id = ? AND window_index = ?")
           .run(now(), plan.planId, window.windowIndex);
+        reportWindowSettled(plan.planId, window.windowIndex);
         continue;
       }
       database.prepare(`

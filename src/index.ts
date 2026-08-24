@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, cpSync } from 'node:fs';
 import { execSync, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import pino from 'pino';
@@ -31,6 +31,7 @@ import {
 } from './daemon/process.js';
 import { bootstrapCodexAuth, clearImportedAuth, formatAuthStatus, importCodexCliAuth, loginWithNativeOAuth, loginWithCodexDeviceCode, refreshStoredNativeOAuth } from './runtime/auth-store.js';
 import { createRuntimeFromConfig } from './runtime/factory.js';
+import { CUTOVER_HOLD } from './runtime/cutover-hold.js';
 import { warmMarkitdownInBackground } from './runtime/markitdown.js';
 import { runDoctor } from './setup/doctor.js';
 import { initHome } from './setup/init-home.js';
@@ -212,9 +213,11 @@ function cmdDaemonLogs(): number {
     console.log('Start the daemon first: clementine daemon start');
     return 1;
   }
-  // Print last 100 lines then follow
+  // Print last 100 lines then follow (no `tail` on win32 — print the file)
   try {
+    if (process.platform === 'win32') throw new Error('tail unavailable');
     const result = spawnSync('tail', ['-n', '100', '-f', DAEMON_LOG_FILE], { stdio: 'inherit' });
+    if (result.error || result.status === null) throw result.error ?? new Error('tail failed');
     return result.status ?? 0;
   } catch {
     // Fallback: just print the file
@@ -227,6 +230,12 @@ function cmdDaemonLogs(): number {
 
 function cmdDaemonInstall(): number {
   const platform = process.platform;
+  if (platform === 'win32') {
+    console.log('Autostart install is not supported from the CLI on Windows yet.');
+    console.log('The Clementine desktop app owns and supervises the daemon on Windows —');
+    console.log('install the app, or run `clementine daemon` in a terminal for a foreground daemon.');
+    return 1;
+  }
   // Try to find the clementine bin
   let clementineBin = process.argv[1];
   try {
@@ -308,9 +317,10 @@ function cmdPluginInstall(target: string): number {
     const name = path.basename(resolved);
     const destDir = path.join(PLUGINS_DIR, name);
     console.log(`Installing plugin from ${resolved} → ${destDir}`);
-    const result = spawnSync('cp', ['-r', resolved, destDir], { stdio: 'inherit' });
-    if (result.status !== 0) {
-      console.error('Failed to copy plugin directory.');
+    try {
+      cpSync(resolved, destDir, { recursive: true });
+    } catch (err) {
+      console.error(`Failed to copy plugin directory: ${err instanceof Error ? err.message : String(err)}`);
       return 1;
     }
     console.log(`Plugin "${name}" installed. Restart daemon or MCP server to activate.`);
@@ -393,6 +403,12 @@ function cmdHarnessAudit(): number {
 }
 
 async function main(): Promise<void> {
+  if (CUTOVER_HOLD) {
+    throw new Error(
+      'CLEMMY_CUTOVER_HOLD=on must be launched through src/daemon/cutover-hold-entry.ts; '
+      + 'the ordinary index intentionally refuses to construct the held runtime graph.',
+    );
+  }
   startSupervisorIpcHeartbeat();
 
   // NOTE: an earlier attempt called process.chdir(os.homedir()) here to
@@ -517,8 +533,8 @@ async function main(): Promise<void> {
         await shutdownLocalTranscriptionRuntime();
       });
       await prepareLocalTranscriptionRuntime();
-    startCliHealthSweep();
-    registerCliAuthRecoverySweep();
+      startCliHealthSweep();
+      registerCliAuthRecoverySweep();
       logger.info({ pid: process.pid }, 'Daemon starting in foreground mode');
       const assistant = new ClementineAssistant(createRuntimeFromConfig());
       await startDaemon(assistant, {

@@ -52,14 +52,27 @@ export function admitConstructWrite(input: {
     sourceLocated: input.observation.sourceLocated,
   };
   const collection = constraints.collection;
-  if (collection && collection.count >= 1) {
+  if (collection && (collection.count >= 1 || collection.completeness === 'exhaust' || collection.projection.length > 0)) {
     const records = input.observation.records ?? [];
-    const distinct = new Set(records.map((record) => JSON.stringify(record))).size;
+    const identityFields = collection.identityFields ?? [];
+    const identityKey = (record: Record<string, unknown>): string => (
+      identityFields.length > 0
+        ? identityFields.map((field) => JSON.stringify(record[field] ?? null)).join('\0')
+        : JSON.stringify(record)
+    );
+    const distinct = new Set(records.map((record) => identityKey(record))).size;
     if (records.length > 0 && distinct !== records.length) {
       return { ok: false, reason: 'collection members are not distinct', next: 'extract' };
     }
     const got = beforeWrite.collectedCount ?? distinct;
-    if (got < collection.count) {
+    if (collection.completeness === 'exhaust' && got < 1) {
+      return {
+        ok: false,
+        reason: 'exhaust collection has no proven members before write',
+        next: beforeWrite.sourceLocated ? 'collection_read' : 'extract',
+      };
+    }
+    if (collection.count >= 1 && got < collection.count) {
       return {
         ok: false,
         reason: `collection requires ${collection.count} members before write; observed ${got}`,

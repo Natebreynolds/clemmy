@@ -182,7 +182,7 @@ test('terminal detector treats only plain completions and run terminal events as
     'completed',
   );
   assert.equal(
-    terminalStatusForWorkLifecycleEvent({ type: 'worker_model_routed', data: { transport: 'openai_agents_harness' } }),
+    terminalStatusForWorkLifecycleEvent({ type: 'worker_model_routed', data: { transport: 'host_harness' } }),
     null,
   );
   assert.equal(terminalStatusForWorkLifecycleEvent({ type: 'awaiting_user_input', data: {} }), null);

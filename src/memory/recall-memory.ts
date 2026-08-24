@@ -1,3 +1,4 @@
+import { activeFactEmbeddingCoverage } from './embeddings.js';
 import { openMemoryDb, type MemoryEpisodeStatus } from './db.js';
 import { renderDeliverableHit, searchDeliverables } from './deliverable-index.js';
 import {
@@ -51,7 +52,7 @@ export interface MemoryEvidenceHit {
 export interface MemoryRecallResult {
   hits: MemoryEvidenceHit[];
   answerability: 'supported' | 'partial' | 'insufficient';
-  diagnostics: { candidates: number; stores: string[]; elapsedMs: number; utilityAdjusted?: number };
+  diagnostics: { candidates: number; stores: string[]; elapsedMs: number; utilityAdjusted?: number; semanticCoverage?: { embedded: number; active: number } };
 }
 
 export interface MemoryRecallContext {
@@ -643,12 +644,23 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
         : searchFactsByText(objective, perStore))
     : [];
 
+  // PER-LEG TIMEOUTS (COMPOUNDING wave): a hanging embedding provider or a
+  // slow vault pass must degrade to the legs that answered — measured live,
+  // ~8% of primers lost EVERYTHING to the single outer timeout. 900ms per
+  // async leg keeps the whole recall under the primer deadline.
+  const legTimeout = <T>(promise: Promise<T>, empty: T): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    return Promise.race([
+      promise.catch(() => empty),
+      new Promise<T>((resolve) => { timer = setTimeout(() => resolve(empty), 900); }),
+    ]).finally(() => { if (timer) clearTimeout(timer); });
+  };
   const [semanticFacts, notes] = await Promise.all([
     searchFactsAsGraphBridge
-      ? findSimilarFactsScored(objective, { topK: perStore, asOf: historicalAsOf }).catch(() => [])
+      ? legTimeout(findSimilarFactsScored(objective, { topK: perStore, asOf: historicalAsOf }), [])
       : Promise.resolve([]),
     wanted.has('note')
-      ? recallHybrid(objective, { limit: perStore, nowMs, timeZone }).catch(() => [])
+      ? legTimeout(recallHybrid(objective, { limit: perStore, nowMs, timeZone }), [])
       : Promise.resolve([]),
   ]);
 
@@ -720,7 +732,9 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     }
   }
 
-  const directResources = (wanted.has('resource') || depth > 0 ? listAllResourcePointers() : [])
+  // Bounded (COMPOUNDING wave): the pointer table grows without limit; the
+  // recency-ordered head is the only part token-overlap can rank anyway.
+  const directResources = (wanted.has('resource') || depth > 0 ? listAllResourcePointers().slice(0, 2_000) : [])
     .map((resource) => ({ resource, overlap: overlapScore(queryTokens, `${resource.name} ${resource.whatsHere ?? ''} ${resource.whenToUse ?? ''}`) }))
     .filter((item) => item.overlap * Math.max(1, queryTokens.size) >= (context.resourceMinOverlap ?? 1))
     .sort((a, b) => b.overlap - a.overlap)
@@ -960,7 +974,10 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     const episodeQueryTokens = temporalMeetingDate ? [] : tokenList;
     const episodeVisibilityParams = historicalAsOf ? [historicalAsOf, historicalAsOf] : [];
     const rows = candidateClauses.length === 0 ? [] : (temporalWindow
-      ? db.prepare(baseEpisodeSql).all(
+      // Bounded (COMPOUNDING wave): the window branch was the one unbounded
+      // scan in recall — a busy episode store could eat the whole primer
+      // deadline. 500 newest rows more than covers any real window.
+      ? db.prepare(`${baseEpisodeSql} LIMIT 500`).all(
           ...episodeQueryTokens.map((token) => `%${token}%`),
           ...episodeVisibilityParams,
         )
@@ -1080,6 +1097,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
       candidates: merged.size,
       stores: Array.from(usedStores),
       elapsedMs: Date.now() - started,
+      ...(activeFactEmbeddingCoverage() ? { semanticCoverage: activeFactEmbeddingCoverage()! } : {}),
       utilityAdjusted: utilityRerank.adjusted,
     },
   };

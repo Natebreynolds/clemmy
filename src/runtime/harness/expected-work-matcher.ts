@@ -17,6 +17,7 @@ import type {
   ExpectedWorkOperationV1,
   ExpectedWorkUniverseV1,
 } from './expected-work-contract.js';
+import { providerResultBookkeepingKey } from './provider-read-evidence.js';
 
 export type ObservedReadCoverageV1 =
   | 'observed'
@@ -145,29 +146,132 @@ export function isDeterministicImplicitRetrieveContract(
     && contract.universes.length === 0;
 }
 
+const SUBSTANCE_IGNORED_KEYS = new Set([
+  'success', 'successful', 'ok', 'status', 'statuscode', 'httpstatus',
+  'message', 'meta', 'metadata', 'request', 'requestargs', 'requestbody',
+  'requestparams', 'requestpayload', 'originalrequest', 'originalrequestargs',
+  'originalrequestbody', 'originalrequestparams', 'originalrequestpayload',
+]);
+
+const SUBSTANCE_PAGINATION_KEYS = new Set([
+  'pagination', 'paging', 'pager', 'pageinfo', 'links',
+  'count', 'itemcount', 'recordcount', 'resultcount', 'size',
+  'total', 'totalcount', 'totalrecords', 'totalitems', 'totalsize', 'odatacount',
+  'returned', 'returnedcount', 'itemsreturned', 'recordsreturned',
+  'pagesize', 'perpage', 'offset', 'start', 'startindex', 'skip',
+  'page', 'pagenumber', 'currentpage', 'pagecount', 'totalpages', 'numpages',
+  'hasmore', 'hasnext', 'hasnextpage', 'moreavailable', 'morepages',
+  'complete', 'iscomplete', 'completed', 'exhausted', 'islastpage', 'done',
+  'cursor', 'nextcursor', 'nextpagetoken', 'pagetoken', 'nexttoken',
+  'continuation', 'continuationtoken', 'nextlink', 'odatanextlink',
+  'nextrecordsurl', 'endcursor',
+]);
+
+const SUBSTANCE_MAX_DEPTH = 8;
+const SUBSTANCE_MAX_NODES = 512;
+const SUBSTANCE_MAX_ENTRIES = 128;
+
+interface SubstanceAnalysis {
+  containsCollection: boolean;
+  substantive: boolean;
+}
+
+interface SubstanceTraversal {
+  nodes: number;
+  truncated: boolean;
+  stack: Set<object>;
+}
+
+function analyzeSubstance(
+  value: unknown,
+  depth: number,
+  traversal: SubstanceTraversal,
+): SubstanceAnalysis {
+  if (traversal.truncated) return { containsCollection: false, substantive: false };
+  if (value === null || value === undefined) {
+    return { containsCollection: false, substantive: false };
+  }
+  if (typeof value === 'string') {
+    return { containsCollection: false, substantive: value.trim().length > 0 };
+  }
+  if (typeof value === 'number') {
+    return { containsCollection: false, substantive: Number.isFinite(value) };
+  }
+  if (typeof value === 'boolean') {
+    return { containsCollection: false, substantive: true };
+  }
+  if (typeof value !== 'object') {
+    return { containsCollection: false, substantive: false };
+  }
+  if (depth > SUBSTANCE_MAX_DEPTH) {
+    traversal.truncated = true;
+    return { containsCollection: false, substantive: false };
+  }
+  traversal.nodes += 1;
+  if (traversal.nodes > SUBSTANCE_MAX_NODES || traversal.stack.has(value as object)) {
+    traversal.truncated = true;
+    return { containsCollection: false, substantive: false };
+  }
+
+  const object = value as object;
+  traversal.stack.add(object);
+  try {
+    if (Array.isArray(value)) {
+      if (value.length > SUBSTANCE_MAX_ENTRIES) {
+        traversal.truncated = true;
+        return { containsCollection: true, substantive: false };
+      }
+      const children = value.map((child) => analyzeSubstance(child, depth + 1, traversal));
+      return {
+        containsCollection: true,
+        substantive: children.some((child) => child.substantive),
+      };
+    }
+
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length > SUBSTANCE_MAX_ENTRIES) {
+      traversal.truncated = true;
+      return { containsCollection: false, substantive: false };
+    }
+    const children = entries
+      .filter(([key]) => {
+        const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+        return !SUBSTANCE_IGNORED_KEYS.has(normalized)
+          && !providerResultBookkeepingKey(key);
+      })
+      .map(([key, child]) => ({
+        pagination: SUBSTANCE_PAGINATION_KEYS.has(
+          key.toLowerCase().replace(/[^a-z0-9]/g, ''),
+        ),
+        analysis: analyzeSubstance(child, depth + 1, traversal),
+      }));
+    const containsCollection = children.some((child) => (
+      !child.pagination && child.analysis.containsCollection
+    ));
+    return {
+      containsCollection,
+      substantive: containsCollection
+        ? children.some((child) => (
+          !child.pagination
+          && child.analysis.containsCollection
+          && child.analysis.substantive
+        ))
+        : children.some((child) => child.analysis.substantive),
+    };
+  } finally {
+    traversal.stack.delete(object);
+  }
+}
+
 /**
  * Whether a redeemed local/compute payload carries any answer-bearing content
  * beyond envelope bookkeeping. A bare success acknowledgement discharges
  * nothing: an empty result cannot ground a retrieval.
  */
 export function computeResultHasSubstance(value: unknown, depth = 0): boolean {
-  if (depth > 8 || value === null || value === undefined) return false;
-  if (typeof value === 'string') return value.trim().length > 0;
-  if (typeof value === 'number') return Number.isFinite(value);
-  if (typeof value === 'boolean') return true;
-  if (Array.isArray(value)) return true;
-  if (typeof value !== 'object') return false;
-  const ignored = new Set([
-    'success', 'successful', 'ok', 'status', 'statuscode', 'httpstatus',
-    'message', 'meta', 'metadata', 'request', 'requestargs', 'requestbody',
-    'requestparams', 'requestpayload',
-  ]);
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
-    if (ignored.has(normalized)) continue;
-    if (computeResultHasSubstance(child, depth + 1)) return true;
-  }
-  return false;
+  const traversal: SubstanceTraversal = { nodes: 0, truncated: false, stack: new Set() };
+  const analysis = analyzeSubstance(value, depth, traversal);
+  return !traversal.truncated && analysis.substantive;
 }
 
 function coverageSatisfied(
@@ -398,7 +502,7 @@ export function matchExpectedWork(
       return false;
     }
     if (computeCarriesImplicitRead) {
-      if (observation.coverage !== 'observed') {
+      if (observation.coverage !== 'observed' && observation.coverage !== 'complete') {
         addGap(gaps, {
           kind: 'coverage_unproven',
           requirementId: expected.id,
@@ -448,6 +552,48 @@ export function matchExpectedWork(
         continue;
       }
       if (candidates.length !== 1) {
+        // One read requirement may need several provider-neutral probes. Pure
+        // reads are safe to repeat, so rank their host-derived coverage and
+        // validate the latest strongest result below. Equal weak probes do not
+        // become proof merely by repetition: validateObservation still leaves
+        // a complete-set requirement incomplete. Irreversible or mixed-effect
+        // multiples retain the strict conflict path.
+        const readProbes = expected.effect === 'read'
+          && candidates.every((candidate) =>
+            candidate.effect === 'read'
+            || (implicitRetrieve && explicit.length === 0 && candidate.effect === 'compute'))
+          && candidates.every((candidate) => candidate.reversibility !== 'irreversible');
+        const successfulObserved = candidates.filter((candidate) =>
+          candidate.outcome === 'succeeded'
+          && (candidate.coverage === 'observed' || candidate.coverage === 'complete'));
+        // Coverage rank is evidence strength, with arrival order only breaking
+        // ties between otherwise equivalent pure-read probes.
+        const coverageRank = (coverage: string): number => (
+          coverage === 'complete' ? 2 : coverage === 'observed' ? 1 : 0
+        );
+        const ranked = successfulObserved
+          .map((candidate) => ({ candidate, rank: coverageRank(candidate.coverage) }))
+          .filter((entry) => entry.rank > 0);
+        const best = ranked.length > 0 ? Math.max(...ranked.map((entry) => entry.rank)) : 0;
+        const winners = ranked.filter((entry) => entry.rank === best).map((entry) => entry.candidate);
+        if (readProbes && winners.length >= 1) {
+          // OVER-SATISFYING A READ IS NOT A DOUBLE-SEND (live 2026-08-19 seq
+          // 63350: several successful Salesforce/scrape reads all matched one
+          // once-cardinality read requirement and the turn's COMPLETE answer
+          // was held as "more than one observed operation claims…"). For pure
+          // read/compute candidates, redoing is free by effect class —
+          // reversibility 'unknown' included — so bind the strongest winner
+          // (highest coverage, then the latest observation) and settle; the
+          // extra reads stay visible as evidence. Writes keep the strict
+          // conflict below.
+          const settled = winners[winners.length - 1]!;
+          instances.set(instanceKey(expected.id), {
+            operation: expected,
+            observation: settled,
+            basicSatisfied: validateObservation(expected, settled),
+          });
+          continue;
+        }
         for (const candidate of candidates) usedObservationIds.add(candidate.id);
         // TWO CLAIMS ON ONE `once` REQUIREMENT IS ONLY DANGEROUS WHEN REDOING IT
         // IS UNFIXABLE. For an irreversible effect it may be a double send, so

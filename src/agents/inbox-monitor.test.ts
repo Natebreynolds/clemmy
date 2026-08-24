@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -17,6 +17,12 @@ mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
 import type { InboxMonitorDeps, UnreadMessage } from './inbox-monitor.js';
 const { inboxMonitorInternalsForTest, processInboxMonitor, scoreMessage } = await import('./inbox-monitor.js');
+
+test('inbox monitor has no ambient raw-provider default owner', () => {
+  const source = readFileSync(new URL('./inbox-monitor.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /executeComposioTool|REAL_DEPS/);
+  assert.match(source, /processInboxMonitor\(deps: InboxMonitorDeps\)/);
+});
 
 // ── fixtures ──────────────────────────────────────────────────────────────
 const outlookResp = (msgs: Array<Partial<UnreadMessage> & { id: string }>): unknown => ({

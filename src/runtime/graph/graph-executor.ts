@@ -44,7 +44,7 @@ import {
   type GraphAdmission,
   type GraphPatch,
 } from './graph-admission.js';
-import { appendActivationHeader, applyGenerationRetirement, computeEdgeVerdict, edgeFires, type PatchGenerations } from './graph-activation.js';
+import { appendActivationHeader, applyGenerationRetirement, computeEdgeVerdict, edgeFires, outcomeAfterAbort, type PatchGenerations } from './graph-activation.js';
 import { validDurableId } from './graph-journal.js';
 import type {
   GraphJournalAdapter,
@@ -117,7 +117,9 @@ export type NodeOutcome =
   /** Cannot run at all (missing authority/capability). Never routes. */
   | { status: 'blocked'; reason: string }
   /** Awaiting input, approval, or budget. Halts the run for later resume. */
-  | { status: 'paused'; reason: string };
+  | { status: 'paused'; reason: string }
+  /** Cancellation signal. Never routes. See `outcomeAfterAbort`. */
+  | { status: 'cancelled'; reason: string; settlementClass?: Extract<SettlementClass, 'cancelled' | 'completed_after_cancel' | 'uncertain_after_cancel'> };
 
 export interface PredecessorRef {
   nodeId: string;
@@ -645,11 +647,7 @@ export async function runGraph(
             settlementClass: 'infrastructure',
           };
         }
-        // A post-abort outcome settles as first-class CANCELLED — journal,
-        // run result, and trace agree; nothing routes.
-        if (options.signal?.aborted) {
-          outcome = { status: 'cancelled' as never, reason: 'cancelled while running', settlementClass: 'cancelled' } as NodeOutcome;
-        }
+        if (options.signal?.aborted) outcome = outcomeAfterAbort(outcome);
         return { ...p, outcome };
       }));
 
@@ -723,8 +721,8 @@ export async function runGraph(
               ...(p.outcome.status === 'completed'
                 ? { outputRef: p.outcome.outputRef, evidenceRefs: p.outcome.evidenceRefs }
                 : { reason: p.outcome.reason }),
-              ...(p.outcome.status === 'failed'
-                ? { settlementClass: p.outcome.settlementClass ?? 'node' }
+              ...(p.outcome.status === 'failed' || p.outcome.status === 'cancelled'
+                ? { settlementClass: p.outcome.settlementClass ?? (p.outcome.status === 'cancelled' ? 'cancelled' : 'node') }
                 : {}),
               ...(emittedPatchDigest !== undefined && p.outcome.status === 'completed'
                 ? { emittedPatchDigest }

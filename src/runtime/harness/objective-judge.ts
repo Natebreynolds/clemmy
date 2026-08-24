@@ -818,3 +818,35 @@ export function isDirectionSeekingQuestion(reply?: string | null): boolean {
   if (COURTESY_CLOSING_QUESTION_RE.test(tail)) return false;
   return DIRECTION_QUESTION_RE.test(tail) || MATERIAL_CLOSING_QUESTION_RE.test(tail);
 }
+
+/** Text before the last interrogative sentence. Empty when the reply is
+ *  only a question. Used to tell a delivered answer-plus-offer from a
+ *  blocking clarification. */
+export function replyBodyBeforeClosingQuestion(reply?: string | null): string {
+  const text = (reply ?? '').trim();
+  if (!text) return '';
+  const lastQ = text.lastIndexOf('?');
+  if (lastQ < 0) return text;
+  const before = text.slice(0, lastQ);
+  const breakAt = Math.max(
+    before.lastIndexOf('\n'),
+    before.lastIndexOf('. '),
+    before.lastIndexOf('! '),
+  );
+  return (breakAt >= 0 ? before.slice(0, breakAt + 1) : '').trim();
+}
+
+/**
+ * A direction-seeking close only parks the turn when the user still has to
+ * decide something this ask cannot finish without. A retrieve/direct_reply
+ * that already gave a substantive answer may offer a next step and stay
+ * delivered. Act/unknown work still pauses (ask-first).
+ */
+export function isBlockingDirectionSeekingQuestion(
+  reply?: string | null,
+  opts?: { route?: 'direct_reply' | 'retrieve' | 'act' },
+): boolean {
+  if (!isDirectionSeekingQuestion(reply)) return false;
+  if (opts?.route !== 'retrieve' && opts?.route !== 'direct_reply') return true;
+  return replyBodyBeforeClosingQuestion(reply).length < 40;
+}

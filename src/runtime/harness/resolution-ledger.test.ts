@@ -1,5 +1,6 @@
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -44,6 +45,73 @@ function accept(text: string) {
   const work = graph.nodes.find((node) =>
     node.kind === 'retrieve' || node.kind === 'execute' || node.kind === 'fanout');
   return { sessionId: session.id, sourceUserSeq: source.seq, turn: 1, graph, work };
+}
+
+function canonicalGraphValue(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalGraphValue(entry ?? null)).join(',')}]`;
+  if (!value || typeof value !== 'object') return 'null';
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalGraphValue(record[key])}`)
+    .join(',')}}`;
+}
+
+function rehashGraph(graph: import('../graph/turn-graph-ir.js').TurnGraphIR): void {
+  const { graphHash: _graphHash, ...compiler } = graph.compiler;
+  graph.compiler.graphHash = createHash('sha256')
+    .update(canonicalGraphValue({ ...graph, compiler }), 'utf8')
+    .digest('hex');
+}
+
+function persistRehashedGraph(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  graph: import('../graph/turn-graph-ir.js').TurnGraphIR;
+}): void {
+  const graphEvent = eventlog.getTurnGraphEventForSource(input.sessionId, input.sourceUserSeq);
+  assert.ok(graphEvent);
+  if (!graphEvent) return;
+  rehashGraph(input.graph);
+  const data = structuredClone(graphEvent.data);
+  data.graph = input.graph;
+  data.graphHash = input.graph.compiler.graphHash;
+  data.route = input.graph.classification.route;
+  data.fastPath = input.graph.fastPath;
+  data.effectCeiling = input.graph.effectCeiling;
+  eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+    .run(JSON.stringify(data), graphEvent.id);
+}
+
+function addSecondWorkNode(input: {
+  graph: import('../graph/turn-graph-ir.js').TurnGraphIR;
+  join: 'exact' | 'missing' | 'non_success';
+}): {
+  siblingId: string;
+  verifyId: string;
+} {
+  const work = input.graph.nodes.find((node) => (
+    node.kind === 'retrieve' || node.kind === 'execute' || node.kind === 'fanout'
+  ));
+  const verify = input.graph.nodes.find((node) => node.kind === 'verify');
+  assert.ok(work && verify, 'fixture requires one work node and its verifier');
+  const sibling = structuredClone(work!);
+  sibling.id = `${work!.id}:sibling`;
+  sibling.operationId = sibling.id;
+  input.graph.nodes.push(sibling);
+  if (input.join !== 'missing') {
+    input.graph.edges.push({
+      id: `edge:${sibling.id}->${verify!.id}`,
+      source: sibling.id,
+      target: verify!.id,
+      when: input.join === 'exact' ? 'success' : 'authority_available',
+    });
+  }
+  return { siblingId: sibling.id, verifyId: verify!.id };
 }
 
 function runRaceChild(input: {
@@ -112,6 +180,94 @@ test('frozen operation authority stores argument structure and digest but never 
   assert.equal(mirror.length, 1);
   assert.equal(JSON.stringify({ persisted, mirror }).includes(secret), false);
 });
+
+test('a hash-valid non-direct graph with zero work nodes remains ambiguous', () => {
+  const task = accept('Thank you.');
+  assert.equal(task.graph.classification.route, 'direct_reply');
+  assert.equal(task.work, undefined);
+  const graphEvent = eventlog.getTurnGraphEventForSource(task.sessionId, task.sourceUserSeq);
+  assert.ok(graphEvent);
+  if (!graphEvent) return;
+
+  const data = structuredClone(graphEvent.data);
+  const graph = structuredClone(data.graph) as import('../graph/turn-graph-ir.js').TurnGraphIR;
+  graph.classification.route = 'act';
+  graph.classification.messageIntent = 'action';
+  graph.fastPath = 'single_action';
+  graph.effectCeiling = 'unknown';
+  rehashGraph(graph);
+  data.graph = graph;
+  data.graphHash = graph.compiler.graphHash;
+  data.route = graph.classification.route;
+  data.fastPath = graph.fastPath;
+  data.effectCeiling = graph.effectCeiling;
+  eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+    .run(JSON.stringify(data), graphEvent.id);
+
+  assert.deepEqual(
+    ledger.expectedTaskFor(task.sessionId, task.sourceUserSeq),
+    { status: 'ambiguous', reason: 'non-conversational graph has no unique work node' },
+  );
+});
+
+test('several primary work nodes use only their exact all-success verification rendezvous', () => {
+  const task = accept('Send the finished report to Alice and archive one local copy.');
+  assert.ok(task.work);
+  const graph = structuredClone(task.graph);
+  const { verifyId } = addSecondWorkNode({ graph, join: 'exact' });
+  persistRehashedGraph({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    graph,
+  });
+
+  const expected = ledger.expectedTaskFor(task.sessionId, task.sourceUserSeq);
+  assert.equal(expected.status, 'ok');
+  if (expected.status !== 'ok') return;
+  assert.equal(expected.expectation.workNodeId, verifyId);
+  assert.equal(expected.expectation.workKind, 'execute');
+});
+
+for (const candidate of [
+  { label: 'partial', join: 'missing' as const },
+  { label: 'non-success', join: 'non_success' as const },
+  { label: 'multiple', join: 'exact' as const, competing: true },
+]) {
+  test(`${candidate.label} compound verification ownership remains ambiguous`, () => {
+    const task = accept(`Perform two bounded actions for ${candidate.label} verification.`);
+    assert.ok(task.work);
+    const graph = structuredClone(task.graph);
+    const { siblingId, verifyId } = addSecondWorkNode({ graph, join: candidate.join });
+    if (candidate.competing) {
+      const verify = graph.nodes.find((node) => node.id === verifyId)!;
+      const competing = structuredClone(verify);
+      competing.id = `${verify.id}:competing`;
+      graph.nodes.push(competing);
+      const primaryIds = [task.work!.id, siblingId];
+      for (const source of primaryIds) {
+        graph.edges.push({
+          id: `edge:${source}->${competing.id}`,
+          source,
+          target: competing.id,
+          when: 'success',
+        });
+      }
+    }
+    persistRehashedGraph({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      graph,
+    });
+
+    assert.deepEqual(
+      ledger.expectedTaskFor(task.sessionId, task.sourceUserSeq),
+      {
+        status: 'ambiguous',
+        reason: 'turn graph contains 2 primary work nodes without one exact verification rendezvous',
+      },
+    );
+  });
+}
 
 test('finalization is a one-way CAS and no later operation can enter the frozen set', () => {
   const task = accept('Send the finished report to Alice.');

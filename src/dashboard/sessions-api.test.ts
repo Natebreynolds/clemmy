@@ -29,7 +29,19 @@ const {
   deleteUnifiedSession,
 } = await import('./sessions-api.js');
 const { SessionStore } = await import('../memory/session-store.js');
-const { createSession, appendEvent, getSession } = await import('../runtime/harness/eventlog.js');
+const {
+  createSession,
+  appendEvent,
+  beginRunAttempt,
+  getSession,
+  openEventLog,
+  reapStaleSessions,
+  recordRunAttemptUserInput,
+  updateSession,
+} = await import('../runtime/harness/eventlog.js');
+const { claimSessionForAcceptedSource } = await import('../runtime/harness/accepted-source-session-branch.js');
+const { ClementineGateway } = await import('../gateway/router.js');
+const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-presentation.js');
 
 const turn = (role: 'user' | 'assistant', text: string) => ({ role, text, createdAt: new Date().toISOString() });
 
@@ -423,6 +435,174 @@ test('delete on a collapsed workflow run archives every step session', () => {
   assert.equal(getSession(stepB.id)?.metadata.archived, true);
   assert.equal(buildUnifiedSessionList({ source: 'workflow' }).some((s) => s.title === 'Delete Flow'), false);
   assert.equal(buildUnifiedSessionList({ source: 'workflow', includeArchived: true }).filter((s) => s.title === 'Delete Flow').length, 1);
+});
+
+test('hard delete of a source-bound session becomes a bounded replay tombstone with typed no-redispatch truth', async () => {
+  const bound = createSession({
+    id: 'sess-delete-replay-tombstone',
+    kind: 'chat',
+    channel: 'desktop',
+    userId: 'desktop',
+    metadata: {
+      source: 'desktop',
+      channelId: 'delete-replay-root',
+      userId: 'desktop',
+    },
+  });
+  const first = claimSessionForAcceptedSource({
+    kind: 'ordinary',
+    entrySessionId: bound.id,
+    durableSourceId: 'delete-replay-run',
+    continuity: {
+      provider: 'desktop',
+      scopeId: null,
+      conversationId: 'delete-replay-root',
+      audienceId: 'desktop',
+    },
+    receipt: {
+      requestId: 'delete-replay-request',
+      runId: 'delete-replay-run',
+      inputHash: 'delete-replay-input',
+    },
+  });
+  const acceptedAttempt = beginRunAttempt(first.selection.sessionId, { runId: 'delete-replay-run' });
+  const acceptedSource = recordRunAttemptUserInput(acceptedAttempt, {
+    turn: 1,
+    role: 'user',
+    data: {
+      text: 'perform the exact external effect once',
+      displayText: 'perform the exact external effect once',
+      runId: 'delete-replay-run',
+    },
+  }, { armRunInFlight: true });
+  updateSession(first.selection.sessionId, { status: 'completed' });
+
+  const deleted = deleteUnifiedSession(`harness:${first.selection.sessionId}`, true);
+  assert.deepEqual(deleted, {
+    ok: true,
+    mode: 'archived',
+    retainedForReplay: true,
+    retentionDays: 14,
+    authorityPayloadsDeleted: true,
+    replayMode: 'terminal_or_typed_no_redispatch',
+  });
+  assert.equal(getSession(first.selection.sessionId)?.metadata.acceptedSourceReplayTombstone, true);
+  const replay = claimSessionForAcceptedSource({
+    kind: 'ordinary',
+    entrySessionId: bound.id,
+    durableSourceId: 'delete-replay-run',
+    continuity: {
+      provider: 'desktop',
+      scopeId: null,
+      conversationId: 'delete-replay-root',
+      audienceId: 'desktop',
+    },
+    receipt: {
+      requestId: 'delete-replay-request',
+      runId: 'delete-replay-run',
+      inputHash: 'delete-replay-input',
+    },
+  });
+  assert.equal(replay.selection.sessionId, first.selection.sessionId);
+  const authorityBodyCount = (openEventLog().prepare(`
+    SELECT (
+      (SELECT COUNT(*) FROM physical_dispatch_authority WHERE session_id = ?)
+      + (SELECT COUNT(*) FROM physical_dispatch_authority_payload WHERE session_id = ?)
+      + (SELECT COUNT(*) FROM physical_dispatch_authority_sealed WHERE session_id = ?)
+    ) AS count
+  `).get(first.selection.sessionId, first.selection.sessionId, first.selection.sessionId) as { count: number }).count;
+  assert.equal(authorityBodyCount, 0, 'hard delete leaves no physical authority body or sealed dispatch bytes');
+  let redispatches = 0;
+  const recovery = await new ClementineGateway({
+    async respond() {
+      redispatches += 1;
+      return { sessionId: first.selection.sessionId, text: 'must not redispatch' };
+    },
+  } as never).handleMessage({
+    message: 'perform the exact external effect once',
+    sessionId: first.selection.sessionId,
+    channel: 'desktop',
+    source: 'desktop',
+    runId: 'delete-replay-run',
+    failClosedOnUnsettledReplay: true,
+  });
+  assert.equal(redispatches, 0);
+  assert.equal(recovery.text, PUBLIC_RUN_FAILURE_TEXT);
+  const replayEvents = openEventLog().prepare(`
+    SELECT type, COUNT(*) AS count FROM events
+     WHERE session_id = ?
+       AND (type = 'user_input_received'
+         OR (type = 'conversation_completed' AND json_extract(data_json, '$.sourceUserSeq') = ?))
+     GROUP BY type
+  `).all(first.selection.sessionId, acceptedSource.seq) as Array<{ type: string; count: number }>;
+  assert.equal(replayEvents.find((row) => row.type === 'user_input_received')?.count, 1);
+  assert.equal(replayEvents.find((row) => row.type === 'conversation_completed')?.count, 1);
+
+  const db = openEventLog();
+  db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?')
+    .run('2000-01-01T00:00:00.000Z', first.selection.sessionId);
+  assert.equal(reapStaleSessions(1), 0, 'fresh replay authority protects the tombstone during its horizon');
+  db.prepare('UPDATE harness_chat_requests SET created_at = ? WHERE session_id = ?')
+    .run('2000-01-01T00:00:00.000Z', first.selection.sessionId);
+  const binding = db.prepare(`
+    SELECT durable_source_digest, root_session_id, continuity_digest,
+           session_id, disposition, selected_after_seq
+      FROM accepted_source_session_bindings WHERE session_id = ?
+  `).get(first.selection.sessionId) as {
+    durable_source_digest: string;
+    root_session_id: string;
+    continuity_digest: string;
+    session_id: string;
+    disposition: string;
+    selected_after_seq: number;
+  };
+  db.prepare('DELETE FROM accepted_source_session_bindings WHERE durable_source_digest = ?')
+    .run(binding.durable_source_digest);
+  db.prepare('UPDATE accepted_source_session_pointers SET updated_at = ? WHERE head_session_id = ?')
+    .run('2000-01-01T00:00:00.000Z', first.selection.sessionId);
+  db.prepare(`
+    INSERT INTO accepted_source_session_bindings
+      (durable_source_digest, root_session_id, continuity_digest, session_id,
+       disposition, selected_after_seq, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    binding.durable_source_digest,
+    binding.root_session_id,
+    binding.continuity_digest,
+    binding.session_id,
+    binding.disposition,
+    binding.selected_after_seq,
+    '2000-01-01T00:00:00.000Z',
+  );
+  assert.equal(reapStaleSessions(1), 1, 'expired replay authority is reaped with its minimal tombstone');
+  assert.equal(getSession(first.selection.sessionId), null);
+});
+
+test('hard delete truly removes an unbound harness session instead of returning a false deleted mode', () => {
+  const unbound = createSession({
+    id: 'sess-hard-delete-unbound',
+    kind: 'chat',
+    channel: 'desktop',
+    userId: 'desktop',
+    metadata: { source: 'desktop' },
+  });
+  appendEvent({
+    sessionId: unbound.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'delete this unrelated unbound session' },
+  });
+
+  assert.deepEqual(deleteUnifiedSession(`harness:${unbound.id}`, true), {
+    ok: true,
+    mode: 'deleted',
+    authorityPayloadsDeleted: true,
+  });
+  assert.equal(getSession(unbound.id), null);
+  const remaining = openEventLog().prepare('SELECT COUNT(*) AS count FROM events WHERE session_id = ?')
+    .get(unbound.id) as { count: number };
+  assert.equal(remaining.count, 0);
 });
 
 // A2 (v2.3.0): a reopened chat must render a STILL-PENDING approval as the

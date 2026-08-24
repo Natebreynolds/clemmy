@@ -18,8 +18,13 @@ export type AcceptedGoalConstruct =
 export type AcceptedGoalDestinationPosture = 'create_new' | 'named_existing';
 
 export interface AcceptedGoalCollection {
+  /** 0 means count is not the completeness predicate. */
   count: number;
   projection: string[];
+  /** Counted N vs exhaust a typed dimension (region, category, page). */
+  completeness?: 'count' | 'exhaust';
+  /** Fields that define one unique record. Distinct from the full projection. */
+  identityFields?: string[];
 }
 
 export interface AcceptedGoalDestination {
@@ -89,6 +94,7 @@ export function withCanonicalDestinations(
 
 /** Container families. Keys are kinds, not vendors. */
 const DESTINATION_FAMILY_RULES: ReadonlyArray<readonly [string, RegExp]> = [
+  ['records', /\b(?:databases?|tables?|rosters?)\b/i],
   ['workbook', /\b(?:spreadsheets?|workbooks?|sheets?)\b/i],
   ['document', /\b(?:documents?|\bdocs?\b)\b/i],
   ['email', /\b(?:e-?mails?|mailbox)\b/i],
@@ -120,7 +126,9 @@ const PER_ITEM_FIELD_PROJECTION_RE =
 const LEADING_PER_ITEM_FIELD_PROJECTION_RE =
   /\b(?:give|provide|return|show|include|capture|record)\s+(?:(?:me|us)\s+)?(?:the\s+)?(?:for\s+)?(?:each|every)\s+[a-z][a-z'-]*\s+([^.!?\n]{1,160}?)(?=\s*,?\s*(?:then|before|after)\b|[.;!?]|$)/i;
 const CONSTRUCT_VERB_RE =
-  /\b(?:put|add|place|save|drop|create|build|write|make|compile|assemble|export)\b/i;
+  /\b(?:put|add|place|save|drop|create|build|write|make|compile|assemble|export|populate|persist|store|upsert)\b/i;
+const FIELD_BLOCK_RE =
+  /(?:information|fields?|columns?|attributes?)[^\n]{0,120}(?:following|fields)\s*:\s*\n((?:[ \t]*[A-Za-z][^\n]{0,48}\n?)+)/i;
 
 function destinationFamilyFromText(text: string): string | undefined {
   for (const [family, pattern] of DESTINATION_FAMILY_RULES) {
@@ -133,13 +141,27 @@ function namesExistingDestination(text: string, family: string): boolean {
   return NAMED_EXISTING_DESTINATION_RULES[family]?.test(text) === true;
 }
 
+function projectionFromBlockList(text: string): string[] {
+  const block = FIELD_BLOCK_RE.exec(text ?? '')?.[1] ?? '';
+  if (!block.trim()) return [];
+  return block.split(/\n/)
+    .map((line) => line.trim().replace(/^[•\-*\d.)]+\s+/, ''))
+    .filter((line) => (
+      /^[A-Za-z]/.test(line)
+      && line.split(/\s+/).length <= 4
+      && !/\b(?:if we|would be|please|thanks)\b/i.test(line)
+    ));
+}
+
 export function projectionRolesFromText(text: string): string[] {
   const match = FIELD_LIST_RE.exec(text ?? '');
   const leadingPerItem = LEADING_PER_ITEM_FIELD_PROJECTION_RE.exec(text ?? '')?.[1] ?? '';
   const listed = match
     ? [match[1], match[2], match[3]]
-    : (leadingPerItem || PER_ITEM_FIELD_PROJECTION_RE.exec(text ?? '')?.[1] || '')
-      .split(/\s*,\s*(?:and\s+)?|\s+and\s+/i);
+    : projectionFromBlockList(text).length > 0
+      ? projectionFromBlockList(text)
+      : (leadingPerItem || PER_ITEM_FIELD_PROJECTION_RE.exec(text ?? '')?.[1] || '')
+        .split(/\s*,\s*(?:and\s+)?|\s+and\s+/i);
   const roles = listed
     .filter((role): role is string => typeof role === 'string' && role.trim().length > 0)
     .map((role) => role
@@ -185,10 +207,18 @@ export function compileAcceptedGoal(input: {
       : undefined);
   const destinations = admittedDestinations
     ?? (destination ? [destination] : undefined);
-  const collection: AcceptedGoalCollection | undefined = multi.itemCount >= 3
-    ? { count: multi.itemCount, projection }
+  const persist = Boolean(destination) && CONSTRUCT_VERB_RE.test(text);
+  const collection: AcceptedGoalCollection | undefined = (
+    multi.itemCount >= 3 || (projection.length >= 2 && persist)
+  )
+    ? {
+        count: multi.itemCount >= 3 ? multi.itemCount : 0,
+        projection,
+        completeness: multi.itemCount >= 3 ? 'count' : undefined,
+      }
     : undefined;
   const construct: AcceptedGoalConstruct = multi.collectThenConstruct === true
+    || Boolean(collection && persist)
     ? 'collect_then_construct'
     : multi.isMultiItem
       ? 'fanout'
@@ -204,7 +234,10 @@ export function compileAcceptedGoal(input: {
       sink.binding?.effect === 'external_write' || sink.binding?.effect === 'admin'
     ))
     || (!admittedDestinations && (destinations ?? []).some((sink) => (
-      sink.family === 'workbook' || sink.family === 'email' || sink.family === 'document'
+      sink.family === 'workbook'
+      || sink.family === 'email'
+      || sink.family === 'document'
+      || sink.family === 'records'
     )))
     || classifyExternalEffectRequest(text).requested
   );

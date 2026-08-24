@@ -146,6 +146,7 @@ function eventCategory(type: EventType): TraceNodeCategory {
   if (type === 'user_input_received' || type === 'awaiting_user_input') return 'user';
   if (
     type === 'reasoning_effort'
+    || type === 'turn_engine_selected'
     || type === 'worker_model_routed'
     || type === 'brain_fallover'
     || type === 'sdk_auto_continue'
@@ -236,6 +237,7 @@ function eventLabel(type: EventType, data: Record<string, unknown>): string {
     case 'run_completed': return 'Run completed';
     case 'run_failed': return 'Run failed';
     case 'worker_model_routed': return 'Worker model routed';
+    case 'turn_engine_selected': return `Turn engine: ${str(data, 'engine') ?? 'unknown'}`;
     case 'reasoning_effort': return 'Reasoning effort selected';
     case 'goal_alignment_judged': return 'Goal alignment judged';
     case 'output_grounding_judged': return 'Output grounding judged';

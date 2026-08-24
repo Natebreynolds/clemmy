@@ -39,6 +39,10 @@ import {
   localEmbeddingSpaceKey,
   vectorToBuffer,
 } from './embeddings.js';
+import {
+  parseVerifiedReadCapabilityOrigin,
+  type VerifiedReadCapabilityOrigin,
+} from './verified-read-origin.js';
 
 /** How much of an accepted phrase may become retrievable lexical features. */
 const MAX_ALIAS_TERMS = 12;
@@ -338,6 +342,14 @@ function db(): Database.Database {
         PRIMARY KEY (alias_digest, scope_digest, identifier, account_identity)
       );
       CREATE INDEX IF NOT EXISTS aliases_by_scope ON aliases (scope_digest);
+      CREATE TABLE IF NOT EXISTS alias_verified_read_origins (
+        alias_digest       TEXT NOT NULL,
+        scope_digest       TEXT NOT NULL,
+        identifier         TEXT NOT NULL,
+        account_identity   TEXT NOT NULL DEFAULT '',
+        origin_json        TEXT NOT NULL,
+        PRIMARY KEY (alias_digest, scope_digest, identifier, account_identity)
+      );
       CREATE TABLE IF NOT EXISTS alias_claims (
         session_id       TEXT NOT NULL,
         source_user_seq  INTEGER NOT NULL,
@@ -442,9 +454,15 @@ function hydrate(raw: RawRow): CapabilityAliasRow | null {
  *  rather than a permanent poisoned hit. */
 function dropRow(raw: Pick<RawRow, 'alias_digest' | 'scope_digest' | 'identifier' | 'account_identity'>): void {
   try {
-    db().prepare(
-      'DELETE FROM aliases WHERE alias_digest = ? AND scope_digest = ? AND identifier = ? AND account_identity = ?',
-    ).run(raw.alias_digest, raw.scope_digest, raw.identifier, raw.account_identity);
+    const database = db();
+    database.transaction(() => {
+      database.prepare(
+        'DELETE FROM aliases WHERE alias_digest = ? AND scope_digest = ? AND identifier = ? AND account_identity = ?',
+      ).run(raw.alias_digest, raw.scope_digest, raw.identifier, raw.account_identity);
+      database.prepare(
+        'DELETE FROM alias_verified_read_origins WHERE alias_digest = ? AND scope_digest = ? AND identifier = ? AND account_identity = ?',
+      ).run(raw.alias_digest, raw.scope_digest, raw.identifier, raw.account_identity);
+    })();
   } catch { /* a failed cleanup must never fail a turn */ }
 }
 
@@ -465,6 +483,9 @@ export function recordCapabilityAlias(input: {
   klass: CapabilityAliasClass;
   terms: string[];
   schemaFingerprint?: string | null;
+  /** Private, receipt-backed origin. Stored separately from the tamper-evident
+   * alias row so legacy row digests remain byte-compatible. */
+  verifiedReadOrigin?: VerifiedReadCapabilityOrigin;
   now?: string;
 }): CapabilityAliasWrite {
   const aliasDigest = input.aliasDigest.trim();
@@ -478,6 +499,7 @@ export function recordCapabilityAlias(input: {
   const terms = input.terms.filter((t) => typeof t === 'string' && t.length > 0);
   const now = input.now ?? new Date().toISOString();
   const schemaFingerprint = input.schemaFingerprint?.trim() || null;
+  const verifiedReadOrigin = parseVerifiedReadCapabilityOrigin(input.verifiedReadOrigin);
 
   const candidate: CapabilityAliasRow = {
     aliasDigest, scopeDigest, intent, kind: input.kind, identifier, accountIdentity,
@@ -517,11 +539,96 @@ export function recordCapabilityAlias(input: {
         keepEmbedding ? existing.embedding_space : null,
         createdAt, now, rowDigest(row),
       );
+      if (verifiedReadOrigin) {
+        database.prepare(`
+          INSERT INTO alias_verified_read_origins (
+            alias_digest, scope_digest, identifier, account_identity, origin_json
+          ) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT (alias_digest, scope_digest, identifier, account_identity)
+          DO UPDATE SET origin_json = excluded.origin_json
+        `).run(
+          aliasDigest,
+          scopeDigest,
+          identifier,
+          accountIdentity,
+          JSON.stringify(verifiedReadOrigin),
+        );
+      } else {
+        // A manual re-recording cannot inherit historical receipt authority for
+        // new terms merely because it reused the same alias identity.
+        database.prepare(`
+          DELETE FROM alias_verified_read_origins
+           WHERE alias_digest = ? AND scope_digest = ? AND identifier = ? AND account_identity = ?
+        `).run(aliasDigest, scopeDigest, identifier, accountIdentity);
+      }
       return { stored: true, row };
     });
     return write();
   } catch (err) {
     return { stored: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Resolve the exact private learning origin for one alias row. Missing legacy
+ * provenance grants no source-selection authority. */
+export function capabilityAliasVerifiedReadOrigin(
+  row: CapabilityAliasRow,
+): VerifiedReadCapabilityOrigin | null {
+  try {
+    const raw = db().prepare(`
+      SELECT origin_json FROM alias_verified_read_origins
+       WHERE alias_digest = ? AND scope_digest = ? AND identifier = ? AND account_identity = ?
+    `).get(
+      row.aliasDigest,
+      row.scopeDigest,
+      row.identifier,
+      row.accountIdentity,
+    ) as { origin_json?: string } | undefined;
+    if (!raw?.origin_json) return null;
+    return parseVerifiedReadCapabilityOrigin(JSON.parse(raw.origin_json));
+  } catch {
+    return null;
+  }
+}
+
+export interface CapabilityAliasLearningClaim {
+  sessionId: string;
+  sourceUserSeq: number;
+}
+
+/**
+ * Bounded legacy provenance hints for one exact alias capability. Claims do not
+ * prove an origin by themselves; the read-path authority verifier must still
+ * join the accepted user digest, canonical read receipt, settlement, account,
+ * and schema. This exists only for rows learned before the alias-specific
+ * origin side table shipped.
+ */
+export function capabilityAliasLearningClaims(
+  row: Pick<CapabilityAliasRow, 'identifier' | 'accountIdentity'>,
+  limit = 12,
+): CapabilityAliasLearningClaim[] {
+  const boundedLimit = Math.max(1, Math.min(limit, 32));
+  try {
+    const rows = db().prepare(`
+      SELECT session_id, source_user_seq
+        FROM alias_claims
+       WHERE lower(identifier) = lower(?) AND account_identity = ?
+       ORDER BY claimed_at DESC
+       LIMIT ?
+    `).all(row.identifier, row.accountIdentity, boundedLimit) as Array<{
+      session_id?: unknown;
+      source_user_seq?: unknown;
+    }>;
+    return rows.flatMap((claim) => (
+      typeof claim.session_id === 'string'
+      && claim.session_id.length > 0
+      && Number.isSafeInteger(claim.source_user_seq)
+      && Number(claim.source_user_seq) > 0
+        ? [{ sessionId: claim.session_id, sourceUserSeq: Number(claim.source_user_seq) }]
+        : []
+    ));
+  } catch {
+    return [];
   }
 }
 
@@ -579,6 +686,35 @@ export function lookupExactCapabilityAliases(
   return rows;
 }
 
+/**
+ * Exact rows that may justify reacquiring provider metadata, but are not yet
+ * retrieval candidates. This deliberately skips only the live-schema lease
+ * check; row integrity and privacy scope are still enforced. Callers must
+ * re-resolve receipt provenance and require stored === live schema identity
+ * before exposing any row as a capability.
+ */
+export function lookupExactCapabilityAliasAuthorityHints(
+  aliasDigest: string,
+  options: { scope?: CapabilityAliasScope } = {},
+): CapabilityAliasRow[] {
+  if (!aliasDigest) return [];
+  const scopeDigest = aliasScopeDigest(options.scope);
+  let raws: RawRow[];
+  try {
+    raws = db().prepare('SELECT * FROM aliases WHERE alias_digest = ? AND scope_digest = ?')
+      .all(aliasDigest, scopeDigest) as RawRow[];
+  } catch {
+    return [];
+  }
+  const rows: CapabilityAliasRow[] = [];
+  for (const raw of raws) {
+    const row = hydrate(raw);
+    if (!row) { dropRow(raw); continue; }
+    rows.push(row);
+  }
+  return rows;
+}
+
 export type SemanticAliasHit = { row: CapabilityAliasRow; score: number };
 
 /**
@@ -613,6 +749,51 @@ export function semanticCapabilityAliases(
     const row = hydrate(raw);
     if (!row) { dropRow(raw); continue; }
     if (!schemaIsCurrent(row, options.liveSchemaFingerprintFor?.(row.identifier))) continue;
+    if (!raw.embedding) continue;
+    let score: number;
+    try {
+      score = cosine(queryVector, bufferToVector(raw.embedding));
+    } catch {
+      continue;
+    }
+    if (!Number.isFinite(score) || score < floor) continue;
+    hits.push({ row, score });
+  }
+  hits.sort((a, b) => b.score - a.score);
+  return hits.slice(0, limit);
+}
+
+/**
+ * Semantic rows that may justify one exact provider-metadata reacquisition.
+ * Unlike `semanticCapabilityAliases`, these are NOT candidates: the live
+ * schema check is intentionally deferred so a cold daemon can restore an
+ * existing authority lease. The source selector must validate canonical
+ * receipt provenance and exact stored-vs-live fingerprint before use.
+ */
+export function semanticCapabilityAliasAuthorityHints(
+  queryVector: Float32Array,
+  options: {
+    scope?: CapabilityAliasScope;
+    embeddingSpace: string;
+    limit?: number;
+    floor?: number;
+  },
+): SemanticAliasHit[] {
+  const scopeDigest = aliasScopeDigest(options.scope);
+  const limit = Math.max(1, Math.min(options.limit ?? 5, 25));
+  const floor = options.floor ?? DEFAULT_SEMANTIC_FLOOR;
+  let raws: RawRow[];
+  try {
+    raws = db().prepare(
+      'SELECT * FROM aliases WHERE scope_digest = ? AND embedding IS NOT NULL AND embedding_space = ?',
+    ).all(scopeDigest, options.embeddingSpace) as RawRow[];
+  } catch {
+    return [];
+  }
+  const hits: SemanticAliasHit[] = [];
+  for (const raw of raws) {
+    const row = hydrate(raw);
+    if (!row) { dropRow(raw); continue; }
     if (!raw.embedding) continue;
     let score: number;
     try {

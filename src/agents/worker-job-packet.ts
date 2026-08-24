@@ -91,6 +91,12 @@ export const WorkerToolInputSchema = z.object({
     .min(1)
     .nullable()
     .describe('Model-routing intent/category for this item, using the user\'s own word such as "design", "writing", or "research". Pass null for ordinary workers.'),
+  model: z
+    .string()
+    .min(1)
+    .nullable()
+    .optional()
+    .describe('Exact model id this worker should run on (for example a codex or grok id) — spread a fleet across models per item. Null/omitted uses intent/role routing. An unroutable id falls back to routing; it never refuses the dispatch.'),
   workManifest: WorkerManifestDescriptorSchema
     .nullable()
     .optional()

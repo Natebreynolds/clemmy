@@ -168,6 +168,21 @@ interface RegistryRow {
 
 // Order matters: first match wins. More specific families first.
 const REGISTRY: RegistryRow[] = [
+  // ---- xAI Grok (openai_chat via BYO/native OAuth) --------------------------
+  // ONE LOOP, MANY BRAINS (2026-08-20): grok ids previously fell to
+  // DEFAULT_CAPABILITY (128K/8K, generic retry) — mis-budgeted for fleet
+  // work. grok-4 family: 256K window per xAI docs; no server-side prompt
+  // cache contract we can rely on; no effort knob on the chat shape.
+  {
+    idMatch: /grok-4|grok-3|grok-beta|grok-/i,
+    cap: {
+      family: 'grok', apiShape: 'openai_completions',
+      contextWindow: 256_000, maxOutput: 32_000, supportsEffort: false,
+      effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+      thinkingMode: 'none',
+      supportsPromptCache: false, cacheMinTokens: 0, retryClass: 'openai_compat',
+    },
+  },
   // ---- Claude (anthropic_messages) ------------------------------------------
   // Opus 4.7/4.8 + Fable 5: budget_tokens thinking is REMOVED (HTTP 400) — must
   // use output_config.effort. cacheMin 4096 (Opus/Haiku) or 2048 (Fable/Sonnet4.6).

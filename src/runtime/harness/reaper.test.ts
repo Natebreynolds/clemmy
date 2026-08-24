@@ -145,8 +145,17 @@ test('dead-session reap preserves exact Workspace runner decisions but still can
   reaper.reapOnce();
 
   assert.equal(reg.get(trust.approvalId)?.status, 'pending');
-  assert.equal(reg.get(ordinary.approvalId)?.status, 'resolved');
-  assert.equal(reg.get(ordinary.approvalId)?.resolution, 'cancelled_by_user');
+  assert.equal(reg.get(ordinary.approvalId)?.status, 'cancelled');
+  assert.equal(reg.get(ordinary.approvalId)?.resolution, 'cancelled_by_system');
+  assert.equal(reg.get(ordinary.approvalId)?.resolver, 'reaper-dead-session');
+  const cleanupNote = listNotifications(50).find((item) => (
+    item.metadata?.approvalId === ordinary.approvalId
+    && item.metadata?.approvalResolution === 'cancelled_by_system'
+  ));
+  assert.ok(cleanupNote, 'desktop/mobile generic notification projection records the system outcome');
+  assert.equal(cleanupNote.title, 'Approval closed with its ended session');
+  assert.match(cleanupNote.body, /system cleanup, not a user decision/i);
+  assert.doesNotMatch(cleanupNote.body, /expired without a reply/i);
 });
 
 test('startApprovalReaper is idempotent — second start is a no-op', () => {

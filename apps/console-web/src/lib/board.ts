@@ -341,6 +341,33 @@ export const COLUMNS: { id: BoardColumnId; label: string }[] = [
 
 export const listBoard = () => apiGet<{ cards: BoardCard[]; generatedAt: string }>('/api/console/board');
 
+export interface ForegroundTaskControlCard {
+  id: string;
+  sourceKind: 'background' | 'run' | 'workflow';
+  title: string;
+  column: BoardColumnId;
+  status: string;
+  progressHint: string;
+  sessionId: string | null;
+  ageMs: number;
+  updatedAt: string;
+  actions: string[];
+  attemptId?: string;
+  runScopeId?: string;
+  cancelEndpoint?: string;
+  raw: {
+    runId?: string;
+    workflowName?: string;
+    workflowSlug?: string;
+  };
+}
+
+/** Exact action carriers for the compact foreground chat affordance. The
+ * server response is a bounded whitelist, not the full Tasks review model. */
+export const listForegroundTaskControls = () => apiGet<{ cards: ForegroundTaskControlCard[]; generatedAt: string }>(
+  '/api/console/board?surface=foreground-chat',
+);
+
 export interface BoardRunSelection {
   select: string;
   attemptId?: string | null;

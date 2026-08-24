@@ -373,13 +373,13 @@ test('renderClaudeAgentWorkflowStepSystemAppend full lane permits gated executio
   assert.match(prompt, /run_shell_command/);
   assert.match(prompt, /harness gate chain/);
   assert.match(prompt, /call `skill_read`/);
-  // Move 3 / adoption: the full (data-tool) lane carries the code-mode batch-shape
-  // steer so a multi-fetch step aggregates through run_tool_program.
+  // The full (data-tool) lane carries the shared batch-shape
+  // steer so a multi-fetch step issues its fetches as parallel calls.
   assert.match(prompt, /BATCH-SHAPE RULE/);
-  assert.match(prompt, /run_tool_program/);
+  assert.match(prompt, /BATCH-SHAPE RULE/);
 });
 
-test('renderClaudeAgentWorkflowStepSystemAppend read-only lane omits the code-mode batch-shape rule (no send/write tools to steer)', () => {
+test('renderClaudeAgentWorkflowStepSystemAppend read-only lane omits the full-lane batch-shape rule (no send/write tools to steer)', () => {
   const prompt = renderClaudeAgentWorkflowStepSystemAppend({ workflowName: 'Report Workflow', step, fullLane: false });
   assert.doesNotMatch(prompt, /BATCH-SHAPE RULE/);
 });

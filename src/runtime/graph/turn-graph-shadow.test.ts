@@ -22,6 +22,7 @@ const {
 const { projectHarnessEventForPublic } = await import('../harness/public-presentation.js');
 const { actionBus } = await import('../action-bus.js');
 const { recordTurnGraphShadow } = await import('./turn-graph-shadow.js');
+const { compileTurnGraph } = await import('./turn-graph-compiler.js');
 const continuityRuntime = await import('../harness/task-continuity-runtime.js');
 const { commitTurnOutcome } = await import('../harness/delivery-committer.js');
 const { turnOutcomeId } = await import('../harness/turn-outcome.js');
@@ -62,7 +63,7 @@ function acceptedTurn(opts: { sessionId: string; kind?: 'chat' | 'execution'; te
 }
 
 test('shadow recorder persists one source-owned private graph and dedupes retries', () => {
-  const source = acceptedTurn({ sessionId: 'shadow-once', text: 'What is the Acme account status?' });
+  const source = acceptedTurn({ sessionId: 'shadow-once', text: 'What is the current status of the Acme account?' });
   const identity = { sessionId: 'shadow-once', turn: source.turn, sourceUserSeq: source.seq };
   const first = recordTurnGraphShadow({
     identity,
@@ -96,6 +97,39 @@ test('shadow recorder persists one source-owned private graph and dedupes retrie
     'internals never leak into the projection',
   );
   assert.equal((events[0].data.graph as { source?: { surface?: unknown } }).source?.surface, 'home');
+});
+
+test('a precompiled graph cannot silently replay a different legacy graph for the same source', () => {
+  const source = acceptedTurn({ sessionId: 'shadow-precompiled-conflict', text: 'hello' });
+  const identity = {
+    sessionId: source.sessionId,
+    turn: source.turn,
+    sourceUserSeq: source.seq,
+  };
+  const legacy = recordTurnGraphShadow({ identity, surface: 'home' });
+  assert.ok(legacy);
+  const legacyGraph = legacy.data.graph as import('./turn-graph-ir.js').TurnGraphIR;
+  const incoming = compileTurnGraph({
+    identity,
+    input: 'hello',
+    sessionKind: 'chat',
+    surface: 'discord',
+    policy: legacyGraph.policy,
+  });
+  assert.equal(incoming.validation.ok, true);
+  assert.notEqual(incoming.graph.compiler.graphHash, legacyGraph.compiler.graphHash);
+
+  const refused = recordTurnGraphShadow({
+    identity,
+    surface: 'discord',
+    graph: incoming.graph,
+  });
+  assert.equal(refused, null, 'the older graph is not returned as if it matched the admitted graph');
+  assert.equal(
+    listEvents(source.sessionId, { types: ['turn_graph_compiled'] }).length,
+    1,
+    'the durable legacy graph is left intact for explicit migration/reconciliation',
+  );
 });
 
 test('accepted event text is authoritative and neither it nor tool input is persisted raw', () => {
@@ -181,9 +215,10 @@ test('shadow graph emits ONE public plan row, shape-only — internals stay off 
   } finally {
     detach();
   }
-  // CONTRACT CHANGE (2026-08-07, "see the graph"): the chat strip renders
-  // "Planned: … · N steps" from exactly this row. Shape only — never the
-  // graph body, hashes, or surface internals.
+  // The public bus still carries a SHAPE-ONLY summary (route / fastPath /
+  // nodeCount) for diagnostics and the header beat. The chat strip no longer
+  // pins "Planned: … · N steps" — that row was generic topology, not work.
+  // Graph body, hashes, and surface internals stay private.
   assert.equal(publicRows.length, 1);
   assert.equal(publicRows[0].type, 'turn_graph_compiled');
   assert.doesNotMatch(

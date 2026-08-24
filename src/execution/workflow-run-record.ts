@@ -1,8 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
   existsSync,
   fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -411,4 +412,261 @@ export function tryReadWorkflowRunRecord<T extends object>(filePath: string): Wo
   } catch {
     return { acquired: false, record: null };
   }
+}
+
+export type WorkflowRunRecordCorruptionReason =
+  | 'invalid_json'
+  | 'not_json_object'
+  | 'invalid_canonical_identity';
+
+/**
+ * Content-addressed evidence for one unreadable canonical run generation.
+ * It intentionally contains neither the corrupt bytes nor any fields inferred
+ * from them. `corruptionId` binds the resolved pathname and exact raw bytes so
+ * a separately-written valid replacement is a different generation.
+ */
+export interface WorkflowRunRecordCorruptionEvidence {
+  version: 1;
+  corruptionId: string;
+  pathDigest: string;
+  contentDigest: string;
+  byteLength: number;
+  fileName: string;
+  reason: WorkflowRunRecordCorruptionReason;
+}
+
+export type WorkflowRunRecordScanResult<T extends object> =
+  | { status: 'ok'; record: T }
+  | { status: 'missing' }
+  | { status: 'busy' }
+  | { status: 'corrupt'; evidence: WorkflowRunRecordCorruptionEvidence };
+
+export interface WorkflowRunRecordQuarantineMarkerV1
+  extends WorkflowRunRecordCorruptionEvidence {
+  kind: 'workflow_run_record_quarantine';
+  state: 'blocked';
+  detectedAt: string;
+}
+
+const WORKFLOW_RUN_RECORD_QUARANTINE_DIR = '.run-record-quarantine';
+
+function sha256(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function corruptionEvidence(
+  filePath: string,
+  raw: Buffer,
+  reason: WorkflowRunRecordCorruptionReason,
+): WorkflowRunRecordCorruptionEvidence {
+  const resolvedPath = path.resolve(filePath);
+  const pathDigest = sha256(resolvedPath);
+  const contentDigest = sha256(raw);
+  const corruptionId = createHash('sha256')
+    .update(resolvedPath)
+    .update('\0')
+    .update(raw)
+    .digest('hex');
+  return {
+    version: 1,
+    corruptionId,
+    pathDigest,
+    contentDigest,
+    byteLength: raw.byteLength,
+    fileName: path.basename(filePath),
+    reason,
+  };
+}
+
+function canonicalWorkflowRunIdentityIsValid(
+  filePath: string,
+  value: Record<string, unknown>,
+): boolean {
+  const fileName = path.basename(filePath);
+  if (!fileName.endsWith('.json')) return false;
+  const runId = fileName.slice(0, -'.json'.length);
+  return runId.length > 0
+    && runId === runId.replace(/[^a-zA-Z0-9_.:-]/g, '')
+    && value.id === runId
+    && typeof value.workflow === 'string'
+    && value.workflow.trim().length > 0;
+}
+
+/**
+ * Canonical non-blocking maintenance read.
+ *
+ * Unlike the legacy nullable snapshot, this never aliases a corrupt record to
+ * a missing or contended one. A canonical identity check is deliberately
+ * narrow: legacy records may omit newer timestamps/status fields, but the
+ * exact filename id and non-blank workflow owner must agree before execution.
+ */
+export function scanWorkflowRunRecord<T extends object>(
+  filePath: string,
+): WorkflowRunRecordScanResult<T> {
+  try {
+    return withWorkflowRunRecordLock(
+      filePath,
+      () => scanWorkflowRunRecordSnapshot<T>(filePath),
+      { timeoutMs: 0 },
+    );
+  } catch {
+    return { status: 'busy' };
+  }
+}
+
+/**
+ * Lock-free broad inventory read. Canonical writers publish by atomic rename,
+ * so this sees one complete old/new generation without creating thousands of
+ * lock directories on every daemon tick. `busy` here means the bytes were
+ * temporarily unavailable; the strict scan above additionally uses it for a
+ * contended or ambiguous writer lock.
+ */
+export function scanWorkflowRunRecordSnapshot<T extends object>(
+  filePath: string,
+): WorkflowRunRecordScanResult<T> {
+  if (!existsSync(filePath)) return { status: 'missing' };
+  let raw: Buffer;
+  try {
+    raw = readFileSync(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { status: 'missing' };
+    // An I/O failure is retryable/unavailable, not proof that the bytes
+    // themselves are corrupt. Never quarantine what we could not read.
+    return { status: 'busy' };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.toString('utf-8')) as unknown;
+  } catch {
+    return { status: 'corrupt', evidence: corruptionEvidence(filePath, raw, 'invalid_json') };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { status: 'corrupt', evidence: corruptionEvidence(filePath, raw, 'not_json_object') };
+  }
+  if (!canonicalWorkflowRunIdentityIsValid(filePath, parsed as Record<string, unknown>)) {
+    return {
+      status: 'corrupt',
+      evidence: corruptionEvidence(filePath, raw, 'invalid_canonical_identity'),
+    };
+  }
+  return { status: 'ok', record: parsed as T };
+}
+
+function quarantineMarkerPath(
+  filePath: string,
+  corruptionId: string,
+): string {
+  return path.join(
+    path.dirname(filePath),
+    WORKFLOW_RUN_RECORD_QUARANTINE_DIR,
+    `${corruptionId}.json`,
+  );
+}
+
+function sameQuarantineMarker(
+  value: unknown,
+  expected: WorkflowRunRecordQuarantineMarkerV1,
+): value is WorkflowRunRecordQuarantineMarkerV1 {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const marker = value as Partial<WorkflowRunRecordQuarantineMarkerV1>;
+  return marker.version === expected.version
+    && marker.kind === expected.kind
+    && marker.state === expected.state
+    && marker.corruptionId === expected.corruptionId
+    && marker.pathDigest === expected.pathDigest
+    && marker.contentDigest === expected.contentDigest
+    && marker.byteLength === expected.byteLength
+    && marker.fileName === expected.fileName
+    && marker.reason === expected.reason
+    && typeof marker.detectedAt === 'string'
+    && Number.isFinite(Date.parse(marker.detectedAt));
+}
+
+function sameCorruptionEvidence(
+  left: WorkflowRunRecordCorruptionEvidence,
+  right: WorkflowRunRecordCorruptionEvidence,
+): boolean {
+  return left.version === right.version
+    && left.corruptionId === right.corruptionId
+    && left.pathDigest === right.pathDigest
+    && left.contentDigest === right.contentDigest
+    && left.byteLength === right.byteLength
+    && left.fileName === right.fileName
+    && left.reason === right.reason;
+}
+
+/**
+ * Persist immutable blocked truth for a corrupt generation without moving,
+ * rewriting, parsing around, or otherwise normalizing its source bytes.
+ * Same-generation replay returns the first marker; conflicting marker bytes
+ * fail closed and are never overwritten.
+ */
+export function persistWorkflowRunRecordQuarantine(
+  filePath: string,
+  evidence: WorkflowRunRecordCorruptionEvidence,
+  detectedAt = new Date().toISOString(),
+): WorkflowRunRecordQuarantineMarkerV1 | null {
+  const detectedAtIso = Number.isFinite(Date.parse(detectedAt))
+    ? detectedAt
+    : new Date().toISOString();
+  const marker: WorkflowRunRecordQuarantineMarkerV1 = {
+    ...evidence,
+    kind: 'workflow_run_record_quarantine',
+    state: 'blocked',
+    detectedAt: detectedAtIso,
+  };
+  const markerPath = quarantineMarkerPath(filePath, evidence.corruptionId);
+  try {
+    return withWorkflowRunRecordLock(filePath, () => {
+      const current = scanWorkflowRunRecordSnapshot<Record<string, unknown>>(filePath);
+      if (current.status !== 'corrupt' || !sameCorruptionEvidence(current.evidence, evidence)) {
+        // The canonical file changed after the scan. Only a later scan may act
+        // on that replacement generation; never attach stale corruption truth.
+        return null;
+      }
+      mkdirSync(path.dirname(markerPath), { recursive: true });
+      const staging = `${markerPath}.${process.pid}.${randomUUID()}.tmp`;
+      let fd: number | undefined;
+      try {
+        fd = openSync(staging, 'wx', 0o600);
+        writeFileSync(fd, JSON.stringify(marker, null, 2), 'utf-8');
+        fsyncSync(fd);
+        closeSync(fd);
+        fd = undefined;
+        try {
+          // A hard link publishes the already-fsynced bytes create-only. Two
+          // daemon processes can race without either replacing the winner.
+          linkSync(staging, markerPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+          const winner = JSON.parse(readFileSync(markerPath, 'utf-8')) as unknown;
+          if (!sameQuarantineMarker(winner, marker)) {
+            throw new Error(`Workflow run quarantine marker ${evidence.corruptionId} is conflicting or corrupt.`);
+          }
+          return winner;
+        }
+        if (process.platform !== 'win32') {
+          const dirFd = openSync(path.dirname(markerPath), 'r');
+          try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+        }
+        return marker;
+      } finally {
+        if (fd !== undefined) {
+          try { closeSync(fd); } catch { /* best effort */ }
+        }
+        try { unlinkSync(staging); } catch { /* published or best effort */ }
+      }
+    }, { timeoutMs: 0 });
+  } catch {
+    // Busy/ambiguous ownership or a temporarily unavailable marker store is a
+    // retry, never permission to execute and never proof of durable blocking.
+    return null;
+  }
+}
+
+export function workflowRunRecordQuarantinePathForTest(
+  filePath: string,
+  corruptionId: string,
+): string {
+  return quarantineMarkerPath(filePath, corruptionId);
 }

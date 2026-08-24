@@ -2,6 +2,8 @@ import {
   inspectProviderEnvelope,
   pruneProviderRequestEchoes,
 } from './provider-read-evidence.js';
+import { createHash } from 'node:crypto';
+import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 
 /**
  * Pure, provider-reviewed content proof for GOOGLESHEETS_SHEET_FROM_JSON.
@@ -22,6 +24,8 @@ export interface GoogleSheetsSheetFromJsonContract {
   expectedValues: GoogleSheetsCell[][];
   /** Canonical exact range callers can use for BATCH_GET/GET_VALUES. */
   expectedRange: string;
+  /** Digest of the exact worksheet name + ordered cell matrix submitted. */
+  submittedContentDigest: string;
 }
 
 export interface GoogleSheetsSheetTarget {
@@ -175,6 +179,16 @@ function quotedSheetName(sheetName: string): string {
   return `'${sheetName.replace(/'/g, "''")}'`;
 }
 
+function submittedContentDigest(
+  sheetName: string,
+  expectedValues: readonly (readonly GoogleSheetsCell[])[],
+): string {
+  return createHash('sha256').update(closedCanonicalJson({
+    sheetName,
+    expectedValues,
+  }), 'utf8').digest('hex');
+}
+
 /** Compile only a reviewed Sheet-from-JSON action and its provider-ready rows. */
 export function compileGoogleSheetsSheetFromJsonContract(
   toolName: string,
@@ -206,14 +220,86 @@ export function compileGoogleSheetsSheetFromJsonContract(
     expectedRows.push(values as GoogleSheetsCell[]);
   }
 
+  const expectedValues = [headers, ...expectedRows];
   return {
     kind: 'googlesheets_sheet_from_json_content_v1',
     createShape,
     sheetName,
     headers,
-    expectedValues: [headers, ...expectedRows],
+    expectedValues,
     expectedRange: `${quotedSheetName(sheetName)}!A1:${columnName(headers.length)}${expectedRows.length + 1}`,
+    submittedContentDigest: submittedContentDigest(sheetName, expectedValues),
   };
+}
+
+/** Strict parser/recomputation seam for durable submitted-content contracts. */
+export function parseGoogleSheetsSheetFromJsonContract(
+  value: unknown,
+): GoogleSheetsSheetFromJsonContract | null {
+  if (!plainRecord(value)) return null;
+  const allowed = new Set([
+    'kind', 'createShape', 'sheetName', 'headers', 'expectedValues',
+    'expectedRange', 'submittedContentDigest',
+  ]);
+  if (Object.keys(value).length !== allowed.size
+    || Object.keys(value).some((key) => !allowed.has(key))) return null;
+  if (
+    value.kind !== 'googlesheets_sheet_from_json_content_v1'
+    || value.createShape !== 'GOOGLESHEETS_SHEET_FROM_JSON'
+    || typeof value.sheetName !== 'string'
+    || !value.sheetName.trim()
+    || typeof value.expectedRange !== 'string'
+    || !Array.isArray(value.headers)
+    || !Array.isArray(value.expectedValues)
+    || typeof value.submittedContentDigest !== 'string'
+    || !/^[a-f0-9]{64}$/.test(value.submittedContentDigest)
+  ) return null;
+  const headers = value.headers as unknown[];
+  const expectedValues = value.expectedValues as unknown[];
+  const headerRow = expectedValues[0];
+  if (
+    headers.length < 1
+    || headers.length > MAX_COLUMNS
+    || !headers.every((header) => typeof header === 'string' && header.length > 0 && header.length <= 256)
+    || new Set(headers).size !== headers.length
+    || expectedValues.length < 2
+    || expectedValues.length > MAX_ROWS + 1
+    || !expectedValues.every((row) => Array.isArray(row)
+      && row.length === headers.length
+      && row.every(cell))
+    || !Array.isArray(headerRow)
+    || !headers.every((header, index) => headerRow[index] === header)
+  ) return null;
+  const contract = value as unknown as GoogleSheetsSheetFromJsonContract;
+  if (contract.expectedRange !== `${quotedSheetName(contract.sheetName)}!A1:${columnName(contract.headers.length)}${contract.expectedValues.length}`) {
+    return null;
+  }
+  if (contract.submittedContentDigest !== submittedContentDigest(contract.sheetName, contract.expectedValues)) {
+    return null;
+  }
+  return contract;
+}
+
+/**
+ * Prove the submitted worksheet rows are all and only one settled source
+ * collection. Column order may differ as object-key order is not data, but no
+ * row, field, or value may be inserted, omitted, or changed.
+ */
+export function googleSheetsSheetFromJsonMatchesSourceRecords(
+  contract: GoogleSheetsSheetFromJsonContract,
+  sourceRecords: unknown,
+): boolean {
+  const parsedContract = parseGoogleSheetsSheetFromJsonContract(contract);
+  if (!parsedContract || !Array.isArray(sourceRecords) || sourceRecords.length !== contract.expectedValues.length - 1) {
+    return false;
+  }
+  const submittedRows = contract.expectedValues.slice(1).map((values) =>
+    Object.fromEntries(contract.headers.map((header, index) => [header, values[index]])));
+  try {
+    return closedCanonicalJson(submittedRows) === closedCanonicalJson(sourceRecords);
+  } catch {
+    return false;
+  }
 }
 
 interface ExactSheetFields {

@@ -24,17 +24,43 @@ const {
 } = await import('./turn-control.js');
 const {
   DEFAULT_PREFLIGHT_CONVERSATION_AUTHOR_TIMEOUT_MS,
+  REQUIRED_SOURCE_STRATEGY_CONFIRMATION_AUTHOR_TIMEOUT_MS,
   createAgentsPreflightConversationPort,
   preflightConversationPrompt,
   publishPreflightConversation,
   startSettledPreflightConversationAuthor,
 } = await import('./preflight-conversation.js');
 const { presentationEventFromCompletionData } = await import('./turn-outcome.js');
+const { peekTaskContinuityPacket } = await import('../../memory/task-continuity.js');
+
+const SOURCE_STRATEGY_BINDING = {
+  version: 1,
+  primary: {
+    capabilityId: 'capability:reviews:aggregate-v2',
+    accountIdentity: 'account:workspace-primary',
+    schemaFingerprint: 'schema:reviews-v2',
+  },
+  equivalentFallbacks: [
+    {
+      capabilityId: 'capability:reviews:aggregate-compatible',
+      schemaFingerprint: 'schema:reviews-v2',
+    },
+  ],
+  topology: 'single_aggregate_read_then_single_artifact_write',
+  topologyDigest: 'a'.repeat(64),
+  destination: { family: 'workbook', posture: 'create_new' },
+  effect: 'external_write',
+} as const satisfies import('./turn-control.js').TurnSourceStrategyBindingV1;
 
 beforeEach(() => resetEventLog());
 
 test('the production voice pass has a bounded pre-execution latency ceiling', () => {
-  assert.ok(DEFAULT_PREFLIGHT_CONVERSATION_AUTHOR_TIMEOUT_MS <= 6_000);
+  assert.equal(DEFAULT_PREFLIGHT_CONVERSATION_AUTHOR_TIMEOUT_MS, 6_000);
+  assert.equal(REQUIRED_SOURCE_STRATEGY_CONFIRMATION_AUTHOR_TIMEOUT_MS, 15_000);
+  assert.ok(
+    REQUIRED_SOURCE_STRATEGY_CONFIRMATION_AUTHOR_TIMEOUT_MS
+      > DEFAULT_PREFLIGHT_CONVERSATION_AUTHOR_TIMEOUT_MS,
+  );
 });
 
 after(() => {
@@ -57,6 +83,33 @@ function alignedFixture(id: string) {
     sessionId: id,
     sessionKind: 'chat',
     sourceUserSeq: source.seq,
+  });
+  assert.equal(decision.phase, 'align');
+  recordTurnPreflightDecision(id, decision, source.seq);
+  return { objective, source, decision };
+}
+
+function sourceStrategyFixture(
+  id: string,
+  sourceStrategyPosture?: 'materially_variant' | 'confirmed_exact' | 'standing_exact',
+  sourceStrategyBinding?: import('./turn-control.js').TurnSourceStrategyBindingV1,
+) {
+  createSession({ id, kind: 'chat', channel: 'desktop', title: id });
+  const objective = 'Find me the top 5 places in Coast City based on public reviews, give me rating count and phone number for each, and create a new workbook.';
+  const source = appendEvent({
+    sessionId: id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective },
+  });
+  const decision = classifyTurnPreflight({
+    message: objective,
+    sessionId: id,
+    sessionKind: 'chat',
+    sourceUserSeq: source.seq,
+    ...(sourceStrategyPosture ? { sourceStrategyPosture } : {}),
+    ...(sourceStrategyBinding ? { sourceStrategyBinding } : {}),
   });
   assert.equal(decision.phase, 'align');
   recordTurnPreflightDecision(id, decision, source.seq);
@@ -136,6 +189,53 @@ test('the one-turn no-tool author receives a distinct SETTLED proceed contract',
   assert.doesNotMatch(text, /\?/);
 });
 
+test('required source confirmation can outlive the ordinary author wall but remains bounded', async () => {
+  const timeoutScale = 0.005;
+  const ordinaryWallMs = Math.trunc(DEFAULT_PREFLIGHT_CONVERSATION_AUTHOR_TIMEOUT_MS * timeoutScale);
+  const requiredWallMs = Math.trunc(
+    REQUIRED_SOURCE_STRATEGY_CONFIRMATION_AUTHOR_TIMEOUT_MS * timeoutScale,
+  );
+  const runnerDelayMs = ordinaryWallMs + 20;
+  assert.ok(runnerDelayMs < requiredWallMs, 'the injected author finishes only inside the required window');
+
+  const authored = 'I recommend Collector A for one aggregate review pull, followed by one new workbook. Should I use that exact source?';
+  const port = createAgentsPreflightConversationPort({
+    model: 'gpt-5.5-codex',
+    timeoutScale,
+    runner: {
+      async run() {
+        await new Promise<void>((resolve) => setTimeout(resolve, runnerDelayMs));
+        return { finalOutput: authored };
+      },
+    },
+  });
+  const fixture = sourceStrategyFixture(
+    'preflight-required-author-deadline',
+    undefined,
+    SOURCE_STRATEGY_BINDING,
+  );
+  const packetBase = {
+    version: 1 as const,
+    objective: fixture.objective,
+    decision: fixture.decision,
+    conversationContext: '',
+    memoryContext: '',
+    capabilityContext: 'Collector A is the validated aggregate source.',
+    openness: null,
+  };
+
+  await assert.rejects(
+    port.render({ ...packetBase, kind: 'proceed' }),
+    /Preflight conversation author timed out/,
+    'the same runner exceeds the ordinary 6-second policy after scaling',
+  );
+  assert.equal(
+    await port.render({ ...packetBase, kind: 'confirm_source_strategy' }),
+    authored,
+    'the required confirmation receives the separate 15-second policy after scaling',
+  );
+});
+
 test('OPEN author outage safely asks for only the first bounded dimension', async () => {
   const port = createAgentsPreflightConversationPort({
     model: 'gpt-5.5-codex',
@@ -148,7 +248,7 @@ test('OPEN author outage safely asks for only the first bounded dimension', asyn
     decision: fixture.decision,
     openness: { open: ['which Google account owns the sheet', 'which email mailbox sends the link'] },
     port,
-    transport: 'openai_agents_harness',
+    transport: 'host_harness',
   });
   assert.equal(disposition.kind, 'ask');
   if (disposition.kind !== 'ask') assert.fail('OPEN must ask');
@@ -158,6 +258,8 @@ test('OPEN author outage safely asks for only the first bounded dimension', asyn
 });
 
 test('SETTLED author outage proceeds silently and publishes no terminal', async () => {
+  // Doctrine (2026-08-18 final): a settled plan line informs and proceeds —
+  // "want me to start" is an illegal needs_input. Outage degrades to silence.
   const fixture = alignedFixture('preflight-settled-outage');
   const disposition = await publishPreflightConversation({
     identity: identityOf(fixture),
@@ -187,7 +289,7 @@ test('OPEN publishes one exact-source clarification and typed needs_input termin
         return 'I have the Ventura handoff in mind. Which Google account should own the new sheet?';
       },
     },
-    transport: 'openai_agents_harness',
+    transport: 'host_harness',
   });
   assert.equal(disposition.kind, 'ask');
   if (disposition.kind !== 'ask') assert.fail('OPEN must ask');
@@ -215,11 +317,137 @@ test('SETTLED returns a model-authored preamble and no awaiting-input or termina
     openness: null,
     conversationContext: 'A prior attempt failed before producing a sheet.',
     port: { async render(packet) { assert.equal(packet.kind, 'proceed'); return expected; } },
-    transport: 'openai_agents_harness',
+    transport: 'host_harness',
   });
   assert.deepEqual(disposition, { kind: 'proceed', preamble: expected });
   assert.equal(listEvents(fixture.source.sessionId, { types: ['awaiting_user_input'] }).length, 0);
   assert.equal(listEvents(fixture.source.sessionId, { types: ['conversation_completed'] }).length, 0);
+});
+
+test('a material source strategy is model-authored but host-enforced as one exact-source confirmation stop', async () => {
+  const fixture = sourceStrategyFixture(
+    'preflight-material-source-confirm',
+    undefined,
+    SOURCE_STRATEGY_BINDING,
+  );
+  assert.equal(fixture.decision.confirmationDisposition, 'material_source_strategy');
+  const authored = 'I recommend Collector A for one aggregate review pull, then I’ll create and populate one workbook with the requested fields. Should I use that source, or do you want a different one?';
+  let authorCalls = 0;
+  const port = {
+    async render(packet: import('./preflight-conversation.js').PreflightConversationPacketV1) {
+      authorCalls += 1;
+      assert.equal(packet.kind, 'confirm_source_strategy');
+      const prompt = preflightConversationPrompt(packet);
+      assert.match(prompt, /MATERIAL SOURCE STRATEGY/);
+      assert.match(prompt, /one bounded fallback posture/i);
+      assert.doesNotMatch(prompt, /Apify|DataForSEO/i, 'the host topology never names a provider');
+      return authored;
+    },
+  };
+  const common = {
+    identity: identityOf(fixture),
+    decision: fixture.decision,
+    openness: null,
+    capabilityContext: 'Collector A is proven and active; Collector B is available but has no settled result.',
+    port,
+    transport: 'host_harness' as const,
+  };
+  const disposition = await publishPreflightConversation({
+    ...common,
+    settledProceedAuthor: startSettledPreflightConversationAuthor(common),
+  });
+  assert.equal(disposition.kind, 'ask');
+  if (disposition.kind !== 'ask') assert.fail('material source strategy must stop');
+  assert.equal(disposition.presentation.text, authored);
+  assert.equal(disposition.presentation.status, 'needs_input');
+  assert.equal(authorCalls, 1);
+
+  const awaiting = listEvents(fixture.source.sessionId, { types: ['awaiting_user_input'] });
+  assert.equal(awaiting.length, 1);
+  assert.equal(awaiting[0]?.data.source, 'preflight_alignment');
+  assert.equal(awaiting[0]?.data.confirmationDisposition, 'material_source_strategy');
+  assert.equal(
+    JSON.stringify(awaiting[0]?.data.sourceStrategyBinding),
+    JSON.stringify(SOURCE_STRATEGY_BINDING),
+    'the pending confirmation owns the selector-authored binding exactly',
+  );
+  assert.equal(listEvents(fixture.source.sessionId, { types: ['conversation_completed'] }).length, 1);
+  const continuity = peekTaskContinuityPacket({ sessionId: fixture.source.sessionId });
+  assert.equal(continuity.status, 'available');
+  if (continuity.status === 'available') {
+    assert.equal(continuity.packet.originatingSourceUserSeq, fixture.source.seq);
+    assert.equal(continuity.packet.pause.question, authored);
+  }
+
+  const replay = await publishPreflightConversation(common);
+  assert.equal(replay.kind, 'ask');
+  if (replay.kind === 'ask') assert.equal(replay.presentation.text, authored);
+  assert.equal(authorCalls, 1, 'the exact accepted source owns one confirmation author and terminal');
+
+  const approval = appendEvent({
+    sessionId: fixture.source.sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Yes.' },
+  });
+  const approved = classifyTurnPreflight({
+    message: 'Yes.',
+    sessionId: fixture.source.sessionId,
+    sessionKind: 'chat',
+    sourceUserSeq: approval.seq,
+  });
+  assert.equal(approved.reason, 'continuation_approved');
+  assert.equal(approved.sourceStrategyPosture, 'confirmed_exact');
+  assert.equal(
+    JSON.stringify(approved.sourceStrategyBinding),
+    JSON.stringify(SOURCE_STRATEGY_BINDING),
+    'a later yes preserves the exact primary, fallback, destination, effect, and topology bytes',
+  );
+});
+
+test('source-strategy author outage or non-question output fails closed without canned UX', async () => {
+  for (const [id, render] of [
+    ['preflight-source-author-outage', async () => { throw new Error('offline'); }],
+    ['preflight-source-author-no-question', async () => 'I recommend the proven aggregate collector.'],
+  ] as const) {
+    const fixture = sourceStrategyFixture(id, undefined, SOURCE_STRATEGY_BINDING);
+    await assert.rejects(
+      publishPreflightConversation({
+        identity: identityOf(fixture),
+        decision: fixture.decision,
+        openness: null,
+        port: { render },
+        transport: 'host_harness',
+      }),
+      /Source-strategy confirmation author|offline/,
+    );
+    assert.equal(listEvents(id, { types: ['awaiting_user_input'] }).length, 0);
+    assert.equal(listEvents(id, { types: ['conversation_completed'] }).length, 0);
+  }
+});
+
+test('a confirmed or standing exact source keeps SETTLED on the same-turn proceed path', async () => {
+  for (const posture of ['confirmed_exact', 'standing_exact'] as const) {
+    const fixture = sourceStrategyFixture(`preflight-source-${posture}`, posture);
+    assert.equal(fixture.decision.confirmationDisposition, undefined);
+    const preamble = `I’ll use the ${posture.replace('_', ' ')} source and create one workbook.`;
+    const disposition = await publishPreflightConversation({
+      identity: identityOf(fixture),
+      decision: fixture.decision,
+      openness: null,
+      port: {
+        async render(packet) {
+          assert.equal(packet.kind, 'proceed');
+          return preamble;
+        },
+      },
+      transport: 'host_harness',
+    });
+    assert.deepEqual(disposition, { kind: 'proceed', preamble });
+    assert.equal(listEvents(fixture.source.sessionId, { types: ['awaiting_user_input'] }).length, 0);
+    assert.equal(listEvents(fixture.source.sessionId, { types: ['conversation_completed'] }).length, 0);
+  }
 });
 
 test('a prestarted SETTLED author launches immediately and publish consumes it exactly once', async () => {
@@ -254,12 +482,24 @@ test('a prestarted SETTLED author launches immediately and publish consumes it e
     ...common,
     openness: null,
     settledProceedAuthor,
-    transport: 'openai_agents_harness',
+    transport: 'host_harness',
   });
   assert.equal(authorCalls, 1, 'publish must reuse, not restart, the in-flight author');
   releaseAuthor(expected);
   assert.deepEqual(await publishing, { kind: 'proceed', preamble: expected });
   assert.equal(authorCalls, 1);
+});
+
+test('an ordinary SETTLED author cannot smuggle a question into the proceed preamble', async () => {
+  const fixture = alignedFixture('preflight-proceed-drops-plan-checkin');
+  const disposition = await publishPreflightConversation({
+    identity: identityOf(fixture),
+    decision: fixture.decision,
+    openness: null,
+    port: { async render() { return 'I have everything I need. Should I go ahead?'; } },
+    transport: 'claude_agent_sdk_brain',
+  });
+  assert.deepEqual(disposition, { kind: 'proceed', preamble: '' });
 });
 
 test('OPEN discards speculative SETTLED prose and authors its distinct question with the same context', async () => {
@@ -296,6 +536,47 @@ test('OPEN discards speculative SETTLED prose and authors its distinct question 
   assert.deepEqual(kinds, ['proceed', 'ask']);
 });
 
+test('SETTLED authoring joins the accepted user seq, not the later loop turn', async () => {
+  const fixture = alignedFixture('preflight-later-loop-turn');
+  const laterLoopTurn = fixture.source.turn + 1;
+  assert.notEqual(laterLoopTurn, fixture.source.turn);
+  const expected = 'I’ll collect the last five posts and put title, date, and link in one workbook.';
+  const identity = {
+    sessionId: fixture.source.sessionId,
+    turn: laterLoopTurn,
+    sourceUserSeq: fixture.source.seq,
+  };
+  const disposition = await publishPreflightConversation({
+    identity,
+    decision: fixture.decision,
+    openness: null,
+    port: { async render() { return expected; } },
+    settledProceedAuthor: startSettledPreflightConversationAuthor({
+      identity,
+      decision: fixture.decision,
+      conversationContext: '',
+      memoryContext: '',
+      capabilityContext: '',
+      port: { async render() { return expected; } },
+    }),
+    transport: 'host_harness',
+  });
+  assert.deepEqual(disposition, { kind: 'proceed', preamble: expected });
+  appendConversationPreambleOnce({
+    source: fixture.source,
+    text: expected,
+    intentKey: fixture.decision.intentKey,
+  });
+  const replay = await publishPreflightConversation({
+    identity,
+    decision: fixture.decision,
+    openness: null,
+    port: { async render() { return 'A later loop turn must not re-author.'; } },
+    transport: 'host_harness',
+  });
+  assert.deepEqual(replay, { kind: 'proceed', preamble: expected });
+});
+
 test('SETTLED exact-source replay reuses the durable preamble without re-authoring', async () => {
   const fixture = alignedFixture('preflight-settled-durable-replay');
   const durableText = 'I remember the Ventura attempt and I’m continuing with the same sheet-to-email handoff.';
@@ -329,7 +610,7 @@ test('SETTLED exact-source replay reuses the durable preamble without re-authori
         return 'A different brain authored conflicting prose.';
       },
     },
-    transport: 'openai_agents_harness',
+    transport: 'host_harness',
   });
 
   assert.deepEqual(replay, { kind: 'proceed', preamble: durableText });
@@ -344,7 +625,7 @@ test('a SETTLED author cannot manufacture a confirmation checkpoint', async () =
     decision: fixture.decision,
     openness: null,
     port: { async render() { return 'I have everything I need. Should I go ahead?'; } },
-    transport: 'openai_agents_harness',
+    transport: 'host_harness',
   });
   assert.deepEqual(disposition, { kind: 'proceed', preamble: '' });
   assert.equal(listEvents(fixture.source.sessionId, { types: ['awaiting_user_input'] }).length, 0);
@@ -360,7 +641,7 @@ test('prior context is model context, not a regex-triggered canned replacement',
     openness: { open: ['which Google account should own the sheet'] },
     conversationContext: '[RELEVANT PRIOR WORK — historical only] A matching Ventura attempt exists.',
     port: { async render() { return authored; } },
-    transport: 'openai_agents_harness',
+    transport: 'host_harness',
   });
   assert.equal(disposition.kind, 'ask');
   if (disposition.kind !== 'ask') assert.fail('OPEN must ask');
@@ -376,7 +657,7 @@ test('OPEN publication is idempotent for the exact source and intent', async () 
     decision: fixture.decision,
     openness: { open: ['which Google account should own the sheet'] },
     port: { async render() { authorCalls += 1; return 'Which Google account should own the sheet?'; } },
-    transport: 'openai_agents_harness' as const,
+    transport: 'host_harness' as const,
   };
   const first = await publishPreflightConversation(input);
   const second = await publishPreflightConversation(input);
@@ -402,7 +683,7 @@ test('neither OPEN nor SETTLED can weaken the durable accepted-source anchor', a
         decision: fixture.decision,
         openness,
         port: { async render() { return 'Authored text.'; } },
-        transport: 'openai_agents_harness',
+        transport: 'host_harness',
       }),
       /not durably anchored/,
     );
@@ -422,4 +703,32 @@ test('the exported prompt itself preserves the OPEN/SETTLED discrimination', () 
   };
   assert.match(preflightConversationPrompt({ ...base, kind: 'ask', openness: { open: ['which account'] } }), /OPEN/);
   assert.match(preflightConversationPrompt({ ...base, kind: 'proceed', openness: null }), /SETTLED/);
+});
+
+test('a transient source-strategy author outage is retried once; a persistent one still fails closed (live 2026-08-21)', async () => {
+  // Two consecutive live turns died on the generic failure text because one
+  // empty print-mode return ended the turn; the same packet authored fine
+  // seconds later. Retry once. Fabricating her question stays forbidden.
+  let calls = 0;
+  const fixture = sourceStrategyFixture('preflight-source-author-transient', undefined, SOURCE_STRATEGY_BINDING);
+  const disposition = await publishPreflightConversation({
+    identity: identityOf(fixture),
+    decision: fixture.decision,
+    openness: null,
+    port: {
+      async render() {
+        calls += 1;
+        if (calls === 1) return '';
+        return 'Which ad source should the scrape target — Google Ads or the Meta Ad Library?';
+      },
+    },
+    transport: 'host_harness',
+  });
+  assert.equal(calls, 2, 'the empty first author is retried exactly once');
+  assert.equal(disposition.kind, 'ask');
+  assert.match(
+    disposition.kind === 'ask' ? disposition.presentation.text : '',
+    /Meta Ad Library/,
+    'the retry authored the real question — no canned substitute',
+  );
 });

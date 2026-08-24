@@ -697,8 +697,8 @@ function getOrCreateFailOpenExternalShim(scope: McpToolScope): MCPServer {
 /**
  * The turn's authority is a ceiling, not a suggestion.
  *
- * Helpers that build their own scope — the on-demand inventory tool, code mode,
- * status probes — were each free to mint a broad one and hand it straight here,
+ * Helpers that build their own scope — the on-demand inventory tool, nested
+ * dispatch, and status probes — were each free to mint a broad one and hand it straight here,
  * which made every such helper a side door around the decision the user
  * actually made. Narrowing at the single construction point closes all of them
  * at once, including the ones nobody has written yet.

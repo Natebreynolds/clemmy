@@ -25,7 +25,8 @@ import type { MCPServer } from '@openai/agents';
 
 const { createMcpNamespaceShim, namespaceToolName, slugifyServerName, classifyMcpIntegrityScope } = await import('./mcp-namespace-shim.js');
 const { withHarnessRunContext, ToolCallsCounter, wrapToolForHarness } = await import('./harness/brackets.js');
-const { appendEvent, createSession, listEvents } = await import('./harness/eventlog.js');
+const { ToolAttemptSettlementAuthorityError } = await import('./harness/attempt-settlement.js');
+const { appendEvent, createSession, listEvents, openEventLog } = await import('./harness/eventlog.js');
 const { grantSendTrust, openPlanScope, revokeSendTrust } = await import('../agents/plan-scope.js');
 const { saveProactivityPolicy } = await import('../agents/proactivity-policy.js');
 const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
@@ -181,6 +182,329 @@ test('ordinary native MCP writes reserve before dispatch and settle only a clean
   assert.equal(reservation?.data.sourceUserSeq, source.seq);
   assert.equal(listEvents(sid, { types: ['external_write_succeeded'] }).length, 1);
   assert.equal(listEvents(sid, { types: ['external_write_orphaned'] }).length, 0);
+});
+
+test('a cold native MCP business call refuses before connect, listing, body, write reservation, or physical start', async () => {
+  const slug = 'cold-route';
+  const tool = 'create_record';
+  const counters = { connect: 0, list: 0, body: 0 };
+  const server = {
+    name: slug,
+    cacheToolsList: false,
+    toolFilter: undefined,
+    async connect() { counters.connect += 1; },
+    async close() {},
+    async invalidateToolsCache() {},
+    async listTools() {
+      counters.list += 1;
+      return [{ name: tool, description: 'write', inputSchema: { type: 'object' } }];
+    },
+    async callTool() {
+      counters.body += 1;
+      return [{ type: 'text', text: 'created' }];
+    },
+  } as unknown as MCPServer;
+  const shim = createMcpNamespaceShim({ servers: [server] });
+  const namespaced = namespaceToolName(slugifyServerName(slug), tool);
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Create the record after the MCP route is prepared.');
+
+  await withHarnessRunContext(ctx(sid, source.seq), async () => {
+    await assert.rejects(
+      () => shim.callTool(namespaced, { base_id: 'app1', fields: { Name: 'Ada' } }),
+      /route map is not prepared.*No provider dispatch was started/i,
+    );
+  });
+
+  assert.deepEqual(counters, { connect: 0, list: 0, body: 0 });
+  assert.equal(listEvents(sid, { types: ['external_write'] }).length, 0);
+  assert.equal(listEvents(sid, { types: ['external_write_failed'] }).length, 0);
+  assert.equal(listEvents(sid, { types: ['external_write_orphaned'] }).length, 0);
+  const db = openEventLog();
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS count FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(sid, source.seq) as { count: number }).count, 0);
+  assert.deepEqual(db.prepare(`
+    SELECT execution_kind, outcome_kind, physical_crossing_count
+      FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ?
+  `).all(sid, source.seq), [{
+    execution_kind: 'refused_pre_dispatch',
+    outcome_kind: 'unknown',
+    physical_crossing_count: 0,
+  }]);
+});
+
+test('a native write whose physical start cannot persist compensates its exact reservation before retry', async () => {
+  const slug = 'airtable-begin-fault';
+  const tool = 'create_record';
+  let providerBodies = 0;
+  const server = successfulServer(slug, tool, () => { providerBodies += 1; });
+  const shim = createMcpNamespaceShim({ servers: [server] });
+  const namespaced = namespaceToolName(slugifyServerName(slug), tool);
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Create the approved Airtable record exactly once.');
+  openPlanScope({
+    sessionId: sid,
+    planProposalId: 'p-native-begin-storage-fault',
+    approvedPlanObjective: 'create the approved record',
+    goalScoped: { goalId: 'g-native-begin-storage-fault' },
+    allowedTools: [namespaced, tool],
+    allowedSends: [],
+  });
+  const args = {
+    base_id: 'app1',
+    table_id: 'tbl1',
+    fields: { Name: 'Ada' },
+  };
+
+  await withHarnessRunContext(ctx(sid, source.seq), async () => {
+    await shim.listTools();
+    const db = openEventLog();
+    db.exec(`
+      CREATE TRIGGER native_mcp_test_fail_physical_begin
+      BEFORE INSERT ON physical_dispatches
+      BEGIN
+        SELECT RAISE(ABORT, 'forced native MCP physical begin failure');
+      END;
+      CREATE TRIGGER native_mcp_test_fail_logical_settlement
+      BEFORE INSERT ON logical_call_settlements
+      BEGIN
+        SELECT RAISE(ABORT, 'forced native MCP logical settlement failure');
+      END;
+    `);
+    try {
+      await assert.rejects(() => shim.callTool(namespaced, args));
+    } finally {
+      db.exec('DROP TRIGGER IF EXISTS native_mcp_test_fail_physical_begin');
+      db.exec('DROP TRIGGER IF EXISTS native_mcp_test_fail_logical_settlement');
+    }
+
+    assert.equal(providerBodies, 0, 'a failed durable start cannot enter the provider body');
+    const [reservation] = listEvents(sid, { types: ['external_write'] });
+    const [failed] = listEvents(sid, { types: ['external_write_failed'] });
+    assert.ok(reservation, 'the pre-start reservation was durably recorded');
+    assert.equal(failed?.parentEventId, reservation.id, 'compensation owns the exact reservation');
+    assert.equal(failed?.data.dispatch, 'not_started');
+    assert.equal(failed?.data.effect, 'none');
+    assert.equal(listEvents(sid, { types: ['external_write_orphaned'] }).length, 0);
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS count FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(sid, source.seq) as { count: number }).count, 0, 'storage failure left no physical row');
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS count FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(sid, source.seq) as { count: number }).count, 0,
+    'the forced settlement fault fired only after durable reservation compensation');
+
+    // The exact failed reservation is retry-safe. If compensation were missing,
+    // the shared duplicate wall would block this second call before its body.
+    await shim.callTool(namespaced, args);
+  });
+
+  assert.equal(providerBodies, 1, 'the compensated attempt does not duplicate-block a later exact retry');
+  assert.equal(listEvents(sid, { types: ['external_write'] }).length, 2);
+  assert.equal(listEvents(sid, { types: ['external_write_failed'] }).length, 1);
+  assert.equal(listEvents(sid, { types: ['external_write_orphaned'] }).length, 0);
+  assert.equal(listEvents(sid, { types: ['external_write_succeeded'] }).length, 1);
+});
+
+test('a failed zero-crossing compensation stays conservative and duplicate-blocks retry', async () => {
+  const slug = 'airtable-compensation-fault';
+  const tool = 'create_record';
+  let providerBodies = 0;
+  const shim = createMcpNamespaceShim({
+    servers: [successfulServer(slug, tool, () => { providerBodies += 1; })],
+  });
+  const namespaced = namespaceToolName(slugifyServerName(slug), tool);
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Create the approved record only when its reservation is owned.');
+  openPlanScope({
+    sessionId: sid,
+    planProposalId: 'p-native-compensation-storage-fault',
+    approvedPlanObjective: 'create the approved record',
+    goalScoped: { goalId: 'g-native-compensation-storage-fault' },
+    allowedTools: [namespaced, tool],
+    allowedSends: [],
+  });
+  const args = { base_id: 'app1', table_id: 'tbl1', fields: { Name: 'Ada' } };
+
+  await withHarnessRunContext(ctx(sid, source.seq), async () => {
+    await shim.listTools();
+    const db = openEventLog();
+    db.exec(`
+      CREATE TRIGGER native_mcp_test_fail_physical_begin_for_compensation
+      BEFORE INSERT ON physical_dispatches
+      BEGIN
+        SELECT RAISE(ABORT, 'forced native MCP physical begin failure');
+      END;
+      CREATE TRIGGER native_mcp_test_fail_compensation_append
+      BEFORE INSERT ON events
+      WHEN NEW.type = 'external_write_failed'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced native MCP compensation append failure');
+      END;
+    `);
+    try {
+      await assert.rejects(() => shim.callTool(namespaced, args));
+    } finally {
+      db.exec('DROP TRIGGER IF EXISTS native_mcp_test_fail_physical_begin_for_compensation');
+      db.exec('DROP TRIGGER IF EXISTS native_mcp_test_fail_compensation_append');
+    }
+
+    assert.equal(providerBodies, 0);
+    assert.equal(listEvents(sid, { types: ['external_write'] }).length, 1);
+    assert.equal(listEvents(sid, { types: ['external_write_failed'] }).length, 0);
+    assert.equal(listEvents(sid, { types: ['external_write_orphaned'] }).length, 0);
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS count FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(sid, source.seq) as { count: number }).count, 0);
+
+    await assert.rejects(
+      () => shim.callTool(namespaced, args),
+      /already been attempted|duplicate|blind retry|unresolved/i,
+    );
+  });
+
+  assert.equal(providerBodies, 0, 'an unresolved reservation never authorizes a blind retry');
+  assert.equal(listEvents(sid, { types: ['external_write'] }).length, 1);
+});
+
+test('a post-return write-outcome fault settles the provider return once and never rewrites it as thrown', async () => {
+  const slug = 'airtable-returned-outcome-fault';
+  const tool = 'create_record';
+  let providerBodies = 0;
+  const shim = createMcpNamespaceShim({
+    servers: [successfulServer(slug, tool, () => { providerBodies += 1; })],
+  });
+  const namespaced = namespaceToolName(slugifyServerName(slug), tool);
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Create the approved record exactly once.');
+  openPlanScope({
+    sessionId: sid,
+    planProposalId: 'p-native-returned-outcome-fault',
+    approvedPlanObjective: 'create the approved record',
+    goalScoped: { goalId: 'g-native-returned-outcome-fault' },
+    allowedTools: [namespaced, tool],
+    allowedSends: [],
+  });
+
+  await withHarnessRunContext(ctx(sid, source.seq), async () => {
+    await shim.listTools();
+    const db = openEventLog();
+    db.exec(`
+      CREATE TRIGGER native_mcp_test_fail_success_outcome_append
+      BEFORE INSERT ON events
+      WHEN NEW.type = 'external_write_succeeded'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced native MCP success outcome append failure');
+      END;
+    `);
+    try {
+      await assert.rejects(() => shim.callTool(namespaced, {
+        base_id: 'app1',
+        table_id: 'tbl1',
+        fields: { Name: 'Ada' },
+      }));
+    } finally {
+      db.exec('DROP TRIGGER IF EXISTS native_mcp_test_fail_success_outcome_append');
+    }
+  });
+
+  assert.equal(providerBodies, 1);
+  assert.equal(listEvents(sid, { types: ['external_write'] }).length, 1);
+  assert.equal(listEvents(sid, { types: ['external_write_succeeded'] }).length, 0);
+  assert.equal(listEvents(sid, { types: ['external_write_orphaned'] }).length, 1,
+    'a failed success receipt remains conservative without erasing the provider return');
+  const db = openEventLog();
+  assert.deepEqual(db.prepare(`
+    SELECT state, execution_site FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+  `).all(sid, source.seq), [{ state: 'returned', execution_site: null }]);
+  assert.deepEqual(db.prepare(`
+    SELECT execution_kind, outcome_kind, physical_crossing_count
+      FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ?
+  `).all(sid, source.seq), [{
+    execution_kind: 'provider_execution',
+    outcome_kind: 'succeeded',
+    physical_crossing_count: 1,
+  }]);
+  assert.equal(listEvents(sid, { types: ['tool_attempt_settled'] }).length, 1,
+    'the post-return fault cannot create a second thrown settlement event');
+});
+
+test('a logical-settlement storage fault after a clean provider return is attempted once and never rewrites returned as thrown', async () => {
+  const slug = 'airtable-returned-settlement-fault';
+  const tool = 'create_record';
+  let providerBodies = 0;
+  const shim = createMcpNamespaceShim({
+    servers: [successfulServer(slug, tool, () => { providerBodies += 1; })],
+  });
+  const namespaced = namespaceToolName(slugifyServerName(slug), tool);
+  const sid = createSession({ kind: 'chat' }).id;
+  const source = anchorAcceptedTask(sid, 'Create the approved record exactly once.');
+  openPlanScope({
+    sessionId: sid,
+    planProposalId: 'p-native-returned-settlement-storage-fault',
+    approvedPlanObjective: 'create the approved record',
+    goalScoped: { goalId: 'g-native-returned-settlement-storage-fault' },
+    allowedTools: [namespaced, tool],
+    allowedSends: [],
+  });
+  const args = {
+    base_id: 'app1',
+    table_id: 'tbl1',
+    fields: { Name: 'Ada' },
+  };
+  let settlementInsertAttempts = 0;
+
+  await withHarnessRunContext(ctx(sid, source.seq), async () => {
+    await shim.listTools();
+    const db = openEventLog();
+    db.function('native_mcp_count_and_fail_logical_settlement', () => {
+      settlementInsertAttempts += 1;
+      throw new Error('forced native MCP logical settlement storage failure');
+    });
+    db.exec(`
+      CREATE TRIGGER native_mcp_test_count_and_fail_logical_settlement
+      BEFORE INSERT ON logical_call_settlements
+      BEGIN
+        SELECT native_mcp_count_and_fail_logical_settlement();
+      END;
+    `);
+    try {
+      await assert.rejects(
+        () => shim.callTool(namespaced, args),
+        (error: unknown) => error instanceof ToolAttemptSettlementAuthorityError
+          && error.status === 'storage_error'
+          && /forced native MCP logical settlement storage failure/.test(error.reason),
+        'durable settlement authority failure is surfaced without inventing a provider throw',
+      );
+    } finally {
+      db.exec('DROP TRIGGER IF EXISTS native_mcp_test_count_and_fail_logical_settlement');
+    }
+  });
+
+  assert.equal(providerBodies, 1, 'the provider body crossed exactly once');
+  assert.equal(settlementInsertAttempts, 1, 'the clean return gets one logical settlement attempt');
+  assert.equal(listEvents(sid, { types: ['external_write_succeeded'] }).length, 1,
+    'the durable write outcome precedes the failed logical settlement write');
+  assert.equal(listEvents(sid, { types: ['tool_attempt_settled'] }).length, 0,
+    'the failed transaction cannot publish a phantom or thrown settlement event');
+  const db = openEventLog();
+  assert.deepEqual(db.prepare(`
+    SELECT state, execution_site FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+  `).all(sid, source.seq), [{ state: 'returned', execution_site: null }]);
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS count FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(sid, source.seq) as { count: number }).count, 0,
+  'the injected storage fault leaves no durable logical settlement to misclassify');
 });
 
 test('valid-shaped native MCP failure prose and empty envelopes never certify a write', async () => {

@@ -39,6 +39,10 @@ test('fan-out item failures are partial, never clean completion', () => {
 
 test('report evidence distinguishes recoverable block from execution failure', () => {
   assert.equal(deriveWorkflowTerminalOutcome({
+    status: 'blocked',
+    reportBack: { outcome: 'blocked' },
+  }), 'blocked');
+  assert.equal(deriveWorkflowTerminalOutcome({
     status: 'error',
     reportBack: { outcome: 'blocked' },
   }), 'blocked');

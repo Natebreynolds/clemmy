@@ -99,6 +99,8 @@ export interface ChatTurnSpineInput<CoreResult> {
    * recorded a graph retain the existing deterministic compile path.
    */
   graph?: TurnGraphIR;
+  /** Injected prior-route signal. The spine does not read the event log. */
+  continueHostedWorld?: boolean;
   phases: ChatTurnSpinePhases<CoreResult>;
 }
 
@@ -153,6 +155,9 @@ export async function driveChatTurnSpine<CoreResult>(
         sessionKind: 'chat',
         surface: spine.surface,
         policy: snapshotTurnGraphPolicy(spine.policy),
+        signals: {
+          continueHostedWorld: spine.continueHostedWorld === true,
+        },
       });
     }
     if (!compiled.validation.ok) {

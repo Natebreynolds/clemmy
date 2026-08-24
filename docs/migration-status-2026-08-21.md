@@ -26,7 +26,7 @@ Live typed callers of `dispatchAdmittedSource`: `src/runtime/harness/loop.ts` (t
 
 `runAdmittedTurnGraph` live caller: `dispatchAdmittedSource` only.
 
-No `legacy` dispatch kind remains. After semantic participation, unbound retrieve/act is `blocked`/`needs_input`, not an untyped tool loop. Conversation is the cheap mode of the same kernel.
+No `legacy` dispatch kind remains. After semantic participation, an unbound **write** is `blocked`/`needs_input` — it must not fall through to the conversation loop (north-star cutover). Unbound **reads** may still answer in conversation. Typed dispatch runs only with a bound `operationId`.
 
 ---
 
@@ -145,9 +145,76 @@ Dirty-dev banner retained. No git tag, push, or deploy.
 
 ### Remaining (not this slice)
 
-- `new_goal` with explicit openSlots and no work must park `DependencyRequest` `user_input`, not fail admission as illegal payload (converse-first).
 - `satisfyConnectionRequestsNow` still walks `connection_requests`; enumerator wake not folded onto `dependency_requests`.
 - `host-bind-operations.ts` still `.find()`s; `admitted-construct-run.ts` still branches on `capabilityRole`.
 - Bounded-loop runner not landed; fanout still uses the durable scheduler.
 - Workflow lane still has separate `workflow-graphs.db`.
-- Packed-candidate / clean-commit proof not obtained.
+
+---
+
+## Clean-tree proof — 2026-08-21 later (`82e17946`)
+
+Candidate (no tag): `82e17946bf97c295d50967d1193d5c4f136f8b20` on `wave/one-gate-and-hardcode-subtraction`.
+
+Adversarial check of `f713b731` / `6c7c8059` on a stashed-clean tree: not self-contained. `tsc --noEmit` failed (schema 42 vs migration 49, missing attested transport, unresolved typed-dispatch exports). Dirty-dev proofs of the full worktree are not tag evidence.
+
+Follow-up commits that closed the kernel graph without tagging:
+
+- `e0ae3cd6` — remaining identity, settlement, schema, and shipped-artifact modules so a clean tree typechecks and boots.
+- `82e17946` — Codex workflow-step scorer expects `openai_agents_harness` (the committed SDK transport). `f713b731` had scored dirty-tree `host_harness`.
+
+Measurement: detached worktree at `82e17946` with empty `PROOF_SOURCE_PATHS`. Runtime: `candidate-clean-tree` (`npm ci` + `npm run build` in an out-of-repo worktree). `sourceClean=true`, `sourceStable=true`. No `--allow-dirty-dev`. No dirty-dev banner.
+
+| Brain | converse-first | capability-reconnect-resume | sourceClean |
+|---|---|---|---|
+| Claude | PASS 8/8 (wall 9.6s) | PASS 20/20 (wall 32s) | true |
+| Codex | PASS 8/8 (wall 11s) | PASS 20/20 (wall 23s) | true |
+
+Claude on `e0ae3cd6` was also PASS 8/8 + 20/20, `sourceClean=true`. Codex reconnect on that commit failed 19/20 solely on the stale `host_harness` score; production used `openai_agents_harness`.
+
+Focused TAP on clean `e0ae3cd6`: 52 pass / 3 fail. The three fails are `shipped-implementation-identity.test.ts` `npm pack` / `prepack` (mobile-web tsc) and subsequent stamp mismatch — not the kernel admission/dispatch tests. Clarifying-open-slots, AUTH-5 catalog, proportional-control, requirement-coverage, SDK carriers, and physical-dispatch-grounding were green. `tsc --noEmit` exit 0.
+
+`git describe --tags --exact-match` empty. No push, deploy, or daemon restart of the installed-app home. Main worktree remains dirty (~429 unrelated files).
+
+---
+
+## Clean-tree proof — 2026-08-21 later (`9e26685d`)
+
+Next-tag candidate (no tag): `9e26685dcb8a6ae4b47b177e0b95339bc5d88e22`.
+
+`82e17946` was not shippable as-is:
+
+- Kernel TAP on a clean `82e17946` worktree: 27 pass / 1 fail. The two-teeth pin failed because `loop.ts` and `claude-agent-brain.ts` still called `recordTurnGraphShadow` and never entered `recordAcceptedSourceGraph` / `dispatchAdmittedSource`.
+- Wiring that seam (`5f2b6db0`) made converse-first HTTP 500: `semantic port is unavailable`. Daemon boot did not call `configureTypedExecutionRuntime`.
+- `9e26685d` installs that runtime at `startDaemon`.
+
+Gating captures from clean worktree `/tmp/clem-kernel-clean` at `9e26685d`:
+
+- `kernel-isolated.tap`: 28 pass / 0 fail
+- `sdk-carriers.tap`: 9 pass / 0 fail
+- `npm run typecheck`: exit 0
+
+Live proof, `sourceClean=true`, `candidate-clean-tree`, no `--allow-dirty-dev`:
+
+| Brain | converse-first | capability-reconnect-resume |
+|---|---|---|
+| Claude | PASS 8/8 (wall 22s) | PASS 20/20 (wall 35s) |
+| Codex | PASS 8/8 (wall 6.6s) | PASS 20/20 (wall 27s) |
+
+No tag.
+
+---
+
+## Session composition root — 2026-08-21 later (dirty tree, no tag)
+
+Doctrine: [blank-state-universal-execution.md §6.1](blank-state-universal-execution.md) / **COMPOSE-1**.
+
+Clem's DeepSeek-style adaptation: the loop stays task-blind; session identity mounts tools and primers.
+
+| Identity | Mount | Kernel |
+|---|---|---|
+| `chat` | memory inject + connected surface | `dispatchAdmittedSource` |
+| `space-<slug>` | workspace contract primer + `space_*` pin | same |
+| `workflow:…` | saved-bundle allowlist | same |
+
+Owner: `src/runtime/harness/session-composition.ts`. Consumers: Claude brain, Codex loop/orchestrator, console and mobile docks. Memory injects and does not grant reachability. Not tag evidence.

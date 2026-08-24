@@ -57,12 +57,10 @@ export const DEV_FLAG_REGISTRY: DevFlagDef[] = [
   { key: 'CLEMMY_BRAIN_FALLOVER', label: 'Brain fallover', category: 'Brain & judges', type: 'boolean', default: 'on', description: 'Fall over to an alternate brain provider on a transient/overload failure.' },
   { key: 'CLEMMY_JUDGE_CROSS_FAMILY', label: 'Cross-family judge', category: 'Brain & judges', type: 'boolean', default: 'on', description: 'Force the judge/checker to a different LLM family than the brain (never self-grade).' },
   { key: 'CLEMMY_DEBATE_MODE', label: 'Debate / verify mode', category: 'Brain & judges', type: 'boolean', default: 'off', description: 'Multi-brain debate + verify-checker on high-stakes turns.' },
-  { key: 'CLEMMY_RUBRIC_VARIANT', label: 'Orchestrator rubric variant', category: 'Brain & judges', type: 'string', default: 'legacy', description: 'Which orchestrator rubric to inject. "lean" is ~80% smaller than legacy.', options: ['legacy', 'lean'] },
+  { key: 'CLEMMY_RUBRIC_VARIANT', label: 'Orchestrator rubric variant', category: 'Brain & judges', type: 'string', default: 'lean', description: 'Which orchestrator rubric to inject. Lean is the production default; legacy is the rollback.', options: ['lean', 'legacy'] },
 
   // ── Tools & efficiency ──
   { key: 'CLEMMY_TOOL_JIT', label: 'JIT tool selection (Tool-RAG)', category: 'Tools & efficiency', type: 'boolean', default: 'on', description: 'Advertise only the turn-relevant tools to shrink the surface + token cost.' },
-  { key: 'CLEMMY_CODE_MODE', label: 'Code Mode (run_tool_program)', category: 'Tools & efficiency', type: 'boolean', default: 'on', description: 'Let the model write ONE program that batches tool calls instead of serial loops.' },
-  { key: 'CLEMMY_CODE_MODE_WRITES', label: 'Code Mode writes', category: 'Tools & efficiency', type: 'boolean', default: 'on', description: 'Allow gated external writes from inside a code-mode program (full gate chain still fires).' },
   { key: 'CLEMMY_MCP_ERROR_CORRECTIVE', label: 'MCP error self-correct', category: 'Tools & efficiency', type: 'boolean', default: 'on', description: 'Steer the model to a specific recovery move when an MCP tool errors.' },
   { key: 'CLEMMY_WORKER_THRASH_GUARD', label: 'Worker thrash guard', category: 'Tools & efficiency', type: 'boolean', default: 'on', description: 'Per-worker loop-detection so parallel workers don’t poison one tracker.' },
   { key: 'CLEMMY_DYNAMIC_REASONING', label: 'Dynamic reasoning effort', category: 'Tools & efficiency', type: 'boolean', default: 'on', description: 'Pick the per-turn reasoning effort tier from the turn’s intent.' },

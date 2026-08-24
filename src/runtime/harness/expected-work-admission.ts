@@ -69,6 +69,7 @@ import {
   actionTopologyRoleForRuntimeCall,
   classifyRuntimeToolEffect,
   inspectTrustedRuntimeEffectCarrier,
+  runtimeExpectedWorkProjection,
   type RuntimeToolEffect,
   type TrustedRuntimeEffectCarrier,
 } from './tool-effect.js';
@@ -1494,11 +1495,14 @@ export function loadExpectedWorkCallBindingState(input: {
   logicalToolCallId: string;
 }): ExpectedWorkCallBindingState {
   try {
-    const row = openEventLog().prepare(`
+    const db = openEventLog();
+    const row = db.prepare(`
       SELECT * FROM expected_work_call_bindings
        WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
     `).get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId) as Record<string, unknown> | undefined;
-    return row ? { status: 'ok', binding: bindingFromRow(row) } : { status: 'missing' };
+    return row
+      ? { status: 'ok', binding: generatedArtifactContractForBinding(db, bindingFromRow(row)) }
+      : { status: 'missing' };
   } catch (error) {
     return { status: 'storage_error', reason: boundedReason(error) };
   }
@@ -1927,25 +1931,14 @@ export function admitExpectedWorkInvocation(input: {
   };
   const operation = contract.operations.find((entry) => entry.id === input.requirementId);
   if (!operation) return refusedWithPlan('work_requirement_unknown', `requirement ${input.requirementId} is not in the frozen proposal`);
-  if (actionTopologyRoleForRuntimeCall(input.tool, input.args) === 'control') {
-    // A WRITE-capable control tool IS the business of its own domain (live
-    // 2026-08-19 sess-mt0kw772: workflow_schedule — sideEffect write, the
-    // exact tool for "run every 4 hours" — was refused here three times
-    // while the model hunted for a lane the harness would accept). The
-    // refusal's real target is read-only control chatter (history, focus,
-    // recall) claiming business credit; a durable control write falls
-    // through to the SAME effect-match checks below as any business call.
-    const controlEffect = classifyRuntimeToolEffect(input.tool, input.args);
-    const durableControlWrite = controlEffect.source === 'registry'
-      && (controlEffect.effect === 'local_write' || controlEffect.effect === 'external_write' || controlEffect.mutating);
-    if (!durableControlWrite) {
-      return refusedWithPlan(
-        'work_effect_mismatch',
-        `requirement ${operation.id} is business work; a control call cannot discharge it`,
-      );
-    }
+  const runtimeProjection = runtimeExpectedWorkProjection(input.tool, input.args);
+  if (!runtimeProjection.mayBindBusinessWork) {
+    return refusedWithPlan(
+      'work_effect_mismatch',
+      `requirement ${operation.id} is business work; this control call cannot bind it`,
+    );
   }
-  const runtime = classifyRuntimeToolEffect(input.tool, input.args);
+  const runtime = runtimeProjection.decision;
   const sealedEffect = (() => {
     if (!input.hostSealedEffect) return null;
     if (!input.args || typeof input.args !== 'object' || Array.isArray(input.args)) return null;

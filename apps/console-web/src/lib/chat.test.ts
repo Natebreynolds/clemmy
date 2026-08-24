@@ -6,6 +6,7 @@ test('chat stream keeps budget-limit telemetry non-terminal', () => {
   assert.equal(isTerminalEvent('conversation_limit_exceeded'), false);
   assert.equal(isTerminalEvent('conversation_completed'), true);
   assert.equal(isTerminalEvent('run_failed'), true);
+  assert.equal(isTerminalEvent('async_work_dispatched'), true);
 });
 
 test('chat stream delivers every approval in one replay burst before settling', async () => {
@@ -91,11 +92,17 @@ test('delegated-activity subscription forwards only bridged frames from the prom
     // Bridged frames from the promoted task's run session ARE the strip.
     es.emit('event', { seq: 4, turn: 1, role: 'agent', type: 'batch_progress', sessionId: 'background:task-1', data: { batchId: 'accounts', done: 12, total: 29, failed: 0 } });
     es.emit('event', { seq: 5, turn: 1, role: 'agent', type: 'tool_called', sessionId: 'background:task-1', data: { tool: 'web_search' } });
+    // Reconnect mid-run: foreign-session replay frames seed the strip.
+    es.emit('replay', { events: [
+      { seq: 6, turn: 1, role: 'agent', type: 'tool_called', sessionId: 'workflow:1786726670475-33ef31:find_official_page', data: { tool: 'web_search' } },
+      { seq: 7, turn: 1, role: 'Clem', type: 'async_work_dispatched', sessionId: 'console:origin', data: { runIds: ['1786726670475-33ef31'] } },
+    ] });
     unsubscribe();
 
     assert.deepEqual(seen, [
       { type: 'batch_progress', sessionId: 'background:task-1' },
       { type: 'tool_called', sessionId: 'background:task-1' },
+      { type: 'tool_called', sessionId: 'workflow:1786726670475-33ef31:find_official_page' },
     ], 'only frames bridged from another session reach the delegated-work strip');
   } finally {
     Object.assign(globalThis, {

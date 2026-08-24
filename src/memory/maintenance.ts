@@ -59,6 +59,7 @@ import {
   countLegacyReflectionCandidateBatches,
   type LegacyReflectionCandidateBackfillResult,
 } from './reflection-candidates.js';
+import { drainTerminalSemanticLearning } from './semantic-learning-worker.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -85,6 +86,7 @@ const logger = pino({ name: 'clementine-next.memory.maintenance' });
 
 const REINDEX_EVERY_N_TICKS = 4;     // ~60s with a 15s tick
 const CONSOLIDATION_REPLAY_EVERY_N_TICKS = 4; // ~60s; crash-safe user-statement replay
+const TERMINAL_LEARNING_EVERY_N_TICKS = 4; // ~60s; terminal-gated and foreground-idle only
 const BACKFILL_EVERY_N_TICKS = 8;    // ~120s with a 15s tick
 const BACKFILL_BATCH = 200;          // chunks per pass — caps API spend per tick
 // MEMORY.md is read into the agent's instructions on every turn. The
@@ -648,6 +650,21 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
+  if (tickCount % TERMINAL_LEARNING_EVERY_N_TICKS === 0) {
+    try {
+      const learning = await drainTerminalSemanticLearning({ requireIdle: true, shardLimit: 2 });
+      if (
+        learning.intake.batchesCreated > 0
+        || learning.intake.resourcePointers > 0
+        || learning.shardsCompleted > 0
+        || learning.shardsRetried > 0
+        || learning.shardsDeadLettered > 0
+      ) logger.info({ learning }, 'terminal semantic-learning tick');
+    } catch (err) {
+      logger.warn({ err }, 'terminal semantic-learning tick failed');
+    }
+  }
+
   if (tickCount % BACKFILL_EVERY_N_TICKS === 0 && isEmbeddingsEnabled()) {
     try {
       const stats = await embedMissingChunks({ maxChunks: BACKFILL_BATCH });
@@ -755,19 +772,6 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       if (expiredPending > 0) logger.info({ expiredPending }, 'pending reflection evidence expired');
     } catch (err) {
       logger.warn({ err }, 'pending reflection reaper tick failed');
-    }
-    // Replay reflections that FAILED while the extractor was down (quota /
-    // outage). The raw tool output survives in tool_outputs for 14 days, so an
-    // extractor outage delays learning instead of deleting it. Bounded per
-    // receipt; no-ops while the extractor is in its backoff window.
-    try {
-      const { replayFailedReflections } = await import('./reflection.js');
-      const replayed = await replayFailedReflections();
-      if (replayed.replayed > 0 || replayed.rawGone > 0) {
-        logger.info(replayed, 'failed-reflection replay tick');
-      }
-    } catch (err) {
-      logger.warn({ err }, 'failed-reflection replay tick failed');
     }
     try {
       const expiredRecallRuns = reapExpiredUnusedRecallRuns();

@@ -108,10 +108,17 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
   });
   const perStore: Record<string, number> = {};
   const completeSet = asksForCompleteSet(obj);
-  const hits = result.hits.map((hit): UnifiedHit => {
+  const hits = result.hits.map((hit, index): UnifiedHit => {
     const type = legacyType(hit);
     perStore[type] = (perStore[type] ?? 0) + 1;
-    const projected = projectSnippet(hit.text, completeSet && (type === 'fact' || type === 'policy') ? 1_200 : 240);
+    // ANSWERS, NOT LEADS (COMPOUNDING wave): the TOP-ranked fact/policy hit
+    // carries its full durable value (up to 1,200 chars) on every query, not
+    // only complete-set asks — the measured live primer delivered 240-char
+    // leads and the model re-fetched what memory already held. Lower hits
+    // stay compact so corroborators still fit.
+    const fullValueHit = (type === 'fact' || type === 'policy')
+      && (completeSet || index === 0);
+    const projected = projectSnippet(hit.text, fullValueHit ? 1_200 : 240);
     return {
       type,
       ref: String(hit.ref.id),
@@ -235,20 +242,31 @@ export function unifiedRecallEnabled(): boolean {
 
 export async function crossStoreBreadcrumbs(
   query: string,
-  opts: { perStore?: number; resourceMinOverlap?: number } = {},
+  opts: { perStore?: number; resourceMinOverlap?: number; timeoutMs?: number } = {},
 ): Promise<string> {
   if (!unifiedRecallEnabled()) return '';
   const q = query.replace(/\s+/g, ' ').trim();
   if (!q) return '';
   try {
     const perStore = opts.perStore ?? 4;
-    const result = await recallEverything(q, {
-      stores: ['entity', 'resource', 'tool-recall'],
-      perStore,
-      limit: perStore * 3,
-      resourceMinOverlap: opts.resourceMinOverlap ?? 2,
-      graphDepth: 1,
+    const timeoutMs = Math.max(25, Math.min(15_000, opts.timeoutMs ?? 1_500));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const recalled = await Promise.race([
+      recallEverything(q, {
+        stores: ['entity', 'resource', 'tool-recall'],
+        perStore,
+        limit: perStore * 3,
+        resourceMinOverlap: opts.resourceMinOverlap ?? 2,
+        graphDepth: 1,
+      }).then((result) => ({ kind: 'result' as const, result })),
+      new Promise<{ kind: 'timeout' }>((resolve) => {
+        timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
     });
+    if (recalled.kind === 'timeout') return '';
+    const result = recalled.result;
     if (result.hits.length === 0) return '';
     const label: Record<string, string> = { entity: 'WHO/WHAT', resource: 'WHERE', 'tool-recall': 'HOW' };
     return [

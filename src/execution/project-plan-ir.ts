@@ -303,7 +303,6 @@ const PROJECT_GENERIC_EXECUTORS = new Set([
   'pending_action_execute',
   'run_batch',
   'run_shell_command',
-  'run_tool_program',
 ]);
 
 /** A tool the canonical registry classifies as a pure read. */

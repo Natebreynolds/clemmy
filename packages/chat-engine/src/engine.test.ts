@@ -26,12 +26,14 @@ class FakeTransport implements StreamTransport {
   recentPayloads: ReplayPayload[] = [];
   live: { onEvent(e: HarnessEvent): void; onError(): void } | null = null;
   fetchRecentCalls = 0;
+  connectedSessionIds: string[] = [];
 
   async connect(opts: {
     sessionId: string; sinceSeq: number;
     onReplay(p: ReplayPayload): void; onEvent(e: HarnessEvent): void; onError(): void;
   }): Promise<StreamConnection> {
     this.connectCalls += 1;
+    this.connectedSessionIds.push(opts.sessionId);
     if (this.failConnects > 0) {
       this.failConnects -= 1;
       throw new Error('connect refused');
@@ -167,6 +169,26 @@ test('ChatEngine send → stream → terminal reconciliation, with streamed text
   assert.equal(snap.busy, false);
   assert.equal(snap.messages[1].status, 'complete');
   assert.equal(snap.messages[1].text, 'Hi Nathan', 'streamed text survives an empty terminal');
+  engine.dispose();
+});
+
+test('ChatEngine adopts a server-selected successor for an existing held session', async () => {
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({
+    transport,
+    sessionId: 'held-parent-a',
+    api: {
+      send: async (input) => {
+        assert.equal(input.sessionId, 'held-parent-a');
+        return { sessionId: 'fresh-successor-b', accepted: true };
+      },
+      loadSession: async () => ({ events: [], latestSeq: 0 }),
+    },
+  });
+  await engine.send('unrelated fresh work');
+  await wait(10);
+  assert.equal(engine.snapshot().sessionId, 'fresh-successor-b');
+  assert.equal(transport.connectedSessionIds.at(-1), 'fresh-successor-b');
   engine.dispose();
 });
 

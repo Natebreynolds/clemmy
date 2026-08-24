@@ -1302,7 +1302,7 @@ export function cancelPendingActionIfQueuedUnlinked(
 
 export function markPendingActionApprovalResolved(
   id: string,
-  resolution: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user',
+  resolution: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user' | 'cancelled_by_system',
   approvalId?: string | null,
   consent?: { by: PendingActionApprovedBy; evidence: PendingActionApprovalEvidence },
 ): PendingActionRecord | null {

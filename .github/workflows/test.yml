@@ -49,6 +49,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -59,11 +61,11 @@ jobs:
       - name: Check public repository hygiene
         run: npm run check:public-hygiene
 
-      - name: Test public repository hygiene gate
-        run: npm run test:public-hygiene
-
       - name: Install dependencies
         run: npm ci
+
+      - name: Test public repository hygiene gate
+        run: npm run test:public-hygiene
 
       - name: Install console-web test dependencies
         working-directory: apps/console-web
@@ -91,8 +93,17 @@ jobs:
       - name: Run measurement-layer tests
         run: npm run test:measurement
 
+      - name: Run proof self-tests
+        run: npm run proof:selftest
+
       - name: Run release asset tests
         run: npm run test:release-assets
+
+      - name: Run release closure tests
+        run: |
+          command -v sqlite3
+          sqlite3 --version
+          npm run test:release-closure
 
   gate-benchmark:
     name: Harness gate benchmark (violations prevented)
@@ -205,3 +216,52 @@ jobs:
       - name: Build console-web
         run: npm run build
         working-directory: apps/console-web
+
+  windows-smoke:
+    name: Windows smoke (daemon boots + core suites)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install daemon dependencies
+        run: npm ci
+
+      - name: Typecheck daemon
+        run: npx tsc --noEmit
+
+      - name: Windows-readiness pins
+        run: node scripts/run-tests-isolated.mjs src/runtime/windows-readiness.test.ts
+
+      - name: Core suites on win32
+        run: node scripts/run-tests-isolated.mjs src/tools/inner-dispatch.test.ts src/tools/composio-carrier.test.ts src/runtime/harness/logical-call-contract-refinement.test.ts
+
+      - name: Daemon boot smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CLEMENTINE_HOME = Join-Path $env:RUNNER_TEMP 'clem-win-smoke'
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:CLEMENTINE_HOME 'state') | Out-Null
+          $env:MCP_AUTO_IMPORT_ENABLED = 'false'
+          $log = Join-Path $env:RUNNER_TEMP 'daemon-smoke.log'
+          $proc = Start-Process -FilePath 'npx.cmd' -ArgumentList 'tsx','src/index.ts','daemon','--foreground' `
+            -RedirectStandardOutput $log -RedirectStandardError (Join-Path $env:RUNNER_TEMP 'daemon-smoke.err.log') `
+            -NoNewWindow -PassThru
+          $deadline = (Get-Date).AddSeconds(150)
+          $booted = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+            if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'Daemon loop started' -Quiet)) { $booted = $true; break }
+            if ($proc.HasExited) { break }
+          }
+          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          Get-Content $log -Tail 40 -ErrorAction SilentlyContinue
+          Get-Content (Join-Path $env:RUNNER_TEMP 'daemon-smoke.err.log') -Tail 40 -ErrorAction SilentlyContinue
+          if (-not $booted) { throw 'Daemon did not reach "Daemon loop started" on Windows.' }
+          Write-Host 'Windows daemon boot smoke: OK'

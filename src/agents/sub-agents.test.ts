@@ -25,7 +25,7 @@ const {
   isOrchestratorSlug,
 } = await import('./sub-agents.js');
 const { externalMcpScopeFromResolvedTools } = await import('./external-mcp-scope-lock.js');
-const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
+const { _setInnerDispatchToolsForTests } = await import('../tools/inner-dispatch.js');
 const {
   bindAgentCapabilityEnvelope,
   bindAgentCapabilityRevision,
@@ -250,7 +250,7 @@ test('worker call_tool advances its sealed revision once and refuses outside reb
   const priorSlim = process.env.CLEMMY_WORKER_SLIM_TOOLS;
   process.env.CLEMMY_WORKER_SLIM_TOOLS = 'on';
   let dispatches = 0;
-  _setCodeModeToolsForTests(new Map([['desktop_status', {
+  _setInnerDispatchToolsForTests(new Map([['desktop_status', {
     name: 'desktop_status',
     invoke: async () => {
       dispatches += 1;
@@ -309,7 +309,7 @@ test('worker call_tool advances its sealed revision once and refuses outside reb
     assert.deepEqual(refusal.outside, ['desktop_status']);
     assert.equal(dispatches, 2, 'refused worker acquisition entered the inner handler');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (priorSlim === undefined) delete process.env.CLEMMY_WORKER_SLIM_TOOLS;
     else process.env.CLEMMY_WORKER_SLIM_TOOLS = priorSlim;
   }

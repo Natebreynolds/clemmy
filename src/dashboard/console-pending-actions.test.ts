@@ -236,6 +236,7 @@ test('approve-execute rejects rejected, expired, and cancelled cards without rev
     { resolution: 'rejected' as const, expectedStatus: 'rejected' },
     { resolution: 'expired' as const, expectedStatus: 'expired' },
     { resolution: 'cancelled_by_user' as const, expectedStatus: 'cancelled' },
+    { resolution: 'cancelled_by_system' as const, expectedStatus: 'cancelled' },
   ];
   const h = await boot();
   try {

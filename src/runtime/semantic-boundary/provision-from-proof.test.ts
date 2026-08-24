@@ -1,6 +1,6 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/semantic-boundary/provision-from-proof.test.ts
  *
- * Live 2026-08-18 sess-msywj8qp: semantic admission recorded "No host
+ * Live 2026-08-18 session-fixture-unprovisioned-catalog: semantic admission recorded "No host
  * capabilities were supplied, so no operations could be bound" while the same
  * turn's capability_resolution event held PROVEN FIRECRAWL_SEARCH /
  * GOOGLEDRIVE_LIST_FILES entries with live prepared commands. The typed

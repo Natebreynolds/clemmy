@@ -19,6 +19,14 @@ import {
   deriveResultHandleFactsFromRaw,
   reconcileStoredEnvelopeMetadata,
 } from './result-facts.js';
+import { readDurableResultPayload } from './result-payload-storage.js';
+import {
+  settlementCrossingAuthorityProjection,
+  type SettlementCrossingAuthorityVersion,
+} from './settlement-crossing-authority.js';
+import { verifyAtomicContentCommit } from './atomic-content-commit-proof.js';
+import type { SealedNodeBinding } from './host-capability-catalog-factory.js';
+import { reopenTypedPhysicalAuthorityInTransaction } from './typed-physical-authority-proof.js';
 
 const MAX_DURABLE_CURSOR_BYTES = 65_536;
 
@@ -71,6 +79,7 @@ interface ReceiptAuthorityRow {
   settlement_result_handle_id: string | null;
   settlement_crossing_count: number;
   settlement_host_crossing_count: number | null;
+  settlement_crossing_authority_version: number;
   settlement_crossings_digest: string;
   dispatch_execution_site: string | null;
   logical_accepted_task_id: string;
@@ -122,6 +131,8 @@ interface CrossingAuthorityRow {
   retry_of: string | null;
   tool_name: string;
   argument_digest: string;
+  state: 'started' | 'returned' | 'threw' | 'timed_out' | 'cancelled' | 'unknown' | null;
+  execution_site: 'host' | null;
 }
 
 interface SettledResultAuthorityRow {
@@ -135,6 +146,7 @@ interface SettledResultAuthorityRow {
   settlement_result_handle_id: string | null;
   physical_crossing_count: number;
   host_crossing_count: number | null;
+  crossing_authority_version: number;
   physical_crossings_digest: string;
   handle_id: string;
   scope_kind: string;
@@ -231,22 +243,43 @@ function storedBytesMatch(stored: Buffer | null, expected: Buffer | null): boole
   return bytes.equals(expected);
 }
 
-function crossingProjection(rows: readonly CrossingAuthorityRow[]): Array<{
-  physicalDispatchId: string;
-  ordinal: number;
-  relation: CrossingAuthorityRow['relation'];
-  retryOf: string | null;
-  toolName: string;
-  argumentDigest: string;
-}> {
-  return rows.map((row) => ({
+function crossingProjection(
+  rows: readonly CrossingAuthorityRow[],
+  version: SettlementCrossingAuthorityVersion,
+): Array<Record<string, unknown>> {
+  return settlementCrossingAuthorityProjection(rows.map((row) => ({
     physicalDispatchId: row.physical_dispatch_id,
     ordinal: row.ordinal,
     relation: row.relation,
     retryOf: row.retry_of,
     toolName: row.tool_name,
     argumentDigest: row.argument_digest,
-  }));
+    terminalState: row.state,
+    executionSite: row.execution_site,
+  })), version);
+}
+
+function crossingProjectionDigest(
+  rows: readonly CrossingAuthorityRow[],
+  version: SettlementCrossingAuthorityVersion,
+): string {
+  return sha256Bytes(JSON.stringify(crossingProjection(rows, version)));
+}
+
+function crossingSitesAndStatesMatch(input: {
+  frozen: readonly CrossingAuthorityRow[];
+  live: readonly CrossingAuthorityRow[];
+  version: SettlementCrossingAuthorityVersion;
+  providerCount: number;
+  hostCount: number;
+}): boolean {
+  if (input.version === 1) return true;
+  return input.frozen.every((crossing) => crossing.state !== null)
+    && input.live.every((crossing) => crossing.state !== null && crossing.state !== 'started')
+    && input.frozen.filter((crossing) => crossing.execution_site === 'host').length === input.hostCount
+    && input.live.filter((crossing) => crossing.execution_site === 'host').length === input.hostCount
+    && input.frozen.filter((crossing) => crossing.execution_site === null).length === input.providerCount
+    && input.live.filter((crossing) => crossing.execution_site === null).length === input.providerCount;
 }
 
 function exactCrossingAuthority(input: {
@@ -258,14 +291,14 @@ function exactCrossingAuthority(input: {
   const params = [input.sessionId, input.sourceUserSeq, input.logicalToolCallId] as const;
   const frozen = input.db.prepare(`
     SELECT physical_dispatch_id, ordinal, relation, retry_of,
-           tool_name, argument_digest
+           tool_name, argument_digest, terminal_state AS state, execution_site
       FROM logical_call_settlement_crossings
      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
      ORDER BY ordinal
   `).all(...params) as CrossingAuthorityRow[];
   const live = input.db.prepare(`
     SELECT accepted_task_id, physical_dispatch_id, ordinal, relation, retry_of,
-           tool_name, argument_digest
+           tool_name, argument_digest, state, execution_site
       FROM physical_dispatches
      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
      ORDER BY ordinal
@@ -275,6 +308,10 @@ function exactCrossingAuthority(input: {
 
 function digest64(value: unknown): value is string {
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+
+function crossingAuthorityVersion(value: number): SettlementCrossingAuthorityVersion | null {
+  return value === 1 || value === 2 ? value : null;
 }
 
 function boundedIdentity(value: unknown): value is string {
@@ -348,11 +385,19 @@ function exactManifestOperationMapping(input: {
   effectKind: string;
 }): boolean {
   const rows = input.db.prepare(`
-    SELECT operation_id, logical_tool_call_id, resolved_tool, effect_kind
-      FROM accepted_task_operations
-     WHERE session_id = ? AND source_user_seq = ?
-       AND operation_id = ? AND logical_tool_call_id = ?
+    SELECT operation.operation_id, operation.logical_tool_call_id,
+           operation.resolved_tool, operation.effect_kind,
+           logical.tool_name AS logical_tool_name
+      FROM accepted_task_operations operation
+      JOIN logical_tool_calls logical
+        ON logical.session_id = operation.session_id
+       AND logical.source_user_seq = operation.source_user_seq
+       AND logical.logical_tool_call_id = operation.logical_tool_call_id
+       AND logical.accepted_task_id = ?
+     WHERE operation.session_id = ? AND operation.source_user_seq = ?
+       AND operation.operation_id = ? AND operation.logical_tool_call_id = ?
   `).all(
+    input.acceptedTaskId,
     input.sessionId,
     input.sourceUserSeq,
     input.operationId,
@@ -362,21 +407,13 @@ function exactManifestOperationMapping(input: {
     logical_tool_call_id: string;
     resolved_tool: string;
     effect_kind: string;
+    logical_tool_name: string;
   }>;
   if (rows.length !== 1) return false;
   const row = rows[0]!;
   return row.resolved_tool === input.resolvedTool
     && row.effect_kind === input.effectKind
-    && Boolean(input.db.prepare(`
-      SELECT 1 FROM logical_tool_calls
-       WHERE session_id = ? AND source_user_seq = ?
-         AND logical_tool_call_id = ? AND accepted_task_id = ?
-    `).get(
-      input.sessionId,
-      input.sourceUserSeq,
-      input.logicalToolCallId,
-      input.acceptedTaskId,
-    ));
+    && row.logical_tool_name === input.resolvedTool;
 }
 
 function exactSuccessfulResult(input: {
@@ -391,7 +428,8 @@ function exactSuccessfulResult(input: {
            l.tool_name AS logical_tool_name, l.argument_digest AS logical_argument_digest,
            s.execution_kind, s.outcome_kind, s.continues_requirement,
            s.result_handle_id AS settlement_result_handle_id,
-           s.physical_crossing_count, s.host_crossing_count, s.physical_crossings_digest,
+           s.physical_crossing_count, s.host_crossing_count,
+           s.crossing_authority_version, s.physical_crossings_digest,
            h.handle_id, h.scope_kind, h.session_id AS handle_session_id,
            h.source_user_seq AS handle_source_user_seq,
            h.accepted_task_id AS handle_accepted_task_id,
@@ -448,20 +486,28 @@ function exactSuccessfulResult(input: {
     || row.dispatch_argument_digest !== row.handle_argument_digest
     || row.dispatch_ordinal !== row.final_dispatch_ordinal
     || row.raw_location !== `tool_output:${row.handle_id}`
-    || row.raw_payload_json === null
     || row.raw_payload_sha256 === null
-    || Buffer.byteLength(row.raw_payload_json, 'utf8') !== row.raw_byte_count
-    || sha256Bytes(row.raw_payload_json) !== row.raw_payload_sha256
   ) return { ok: false, reason: 'settlement, crossing, and result handle are not exact' };
+  const authorityVersion = crossingAuthorityVersion(row.crossing_authority_version);
+  if (authorityVersion === null) {
+    return { ok: false, reason: 'settlement crossing authority version is invalid' };
+  }
   const crossings = exactCrossingAuthority(input);
-  const frozen = crossingProjection(crossings.frozen);
-  const live = crossingProjection(crossings.live);
+  const frozen = crossingProjection(crossings.frozen, authorityVersion);
+  const live = crossingProjection(crossings.live, authorityVersion);
   const crossingCount = row.physical_crossing_count + (row.host_crossing_count ?? 0);
   if (
     crossings.frozen.length !== crossingCount
     || crossings.live.length !== crossingCount
     || crossings.live.some((crossing) => crossing.accepted_task_id !== input.acceptedTaskId)
-    || sha256Bytes(JSON.stringify(frozen)) !== row.physical_crossings_digest
+    || !crossingSitesAndStatesMatch({
+      frozen: crossings.frozen,
+      live: crossings.live,
+      version: authorityVersion,
+      providerCount: row.physical_crossing_count,
+      hostCount: row.host_crossing_count ?? 0,
+    })
+    || crossingProjectionDigest(crossings.frozen, authorityVersion) !== row.physical_crossings_digest
     || JSON.stringify(live) !== JSON.stringify(frozen)
   ) return { ok: false, reason: 'settlement crossing snapshot is not exact' };
   const expectedHandleId = `rh_${sha256Bytes([
@@ -473,10 +519,17 @@ function exactSuccessfulResult(input: {
     row.continuation_chain_id,
   ].join('|') + `|${row.handle_argument_digest}|${row.raw_payload_sha256}`).slice(0, 32)}`;
   if (row.handle_id !== expectedHandleId) return { ok: false, reason: 'result handle content address is invalid' };
-  let raw: unknown;
-  try { raw = JSON.parse(row.raw_payload_json); } catch {
-    return { ok: false, reason: 'settled result payload is unreadable' };
+  const retained = readDurableResultPayload({
+    rawLocation: row.raw_location,
+    rawPayloadJson: row.raw_payload_json,
+    rawPayloadSha256: row.raw_payload_sha256,
+    rawByteCount: row.raw_byte_count,
+    rejectionReason: row.rejection_reason,
+  });
+  if (retained.status !== 'ok') {
+    return { ok: false, reason: `settled result payload is unreadable (${retained.reason})` };
   }
+  const raw = retained.value;
   if (inspectProviderEnvelope(raw).verdict !== 'clean') {
     return { ok: false, reason: 'settled result provider envelope is contradictory' };
   }
@@ -545,6 +598,7 @@ function exactReceiptAuthority(
       s.result_handle_id AS settlement_result_handle_id,
       s.physical_crossing_count AS settlement_crossing_count,
       s.host_crossing_count AS settlement_host_crossing_count,
+      s.crossing_authority_version AS settlement_crossing_authority_version,
       s.physical_crossings_digest AS settlement_crossings_digest,
       l.accepted_task_id AS logical_accepted_task_id,
       l.tool_name AS logical_tool_name,
@@ -707,36 +761,54 @@ function verifyReceipt(input: {
     sourceUserSeq: input.sourceUserSeq,
     logicalToolCallId: row.receipt_logical_tool_call_id,
   });
-  const frozenCrossings = crossingProjection(crossingAuthority.frozen);
-  const liveCrossings = crossingProjection(crossingAuthority.live);
+  const authorityVersion = crossingAuthorityVersion(row.settlement_crossing_authority_version);
+  if (authorityVersion === null) {
+    return { ok: false, status: 'conflict', reason: 'settlement crossing authority version is invalid' };
+  }
+  const frozenCrossings = crossingProjection(crossingAuthority.frozen, authorityVersion);
+  const liveCrossings = crossingProjection(crossingAuthority.live, authorityVersion);
   const totalCrossingCount = row.settlement_crossing_count
     + (row.settlement_host_crossing_count ?? 0);
   if (
     crossingAuthority.frozen.length !== totalCrossingCount
     || crossingAuthority.live.length !== totalCrossingCount
     || crossingAuthority.live.some((crossing) => crossing.accepted_task_id !== input.acceptedTaskId)
-    || sha256Bytes(JSON.stringify(frozenCrossings)) !== row.settlement_crossings_digest
+    || !crossingSitesAndStatesMatch({
+      frozen: crossingAuthority.frozen,
+      live: crossingAuthority.live,
+      version: authorityVersion,
+      providerCount: row.settlement_crossing_count,
+      hostCount: row.settlement_host_crossing_count ?? 0,
+    })
+    || crossingProjectionDigest(crossingAuthority.frozen, authorityVersion)
+      !== row.settlement_crossings_digest
     || JSON.stringify(liveCrossings) !== JSON.stringify(frozenCrossings)
   ) {
     return { ok: false, status: 'conflict', reason: 'settlement crossing snapshot is corrupt or differs from live dispatch authority' };
   }
   if (
     row.raw_location === null
-    || row.raw_payload_json === null
     || row.handle_raw_payload_sha256 === null
-    || Buffer.byteLength(row.raw_payload_json, 'utf8') !== row.handle_raw_byte_count
-    || sha256Bytes(row.raw_payload_json) !== row.handle_raw_payload_sha256
     || row.receipt_raw_payload_sha256 !== row.handle_raw_payload_sha256
     || row.receipt_raw_byte_count !== row.handle_raw_byte_count
   ) {
     return { ok: false, status: 'conflict', reason: 'receipt backing bytes are missing or do not match their digest' };
   }
-  let rawPayload: unknown;
-  try {
-    rawPayload = JSON.parse(row.raw_payload_json);
-  } catch {
-    return { ok: false, status: 'conflict', reason: 'receipt backing payload is not valid JSON' };
+  const retained = readDurableResultPayload({
+    rawLocation: row.raw_location,
+    rawPayloadJson: row.raw_payload_json,
+    rawPayloadSha256: row.handle_raw_payload_sha256,
+    rawByteCount: row.handle_raw_byte_count,
+    rejectionReason: row.rejection_reason,
+  });
+  if (retained.status !== 'ok') {
+    return {
+      ok: false,
+      status: 'conflict',
+      reason: `receipt backing payload is unreadable (${retained.reason})`,
+    };
   }
+  const rawPayload = retained.value;
   if (inspectProviderEnvelope(rawPayload).verdict !== 'clean') {
     return { ok: false, status: 'conflict', reason: 'receipt backing provider envelope is contradictory or uninspected' };
   }
@@ -895,7 +967,7 @@ function exactSealedNodeAuthority(input: {
   nodeId: string;
   expectedEffect: string;
   expectedBindingDigest?: string;
-}): { ok: true; binding: Record<string, unknown>; logicalToolCallId: string }
+}): { ok: true; binding: SealedNodeBinding; logicalToolCallId: string }
   | { ok: false; reason: string } {
   const rows = input.db.prepare(`
     SELECT n.binding_json, n.binding_digest,
@@ -945,7 +1017,11 @@ function exactSealedNodeAuthority(input: {
     || binding.logicalToolName !== row.tool_name
     || !digest64(row.argument_digest)
   ) return { ok: false, reason: `node binding and expected-work authority disagree for ${input.nodeId}` };
-  return { ok: true, binding, logicalToolCallId: row.logical_tool_call_id };
+  return {
+    ok: true,
+    binding: binding as unknown as SealedNodeBinding,
+    logicalToolCallId: row.logical_tool_call_id,
+  };
 }
 
 function createdPayload(raw: unknown): {
@@ -970,6 +1046,79 @@ function recordsValue(raw: unknown): unknown[] | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const records = (raw as { records?: unknown }).records;
   return Array.isArray(records) ? records : null;
+}
+
+function verifyAtomicContentCommitInTransaction(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  manifest: ObligationManifest;
+  node: ObligationManifest['nodes'][number];
+  logicalToolCallId: string;
+  createdRaw: unknown;
+  createdToolName: string;
+  createdExecutionSite: 'host' | 'provider';
+  createdPhysicalDispatchId: string;
+  createdId: string;
+  handle: string;
+  providerReceipt: string;
+  intendedDigest: string | null;
+  physicalDispatchId: string;
+}): TerminalPublicationProofResult {
+  const proof = verifyAtomicContentCommit({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    manifest: input.manifest,
+    node: input.node,
+    logicalToolCallId: input.logicalToolCallId,
+    created: {
+      rawPayload: input.createdRaw,
+      toolName: input.createdToolName,
+      executionSite: input.createdExecutionSite,
+      physicalDispatchId: input.createdPhysicalDispatchId,
+    },
+    resolveSealedNodeAuthority(authority) {
+      return exactSealedNodeAuthority({
+        db: input.db,
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        contractId: authority.contractId,
+        nodeId: authority.nodeId,
+        expectedEffect: authority.expectedEffect,
+      });
+    },
+    resolveTypedPhysicalAuthority(authority) {
+      return reopenTypedPhysicalAuthorityInTransaction({
+        db: input.db,
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        physicalDispatchId: authority.physicalDispatchId,
+      });
+    },
+    resolveSuccessfulResult(logicalToolCallId) {
+      const source = exactSuccessfulResult({
+        db: input.db,
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId: input.acceptedTaskId,
+        logicalToolCallId,
+      });
+      return source.ok
+        ? { ok: true, rawPayload: source.raw }
+        : { ok: false, reason: source.reason };
+    },
+  });
+  if (!proof.ok) return proof;
+  return proof.facts.createdId === input.createdId
+    && proof.facts.handle === input.handle
+    && proof.facts.providerReceipt === input.providerReceipt
+    && proof.facts.intendedDigest === input.intendedDigest
+    && proof.facts.physicalDispatchId === input.physicalDispatchId
+    ? { ok: true }
+    : { ok: false, status: 'conflict', reason: 'atomic proof facts conflict with terminal receipt identity' };
 }
 
 function verifyHostSealedWriteReceipt(input: {
@@ -1001,6 +1150,7 @@ function verifyHostSealedWriteReceipt(input: {
   const expectedKind = input.obligation === 'derivation_from_current_source' ? 'derivation'
     : input.obligation === 'commit_effect' ? 'commit'
       : input.obligation === 'verify_committed_readback' ? 'readback'
+        : input.obligation === 'verify_committed_content' ? 'content_commit'
         : null;
   if (!expectedKind) {
     return { ok: false, status: 'not_ready', reason: `write obligation ${input.obligation} has no sealed verifier` };
@@ -1019,7 +1169,9 @@ function verifyHostSealedWriteReceipt(input: {
     || (input.transition.physical_dispatch_id !== null
       && input.transition.physical_dispatch_id !== receipt.physical_dispatch_id)
     || !digest64(receipt.intended_digest)
-    || receipt.observed_digest !== receipt.intended_digest
+    || (input.node.contentCommitMode === 'documented_atomic_input'
+      ? receipt.observed_digest !== null
+      : receipt.observed_digest !== receipt.intended_digest)
   ) return { ok: false, status: 'conflict', reason: 'write transition and receipt identity disagree' };
   if (!exactManifestOperationMapping({
     db: input.db,
@@ -1093,6 +1245,30 @@ function verifyHostSealedWriteReceipt(input: {
     || receipt.provider_receipt === JSON.stringify(createResult.raw)
     || createResult.row.handle_physical_dispatch_id !== receipt.physical_dispatch_id
   ) return { ok: false, status: 'conflict', reason: 'write receipt does not match the exact returned create result' };
+
+  if (input.node.contentCommitMode === 'documented_atomic_input') {
+    if (!['derivation_from_current_source', 'commit_effect', 'verify_committed_content'].includes(input.obligation)) {
+      return { ok: false, status: 'conflict', reason: 'atomic content node declares an incompatible write obligation' };
+    }
+    return verifyAtomicContentCommitInTransaction({
+      db: input.db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: input.acceptedTaskId,
+      manifest: input.manifest,
+      node: input.node,
+      logicalToolCallId: receipt.logical_tool_call_id,
+      createdRaw: createResult.raw,
+      createdToolName: createResult.row.dispatch_tool_name,
+      createdExecutionSite: createResult.row.dispatch_execution_site === 'host' ? 'host' : 'provider',
+      createdPhysicalDispatchId: createResult.row.handle_physical_dispatch_id,
+      createdId: receipt.created_id,
+      handle: receipt.handle,
+      providerReceipt: receipt.provider_receipt,
+      intendedDigest: receipt.intended_digest,
+      physicalDispatchId: receipt.physical_dispatch_id,
+    });
+  }
 
   const artifactRows = input.db.prepare(`
     SELECT a.id AS artifact_id, a.status, a.resource_id, a.uri, a.source_call_id,

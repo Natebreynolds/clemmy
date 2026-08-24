@@ -269,7 +269,7 @@ test('execution primitives are mandated CORE — never pruned off the surface', 
   // 2026-07-07: run_batch shipped registered but NOT mandated, so a fresh chat
   // JIT-pruned it and the model reported it "not exposed". Execution primitives
   // are reached by intent, not message keywords — they MUST survive any JIT.
-  for (const primitive of ['run_worker', 'run_tool_program', 'run_batch']) {
+  for (const primitive of ['run_worker', 'run_batch']) {
     assert.ok(TOOL_JIT_MANDATED.has(primitive), `${primitive} must be a mandated execution primitive`);
   }
 });

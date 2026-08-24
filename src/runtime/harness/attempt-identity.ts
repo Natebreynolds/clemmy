@@ -15,7 +15,7 @@
  * see that the new path paid three times to answer once.
  *
  * So: nested transport wrappers reuse the LOGICAL identity and settle nothing;
- * every retry, poll, account probe and code-mode child dispatch takes a fresh
+ * every retry, poll, account probe and nested child dispatch takes a fresh
  * PHYSICAL id. A pre-dispatch refusal has a logical call and no physical
  * dispatch at all, which is exactly what `dispatchState: 'not_started'` means.
  *
@@ -37,6 +37,15 @@ import {
 import { assertExpectedWorkLogicalAdmission } from './expected-work-admission.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import type { TrustedRuntimeEffectCarrier } from './tool-effect.js';
+import {
+  admitSourceStrategyPhysicalDispatch,
+  type PhysicalSourceCapabilityIdentityV1,
+} from './source-strategy-admission.js';
+import { mintCurrentRequestSourceArgumentAuthority } from './source-strategy-argument-authority.js';
+import {
+  assertDispatchLeaseCurrent,
+  currentDispatchLease,
+} from './dispatch-lease.js';
 
 export interface LogicalCallIdentity {
   acceptedTaskId: string;
@@ -52,10 +61,51 @@ export interface PhysicalDispatchIdentity extends LogicalCallIdentity {
   retryOf?: string;
 }
 
+export interface PhysicalDispatchInput {
+  sessionId: string;
+  sourceUserSeq: number;
+  tool: string;
+  args?: unknown;
+  turn?: number;
+  relation?: DispatchRelation;
+  retryOf?: string;
+  /** Host-only provenance for a wrapper peeled before this paid crossing. */
+  trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
+  /** Exact provider/tool/account/schema identity resolved by the trusted
+   * gateway. Required only when this crossing is the confirmed aggregate
+   * source requirement; irrelevant reads and writes keep existing behavior. */
+  sourceCapability?: PhysicalSourceCapabilityIdentityV1;
+  /** Opaque proof that the source-strategy reducer already admitted these exact
+   * bytes in this exact logical-call/lease frame. This is used only when an
+   * adapter must perform a durable local reservation after source admission but
+   * before the physical provider-start row is inserted. */
+  sourceAdmissionProof?: PhysicalDispatchSourceAdmissionProof;
+}
+
+/** Public only as an opaque hand-off type. Object shape is not authority; the
+ * module-private WeakMap below binds the exact minted object and consumes it
+ * once at `withPhysicalDispatch`. */
+export interface PhysicalDispatchSourceAdmissionProof {
+  readonly version: 1;
+}
+
 export class PhysicalDispatchPreDispatchError extends Error {
-  override readonly name = 'PhysicalDispatchPreDispatchError';
+  override readonly name: string = 'PhysicalDispatchPreDispatchError';
   constructor(readonly reason: string) {
     super(`Provider dispatch refused before I/O: ${reason}`);
+  }
+}
+
+/** A confirmed aggregate-source binding refused this exact resolved provider
+ * identity. This is a physical pre-dispatch denial: no provider-start row and
+ * no network I/O exist. */
+export class SourceStrategyPhysicalDispatchError extends PhysicalDispatchPreDispatchError {
+  override readonly name = 'SourceStrategyPhysicalDispatchError';
+  constructor(
+    readonly kind: 'source_strategy_unconfirmed' | 'source_strategy_mismatch' | 'source_strategy_authority_invalid',
+    reason: string,
+  ) {
+    super(`${kind}: ${reason}`);
   }
 }
 
@@ -105,6 +155,139 @@ interface LogicalFrame extends LogicalCallIdentity {
 
 const logicalStorage = new AsyncLocalStorage<LogicalFrame>();
 const physicalStorage = new AsyncLocalStorage<PhysicalDispatchIdentity>();
+
+interface PhysicalDispatchSourceAdmissionRecord {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalFrame?: LogicalFrame;
+  logicalToolCallId?: string;
+  dispatchLease?: ReturnType<typeof currentDispatchLease>;
+  toolName: string;
+  argumentDigest: string;
+  capabilityKey: string;
+}
+
+const physicalSourceAdmissionProofs = new WeakMap<object, PhysicalDispatchSourceAdmissionRecord>();
+
+function sourceCapabilityKey(capability: PhysicalSourceCapabilityIdentityV1 | undefined): string {
+  return JSON.stringify([
+    capability?.capabilityId ?? null,
+    capability?.accountIdentity ?? null,
+    capability?.schemaFingerprint ?? null,
+  ]);
+}
+
+function sameDispatchLease(
+  left: ReturnType<typeof currentDispatchLease>,
+  right: ReturnType<typeof currentDispatchLease>,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.sessionId === right.sessionId
+    && left.scopeId === right.scopeId
+    && left.leaseId === right.leaseId
+    && left.sourceUserSeq === right.sourceUserSeq
+    && left.acceptedTaskId === right.acceptedTaskId
+    && left.logicalToolCallId === right.logicalToolCallId;
+}
+
+function admitPhysicalSourceAtCurrentEdge(
+  input: Pick<PhysicalDispatchInput, 'sessionId' | 'sourceUserSeq' | 'tool' | 'args' | 'sourceCapability'>,
+  acceptedTaskId: string,
+  owned: LogicalFrame | undefined,
+  dispatchLease: ReturnType<typeof currentDispatchLease>,
+): void {
+  // A source binding proves provider/account/schema identity, not arbitrary
+  // model-selected query bytes. At the resolved body edge, bind the exact
+  // provider-ready contract to this open logical row and current call lease.
+  const sourceArgumentAuthority = input.sourceCapability && owned && dispatchLease
+    ? mintCurrentRequestSourceArgumentAuthority({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId,
+        logicalToolCallId: owned.logicalToolCallId,
+        tool: input.tool,
+        args: input.args,
+        lease: dispatchLease,
+      })
+    : null;
+
+  const sourceAdmission = admitSourceStrategyPhysicalDispatch({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    ...(input.sourceCapability ? { capability: input.sourceCapability } : {}),
+    tool: input.tool,
+    args: input.args,
+    ...(sourceArgumentAuthority ? { argumentAuthority: sourceArgumentAuthority } : {}),
+  });
+  if (sourceAdmission.status === 'refused') {
+    throw new SourceStrategyPhysicalDispatchError(sourceAdmission.kind, sourceAdmission.message);
+  }
+}
+
+/**
+ * Admit source strategy before an adapter's irreversible local reservation.
+ *
+ * The returned proof is exact-call, exact-lease, exact-provider-ready-args and
+ * one-shot. A copied/lookalike object, a changed argument/capability, a different
+ * logical frame, or a revoked/replaced lease cannot authorize the later body.
+ */
+export function preflightPhysicalDispatchSourceAdmission(
+  input: Omit<PhysicalDispatchInput, 'sourceAdmissionProof'>,
+): PhysicalDispatchSourceAdmissionProof {
+  const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
+  const dispatchLease = currentDispatchLease();
+  assertDispatchLeaseCurrent(dispatchLease);
+  const frame = logicalStorage.getStore();
+  const owned = frame && frame.acceptedTaskId === acceptedTaskId ? frame : undefined;
+  const contract = durableLogicalCallContract(acceptedTaskId, input.tool, input.args);
+  if (!contract) {
+    throw new PhysicalDispatchPreDispatchError('source admission input is not a durable logical contract');
+  }
+  admitPhysicalSourceAtCurrentEdge(input, acceptedTaskId, owned, dispatchLease);
+  const proof = Object.freeze({ version: 1 as const });
+  physicalSourceAdmissionProofs.set(proof, {
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId,
+    ...(owned ? { logicalFrame: owned, logicalToolCallId: owned.logicalToolCallId } : {}),
+    ...(dispatchLease ? { dispatchLease } : {}),
+    toolName: contract.toolName,
+    argumentDigest: contract.argumentDigest,
+    capabilityKey: sourceCapabilityKey(input.sourceCapability),
+  });
+  return proof;
+}
+
+function consumePhysicalDispatchSourceAdmissionProof(
+  proof: PhysicalDispatchSourceAdmissionProof,
+  input: PhysicalDispatchInput,
+  acceptedTaskId: string,
+  owned: LogicalFrame | undefined,
+  dispatchLease: ReturnType<typeof currentDispatchLease>,
+): void {
+  const record = physicalSourceAdmissionProofs.get(proof as object);
+  physicalSourceAdmissionProofs.delete(proof as object);
+  const contract = durableLogicalCallContract(acceptedTaskId, input.tool, input.args);
+  if (
+    !record
+    || record.sessionId !== input.sessionId
+    || record.sourceUserSeq !== input.sourceUserSeq
+    || record.acceptedTaskId !== acceptedTaskId
+    || record.logicalFrame !== owned
+    || record.logicalToolCallId !== owned?.logicalToolCallId
+    || !sameDispatchLease(record.dispatchLease, dispatchLease)
+    || !contract
+    || record.toolName !== contract.toolName
+    || record.argumentDigest !== contract.argumentDigest
+    || record.capabilityKey !== sourceCapabilityKey(input.sourceCapability)
+  ) {
+    throw new SourceStrategyPhysicalDispatchError(
+      'source_strategy_authority_invalid',
+      'physical source admission proof is absent, consumed, or does not own this exact call and lease. No provider call was started.',
+    );
+  }
+}
 
 export function currentLogicalCall(): LogicalCallIdentity | undefined {
   const frame = logicalStorage.getStore();
@@ -194,7 +377,7 @@ export function withLogicalToolCall<T>(
     /** Host-only provenance for a trusted wrapper peeled to this exact call. */
     trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
     /**
-     * The host invocation id when one already exists (SDK call id, code-mode
+     * The host invocation id when one already exists (SDK call id, nested-dispatch
      * child id, batch item id).  A nested carrier that supplies the SAME id
      * inherits the ambient call; a genuinely different host invocation opens
      * a new logical call even when it runs beneath a parent tool.
@@ -299,22 +482,29 @@ export function withLogicalToolCall<T>(
  * from a comparison.
  */
 export async function withPhysicalDispatch<T>(
-  input: {
-    sessionId: string;
-    sourceUserSeq: number;
-    tool: string;
-    args?: unknown;
-    turn?: number;
-    relation?: DispatchRelation;
-    retryOf?: string;
-    /** Host-only provenance for a wrapper peeled before this paid crossing. */
-    trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
-  },
+  input: PhysicalDispatchInput,
   work: (identity: PhysicalDispatchIdentity) => Promise<T>,
 ): Promise<T> {
   const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
+  const dispatchLease = currentDispatchLease();
   const frame = logicalStorage.getStore();
   const owned = frame && frame.acceptedTaskId === acceptedTaskId ? frame : undefined;
+
+  // The provider adapter has finished resolving the actual slug/account/schema
+  // at this point, but no paid-crossing authority has been inserted yet. Apply
+  // the one durable source-selection gate here so Claude/Codex, Composio/native
+  // MCP, resume, and fallover cannot acquire different opinions downstream.
+  if (input.sourceAdmissionProof) {
+    consumePhysicalDispatchSourceAdmissionProof(
+      input.sourceAdmissionProof,
+      input,
+      acceptedTaskId,
+      owned,
+      dispatchLease,
+    );
+  } else {
+    admitPhysicalSourceAtCurrentEdge(input, acceptedTaskId, owned, dispatchLease);
+  }
   if (owned) owned.crossings += 1;
 
   const proposed: PhysicalDispatchIdentity = {
@@ -350,23 +540,20 @@ export async function withPhysicalDispatch<T>(
   const crossing = { ...identity, sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq };
 
   return physicalStorage.run(identity, async () => {
+    let result: T;
     try {
-      const result = await work(identity);
-      const settled = settlePhysicalDispatch({
-        identity: crossing, tool: input.tool, outcome: 'returned', turn: input.turn,
-      });
-      if (settled.status !== 'inserted' && settled.status !== 'replayed') {
-        throw new PhysicalDispatchSettlementError(
-          settled.reason,
-        );
-      }
-      return result;
+      result = await work(identity);
     } catch (error) {
-      // A settlement-persistence error thrown above already attempted to close
-      // the returned crossing. Do not contradict it with a synthetic `threw`.
-      if (error instanceof PhysicalDispatchSettlementError) throw error;
+      // A host stop revokes this generation before recovery. The detached body
+      // must then leave terminalization to the exact-generation CAS instead of
+      // upgrading a timed_out/cancelled/unknown row to `threw` later.
+      assertDispatchLeaseCurrent(dispatchLease);
       const settled = settlePhysicalDispatch({
-        identity: crossing, tool: input.tool, outcome: 'threw', turn: input.turn,
+        identity: crossing,
+        tool: input.tool,
+        outcome: 'threw',
+        turn: input.turn,
+        dispatchLease,
       });
       if (settled.status !== 'inserted' && settled.status !== 'replayed') {
         throw new PhysicalDispatchSettlementError(
@@ -375,6 +562,18 @@ export async function withPhysicalDispatch<T>(
       }
       throw error;
     }
+    assertDispatchLeaseCurrent(dispatchLease);
+    const settled = settlePhysicalDispatch({
+      identity: crossing,
+      tool: input.tool,
+      outcome: 'returned',
+      turn: input.turn,
+      dispatchLease,
+    });
+    if (settled.status !== 'inserted' && settled.status !== 'replayed') {
+      throw new PhysicalDispatchSettlementError(settled.reason);
+    }
+    return result;
   });
 }
 

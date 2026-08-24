@@ -30,7 +30,11 @@ const {
   updateBackgroundTask,
 } = await import('../execution/background-tasks.js');
 const { startRun, finishRun } = await import('../runtime/run-events.js');
-const { executionBoardProjection, registerConsoleRoutes } = await import('./console-routes.js');
+const {
+  executionBoardProjection,
+  projectForegroundTaskControlCard,
+  registerConsoleRoutes,
+} = await import('./console-routes.js');
 const { readWorkflow, writeWorkflow } = await import('../memory/workflow-store.js');
 const { fireWorkflowSystemEvent } = await import('../execution/workflow-trigger-engine.js');
 const { CRON_TRIGGERS_DIR, WORKFLOW_RUNS_DIR, updateEnvKey, clearWorkspaceProjectCache } = await import('../tools/shared.js');
@@ -38,6 +42,7 @@ const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 const { queueWorkflowRun } = await import('../tools/workflow-run-queue.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { registerResumableApprovalCardAtomically } = await import('../runtime/harness/approval-card.js');
 const { queuePendingAction } = await import('../runtime/harness/pending-actions.js');
 const {
   appendEvent: appendHarnessEvent,
@@ -328,6 +333,89 @@ test('GET /api/console/board normalizes every background-task status into the ri
     assert.equal(byId.get(awaitingContinue.id)?.primaryAction, 'continue');
     assert.equal(byId.get(awaitingInput.id)?.primaryAction, 'none');
     assert.match(byId.get(awaitingInput.id)?.nextSafeAction ?? '', /originating chat/i);
+  } finally {
+    await h.close();
+  }
+});
+
+test('foreground chat board mode returns only bounded exact control carriers', async () => {
+  const task = createBackgroundTask({
+    title: 'Foreground control safe title',
+    prompt: 'CONTROL-PRIVATE-PROMPT-CANARY',
+    source: 'CONTROL-PRIVATE-ORIGIN-CANARY',
+  });
+  markBackgroundTaskRunning(task.id);
+  markBackgroundTaskAwaitingInput(
+    task.id,
+    'control-private-question-id',
+    'CONTROL-PRIVATE-PENDING-QUESTION-CANARY',
+  );
+  updateBackgroundTask(task.id, {
+    result: 'CONTROL-PRIVATE-RESULT-PREVIEW-CANARY',
+    error: 'CONTROL-PRIVATE-ERROR-CANARY',
+    requestedModel: 'CONTROL-PRIVATE-REQUESTED-MODEL-CANARY',
+    effectiveModel: 'CONTROL-PRIVATE-EFFECTIVE-MODEL-CANARY',
+    modelProvider: 'CONTROL-PRIVATE-PROVIDER-CANARY',
+  });
+
+  const h = await boot();
+  try {
+    const response = await fetch(`${h.url}/api/console/board?surface=foreground-chat`);
+    assert.equal(response.status, 200);
+    const bytes = await response.text();
+    for (const canary of [
+      'CONTROL-PRIVATE-PROMPT-CANARY',
+      'CONTROL-PRIVATE-ORIGIN-CANARY',
+      'CONTROL-PRIVATE-PENDING-QUESTION-CANARY',
+      'CONTROL-PRIVATE-RESULT-PREVIEW-CANARY',
+      'CONTROL-PRIVATE-ERROR-CANARY',
+      'CONTROL-PRIVATE-REQUESTED-MODEL-CANARY',
+      'CONTROL-PRIVATE-EFFECTIVE-MODEL-CANARY',
+      'CONTROL-PRIVATE-PROVIDER-CANARY',
+    ]) {
+      assert.equal(bytes.includes(canary), false, `foreground control response leaked ${canary}`);
+    }
+    const body = JSON.parse(bytes) as { cards: Array<Record<string, unknown>> };
+    assert.ok(body.cards.length <= 100, 'foreground control response exceeded its cap');
+    const control = body.cards.find((card) => card.id === task.id);
+    assert.ok(control, 'exact background control carrier was omitted');
+    assert.deepEqual(Object.keys(control!).sort(), [
+      'actions', 'ageMs', 'column', 'id', 'progressHint', 'raw', 'sessionId',
+      'sourceKind', 'status', 'title', 'updatedAt',
+    ].sort());
+    assert.deepEqual(control!.actions, ['cancel']);
+    assert.deepEqual(control!.raw, {});
+    assert.equal(control!.title, '');
+    assert.equal(control!.progressHint, '');
+
+    const pure = projectForegroundTaskControlCard({
+      id: 'run-control', sourceKind: 'run', title: 'PRIVATE-TITLE', column: 'running',
+      status: 'active', progressHint: 'PRIVATE-PROGRESS', sessionId: 'session-control',
+      ageMs: 1, updatedAt: '2026-08-23T00:00:00.000Z',
+      actions: ['cancel', 'approve', 'archive', 'resume_safe'],
+      attemptId: 'attempt-control', runScopeId: 'scope-control',
+      cancelEndpoint: '/api/console/harness-sessions/session-control/cancel',
+      raw: {
+        runId: 'run-control', workflowName: 'Safe workflow', workflowSlug: 'safe-workflow',
+        resultPreview: 'PRIVATE-RESULT', modelRoute: 'PRIVATE-MODEL',
+        pendingQuestion: 'PRIVATE-QUESTION', error: 'PRIVATE-ERROR', output: 'PRIVATE-OUTPUT',
+        prompt: 'PRIVATE-PROMPT',
+      },
+    });
+    assert.deepEqual(pure?.actions, ['cancel', 'resume_safe']);
+    assert.deepEqual(pure?.raw, {
+      runId: 'run-control', workflowName: 'Safe workflow', workflowSlug: 'safe-workflow',
+    });
+    assert.equal(JSON.stringify(pure).includes('PRIVATE-'), false);
+
+    const resumableBackground = projectForegroundTaskControlCard({
+      id: 'background-control', sourceKind: 'background', title: 'PRIVATE-TITLE',
+      column: 'needs_you', status: 'blocked', progressHint: 'PRIVATE-PROGRESS',
+      sessionId: 'background:control', ageMs: 1, updatedAt: '2026-08-23T00:00:00.000Z',
+      actions: ['resume', 'cancel', 'promote', 'approve'], raw: { resultPreview: 'PRIVATE-RESULT' },
+    });
+    assert.deepEqual(resumableBackground?.actions, ['resume', 'cancel']);
+    assert.deepEqual(resumableBackground?.raw, {});
   } finally {
     await h.close();
   }
@@ -656,6 +744,8 @@ test('GET /api/console/approvals/list joins queued pending-action payloads', asy
     const body = await res.json() as {
       approvals: Array<{
         approvalId: string;
+        status: string;
+        resolution: string | null;
         pendingAction?: {
           id: string;
           title: string;
@@ -668,12 +758,55 @@ test('GET /api/console/approvals/list joins queued pending-action payloads', asy
     };
     const row = body.approvals.find((a) => a.approvalId === approval.approvalId);
     assert.ok(row, 'approval row returned');
+    assert.equal(row!.status, 'pending');
+    assert.equal(row!.resolution, null);
     assert.equal(row!.pendingAction?.id, action.id);
     assert.equal(row!.pendingAction?.title, 'Send queued proof email');
     assert.equal(row!.pendingAction?.toolName, 'composio_execute_tool');
     assert.equal(row!.pendingAction?.targetSummary, 'proof@example.com');
     assert.equal(row!.pendingAction?.payloadHash, action.payloadHash);
     assert.deepEqual(row!.pendingAction?.payload, payload);
+  } finally {
+    await h.close();
+  }
+});
+
+test('formal recurrence consent is visible and resolvable through the desktop approval surface', async () => {
+  const sessionId = `desktop-recurrence-consent-${Date.now().toString(36)}`;
+  createHarnessSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
+  const card = registerResumableApprovalCardAtomically({
+    sessionId,
+    channel: 'desktop',
+    subject: 'Activate the reviewed read-only interval?',
+    tool: 'automation_recurrence_activate',
+    args: {
+      version: 1,
+      workflowId: 'record-index',
+      previewId: 'preview.record-index',
+      effect: 'read',
+      externalWrites: false,
+      sends: false,
+    },
+    resumeKey: `automation-recurrence-consent:v1:${'a'.repeat(64)}`,
+  });
+  const h = await boot();
+  try {
+    const list = await fetch(`${h.url}/api/console/approvals/list`);
+    assert.equal(list.status, 200);
+    const body = await list.json() as {
+      approvals: Array<{ approvalId: string; tool: string; subject: string }>;
+    };
+    assert.ok(body.approvals.some((row) => (
+      row.approvalId === card.row.approvalId
+      && row.tool === 'automation_recurrence_activate'
+      && row.subject === 'Activate the reviewed read-only interval?'
+    )));
+    const approved = await fetch(
+      `${h.url}/api/console/harness-approvals/${card.row.approvalId}/approve`,
+      { method: 'POST' },
+    );
+    assert.equal(approved.status, 200);
+    assert.equal(approvalRegistry.get(card.row.approvalId)?.resolution, 'approved');
   } finally {
     await h.close();
   }
@@ -3264,11 +3397,27 @@ test('workflow failed-item recovery endpoints list and requeue only final failed
   appendWorkflowEvent(workflowSlug, runId, { kind: 'item_failed', stepId: 'send', itemKey: 'a', error: 'transient a failure' });
   appendWorkflowEvent(workflowSlug, runId, { kind: 'item_failed', stepId: 'send', itemKey: 'b', error: 'still failed' });
   appendWorkflowEvent(workflowSlug, runId, { kind: 'item_completed', stepId: 'send', itemKey: 'a', output: 'recovered' });
+  // Match the production workflow runner's public lifecycle projection. A
+  // terminal workflow JSON record is not an in-flight queue item; the Tasks
+  // board receives terminal truth from the canonical activity run instead.
+  startRun({
+    id: runId,
+    sessionId: `workflow:${runId}`,
+    channel: 'workflow',
+    source: 'workflow',
+    title: `Workflow: ${workflowName}`,
+    message: `Running workflow "${workflowName}"`,
+  });
+  finishRun(runId, {
+    status: 'completed',
+    message: 'Needs attention — one item is still failed',
+    needsAttention: true,
+  });
 
   const h = await boot();
   try {
     const board = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: BoardCard[] };
-    const wfCard = board.cards.find((c) => c.sourceKind === 'workflow' && c.raw?.runId === runId);
+    const wfCard = board.cards.find((c) => c.sourceKind === 'run' && c.raw?.runId === runId);
     assert.ok(wfCard, 'workflow run appears on the Tasks board');
     assert.equal(wfCard!.primaryAction, 'retry_failed_items');
     assert.equal(wfCard!.failureSummary?.failedItems, 1);

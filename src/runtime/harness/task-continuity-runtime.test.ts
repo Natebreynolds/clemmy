@@ -13,8 +13,15 @@ const eventlog = await import('./eventlog.js');
 const continuity = await import('../../memory/task-continuity.js');
 const runtime = await import('./task-continuity-runtime.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
-const { turnOutcomeId } = await import('./turn-outcome.js');
+const { presentationEventFromCompletionData, turnOutcomeId } = await import('./turn-outcome.js');
 const { discoveryGovernor } = await import('./discovery-governor.js');
+const attemptIdentity = await import('./attempt-identity.js');
+const dispatchLedger = await import('./dispatch-ledger.js');
+const schemaCache = await import('../../tools/composio-schema-cache.js');
+const capabilityCandidates = await import('../read-path/capability-candidates.js');
+const { recordAcceptedSourceGraph } = await import('./record-accepted-source-graph.js');
+const turnControl = await import('./turn-control.js');
+const sourceAdmission = await import('./source-strategy-admission.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -241,6 +248,19 @@ test('an internal awaiting question that differs from the delivered terminal can
 test('clarification answer classification is conversational but question-shaped and fail-closed', () => {
   const binary = { kind: 'clarification' as const, question: 'Should I send it?', options: ['Yes', 'No'] };
   assert.deepEqual(runtime.classifyClarificationAnswer('Yes, please.', binary), { disposition: 'affirmed' });
+  const meantHost = {
+    kind: 'clarification' as const,
+    question: 'Nate, did you mean Acme.io (plural)? Example.com is a sale page; Acme.io has the active index.',
+    options: [] as string[],
+  };
+  assert.equal(runtime.classifyClarificationAnswer('Yes', meantHost)?.disposition, 'affirmed');
+  assert.equal(runtime.classifyClarificationAnswer('i did yes', meantHost)?.disposition, 'affirmed');
+  assert.equal(runtime.classifyClarificationAnswer('yes acme.io', meantHost)?.disposition, 'affirmed');
+  assert.equal(
+    runtime.classifyClarificationAnswer('find five widgets and put them in a workbook', meantHost),
+    null,
+    'a new construct is not an answer to the parked host question',
+  );
   assert.deepEqual(runtime.classifyClarificationAnswer('No.', binary), {
     disposition: 'declined',
   });
@@ -429,6 +449,609 @@ test('a public slot answer resumes private task context while hidden option ordi
   assert.match(enriched.semanticTaskInput ?? '', /Which connected calendar should I use/);
   assert.ok(enriched.turnCandidates?.candidates.some((row) => row.identifier === 'calendar_list_events'));
   assert.equal(discoveryGovernor.getTaskState({ sessionId, sourceUserSeq: answer.seq })?.policy.knownCapability, true);
+});
+
+test('an exact material-source answer inherits and re-promotes the durable parent binding', async () => {
+  const sessionId = 'continuity-material-source-binding';
+  const objective = 'Find five Pismo Beach restaurants and create one new Google Sheet.';
+  const question = 'I will use the exact Apify restaurant source and create one new Google Sheet. Use that source?';
+  const slug = 'APIFY_PISMO_PRIMARY_GET_ITEMS';
+  const fallbackSlug = 'APIFY_PISMO_FALLBACK_GET_ITEMS';
+  const initialObservation = Date.now() - 1_000;
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object',
+    properties: { actorId: { type: 'string' } },
+    required: ['actorId'],
+  }, initialObservation);
+  schemaCache.rememberToolSchema(fallbackSlug, {
+    type: 'object',
+    properties: { actorId: { type: 'string' } },
+    required: ['actorId'],
+  }, initialObservation);
+  const schemaFingerprint = schemaCache.liveComposioSchemaFingerprint(slug);
+  const fallbackSchemaFingerprint = schemaCache.liveComposioSchemaFingerprint(fallbackSlug);
+  assert.ok(schemaFingerprint);
+  assert.ok(fallbackSchemaFingerprint);
+  const sourceStrategyBinding = {
+    version: 1,
+    primary: {
+      capabilityId: `capability:composio:${slug}`,
+      schemaFingerprint: schemaFingerprint!,
+    },
+    equivalentFallbacks: [{
+      capabilityId: `capability:composio:${fallbackSlug}`,
+      schemaFingerprint: fallbackSchemaFingerprint!,
+    }],
+    topology: 'single_aggregate_read_then_single_artifact_write',
+    topologyDigest: 'd'.repeat(64),
+    destination: { family: 'workbook', posture: 'create_new' },
+    effect: 'external_write',
+  } as const;
+  const source = accepted(sessionId, objective);
+  await recordAcceptedSourceGraph({
+    identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
+    surface: 'direct',
+    acceptedText: objective,
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'system',
+    type: 'turn_preflight_decision',
+    data: {
+      phase: 'align',
+      consequential: true,
+      objective,
+      intentKey: 'material-source-binding',
+      reason: 'collect_then_construct',
+      confirmationDisposition: 'material_source_strategy',
+      sourceStrategyPosture: 'materially_variant',
+      sourceStrategyBinding,
+      sourceUserSeq: source.seq,
+    },
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question,
+      purpose: 'clarification',
+      source: 'preflight_alignment',
+      sourceUserSeq: source.seq,
+      intentKey: 'material-source-binding',
+      confirmationDisposition: 'material_source_strategy',
+      sourceStrategyBinding,
+    },
+  });
+  const identity = { sessionId, turn: 1, sourceUserSeq: source.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: question },
+  });
+  const answerText = 'Use Apify as the restaurant source.';
+  const answer = accepted(sessionId, answerText);
+  const crowded = Array.from({ length: 12 }, (_, index) => ({
+    identifier: `UNRELATED_SOURCE_${index}`,
+    kind: 'composio',
+    intent: `unrelated source ${index}`,
+    klass: 'capability_only',
+    via: 'exact' as const,
+    score: 1 - index / 100,
+  }));
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId,
+    sourceUserSeq: answer.seq,
+    message: answerText,
+    turnCandidates: {
+      candidates: crowded,
+      requirements: [],
+      matches: [],
+      pinnedTools: [],
+      semanticApplied: false,
+    },
+  }, answer.seq, {
+    typedClassification: { disposition: 'provided' },
+  });
+
+  assert.equal(
+    JSON.stringify(enriched.turnCandidates?.sourceStrategyBinding),
+    JSON.stringify(sourceStrategyBinding),
+    'the exact parent awaiting/decision bytes outrank a fresh continuation re-resolve',
+  );
+  assert.equal(enriched.turnCandidates?.candidates[0]?.identifier, slug,
+    'the bound primary survives the continuation top-K as the first executable row');
+  assert.equal(enriched.turnCandidates?.candidates[1]?.identifier, fallbackSlug,
+    'every bounded fallback survives the continuation top-K beside the primary');
+  assert.deepEqual(enriched.turnCandidates?.candidates.slice(0, 2).map((row) => row.requiredFields), [
+    ['actorId'],
+    ['actorId'],
+  ]);
+  assert.ok(enriched.turnCandidates?.pinnedTools.includes('composio_execute_tool'));
+  const card = capabilityCandidates.renderCapabilityCandidateCard(enriched.turnCandidates);
+  assert.match(card, new RegExp(`work_call[\\s\\S]*${slug}`));
+  assert.match(card, /Required inner arguments: actorId/);
+});
+
+test('exact live primary-only A/Q/B consumes, narrows, approves, and leaves parameterized source I/O blocked', async () => {
+  const sessionId = 'continuity-live-primary-only-pismo';
+  const objective = 'Find the top 5 restaurants in Pismo Beach by Google review count. Include each restaurant name, review count, and phone number, then create one new Google Sheet containing those 5 rows. Do not email or share it.';
+  const question = [
+    "I want to pull this from Apify's Google Maps scraper (via the sync dataset-items run) to gather the top 5 Pismo Beach restaurants ranked by review count, pulling name, review count, and phone for each — with the alternate Apify actor-run endpoint as fallback if the primary one doesn't return clean results. Once I have those 5 rows, I'll create one brand-new Google Sheet with them, nothing shared or emailed.",
+    'Does that source and approach work for you, or would you rather I pull from a different provider?',
+  ].join('\n\n');
+  const answerText = 'Yes—use exactly the primary source action you named, with the same parameters. Do not use the fallback.';
+  const slug = 'APIFY_PISMO_CONTINUATION_PRIMARY_GET_ITEMS';
+  const fallbackSlug = 'APIFY_PISMO_CONTINUATION_FALLBACK_GET_ITEMS';
+  const initialObservation = Date.now() - 1_000;
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object',
+    properties: { actorId: { type: 'string' } },
+    required: ['actorId'],
+  }, initialObservation);
+  schemaCache.rememberToolSchema(fallbackSlug, {
+    type: 'object',
+    properties: { actorId: { type: 'string' } },
+    required: ['actorId'],
+  }, initialObservation);
+  const schemaFingerprint = schemaCache.liveComposioSchemaFingerprint(slug);
+  const fallbackSchemaFingerprint = schemaCache.liveComposioSchemaFingerprint(fallbackSlug);
+  assert.ok(schemaFingerprint);
+  assert.ok(fallbackSchemaFingerprint);
+  const sourceStrategyBinding = {
+    version: 1,
+    primary: {
+      capabilityId: `capability:composio:${slug}`,
+      accountIdentity: 'account-primary',
+      schemaFingerprint: schemaFingerprint!,
+    },
+    equivalentFallbacks: [{
+      capabilityId: `capability:composio:${fallbackSlug}`,
+      schemaFingerprint: fallbackSchemaFingerprint!,
+    }, {
+      capabilityId: `capability:composio:${slug}`,
+      accountIdentity: 'account-fallback',
+      schemaFingerprint: schemaFingerprint!,
+    }],
+    topology: 'single_aggregate_read_then_single_artifact_write',
+    topologyDigest: 'f'.repeat(64),
+    destination: { family: 'workbook', posture: 'create_new' },
+    effect: 'external_write',
+  } as const;
+  const source = accepted(sessionId, objective);
+  await recordAcceptedSourceGraph({
+    identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
+    surface: 'direct',
+    acceptedText: objective,
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'system',
+    type: 'turn_preflight_decision',
+    data: {
+      phase: 'align',
+      consequential: true,
+      objective,
+      intentKey: 'live-primary-only-pismo',
+      reason: 'collect_then_construct',
+      confirmationDisposition: 'material_source_strategy',
+      sourceStrategyPosture: 'materially_variant',
+      sourceStrategyBinding,
+      sourceUserSeq: source.seq,
+    },
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: source.turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question,
+      purpose: 'clarification',
+      source: 'preflight_alignment',
+      sourceUserSeq: source.seq,
+      intentKey: 'live-primary-only-pismo',
+      confirmationDisposition: 'material_source_strategy',
+      sourceStrategyBinding,
+    },
+  });
+  const identity = { sessionId, turn: source.turn, sourceUserSeq: source.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: question },
+  });
+  const parked = continuity.peekTaskContinuityPacket({ sessionId });
+  assert.equal(parked.status, 'available');
+  if (parked.status === 'available') {
+    assert.equal(parked.packet.originatingSourceUserSeq, source.seq);
+    assert.equal(parked.packet.pause.question, question.replace(/\s+/g, ' ').trim());
+  }
+  assert.deepEqual(
+    turnControl.sourceStrategyBindingAffirmedByAnswer(answerText, sourceStrategyBinding),
+    { ...sourceStrategyBinding, equivalentFallbacks: [] },
+  );
+
+  // The exact A/Q binding remains durable audit history, but the fallback's
+  // provider contract drifts before B arrives. B revokes it, so only the
+  // retained primary may participate in continuation validation/replay.
+  schemaCache.rememberToolSchema(fallbackSlug, {
+    type: 'object',
+    properties: {
+      actorId: { type: 'string' },
+      locale: { type: 'string' },
+    },
+    required: ['actorId', 'locale'],
+  }, Date.now());
+  assert.notEqual(
+    schemaCache.liveComposioSchemaFingerprint(fallbackSlug),
+    fallbackSchemaFingerprint,
+    'the revoked fallback is provably stale before B is consumed',
+  );
+
+  const answer = accepted(sessionId, answerText);
+  const staleFallbackCandidate = {
+    identifier: fallbackSlug,
+    kind: 'composio',
+    intent: 'stale fallback leaked from the caller surface',
+    klass: 'capability_only',
+    via: 'exact' as const,
+    score: 1,
+    effectClass: 'read' as const,
+  };
+  const sameSlugFallbackCandidate = {
+    identifier: slug,
+    kind: 'composio',
+    accountIdentity: 'account-fallback',
+    schemaFingerprint: schemaFingerprint!,
+    intent: 'same action slug on the explicitly revoked fallback account',
+    klass: 'capability_only',
+    via: 'exact' as const,
+    score: 1,
+    effectClass: 'read' as const,
+  };
+  const continuationRequest = {
+    sessionId,
+    sourceUserSeq: answer.seq,
+    message: answerText,
+    turnCandidates: {
+      candidates: [staleFallbackCandidate, sameSlugFallbackCandidate],
+      requirements: [{
+        roleKey: 'clause-0:read',
+        clauseIndex: 0,
+        text: 'collect the restaurant source set',
+        effect: 'read' as const,
+        resolved: true,
+        resolvedCapabilities: [staleFallbackCandidate],
+      }],
+      matches: [],
+      pinnedTools: ['composio_execute_tool'],
+      semanticApplied: false,
+      sourceStrategyBinding,
+    },
+  };
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity(
+    continuationRequest,
+    answer.seq,
+  );
+
+  assert.equal(enriched.taskContinuation?.disposition, 'affirmed');
+  assert.equal(enriched.taskContinuation?.parentSourceUserSeq, source.seq);
+  assert.equal(enriched.taskContinuation?.question, question.replace(/\s+/g, ' ').trim());
+  assert.equal(enriched.taskContinuation?.answer, answerText);
+  const narrowedBinding = enriched.turnCandidates?.sourceStrategyBinding;
+  assert.equal(narrowedBinding?.primary.capabilityId, `capability:composio:${slug}`);
+  assert.deepEqual(narrowedBinding?.equivalentFallbacks, [], 'B explicitly revoked the fallback');
+  assert.equal(
+    enriched.turnCandidates?.candidates.some((candidate) => candidate.identifier === fallbackSlug),
+    false,
+    'the revoked fallback is absent from the merged executable candidate surface',
+  );
+  assert.equal(
+    enriched.turnCandidates?.candidates.some((candidate) =>
+      candidate.identifier === slug && candidate.accountIdentity === 'account-fallback'),
+    false,
+    'a same-slug fallback on a different account is pruned by full source identity',
+  );
+  assert.equal(
+    enriched.turnCandidates?.candidates.some((candidate) =>
+      candidate.identifier === slug && candidate.accountIdentity === 'account-primary'),
+    true,
+    'the retained same-slug primary account remains model-visible',
+  );
+  const narrowedCard = capabilityCandidates.renderCapabilityCandidateCard(enriched.turnCandidates);
+  assert.doesNotMatch(narrowedCard, new RegExp(fallbackSlug));
+  assert.doesNotMatch(narrowedCard, /account-fallback/);
+  assert.match(narrowedCard, new RegExp(slug));
+  assert.equal(enriched.turnCandidates?.requirements[0]?.resolved, true,
+    'revoking a fallback does not reopen broad source discovery');
+  assert.deepEqual(enriched.turnCandidates?.requirements[0]?.resolvedCapabilities, []);
+  const consumed = continuity.readConsumedTaskContinuityPacket({
+    sessionId,
+    consumingSourceUserSeq: answer.seq,
+  });
+  assert.equal(consumed.status, 'consumed', 'the exact durable packet must not be dismissed as topic_changed');
+  const replayed = await runtime.enrichAcceptedRequestWithTaskContinuity(
+    continuationRequest,
+    answer.seq,
+  );
+  assert.deepEqual(replayed.turnCandidates?.sourceStrategyBinding?.equivalentFallbacks, []);
+  assert.equal(
+    replayed.turnCandidates?.candidates.some((candidate) => candidate.identifier === fallbackSlug),
+    false,
+    'consumed-packet replay also validates and presents only the narrowed primary',
+  );
+
+  const childGraphEvent = await recordAcceptedSourceGraph({
+    identity: { sessionId, turn: answer.turn, sourceUserSeq: answer.seq },
+    surface: 'direct',
+    acceptedText: answerText,
+    verifiedTaskContinuation: enriched.taskContinuation,
+  });
+  assert.ok(childGraphEvent);
+  assert.equal(childGraphEvent?.data.effectCeiling, 'external_write');
+  const childGraph = childGraphEvent?.data.graph as {
+    classification?: { externalEffectRequested?: boolean };
+  } | undefined;
+  assert.equal(childGraph?.classification?.externalEffectRequested, true,
+    'B inherits A\'s external-write goal semantics through verified lineage');
+  const lineage = childGraphEvent?.data.taskContinuationLineage as Record<string, unknown> | undefined;
+  assert.ok(lineage);
+  assert.equal(lineage?.parentSourceUserSeq, source.seq);
+  assert.equal(lineage?.consumingSourceUserSeq, answer.seq);
+  assert.equal(lineage?.disposition, 'affirmed');
+  const decision = turnControl.classifyTurnPreflight({
+    message: answerText,
+    sessionId,
+    sessionKind: 'chat',
+    sourceUserSeq: answer.seq,
+    sourceStrategyBinding: narrowedBinding,
+  });
+  assert.equal(decision.reason, 'continuation_approved');
+  assert.equal(decision.consequential, true);
+  assert.equal(decision.sourceStrategyPosture, 'confirmed_exact');
+  assert.deepEqual(decision.sourceStrategyBinding?.primary, sourceStrategyBinding.primary,
+    'primary account/schema/capability bytes remain unchanged');
+  assert.deepEqual(decision.sourceStrategyBinding?.equivalentFallbacks, []);
+
+  const admission = sourceAdmission.evaluateSourceStrategyPhysicalAdmission({
+    requirementEffect: 'read',
+    requirementRole: 'collection',
+    decision,
+    capability: {
+      capabilityId: `capability:composio:${slug}`,
+      accountIdentity: 'account-primary',
+      schemaFingerprint: schemaFingerprint!,
+    },
+    args: { actorId: 'compass/google-maps-extractor' },
+    requireDurableDecision: true,
+  });
+  assert.equal(admission.status, 'refused');
+  if (admission.status === 'refused') {
+    assert.equal(admission.kind, 'source_strategy_authority_invalid');
+    assert.match(admission.message, /does not carry current call-bound authority/i);
+  }
+
+  turnControl.recordTurnPreflightDecision(sessionId, decision, answer.seq);
+  let providerCallbacks = 0;
+  let refusal: Error | null = null;
+  try {
+    await sourceAdmission.withSourceStrategyRequirement(
+      { role: 'collection', effect: 'read' },
+      () => attemptIdentity.withPhysicalDispatch({
+        sessionId,
+        sourceUserSeq: answer.seq,
+        turn: answer.turn,
+        tool: slug,
+        args: { actorId: 'compass/google-maps-extractor' },
+        sourceCapability: {
+          capabilityId: `capability:composio:${slug}`,
+          accountIdentity: 'account-primary',
+          schemaFingerprint: schemaFingerprint!,
+        },
+      }, async () => {
+        providerCallbacks += 1;
+        return 'must not cross';
+      }),
+    );
+  } catch (error) {
+    refusal = error instanceof Error ? error : new Error(String(error));
+  }
+  assert.ok(refusal instanceof attemptIdentity.SourceStrategyPhysicalDispatchError);
+  assert.match(refusal?.message ?? '', /no attested argument template/i);
+  assert.equal(providerCallbacks, 0, 'callback0: provider carrier never ran');
+  assert.deepEqual(
+    dispatchLedger.physicalCrossingsFor(sessionId, answer.seq),
+    [],
+    'p0: no physical provider row exists',
+  );
+  const toolHistory = eventlog.listEvents(sessionId, { types: ['tool_called', 'tool_returned'] })
+    .filter((event) => event.data.sourceUserSeq === answer.seq);
+  assert.deepEqual(toolHistory, [], 'h0: no provider tool-history event exists');
+
+  const blocked = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId({ sessionId, turn: answer.turn, sourceUserSeq: answer.seq }),
+    identity: { sessionId, turn: answer.turn, sourceUserSeq: answer.seq },
+    status: 'blocked',
+    resumable: true,
+    presentation: {
+      kind: 'blocked',
+      text: `No provider call was started. ${refusal?.message ?? 'The source authority was invalid.'}`,
+    },
+  });
+  assert.ok(blocked, 'the pre-provider refusal publishes one blocked terminal');
+  const blockedPresentations = eventlog.listEvents(sessionId, { types: ['conversation_completed'] })
+    .map((event) => presentationEventFromCompletionData(event.data))
+    .filter((presentation) => presentation.identity.sourceUserSeq === answer.seq);
+  assert.equal(blockedPresentations.length, 1, 'the refused B has exactly one terminal');
+  const [blockedPresentation] = blockedPresentations;
+  assert.equal(blockedPresentation?.status, 'blocked');
+  assert.equal(blockedPresentation?.kind, 'blocked');
+  assert.match(blockedPresentation?.text ?? '', /no provider call was started/i);
+
+  schemaCache._clearToolSchemaCacheForTest();
+  const coldReplay = await runtime.enrichAcceptedRequestWithTaskContinuity(
+    continuationRequest,
+    answer.seq,
+  );
+  assert.deepEqual(coldReplay.turnCandidates?.sourceStrategyBinding?.equivalentFallbacks, [],
+    'a process-cold replay keeps the selected primary; missing cache state is not schema drift');
+  assert.equal(
+    coldReplay.turnCandidates?.candidates.some((candidate) =>
+      candidate.identifier === fallbackSlug || candidate.accountIdentity === 'account-fallback'),
+    false,
+  );
+
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object',
+    properties: {
+      actorId: { type: 'string' },
+      countryCode: { type: 'string' },
+    },
+    required: ['actorId', 'countryCode'],
+  }, Date.now());
+  const retainedPrimaryDrift = await runtime.enrichAcceptedRequestWithTaskContinuity(
+    continuationRequest,
+    answer.seq,
+  );
+  assert.equal(retainedPrimaryDrift.turnCandidates?.sourceStrategyBinding, undefined,
+    'a stale retained primary has no executable source binding');
+  assert.equal(
+    retainedPrimaryDrift.turnCandidates?.candidates.some((candidate) =>
+      candidate.identifier === fallbackSlug || candidate.accountIdentity === 'account-fallback'),
+    false,
+    'structural primary-only selection still prunes every revoked fallback when live primary validation fails',
+  );
+});
+
+test('a materially different source answer cannot inherit the pending binding', async () => {
+  const sessionId = 'continuity-material-source-substitution';
+  const objective = 'Find the top 5 Pismo Beach restaurants by Google review count and create one new Google Sheet.';
+  const question = 'I will use the exact Apify restaurant source and create one new Google Sheet. Use that source?';
+  const slug = 'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET';
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object',
+    properties: { actorId: { type: 'string' } },
+    required: ['actorId'],
+  }, Date.now());
+  const schemaFingerprint = schemaCache.liveComposioSchemaFingerprint(slug);
+  assert.ok(schemaFingerprint);
+  const sourceStrategyBinding = {
+    version: 1,
+    primary: {
+      capabilityId: `capability:composio:${slug}`,
+      schemaFingerprint: schemaFingerprint!,
+    },
+    equivalentFallbacks: [],
+    topology: 'single_aggregate_read_then_single_artifact_write',
+    topologyDigest: 'e'.repeat(64),
+    destination: { family: 'workbook', posture: 'create_new' },
+    effect: 'external_write',
+  } as const;
+  const source = accepted(sessionId, objective);
+  await recordAcceptedSourceGraph({
+    identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
+    surface: 'direct',
+    acceptedText: objective,
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'system',
+    type: 'turn_preflight_decision',
+    data: {
+      phase: 'align',
+      consequential: true,
+      objective,
+      intentKey: 'material-source-substitution',
+      reason: 'collect_then_construct',
+      confirmationDisposition: 'material_source_strategy',
+      sourceStrategyPosture: 'materially_variant',
+      sourceStrategyBinding,
+      sourceUserSeq: source.seq,
+    },
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question,
+      purpose: 'clarification',
+      source: 'preflight_alignment',
+      sourceUserSeq: source.seq,
+      intentKey: 'material-source-substitution',
+      confirmationDisposition: 'material_source_strategy',
+      sourceStrategyBinding,
+    },
+  });
+  const identity = { sessionId, turn: 1, sourceUserSeq: source.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: question },
+  });
+  const answerText = 'Do not use Apify as the source; use DataForSEO instead.';
+  const answer = accepted(sessionId, answerText);
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId,
+    sourceUserSeq: answer.seq,
+    message: answerText,
+    turnCandidates: {
+      candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false,
+      sourceStrategyBinding,
+    },
+  }, answer.seq, {
+    typedClassification: { disposition: 'provided' },
+  });
+
+  assert.ok(enriched.taskContinuation, 'the conversational A/Q/B capsule remains available');
+  assert.equal(enriched.turnCandidates?.sourceStrategyBinding, undefined,
+    'an alternate named source cannot inherit or retain A’s exact Apify binding');
+  await recordAcceptedSourceGraph({
+    identity: { sessionId, turn: answer.turn, sourceUserSeq: answer.seq },
+    surface: 'direct',
+    acceptedText: answerText,
+    verifiedTaskContinuation: enriched.taskContinuation,
+  });
+  const graphFacts = turnControl.compiledGraphPreflightFacts(sessionId, answer.seq);
+  assert.equal(graphFacts?.construct, 'collect_then_construct', JSON.stringify(graphFacts));
+  const decision = turnControl.classifyTurnPreflight({
+    message: answerText,
+    sessionId,
+    sessionKind: 'chat',
+    sourceUserSeq: answer.seq,
+  });
+  assert.equal(decision.phase, 'align');
+  assert.equal(decision.reason, 'collect_then_construct');
+  assert.notEqual(decision.reason, 'continuation_approved');
+  assert.equal(decision.sourceStrategyPosture, 'materially_variant');
+  assert.equal(decision.sourceStrategyBinding, undefined);
+  const admission = sourceAdmission.evaluateSourceStrategyPhysicalAdmission({
+    requirementEffect: 'read',
+    requirementRole: 'collection',
+    decision,
+    requireDurableDecision: true,
+    capability: { capabilityId: 'capability:composio:DATAFORSEO_MAPS_SEARCH' },
+  });
+  assert.equal(admission.status, 'refused', 'the alternate provider has zero physical dispatch authority');
 });
 
 test('an ordinal matching only hidden awaiting options cannot consume the parent action', async () => {

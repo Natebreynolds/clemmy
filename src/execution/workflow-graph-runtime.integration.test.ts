@@ -328,8 +328,12 @@ test('read_parallel_v1 executes real specialist nodes concurrently, joins them, 
   let maxActiveSpecialists = 0;
   let specialistStarts = 0;
   let releaseSpecialists = (): void => {};
-  const bothStarted = new Promise<void>((resolve) => { releaseSpecialists = resolve; });
-  const fallback = setTimeout(releaseSpecialists, 1_000);
+  let rejectSpecialists = (_error: Error): void => {};
+  let barrierTimeout: NodeJS.Timeout | undefined;
+  const bothStarted = new Promise<void>((resolve, reject) => {
+    releaseSpecialists = resolve;
+    rejectSpecialists = reject;
+  });
   const reducerPrompts: string[] = [];
   const toolSurfaces = new Map<string, string[]>();
 
@@ -346,7 +350,16 @@ test('read_parallel_v1 executes real specialist nodes concurrently, joins them, 
         activeSpecialists += 1;
         specialistStarts += 1;
         maxActiveSpecialists = Math.max(maxActiveSpecialists, activeSpecialists);
-        if (specialistStarts === 2) releaseSpecialists();
+        if (specialistStarts === 1) {
+          barrierTimeout = setTimeout(
+            () => rejectSpecialists(new Error('second read_parallel_v1 specialist did not start within 30s')),
+            30_000,
+          );
+        }
+        if (specialistStarts === 2) {
+          if (barrierTimeout) clearTimeout(barrierTimeout);
+          releaseSpecialists();
+        }
         await bothStarted;
         activeSpecialists -= 1;
         const marker = sessionId.endsWith(`:${factsId}`) ? 'FACTS-BRANCH' : 'RISKS-BRANCH';
@@ -372,7 +385,7 @@ test('read_parallel_v1 executes real specialist nodes concurrently, joins them, 
   try {
     await processWorkflowRuns({ respond: async () => ({ text: 'legacy path must not run' }) } as never);
   } finally {
-    clearTimeout(fallback);
+    if (barrierTimeout) clearTimeout(barrierTimeout);
     _setWorkflowHarnessLoopImplsForTests();
   }
 

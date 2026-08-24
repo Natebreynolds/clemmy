@@ -13,7 +13,11 @@
  * the projection's privacy-safe text; raw args, targets, prompts, and
  * reasoning can never appear because they are not in the input type.
  */
-import { renderActivityLabel, type SurfaceRunSnapshot } from '../runtime/graph/surface-projection.js';
+import {
+  renderActivityLabel,
+  type SurfaceRunSnapshot,
+  type SurfaceTerminal,
+} from '../runtime/graph/surface-projection.js';
 
 export interface TransportProgressState {
   /** The last milestone text actually sent/edited. */
@@ -82,6 +86,33 @@ export function advanceTransportProgress(
 ): { action: TransportProgressAction; state: TransportProgressState } {
   const action = reduceTransportProgress(snapshot, state, nowMs);
   return { action, state: applyTransportProgress(state, action, nowMs) };
+}
+
+/**
+ * Fold a channel message settlement after the replacement was delivered.
+ *
+ * A blocked run is deliberately NOT a final run terminal: approval/input
+ * parks remain host-owned and resumable. The channel message for that turn is
+ * nevertheless settled once the pause text and controls have landed. Keep
+ * that message-level truth here instead of promoting `blocked` into a global
+ * terminal, which would freeze the durable run against resume.
+ */
+export function settleTransportProgress(
+  snapshot: SurfaceRunSnapshot,
+  state: TransportProgressState,
+  nowMs: number,
+  deliveredPause?: SurfaceTerminal,
+): { action: TransportProgressAction; state: TransportProgressState } {
+  if (
+    !state.finalized
+    && !snapshot.terminal
+    && snapshot.lifecycle === 'blocked'
+    && deliveredPause?.status === 'blocked'
+  ) {
+    const action: TransportProgressAction = { action: 'final', text: deliveredPause.text };
+    return { action, state: applyTransportProgress(state, action, nowMs) };
+  }
+  return advanceTransportProgress(snapshot, state, nowMs);
 }
 
 /**

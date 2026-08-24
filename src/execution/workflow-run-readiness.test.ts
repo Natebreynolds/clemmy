@@ -119,9 +119,9 @@ test('ready items are neither blockers nor warnings', () => {
   assert.equal(warnings.length, 0);
 });
 
-test('workflow readiness advertises code mode because workflow steps can execute it', () => {
+test('workflow readiness does not advertise the removed program executor', () => {
   const inventory = buildWorkflowReadinessInventory();
-  assert.ok(inventory.availableTools?.includes('run_tool_program'));
+  assert.ok(!inventory.availableTools?.includes('run_tool_program'), 'the subtracted program surface is not advertised');
 });
 
 test('targetStepId scopes the partition to that step only', () => {

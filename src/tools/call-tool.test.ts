@@ -5,7 +5,7 @@
  *  - AUTHORITY: refuses a target that is not on the orchestrator surface (no escalation).
  *  - ARG VALIDATION: bad args return {error:'arg_validation', schema} with NO dispatch.
  *  - GATE PARITY: a mutating inner tool routed through call_tool trips the SAME
- *    write-boundary gate (keyed on the INNER name), via the _setCodeModeToolsForTests seam.
+ *    write-boundary gate (keyed on the INNER name), via the _setInnerDispatchToolsForTests seam.
  *  - PROMOTION: a successful dispatch records the reached tool to the session hot-set.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -25,9 +25,9 @@ const {
   materializeStrictNullableFields,
 } = await import('./call-tool.js');
 const {
-  _setCodeModeToolsForTests,
-  _setCodeModeMcpResolverForTests,
-} = await import('./code-mode-tool.js');
+  _setInnerDispatchToolsForTests,
+  _setInnerDispatchMcpResolverForTests,
+} = await import('./inner-dispatch.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const {
   withHarnessRunContext,
@@ -106,8 +106,8 @@ function invokeCallToolFixture(
 }
 
 test.after(() => {
-  _setCodeModeToolsForTests(null);
-  _setCodeModeMcpResolverForTests(null);
+  _setInnerDispatchToolsForTests(null);
+  _setInnerDispatchMcpResolverForTests(null);
   _resetHotSetForTest();
   closeEventLog();
   closeOperationalTelemetryDb();
@@ -170,7 +170,7 @@ test('an explicit local-only MCP scope rejects a guessed name before provider re
   let resolverCalls = 0;
   let listCalls = 0;
   let dispatchCalls = 0;
-  _setCodeModeMcpResolverForTests(() => {
+  _setInnerDispatchMcpResolverForTests(() => {
     resolverCalls += 1;
     return {
       listTools: async () => {
@@ -205,7 +205,7 @@ test('an explicit local-only MCP scope rejects a guessed name before provider re
     assert.equal(listCalls, 0, 'authority must run before listTools');
     assert.equal(dispatchCalls, 0, 'authority must run before callTool');
   } finally {
-    _setCodeModeMcpResolverForTests(null);
+    _setInnerDispatchMcpResolverForTests(null);
   }
 });
 
@@ -272,7 +272,7 @@ test('a wrapped write-shaped carrier rejection records typed no-dispatch instead
   const session = createSession({ kind: 'chat' });
   const accepted = acceptedSourceForCallToolFixture(session.id);
   let providerDispatches = 0;
-  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
     invoke: async () => {
       providerDispatches += 1;
@@ -316,7 +316,7 @@ test('a wrapped write-shaped carrier rejection records typed no-dispatch instead
     assert.equal(listEvents(session.id, { types: ['external_write'] }).length, 0, 'the carrier creates no outer reservation');
     assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0);
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (previous === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = previous;
   }
@@ -331,7 +331,7 @@ test('an exhausted write-shaped carrier hard-stops without manufacturing no-disp
   const counter = new ToolCallsCounter(1);
   counter.increment();
   let providerDispatches = 0;
-  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
     invoke: async () => {
       providerDispatches += 1;
@@ -370,7 +370,7 @@ test('an exhausted write-shaped carrier hard-stops without manufacturing no-disp
     assert.equal(listEvents(session.id, { types: ['external_write'] }).length, 0);
     assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0);
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (previous === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = previous;
   }
@@ -389,7 +389,7 @@ test('an ambiguous reached write produces one inner orphan and no outer carrier 
   const session = createSession({ kind: 'chat' });
   const accepted = acceptedSourceForCallToolFixture(session.id);
   let providerDispatches = 0;
-  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
     invoke: async () => {
       providerDispatches += 1;
@@ -437,7 +437,7 @@ test('an ambiguous reached write produces one inner orphan and no outer carrier 
     );
     assert.equal(listEvents(session.id, { types: ['external_write_failed'] }).length, 0);
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (previous.brackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = previous.brackets;
     if (previous.confirm === undefined) delete process.env.CLEMMY_CONFIRM_FIRST;
@@ -552,7 +552,7 @@ test('call_tool freezes strict host materialization as the one effective logical
     identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
   }));
   let received: unknown;
-  _setCodeModeToolsForTests(new Map([[
+  _setInnerDispatchToolsForTests(new Map([[
     'memory_list_facts',
     { name: 'memory_list_facts', invoke: async (_context: unknown, input: unknown) => {
       received = typeof input === 'string' ? JSON.parse(input) : input;
@@ -597,7 +597,7 @@ test('call_tool freezes strict host materialization as the one effective logical
       1,
     );
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
@@ -625,7 +625,7 @@ test('gate parity: a mutating inner tool routed through call_tool trips the writ
   const sess = createSession({ kind: 'chat' });
   // Inject a fake inner composio_execute_tool. dispatchBatchItemTool wraps THIS via
   // wrapToolForHarness, so the write boundary keys on 'composio_execute_tool' (inner).
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'sent' }]]),
   );
   try {
@@ -645,7 +645,7 @@ test('gate parity: a mutating inner tool routed through call_tool trips the writ
 
     // A REVERSIBLE WRITE still routes through the gated boundary keyed on the
     // inner tool name (gate parity preserved for non-sends).
-    _setCodeModeToolsForTests(
+    _setInnerDispatchToolsForTests(
       new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'updated' }]]),
     );
     const writeOut = String(await invokeCallTool(
@@ -654,7 +654,7 @@ test('gate parity: a mutating inner tool routed through call_tool trips the writ
     ));
     assert.ok(writeOut.startsWith('updated'), 'a reversible write routes through the gated inner tool');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     process.env.HARNESS_TOOL_BRACKETS = prev.brackets;
     process.env.CLEMMY_CONFIRM_FIRST = prev.confirm;
     process.env.CLEMMY_EXECUTION_GATE = prev.execGate;
@@ -672,7 +672,7 @@ test('a wrapped nested irreversible send gives one pending-action recovery, neve
   const sess = createSession({ kind: 'chat' });
   const accepted = acceptedSourceForCallToolFixture(sess.id);
   let dispatched = 0;
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', {
       name: 'composio_execute_tool',
       invoke: async () => {
@@ -726,7 +726,7 @@ test('a wrapped nested irreversible send gives one pending-action recovery, neve
        WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
     `).get(sess.id, accepted.sourceUserSeq, 'nested-send-one-recovery') as { n: number }).n, 0);
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (prev.brackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = prev.brackets;
     if (prev.execution === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
@@ -741,7 +741,7 @@ test('carrier target policy allows account-scoped social posts but blocks target
   const accepted = acceptedSourceForCallToolFixture(session.id);
   const counter = new ToolCallsCounter(10);
   let dispatched = 0;
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', {
       name: 'composio_execute_tool',
       invoke: async () => {
@@ -845,7 +845,7 @@ test('carrier target policy allows account-scoped social posts but blocks target
       },
     ]);
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = prev;
   }
@@ -858,7 +858,7 @@ test('unknown, denied, and malformed nested sends validate before any pending-ac
   const sess = createSession({ kind: 'chat' });
   const accepted = acceptedSourceForCallToolFixture(sess.id);
   let dispatched = 0;
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', {
       name: 'composio_execute_tool',
       invoke: async () => {
@@ -953,7 +953,7 @@ test('unknown, denied, and malformed nested sends validate before any pending-ac
       'unvalidated carrier JSON never reaches an approval-routing gate',
     );
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = prev;
   }
@@ -962,7 +962,7 @@ test('unknown, denied, and malformed nested sends validate before any pending-ac
 test('a successful dispatch records the reached tool to the session hot-set', async () => {
   _resetHotSetForTest();
   // Fake read inner tool (a read slug → no gate) so dispatch is deterministic.
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'ok' }]]),
   );
   try {
@@ -974,13 +974,13 @@ test('a successful dispatch records the reached tool to the session hot-set', as
     assert.equal(String(out), 'ok');
     assert.ok(getHotSet('sess-lru').includes('composio_execute_tool'), 'reached tool is promoted to the hot-set');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
 test('call_tool canonicalizes object-form Composio arguments before one inner dispatch', async () => {
   const dispatched: Array<Record<string, unknown>> = [];
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', {
       name: 'composio_execute_tool',
       invoke: async (_context: unknown, input: string) => {
@@ -1025,19 +1025,22 @@ test('call_tool canonicalizes object-form Composio arguments before one inner di
     );
     assert.equal(String(populated), 'rows');
     assert.equal(dispatched.length, 2, 'a second outer request still causes only one inner dispatch');
-    assert.equal(dispatched[1].arguments, '{"q":"firm-a","z":2}');
+    // The wire retains the caller's field order (order is semantic for some
+    // provider operations — Sheet-from-JSON column order); order-independent
+    // identity is owned by the DIGEST, never by wire bytes (2026-08-20).
+    assert.equal(dispatched[1].arguments, '{"z":2,"q":"firm-a"}');
     assert.equal(
       dispatched[1].connected_account_id,
       'ca_proof_primary',
       'canonicalizing the inner payload must preserve an explicit outer account selector',
     );
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
 test('a first-class built-in accidentally wrapped in call_tool dispatches instead of bouncing not_reachable', async () => {
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['memory_recall_all', { name: 'memory_recall_all', invoke: async () => 'all eight teammates' }]]),
   );
   try {
@@ -1053,7 +1056,7 @@ test('a first-class built-in accidentally wrapped in call_tool dispatches instea
     );
     assert.equal(String(out), 'all eight teammates');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
@@ -1061,7 +1064,7 @@ test('a common http_fetch guess repairs to the allowed bounded GET path without 
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   let dispatched: Record<string, unknown> | null = null;
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['run_shell_command', {
       name: 'run_shell_command',
       invoke: async (_ctx: unknown, input: string) => {
@@ -1105,13 +1108,13 @@ test('a common http_fetch guess repairs to the allowed bounded GET path without 
     assert.equal(inner!.data.accounting, 'transport_mirror');
     assert.equal(inner!.data.canonicalCallId, 'outer-http-fetch');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
 test('the common mcp_tools guess repairs to the on-demand MCP inventory tool', async () => {
   let dispatched: Record<string, unknown> | null = null;
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['mcp_list_tools', {
       name: 'mcp_list_tools',
       invoke: async (_ctx: unknown, input: string) => {
@@ -1137,7 +1140,7 @@ test('the common mcp_tools guess repairs to the on-demand MCP inventory tool', a
     assert.equal(dispatched?.server_name, 'dataforseo');
     assert.equal(dispatched?.query, 'keyword suggestions');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
@@ -1166,7 +1169,7 @@ test('production run context attributes the inner dispatch without a tool-output
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const accepted = acceptedSourceForCallToolFixture(sess.id);
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'rows' }]]),
   );
   try {
@@ -1189,12 +1192,12 @@ test('production run context attributes the inner dispatch without a tool-output
     assert.equal(innerCalls.length, 1, 'inner dispatch telemetry stays on the active session');
     assert.ok(getHotSet(sess.id).includes('composio_execute_tool'), 'promotion stays on the active session');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
 test('nested call_tool dispatch reuses the ambient run counter', async () => {
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'rows' }]]),
   );
   const counter = new ToolCallsCounter(1);
@@ -1222,7 +1225,7 @@ test('nested call_tool dispatch reuses the ambient run counter', async () => {
       },
     );
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
@@ -1302,7 +1305,7 @@ test('a harness-wrapped call_tool charges the ambient budget exactly ONCE per de
   // the inner dispatch charges the SAME ambient counter. Without the wrapper
   // exemption every deferred action costs 2, halving the effective per-turn
   // budget on the schema-on-demand lane.
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'rows' }]]),
   );
   const counter = new ToolCallsCounter(10);
@@ -1327,7 +1330,7 @@ test('a harness-wrapped call_tool charges the ambient budget exactly ONCE per de
       },
     );
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
@@ -1370,7 +1373,7 @@ test('a built-in dispatch is observed as an acquisition; refusals and MCP names 
   const acquired: string[] = [];
   const previousExecutionGate = process.env.CLEMMY_EXECUTION_GATE;
   process.env.CLEMMY_EXECUTION_GATE = 'off';
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'updated' }]]),
   );
   try {
@@ -1399,7 +1402,7 @@ test('a built-in dispatch is observed as an acquisition; refusals and MCP names 
     assert.ok(out.startsWith('updated'), out);
     assert.deepEqual(acquired, ['composio_execute_tool']);
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (previousExecutionGate === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
     else process.env.CLEMMY_EXECUTION_GATE = previousExecutionGate;
   }
@@ -1424,7 +1427,7 @@ test('a sealed built-in acquisition appends once, reuses its revision, and dispa
 
   let dispatches = 0;
   let admissions = 0;
-  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
     invoke: async () => {
       dispatches += 1;
@@ -1460,7 +1463,7 @@ test('a sealed built-in acquisition appends once, reuses its revision, and dispa
     assert.equal(admissions, 2, 'each requested dispatch must cross admission exactly once');
     assert.equal(dispatches, 2, 'each admitted call must dispatch its inner tool exactly once');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
@@ -1481,7 +1484,7 @@ test('outside-universe and missing capability authority return requires_readmiss
   const before = boundAgentCapabilityRevision(sealedAuthority)!;
 
   let dispatches = 0;
-  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
     invoke: async () => {
       dispatches += 1;
@@ -1536,7 +1539,7 @@ test('outside-universe and missing capability authority return requires_readmiss
     assert.equal(after.revision, before.revision, 'outside-universe refusal mutated revision number');
     assert.equal(after.revisionDigest, before.revisionDigest, 'outside-universe refusal mutated revision content');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
@@ -1544,7 +1547,7 @@ test('external MCP dispatch stays under MCP scope and bypasses built-in capabili
   let admissions = 0;
   let listCalls = 0;
   let dispatches = 0;
-  _setCodeModeMcpResolverForTests(() => ({
+  _setInnerDispatchMcpResolverForTests(() => ({
     listTools: async () => {
       listCalls += 1;
       return [{ name: 'proof__read' }];
@@ -1581,7 +1584,7 @@ test('external MCP dispatch stays under MCP scope and bypasses built-in capabili
     assert.equal(listCalls, 1);
     assert.equal(dispatches, 1);
   } finally {
-    _setCodeModeMcpResolverForTests(null);
+    _setInnerDispatchMcpResolverForTests(null);
   }
 });
 
@@ -1590,7 +1593,7 @@ test('a throwing acquisition observer never breaks dispatch', async () => {
   const sess = createSession({ kind: 'chat' });
   const previousExecutionGate = process.env.CLEMMY_EXECUTION_GATE;
   process.env.CLEMMY_EXECUTION_GATE = 'off';
-  _setCodeModeToolsForTests(
+  _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'updated' }]]),
   );
   try {
@@ -1609,8 +1612,256 @@ test('a throwing acquisition observer never breaks dispatch', async () => {
     ));
     assert.ok(out.startsWith('updated'), `instrumentation killed the dispatch: ${out}`);
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (previousExecutionGate === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
     else process.env.CLEMMY_EXECUTION_GATE = previousExecutionGate;
+  }
+});
+
+// ————— consume the turn's proven resolution (2026-08-18 calendar shape) —————
+// The host proves a capability + connection BEFORE the model speaks; the first
+// model call naming that exact identifier must land on the carrier. Refusing it
+// charged the model three calls of tuition to rediscover the harness's own
+// knowledge. One ask, every carrier-surface shape: orchestrator
+// (reachableBuiltinNames) and Claude lane (firstClassNames) — lane parity is
+// the invariant, so both branches of the carrier-reachability precondition pin.
+
+function seedProvenCalendarResolution(sessionId: string, sourceUserSeq: number, identifier = 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW'): void {
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'capability_resolution',
+    data: {
+      entries: [{
+        intent: 'outlook.calendar.view_day',
+        kind: 'composio',
+        identifier,
+        status: 'proven',
+        connection: 'active',
+      }],
+      registryAvailable: true,
+      authoritativeForTask: true,
+      sourceUserSeq,
+    },
+  });
+}
+
+test('a proven, connected Composio identifier named as the tool lands on the carrier (orchestrator surface)', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
+  seedProvenCalendarResolution(session.id, accepted.sourceUserSeq);
+  const carrierCalls: string[] = [];
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
+    name: 'composio_execute_tool',
+    invoke: async (_ctx: unknown, raw: string) => {
+      carrierCalls.push(raw);
+      return JSON.stringify({ successful: true, data: { events: [] } });
+    },
+  }]]));
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(['composio_execute_tool']),
+    }) as unknown as ToolLike;
+    const out = await withHarnessRunContext(
+      { sessionId: session.id, ...accepted, counter: new ToolCallsCounter(10) },
+      () => withToolOutputContext(
+        { sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, callId: 'call-proven-slug', toolName: 'call_tool' },
+        () => callTool.invoke!(
+          { context: { sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn } },
+          JSON.stringify({
+            name: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+            args_json: JSON.stringify({
+              start_date_time: '2026-08-19T00:00:00Z',
+              end_date_time: '2026-08-20T00:00:00Z',
+            }),
+          }),
+          { toolCall: { callId: 'call-proven-slug' } },
+        ) as Promise<unknown>,
+      ),
+    );
+    const text = String(out);
+    assert.ok(!text.includes('not_reachable'), `the harness must not refuse its own proof: ${text}`);
+    assert.equal(carrierCalls.length, 1, 'exactly one carrier dispatch, zero refusals of tuition');
+    assert.match(carrierCalls[0], /OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW/);
+    assert.match(carrierCalls[0], /start_date_time/, "the model's arguments ride the carrier envelope");
+  } finally {
+    _setInnerDispatchToolsForTests(null);
+  }
+});
+
+test('the same proof consumes identically on the Claude-lane surface shape (firstClassNames)', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
+  seedProvenCalendarResolution(session.id, accepted.sourceUserSeq);
+  let resolved: { targetName: string; targetArgs: unknown } | undefined;
+  const callTool = buildCallTool({
+    reachableBuiltinNames: new Set(),
+    firstClassNames: new Set(['composio_execute_tool']),
+    aroundResolvedDispatch: async (input) => {
+      resolved = { targetName: input.targetName, targetArgs: input.targetArgs };
+      return { successful: true };
+    },
+  }) as unknown as ToolLike;
+  const out = await withHarnessRunContext(
+    { sessionId: session.id, ...accepted, counter: new ToolCallsCounter(10) },
+    () => withToolOutputContext(
+      { sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, callId: 'call-proven-slug-fc', toolName: 'call_tool' },
+      () => callTool.invoke!(
+        { context: { sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn } },
+        JSON.stringify({
+          name: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+          args_json: JSON.stringify({ start_date_time: '2026-08-19T00:00:00Z' }),
+        }),
+        { toolCall: { callId: 'call-proven-slug-fc' } },
+      ) as Promise<unknown>,
+    ),
+  );
+  assert.ok(!String(out).includes('not_reachable'), `lane parity: ${String(out)}`);
+  assert.ok(resolved, 'the resolved dispatch must be reached');
+  assert.equal(resolved!.targetName, 'composio_execute_tool');
+  assert.match(JSON.stringify(resolved!.targetArgs), /OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW/);
+});
+
+test('an exact bound source slug reaches the shared Composio carrier without generic capability proof', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
+  const exactSlug = 'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET';
+  const fallbackSlug = 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS';
+  const carrierCalls: string[] = [];
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
+    name: 'composio_execute_tool',
+    invoke: async (_ctx: unknown, raw: string) => {
+      carrierCalls.push(raw);
+      return JSON.stringify({ successful: true, data: { items: [] } });
+    },
+  }]]));
+  const callTool = buildCallTool({
+    reachableBuiltinNames: new Set(['composio_execute_tool']),
+    sourceStrategyBinding: {
+      version: 1,
+      primary: {
+        capabilityId: `capability:composio:${exactSlug}`,
+        schemaFingerprint: 'a'.repeat(64),
+      },
+      equivalentFallbacks: [{
+        capabilityId: `capability:composio:${fallbackSlug}`,
+        schemaFingerprint: 'b'.repeat(64),
+      }],
+      topology: 'single_aggregate_read_then_single_artifact_write',
+      topologyDigest: 'c'.repeat(64),
+      destination: { family: 'workbook', posture: 'create_new' },
+      effect: 'external_write',
+    },
+  }) as unknown as ToolLike;
+  const invoke = (name: string, callId: string) => withHarnessRunContext(
+    { sessionId: session.id, ...accepted, counter: new ToolCallsCounter(10) },
+    () => withToolOutputContext(
+      { sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, callId, toolName: 'call_tool' },
+      () => callTool.invoke!(
+        { context: { sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn } },
+        JSON.stringify({ name, args_json: JSON.stringify({ actorId: 'compass~crawler-google-places' }) }),
+        { toolCall: { callId } },
+      ) as Promise<unknown>,
+    ),
+  );
+
+  try {
+    const exact = String(await invoke(exactSlug, 'call-bound-source-exact'));
+    assert.doesNotMatch(exact, /not_reachable/);
+    assert.equal(carrierCalls.length, 1, 'the exact bound source maps onto one existing carrier dispatch');
+    assert.match(carrierCalls[0], new RegExp(exactSlug));
+    assert.match(carrierCalls[0], /actorId/);
+
+    const typo = JSON.parse(String(await invoke(
+      'APIFY_ACTOR_TASK_RUN_SYNC_GET_DATASET_ITEMS_GET',
+      'call-bound-source-typo',
+    )));
+    assert.equal(typo.error, 'not_reachable', 'near names never gain fuzzy source authority');
+    assert.match(typo.detail, new RegExp(exactSlug));
+    assert.match(typo.detail, new RegExp(fallbackSlug));
+    assert.match(typo.detail, /do not rediscover or switch provider families/i);
+    assert.equal(carrierCalls.length, 1, 'the typo has zero carrier dispatches');
+  } finally {
+    _setInnerDispatchToolsForTests(null);
+  }
+});
+
+test('without proof — or with another turn\'s proof — the identifier stays not_reachable', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
+  let dispatches = 0;
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
+    name: 'composio_execute_tool',
+    invoke: async () => { dispatches += 1; return 'never'; },
+  }]]));
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(['composio_execute_tool']),
+    }) as unknown as ToolLike;
+    const invokeSlug = () => withHarnessRunContext(
+      { sessionId: session.id, ...accepted, counter: new ToolCallsCounter(10) },
+      () => withToolOutputContext(
+        { sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, callId: `call-unproven-${dispatches}`, toolName: 'call_tool' },
+        () => callTool.invoke!(
+          { context: { sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn } },
+          JSON.stringify({ name: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW', args_json: '{}' }),
+          { toolCall: { callId: `call-unproven-${dispatches}` } },
+        ) as Promise<unknown>,
+      ),
+    );
+    const unproven = JSON.parse(String(await invokeSlug()));
+    assert.equal(unproven.error, 'not_reachable', 'no proof event → the regex widening grants nothing');
+    // A prior turn's proof must not authorize this turn.
+    seedProvenCalendarResolution(session.id, accepted.sourceUserSeq + 100);
+    const crossTurn = JSON.parse(String(await invokeSlug()));
+    assert.equal(crossTurn.error, 'not_reachable', 'proof is scoped to the accepted source');
+    assert.equal(dispatches, 0, 'no carrier dispatch on either refusal');
+  } finally {
+    _setInnerDispatchToolsForTests(null);
+  }
+});
+
+test('control-only dispatcher admits registry-declared READS and still refuses business writes (live 2026-08-20 mobile dashboard)', async () => {
+  // A read duplicates nothing, so the frozen action contract protects nothing
+  // on it — deferred reads (workflow_get, space_history…) ride the control
+  // dispatcher directly instead of paying work_call proposal grammar.
+  const { isRegistryDeclaredRead } = await import('./tool-registry.js');
+  assert.equal(isRegistryDeclaredRead('workflow_get'), true);
+  assert.equal(isRegistryDeclaredRead('space_history'), true);
+  assert.equal(isRegistryDeclaredRead('composio_execute_tool'), false, 'writes are never reads');
+  assert.equal(isRegistryDeclaredRead('not_a_tool'), false);
+
+  const dispatched: string[] = [];
+  _setInnerDispatchToolsForTests(new Map([
+    ['workflow_get', { name: 'workflow_get', invoke: async () => JSON.stringify({ ok: true, name: 'daily-pull' }) }],
+    ['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => { dispatched.push('composio_execute_tool'); return '{}'; } }],
+  ]) as never);
+  const controlOnly = buildCallTool({
+    controlOnlyBuiltins: true,
+    reachableBuiltinNames: new Set(['workflow_get', 'composio_execute_tool']),
+  }) as unknown as ToolLike;
+  try {
+    const read = await invokeCallToolFixture(
+      controlOnly,
+      'sess-control-read',
+      JSON.stringify({ name: 'workflow_get', args_json: '{"name":"daily-pull"}' }),
+      'control-read-1',
+    );
+    assert.match(String(read), /daily-pull/, 'the deferred read dispatches directly through the control door');
+    const write = await invokeCallToolFixture(
+      controlOnly,
+      'sess-control-read',
+      JSON.stringify({ name: 'composio_execute_tool', args_json: '{"tool_slug":"OUTLOOK_SEND_EMAIL","arguments":"{}"}' }),
+      'control-write-1',
+    );
+    assert.match(String(write), /not_reachable|work_call/, 'a business write is refused toward work_call');
+    assert.deepEqual(dispatched, [], 'the refused write never reaches its tool');
+  } finally {
+    _setInnerDispatchToolsForTests(null);
   }
 });

@@ -126,7 +126,7 @@ test('touchFocus from a fresh action session preserves historical ownership', ()
   const ownerSessionId = 'historical-action-session';
   const freshSessionId = 'fresh-action-session';
   const focus = createFocus({
-    resourceRef: 'https://docs.google.com/spreadsheets/d/historical_google_sheet_00000002',
+    resourceRef: 'https://docs.google.com/spreadsheets/d/fixture-historical-google-sheet-0002',
     title: 'Historical sheet work',
     summary: 'Rows written during the historical request.',
     resourceKind: 'sheet',

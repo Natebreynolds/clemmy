@@ -3,7 +3,6 @@
  */
 import pino from 'pino';
 import { admitAndCompileAcceptedSource } from '../semantic-boundary/admit-and-compile-accepted-source.js';
-import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
 import {
   blockedPresentationForSemanticRecord,
   readPersistedSemanticInterpretation,
@@ -37,34 +36,11 @@ export async function recordAcceptedSourceGraph(input: {
       sourceUserSeq: input.identity.sourceUserSeq,
       reason: result.reason,
     }, 'accepted source could not be admitted');
-    // ADVISORY-UNTIL-BINDABLE, AT THE SOURCE. A failed semantic admission is
-    // a checker verdict; the disposition is already durably 'blocked', which
-    // withholds TYPED authority everywhere. Returning null here was how a
-    // checker verdict still ended the user's turn: every caller converts a
-    // missing graph into a blocked terminal (live 2026-08-18 breaker 3:
-    // "do it, but make it 5 firms" \u2192 invalid \u2192 "I could not admit
-    // this turn's interpretation" \u2014 the SECOND door of the same class
-    // fixed at typed-source-dispatch three days earlier). Degrade to the
-    // identity-only shadow instead: the same regex-compiled graph every
-    // non-semantic lane runs on, carrying tools and every effect gate.
-    try {
-      const fallback = recordTurnGraphShadow({
-        identity: input.identity,
-        surface: input.surface,
-        ...(input.allowedToolNames ? { allowedToolNames: input.allowedToolNames } : {}),
-        ...(input.excludedToolNames ? { excludedToolNames: input.excludedToolNames } : {}),
-        ...(input.verifiedTaskContinuation
-          ? { verifiedTaskContinuation: input.verifiedTaskContinuation }
-          : {}),
-      });
-      if (fallback) {
-        logger.warn({
-          sessionId: input.identity.sessionId,
-          sourceUserSeq: input.identity.sourceUserSeq,
-        }, 'unadmitted source kept an identity-only graph; dispatch stays blocked');
-        return fallback;
-      }
-    } catch { /* the terminal refusal below remains the last resort */ }
+    // The compiler already owns the one compatibility case: when no semantic
+    // port participated it returns a validated shadow graph as an `ok` result.
+    // Once a semantic port participated, refusal is the durable route decision.
+    // Rebuilding an identity-only graph here would open a second, tool-bearing
+    // executor after that decision.
     return null;
   }
   return result.event;

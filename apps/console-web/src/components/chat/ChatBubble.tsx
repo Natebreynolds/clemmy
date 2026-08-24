@@ -225,6 +225,7 @@ export function ChatBubble({
   }
 
   const thinking = message.status === 'thinking';
+  const live = thinking || Boolean(message.workflowLive);
   const pendingAction = message.approval?.pendingAction;
   return (
     <div className="flex gap-3">
@@ -286,12 +287,12 @@ export function ChatBubble({
           {message.activity && message.activity.length > 0 ? (
             <TurnActivity
               items={message.activity}
-              live={thinking}
-              terminalOutcome={activityTerminalOutcomeForMessageStatus(message.status)}
+              live={live}
+              terminalOutcome={live ? undefined : activityTerminalOutcomeForMessageStatus(message.status)}
               traceHref={traceHref}
             />
           ) : (
-            thinking && message.text && message.progress && (
+            live && message.text && message.progress && (
               <div className="mt-2.5 flex items-center gap-2 border-t border-border/60 pt-2 text-caption text-faint">
                 <ThinkingDots />
                 <span>{message.progress}</span>

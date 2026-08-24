@@ -321,7 +321,7 @@ export async function rotateSessionToken(
 export async function detectTokenReuse(
   token: string,
   opts?: MobileSessionStoreOptions,
-): Promise<{ reused: true; deviceId: string } | { reused: false }> {
+): Promise<{ reused: true; deviceId: string; record: MobileSessionRecord } | { reused: false }> {
   if (!token) return { reused: false };
   const now = opts?.now?.() ?? Date.now();
   const tokenHash = hashToken(token);
@@ -330,7 +330,10 @@ export async function detectTokenReuse(
     (row) => row.previousTokenHash === tokenHash
       && (!row.previousTokenValidUntil || Date.parse(row.previousTokenValidUntil) <= now),
   );
-  return match ? { reused: true, deviceId: match.deviceId } : { reused: false };
+  // The record travels with the verdict because a retired token alone cannot
+  // tell a leak from a client that simply fell behind — the caller needs the
+  // device key to arbitrate, and only this row knows it.
+  return match ? { reused: true, deviceId: match.deviceId, record: { ...match } } : { reused: false };
 }
 
 /**

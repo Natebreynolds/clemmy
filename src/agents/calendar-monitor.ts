@@ -20,14 +20,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { BASE_DIR, getRuntimeEnv } from '../config.js';
-import {
-  executeComposioTool,
-  listConnectedToolkits,
-  readComposioConnectionSuppressionState,
-  saveComposioConnectionSuppressionState,
-} from '../integrations/composio/client.js';
-import { addNotification, type NotificationRecord } from '../runtime/notifications.js';
+import { BASE_DIR } from '../config.js';
+import type { ConnectedToolkit } from '../integrations/composio/client.js';
+import type { NotificationRecord } from '../runtime/notifications.js';
 import {
   clearConnectionSuppression,
   isConnectionSuppressed,
@@ -37,7 +32,6 @@ import {
   type ComposioConnectionSuppression,
   type ComposioConnectionSuppressionState,
 } from './composio-connection-suppression.js';
-import { getProactivityPolicySnapshot, loadProactivityPolicy } from './proactivity-policy.js';
 import { decideSurface, shouldSurface, type SurfaceDecision } from './surface-decision.js';
 
 const logger = pino({ name: 'clementine-next.calendar-monitor' });
@@ -79,8 +73,12 @@ export interface CalendarMonitorConfig {
 }
 
 export interface CalendarMonitorDeps {
-  listConnections: typeof listConnectedToolkits;
-  executeTool: typeof executeComposioTool;
+  listConnections: () => Promise<ConnectedToolkit[]>;
+  executeTool: (
+    operation: string,
+    args: Record<string, unknown>,
+    connectionId?: string,
+  ) => Promise<unknown>;
   notify: (n: NotificationRecord) => void;
   config: () => CalendarMonitorConfig;
   proactiveWorkAllowed: () => boolean;
@@ -89,18 +87,6 @@ export interface CalendarMonitorDeps {
   saveState: (s: CalendarMonitorState) => void;
   readConnectionSuppressions?: (nowMs: number) => ComposioConnectionSuppressionState;
   saveConnectionSuppressions?: (s: ComposioConnectionSuppressionState, nowMs?: number) => void;
-}
-
-// ── config (user-editable via the proactivity policy) ────────────────────────
-function realConfig(): CalendarMonitorConfig {
-  const policy = loadProactivityPolicy();
-  const fetchOverride = Number.parseInt(getRuntimeEnv('CLEMMY_CALENDAR_MONITOR_FETCH', '50') || '50', 10);
-  return {
-    enabled: policy.calendarWatchEnabled !== false,
-    intervalMs: Math.max(1, policy.calendarWatchMinutes) * 60_000,
-    maxPerScan: Math.max(1, policy.calendarWatchMax),
-    fetchTop: Number.isFinite(fetchOverride) && fetchOverride >= 1 ? fetchOverride : 50,
-  };
 }
 
 // ── response parsing (defensive) ─────────────────────────────────────────────
@@ -258,19 +244,6 @@ function saveStateReal(s: CalendarMonitorState): void {
   writeFileSync(STATE_FILE, JSON.stringify(s, null, 2), 'utf-8');
 }
 
-const REAL_DEPS: CalendarMonitorDeps = {
-  listConnections: listConnectedToolkits,
-  executeTool: executeComposioTool,
-  notify: addNotification,
-  config: realConfig,
-  proactiveWorkAllowed: () => getProactivityPolicySnapshot().proactiveWorkAllowed,
-  now: () => Date.now(),
-  loadState: loadStateReal,
-  saveState: saveStateReal,
-  readConnectionSuppressions: readComposioConnectionSuppressionState,
-  saveConnectionSuppressions: saveComposioConnectionSuppressionState,
-};
-
 export const calendarMonitorInternalsForTest = { loadStateReal, saveStateReal };
 
 function accountLabel(conn: { accountEmail?: string; accountName?: string; slug: string }): string {
@@ -284,7 +257,7 @@ function accountLabel(conn: { accountEmail?: string; accountName?: string; slug:
  * by connection id so stale accounts do not spam the logs. Returns the count
  * surfaced. Best-effort: never throws.
  */
-export async function processCalendarMonitor(deps: CalendarMonitorDeps = REAL_DEPS): Promise<number> {
+export async function processCalendarMonitor(deps: CalendarMonitorDeps): Promise<number> {
   const cfg = deps.config();
   if (!cfg.enabled) return 0;
   if (!deps.proactiveWorkAllowed()) return 0;
@@ -303,7 +276,7 @@ export async function processCalendarMonitor(deps: CalendarMonitorDeps = REAL_DE
   }
   if (state.lastScanAt && nowMs - Date.parse(state.lastScanAt) < cfg.intervalMs) return 0;
 
-  let connections: Awaited<ReturnType<typeof listConnectedToolkits>>;
+  let connections: ConnectedToolkit[];
   try {
     connections = await deps.listConnections();
   } catch (err) {

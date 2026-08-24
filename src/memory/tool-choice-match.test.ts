@@ -14,7 +14,11 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { matchToolChoicesForStep, type ToolChoiceRecord } from './tool-choice-store.js';
+import {
+  matchInvalidatedToolChoices,
+  matchToolChoicesForStep,
+  type ToolChoiceRecord,
+} from './tool-choice-store.js';
 
 function rec(
   intent: string,
@@ -99,6 +103,36 @@ test('poisoned-composio routing: a clean cli choice beats a mislabeled composio 
   assert.ok(matches.length >= 1);
   assert.equal(matches[0].kind, 'cli', 'cli choice should rank first on a near tie');
   assert.equal(matches[0].autoBindable, true);
+});
+
+test('advertise: a learned ask retrieves the CLI without naming Salesforce', () => {
+  const learned = rec(
+    'sf.data.query',
+    'cli',
+    'sf',
+    'sf data query --json --query "{{soql}}"',
+    'Auto-remembered: this local CLI read satisfied "What is the net MRR we sold as a team this week?".',
+  );
+  learned.aliases = [{
+    intent: 'What is the net MRR we sold as a team this week?',
+    status: 'active',
+    source: 'synthetic',
+    firstSeenAt: '2026-08-14T00:00:00Z',
+    lastSeenAt: '2026-08-14T00:00:00Z',
+  }];
+  const advertised = matchToolChoicesForStep(
+    'What is the net MRR we sold as a team this week?',
+    { purpose: 'advertise', choices: [learned] },
+  );
+  assert.equal(advertised.length, 1);
+  assert.equal(advertised[0].kind, 'cli');
+  assert.equal(advertised[0].identifier, 'sf');
+
+  const bound = matchToolChoicesForStep(
+    'What is the net MRR we sold as a team this week?',
+    { choices: [learned] },
+  );
+  assert.equal(bound.length, 0, 'advertise-only: do not auto-bind a workflow step from a paraphrase');
 });
 
 test('precision: a single generic/short token does NOT trigger a match', () => {
@@ -230,6 +264,62 @@ test('inactive (invalidated) choices are skipped', () => {
     choices: [inactive],
   });
   assert.equal(matches.length, 0);
+});
+
+test('newer canonical success suppresses only the same stale orphan invalidation', () => {
+  const staleSame: ToolChoiceRecord = {
+    intent: 'Apify run actor sync get dataset items',
+    choice: null,
+    fallbacks: [{
+      kind: 'composio',
+      identifier: 'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET',
+      failedAt: '2026-07-08T04:46:27.736Z',
+      reason: 'agent re-searched this intent',
+    }],
+    body: '',
+    filePath: '/tmp/stale-apify-orphan.md',
+  };
+  const active = rec(
+    'apify.act_run_sync_get_dataset_items_get',
+    'composio',
+    'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET',
+  );
+  active.procedureId = 'tp_active_apify';
+  active.procedureKey = 'v1|composio|apify|act';
+  active.choice = {
+    ...active.choice!,
+    testedAt: '2026-08-13T08:51:39.928Z',
+    lastSuccessAt: '2026-08-13T08:51:39.701Z',
+  };
+  const distinctFailed: ToolChoiceRecord = {
+    ...staleSame,
+    intent: 'Apify run another actor and get dataset items',
+    filePath: '/tmp/distinct-apify-orphan.md',
+    fallbacks: [{
+      kind: 'composio',
+      identifier: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
+      failedAt: '2026-08-14T04:46:27.736Z',
+      reason: 'this distinct capability still failed',
+    }],
+  };
+
+  const matches = matchInvalidatedToolChoices(
+    'Use Apify to run the actor and get dataset items.',
+    { choices: [staleSame, active, distinctFailed] },
+  );
+  assert.ok(!matches.some((match) =>
+    match.identifier === 'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET'),
+  'the newer active canonical procedure supersedes the stale orphan');
+  assert.ok(matches.some((match) =>
+    match.identifier === 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS'),
+  'a distinct failed physical capability remains visible');
+
+  active.choice = { ...active.choice!, testedAt: '2026-06-01T00:00:00.000Z', lastSuccessAt: undefined };
+  assert.ok(matchInvalidatedToolChoices(
+    'Use Apify to run the actor and get dataset items.',
+    { choices: [staleSame, active] },
+  ).some((match) => match.identifier === 'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET'),
+  'an older active record cannot erase a later invalidation');
 });
 
 test('placeholder active choices are skipped even when injected directly', () => {

@@ -21,6 +21,7 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-autonomy-stagger-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.OPENAI_AGENTS_DISABLE_TRACING = '1';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const {
   processAgentAutonomyV2,
@@ -149,7 +150,7 @@ test('a timed-out turn holds the global lane until its provider promise settles'
 
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) =>
-    realSetTimeout(callback, (delay ?? 0) >= 60_000 ? 1 : delay, ...args)) as typeof setTimeout;
+    realSetTimeout(callback, (delay ?? 0) >= 60_000 ? 25 : delay, ...args)) as typeof setTimeout;
 
   try {
     const first = await processAgentAutonomyV2(stubAssistant);
@@ -190,7 +191,7 @@ test('a provider that ignores abort cannot freeze unrelated autonomy agents fore
 
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) =>
-    realSetTimeout(callback, (delay ?? 0) >= 60_000 ? 1 : delay, ...args)) as typeof setTimeout;
+    realSetTimeout(callback, (delay ?? 0) >= 60_000 ? 25 : delay, ...args)) as typeof setTimeout;
 
   try {
     const first = await processAgentAutonomyV2(stubAssistant);
@@ -236,7 +237,7 @@ test('two providers that ignore abort open a bounded circuit instead of accumula
 
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) =>
-    realSetTimeout(callback, (delay ?? 0) >= 60_000 ? 1 : delay, ...args)) as typeof setTimeout;
+    realSetTimeout(callback, (delay ?? 0) >= 60_000 ? 25 : delay, ...args)) as typeof setTimeout;
 
   try {
     assert.equal((await processAgentAutonomyV2(stubAssistant)).failed, 1);

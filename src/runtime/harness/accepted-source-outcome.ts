@@ -63,12 +63,8 @@ export function acceptedSourceOutcome(source: EventRow): AcceptedSourceOutcome |
     || source.role !== 'user'
     || source.data.synthetic === true
   ) return null;
-  try {
-    return exactTerminalForAcceptedSource(source)
-      ?? exactDispatchForAcceptedSource(source);
-  } catch {
-    // This reducer sits on provider replay/failure paths. An unreadable ledger
-    // is never permission to replay work or publish an unverified proposal.
-    return null;
-  }
+  // A source-claiming legacy/corrupt terminal is projected conservatively as
+  // blocked. Only a proven absence reaches the dispatch lookup below.
+  return exactTerminalForAcceptedSource(source)
+    ?? exactDispatchForAcceptedSource(source);
 }

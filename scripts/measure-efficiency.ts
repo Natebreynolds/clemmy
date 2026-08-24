@@ -23,7 +23,6 @@
  */
 import { readUsageEventsForDate, listUsageDates, rollupUsage, classifyUsageKind, type UsageEvent } from '../src/runtime/usage-log.js';
 import { openEventLog } from '../src/runtime/harness/eventlog.js';
-import { summarizeCodeModeEfficiency, formatCodeModeEfficiency, type CodeModeSummaryEvent } from '../src/runtime/harness/code-mode-metrics.js';
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -127,12 +126,10 @@ if (withComponents.length > 0) {
   console.log(`\nPROMPT COMPONENTS: (none recorded — assembly instrumentation A2 not yet emitting promptComponents)`);
 }
 
-// ── JIT + Code-Mode readout (from the harness eventlog) ──────────────────────
-// The usage-log doesn't carry the JIT arm / code-mode tags — those live in the
-// harness eventlog (tool_jit_scope, codeMode-tagged tool_called). Read them
-// directly so the next data-justified flips are decided from data:
-//   - JIT: how much is it actually pruning the tool surface (drop %)? → flip to 100%
-//   - Code Mode: is the model reaching for run_tool_program (in-program calls)? → expand
+// ── JIT readout (from the harness eventlog) ──────────────────────────────────
+// The usage log doesn't carry the JIT arm tags; those live in the harness
+// eventlog as tool_jit_scope events. Read them directly so the next
+// data-justified flip is based on observed pruning rather than configuration.
 // Best-effort + read-only; a missing/locked DB never breaks the usage readout above.
 const cutoffStart = `${dates[dates.length - 1] ?? '0000-00-00'}T00:00:00`;
 const cutoffEnd = explicitDate ? `${explicitDate}T23:59:59.999` : '9999-12-31T23:59:59';
@@ -161,24 +158,8 @@ try {
     console.log(`\nTOOL JIT: (no tool_jit_scope events in window — JIT off, or no turns yet)`);
   }
 
-  const cmRows = db.prepare(
-    `SELECT session_id FROM events WHERE type = 'tool_called' AND created_at >= ? AND created_at <= ? AND data_json LIKE '%"codeMode":true%'`,
-  ).all(cutoffStart, cutoffEnd) as Array<{ session_id: string }>;
-  const cmSessions = new Set(cmRows.map((r) => r.session_id)).size;
-  console.log(`CODE MODE          in-program calls ${cmRows.length} across ${cmSessions} session(s)  (adoption signal — 0 ⇒ the model isn't reaching for run_tool_program yet)`);
-
-  // The efficiency readout the DELETE-WHEN-VALIDATED mandate was waiting on:
-  // aggregate codemode_program_summary (savedBytes = intermediate − distilled).
-  const cmSummaryRows = db.prepare(
-    `SELECT data_json FROM events WHERE type = 'codemode_program_summary' AND created_at >= ? AND created_at <= ?`,
-  ).all(cutoffStart, cutoffEnd) as Array<{ data_json: string }>;
-  const cmEvents: CodeModeSummaryEvent[] = [];
-  for (const row of cmSummaryRows) {
-    try { cmEvents.push(JSON.parse(row.data_json) as CodeModeSummaryEvent); } catch { /* skip corrupt row */ }
-  }
-  console.log(formatCodeModeEfficiency(summarizeCodeModeEfficiency(cmEvents)));
 } catch (err) {
-  console.log(`\nTOOL JIT / CODE MODE: (eventlog unavailable — ${err instanceof Error ? err.message : String(err)})`);
+  console.log(`\nTOOL JIT: (eventlog unavailable — ${err instanceof Error ? err.message : String(err)})`);
 }
 
 console.log('');

@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   isMutatingExternalWrite,
+  classifyCanonicalExternalEffect,
   isGateEnabled,
   MissingExecutionWrapError,
   isIrreversibleSendSlug,
@@ -595,5 +596,99 @@ test('coverage sweep: reversible writes / drafts / reads never over-gate', () =>
   ];
   for (const slug of mustNotGate) {
     assert.equal(isIrreversibleSendSlug(slug), false, `${slug} must NOT over-gate (reversible/read/draft)`);
+  }
+});
+
+test('a native MCP server name is never effect evidence — a read verb in the SERVER slug cannot prove a destructive tool read-only (live-verified 2026-08-21)', () => {
+  // Identity must keep the server (two servers can expose the same tool name);
+  // effect must not. Fusing them classified `mcp__audit-log__purge` as
+  // mutating:false / reversibility:'read_only' / classificationKnown:true —
+  // a purge, proven read-only, auto-approvable. Same for unsubscribe,
+  // complete_task and run_robot, because 'list'/'get'/'browse'/'audit' are
+  // read verbs sitting in the SERVER name.
+  for (const name of [
+    'mcp__audit-log__purge',
+    'mcp__list-monk__unsubscribe',
+    'mcp__get-things-done__complete_task',
+    'mcp__browse-ai__run_robot',
+    'mcp__view-mailer__delete_list',
+  ]) {
+    const effect = classifyCanonicalExternalEffect(name, {});
+    assert.equal(effect.external, true, `${name} crosses a provider boundary`);
+    assert.equal(effect.mutating, true, `${name} must not be classified read-only by its server name`);
+    assert.notEqual(effect.reversibility, 'read_only', `${name} must never claim read_only`);
+    assert.equal(isMutatingExternalWrite(name, {}), true, `${name} must reach the write boundary`);
+  }
+  // No verb evidence in the OPERATION ⇒ explicitly unknown, so approval and
+  // workspace consumers fail closed rather than inheriting a server-name read.
+  for (const unknown of ['mcp__audit-log__purge', 'mcp__browse-ai__run_robot']) {
+    assert.equal(
+      classifyCanonicalExternalEffect(unknown, {}).classificationKnown,
+      false,
+      `${unknown} has no proven effect vocabulary`,
+    );
+  }
+  // A write verb in the OPERATION is still proven, which is stronger.
+  assert.equal(
+    classifyCanonicalExternalEffect('mcp__view-mailer__delete_list', {}).classificationKnown,
+    true,
+    'delete_list proves a write from its own verb',
+  );
+});
+
+test('effect evidence comes from the operation segment while IDENTITY keeps the server', () => {
+  // The send floor must still fire on the operation, and the identity the
+  // approval/telemetry layer sees must remain server-qualified.
+  const send = classifyCanonicalExternalEffect('mcp__mailer__send_campaign', {});
+  assert.equal(send.irreversible, true, 'a send verb in the OPERATION still proves an irreversible send');
+  assert.equal(send.action, 'mailer_send_campaign', 'identity stays server-qualified');
+  // Composio slugs have no server segment and are unchanged by this split.
+  const write = classifyCanonicalExternalEffect('composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{}' });
+  assert.equal(write.mutating, true);
+  assert.equal(write.irreversible, true);
+  const read = classifyCanonicalExternalEffect('composio_execute_tool', { tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: '{}' });
+  assert.equal(read.mutating, false);
+  assert.equal(read.classificationKnown, true);
+});
+
+test('a server-declared readOnly tool becomes usable for reads; a declared destructive one never does', async () => {
+  // The blank-install case: a user connects a third-party MCP server whose
+  // tool names carry no verb (`issues`, `customers`, `whoami`). Without the
+  // server's own declaration there is no evidence, so every read parks for
+  // approval. With it, a read is admitted — but only when nothing contradicts.
+  const {
+    recordDeclaredMcpToolEffect,
+    _resetDeclaredMcpToolEffectsForTest,
+  } = await import('../mcp-declared-effects.js');
+  _resetDeclaredMcpToolEffectsForTest();
+  try {
+    // No declaration ⇒ unknown ⇒ fails closed (unchanged).
+    assert.equal(classifyCanonicalExternalEffect('mcp__linear__issues', {}).mutating, true);
+    assert.equal(classifyCanonicalExternalEffect('mcp__linear__issues', {}).classificationKnown, false);
+
+    recordDeclaredMcpToolEffect('mcp__linear__issues', { readOnlyHint: true });
+    const declaredRead = classifyCanonicalExternalEffect('mcp__linear__issues', {});
+    assert.equal(declaredRead.mutating, false, 'a declared read is admitted');
+    assert.equal(declaredRead.classificationKnown, true);
+    assert.equal(isMutatingExternalWrite('mcp__linear__issues', {}), false);
+
+    // A declared destructive tool is believed immediately.
+    recordDeclaredMcpToolEffect('mcp__linear__wipe_workspace', { destructiveHint: true });
+    const declaredDestructive = classifyCanonicalExternalEffect('mcp__linear__wipe_workspace', {});
+    assert.equal(declaredDestructive.mutating, true);
+    assert.equal(declaredDestructive.classificationKnown, true);
+
+    // A DECLARATION CANNOT OVERRIDE CONTRARY EVIDENCE: a write verb in the
+    // operation outranks the server's claim that the tool is read-only.
+    recordDeclaredMcpToolEffect('mcp__tidy__delete_everything', { readOnlyHint: true });
+    const lyingServer = classifyCanonicalExternalEffect('mcp__tidy__delete_everything', {});
+    assert.equal(lyingServer.mutating, true, 'a write verb outranks a readOnly declaration');
+    assert.notEqual(lyingServer.reversibility, 'read_only');
+
+    // Non-boolean or absent hints are not claims.
+    recordDeclaredMcpToolEffect('mcp__vendor__thing', { readOnlyHint: 'yes' });
+    assert.equal(classifyCanonicalExternalEffect('mcp__vendor__thing', {}).classificationKnown, false);
+  } finally {
+    _resetDeclaredMcpToolEffectsForTest();
   }
 });

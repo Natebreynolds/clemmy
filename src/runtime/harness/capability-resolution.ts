@@ -97,7 +97,7 @@ export const _bindResolutionInputForTest = bindResolutionInput;
  * connected-goal-catalog.ts) — real connectivity, schema-grounded selection —
  * and the binding to the exact accepted input is what lets
  * authoritativeForTask hold, so host-bind is never starved on turn one of a
- * fresh session (live 2026-08-19 sess-mt05r35h).
+ * fresh session (live 2026-08-19 session-fixture-catalog-starvation).
  */
 export function recordAdmissionCapabilityResolution(input: {
   sessionId: string;
@@ -132,7 +132,8 @@ function resolutionBelongsToAcceptedTask(
     limit: 1,
   });
   if (accepted?.seq !== sourceUserSeq) return false;
-  const acceptedInput = normalizeAuthorityInput(accepted?.data.text);
+  const acceptedDisplay = normalizeAuthorityInput(accepted?.data.displayText);
+  const acceptedInput = acceptedDisplay ?? normalizeAuthorityInput(accepted?.data.text);
   return acceptedInput !== null && acceptedInput === resolutionInput;
 }
 
@@ -418,8 +419,9 @@ export function provenComposioSlugForTurn(input: {
   if (!/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(wanted)) return null;
   // Proof scope: this session, at or before this source. The exact-source-only
   // rule made every PAID CONTINUATION turn unreachable-by-remap — live
-  // 2026-08-18 sess-msz8m5vg seq 58306 ("FIRECRAWL_SEARCH is not a deferred
-  // callable tool on this turn's surface") and sess-msz2h3zi seq 58040: the
+  // 2026-08-18 session-fixture-remap-a seq 58306 ("FIRECRAWL_SEARCH is not a
+  // deferred callable tool on this turn's surface") and
+  // session-fixture-remap-b seq 58040: the
   // reply turn had no own-source resolution yet, so a PROVEN slug bounced.
   // The remap only rewrites the carrier; admission, effect, and once-guards
   // still govern the call. Cross-SESSION remap stays forbidden.
@@ -529,7 +531,7 @@ function renderContractRecall(focusInput: string): string | null {
  * PROVISION FROM PROOF. The turn's own host-verified resolution entries,
  * readable as capability supply for semantic admission.
  *
- * Live 2026-08-18 (sess-msywj8qp): the typed catalog was unprovisioned on the
+ * Live 2026-08-18 (session-fixture-unprovisioned-catalog): the typed catalog was unprovisioned on the
  * live home (production packs refuse: identity_mismatch), so semantic
  * admission recorded "No host capabilities were supplied, so no operations
  * could be bound" — while THIS event, one read away, held proven

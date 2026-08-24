@@ -607,3 +607,39 @@ export function formatBatchValidationError(
     ...recovery,
   ].join('\n');
 }
+
+/**
+ * Deterministic single-field rename: the caller supplied exactly ONE field
+ * the schema does not know while exactly ONE required field is missing —
+ * the classic `arguments.query` vs required `q` (live 2026-08-18
+ * session-fixture-unprovisioned-catalog guardrail: FIRECRAWL_SEARCH refused pre-dispatch and a paid
+ * tuition round-trip followed). The value is the caller's own; only the key
+ * moves, only when the mapping is unambiguous, and the repair is surfaced as
+ * a note — never silent. Anything less certain still refuses with the
+ * repair template.
+ */
+export function repairUnambiguousFieldRename(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  schema?: Record<string, unknown> | null,
+): { args: Record<string, unknown>; note: string } | null {
+  if (!isRecordValue(schema)) return null;
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((k): k is string => typeof k === 'string')
+    : [];
+  const props = isRecordValue(schema.properties) ? schema.properties : null;
+  if (!props) return null;
+  const missing = required.filter((key) => !(key in args));
+  if (missing.length !== 1) return null;
+  const unknown = Object.keys(args).filter((key) => !(key in props));
+  if (unknown.length !== 1) return null;
+  const from = unknown[0]!;
+  const to = missing[0]!;
+  const repaired: Record<string, unknown> = { ...args };
+  repaired[to] = repaired[from];
+  delete repaired[from];
+  return {
+    args: repaired,
+    note: `[arg-repair] ${toolSlug}: renamed \`${from}\` to the schema's required \`${to}\` (value unchanged).`,
+  };
+}

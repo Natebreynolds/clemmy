@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -16,6 +16,12 @@ mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
 import type { CalendarMonitorDeps, CalEvent } from './calendar-monitor.js';
 const { calendarMonitorInternalsForTest, processCalendarMonitor, scoreEvent } = await import('./calendar-monitor.js');
+
+test('calendar monitor has no ambient raw-provider default owner', () => {
+  const source = readFileSync(new URL('./calendar-monitor.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /executeComposioTool|REAL_DEPS/);
+  assert.match(source, /processCalendarMonitor\(deps: CalendarMonitorDeps\)/);
+});
 
 const NOW = Date.parse('2026-06-16T12:00:00Z');
 // Outlook Graph event fixture; dateTime in UTC without offset (as Graph returns).

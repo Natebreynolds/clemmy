@@ -152,7 +152,9 @@ test('stable context carries compact skill discovery while the volatile query ge
   assert.doesNotMatch(stable, /`proposal-style`/, 'installed names do not bloat or churn the stable prefix');
 
   const relevant = renderHarnessMemoryContext({
-    query: 'Create a polished proposal document for a client.',
+    // Name the installed skill explicitly so this test pins partitioning, not
+    // the separate ambient-relevance precision threshold.
+    query: 'Use the Proposal Style skill to create a polished proposal document for a client.',
     partition: 'volatile',
   });
   assert.match(relevant, /## Relevant Skills/);

@@ -1,6 +1,7 @@
 import {
   TOOL_REGISTRY,
   actionTopologyRoleFor,
+  isRegisteredDelegationPrimitive,
   type ActionTopologyRole,
   type ToolSideEffect,
 } from '../../tools/tool-registry.js';
@@ -33,6 +34,32 @@ export interface RuntimeToolEffectDecision {
   /** A mutation outside Clementine's local workspace/state boundary. */
   dangerousWrite: boolean;
   source: 'shell' | 'composio' | 'native_mcp' | 'registry' | 'unknown';
+}
+
+/** Provider-neutral authority class consumed by shared execution owners. */
+export type RuntimeToolAuthorityBinding = 'local_envelope' | 'catalog_manifest' | 'unknown';
+
+/**
+ * Translate adapter provenance into the only authority fact the host kernel
+ * needs. The positive local allowlist is deliberate: an unrecognized future
+ * source can never inherit local-envelope authority by omission.
+ */
+export function runtimeToolAuthorityBinding(
+  decision: RuntimeToolEffectDecision,
+): RuntimeToolAuthorityBinding {
+  if (decision.effect === 'unknown' || decision.source === 'unknown') return 'unknown';
+  switch (decision.source) {
+    case 'registry':
+    case 'shell':
+      return decision.effect === 'external_write' || decision.effect === 'admin'
+        ? 'catalog_manifest'
+        : 'local_envelope';
+    case 'composio':
+    case 'native_mcp':
+      return 'catalog_manifest';
+    default:
+      return 'unknown';
+  }
 }
 
 /**
@@ -239,6 +266,9 @@ export function pairTransportMirrorToolCalls(
 const REGISTRY_EFFECTS = new Map<string, ToolSideEffect>(
   TOOL_REGISTRY.map((decl) => [decl.name, decl.sideEffect]),
 );
+const REGISTRY_RUNTIME_EFFECTS = new Map<string, RuntimeToolEffect>(
+  TOOL_REGISTRY.flatMap((decl) => decl.runtimeEffect ? [[decl.name, decl.runtimeEffect]] : []),
+);
 
 function shellCommand(args: unknown): string {
   if (typeof args === 'string') return args;
@@ -263,13 +293,10 @@ function decodedToolArgs(args: unknown): unknown {
 export interface RuntimeEffectiveToolIdentity {
   toolName: string | null;
   args: unknown;
-  /** True when the peel ended at the trusted Composio gateway, so `args` is
-   *  that gateway's `{tool_slug, arguments}` carrier payload. Contract
-   *  canonicalization must peel it to the inner contract regardless of which
-   *  outer carrier (call_tool, work_call, direct) started the chain — keying
-   *  on the OUTER name digested the same provider call differently per
-   *  carrier, and that divergence is what poisoned the 2026-08-18 live
-   *  FIRECRAWL_SEARCH step. */
+  /** True when the peel crossed the trusted Composio gateway. `toolName` and
+   *  `args` are already the exact inner operation + argument object; the flag
+   *  retains carrier provenance without making downstream callers interpret
+   *  the envelope a second time. */
   composioCarrier?: boolean;
 }
 
@@ -316,12 +343,33 @@ export function unwrapRuntimeEffectiveToolIdentity(
   }
 
   if (isTrustedComposioGateway(toolName)) {
-    const slug = args && typeof args === 'object' && !Array.isArray(args)
-      ? (args as Record<string, unknown>).tool_slug
-      : undefined;
+    const carrier = args && typeof args === 'object' && !Array.isArray(args)
+      ? args as Record<string, unknown>
+      : null;
+    const slug = carrier?.tool_slug;
+    const rawInnerArgs = carrier?.arguments;
+    // The authoritative Composio wire uses explicit null for a valid action
+    // with zero arguments. Normalize only that sanctioned representation to
+    // the canonical empty object. A missing field, malformed JSON, array, or
+    // primitive remains unreadable and therefore fails closed below.
+    const innerArgs = rawInnerArgs === null ? {} : decodedToolArgs(rawInnerArgs);
+    // The trusted gateway is a transport envelope, not the business call.
+    // Host admission, settlement and the provider port must all bind the exact
+    // inner operation + arguments. Malformed/non-object inner bytes do not
+    // degrade to `{}` or retain the wrapper identity: they are deliberately
+    // uncontractible so the execution boundary fails closed before I/O.
+    if (
+      typeof slug !== 'string'
+      || !slug.trim()
+      || !innerArgs
+      || typeof innerArgs !== 'object'
+      || Array.isArray(innerArgs)
+    ) {
+      return { toolName: null, args: innerArgs, composioCarrier: true };
+    }
     return {
-      toolName: typeof slug === 'string' && slug.trim() ? slug.trim() : tail,
-      args,
+      toolName: slug.trim(),
+      args: innerArgs,
       composioCarrier: true,
     };
   }
@@ -418,6 +466,10 @@ function classifyRegistered(toolName: string): RuntimeToolEffectDecision | null 
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
     .replace(/-/g, '_')
     .toLowerCase();
+  const runtimeEffect = REGISTRY_RUNTIME_EFFECTS.get(tail) ?? REGISTRY_RUNTIME_EFFECTS.get(registryTail);
+  if (runtimeEffect === 'host_only') {
+    return { effect: 'host_only', mutating: true, dangerousWrite: false, source: 'registry' };
+  }
   const sideEffect = REGISTRY_EFFECTS.get(tail) ?? REGISTRY_EFFECTS.get(registryTail);
   if (!sideEffect) return null;
   switch (sideEffect) {
@@ -443,6 +495,65 @@ export function actionTopologyRoleForRuntimeCall(
     .replace(/-/g, '_')
     .toLowerCase();
   return actionTopologyRoleFor(registryName);
+}
+
+/**
+ * One structural projection for the boundary between registry control
+ * operations and accepted business work. A read-only control remains control;
+ * a registry-declared mutation may be bound to an exact expected-work
+ * requirement and, once bound, that durable row is the settlement authority.
+ * No tool name or provider identity participates in this decision.
+ */
+export function runtimeExpectedWorkProjection(
+  toolName: string,
+  args: unknown,
+): {
+  role: ActionTopologyRole;
+  decision: RuntimeToolEffectDecision;
+  mayBindBusinessWork: boolean;
+} {
+  const role = actionTopologyRoleForRuntimeCall(toolName, args);
+  const decision = classifyRuntimeToolEffect(toolName, args);
+  return {
+    role,
+    decision,
+    mayBindBusinessWork: role === 'business'
+      || (
+        decision.source === 'registry'
+        && decision.mutating
+        && runtimeEffectIsMutation(decision.effect)
+      ),
+  };
+}
+
+/** Shared effect projection for durable admission and settlement rows. */
+export function runtimeEffectIsMutation(effect: RuntimeToolEffect): boolean {
+  return effect === 'local_write' || effect === 'external_write' || effect === 'admin';
+}
+
+/** True only for a trusted local registry call whose exact declaration can
+ * execute, release, auto-test, activate, or mint future unpropagated work.
+ * Foreign lookalikes and provider calls fail closed to false; no provider/tool
+ * prose is parsed. */
+export function isDelegationPrimitiveRuntimeCall(
+  toolName: string,
+  args: unknown,
+): boolean {
+  const effective = unwrapRuntimeEffectiveToolIdentity(toolName, args);
+  if (!effective.toolName) return false;
+  if (classifyRuntimeToolEffect(toolName, args).source !== 'registry') return false;
+  const registryName = localToolTail(effective.toolName)
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/-/g, '_')
+    .toLowerCase();
+  return isRegisteredDelegationPrimitive(registryName);
+}
+
+/** Trusted local shell carriers can perform arbitrary network reads without a
+ * catalog/source identity. During a material-source turn they must be refused
+ * rather than deriving authority from command text. */
+export function isUnscopedShellRuntimeCall(toolName: string, args: unknown): boolean {
+  return classifyRuntimeToolEffect(toolName, args).source === 'shell';
 }
 
 export function classifyRuntimeToolEffect(toolName: string, args: unknown): RuntimeToolEffectDecision {

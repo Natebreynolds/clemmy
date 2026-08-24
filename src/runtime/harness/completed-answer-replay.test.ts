@@ -30,9 +30,12 @@ const {
   openEventLog,
   recordRunAttemptUserInput,
 } = await import('./eventlog.js');
-const { exactTerminalForAcceptedSource } = await import('./accepted-source-terminal.js');
+const {
+  exactTerminalForAcceptedSource,
+  resolveExactTerminalForAcceptedSource,
+} = await import('./accepted-source-terminal.js');
 const { acceptedSourceOutcome } = await import('./accepted-source-outcome.js');
-const { commitTurnOutcome } = await import('./delivery-committer.js');
+const { commitTurnOutcome, completionDataForTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 const { currentAcceptedReadAuthority } = await import('../read-path/accepted-read-authority.js');
 
@@ -163,7 +166,7 @@ test('production protection admits a clean typed completed-answer replay', async
   assert.equal(candidate.priorPresentationId, seed.priorCommit.presentation.id);
 });
 
-test('narrow terminal resolution preserves fail-closed corrupt-row behavior', () => {
+test('narrow terminal resolution distinguishes a historical corrupt row from absence', () => {
   sessionSequence += 1;
   const sessionId = `completed-answer-replay-corrupt-${sessionSequence}`;
   createSession({ id: sessionId, kind: 'chat' });
@@ -173,28 +176,93 @@ test('narrow terminal resolution preserves fail-closed corrupt-row behavior', ()
     role: 'user',
     data: { text: 'Inspect the workspace.' },
   }, { armRunInFlight: true });
-  appendEvent({
-    sessionId,
-    turn: source.turn,
-    role: 'assistant',
-    type: 'conversation_completed',
-    parentEventId: source.id,
-    data: {
-      terminalKey: `turn:${source.seq}`,
-      sourceUserSeq: source.seq,
-      presentation: {
-        identity: {
-          sessionId,
-          turn: source.turn,
-          sourceUserSeq: source.seq,
-        },
+  const corruptData = {
+    terminalKey: `turn:${source.seq}`,
+    sourceUserSeq: source.seq,
+    presentation: {
+      identity: {
+        sessionId,
+        turn: source.turn,
+        sourceUserSeq: source.seq,
       },
     },
-  });
+  };
+  openEventLog().prepare(`
+    INSERT INTO events
+      (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+    VALUES (?, ?, ?, 'assistant', 'conversation_completed', ?, ?, ?)
+  `).run(
+    `${sessionId}:corrupt-terminal`,
+    sessionId,
+    source.turn,
+    source.id,
+    JSON.stringify(corruptData),
+    new Date().toISOString(),
+  );
   finishRunAttempt(attempt, 'completed');
 
-  assert.equal(exactTerminalForAcceptedSource(source), null);
-  assert.equal(acceptedSourceOutcome(source), null);
+  const terminal = exactTerminalForAcceptedSource(source);
+  assert.equal(terminal?.presentation.status, 'blocked');
+  assert.match(terminal?.presentation.text ?? '', /cannot verify safely/i);
+  assert.deepEqual(acceptedSourceOutcome(source), terminal);
+});
+
+test('terminal resolution preserves earliest-writer authority across rolling-upgrade rows', () => {
+  sessionSequence += 1;
+  const sessionId = `completed-answer-replay-first-writer-${sessionSequence}`;
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Inspect the workspace.' },
+  });
+  const terminalKey = `turn:${source.seq}`;
+  const insert = openEventLog().prepare(`
+    INSERT INTO events
+      (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+    VALUES (?, ?, ?, 'system', 'conversation_completed', ?, ?, ?)
+  `);
+  const legacyId = `${sessionId}:legacy-first-writer`;
+  insert.run(
+    legacyId,
+    sessionId,
+    source.turn,
+    source.id,
+    JSON.stringify({
+      terminalKey,
+      reply: 'The pre-upgrade writer committed first.',
+      summary: 'The pre-upgrade writer committed first.',
+      reason: 'success',
+      delivered: true,
+    }),
+    new Date(Date.now() - 1_000).toISOString(),
+  );
+  const identity = { sessionId, turn: source.turn, sourceUserSeq: source.seq } as const;
+  const typed = completionDataForTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text: 'A later typed row must not replace the first writer.' },
+  });
+  insert.run(
+    `${sessionId}:typed-later-loser`,
+    sessionId,
+    source.turn,
+    source.id,
+    JSON.stringify(typed),
+    new Date().toISOString(),
+  );
+
+  const resolution = resolveExactTerminalForAcceptedSource(source);
+  assert.equal(resolution.kind, 'legacy');
+  assert.equal('event' in resolution ? resolution.event.id : null, legacyId);
+  const terminal = exactTerminalForAcceptedSource(source);
+  assert.equal(terminal?.event.id, legacyId);
+  assert.equal(terminal?.presentation.status, 'blocked');
 });
 
 test('production protection blocks material durable unfinished-work owners', async (t) => {

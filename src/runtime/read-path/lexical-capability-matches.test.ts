@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { requestSemanticSegments } from '../../assistant/request-segments.js';
 import {
+  diversifyCapabilities,
   lexicalCapabilityMatchesForRequest,
   lexicalCapabilityProjectionForRequest,
 } from './lexical-capability-matches.js';
@@ -120,6 +121,31 @@ test('sibling destination variants cannot crowd out an independent delivery role
     new Set(matches.map((match) => match.roleKey)),
     new Set(['clause-0:read', 'clause-1:write', 'clause-2:write']),
   );
+});
+
+test('diversity preserves every account provenance for the selected physical capability', () => {
+  const roleKey = 'clause-0:read';
+  const matches = diversifyCapabilities([
+    {
+      kind: 'composio', identifier: 'MAILCO_FETCH_INVOICES', score: 1,
+      accountIdentity: 'ap@northco.example', roleKey,
+    },
+    {
+      kind: 'composio', identifier: 'MAILCO_FETCH_INVOICES', score: 0.99,
+      accountIdentity: 'billing@southco.example', roleKey,
+    },
+    {
+      kind: 'composio', identifier: 'MAILCO_FETCH_ARCHIVED_INVOICES', score: 0.8,
+      accountIdentity: 'ap@northco.example', roleKey,
+    },
+  ], 4);
+  assert.deepEqual(
+    new Set(matches.map((match) => match.accountIdentity)),
+    new Set(['ap@northco.example', 'billing@southco.example']),
+    'account variants of one operation are provenance, not sibling-operation noise',
+  );
+  assert.equal(matches.some((match) => match.identifier === 'MAILCO_FETCH_ARCHIVED_INVOICES'), false,
+    'a different sibling operation remains deduplicated');
 });
 
 test('per-clause retrieval is integration-neutral across compound phrasing mutations', () => {

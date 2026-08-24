@@ -455,7 +455,7 @@ test('uncertain reversible committed-result salvage reaches repair and the share
   );
 });
 
-test('unresolved artifact verification reaches repair and the shared DISCLOSE edge', async () => {
+test('unresolved artifact verification reaches repair and one typed blocked terminal', async () => {
   const sessionId = 'claude-preterminal-artifact-disclose';
   const documentId = 'doc_claude_gate_unverified_123';
   const disclosure = 'I created the brief, but I could not independently read back its exact document ID.';
@@ -523,13 +523,17 @@ test('unresolved artifact verification reaches repair and the shared DISCLOSE ed
     sessionId,
   });
 
-  assert.equal(sdkRuns, 2, 'the exact-ID verification query remains bounded to one attempt');
+  // ONE-STEP CUT: the exact-ID verification query no longer runs inside the
+  // same host invocation; the unresolved binding reaches terminal repair and
+  // then remains a typed blocked outcome until a later host-owned verification.
+  assert.equal(sdkRuns, 1, 'one model step; verification is the host\'s next step');
   assert.equal(repairCalls, 1, 'unresolved artifact state reaches terminal repair');
   assert.equal(response.stoppedReason, 'unverified');
   assert.equal(response.text, disclosure);
   assert.equal(artifactLedger.listUnverifiedRunArtifacts(sessionId).length, 1);
   const { data } = terminalFor(sessionId);
-  assert.equal(data.deliveryDisclosure, 'state_machine_hold');
+  assert.equal((data.presentation as { status?: string } | undefined)?.status, 'blocked');
+  assert.equal(data.deliveryDisclosure, undefined, 'the lane proposed blocked; the committer did not downgrade done');
   assert.equal((data.artifactVerification as { status?: string } | undefined)?.status, 'pending');
   assert.ok(
     (data.verificationMissing as unknown[] | undefined)?.some((item) =>

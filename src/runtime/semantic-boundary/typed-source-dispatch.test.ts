@@ -10,10 +10,15 @@ process.env.CLEMENTINE_HOME = HOME;
 mkdirSync(path.join(HOME, 'state'), { recursive: true });
 writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-typed-dispatch\n', 'utf8');
 
-const { createSession, appendEvent } = await import('../harness/eventlog.js');
+const { createSession, appendEvent, listEvents } = await import('../harness/eventlog.js');
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
-const { recordSemanticParticipation } = await import('./semantic-disposition.js');
-const { dispatchAdmittedSource } = await import('./typed-source-dispatch.js');
+const {
+  recordSemanticDispositionOutcome,
+  recordSemanticParticipation,
+} = await import('./semantic-disposition.js');
+const {
+  dispatchAdmittedSource,
+} = await import('./typed-source-dispatch.js');
 
 async function dispatchFor(text: string) {
   const sess = createSession({ kind: 'chat' });
@@ -72,6 +77,47 @@ test('an unbound write never falls through to the conversation loop', async () =
 test('a conversation-routed graph dispatches conversation, not an action loop', async () => {
   const dispatched = await dispatchFor('hey hows it going');
   assert.ok(dispatched.kind === 'conversation' || dispatched.kind === 'blocked', dispatched.kind);
+  if (dispatched.kind === 'conversation') {
+    assert.equal(dispatched.capabilityRoute, 'direct_reply');
+  }
+});
+
+test('an unparticipated compatibility action preserves its action carrier', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id, turn: 1, role: 'user',
+    type: 'user_input_received',
+    data: { text: 'create one generic artifact from these records' },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: sess.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
+  const dispatched = await dispatchAdmittedSource({
+    sessionId: sess.id,
+    turn: 1,
+    sourceUserSeq: source.seq,
+  });
+  assert.deepEqual(dispatched, { kind: 'conversation', capabilityRoute: 'act' });
+});
+
+test('a participated blocked direct reply cannot reopen conversation', async () => {
+  const { recordSemanticDispositionOutcome } = await import('./semantic-disposition.js');
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: 'hello there' },
+  });
+  assert.ok(recordTurnGraphShadow({
+    identity: { sessionId: sess.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
+  recordSemanticDispositionOutcome(sess.id, source.seq, 'blocked');
+  const dispatched = await dispatchAdmittedSource({
+    sessionId: sess.id,
+    turn: 1,
+    sourceUserSeq: source.seq,
+  });
+  assert.notEqual(dispatched.kind, 'conversation');
+  assert.ok(dispatched.kind === 'blocked' || dispatched.kind === 'needs_input');
 });
 
 test('a failed semantic admission does not fall through to a read loop', async () => {

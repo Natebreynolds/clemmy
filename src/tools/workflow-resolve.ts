@@ -95,7 +95,15 @@ function scoreEntry(qTokens: Set<string>, qCompact: string, entry: ResolverEntry
   let containment = 0;
   if (qCompact.length >= 4) {
     for (const hay of [nameCompact, slugCompact]) {
-      if (hay.length >= 4 && (hay.includes(qCompact) || qCompact.includes(hay))) {
+      if (hay.length < 4) continue;
+      // The user said the workflow's compact name/slug.
+      if (qCompact.includes(hay)) {
+        containment = 0.9;
+        break;
+      }
+      // Abbreviation of the name ("prospectprep" ⊂ "morningprospectprep").
+      // A short leftover token ("review" ⊂ "weeklyreview") is not a name.
+      if (qCompact.length >= 8 && hay.includes(qCompact)) {
         containment = 0.9;
         break;
       }
@@ -103,7 +111,10 @@ function scoreEntry(qTokens: Set<string>, qCompact: string, entry: ResolverEntry
   }
   const eTokens = entryTokens(entry);
   let tokenScore = 0;
-  if (eTokens.size > 0 && qTokens.size > 0) {
+  // A one-token leftover after cadence stopwords ("weekly-review" → "review")
+  // is not unique identity. "scrape their reviews" must not dispatch that
+  // workflow; "run my facebook trends" still can (2 of 3 name tokens).
+  if (eTokens.size >= 2 && qTokens.size > 0) {
     let matched = 0;
     for (const t of eTokens) if (qTokens.has(t)) matched += 1;
     tokenScore = matched / eTokens.size;

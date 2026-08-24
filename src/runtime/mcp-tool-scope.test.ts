@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { filterMcpToolsForScope } from './mcp-tool-filter.js';
-import { resolveMcpToolScope, resolveMcpToolScopeWithContinuity, resolveMcpToolScopeWithRecall, isToolScopeContinuation, mcpToolScopeAuthority, type McpToolScope } from './mcp-tool-scope.js';
+import { compileMcpAccessConstraint, resolveMcpToolScope, resolveMcpToolScopeWithContinuity, resolveMcpToolScopeWithRecall, isToolScopeContinuation, mcpToolScopeAuthority, type McpToolScope } from './mcp-tool-scope.js';
 import type { StepToolChoiceMatch } from '../memory/tool-choice-store.js';
 
 function mcpMatch(identifier: string, tier: 'high' | 'medium' = 'high'): StepToolChoiceMatch {
@@ -106,6 +106,37 @@ test('resolveMcpToolScope: explicit local-memory diagnostics cannot be misread a
   // The contract is the authority, not the sentence describing it: an explicit
   // refusal must resolve to zero external authority however it is worded.
   assert.equal(mcpToolScopeAuthority(scope), 'none');
+});
+
+test('resolveMcpToolScope: explicit external-app refusals compile to zero external authority', () => {
+  for (const userInput of [
+    'Do not use external apps for this turn.',
+    'No external applications; answer from local context only.',
+  ]) {
+    assert.equal(
+      compileMcpAccessConstraint(userInput, ['Salesforce', 'Google Sheets']).mode,
+      'deny_all',
+      userInput,
+    );
+    const scope = resolveMcpToolScope({
+      userInput,
+      configuredServerNames: ['Salesforce', 'Google Sheets'],
+    });
+    assert.equal(mcpToolScopeAuthority(scope), 'none', userInput);
+    assert.equal(scope.maxTools, 0, userInput);
+    assert.deepEqual(scope.allowedServerSlugs, [], userInput);
+  }
+});
+
+test('resolveMcpToolScope: positive external-app intent does not compile as a refusal', () => {
+  const userInput = 'Use external apps to look up the latest account details.';
+  assert.equal(
+    compileMcpAccessConstraint(userInput, ['Salesforce']).mode,
+    'none',
+  );
+  const scope = resolveMcpToolScope({ userInput, configuredServerNames: ['Salesforce'] });
+  assert.notEqual(mcpToolScopeAuthority(scope), 'none');
+  assert.ok((scope.maxTools ?? 0) > 0);
 });
 
 test('resolveMcpToolScope: an email column in a Sheet is structured data, not Outlook intent', () => {

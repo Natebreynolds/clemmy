@@ -79,6 +79,11 @@ import { injectWorkspaceBootstrap } from '../spaces/view-html.js';
 import { appendWiringHealthBanner, spaceWiringHealth } from '../spaces/wiring-health.js';
 import { availableStarterRecipes } from '../spaces/starter-recipes.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
+import {
+  DEFAULT_CANONICAL_PARTITION_PAGE_SIZE,
+  MAX_CANONICAL_PARTITION_PAGE_SIZE,
+  readWorkspaceCanonicalEntityProjectionPage,
+} from './workspace-canonical-entity-projection.js';
 
 type IsAuthorized = (req: Request) => boolean;
 
@@ -461,6 +466,58 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       health,
       linkedWorkflows: linkedWorkflowsForSpace(slug),
     });
+  });
+
+  /**
+   * Reference-only canonical entity status. Counts and bounded references come
+   * from the validated projection head; rows come only from the normalized
+   * partition index. The opaque keyset cursor pins the exact binding + head so
+   * a rebuild can never splice two projections into one client-side page.
+   */
+  app.get('/api/console/spaces/:id/canonical-entity-projection', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const slug = req.params.id;
+    if (!isValidSpaceSlug(slug)) { res.status(400).json({ error: 'invalid id' }); return; }
+    if (!spaceStore.get(slug)) { res.status(404).json({ error: 'not found' }); return; }
+    const cursor = singleQueryString(req.query.cursor);
+    const rawLimit = singleQueryString(req.query.limit);
+    if (cursor === null
+      || rawLimit === null
+      || (rawLimit !== undefined && !/^[1-9]\d{0,2}$/.test(rawLimit))) {
+      res.status(400).json({ error: 'invalid canonical projection pagination query' });
+      return;
+    }
+    const limit = rawLimit === undefined
+      ? DEFAULT_CANONICAL_PARTITION_PAGE_SIZE
+      : Number(rawLimit);
+    if (limit > MAX_CANONICAL_PARTITION_PAGE_SIZE) {
+      res.status(400).json({ error: 'invalid canonical projection pagination query' });
+      return;
+    }
+    let projection: ReturnType<typeof readWorkspaceCanonicalEntityProjectionPage>;
+    try {
+      projection = readWorkspaceCanonicalEntityProjectionPage({
+        workspaceId: slug,
+        ...(cursor !== undefined ? { cursor } : {}),
+        limit,
+      });
+    } catch {
+      res.status(500).json({
+        error: 'canonical projection could not be read safely',
+        code: 'CANONICAL_PROJECTION_READ_FAILED',
+      });
+      return;
+    }
+    if (!projection.ok) {
+      const badRequest = projection.kind === 'invalid_request'
+        || projection.kind === 'invalid_cursor';
+      res.status(badRequest ? 400 : 409).json({
+        error: projection.message,
+        code: `CANONICAL_PROJECTION_${projection.kind.toUpperCase()}`,
+      });
+      return;
+    }
+    res.json(projection.value);
   });
 
   app.patch('/api/console/spaces/:id', (req, res) => {

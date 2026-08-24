@@ -40,6 +40,7 @@ import {
   InboundIdentityConflictError,
 } from './inbox-store.js';
 import { durablePayloadHash, durableRequestIdentity } from './durable-request.js';
+import { selectSessionForAcceptedSource } from '../runtime/harness/accepted-source-session-branch.js';
 import type { ApprovalResolutionResult } from '../types.js';
 import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal, listActiveGoalContracts, listPlanProposals } from '../agents/plan-proposals.js';
 import { createGoalFromDraft, dismissGoalDraft, getGoalDraft, listGoalDrafts } from '../agents/goal-drafts.js';
@@ -1194,7 +1195,11 @@ async function dispatchInbound(opts: {
   };
   const durableRequest = {
     runId: ingress.identity.runId,
+    requestId: ingress.identity.requestId,
+    inputHash: ingress.payloadHash,
     sessionId: ingress.claim.record.sessionId,
+    userId: opts.userId,
+    scopeId: opts.teamId ?? null,
     onSourceAccepted,
   };
 
@@ -1249,6 +1254,7 @@ async function dispatchInbound(opts: {
       channel: 'slack',
       durableRequest,
       userId: opts.userId,
+      scopeId: opts.teamId ?? null,
       conversationKey: `slack:${conversationId}`,
       onlyIfApprovalPending: Boolean(stopControl?.rejectRelevantApprovalFirst),
     });
@@ -1259,10 +1265,17 @@ async function dispatchInbound(opts: {
     if (stopControl) {
       await executeEarlyControl(async (capturing) => {
         const explicitPausedCancel = opts.prompt.trim().toLowerCase() === '/cancel'
-          && isChannelSessionAwaitingApproval(conversationId, 'slack');
+          && isChannelSessionAwaitingApproval(
+            conversationId,
+            'slack',
+            opts.userId,
+            opts.teamId ?? null,
+          );
         const stopped = requestBoundChannelRunStop({
           channelId: conversationId,
           channel: 'slack',
+          userId: opts.userId,
+          guildId: opts.teamId ?? null,
           reason: 'stopped from Slack',
         });
         if (stopped && !explicitPausedCancel) {
@@ -1275,7 +1288,13 @@ async function dispatchInbound(opts: {
         }
         // Preserve the established bare-/slash-cancel semantics without model
         // preflight, now behind the accepted control source above.
-        await handleHarnessCancel({ channelId: conversationId, transport: capturing, channel: 'slack' });
+        await handleHarnessCancel({
+          channelId: conversationId,
+          transport: capturing,
+          channel: 'slack',
+          userId: opts.userId,
+          guildId: opts.teamId ?? null,
+        });
       });
       return;
     }
@@ -1286,6 +1305,8 @@ async function dispatchInbound(opts: {
         channelId: conversationId,
         transport: capturing,
         channel: 'slack',
+        userId: opts.userId,
+        guildId: opts.teamId ?? null,
       }));
       return;
     }
@@ -1377,12 +1398,49 @@ async function dispatchInbound(opts: {
 }
 
 // ── Action (button) handling ───────────────────────────────────────────────
+function bindSlackSessionResumeForAction(input: {
+  targetSessionId: string;
+  channelId: string;
+  threadTs?: string;
+  teamId: string | null;
+  userId: string;
+  actionIdentity: string;
+}): boolean {
+  if (!getHarnessSession(input.targetSessionId)) return false;
+  const conversationId = slackHarnessConversationId(input.channelId, input.threadTs);
+  const durableSourceId = durableRequestIdentity(
+    'slack',
+    `action:${input.actionIdentity}`,
+  ).runId;
+  const selected = selectSessionForAcceptedSource({
+    kind: 'bound_control',
+    entrySessionId: input.targetSessionId,
+    targetSessionId: input.targetSessionId,
+    durableSourceId,
+    continuity: {
+      provider: 'slack',
+      scopeId: input.teamId,
+      conversationId,
+      audienceId: input.userId,
+    },
+  });
+  if (selected.sessionId !== input.targetSessionId) return false;
+  return bindDiscordHarnessSession({
+    channel: 'slack',
+    channelId: conversationId,
+    sessionId: selected.sessionId,
+    userId: input.userId,
+    guildId: input.teamId,
+  });
+}
+
 async function handleSlackAction(opts: {
   assistant: ClementineAssistant;
   client: WebClient;
   actionId: string;
   userId: string;
   channelId: string;
+  teamId: string | null;
   triggerId?: string;
   messageTs?: string;
   threadTs?: string;
@@ -1399,8 +1457,15 @@ async function handleSlackAction(opts: {
   }
 
   if (action === 'session-resume') {
-    const conversationId = slackHarnessConversationId(opts.channelId, opts.threadTs ?? opts.messageTs);
-    const bound = bindDiscordHarnessSession({ channelId: conversationId, sessionId: targetId, userId: opts.userId });
+    const bound = bindSlackSessionResumeForAction({
+      targetSessionId: targetId,
+      channelId: opts.channelId,
+      threadTs: opts.threadTs,
+      teamId: opts.teamId,
+      userId: opts.userId,
+      actionIdentity: opts.triggerId
+        ?? `${opts.channelId}:${opts.messageTs ?? ''}:${opts.actionId}:${opts.userId}`,
+    });
     await opts.respondEphemeral(bound
       ? `Bound this conversation to \`${targetId}\`. Your next message continues that session.`
       : `Session \`${targetId}\` was not found.`);
@@ -1914,6 +1979,7 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
       await ack();
       const b = body as {
         user?: { id?: string };
+        team?: { id?: string };
         channel?: { id?: string };
         trigger_id?: string;
         message?: { ts?: string; thread_ts?: string };
@@ -1934,6 +2000,7 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
           actionId,
           userId: b.user?.id ?? '',
           channelId,
+          teamId: b.team?.id ?? null,
           triggerId: b.trigger_id,
           messageTs: b.message?.ts,
           threadTs: b.message?.thread_ts,
@@ -2131,5 +2198,6 @@ export const __test__ = {
   buildSuggestedPrompts,
   buildAppHomeBlocks,
   dispatchInbound,
+  bindSlackSessionResumeForAction,
   parseSlackRunStopControl,
 };

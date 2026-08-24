@@ -297,8 +297,12 @@ console.log(JSON.stringify({
   let synthesisCalls = 0;
   let conversationCalls = 0;
   let releaseSpecialists = (): void => {};
-  const allSpecialistsStarted = new Promise<void>((resolve) => { releaseSpecialists = resolve; });
-  const concurrencyFallback = setTimeout(releaseSpecialists, 1_000);
+  let rejectSpecialists = (_error: Error): void => {};
+  let specialistBarrierTimeout: ReturnType<typeof setTimeout> | undefined;
+  const allSpecialistsStarted = new Promise<void>((resolve, reject) => {
+    releaseSpecialists = resolve;
+    rejectSpecialists = reject;
+  });
   const specialistPrompts: string[] = [];
   const reducerPrompts: string[] = [];
   const synthesisPrompts: string[] = [];
@@ -336,7 +340,15 @@ console.log(JSON.stringify({
         activeSpecialists += 1;
         specialistStarts += 1;
         maxActiveSpecialists = Math.max(maxActiveSpecialists, activeSpecialists);
-        if (specialistStarts === 3) releaseSpecialists();
+        if (specialistStarts === 1) {
+          specialistBarrierTimeout = setTimeout(() => {
+            rejectSpecialists(new Error('timed out waiting for all three sales specialists to enter the scheduler wave'));
+          }, 30_000);
+        }
+        if (specialistStarts === 3) {
+          clearTimeout(specialistBarrierTimeout);
+          releaseSpecialists();
+        }
         await allSpecialistsStarted;
 
         const offset = role === 'trend' ? 0 : role === 'rep' ? 500 : 1_180;
@@ -456,7 +468,7 @@ console.log(JSON.stringify({
     await processWorkflowRuns({ respond: async () => ({ text: 'legacy provider must not run' }) } as never);
     assert.equal(conversationCalls, callsAfterCompletion, 'a completed run is a no-op on the next daemon poll');
   } finally {
-    clearTimeout(concurrencyFallback);
+    clearTimeout(specialistBarrierTimeout);
     _setWorkflowCallNodeForTests();
     _setWorkflowHarnessLoopImplsForTests();
   }

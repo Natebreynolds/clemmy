@@ -24,6 +24,9 @@ const { registerConsoleRoutes } = await import('./console-routes.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const {
   projectActivitySnapshot,
+  projectForegroundWorkingNowEntry,
+  projectForegroundWorkingNowSnapshot,
+  projectWorkingNowSnapshot,
   projectWorkflowRunActivity,
   shouldSurfaceInWorkingNow,
   WORKING_NOW_FOREGROUND_MS,
@@ -145,6 +148,26 @@ test('durable run records project to shared snapshots with truth rules and priva
     // The privacy inheritance, asserted at the byte level.
     assert.equal(JSON.stringify(body).includes('NEVER-IN-A-SNAPSHOT'), false,
       'a private field crossed into the activity projection');
+
+    const foregroundResponse = await fetch(
+      `${server.url}/api/console/activity/v2?workingNow=1&surface=foreground-chat`,
+    );
+    assert.equal(foregroundResponse.status, 200);
+    const foregroundBytes = await foregroundResponse.text();
+    const foreground = JSON.parse(foregroundBytes) as { entries: Array<Record<string, unknown>> };
+    assert.ok(foreground.entries.some((entry) => entry.runKey === 'workflow:act-blocked'));
+    for (const canary of [
+      'Reconnect Salesforce to resume.',
+      'salesforce',
+      'send_update',
+      'not sent again',
+    ]) {
+      assert.equal(foregroundBytes.includes(canary), false, `foreground Activity leaked ${canary}`);
+    }
+    const foregroundBlocked = foreground.entries.find((entry) => entry.runKey === 'workflow:act-blocked')!;
+    for (const forbiddenKey of ['detail', 'origin', 'owner', 'nextAction', 'terminal', 'presentationLane', 'connectivity']) {
+      assert.equal(Object.hasOwn(foregroundBlocked, forbiddenKey), false, forbiddenKey);
+    }
   } finally {
     await server.close();
   }
@@ -271,6 +294,82 @@ test('Working Now opens for detached work and for long chat, never for an ordina
   assert.ok(WORKING_NOW_FOREGROUND_MS >= 60_000);
 });
 
+test('Working Now filters durable rows before its response cap', async () => {
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const activeId = 'working-now-behind-terminals';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${activeId}.json`), JSON.stringify({
+    id: activeId,
+    workflow: 'Long-running audit',
+    status: 'running',
+    createdAt: '2026-08-01T00:00:00.000Z',
+    startedAt: '2026-08-01T00:00:00.000Z',
+  }), 'utf-8');
+  const terminalBase = Date.parse('2026-08-29T00:00:00.000Z');
+  for (let index = 0; index < 105; index += 1) {
+    const id = `working-now-newer-terminal-${String(index).padStart(3, '0')}`;
+    const startedAt = new Date(terminalBase + index * 1_000).toISOString();
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${id}.json`), JSON.stringify({
+      id,
+      workflow: 'Already settled audit',
+      status: 'completed',
+      createdAt: startedAt,
+      startedAt,
+      finishedAt: startedAt,
+    }), 'utf-8');
+  }
+
+  const observedAt = '2026-08-30T00:00:00.000Z';
+  const cappedBeforeMembership = projectActivitySnapshot({ observedAt, kinds: ['workflow'], limit: 100 });
+  assert.equal(cappedBeforeMembership.entries.some((entry) => entry.runId === activeId), false,
+    'the fixture did not place the live run behind the ordinary snapshot cap');
+  const workingNow = projectWorkingNowSnapshot({ observedAt, kinds: ['workflow'], limit: 100 });
+  assert.ok(workingNow.entries.some((entry) => entry.runId === activeId),
+    'newer terminal history hid older durable work before Working Now membership was applied');
+  assert.ok(workingNow.entries.every((entry) => !entry.terminal),
+    'a terminal crossed the dedicated Working Now boundary');
+
+  const server = await boot();
+  try {
+    const response = await fetch(`${server.url}/api/console/activity/v2?workingNow=1`);
+    assert.equal(response.status, 200);
+    const body = await response.json() as { entries: Entry[] };
+    assert.ok(body.entries.some((entry) => entry.runId === activeId),
+      'the console route reintroduced cap-before-membership');
+    assert.ok(body.entries.length <= 100, 'the bounded route exceeded its response contract');
+  } finally {
+    await server.close();
+  }
+});
+
+test('Working Now reads eligible active chat attempts past the historical session cap', () => {
+  const oldStartedAt = Date.now() - 5 * 60_000;
+  const oldLive = createSession({ kind: 'chat', channel: 'desktop', title: 'Older live turn' });
+  const claim = claimRunAttemptLease({
+    sessionId: oldLive.id,
+    runId: 'working-now-old-live-chat',
+    ownerId: 'working-now-query-test',
+    leaseMs: 30 * 60_000,
+    nowMs: oldStartedAt,
+  });
+  assert.equal(claim.claimed, true);
+
+  for (let index = 0; index < 65; index += 1) {
+    const newer = createSession({ kind: 'chat', channel: 'desktop', title: `Newer settled turn ${index}` });
+    const attempt = beginRunAttempt(newer.id, { runId: `working-now-newer-${index}` });
+    finishRunAttempt(attempt, 'completed');
+  }
+
+  const observedAt = new Date().toISOString();
+  const ordinary = projectActivitySnapshot({ observedAt, kinds: ['chat'], sessionLimit: 60, limit: 100 });
+  assert.equal(ordinary.entries.some((entry) => entry.sessionId === oldLive.id), false,
+    'the fixture did not place the active chat behind newer session history');
+  const workingNow = projectWorkingNowSnapshot({ observedAt, kinds: ['chat'], limit: 100 });
+  const surfaced = workingNow.entries.find((entry) => entry.sessionId === oldLive.id);
+  assert.ok(surfaced, 'the bounded active-attempt query lost an eligible older live chat');
+  assert.equal(surfaced?.attemptId, claim.attempt?.attemptId,
+    'Working Now did not rejoin the exact durable attempt');
+});
+
 test('the projection reconstructs identically after a restart', () => {
   const observedAt = '2026-08-04T12:00:00.000Z';
   const before = projectActivitySnapshot({ observedAt });
@@ -293,6 +392,123 @@ test('the projector never invents identity and unknown statuses stay honest', ()
   assert.equal(odd.terminal, undefined);
 });
 
+test('canonical workflow terminal vocabulary has one truthful Working Now membership', () => {
+  const observedAt = '2026-08-04T12:00:00.000Z';
+  const observedAtMs = Date.parse(observedAt);
+  const cases = [
+    { status: 'completed', lifecycle: 'completed', terminal: 'succeeded', visible: false },
+    { status: 'completed_with_errors', lifecycle: 'failed', terminal: 'partial', visible: false },
+    { status: 'blocked', lifecycle: 'blocked', terminal: undefined, visible: true },
+    { status: 'error', lifecycle: 'failed', terminal: 'failed', visible: false },
+    { status: 'failed', lifecycle: 'failed', terminal: 'failed', visible: false },
+    { status: 'cancelled', lifecycle: 'cancelled', terminal: 'cancelled', visible: false },
+    { status: 'dry_run', lifecycle: 'completed', terminal: 'succeeded', visible: false },
+    { status: 'creation_test', lifecycle: 'completed', terminal: 'succeeded', visible: false },
+  ] as const;
+
+  for (const [index, expected] of cases.entries()) {
+    const projected = projectWorkflowRunActivity({
+      id: `terminal-vocabulary-${index}`,
+      workflow: 'Vocabulary workflow',
+      status: expected.status,
+      createdAt: '2026-08-04T10:00:00.000Z',
+      finishedAt: '2026-08-04T10:05:00.000Z',
+    }, observedAt)!;
+    assert.equal(projected.lifecycle, expected.lifecycle, expected.status);
+    assert.equal(projected.terminal?.kind, expected.terminal, expected.status);
+    assert.equal(shouldSurfaceInWorkingNow(projected, observedAtMs), expected.visible, expected.status);
+  }
+
+  for (const status of ['dry_run', 'creation_test'] as const) {
+    const unfinished = projectWorkflowRunActivity({
+      id: `unfinished-${status}`,
+      workflow: 'Unfinished test workflow',
+      status,
+      createdAt: '2026-08-04T10:00:00.000Z',
+    }, observedAt)!;
+    assert.equal(unfinished.lifecycle, 'accepted', `${status} was treated as final without finishedAt`);
+    assert.equal(unfinished.terminal, undefined);
+    assert.equal(shouldSurfaceInWorkingNow(unfinished, observedAtMs), true);
+
+    const needsReview = projectWorkflowRunActivity({
+      id: `needs-review-${status}`,
+      workflow: 'Needs-review test workflow',
+      status,
+      needsAttention: true,
+      createdAt: '2026-08-04T10:00:00.000Z',
+      finishedAt: '2026-08-04T10:05:00.000Z',
+    }, observedAt)!;
+    assert.equal(needsReview.lifecycle, 'blocked');
+    assert.equal(needsReview.terminal, undefined);
+    assert.equal(needsReview.needsAttention, true);
+    assert.equal(shouldSurfaceInWorkingNow(needsReview, observedAtMs), true);
+  }
+
+  for (const status of ['blocked_capability', 'blocked_mutation'] as const) {
+    const activeBlock = projectWorkflowRunActivity({
+      id: `active-${status}`,
+      workflow: 'Active blocked workflow',
+      status,
+      createdAt: '2026-08-04T10:00:00.000Z',
+    }, observedAt)!;
+    assert.equal(activeBlock.lifecycle, 'blocked');
+    assert.equal(activeBlock.terminal, undefined);
+    assert.equal(shouldSurfaceInWorkingNow(activeBlock, observedAtMs), true);
+  }
+
+  const parked = projectWorkflowRunActivity({
+    id: 'parked-terminal-vocabulary', workflow: 'Parked workflow', status: 'parked',
+    createdAt: '2026-08-04T10:00:00.000Z',
+  }, observedAt)!;
+  assert.equal(parked.lifecycle, 'awaiting_approval');
+  assert.equal(parked.terminal, undefined);
+});
+
+test('foreground Activity serialization is an exact prose-free whitelist', () => {
+  const unsafe = {
+    schemaVersion: 1,
+    runKey: 'workflow:privacy-canary',
+    attemptId: 'privacy-canary',
+    kind: 'workflow',
+    presentationLane: 'scheduled',
+    lifecycle: 'blocked',
+    liveness: 'unknown',
+    connectivity: 'connected',
+    needsAttention: true,
+    headline: 'Safe workflow title',
+    detail: 'PRIVATE-CAPABILITY-CANARY',
+    origin: 'PRIVATE-ORIGIN-CANARY',
+    owner: 'PRIVATE-OWNER-CANARY',
+    nextAction: 'PRIVATE-NEXT-ACTION-CANARY',
+    terminal: { status: 'failed', kind: 'failed', text: 'PRIVATE-TERMINAL-CANARY', resumable: true },
+    activity: { phase: 'working_items', text: 'Working on 2 of 4', completed: 2, total: 4 },
+    progress: { completed: 2, total: 4 },
+    children: { running: 1, completed: 2, failed: 1, total: 4 },
+    startedAt: '2026-08-04T10:00:00.000Z',
+    lastEvidenceAt: '2026-08-04T10:05:00.000Z',
+    revision: 7,
+    runId: 'privacy-canary',
+  } as Entry;
+  const entry = projectForegroundWorkingNowEntry(unsafe);
+  assert.deepEqual(Object.keys(entry), [
+    'schemaVersion', 'runKey', 'attemptId', 'kind', 'lifecycle', 'liveness',
+    'needsAttention', 'headline', 'activity', 'progress', 'children',
+    'startedAt', 'lastEvidenceAt', 'revision', 'runId',
+  ]);
+  const snapshot = projectForegroundWorkingNowSnapshot({
+    schemaVersion: 1,
+    observedAt: '2026-08-04T12:00:00.000Z',
+    entries: [unsafe],
+  });
+  const bytes = JSON.stringify(snapshot);
+  for (const canary of ['PRIVATE-CAPABILITY-CANARY', 'PRIVATE-ORIGIN-CANARY', 'PRIVATE-OWNER-CANARY', 'PRIVATE-NEXT-ACTION-CANARY', 'PRIVATE-TERMINAL-CANARY']) {
+    assert.equal(bytes.includes(canary), false, canary);
+  }
+  for (const forbiddenKey of ['detail', 'origin', 'owner', 'nextAction', 'terminal', 'presentationLane', 'connectivity']) {
+    assert.equal(Object.hasOwn(entry, forbiddenKey), false, forbiddenKey);
+  }
+});
+
 test('a canonical workflow clarification projects as awaiting_input and needs attention', () => {
   const paused = projectWorkflowRunActivity({
     id: 'workflow-input-pause',
@@ -310,4 +526,72 @@ test('a canonical workflow clarification projects as awaiting_input and needs at
     'canonical awaiting_input fell through to the generic accepted lifecycle');
   assert.equal(paused.needsAttention, true);
   assert.equal(paused.terminal, undefined, 'a clarification pause became terminal');
+});
+
+// The live run view must show work IN FLIGHT, not only work you could have
+// walked away from. Before this, a foreground turn had to survive a 90s dwell
+// before any surface could render it — so on desktop the drawer never appeared
+// at all (every chat canary finished inside the dwell), while mobile showed
+// workflow rows fine because non-foreground lanes skip it entirely.
+test('Working Now shows a foreground turn as soon as it has work to show', () => {
+  const observedAtMs = Date.parse('2026-08-24T12:00:00.000Z');
+  const justStarted = {
+    kind: 'chat', presentationLane: 'foreground', startedAt: '2026-08-24T11:59:58.000Z',
+  } as unknown as Entry;
+
+  // Nothing to render yet — still deliberately quiet, so an ordinary reply
+  // cannot flash a row.
+  assert.equal(shouldSurfaceInWorkingNow(justStarted, observedAtMs), false);
+
+  // Calling tools: an activity label is enough.
+  assert.equal(
+    shouldSurfaceInWorkingNow(
+      { ...justStarted, activity: { phase: 'tool', text: 'Searching' } } as unknown as Entry,
+      observedAtMs,
+    ),
+    true,
+    'a turn already doing tool work must surface immediately',
+  );
+
+  // A declared denominator is work in flight.
+  assert.equal(
+    shouldSurfaceInWorkingNow(
+      { ...justStarted, progress: { completed: 1, total: 4 } } as unknown as Entry,
+      observedAtMs,
+    ),
+    true,
+  );
+
+  // So is fan-out.
+  assert.equal(
+    shouldSurfaceInWorkingNow(
+      { ...justStarted, children: { running: 3, completed: 0, failed: 0, total: 3 } } as unknown as Entry,
+      observedAtMs,
+    ),
+    true,
+    'parallel fan-out is exactly what the live view exists to show',
+  );
+
+  // An empty denominator is not evidence of work.
+  assert.equal(
+    shouldSurfaceInWorkingNow(
+      { ...justStarted, progress: { completed: 0, total: 0 } } as unknown as Entry,
+      observedAtMs,
+    ),
+    false,
+  );
+
+  // A settled turn stays gone regardless of what it did.
+  assert.equal(
+    shouldSurfaceInWorkingNow(
+      {
+        ...justStarted,
+        activity: { phase: 'tool', text: 'Searching' },
+        terminal: { status: 'completed', kind: 'done', text: 'Done.', resumable: false },
+      } as unknown as Entry,
+      observedAtMs,
+    ),
+    false,
+    'a settled run is not working, even with activity evidence',
+  );
 });

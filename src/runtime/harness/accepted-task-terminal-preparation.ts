@@ -29,10 +29,24 @@ import {
 } from './obligation-store.js';
 import { adjudicateTerminalForTaskSync, type TerminalVerdict } from './terminal-truth.js';
 import { replyClaimsCompletedWork } from './objective-judge.js';
+import { objectiveRequiresMutatingEvidence } from './tool-evidence.js';
+import {
+  classifyRuntimeToolEffect,
+  unwrapRuntimeEffectiveToolIdentity,
+} from './tool-effect.js';
+import { durableLogicalCallContract } from './logical-call-contract.js';
+import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
+import { inspectProviderEnvelope } from './provider-read-evidence.js';
 import { prepareDurableMemoryIntakeHostCompletion } from './durable-memory-intake-receipt.js';
 import { listEvents, openEventLog } from './eventlog.js';
 import { resolveWriteEvidence } from './work-report.js';
 import { summarizeWorkManifest, type WorkManifestSummary } from './work-manifest.js';
+import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
+import {
+  objectiveExplicitlyNamesWorkflow,
+  uniqueEnabledWorkflowMatch,
+} from '../../tools/named-workflow-match.js';
+import { workflowNamesEqual } from '../../tools/workflow-resolve.js';
 
 export type AcceptedTaskTerminalPreparation =
   | { status: 'unstaged' }
@@ -214,7 +228,7 @@ function sourceHasWorkEvidence(input: {
     // verdict on the exact canonical return. `sdk_tool_use_recorded` is a later
     // model-facing summary: it includes failed, refused, read-only, lifecycle,
     // and approval-staging calls and therefore has no completion authority.
-    return sourceEvents.some((event) => {
+    if (sourceEvents.some((event) => {
       if (event.type !== 'tool_returned') return false;
       return event.data.accounting === 'top_level'
         && event.data.sourceUserSeq === input.sourceUserSeq
@@ -222,7 +236,8 @@ function sourceHasWorkEvidence(input: {
           event.data.successfulBusinessResult === true
           || event.data.successfulAuthoringResult === true
         );
-    });
+    })) return true;
+    return sourceHasCertifiedLocalRegistryRead(input, sourceEvents);
   } catch {
     return false;
   }
@@ -234,6 +249,183 @@ function turnEventsForWorkEvidence(sessionId: string, sourceUserSeq: number) {
     event.seq > sourceUserSeq && event.type === 'user_input_received');
   return events.filter((event) =>
     event.seq >= sourceUserSeq && (!nextSource || event.seq < nextSource.seq));
+}
+
+function decodedToolArguments(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value) as unknown; } catch { return undefined; }
+}
+
+function exactCanonicalCallId(data: Record<string, unknown>): string | null {
+  const callId = typeof data.callId === 'string' ? data.callId.trim() : '';
+  const canonicalCallId = typeof data.canonicalCallId === 'string'
+    ? data.canonicalCallId.trim()
+    : '';
+  return callId && callId === canonicalCallId ? callId : null;
+}
+
+function workflowGetTargetForAcceptedObjective(
+  objective: string,
+  workflowName: string,
+): ReturnType<typeof uniqueEnabledWorkflowMatch> {
+  const matched = uniqueEnabledWorkflowMatch(objective);
+  if (
+    matched === null
+    || (
+      !workflowNamesEqual(workflowName, matched.slug)
+      && !workflowNamesEqual(workflowName, matched.name)
+    )
+  ) return null;
+  return objectiveExplicitlyNamesWorkflow(objective, matched.slug)
+    || objectiveExplicitlyNamesWorkflow(objective, matched.name)
+    ? matched
+    : null;
+}
+
+function workflowGetUsesBoundedMetadataMode(args: Record<string, unknown> | null): boolean {
+  if (args?.section !== 'metadata') return false;
+  const step = args.step;
+  return step === undefined
+    || step === null
+    || step === '';
+}
+
+const WORKFLOW_METADATA_RESULT_PREFIX =
+  'Workflow metadata (step prompts and workflow body omitted):';
+
+function workflowGetMetadataReturnMatches(
+  data: Record<string, unknown>,
+  workflowName: string,
+): boolean {
+  // Inspect the complete returned-event wrapper before selecting one result
+  // field. Otherwise a canonical `result` sibling could launder `ok: false`,
+  // an explicit error, or another transport contradiction.
+  if (inspectProviderEnvelope(data).verdict !== 'clean') return false;
+  // Both model lanes share the host's first-class local-dispatch record. The
+  // durable event shape is a direct result string; MCP/provider envelopes are
+  // not alternate authority and fail closed instead of being interpreted here.
+  if (typeof data.result !== 'string' || !data.result.trim()) return false;
+  const canonical = data.result.trimStart();
+  if (!canonical.startsWith(WORKFLOW_METADATA_RESULT_PREFIX)) return false;
+  const payload = canonical.slice(WORKFLOW_METADATA_RESULT_PREFIX.length).trim();
+  try {
+    const parsed = JSON.parse(payload) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const metadata = parsed as Record<string, unknown>;
+    const returnedName = typeof metadata.name === 'string' ? metadata.name.trim() : '';
+    const trigger = metadata.trigger;
+    if (!returnedName || !workflowNamesEqual(returnedName, workflowName)) return false;
+    if (!trigger || typeof trigger !== 'object' || Array.isArray(trigger)) return false;
+    const triggerRecord = trigger as Record<string, unknown>;
+    return Object.hasOwn(triggerRecord, 'schedule')
+      && Object.hasOwn(triggerRecord, 'timezone')
+      && typeof metadata.step_count === 'number'
+      && Array.isArray(metadata.steps);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Explicit terminal-read evidence contracts for local CONTROL tools.
+ *
+ * A registry `sideEffect: read` is dispatch metadata, not terminal authority:
+ * that class also contains status/bookkeeping calls and control executors such
+ * as `workflow_run`. Until a tool has an exact evidence contract here, its
+ * local return cannot close an uncontracted action turn. `workflow_get` is the
+ * first contract because the accepted objective is independently resolved by
+ * the host's unique saved-workflow matcher, must appear literally next to the
+ * singular word `workflow`, and is bound again by the call's durable argument
+ * digest. Only the bounded `section="metadata"` mode is admitted, and its
+ * canonical parsed return must name the same workflow and carry trigger
+ * fields. Conflict, missing-step, full-definition, and ordinary prose returns
+ * therefore cannot impersonate frontmatter evidence.
+ *
+ * This is terminal accounting only. It grants no dispatch authority, binds no
+ * work requirement, and cannot admit or discharge a control write.
+ */
+function sourceHasCertifiedLocalRegistryRead(
+  input: { sessionId: string; sourceUserSeq: number },
+  sourceEvents: ReturnType<typeof turnEventsForWorkEvidence>,
+): boolean {
+  const expected = expectedTaskFor(input.sessionId, input.sourceUserSeq);
+  if (expected.status !== 'ok') return false;
+  const acceptedTaskId = expected.expectation.acceptedTaskId;
+  const source = sourceEvents.find((event) => (
+    event.seq === input.sourceUserSeq && event.type === 'user_input_received'
+  ));
+  const objective = typeof source?.data.text === 'string' ? source.data.text : '';
+  if (!objective.trim() || objectiveRequiresMutatingEvidence(objective)) return false;
+
+  return sourceEvents.some((called) => {
+    if (
+      called.type !== 'tool_called'
+      || called.data.accounting !== 'top_level'
+      || called.data.sourceUserSeq !== input.sourceUserSeq
+    ) return false;
+    const logicalToolCallId = exactCanonicalCallId(called.data);
+    const eventTool = typeof called.data.tool === 'string' ? called.data.tool.trim() : '';
+    if (!logicalToolCallId || eventTool !== 'workflow_get') return false;
+    const eventArgs = decodedToolArguments(called.data.arguments ?? called.data.args);
+    const eventContract = durableLogicalCallContract(acceptedTaskId, eventTool, eventArgs);
+    if (!eventContract || eventContract.toolName !== 'workflow_get') return false;
+
+    const redeemed = redeemDurableLogicalCallSettlementForHost({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId,
+      logicalToolCallId,
+    });
+    if (redeemed.status !== 'ok') return false;
+    const settlement = redeemed.settlement;
+    if (
+      settlement.identity.acceptedTaskId !== acceptedTaskId
+      || settlement.toolName !== eventContract.toolName
+      || settlement.argumentDigest !== eventContract.argumentDigest
+      || settlement.executionKind !== 'local_execution'
+      || settlement.outcome.kind !== 'succeeded'
+      || settlement.recovery.businessCall
+      || settlement.recovery.mutating
+      || settlement.recovery.continuesRequirement === true
+      || settlement.physicalCrossingCount !== 0
+      || settlement.hostCrossingCount !== 0
+      || settlement.observer.callId !== logicalToolCallId
+    ) return false;
+
+    const declaration = TOOL_REGISTRY.find((entry) => entry.name === settlement.toolName);
+    if (
+      !declaration
+      || declaration.sideEffect !== 'read'
+      || declaration.loopClass !== 'idempotent'
+      || declaration.actionTopologyRole !== 'control'
+    ) return false;
+    const runtimeEffect = classifyRuntimeToolEffect(eventTool, eventArgs);
+    if (runtimeEffect.source !== 'registry' || runtimeEffect.effect !== 'read' || runtimeEffect.mutating) {
+      return false;
+    }
+    const effective = unwrapRuntimeEffectiveToolIdentity(eventTool, eventArgs);
+    if (effective.toolName !== settlement.toolName) return false;
+    const effectiveArgs = effective.args && typeof effective.args === 'object' && !Array.isArray(effective.args)
+      ? effective.args as Record<string, unknown>
+      : null;
+    if (!workflowGetUsesBoundedMetadataMode(effectiveArgs)) return false;
+    const workflowName = typeof effectiveArgs?.name === 'string' ? effectiveArgs.name.trim() : '';
+    const workflowTarget = workflowName
+      ? workflowGetTargetForAcceptedObjective(objective, workflowName)
+      : null;
+    if (!workflowTarget) return false;
+
+    const returned = sourceEvents.find((event) => {
+      return event.type === 'tool_returned'
+        && event.data.accounting === 'top_level'
+        && event.data.sourceUserSeq === input.sourceUserSeq
+        && exactCanonicalCallId(event.data) === logicalToolCallId
+        && event.parentEventId === called.id
+        && event.data.tool === eventTool;
+    });
+    if (!returned) return false;
+    return workflowGetMetadataReturnMatches(returned.data, workflowTarget.name);
+  });
 }
 
 type AcceptedSourceFreshnessRequirement = 'none' | 'current_state';

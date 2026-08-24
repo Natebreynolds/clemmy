@@ -51,6 +51,12 @@ export interface RegisteredHostCapability {
   advisoryRoles?: readonly string[];
   manifestDigest?: string;
   providerKind?: CapabilityProviderKind;
+  /** Selector-visible input-schema fingerprint for source matching. This is
+   * distinct from `liveFingerprint`, the 64-hex workflow definition authority. */
+  sourceSchemaFingerprint?: string;
+  /** Full canonical digest of the exact provider input schema. Present only
+   * when the catalog entry was materialized under a current provider lease. */
+  providerInputSchemaDigest?: string;
   liveFingerprint?: string;
   delegatedFrom?: string;
   manifest?: import('./capability-manifest.js').CapabilityManifestV1;
@@ -74,6 +80,8 @@ export interface CanonicalCatalogIdentityV1 {
   schemaDigest: string;
   providerKind: string;
   providerVersion: string;
+  sourceSchemaFingerprint?: string;
+  providerInputSchemaDigest?: string;
   liveFingerprint: string;
   account: string;
   effect: string;
@@ -98,6 +106,9 @@ export interface SealedNodeBinding {
   /** @deprecated Raw provider operation identity; retained for row compatibility. */
   toolName: string;
   schemaVersion: string;
+  /** Exact provider input-schema digest, distinct from schemaDigest once the
+   * latter closes the full input+output+version/account definition. */
+  providerInputSchemaDigest?: string;
   schemaDigest: string;
   argumentDigest: string;
   account?: string;
@@ -139,6 +150,14 @@ export function canonicalCatalogIdentityOf(
   entry: RegisteredHostCapability,
 ): CanonicalCatalogIdentityV1 | null {
   if (!complete(entry) || !entry.manifestDigest?.trim() || !entry.manifest) return null;
+  const persistedProviderSchemaDigest = entry.manifest.externalDefinition?.providerInputSchemaDigest;
+  if (
+    entry.providerInputSchemaDigest
+    && persistedProviderSchemaDigest
+    && entry.providerInputSchemaDigest !== persistedProviderSchemaDigest
+  ) return null;
+  const providerInputSchemaDigest = entry.providerInputSchemaDigest
+    ?? persistedProviderSchemaDigest;
   return {
     capabilityId: entry.capabilityId,
     manifestId: entry.manifest.manifestId,
@@ -148,6 +167,12 @@ export function canonicalCatalogIdentityOf(
     schemaDigest: entry.schemaDigest,
     providerKind: entry.providerKind ?? entry.manifest.providerKind,
     providerVersion: entry.manifest.providerVersion,
+    ...(entry.sourceSchemaFingerprint
+      ? { sourceSchemaFingerprint: entry.sourceSchemaFingerprint }
+      : {}),
+    ...(providerInputSchemaDigest
+      ? { providerInputSchemaDigest }
+      : {}),
     liveFingerprint: entry.liveFingerprint ?? entry.schemaDigest,
     account: entry.account ?? entry.manifest.accountId,
     effect: String(entry.effect),
@@ -197,6 +222,7 @@ export function bindingDigestOf(binding: Omit<SealedNodeBinding, 'bindingDigest'
     logicalToolName: binding.logicalToolName,
     toolName: binding.toolName,
     schemaVersion: binding.schemaVersion,
+    providerInputSchemaDigest: binding.providerInputSchemaDigest ?? null,
     schemaDigest: binding.schemaDigest,
     argumentDigest: binding.argumentDigest,
     account: binding.account ?? null,
@@ -464,6 +490,12 @@ export function sealBoundCapability(input: {
     logicalToolName,
     toolName: providerOperationId,
     schemaVersion: input.binding.schemaVersion,
+    ...(input.binding.manifest?.externalDefinition?.providerInputSchemaDigest
+      ? {
+          providerInputSchemaDigest:
+            input.binding.manifest.externalDefinition.providerInputSchemaDigest,
+        }
+      : {}),
     schemaDigest: input.binding.schemaDigest,
     argumentDigest: input.argumentDigest,
     account: input.binding.account,

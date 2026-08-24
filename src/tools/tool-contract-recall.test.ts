@@ -61,7 +61,7 @@ test('recall finds the learned contract from natural turn text and renders the w
   assert.ok(rendered);
   assert.match(rendered, /OUTLOOK_CREATE_DRAFT/);
   assert.match(rendered, /required: subject, body, to_recipients/);
-  assert.match(rendered, /worked with:/);
+  assert.doesNotMatch(rendered, /worked with:|a@b\.co/, 'instance payloads are not present-task authority');
 });
 
 test('redaction passthrough: rendered examples carry shapes, not content', () => {

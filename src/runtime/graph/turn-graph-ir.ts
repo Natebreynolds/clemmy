@@ -4,6 +4,7 @@ import type { MessageIntent } from '../../assistant/message-intent.js';
 import type { SessionKind } from '../harness/eventlog.js';
 import type { RuntimeToolEffect } from '../harness/tool-effect.js';
 import type { TurnEvidenceKind, TurnIdentity } from '../harness/turn-outcome.js';
+import type { WorkTopologyV1 } from './work-topology.js';
 
 /**
  * Provider-neutral graph compiled for one accepted chat turn.
@@ -212,6 +213,12 @@ export interface TurnGraphIR {
     allowedToolNames?: string[];
     excludedToolNames: string[];
   };
+  /** The normalized semantic work topology, content-addressed before graph
+   * persistence. Absent on legacy/deterministic graphs. */
+  workTopology?: {
+    topology: WorkTopologyV1;
+    topologyHash: string;
+  };
   classification: {
     messageIntent: MessageIntent;
     confidence: number;
@@ -232,7 +239,12 @@ export interface TurnGraphIR {
      *  destinations survive compilation as evidence requirements. */
     goalConstraints?: {
       construct: 'none' | 'collect_then_construct' | 'fanout' | 'single_act';
-      collection?: { count: number; projection: string[] };
+      collection?: {
+        count: number;
+        projection: string[];
+        completeness?: 'count' | 'exhaust';
+        identityFields?: string[];
+      };
       evidenceRequirements?: readonly string[];
       destinations?: Array<{
         posture: 'create_new' | 'named_existing';

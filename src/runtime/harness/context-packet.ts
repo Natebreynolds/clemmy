@@ -26,6 +26,7 @@ import {
   classifyTurnPreflight,
   confirmBeatDirective,
   recordTurnPreflightDecision,
+  type TurnSourceStrategyBindingV1,
 } from './turn-control.js';
 import {
   recordCapabilityResolution,
@@ -211,7 +212,7 @@ export function fanoutDirectiveLine(intent: MultiItemIntent, waveSize = 8): stri
       `Fan-out directive: this turn names ${n} independent same-shape${kind} to process. `
       + 'Do NOT serialize them in this context — that balloons tokens and forces the harness to clip your freshly-fetched data mid-run. '
       + 'Resolve any shared tool/connection ONCE, then pick the lane by what each item needs: '
-      + `if every item is the SAME shape of read/lookup, write ONE run_tool_program covering all ${n} and return only the distilled rows; `
+      + `if every item is the SAME shape of read/lookup, issue all ${n} as PARALLEL tool calls in one response and synthesize the distilled rows; `
       + `if each item needs its own multi-step work or large payloads, call run_worker with the full ${n}-item \`items\` array and a workManifest declaring that canonical universe (parallel waves of up to ${cappedWaveSize}); `
       + 'if you can bake every item\'s exact arguments now and they are writes, use run_batch. '
       + (n >= 8
@@ -222,7 +223,7 @@ export function fanoutDirectiveLine(intent: MultiItemIntent, waveSize = 8): stri
   return (
     `Fan-out hint: this turn names ${n} independent same-shape${kind}. `
     + `If each item needs its own multi-step work or large payloads, fan out with run_worker (one per item, parallel waves of up to ${cappedWaveSize}) to keep this context lean. `
-    + 'If they are same-shape lookups, cover them in ONE run_tool_program rather than calling the tool once per item.'
+    + 'If they are same-shape lookups, issue them as PARALLEL tool calls in one response rather than serializing one per round.'
   );
 }
 
@@ -535,7 +536,7 @@ function focusLine(input?: string, sessionId?: string): string | null {
 }
 
 function renderCandidates(title: string, candidates: RankedContextCandidate[], instruction: string): string[] {
-  if (candidates.length === 0) return [`${title}: none strongly matched.`];
+  if (candidates.length === 0) return [];
   return [
     `${title}:`,
     ...candidates.map((candidate) =>
@@ -583,15 +584,14 @@ function providerAccessLine(): string {
           .filter(Boolean);
       }
     } catch { /* unparseable BYO list — omit labels */ }
+    if (hasRawOpenAI && byoLabels.length === 0) return '';
     const openaiPart = hasRawOpenAI
       ? 'OpenAI: raw API key configured (harness secret store — reachable through harness config, NEVER print or export it) plus the connected OAuth model lane'
       : 'OpenAI: connected OAuth model lane ONLY — no raw API key is configured';
-    const byoPart = byoLabels.length ? `BYO model providers: ${byoLabels.join(', ')}` : 'BYO model providers: none';
+    const byoPart = byoLabels.length ? `BYO model providers: ${byoLabels.join(', ')}` : '';
     return [
       'Provider access (harness facts — do NOT search the filesystem, vault, or env for API keys):',
-      `${openaiPart}. ${byoPart}.`,
-      'If a task seems to need a missing credential, say so plainly and propose the closest available lane',
-      '(e.g. run model checks through the connected OAuth model) instead of searching or repeatedly asking.',
+      byoPart ? `${openaiPart}. ${byoPart}.` : `${openaiPart}.`,
     ].join(' ');
   } catch {
     return '';
@@ -615,6 +615,10 @@ export function buildAgentContextPacket(
      * active clause. Semantic work proceeds for `input`; parent authority does
      * not. This affects policy guidance only, never the user's wording. */
     declinedParentWithNewTask?: boolean;
+    /** Compiled direct_reply: skip the capability hunt without emptying
+     *  the rest of the conversational packet. */
+    skipCapabilityHunt?: boolean;
+    sourceStrategyBinding?: TurnSourceStrategyBindingV1;
   },
 ): AgentContextPacket {
   const authorityInput = opts?.authorityInput ?? input;
@@ -713,7 +717,7 @@ export function buildAgentContextPacket(
       ? fanoutDirectiveLine(multiItem, recommendedWorkerWaveSize)
       : fanoutBlockedByPolicy
         ? fanoutPolicyLine(multiItem, agentSystem)
-        : STATIC_PARALLELISM_LINE;
+        : '';
 
   // TURN-CONTROL SPINE confirm beat: a fresh execution-shaped chat request
   // gets ONE conversational alignment beat before autonomous execution;
@@ -731,6 +735,11 @@ export function buildAgentContextPacket(
         isMultiItem: multiItem.isMultiItem,
         itemCount: multiItem.itemCount,
         sourceUserSeq: opts?.sourceUserSeq,
+        ...(opts?.sourceStrategyBinding
+          ? {
+              sourceStrategyBinding: opts.sourceStrategyBinding,
+            }
+          : {}),
       });
   // Persistence is execution authority, so write it only on a live chat turn
   // with the exact accepted source row. Pure previews/context probes frequently
@@ -760,7 +769,7 @@ export function buildAgentContextPacket(
   // Same chat-only persistence condition as the preflight decision.
   let capabilityResolution: CapabilityResolution = { entries: [], registryAvailable: false };
   let capabilityBlock = '';
-  if (!constrainedWorkflowNode && !suppressSemanticEnrichment) {
+  if (!constrainedWorkflowNode && !suppressSemanticEnrichment && !opts?.skipCapabilityHunt) {
     try {
       capabilityResolution = resolveTurnCapabilities(input, { sessionId: opts?.sessionId });
       capabilityBlock = renderCapabilityResolutionForContext(capabilityResolution, { focusInput: input });
@@ -777,24 +786,27 @@ export function buildAgentContextPacket(
     }
   }
 
+  const mcpScopeLine = toolScope.allowAll
+    ? ''
+    : `External MCP scope: ${(toolScope.allowedServerSlugs ?? []).join(', ') || 'none'}${toolScope.maxTools ? `, max ${toolScope.maxTools} tools` : ''} (${toolScope.reason}).`;
+  const memoryStatusLine = memory.skippedReason || !memory.enabled
+    ? memoryLine
+    : '';
   const lines = [
     '[AGENT CONTEXT PACKET]',
-    suppressSemanticEnrichment
-      ? ''
-      : 'This deterministic preflight ran before the model call. Use it to choose memory, skills, workflows, and tools instead of guessing.',
     suppressSemanticEnrichment
       ? 'Typed continuation result: the user declined the prior proposal. Keep the conversation natural, but do not revive, retrieve for, or prepare tools for the declined work.'
       : '',
     opts?.declinedParentWithNewTask
       ? 'Typed continuation result: the user declined the prior proposal and supplied separate new work. Keep the full reply conversationally intact, but treat only the fresh clause as active authority; do not revive, retrieve for, or prepare tools from the declined parent.'
       : '',
-    `Complexity: ${complexity}.`,
+    complexity === 'simple' ? '' : `Complexity: ${complexity}.`,
     focus,
-    memoryLine,
+    memoryStatusLine,
     prospective.text,
     prospectiveCapture,
     ruleCapture,
-    `External MCP scope: ${toolScope.allowAll ? 'all external tools allowed' : `${(toolScope.allowedServerSlugs ?? []).join(', ') || 'none'}${toolScope.maxTools ? `, max ${toolScope.maxTools} tools` : ''}`} (${toolScope.reason}).`,
+    mcpScopeLine,
     suppressSemanticEnrichment ? '' : providerAccessLine(),
     ...(suppressSemanticEnrichment
       ? []
@@ -813,16 +825,13 @@ export function buildAgentContextPacket(
     ...(suppressSemanticEnrichment
       ? []
       : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. If the user asks to RUN/start/kick off something by name — even a loose one ("run my email flow", "kick off the prospect routine") — call workflow_run with their exact phrasing: the resolver matches it to the right saved workflow (or asks which) and confirms before anything runs, then it executes in the background and reports back here. Do NOT auto-run a workflow the user did not ask to run; for a task that merely resembles a saved workflow, do it directly and offer to save it as a workflow afterward.')),
-    suppressSemanticEnrichment
-      ? ''
-      : healthWarnings.length > 0
-        ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}`
-        : 'Health warnings: none.',
+    healthWarnings.length > 0
+      ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}`
+      : '',
     agentSystem.text,
     suppressSemanticEnrichment ? '' : parallelismLine,
     confirmBeat,
     capabilityBlock,
-    suppressSemanticEnrichment ? '' : 'Approval reminder: batch related writes/sends under one clear approval with a preview whenever possible.',
   ].filter((line): line is string => Boolean(line));
 
   return {

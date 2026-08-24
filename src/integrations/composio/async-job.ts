@@ -32,6 +32,10 @@
  */
 import { getRuntimeEnv } from '../../config.js';
 import type { ComposioToolkitTool } from './client.js';
+import {
+  composioSlugEffectEvidence,
+  slugHasAffirmativeWriteVerb,
+} from './slug-effect.js';
 export type { ComposioToolkitTool } from './client.js';
 
 export type JobFamily = 'dataforseo' | 'apify' | 'firecrawl' | (string & {});
@@ -76,15 +80,21 @@ function inner(result: unknown): Record<string, unknown> | null {
 /** Execute a Composio action — the caller injects the real (connection-bound) fn. */
 export type ComposioExec = (slug: string, args: Record<string, unknown>) => Promise<unknown>;
 
-/** A resolved plan for HOW to poll a specific receipt to its terminal result.
- *  Apify uses fixed slugs + the receipt's ids, so its plan is empty; DataForSEO /
- *  Firecrawl carry the discovered/fixed result-getter slug. */
+/** A live-verified plan for HOW to poll a specific receipt to its terminal
+ * result. Recipe and durable slugs are hints; every callable slug in this plan
+ * came from the current toolkit catalog. */
 export interface PollPlan {
   getterSlug?: string;
   /** The getter's id-input parameter name (e.g. `id`, `task_id`, `run_id`). Set only
-   *  by the generic recipe, which infers it from the getter's schema; the known
-   *  families all use `id` and leave this undefined (checkOnce defaults to `id`). */
+   *  from the getter's live schema whenever a discovered action replaces a hint. */
   idArg?: string;
+  /** Which durable receipt identifier supplies idArg. Generic/status getters
+   * default to the remote job id. */
+  idSource?: 'job' | 'actor' | 'dataset';
+  /** Optional second-stage getter (for families whose terminal payload lives in
+   * a separate result container, such as an actor run's dataset). */
+  resultGetterSlug?: string;
+  resultIdArg?: string;
 }
 
 /** The outcome of ONE poll attempt. `pending` ⇒ not done yet (retry); `done` ⇒
@@ -100,6 +110,9 @@ export interface PollCheck {
 /** Optional, injectable discovery dependencies (tests inject a fake toolkit list). */
 export interface PollDeps {
   listToolkitTools?: (toolkitSlug: string) => Promise<ComposioToolkitTool[]>;
+  /** A durable watcher plan is only a hint. The resolver verifies it against
+   * the current catalog before reuse, then self-heals through sibling discovery. */
+  preferredPlan?: PollPlan;
 }
 
 export interface JobPollRecipe {
@@ -121,10 +134,135 @@ export interface JobFamilyRecipe {
   poll?: JobPollRecipe;
 }
 
+type PollIdSource = NonNullable<PollPlan['idSource']>;
+interface GetterArgChoice { name: string; source: PollIdSource }
+interface ResolvedGetter {
+  slug: string;
+  idArg: string;
+  idSource: PollIdSource;
+}
+
+/** One bounded, current toolkit view for poll-plan resolution. The ordinary
+ * catalog is intentionally cached for model discovery; a recipe getter is about
+ * to execute, so its existence/contract must be renewed instead of trusting the
+ * cache or a durable record. */
+async function liveToolkitTools(receipt: JobReceipt, deps: PollDeps, limit: number): Promise<ComposioToolkitTool[]> {
+  const toolkitSlug = receipt.originSlug?.split('_')[0]?.toLowerCase();
+  if (!toolkitSlug) return [];
+  if (deps.listToolkitTools) return deps.listToolkitTools(toolkitSlug);
+  const client = await import('./client.js');
+  client.bustToolkitToolsCache();
+  return client.listComposioToolkitTools(toolkitSlug, limit);
+}
+
+function schemaInputShape(tool: ComposioToolkitTool): {
+  known: boolean;
+  names: Set<string>;
+  required: Set<string>;
+} {
+  const schema = tool.inputParameters;
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+    return { known: false, names: new Set(), required: new Set() };
+  }
+  const row = schema as { properties?: unknown; required?: unknown };
+  if (
+    (row.properties !== undefined
+      && (!row.properties || typeof row.properties !== 'object' || Array.isArray(row.properties)))
+    || (row.required !== undefined && !Array.isArray(row.required))
+  ) {
+    return { known: false, names: new Set(), required: new Set() };
+  }
+  const names = new Set<string>();
+  const required = new Set<string>();
+  if (row.properties && typeof row.properties === 'object' && !Array.isArray(row.properties)) {
+    for (const name of Object.keys(row.properties as Record<string, unknown>)) names.add(name);
+  }
+  if (Array.isArray(row.required)) {
+    for (const name of row.required) {
+      if (typeof name !== 'string' || name.length === 0) {
+        return { known: false, names: new Set(), required: new Set() };
+      }
+      names.add(name);
+      required.add(name);
+    }
+  }
+  return { known: true, names, required };
+}
+
+function compatibleReadGetter(
+  tool: ComposioToolkitTool,
+  choices: readonly GetterArgChoice[],
+): ResolvedGetter | null {
+  // The canonical provider-neutral classifier owns effect truth across
+  // dispatch, approval, and retry policy. A getter-looking action it proves to
+  // be a write can never become an unattended poll. Unknown effect remains
+  // eligible only because the sibling matcher separately requires a getter
+  // token and same-family identity overlap.
+  if (composioSlugEffectEvidence(tool.slug) === 'write') return null;
+  const schema = schemaInputShape(tool);
+  const selected = schema.known
+    ? choices.find((choice) =>
+        schema.names.has(choice.name)
+        && [...schema.required].every((name) => name === choice.name))
+    : undefined;
+  if (!selected) return null;
+  // PollPlan supplies exactly one receipt-derived input. A live action whose
+  // contract now requires anything else is stale for this recipe, even if its
+  // old id field still exists. Let bounded sibling discovery self-heal instead
+  // of dispatching an invocation the catalog already proves incomplete.
+  return { slug: tool.slug, idArg: selected.name, idSource: selected.source };
+}
+
+/** Treat exact recipe/cached slugs as hints. Verify each against the renewed
+ * catalog; if absent or incompatible, feed the same compatible catalog into the
+ * generic same-toolkit sibling selector. A discovered replacement needs a real
+ * schema match—its argument name is never guessed from the retired hint. */
+function resolveGetterHint(
+  tools: readonly ComposioToolkitTool[],
+  input: {
+    hints: readonly string[];
+    discoveryIdentity: string;
+    choices: readonly GetterArgChoice[];
+  },
+): ResolvedGetter | null {
+  for (const hint of input.hints) {
+    const exact = tools.find((tool) => tool.slug.toUpperCase() === hint.toUpperCase());
+    if (!exact) continue;
+    const verified = compatibleReadGetter(exact, input.choices);
+    if (verified) return verified;
+  }
+  const compatible = tools.filter((tool) => compatibleReadGetter(tool, input.choices) !== null);
+  const slug = pickSiblingGetterSlug(input.discoveryIdentity, compatible);
+  if (!slug) return null;
+  const selected = compatible.find((tool) => tool.slug === slug);
+  return selected ? compatibleReadGetter(selected, input.choices) : null;
+}
+
+function pollIdValue(receipt: JobReceipt, source: PollIdSource | undefined): string | undefined {
+  if (source === 'actor') return receipt.actorId;
+  if (source === 'dataset') return receipt.datasetId;
+  return receipt.jobId;
+}
+
 // ── Apify family ──────────────────────────────────────────────────────────────────
 
 const APIFY_TERMINAL_OK = new Set(['SUCCEEDED']);
 const APIFY_TERMINAL_BAD = new Set(['FAILED', 'ABORTED', 'TIMED-OUT', 'TIMED_OUT']);
+const APIFY_RUN_STATUS_GETTER_HINT = 'APIFY_GET_LIST_OF_RUNS';
+const APIFY_DATASET_GETTER_HINT = 'APIFY_GET_DATASET_ITEMS';
+const APIFY_STATUS_ARGS: readonly GetterArgChoice[] = [
+  { name: 'actorId', source: 'actor' },
+  { name: 'actor_id', source: 'actor' },
+  { name: 'actId', source: 'actor' },
+  { name: 'runId', source: 'job' },
+  { name: 'run_id', source: 'job' },
+  { name: 'id', source: 'job' },
+];
+const APIFY_DATASET_ARGS: readonly GetterArgChoice[] = [
+  { name: 'datasetId', source: 'dataset' },
+  { name: 'dataset_id', source: 'dataset' },
+  { name: 'id', source: 'dataset' },
+];
 
 const apifyRecipe: JobFamilyRecipe = {
   family: 'apify',
@@ -146,35 +284,65 @@ const apifyRecipe: JobFamilyRecipe = {
         originSlug: slug,
         pollGuidance:
           `This Apify actor run is QUEUED (run id "${d.id}", status ${status}); the output is NOT in this receipt. `
-          + `Do NOT report this run handle as the result. Poll APIFY_GET_LIST_OF_RUNS (actorId) until this run reaches SUCCEEDED, `
-          + `then fetch the output with APIFY_GET_DATASET_ITEMS (datasetId="${datasetId ?? '<the run\'s defaultDatasetId>'}").`,
+          + `Do NOT report this run handle as the result. Poll the current live run-status getter (recipe hint: ${APIFY_RUN_STATUS_GETTER_HINT}) `
+          + `until this run reaches SUCCEEDED, then use the current live dataset-items getter (recipe hint: ${APIFY_DATASET_GETTER_HINT}) `
+          + `with datasetId="${datasetId ?? '<the run\'s defaultDatasetId>'}". The harness verifies both hints before dispatch.`,
       };
     }
     return null;
   },
   poll: {
     inlineAutoResolve: true,
-    unresolvableReason: 'missing-actor-or-dataset',
-    async resolveGetter(receipt) {
-      // Apify polls fixed slugs (LIST_OF_RUNS → DATASET_ITEMS) with the receipt's
-      // own ids — no discovery needed, just the ids present.
+    unresolvableReason: 'apify-getter-not-found-or-incompatible',
+    async resolveGetter(receipt, _exec, deps) {
       if (!receipt.actorId || !receipt.datasetId) return null;
-      return {};
+      let tools: ComposioToolkitTool[];
+      try { tools = await liveToolkitTools(receipt, deps, GENERIC_GETTER_DISCOVERY_LIMIT); } catch { return null; }
+      const status = resolveGetterHint(tools, {
+        hints: [deps.preferredPlan?.getterSlug, APIFY_RUN_STATUS_GETTER_HINT].filter((slug): slug is string => Boolean(slug)),
+        discoveryIdentity: APIFY_RUN_STATUS_GETTER_HINT,
+        choices: APIFY_STATUS_ARGS,
+      });
+      const result = resolveGetterHint(tools, {
+        hints: [deps.preferredPlan?.resultGetterSlug, APIFY_DATASET_GETTER_HINT].filter((slug): slug is string => Boolean(slug)),
+        discoveryIdentity: APIFY_DATASET_GETTER_HINT,
+        choices: APIFY_DATASET_ARGS,
+      });
+      if (!status || !result) return null;
+      return {
+        getterSlug: status.slug,
+        idArg: status.idArg,
+        idSource: status.idSource,
+        resultGetterSlug: result.slug,
+        resultIdArg: result.idArg,
+      };
     },
-    async checkOnce(_plan, receipt, exec) {
-      const runs = await exec('APIFY_GET_LIST_OF_RUNS', { actorId: receipt.actorId });
+    async checkOnce(plan, receipt, exec) {
+      if (!plan.getterSlug || !plan.idArg || !plan.resultGetterSlug || !plan.resultIdArg) {
+        return { state: 'pending' };
+      }
+      const statusId = pollIdValue(receipt, plan.idSource);
+      if (!statusId || !receipt.datasetId) return { state: 'pending' };
+      const runs = await exec(plan.getterSlug, { [plan.idArg]: statusId });
       const p = inner(runs);
       const list = (p?.items ?? p?.data ?? p) as unknown;
       const arr = Array.isArray(list)
         ? list
         : Array.isArray((list as { items?: unknown[] })?.items)
           ? (list as { items: unknown[] }).items
-          : [];
-      const run = (arr as Array<Record<string, unknown>>).find((r) => r?.id === receipt.jobId);
+          : p && typeof p === 'object'
+            ? [p]
+            : [];
+      const exactRun = (arr as Array<Record<string, unknown>>).find((r) =>
+        r?.id === receipt.jobId || r?.runId === receipt.jobId);
+      // A direct run-id getter may omit the id from its single-object response;
+      // an actor/list getter cannot. Never associate an unrelated sole list row
+      // with this receipt merely because the list happened to contain one run.
+      const run = exactRun ?? (plan.idSource === 'job' && arr.length === 1 ? arr[0] : undefined);
       const status = run?.status ? String(run.status).toUpperCase() : undefined;
       if (status && APIFY_TERMINAL_BAD.has(status)) return { state: 'failed', reason: `run ${status}` };
       if (status && APIFY_TERMINAL_OK.has(status)) {
-        const items = await exec('APIFY_GET_DATASET_ITEMS', { datasetId: receipt.datasetId });
+        const items = await exec(plan.resultGetterSlug, { [plan.resultIdArg]: receipt.datasetId });
         return { state: 'done', result: items };
       }
       // still RUNNING/READY (or unknown) — not done yet.
@@ -224,8 +392,13 @@ export function pickDataforseoGetterSlug(originSlug: string, tools: ComposioTool
     if (Array.isArray(ip.required)) return (ip.required as unknown[]).includes('id');
     return null;
   };
-  const withId = candidates.filter((t) => acceptsId(t) !== false);
-  const pool = withId.length > 0 ? withId : candidates;
+  // TASK_GET is the provider's structurally read-only result endpoint even
+  // when the shared operation stem contains CREATE from the paired TASK_POST.
+  const pool = candidates.filter((t) => {
+    const suffix = t.slug.toUpperCase().slice(prefix.length);
+    return acceptsId(t) !== false && !slugHasAffirmativeWriteVerb(suffix);
+  });
+  if (pool.length === 0) return null;
 
   const ranked = [...new Set(pool.map((t) => t.slug))].sort(
     (a, b) => suffixRank(a) - suffixRank(b) || a.localeCompare(b),
@@ -243,13 +416,9 @@ const DATAFORSEO_GETTER_DISCOVERY_LIMIT = 300;
 
 async function resolveDataforseoGetter(receipt: JobReceipt, deps: PollDeps): Promise<PollPlan | null> {
   if (!receipt.originSlug) return null;
-  const toolkitSlug = receipt.originSlug.split('_')[0]?.toLowerCase();
-  if (!toolkitSlug) return null;
   let tools: ComposioToolkitTool[];
   try {
-    const lister = deps.listToolkitTools
-      ?? (await import('./client.js')).listComposioToolkitTools;
-    tools = await lister(toolkitSlug, DATAFORSEO_GETTER_DISCOVERY_LIMIT);
+    tools = await liveToolkitTools(receipt, deps, DATAFORSEO_GETTER_DISCOVERY_LIMIT);
   } catch {
     return null; // no live list ⇒ can't discover a getter ⇒ banner fallback
   }
@@ -317,6 +486,17 @@ const dataforseoRecipe: JobFamilyRecipe = {
 // ── Firecrawl family ──────────────────────────────────────────────────────────────
 
 const FIRECRAWL_STATUS_GETTER = 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB';
+const GENERIC_JOB_ID_ARGS: readonly GetterArgChoice[] = [
+  { name: 'task_id', source: 'job' },
+  { name: 'job_id', source: 'job' },
+  { name: 'run_id', source: 'job' },
+  { name: 'request_id', source: 'job' },
+  { name: 'taskId', source: 'job' },
+  { name: 'jobId', source: 'job' },
+  { name: 'runId', source: 'job' },
+  { name: 'requestId', source: 'job' },
+  { name: 'id', source: 'job' },
+];
 
 const firecrawlRecipe: JobFamilyRecipe = {
   family: 'firecrawl',
@@ -335,7 +515,8 @@ const firecrawlRecipe: JobFamilyRecipe = {
         originSlug: slug,
         pollGuidance:
           `This Firecrawl crawl is IN PROGRESS (job id "${d.id}"); not all pages are ready. `
-          + `Poll FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB (id="${d.id}") until status is "completed", then read the data.`,
+          + `Poll the current live crawl-status getter (recipe hint: ${FIRECRAWL_STATUS_GETTER}, id="${d.id}") `
+          + `until status is "completed", then read the data. The harness verifies the hint before dispatch.`,
       };
     }
     return null;
@@ -343,11 +524,22 @@ const firecrawlRecipe: JobFamilyRecipe = {
   poll: {
     inlineAutoResolve: false,
     unresolvableReason: 'firecrawl-getter-unavailable',
-    async resolveGetter() {
-      return { getterSlug: FIRECRAWL_STATUS_GETTER };
+    async resolveGetter(receipt, _exec, deps) {
+      let tools: ComposioToolkitTool[];
+      try { tools = await liveToolkitTools(receipt, deps, GENERIC_GETTER_DISCOVERY_LIMIT); } catch { return null; }
+      const getter = resolveGetterHint(tools, {
+        hints: [deps.preferredPlan?.getterSlug, FIRECRAWL_STATUS_GETTER]
+          .filter((slug): slug is string => Boolean(slug)),
+        discoveryIdentity: FIRECRAWL_STATUS_GETTER,
+        choices: GENERIC_JOB_ID_ARGS,
+      });
+      return getter
+        ? { getterSlug: getter.slug, idArg: getter.idArg, idSource: getter.idSource }
+        : null;
     },
     async checkOnce(plan, receipt, exec) {
-      const res = await exec(plan.getterSlug ?? FIRECRAWL_STATUS_GETTER, { id: receipt.jobId });
+      if (!plan.getterSlug || !plan.idArg) return { state: 'pending' };
+      const res = await exec(plan.getterSlug, { [plan.idArg]: receipt.jobId });
       const d = inner(res);
       const status = String(d?.status ?? '').toLowerCase();
       if (status === 'completed') return { state: 'done', result: res };
@@ -510,7 +702,10 @@ const GENERIC_START_VERBS = new Set([
   'START', 'CREATE', 'RUN', 'POST', 'SUBMIT', 'ENQUEUE', 'TRIGGER', 'LAUNCH', 'ACTOR',
   'TASK', 'GENERATE', 'INITIATE', 'BEGIN', 'DISPATCH', 'KICKOFF', 'SCHEDULE', 'REQUEST',
 ]);
-const GENERIC_GETTER_TOKEN_ORDER = ['STATUS', 'RESULTS', 'RESULT', 'GET', 'POLL', 'FETCH', 'RETRIEVE'];
+const GENERIC_GETTER_TOKEN_ORDER = [
+  'STATUS', 'RESULTS', 'RESULT', 'GET', 'POLL', 'FETCH', 'RETRIEVE',
+  'LIST', 'SEARCH', 'LOOKUP', 'CHECK',
+];
 const GENERIC_GETTER_TOKENS = new Set(GENERIC_GETTER_TOKEN_ORDER);
 
 export function pickSiblingGetterSlug(originSlug: string, tools: ComposioToolkitTool[]): string | null {
@@ -545,17 +740,6 @@ export function pickSiblingGetterSlug(originSlug: string, tools: ComposioToolkit
   return best.slug;
 }
 
-/** The getter's id-input parameter name, inferred from its schema (required wins over
- *  optional). Defaults to `id` when the schema is unknown. */
-function pickGetterIdArg(tool: ComposioToolkitTool | undefined): string {
-  const ip = tool?.inputParameters as { properties?: Record<string, unknown>; required?: unknown } | undefined;
-  const props = ip?.properties && typeof ip.properties === 'object' ? Object.keys(ip.properties) : [];
-  const required = Array.isArray(ip?.required) ? (ip!.required as unknown[]).filter((x): x is string => typeof x === 'string') : [];
-  for (const k of GENERIC_ID_KEYS) if (required.includes(k)) return k;
-  for (const k of GENERIC_ID_KEYS) if (props.includes(k)) return k;
-  return 'id';
-}
-
 const GENERIC_GETTER_DISCOVERY_LIMIT = 300;
 
 const genericRecipe: JobFamilyRecipe = {
@@ -570,20 +754,20 @@ const genericRecipe: JobFamilyRecipe = {
     unresolvableReason: 'generic-getter-not-found',
     async resolveGetter(receipt, _exec, deps) {
       if (!receipt.originSlug) return null;
-      const toolkitSlug = receipt.originSlug.split('_')[0]?.toLowerCase();
-      if (!toolkitSlug) return null;
       let tools: ComposioToolkitTool[];
       try {
-        const lister = deps.listToolkitTools
-          ?? (await import('./client.js')).listComposioToolkitTools;
-        tools = await lister(toolkitSlug, GENERIC_GETTER_DISCOVERY_LIMIT);
+        tools = await liveToolkitTools(receipt, deps, GENERIC_GETTER_DISCOVERY_LIMIT);
       } catch {
         return null;
       }
-      const getterSlug = pickSiblingGetterSlug(receipt.originSlug, tools ?? []);
-      if (!getterSlug) return null;
-      const idArg = pickGetterIdArg((tools ?? []).find((t) => (t.slug || '').toUpperCase() === getterSlug.toUpperCase()));
-      return { getterSlug, idArg };
+      const getter = resolveGetterHint(tools ?? [], {
+        hints: deps.preferredPlan?.getterSlug ? [deps.preferredPlan.getterSlug] : [],
+        discoveryIdentity: receipt.originSlug,
+        choices: GENERIC_JOB_ID_ARGS,
+      });
+      return getter
+        ? { getterSlug: getter.slug, idArg: getter.idArg, idSource: getter.idSource }
+        : null;
     },
     async checkOnce(plan, receipt, exec) {
       if (!plan.getterSlug) return { state: 'pending' };
@@ -761,7 +945,7 @@ export async function pollJobToResolution(
 /**
  * INLINE call-site auto-poll: resolve a queued receipt to its REAL output on the
  * caller's turn, but ONLY for families flagged `inlineAutoResolve` (today: Apify,
- * whose poll needs no live discovery). A family whose poll needs a toolkit lookup
+ * after its recipe hints are verified against the live catalog). A family whose poll needs a toolkit lookup
  * (DataForSEO / Firecrawl) returns {resolved:false, reason:'family-not-auto-pollable'}
  * so the caller PARKS it to the background job-watcher instead of blocking the turn.
  * Any missing id, terminal-bad run, poll error, or budget overrun also returns

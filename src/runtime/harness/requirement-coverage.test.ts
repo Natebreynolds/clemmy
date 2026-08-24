@@ -42,3 +42,22 @@ test('requested analysis without a transform posture is unresolved', () => {
     assert.ok(admitted.unresolved.includes('transform') || admitted.unresolved.includes('destination'));
   }
 });
+
+test('exhaust collection with listed fields and a records sink is covered', () => {
+  const admitted = admitRequirementCoverage({
+    sourceUserSeq: 4,
+    acceptedText: 'populate a database of every matching profile and keep one unique record',
+    goal: {
+      construct: 'collect_then_construct',
+      route: 'act',
+      collection: {
+        count: 0,
+        projection: ['name', 'phone', 'email'],
+        completeness: 'exhaust',
+        identityFields: ['name', 'phone', 'email'],
+      },
+      destinations: [{ posture: 'create_new', family: 'records', handleRequired: false }],
+    },
+  });
+  assert.equal(admitted.ok, true);
+});

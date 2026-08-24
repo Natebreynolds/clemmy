@@ -9,6 +9,7 @@ import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { DogMark } from '@/components/DogMark';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { Composer } from '@/components/chat/Composer';
+import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { chatApprovalReply, useChat } from '@/lib/useChat';
 import { usePoll } from '@/lib/poll';
 import {
@@ -22,6 +23,7 @@ import {
   type SpaceObservationSummary, WorkspaceRefreshError,
 } from '@/lib/spaces';
 import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
+import { CanonicalEntityCoveragePanel } from '@/components/workspaces/CanonicalEntityCoveragePanel';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
 import { WorkspaceFrame } from '@/components/workspaces/WorkspaceFrame';
 
@@ -49,6 +51,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
   const [iframeKey, setIframeKey] = useState(0);
   const lastMtimeRef = useRef<number | null>(null);
   const seededRef = useRef(false);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
 
   // Auto-reload the view when its file changes — keyed on the view's mtime so it
   // catches ANY edit (Clem's space_edit_view, a write_file rewrite, a rollback).
@@ -368,6 +371,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
               {tab === 'health' && (
                 <div className="space-y-3">
                   <PurposePanel space={space} onSaved={() => { void detail.refetch(); }} />
+                  <CanonicalEntityCoveragePanel workspaceId={id} />
                   {health ? (
                     <>
                       <div className="grid grid-cols-2 gap-2">
@@ -516,7 +520,8 @@ function WorkspaceViewForId({ id }: { id: string }) {
               )}
             </div>
             <div className="border-t border-border p-2">
-              <Composer busy={chat.busy} onSend={chat.send} onStop={chat.stop} placeholder="Ask about this workspace…" />
+              <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
+              <Composer inputRef={composerRef} busy={chat.busy} onSend={chat.send} onStop={chat.stop} placeholder="Ask about this workspace…" />
             </div>
           </div>
         ) : (

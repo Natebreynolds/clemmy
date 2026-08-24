@@ -318,6 +318,21 @@ test('work_call Composio refinement keeps the original binding through the provi
         dataFrom: ['fetch_ventura_from_apify'],
         cardinality: { kind: 'once' as const },
       },
+      {
+        id: 'verify_restaurants_sheet',
+        effect: 'read' as const,
+        coverage: 'complete_set' as const,
+        dependsOn: ['write_restaurants_to_sheet'],
+        dataFrom: ['write_restaurants_to_sheet'],
+        cardinality: { kind: 'once' as const },
+      },
+      {
+        id: 'send_restaurants_sheet',
+        effect: 'external_write' as const,
+        dependsOn: ['verify_restaurants_sheet'],
+        dataFrom: ['verify_restaurants_sheet'],
+        cardinality: { kind: 'once' as const },
+      },
     ],
     universes: [],
   };
@@ -342,8 +357,13 @@ test('work_call Composio refinement keeps the original binding through the provi
   );
   assert.ok(rawContract && providerContract, 'both live contract shapes are safe');
   assert.equal(rawContract!.toolName, providerContract!.toolName, 'resolution keeps the effective APIFY slug');
-  assert.notEqual(rawContract!.argumentDigest, providerContract!.argumentDigest,
-    'provider-ready refinement really changes the argument digest');
+  // Carrier-digest unification (2026-08-18): every carrier form of the same
+  // inner call — work_call envelope, gateway payload, bare provider slug —
+  // digests to ONE contract. The original fixture asserted the pre-unification
+  // split (raw ≠ provider-ready), which is the exact poison class the
+  // unification killed; refinement is now an identity-preserving no-op here.
+  assert.equal(rawContract!.argumentDigest, providerContract!.argumentDigest,
+    'every carrier form of the same inner call digests to one contract');
 
   let nestedProviderId = '';
   let foreignId = '';

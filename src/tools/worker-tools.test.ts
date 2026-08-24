@@ -564,3 +564,60 @@ test('SDK-brain handler still reuses an exact packet replay inside one execution
     else process.env.AUTH_MODE = priorAuthMode;
   }
 });
+
+test('RESTART-GATE fan-out width: a 3-item batch overlaps at least 2 workers (N≥3 → real fan-out)', async () => {
+  // The north-star fan-out promise, pinned at the engine's worker pool: for a
+  // collect-N construct with N≥3, item work must actually overlap — not run as
+  // a disguised sequential loop (live Discord has never shown worker
+  // crossings). Default session cap is 6, so 3 items must reach width ≥ 2.
+  const sessionId = 'sess-fanout-width';
+  const priorAuthMode = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = 'claude_oauth';
+  createSession({ id: sessionId, kind: 'chat' });
+  const handler = captureRunWorker();
+  let inflight = 0;
+  let peak = 0;
+  try {
+    const res = await withInnerSdk(
+      async () => {
+        inflight += 1;
+        peak = Math.max(peak, inflight);
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        inflight -= 1;
+        return { text: 'item done', toolUses: [] };
+      },
+      () => withToolOutputContext({ sessionId }, () => handler({
+        ...packet('unused batch placeholder'),
+        item: null,
+        items: ['Shop A — shopa.example', 'Shop B — shopb.example', 'Shop C — shopc.example'],
+        workManifest: {
+          id: 'coffee-shops',
+          contractVersion: '1',
+          phase: 'research',
+          mode: 'declare',
+          phases: [{ id: 'research' }],
+        },
+      })),
+    );
+    assert.match(res.content[0].text, /Batch complete: 3\/3 items succeeded/);
+    assert.ok(peak >= 2, `worker width must be ≥ 2 for 3 items (observed peak ${peak})`);
+    assert.equal(listEvents(sessionId, { types: ['worker_started'] }).length, 3);
+  } finally {
+    if (priorAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = priorAuthMode;
+  }
+});
+
+// ── ONE LOOP, MANY BRAINS: per-packet model override (permissive)
+test('a routable packet model wins over intent/role routing', async () => {
+  const { resolveSdkBrainWorker } = await import('./worker-tools.js');
+  const route = resolveSdkBrainWorker('research', 'gpt-5.6-terra');
+  assert.equal(route.modelId, 'gpt-5.6-terra', 'the exact packet model runs this worker');
+  assert.equal(route.claudeLane, false, 'a non-Claude packet model rides the cross-provider lane');
+});
+
+test('an unroutable packet model falls through the chain — NEVER refuses the dispatch', async () => {
+  const { resolveSdkBrainWorker } = await import('./worker-tools.js');
+  const route = resolveSdkBrainWorker(undefined, 'totally-unknown-model-xyz');
+  assert.ok(route.modelId, `a worker still runs on the resolvable chain: ${JSON.stringify(route)}`);
+});

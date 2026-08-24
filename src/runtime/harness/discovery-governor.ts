@@ -253,6 +253,10 @@ export interface AdmitDiscoveryInput extends DiscoveryTaskKey {
   /** Exact tool identity for schema refresh, or frozen unresolved role for a
    * broad search. Omitted only by legacy task-wide broad discovery. */
   subject?: string;
+  /** Opaque host-owned admission class for the fresh foreground loop's one
+   * metadata-only catalog disclosure before a graph exists. Model arguments
+   * cannot set this; the exact configured tool object must carry the marker. */
+  authorityClass?: 'fresh_plan_catalog_disclosure';
 }
 
 export interface SettleDiscoveryInput extends AdmitDiscoveryInput {
@@ -289,6 +293,12 @@ export type DiscoveryEvidenceOutcome =
  * indefinitely".
  */
 export const MAX_DISCOVERY_EPOCHS = 4;
+
+/** A complex accepted request may expose many clauses, but foreground broad
+ * discovery remains a small control surface. Each admitted claim is still
+ * keyed by one exact frozen role; this ceiling prevents an oversized role
+ * projection from turning into an unbounded provider-search fan-out. */
+export const MAX_ROLE_SCOPED_DISCOVERY_CLAIMS = 8;
 
 export interface DiscoveryEvidenceRecord {
   outcome: DiscoveryEvidenceOutcome;
@@ -1103,7 +1113,10 @@ export class DiscoveryGovernor {
   admit(input: AdmitDiscoveryInput): DiscoveryDecision {
     const key = taskKey(input);
     const callId = normalizedCallId(input.callId);
-    let subject = normalizedSubject(input.category, input.subject);
+    const freshPlanCatalogDisclosure = input.category === 'broad_discovery'
+      && input.authorityClass === 'fresh_plan_catalog_disclosure';
+    const requestedSubject = normalizedSubject(input.category, input.subject);
+    let subject = requestedSubject;
     const db = this.databaseProvider();
     ensureSchema(db);
     const decide = db.transaction((): DiscoveryDecision => {
@@ -1127,10 +1140,14 @@ export class DiscoveryGovernor {
         });
       }
 
-      // A role key is meaningful only inside the exact host-frozen membership.
-      // Legacy/builtins-only tasks keep their single task-wide broad claim even
-      // if a model supplies an arbitrary role-shaped string.
-      if (input.category === 'broad_discovery' && !policy.roleScoped) subject = '';
+      // The opaque fresh-plan marker proves WHICH configured broker object
+      // issued the call; it never replaces WHAT unresolved requirement the
+      // model selected. A role-scoped task therefore always validates and keys
+      // the exact host-frozen role. Only a compatibility task with no durable
+      // role projection may fall back to the single host marker.
+      if (input.category === 'broad_discovery' && !policy.roleScoped) {
+        subject = freshPlanCatalogDisclosure ? 'host:fresh_plan_catalog' : '';
+      }
 
       if (input.category === 'broad_discovery' && policy.roleScoped) {
         const denyRole = (
@@ -1178,6 +1195,30 @@ export class DiscoveryGovernor {
           policy,
           claim: existing,
         });
+      }
+
+      if (input.category === 'broad_discovery') {
+        const spent = db.prepare(`
+          SELECT COUNT(*) AS count
+            FROM discovery_governor_claims
+           WHERE session_id = ? AND source_user_seq = ?
+             AND epoch = ? AND category = 'broad_discovery'
+        `).get(key.sessionId, key.sourceUserSeq, policy.epoch) as { count: number };
+        const cap = policy.roleScoped ? MAX_ROLE_SCOPED_DISCOVERY_CLAIMS : 1;
+        if (spent.count >= cap) {
+          return buildDecision({
+            key,
+            category: input.category,
+            subject,
+            callId,
+            admitted: false,
+            reason: 'category_budget_exhausted',
+            replay: false,
+            consumedBudget: false,
+            policy,
+            claim: null,
+          });
+        }
       }
 
       const admittedAt = new Date().toISOString();
@@ -1256,7 +1297,11 @@ export class DiscoveryGovernor {
     const detail = normalizedDetail(input.detail);
     const db = this.databaseProvider();
     ensureSchema(db);
-    if (input.category === 'broad_discovery' && !rawRoleSet(db, key)) subject = '';
+    if (
+      input.category === 'broad_discovery'
+      && !rawRoleSet(db, key)
+      && subject !== 'host:fresh_plan_catalog'
+    ) subject = '';
     const settle = db.transaction((): DiscoverySettlement => {
       // Settle the claim this callId actually holds, wherever it sits. An epoch
       // may have advanced between dispatch and return; the in-flight attempt

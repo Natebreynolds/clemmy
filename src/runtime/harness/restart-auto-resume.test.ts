@@ -8,6 +8,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, rmSync } from 'node:fs';
+import type { RestartResumeDispatch } from './restart-recovery.js';
 
 const TEST_HOME = '/tmp/clemmy-test-auto-resume';
 process.env.CLEMENTINE_HOME = TEST_HOME;
@@ -28,7 +29,6 @@ const {
   clearRunInFlightAfterTerminal,
   recoverInterruptedChatRuns,
   markRunInFlight,
-  AUTO_RESUME_DIRECTIVE,
 } = await import('./restart-recovery.js');
 const {
   createWorkflowChatDispatchPreparedReceipt,
@@ -158,7 +158,7 @@ for (const scenario of [
 
     const summary = recoverInterruptedChatRuns(
       () => nowMs,
-      async (sessionId) => { dispatched.push(sessionId); },
+      async (restart) => { dispatched.push(restart.sessionId); },
     );
     await new Promise((resolve) => setTimeout(resolve, 20));
 
@@ -203,9 +203,9 @@ for (const scenario of [
 
 test('a clean interrupted run is auto-resumed with nonterminal progress only', async () => {
   const id = interruptedChatSession();
-  const dispatched: Array<{ sessionId: string; directive: string; sourceUserSeq: number }> = [];
-  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId, directive, sourceUserSeq) => {
-    dispatched.push({ sessionId, directive, sourceUserSeq });
+  const dispatched: RestartResumeDispatch[] = [];
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => {
+    dispatched.push(restart);
   });
   assert.equal(summary.recovered, 1);
   const rec = summary.records[0];
@@ -214,8 +214,10 @@ test('a clean interrupted run is auto-resumed with nonterminal progress only', a
   await new Promise((r) => setTimeout(r, 20)); // fire-and-forget dispatch settles
   assert.equal(dispatched.length, 1);
   assert.equal(dispatched[0].sessionId, id);
-  assert.equal(dispatched[0].directive, AUTO_RESUME_DIRECTIVE);
+  assert.equal(dispatched[0].acceptedInput, 'Finish the interrupted task.');
+  assert.equal(dispatched[0].surface, 'home');
   assert.equal(dispatched[0].sourceUserSeq, getLatestRunAttempt(id)?.sourceUserSeq);
+  assert.doesNotMatch(JSON.stringify(dispatched[0]), /automatically resumed|restart-recovery/i);
   assert.equal(
     listEvents(id, { types: ['user_input_received'] }).length,
     1,
@@ -262,7 +264,7 @@ test('a persisted user stop is never resurrected by restart auto-resume', async 
   requestKill(sess.id, 'user pressed Stop', attempt);
 
   const dispatched: string[] = [];
-  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => { dispatched.push(sessionId); });
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => { dispatched.push(restart.sessionId); });
   assert.equal(summary.records[0].autoResumed, false);
   assert.equal(summary.records[0].autoResumeSkipped, 'user_stopped');
   assert.equal(summary.records[0].replayPrepared, false, 'stopped work gets no continue/resume primer');
@@ -326,19 +328,17 @@ test('answer -> successful space_save -> crash uses the generic durable-result r
     },
   });
 
-  const dispatched: Array<{ sessionId: string; directive: string }> = [];
-  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId, directive) => {
-    dispatched.push({ sessionId, directive });
+  const dispatched: RestartResumeDispatch[] = [];
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => {
+    dispatched.push(restart);
   });
 
   assert.equal(summary.records[0].autoResumed, true);
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(dispatched.length, 1, 'restart recovery dispatches exactly one reconciliation turn');
   assert.equal(dispatched[0].sessionId, sess.id);
-  assert.equal(dispatched[0].directive, AUTO_RESUME_DIRECTIVE);
-  assert.match(dispatched[0].directive, /never repeat a completed mutation, including space_save/i);
-  assert.match(dispatched[0].directive, /question as resolved when a later user_input_received event answers it/i);
-  assert.match(dispatched[0].directive, /read-only verification and report the result/i);
+  assert.equal(dispatched[0].acceptedInput, 'Refresh it daily.');
+  assert.doesNotMatch(JSON.stringify(dispatched[0]), /restart|space_save|read-only verification/i);
 });
 
 test('an intermediate space_save does not truncate clearly unfinished post-save work', async () => {
@@ -377,24 +377,25 @@ test('an intermediate space_save does not truncate clearly unfinished post-save 
     data: { tool: 'run_shell_command', callId: 'publish-verify-unfinished' },
   });
 
-  const dispatched: Array<{ sessionId: string; directive: string }> = [];
-  recoverInterruptedChatRuns(Date.now, async (sessionId, directive) => {
-    dispatched.push({ sessionId, directive });
+  const dispatched: RestartResumeDispatch[] = [];
+  recoverInterruptedChatRuns(Date.now, async (restart) => {
+    dispatched.push(restart);
   });
 
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(dispatched.length, 1);
-  assert.equal(dispatched[0].directive, AUTO_RESUME_DIRECTIVE);
-  assert.match(dispatched[0].directive, /successful space_save can be the final action or an intermediate checkpoint/i);
-  assert.match(dispatched[0].directive, /continue only work .* clearly unfinished/i);
-  assert.match(dispatched[0].directive, /last durable boundary/i);
+  assert.equal(
+    dispatched[0].acceptedInput,
+    'Build the workspace, save it, then run its publish verification.',
+  );
+  assert.doesNotMatch(JSON.stringify(dispatched[0]), /restart|durable boundary/i);
 });
 
 test('an interrupted run WITH an external write keeps the manual banner (double-act guard)', async () => {
   const id = interruptedChatSession();
   appendEvent({ sessionId: id, turn: 1, role: 'Clem', type: 'external_write', data: { tool: 'composio_execute_tool', slug: 'OUTLOOK_SEND_EMAIL' } });
   const dispatched: string[] = [];
-  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => { dispatched.push(sessionId); });
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => { dispatched.push(restart.sessionId); });
   assert.equal(summary.records[0].autoResumed, false);
   assert.equal(summary.records[0].autoResumeSkipped, 'external_write');
   await new Promise((r) => setTimeout(r, 20));
@@ -441,8 +442,8 @@ test('an exactly matched proven-no-effect write failure remains safe to auto-res
   });
 
   const dispatched: string[] = [];
-  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => {
-    dispatched.push(sessionId);
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => {
+    dispatched.push(restart.sessionId);
   });
 
   assert.equal(summary.records[0].autoResumed, true);
@@ -477,8 +478,8 @@ test('a failure compensates only its exact write; a sibling reservation still bl
   });
 
   const dispatched: string[] = [];
-  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => {
-    dispatched.push(sessionId);
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => {
+    dispatched.push(restart.sessionId);
   });
 
   assert.equal(summary.records[0].autoResumeSkipped, 'external_write');
@@ -499,8 +500,8 @@ test('an orphan outcome without a reservation still blocks automatic replay', as
   });
 
   const dispatched: string[] = [];
-  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => {
-    dispatched.push(sessionId);
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => {
+    dispatched.push(restart.sessionId);
   });
 
   assert.equal(summary.records[0].autoResumeSkipped, 'external_write');
@@ -514,7 +515,7 @@ test('kill-switch CLEMMY_CHAT_AUTO_RESUME=off restores banner-only for everyone'
   process.env.CLEMMY_CHAT_AUTO_RESUME = 'off';
   interruptedChatSession();
   const dispatched: string[] = [];
-  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => { dispatched.push(sessionId); });
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => { dispatched.push(restart.sessionId); });
   assert.equal(summary.records[0].autoResumeSkipped, 'disabled');
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(dispatched.length, 0);
@@ -544,7 +545,7 @@ test('no dispatcher (legacy caller) behaves exactly as before — banner only', 
 test('boot cap: only the first 3 eligible runs auto-resume; the rest keep the banner', async () => {
   for (let i = 0; i < 5; i++) interruptedChatSession();
   const dispatched: string[] = [];
-  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => { dispatched.push(sessionId); });
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => { dispatched.push(restart.sessionId); });
   assert.equal(summary.recovered, 5);
   assert.equal(summary.records.filter((r) => r.autoResumed).length, 3);
   assert.equal(summary.records.filter((r) => r.autoResumeSkipped === 'boot_cap').length, 2);
@@ -581,10 +582,13 @@ test('a dispatch rejection after exact workflow activation preserves transferred
 
   const summary = recoverInterruptedChatRuns(
     () => nowMs,
-    async (sessionId, _directive, sourceUserSeq) => {
-      assert.equal(sessionId, fixture.sessionId);
-      assert.equal(sourceUserSeq, fixture.sourceUserSeq);
-      const finalized = finalizePreparedWorkflowDispatchForSource(sessionId, sourceUserSeq);
+    async (restart) => {
+      assert.equal(restart.sessionId, fixture.sessionId);
+      assert.equal(restart.sourceUserSeq, fixture.sourceUserSeq);
+      const finalized = finalizePreparedWorkflowDispatchForSource(
+        restart.sessionId,
+        restart.sourceUserSeq,
+      );
       assert.ok(finalized, 'the resumed source activates its exact prepared workflow group');
       finalizedRunIds = [...finalized.receipt.runIds];
       throw new Error('provider failed after durable workflow dispatch transfer');
@@ -613,9 +617,10 @@ test('a dispatch rejection after exact workflow activation preserves transferred
     0,
     'the rejected foreground Promise cannot publish a competing terminal',
   );
-  assert.ok(
+  assert.equal(
     HarnessSession.load(fixture.sessionId)?.runInFlightSince(),
-    'restart ownership remains armed until the background workflow settles',
+    null,
+    'the foreground restart marker is released after the activated workflow takes ownership',
   );
   assert.equal(
     getLatestRunAttempt(fixture.sessionId)?.status,

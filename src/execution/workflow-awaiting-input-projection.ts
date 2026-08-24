@@ -15,7 +15,7 @@ import { deliverOutcomeWithAcknowledgement } from '../runtime/outcome.js';
 import { finishRun, getRun, type RunInputBlocker } from '../runtime/run-events.js';
 import { appendWorkflowEventDurably, readWorkflowEvents } from './workflow-events.js';
 import {
-  readWorkflowRunRecordUnlocked,
+  scanWorkflowRunRecordSnapshot,
   withWorkflowRunRecordLock,
 } from './workflow-run-record.js';
 import {
@@ -176,10 +176,11 @@ function ensureOriginDeliveries(record: AwaitingInputWorkflowRecord, detail: str
 
 function projectFile(filePath: string): 'projected' | 'skipped' {
   return withWorkflowRunRecordLock(filePath, () => {
-    const record = readWorkflowRunRecordUnlocked<AwaitingInputWorkflowRecord>(filePath);
+    const scan = scanWorkflowRunRecordSnapshot<AwaitingInputWorkflowRecord>(filePath);
+    if (scan.status !== 'ok') return 'skipped';
+    const record = scan.record;
     if (
-      !record
-      || path.basename(filePath, '.json') !== record.id
+      path.basename(filePath, '.json') !== record.id
       || record.status !== 'awaiting_input'
       || !isWorkflowAwaitingInputState(record.awaitingInput)
       || record.awaitingInput.answer !== undefined

@@ -472,6 +472,8 @@ function outcomeMatchesCanonicalStatus(
   switch (run.status) {
     case 'cancelled':
       return outcome === 'failed';
+    case 'blocked':
+      return outcome === 'blocked';
     case 'error':
     case 'failed':
       // Preflight/readiness errors intentionally use the blocked lane; a done

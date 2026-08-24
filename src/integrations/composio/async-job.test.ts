@@ -22,6 +22,7 @@ import {
   type ComposioToolkitTool,
   type JobFamilyRecipe,
 } from './async-job.js';
+import { composioSlugEffectEvidence } from './slug-effect.js';
 
 // Real DataForSEO TASK_POST envelope (keyword: best coffee austin).
 const DFS_TASK_POST = {
@@ -93,6 +94,18 @@ test('a DataForSEO error envelope is NOT a receipt', () => {
 
 // ── A3: bounded Apify auto-poll (fake exec + injectable sleep — no real credits) ──
 const APIFY_RECEIPT: JobReceipt = detectJobReceipt('APIFY_RUN_ACTOR', APIFY_RUN)!;
+const APIFY_GETTER_CATALOG = async (): Promise<ComposioToolkitTool[]> => [
+  {
+    slug: 'APIFY_GET_LIST_OF_RUNS',
+    name: 'APIFY_GET_LIST_OF_RUNS',
+    inputParameters: { type: 'object', properties: { actorId: {} }, required: ['actorId'] },
+  },
+  {
+    slug: 'APIFY_GET_DATASET_ITEMS',
+    name: 'APIFY_GET_DATASET_ITEMS',
+    inputParameters: { type: 'object', properties: { datasetId: {} }, required: ['datasetId'] },
+  },
+];
 
 test('autoPollJob: Apify run polled to SUCCEEDED returns the real dataset items', async () => {
   const calls: string[] = [];
@@ -111,7 +124,10 @@ test('autoPollJob: Apify run polled to SUCCEEDED returns the real dataset items'
     }
     throw new Error(`unexpected slug ${slug}`);
   };
-  const res = await autoPollJob(APIFY_RECEIPT, exec, { sleep: async () => {} });
+  const res = await autoPollJob(APIFY_RECEIPT, exec, {
+    listToolkitTools: APIFY_GETTER_CATALOG,
+    sleep: async () => {},
+  });
   assert.equal(res.resolved, true, 'resolved to the real result');
   assert.deepEqual(res.result, { data: [{ hello: 'world' }], successful: true });
   assert.ok(calls.includes('APIFY_GET_DATASET_ITEMS'), 'fetched dataset items');
@@ -122,15 +138,52 @@ test('autoPollJob: a FAILED run does NOT fetch items and falls back (resolved:fa
     if (slug === 'APIFY_GET_LIST_OF_RUNS') return { data: { items: [{ id: 'Rv5AM2u9CRMGBYt2P', status: 'FAILED' }] } };
     throw new Error('should not fetch dataset for a failed run');
   };
-  const res = await autoPollJob(APIFY_RECEIPT, exec, { sleep: async () => {} });
+  const res = await autoPollJob(APIFY_RECEIPT, exec, {
+    listToolkitTools: APIFY_GETTER_CATALOG,
+    sleep: async () => {},
+  });
   assert.equal(res.resolved, false);
   assert.match(res.reason ?? '', /FAILED/);
+});
+
+test('Apify actor/list polling never associates a sole unrelated run; direct job getter may return one id-less object', async () => {
+  const actorPlan = {
+    getterSlug: 'APIFY_GET_LIST_OF_RUNS',
+    idArg: 'actorId',
+    idSource: 'actor' as const,
+    resultGetterSlug: 'APIFY_GET_DATASET_ITEMS',
+    resultIdArg: 'datasetId',
+  };
+  const actorCalls: string[] = [];
+  const unrelated = await checkJobOnce(actorPlan, APIFY_RECEIPT, async (slug) => {
+    actorCalls.push(slug);
+    if (slug === 'APIFY_GET_LIST_OF_RUNS') {
+      return { data: { items: [{ id: 'a-different-run', status: 'SUCCEEDED' }] } };
+    }
+    throw new Error('an unrelated list row must never trigger dataset retrieval');
+  });
+  assert.equal(unrelated.state, 'pending');
+  assert.deepEqual(actorCalls, ['APIFY_GET_LIST_OF_RUNS']);
+
+  const jobPlan = { ...actorPlan, idArg: 'run_id', idSource: 'job' as const };
+  const directCalls: string[] = [];
+  const direct = await checkJobOnce(jobPlan, APIFY_RECEIPT, async (slug) => {
+    directCalls.push(slug);
+    if (slug === 'APIFY_GET_LIST_OF_RUNS') return { data: { status: 'SUCCEEDED' } };
+    return { data: [{ ok: true }] };
+  });
+  assert.equal(direct.state, 'done');
+  assert.deepEqual(directCalls, ['APIFY_GET_LIST_OF_RUNS', 'APIFY_GET_DATASET_ITEMS']);
 });
 
 test('autoPollJob: budget overrun falls back to the corrective (resolved:false)', async () => {
   let t = 0;
   const exec = async () => ({ data: { items: [{ id: 'Rv5AM2u9CRMGBYt2P', status: 'RUNNING' }] } });
-  const res = await autoPollJob(APIFY_RECEIPT, exec, { now: () => (t += 30_000), sleep: async () => {} });
+  const res = await autoPollJob(APIFY_RECEIPT, exec, {
+    listToolkitTools: APIFY_GETTER_CATALOG,
+    now: () => (t += 30_000),
+    sleep: async () => {},
+  });
   assert.equal(res.resolved, false);
   assert.match(res.reason ?? '', /budget/);
 });
@@ -253,7 +306,7 @@ test('Firecrawl in-progress crawl is detected as a receipt', () => {
 });
 
 test('checkJobOnce: Firecrawl completed → done; failed/cancelled → terminal-bad', async () => {
-  const done = await checkJobOnce({ getterSlug: 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB' }, fcReceipt(),
+  const done = await checkJobOnce({ getterSlug: 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB', idArg: 'id' }, fcReceipt(),
     async (slug, args) => {
       assert.equal(slug, 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB');
       assert.equal(args.id, 'fc-123');
@@ -262,10 +315,96 @@ test('checkJobOnce: Firecrawl completed → done; failed/cancelled → terminal-
   assert.equal(done.state, 'done');
   assert.ok(done.result);
 
-  const failed = await checkJobOnce({ getterSlug: 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB' }, fcReceipt(),
+  const failed = await checkJobOnce({ getterSlug: 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB', idArg: 'id' }, fcReceipt(),
     async () => ({ data: { status: 'failed' } }));
   assert.equal(failed.state, 'failed');
   assert.match(failed.reason ?? '', /failed/);
+});
+
+test('named getter is a verified hint: a stale contract self-heals to the renamed live sibling without stale dispatch', async () => {
+  const receipt = fcReceipt();
+  const retiredHint = 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB';
+  const renamedGetter = 'FIRECRAWL_CRAWL_JOB_STATUS_V2';
+  const plan = await resolveJobGetter(receipt, async () => { throw new Error('resolution must not dispatch'); }, {
+    listToolkitTools: async () => [
+      tool(retiredHint, {
+        type: 'object',
+        properties: { url: {} },
+        required: ['url'],
+      }),
+      tool('FIRECRAWL_UPDATE_CRAWL_JOB_STATUS', {
+        type: 'object',
+        properties: { job_id: {} },
+        required: ['job_id'],
+      }),
+      tool(renamedGetter, {
+        type: 'object',
+        properties: { job_id: {} },
+        required: ['job_id'],
+      }),
+    ],
+  });
+  assert.equal(plan?.getterSlug, renamedGetter);
+  assert.equal(plan?.idArg, 'job_id');
+
+  const dispatched: string[] = [];
+  const checked = await checkJobOnce(plan!, receipt, async (slug, args) => {
+    dispatched.push(slug);
+    assert.equal(args.job_id, receipt.jobId);
+    return { data: { status: 'completed', data: [{ markdown: '# done' }] } };
+  });
+  assert.equal(checked.state, 'done');
+  assert.deepEqual(dispatched, [renamedGetter]);
+  assert.ok(!dispatched.includes(retiredHint), 'the stale named action is never dispatched');
+});
+
+test('a live-catalog name without an input schema is not enough to make a recipe hint callable', async () => {
+  const receipt = fcReceipt();
+  const plan = await resolveJobGetter(receipt, async () => { throw new Error('must not dispatch'); }, {
+    listToolkitTools: async () => [tool('FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB')],
+  });
+  assert.equal(plan, null, 'unknown schema fails closed until the catalog proves the job-id argument');
+});
+
+test('a stale exact hint with a new required input falls through to the compatible live sibling', async () => {
+  const receipt = fcReceipt();
+  const retiredContract = 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB';
+  const renamedGetter = 'FIRECRAWL_CRAWL_JOB_STATUS_V2';
+  const plan = await resolveJobGetter(receipt, async () => { throw new Error('must not dispatch'); }, {
+    listToolkitTools: async () => [
+      tool(retiredContract, {
+        type: 'object',
+        properties: { id: {}, workspace: {} },
+        required: ['id', 'workspace'],
+      }),
+      tool(renamedGetter, {
+        type: 'object',
+        properties: { job_id: {} },
+        required: ['job_id'],
+      }),
+    ],
+  });
+  assert.deepEqual(plan, {
+    getterSlug: renamedGetter,
+    idArg: 'job_id',
+    idSource: 'job',
+  });
+});
+
+test('generic getter discovery rejects an action the canonical effect classifier proves is a write', async () => {
+  const receipt = detectJobReceipt('SOMETOOL_CREATE_JOB', {
+    data: { job_id: 'job-unsafe', status: 'queued' },
+  })!;
+  const writeShapedGetter = 'SOMETOOL_RUN_JOB_CHECK';
+  assert.equal(composioSlugEffectEvidence(writeShapedGetter), 'write');
+  const plan = await resolveJobGetter(receipt, async () => { throw new Error('must not dispatch'); }, {
+    listToolkitTools: async () => [tool(writeShapedGetter, {
+      type: 'object',
+      properties: { job_id: {} },
+      required: ['job_id'],
+    })],
+  });
+  assert.equal(plan, null, 'a proven write cannot become a watcher poll');
 });
 
 // ── S1: one-entry extensibility (a fake 4th family) ───────────────────────────────
@@ -401,19 +540,19 @@ test('resolveJobGetter (generic): discovers the sibling getter + its id-arg name
   const plan = await resolveJobGetter(receipt, async () => { throw new Error('exec unused'); }, {
     listToolkitTools: async () => [
       tool('MYTOOL_CREATE_JOB'),
-      tool('MYTOOL_JOB_STATUS', { properties: { job_id: {} }, required: ['job_id'] }),
+      tool('MYTOOL_GET_JOB_STATUS', { properties: { job_id: {} }, required: ['job_id'] }),
     ],
   });
-  assert.equal(plan?.getterSlug, 'MYTOOL_JOB_STATUS');
+  assert.equal(plan?.getterSlug, 'MYTOOL_GET_JOB_STATUS');
   assert.equal(plan?.idArg, 'job_id', 'poll arg name inferred from the getter schema');
 });
 
 test('checkJobOnce (generic): terminal payload → done; fail status → failed; queued → pending', async () => {
   const receipt = detectJobReceipt('MYTOOL_CREATE_JOB', { data: { job_id: 'j_1', status: 'queued' } })!;
-  const plan = { getterSlug: 'MYTOOL_JOB_STATUS', idArg: 'job_id' };
+  const plan = { getterSlug: 'MYTOOL_GET_JOB_STATUS', idArg: 'job_id' };
 
   const done = await checkJobOnce(plan, receipt, async (slug, args) => {
-    assert.equal(slug, 'MYTOOL_JOB_STATUS');
+    assert.equal(slug, 'MYTOOL_GET_JOB_STATUS');
     assert.equal(args.job_id, 'j_1', 'polls with the inferred id-arg name');
     return { data: { status: 'completed', results: [{ a: 1 }] } };
   });
@@ -442,7 +581,12 @@ test('autoPollJob: with parkAvailable, a still-running Apify run caps SHORT and 
   let t = 0;
   let polls = 0;
   const exec = async () => { polls += 1; return { data: { items: [{ id: 'Rv5AM2u9CRMGBYt2P', status: 'RUNNING' }] } }; };
-  const res = await autoPollJob(APIFY_RECEIPT, exec, { parkAvailable: true, now: () => (t += 5_000), sleep: async () => {} });
+  const res = await autoPollJob(APIFY_RECEIPT, exec, {
+    listToolkitTools: APIFY_GETTER_CATALOG,
+    parkAvailable: true,
+    now: () => (t += 5_000),
+    sleep: async () => {},
+  });
   assert.equal(res.resolved, false);
   assert.match(res.reason ?? '', /budget-exceeded/);
   assert.ok(polls <= 12, `capped short (${polls} polls under the 45s cap, not the 240s budget)`);
@@ -454,7 +598,12 @@ test('autoPollJob: without a park target, the FULL long budget is used (blocking
   let t = 0;
   let polls = 0;
   const exec = async () => { polls += 1; return { data: { items: [{ id: 'Rv5AM2u9CRMGBYt2P', status: 'RUNNING' }] } }; };
-  const res = await autoPollJob(APIFY_RECEIPT, exec, { parkAvailable: false, now: () => (t += 5_000), sleep: async () => {} });
+  const res = await autoPollJob(APIFY_RECEIPT, exec, {
+    listToolkitTools: APIFY_GETTER_CATALOG,
+    parkAvailable: false,
+    now: () => (t += 5_000),
+    sleep: async () => {},
+  });
   assert.equal(res.resolved, false);
   assert.match(res.reason ?? '', /budget-exceeded/);
   assert.ok(polls > 12, `used the long budget (${polls} polls, well past the 45s cap)`);
@@ -468,7 +617,11 @@ test('autoPollJob: parkAvailable does NOT prevent an EARLY terminal resolve with
     if (slug === 'APIFY_GET_DATASET_ITEMS') { assert.equal(args.datasetId, '71epPtxtXZshtjnV4'); return { data: [{ ok: 1 }] }; }
     throw new Error(`unexpected ${slug}`);
   };
-  const res = await autoPollJob(APIFY_RECEIPT, exec, { parkAvailable: true, sleep: async () => {} });
+  const res = await autoPollJob(APIFY_RECEIPT, exec, {
+    listToolkitTools: APIFY_GETTER_CATALOG,
+    parkAvailable: true,
+    sleep: async () => {},
+  });
   assert.equal(res.resolved, true);
   assert.deepEqual(res.result, { data: [{ ok: 1 }] });
 });

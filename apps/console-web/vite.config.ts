@@ -43,11 +43,14 @@ export default defineConfig({
   // cookie handles auth same-origin.
   server: {
     port: 5174,
-    proxy: {
-      '/api': 'http://127.0.0.1:8420',
-      '/dashboard': 'http://127.0.0.1:8420',
-      '/console/vendor': 'http://127.0.0.1:8420',
-      '/console/icon.png': 'http://127.0.0.1:8420',
-    },
+    // The daemon's port is the live home's WEBHOOK_PORT (dev-up prints it).
+    // Default matches the packaged daemon; CLEM_DEV_DAEMON_PORT points the
+    // SPA at a dev daemon (commonly 8520) without editing this file.
+    proxy: Object.fromEntries(
+      ['/api', '/dashboard', '/console/vendor', '/console/icon.png'].map((route) => [
+        route,
+        `http://127.0.0.1:${process.env.CLEM_DEV_DAEMON_PORT ?? '8420'}`,
+      ]),
+    ),
   },
 });

@@ -41,6 +41,7 @@ import {
 } from './capability-alias-index.js';
 import type { ReceiptResolver } from './procedure-receipts.js';
 import { rememberToolChoice, type ToolChoiceKind } from './tool-choice-store.js';
+import { inspectProviderEnvelope } from '../runtime/harness/provider-read-evidence.js';
 
 /** The canonical procedure slug for a dispatchable identifier. */
 export function canonicalIntentSlug(identifier: string): string {
@@ -57,6 +58,12 @@ export function canonicalIntentSlug(identifier: string): string {
  */
 export function settlementCarriesVerifiedData(result: unknown): boolean {
   if (!result || typeof result !== 'object') return false;
+  // Evidence is fail-closed across provider shapes. An outer success marker
+  // cannot launder a nested status/error contradiction (for example a task
+  // wrapper whose inner operation reports a five-digit provider failure).
+  // `uninspected` also grants no learning authority: safety bounds are not
+  // proof that the bytes were clean.
+  if (inspectProviderEnvelope(result).verdict !== 'clean') return false;
   const record = result as Record<string, unknown>;
   if (record.successful === false || record.error) return false;
   const data = record.data ?? record.result ?? record.items;
@@ -324,6 +331,7 @@ export function learnVerifiedReadSettlement(input: VerifiedReadLearningInput): L
       klass: 'capability_only',
       terms,
       schemaFingerprint: receipt.schemaFingerprint,
+      ...(verifiedOrigin ? { verifiedReadOrigin: verifiedOrigin } : {}),
     });
     if (!aliasWrite.stored && !/immutable/.test((aliasWrite as { reason?: string }).reason ?? '')) {
       throw new LearningWriteError((aliasWrite as { reason?: string }).reason ?? 'alias write refused');

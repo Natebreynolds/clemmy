@@ -31,6 +31,8 @@ import * as approvalRegistry from './approval-registry.js';
 import { HarnessSession } from './session.js';
 import { addNotification } from '../notifications.js';
 import { randomUUID } from 'node:crypto';
+import { reapSettledAuthorityPayloads } from './dispatch-ledger.js';
+import { reconcileRevokedHostToolInvocations } from './host-tool-invocation.js';
 
 const logger = pino({ name: 'clementine-next.approval-reaper' });
 
@@ -101,6 +103,26 @@ export function stopApprovalReaper(): void {
  * can inspect the effect.
  */
 export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
+  try {
+    const recovery = reconcileRevokedHostToolInvocations({ limit: 100 });
+    if (recovery.held > 0) {
+      logger.warn(
+        { recovery },
+        'revoked host-tool invocation recovery remains durably held',
+      );
+    } else if (recovery.settled > 0) {
+      logger.info(
+        { settled: recovery.settled },
+        'revoked host-tool invocations reconciled without redispatch',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : err },
+      'revoked host-tool invocation recovery sweep failed',
+    );
+  }
+  try { reapSettledAuthorityPayloads(); } catch { /* authority table may not exist in a partial fixture */ }
   // 1) TTL-based expiry (24h default) — long fallback for "user is
   // away for the day" cases.
   const expired = approvalRegistry.expireStaleApprovals(new Date());
@@ -161,7 +183,7 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
         dead = true;
       }
       if (!dead) continue;
-      const result = approvalRegistry.resolve(row.approvalId, 'cancelled_by_user', 'reaper-dead-session');
+      const result = approvalRegistry.resolve(row.approvalId, 'cancelled_by_system', 'reaper-dead-session');
       if (result.ok && result.row) {
         expired.push(result.row);
         logger.info(
@@ -179,6 +201,7 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
 
   for (const row of expired) {
     const durableProductApproval = hasDurableProductOwner(row);
+    const cancelledBySystem = row.resolution === 'cancelled_by_system';
     if (!durableProductApproval) {
       // Clear the SDK interrupt state so the next user message in this
       // session starts a fresh turn instead of trying to resume the
@@ -202,8 +225,12 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
           addNotification({
             id: `interrupt-clear-failed-${row.approvalId}-${randomUUID().slice(0, 8)}`,
             kind: 'system',
-            title: 'Session cleanup failed after approval expired',
-            body: `The expired approval on **${row.subject}** could not be cleared from its session, which may leave it stuck. If that session stops responding, restart the daemon.`,
+            title: cancelledBySystem
+              ? 'Session cleanup failed after approval was closed'
+              : 'Session cleanup failed after approval expired',
+            body: cancelledBySystem
+              ? `The system-closed approval on **${row.subject}** could not be cleared from its ended session, which may leave it stuck. If that session stops responding, restart the daemon.`
+              : `The expired approval on **${row.subject}** could not be cleared from its session, which may leave it stuck. If that session stops responding, restart the daemon.`,
             createdAt: new Date().toISOString(),
             read: false,
             metadata: { approvalId: row.approvalId, sessionId: row.sessionId },
@@ -219,12 +246,16 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
     // gave up." The notification is the trail back to action.
     try {
       addNotification({
-        id: `approval-expired-${row.approvalId}-${randomUUID().slice(0, 8)}`,
+        id: cancelledBySystem
+          ? `approval-system-cancelled-${row.approvalId}`
+          : `approval-expired-${row.approvalId}-${randomUUID().slice(0, 8)}`,
         kind: 'system',
-        title: 'Approval expired',
-        body: durableProductApproval
-          ? `The approval on **${row.subject}** expired without a reply. The Workspace session remains available, but the runner remains blocked. Refresh it again to request a new exact decision.`
-          : `The approval on **${row.subject}** expired without a reply. The session was cancelled. Re-ask and I'll redo it.`,
+        title: cancelledBySystem ? 'Approval closed with its ended session' : 'Approval expired',
+        body: cancelledBySystem
+          ? `Clementine closed the pending approval on **${row.subject}** because its owning session had already ended. This was a system cleanup, not a user decision, and no approval was granted. Start a new request if you still want the action.`
+          : durableProductApproval
+            ? `The approval on **${row.subject}** expired without a reply. The Workspace session remains available, but the runner remains blocked. Refresh it again to request a new exact decision.`
+            : `The approval on **${row.subject}** expired without a reply. The session was cancelled. Re-ask and I'll redo it.`,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: {
@@ -232,6 +263,9 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
           sessionId: row.sessionId,
           subject: row.subject,
           tool: row.tool,
+          approvalStatus: row.status,
+          approvalResolution: row.resolution,
+          recommendedAction: 'start_new_request',
         },
       });
     } catch (err) {
@@ -243,7 +277,7 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
 
     logger.info(
       { approvalId: row.approvalId, sessionId: row.sessionId, subject: row.subject },
-      'approval expired',
+      cancelledBySystem ? 'approval closed with ended session' : 'approval expired',
     );
   }
   return expired;

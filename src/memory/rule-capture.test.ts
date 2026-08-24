@@ -37,6 +37,8 @@ test('ordinary prose with rule words never fires — questions, conditionals, co
     'send it only if the draft is approved',
     'never mind, use whatever works',
     'can you post the update to slack',
+    'Read only the metadata/frontmatter for workflow platform-49-slack-channel-review. Do not run or update the workflow. Do not use external apps. Return only its schedule and timezone.',
+    'Only use Apify for this restaurant lookup.',
     'ok',
     'that report was great, always love the detail',  // "always" + no operational rule verb pairing…
   ];

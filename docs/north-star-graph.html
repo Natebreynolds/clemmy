@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Clem North Star — Graph Engine (target)</title>
+<style>
+  :root {
+    --bg: #F6F7F8;
+    --panel: #FFFFFF;
+    --ink: #1C242C;
+    --muted: #5A6672;
+    --line: #D8DDE2;
+    --line-soft: #E8ECEF;
+    --graph: #2E5E7D;
+    --graph-bg: #E8EFF4;
+    --ok: #2E7D5B;
+    --ok-bg: #E8F2ED;
+    --pipe: #8A5A12;
+    --pipe-bg: #F7F0E4;
+    --mem: #6B4E9B;
+    --mem-bg: #EFEAF6;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14181D; --panel: #1B2129; --ink: #E4E9ED; --muted: #93A0AC;
+      --line: #333C46; --line-soft: #252D36;
+      --graph: #6FA3C4; --graph-bg: #1A2530;
+      --ok: #4CAF87; --ok-bg: #182720;
+      --pipe: #E0B05A; --pipe-bg: #2A2418;
+      --mem: #A98CD6; --mem-bg: #251E31;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.55;
+    margin: 0; padding: 2.5rem 1.25rem 5rem;
+  }
+  main { max-width: 1080px; margin: 0 auto; }
+  header { border-bottom: 2px solid var(--ink); padding-bottom: 1.25rem; margin-bottom: 2rem; }
+  .eyebrow {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 .6rem;
+  }
+  h1 {
+    font-size: clamp(1.55rem, 4vw, 2.2rem); line-height: 1.14; margin: 0 0 .75rem;
+    letter-spacing: -.015em; text-wrap: balance; font-weight: 700;
+  }
+  .verdict { max-width: 68ch; margin: 0; color: var(--muted); font-size: 1.02rem; }
+  .verdict strong { color: var(--ink); }
+  h2 {
+    font-size: 1.12rem; margin: 2.75rem 0 .35rem; letter-spacing: -.01em;
+    display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap;
+  }
+  h2 .tag { font-family: var(--mono); font-size: .68rem; color: var(--muted); letter-spacing: .1em; }
+  .sub { color: var(--muted); font-size: .92rem; max-width: 74ch; margin: 0 0 1.1rem; }
+  figure { margin: 1.2rem 0; }
+  figcaption { font-size: .84rem; color: var(--muted); margin-top: .5rem; max-width: 80ch; }
+  .figwrap {
+    overflow-x: auto; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 1rem;
+  }
+  svg { display: block; min-width: 920px; max-width: 100%; height: auto; margin: 0 auto; }
+  code, .loc {
+    font-family: var(--mono); font-size: .8em;
+    background: var(--line-soft); padding: .08em .35em; border-radius: 3px;
+  }
+  .pill {
+    display: inline-block; font-family: var(--mono); font-size: .66rem;
+    letter-spacing: .07em; text-transform: uppercase; font-weight: 700;
+    padding: .18em .55em; border-radius: 999px; white-space: nowrap;
+  }
+  .pill.ok { color: var(--ok); background: var(--ok-bg); }
+  .pill.graph { color: var(--graph); background: var(--graph-bg); }
+  .pill.pipe { color: var(--pipe); background: var(--pipe-bg); }
+  .pill.mem { color: var(--mem); background: var(--mem-bg); }
+  .duo { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin-top: 1rem; }
+  .trio { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin-top: 1rem; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 1rem 1.15rem; }
+  .card h3 { margin: 0 0 .5rem; font-size: .95rem; display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  .card ul { margin: 0; padding-left: 1.1rem; font-size: .87rem; }
+  .card li { margin: .32rem 0; }
+  .card li::marker { color: var(--muted); }
+  .kernel {
+    font-family: var(--mono); font-size: .86rem; letter-spacing: -.01em;
+    background: var(--panel); border: 1px solid var(--graph); border-radius: 6px;
+    padding: .9rem 1.1rem; margin: 1rem 0; color: var(--graph);
+  }
+  table { border-collapse: collapse; width: 100%; font-size: .86rem; }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+  th {
+    text-align: left; font-family: var(--mono); font-size: .68rem; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--muted); font-weight: 600;
+    padding: .65rem .8rem; border-bottom: 2px solid var(--line); white-space: nowrap;
+  }
+  td { padding: .58rem .8rem; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.plank { font-weight: 600; white-space: nowrap; }
+  blockquote {
+    margin: 1.3rem 0; padding: 1rem 1.25rem; border-left: 3px solid var(--graph);
+    background: var(--panel); border-radius: 0 6px 6px 0; font-size: 1.02rem; max-width: 66ch;
+  }
+  blockquote p { margin: 0; }
+  blockquote cite { display: block; margin-top: .45rem; font-style: normal; font-family: var(--mono); font-size: .72rem; color: var(--muted); }
+  footer { margin-top: 3.2rem; padding-top: 1rem; border-top: 1px solid var(--line); font-family: var(--mono); font-size: .72rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <p class="eyebrow">Clementine · north star · target · when the cuts are done</p>
+  <h1>One graph engine. Chat, workflows, and cron are the same machine. Brains are pipes. The host owns the turn.</h1>
+  <p class="verdict">This is the destination, not the tree today. Vendor SDKs (Claude Agent SDK, OpenAI Agents Runner) remain <strong>OAuth pipes</strong> so Max/Pro and Codex still bill. They do not own routing, tools, budgets, or the terminal. A brain is a property of a graph node. Ready nodes run concurrently. One crossing kernel. One Outcome, on every surface.</p>
+</header>
+
+<blockquote>
+  <p>Gates and harness shouldn’t stop the models — only help them, and inform the user.</p>
+  <cite>operating doctrine · encoded as the squeeze test below</cite>
+</blockquote>
+
+<p class="kernel">accepted source → admitted graph → exact call authority → fenced reservation → receipt / read-back → one Outcome</p>
+
+<h2>The stack <span class="tag">ONE ENGINE, NOT TWO LANES</span></h2>
+<p class="sub">Today Discord can fork into a Claude SDK mega-loop and desktop into an OpenAI Runner mega-loop, while a shadow graph looks on. Target: every ingress writes one accepted source, one graph runs, pipes only complete a node.</p>
+
+<figure>
+<div class="figwrap">
+<svg viewBox="0 0 1000 720" role="img" aria-label="Target: thin transports into one ingress and durable log; admission compiles a graph; the graph engine runs ready nodes; OAuth pipes are one-step model calls; host tools and the crossing kernel execute effects; one Outcome returns to all surfaces; memory loops beside the stack.">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-family="ui-monospace,Menlo,monospace" font-size="12" fill="currentColor">
+
+    <rect x="20" y="16" width="960" height="48" rx="4" fill="none" stroke="currentColor" stroke-opacity=".4"/>
+    <text x="36" y="46">TRANSPORTS — thin I/O only: desktop · discord · mobile · cli · cron · webhook</text>
+
+    <line x1="500" y1="64" x2="500" y2="90" stroke="currentColor" marker-end="url(#a)"/>
+    <text x="512" y="84" font-size="10" fill="var(--muted)">one ingress</text>
+
+    <rect x="20" y="92" width="620" height="56" rx="4" fill="none" stroke="currentColor" stroke-width="1.6"/>
+    <text x="36" y="116" font-weight="700">DURABLE EVENT LOG — source of truth</text>
+    <text x="36" y="134" font-size="10.5" fill="var(--muted)">append-only · model-visible bytes are a PROJECTION of this log · resume / fork / replay</text>
+
+    <rect x="660" y="92" width="320" height="248" rx="4" fill="var(--mem-bg)" stroke="var(--mem)"/>
+    <text x="676" y="116" fill="var(--mem)" font-weight="700">MEMORY — compounding loop</text>
+    <text x="676" y="140" font-size="11">recall → at the node, toolkit+operation</text>
+    <text x="676" y="158" font-size="11">act → ranks candidates, never binds</text>
+    <text x="676" y="176" font-size="11">remember → on success, with provenance</text>
+    <text x="676" y="194" font-size="11">reflect → after every run, unasked</text>
+    <line x1="676" y1="214" x2="960" y2="214" stroke="var(--mem)" stroke-opacity=".35"/>
+    <text x="676" y="236" font-size="11" fill="var(--mem)">suggests work · never authorizes it</text>
+    <text x="676" y="258" font-size="10" fill="var(--muted)">chat, workflow, and cron share</text>
+    <text x="676" y="274" font-size="10" fill="var(--muted)">the same store and the same keys</text>
+    <text x="676" y="318" font-size="10.5" fill="var(--muted)">domain skills load on next visit</text>
+    <text x="676" y="334" font-size="10.5" fill="var(--muted)">(browser harness playbooks)</text>
+
+    <line x1="330" y1="148" x2="330" y2="176" stroke="currentColor" marker-end="url(#a)"/>
+    <rect x="20" y="178" width="620" height="52" rx="4" fill="none" stroke="currentColor"/>
+    <text x="36" y="200" font-weight="700">ADMISSION — model authors semantics, host freezes identities</text>
+    <text x="36" y="218" font-size="10.5" fill="var(--muted)">typed proposal · exact capability / account / schema · one bounded repair · no vocabulary routing</text>
+
+    <line x1="330" y1="230" x2="330" y2="256" stroke="currentColor" marker-end="url(#a)"/>
+    <rect x="20" y="258" width="620" height="168" rx="4" fill="var(--graph-bg)" stroke="var(--graph)" stroke-width="1.6"/>
+    <text x="36" y="282" fill="var(--graph)" font-weight="700">GRAPH ENGINE — typed nodes · deps · ready-set CONCURRENT</text>
+    <g stroke="var(--graph)" fill="none">
+      <circle cx="70" cy="324" r="14"/><circle cx="70" cy="380" r="14"/>
+      <circle cx="148" cy="352" r="14"/>
+      <circle cx="226" cy="324" r="14"/><circle cx="226" cy="380" r="14"/>
+      <circle cx="304" cy="352" r="14"/>
+      <line x1="84" y1="328" x2="134" y2="348" marker-end="url(#a)" color="var(--graph)"/>
+      <line x1="84" y1="376" x2="134" y2="356" marker-end="url(#a)" color="var(--graph)"/>
+      <line x1="162" y1="346" x2="212" y2="328" marker-end="url(#a)" color="var(--graph)"/>
+      <line x1="162" y1="358" x2="212" y2="376" marker-end="url(#a)" color="var(--graph)"/>
+      <line x1="240" y1="328" x2="290" y2="348" marker-end="url(#a)" color="var(--graph)"/>
+      <line x1="240" y1="376" x2="290" y2="356" marker-end="url(#a)" color="var(--graph)"/>
+    </g>
+    <g fill="var(--graph)" font-size="9">
+      <text x="56" y="328">read</text><text x="56" y="384">read</text>
+      <text x="132" y="356">join</text>
+      <text x="211" y="328">item</text><text x="211" y="384">item</text>
+      <text x="288" y="356">done</text>
+    </g>
+    <text x="340" y="318" font-size="11">settlement = checkpoint · crash → replay log, resume ready set</text>
+    <text x="340" y="338" font-size="11">ceilings PARK an activation · never-resting re-entry</text>
+    <text x="340" y="358" font-size="11">fan-out = sub-graphs of the same engine · no second topology</text>
+    <text x="340" y="378" font-size="11">conversation compiles a 1-node graph · not a 12-node shadow</text>
+    <text x="340" y="404" font-size="11" font-weight="700" fill="var(--graph)">chat · workflow · cron are graphs, not lanes</text>
+
+    <line x1="330" y1="426" x2="330" y2="452" stroke="currentColor" marker-end="url(#a)"/>
+    <rect x="20" y="454" width="960" height="64" rx="4" fill="var(--pipe-bg)" stroke="var(--pipe)"/>
+    <text x="36" y="478" fill="var(--pipe)" font-weight="700">OAUTH PIPES — one model step per host call · not a vendor loop</text>
+    <text x="36" y="498" font-size="11">Claude Max/Pro → claude CLI / Agent SDK as transport only · Codex OAuth → CodexModelProvider / one-step · never Runner.query() owning the turn</text>
+
+    <line x1="330" y1="518" x2="330" y2="544" stroke="currentColor" marker-end="url(#a)"/>
+    <rect x="20" y="546" width="960" height="48" rx="4" fill="none" stroke="currentColor"/>
+    <text x="36" y="568" font-weight="700">HOST TOOLS — call-tool / work_call / browser-harness · schemas from frozen manifests</text>
+    <text x="36" y="584" font-size="10.5" fill="var(--muted)">the model names a proven id · the host binds account, args, effect · SDK native bash/read/grep stay off</text>
+
+    <line x1="330" y1="594" x2="330" y2="618" stroke="currentColor" marker-end="url(#a)"/>
+    <rect x="20" y="620" width="960" height="40" rx="4" fill="var(--ok-bg)" stroke="var(--ok)"/>
+    <text x="36" y="646" fill="var(--ok)" font-weight="700">CROSSING KERNEL — one fenced reservation · one physical I/O · receipt · reconcile-not-retry</text>
+
+    <line x1="500" y1="660" x2="500" y2="684" stroke="currentColor" marker-end="url(#a)"/>
+    <rect x="250" y="686" width="500" height="28" rx="4" fill="none" stroke="currentColor" stroke-width="1.6"/>
+    <text x="268" y="705" font-weight="700">EVIDENCE REDUCER → ONE OUTCOME → every transport renders it</text>
+  </g>
+</svg>
+</div>
+<figcaption>Same spine for a greeting, a calendar read, a 25-firm sheet, a named workflow, and a cron slot. Only the compiled graph changes shape. Pipes never change the kernel.</figcaption>
+</figure>
+
+<h2>Three altitudes, one kernel <span class="tag">PROPORTIONAL, NOT A MEGA-LOOP</span></h2>
+<p class="sub">Complexity is allowed in the kernel. The user should feel a faster Clem. Conversation does not pay construct ceremony. A light write still crosses the write kernel.</p>
+<div class="trio">
+  <div class="card">
+    <h3><span class="pill ok">conversation</span></h3>
+    <ul>
+      <li>Durable turn → natural reply</li>
+      <li>No capability search, task graph, or background run unless they asked Clem to act</li>
+      <li>One model step, zero tools unless needed</li>
+      <li>Greeting is not a 5k-token proposal</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><span class="pill graph">read</span></h3>
+    <ul>
+      <li>Bounded discovery, sourced results</li>
+      <li>Checkpoints only for breadth or duration</li>
+      <li>Does not inherit write reservation or read-back ceremony</li>
+      <li>Proven tools are consumed, not rediscovered</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><span class="pill pipe">construct / write</span></h3>
+    <ul>
+      <li>Exact capability + account + schema</li>
+      <li>Fenced dispatch, one user-facing effect</li>
+      <li>Create+fill of <em>this</em> artifact is one effect; send is another requirement if they asked for both</li>
+      <li>Durable receipt; honest blocked with owner if it cannot finish</li>
+    </ul>
+  </div>
+</div>
+
+<h2>Chat · workflow · cron <span class="tag">SAME ENGINE, DIFFERENT GRAPHS</span></h2>
+<p class="sub">A workflow is not a second product. It is an admitted graph with a longer lifetime. Cron is the same graph fired by a clock. Chat is the same graph fired by a person.</p>
+
+<div class="tablewrap">
+<table>
+  <thead>
+    <tr><th>Surface</th><th>What compiles</th><th>Who runs nodes</th><th>What the user sees</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="plank">Chat (desktop / Discord / mobile)</td>
+      <td>One graph per accepted source. Conversation = tiny graph. Collect-N = collect manifest, then fan-out item work, then one construct.</td>
+      <td>Graph executor. Ready workers overlap. Brain pipe is one step per node.</td>
+      <td>Optional short plan line that does <em>not</em> block. Ledger progress on the ticker. One Outcome. No “authorize a second search.”</td>
+    </tr>
+    <tr>
+      <td class="plank">Named workflow</td>
+      <td>Immutable admitted definition + hashes. Steps are nodes. <code>read_parallel_v1</code> is the same fan-out, not a special loop.</td>
+      <td>Same executor, durable journal, restart re-materializes the graph.</td>
+      <td>Same Outcome on the origin session. Report-back is structural, not a prompt rule.</td>
+    </tr>
+    <tr>
+      <td class="plank">Cron / webhook / schedule</td>
+      <td>The slot is an accepted source. Same compiler. No second “workflow runner personality.”</td>
+      <td>Same pipes, same kernel. A clock is just ingress.</td>
+      <td>One terminal per occurrence. Never a silent skip, never a second send.</td>
+    </tr>
+    <tr>
+      <td class="plank">Fan-out / workers</td>
+      <td>Sub-graphs of the same engine. Manifest of canonical item ids (25 firms stay 25). Independent reads/compute fan out; the destination artifact does not.</td>
+      <td>Bounded concurrency (ready-set). Join at reduce. Brain may be cheaper on workers.</td>
+      <td>Progress names phase + item counts from the ledger, not “Still working.”</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Collect → fan-out → one artifact <span class="tag">THE LONG JOB, DONE</span></h2>
+<p class="sub">The live hole was a shadow graph of two retrieves plus one brain execute, then a once-guard that forbade finishing. Target shape for “find N, work each, put it in a sheet”:</p>
+<figure>
+<div class="figwrap">
+<svg viewBox="0 0 1000 280" role="img" aria-label="Two-phase collect then construct: collect writes a manifest, workers fan out over items, reduce joins, one construct effect create-plus-fill, Outcome done.">
+  <g font-family="ui-monospace,Menlo,monospace" font-size="12" fill="currentColor">
+    <rect x="16" y="40" width="140" height="56" rx="4" fill="none" stroke="currentColor"/>
+    <text x="28" y="64">1. COLLECT</text>
+    <text x="28" y="82" font-size="10" fill="var(--muted)">search / list</text>
+
+    <text x="168" y="72" font-size="16">→</text>
+
+    <rect x="196" y="40" width="168" height="56" rx="4" fill="var(--graph-bg)" stroke="var(--graph)"/>
+    <text x="208" y="64" fill="var(--graph)">2. MANIFEST</text>
+    <text x="208" y="82" font-size="10" fill="var(--muted)">N canonical ids</text>
+
+    <text x="376" y="72" font-size="16">→</text>
+
+    <rect x="404" y="16" width="220" height="104" rx="4" fill="var(--graph-bg)" stroke="var(--graph)"/>
+    <text x="416" y="40" fill="var(--graph)">3. FAN-OUT workers</text>
+    <text x="416" y="60" font-size="10">item 1 scrape/audit</text>
+    <text x="416" y="76" font-size="10">item 2 scrape/audit</text>
+    <text x="416" y="92" font-size="10">item N …  (ready-set)</text>
+    <text x="416" y="108" font-size="10" fill="var(--muted)">not N sheet creates</text>
+
+    <text x="636" y="72" font-size="16">→</text>
+
+    <rect x="664" y="40" width="140" height="56" rx="4" fill="none" stroke="currentColor"/>
+    <text x="676" y="64">4. REDUCE</text>
+    <text x="676" y="82" font-size="10" fill="var(--muted)">join evidence</text>
+
+    <text x="816" y="72" font-size="16">→</text>
+
+    <rect x="844" y="28" width="140" height="80" rx="4" fill="var(--ok-bg)" stroke="var(--ok)"/>
+    <text x="856" y="52" fill="var(--ok)">5. ONE EFFECT</text>
+    <text x="856" y="70" font-size="10">create + fill</text>
+    <text x="856" y="86" font-size="10">this run’s artifact</text>
+
+    <text x="16" y="160" font-size="11" fill="var(--muted)">N=0 → honest stop · N=1 → no fan-out · N≥3 → workers overlap · send/email is a separate requirement if they asked for it</text>
+    <text x="16" y="184" font-size="11" fill="var(--muted)">Wrong-shape search does not consume the only attempt. Never ask the user to authorize a second query.</text>
+    <text x="16" y="208" font-size="11" fill="var(--muted)">Foreign spreadsheet ids from a prior run are not this turn’s artifact.</text>
+    <text x="16" y="244" font-size="12" font-weight="700">Zero extra user messages after the ask. Progress from the ledger on Discord and desktop. One Outcome: done, or blocked with owner + resume.</text>
+  </g>
+</svg>
+</div>
+</figure>
+
+<h2>Brains as pipes <span class="tag">SUBSCRIPTIONS WITHOUT THEIR HARNESS</span></h2>
+<div class="duo">
+  <div class="card">
+    <h3><span class="pill pipe">keep</span> OAuth / billing</h3>
+    <ul>
+      <li>Claude Pro/Max → installed <code>claude</code> CLI / Agent SDK <em>as transport</em></li>
+      <li>Codex / ChatGPT plan → <code>CodexModelProvider</code> + one-step</li>
+      <li>API keys remain for voice, embeddings, or if we choose Console billing</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><span class="pill ok">drop</span> vendor loops as turn owner</h3>
+    <ul>
+      <li>No multi-turn <code>query()</code> until Anthropic is done</li>
+      <li>No <code>Runner.run()</code> looping tools until OpenAI is done</li>
+      <li>No SDK auto-continue, native bash/read/grep, or “want me to continue?”</li>
+      <li>One host call → one model step → host tools → host decides next node</li>
+    </ul>
+  </div>
+</div>
+
+<h2>Squeeze test <span class="tag">WHAT THE HARNESS MAY NEVER DO</span></h2>
+<div class="duo">
+  <div class="card">
+    <h3><span class="pill ok">may</span> Guide</h3>
+    <ul>
+      <li>Project durable context from the log</li>
+      <li>Freeze capability, account, schema, effect</li>
+      <li>Make effects exactly-once so the model can retry fearlessly</li>
+      <li>Label outcomes with evidence (never rewrite her words)</li>
+      <li>Park and resume; ceilings re-enter</li>
+      <li>Interrupt only for discretion, credentials, essential input, uncovered irreversible, uncertain committed write</li>
+      <li>Tell the truth on every surface</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><span class="pill pipe">must never</span> Squeeze</h3>
+    <ul>
+      <li>Rewrite or replace model prose</li>
+      <li>Decide route / effect / completion from vocabulary</li>
+      <li>Ask the user to do bookkeeping (second search, “want me to start,” restart vs review)</li>
+      <li>Let a judge outrank evidence</li>
+      <li>Stop a model mid-reasoning</li>
+      <li>Stall — blocked without owner + resume is a failure</li>
+      <li>Run a second SDK harness beside the graph</li>
+    </ul>
+  </div>
+</div>
+
+<h2>Gone when this is true <span class="tag">SUBTRACTIVE</span></h2>
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Today (do not keep)</th><th>Target</th></tr></thead>
+  <tbody>
+    <tr><td>Shadow graph + SDK mega-loop actually executes</td><td>Admitted graph is what runs</td></tr>
+    <tr><td>Claude lane and Codex lane each re-decide tools, budgets, terminals</td><td>One executor; pipes only complete a node</td></tr>
+    <tr><td><code>collect_then_construct → single_action</code></td><td>Collect manifest, fan-out items, one construct effect</td></tr>
+    <tr><td>Proven tool is <code>not_reachable</code> / <code>query</code> vs <code>q</code></td><td>Host consumes proof with the schema the provider requires</td></tr>
+    <tr><td>Expected-work as a second plan that contradicts the graph</td><td>The graph’s requirements are the plan</td></tr>
+    <tr><td><code>needs_input</code> for search budgets and “continue?”</td><td>Only <code>gate-reason.ts</code> writes <code>needs_input</code></td></tr>
+    <tr><td>Two Discord handlers, two assemblers</td><td>Thin transports, one ingress, one Outcome</td></tr>
+  </tbody>
+</table>
+</div>
+
+<footer>
+  Companion to docs/north-star-unification.md · target architecture after OAuth-pipe cuts and graph execution · not a picture of the current tree · 2026-08-18
+</footer>
+</main>
+</body>
+</html>

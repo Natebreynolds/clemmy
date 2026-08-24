@@ -43,6 +43,7 @@ import {
   operationEvidenceContract,
   type OperationEvidenceMode,
 } from '../graph/operation-evidence-contract.js';
+import { documentedAtomicInputContentCommit } from '../../integrations/composio/operation-semantics.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { isDeterministicImplicitRetrieveContract } from './expected-work-matcher.js';
 import {
@@ -62,6 +63,7 @@ export interface ObligationManifestNode {
   resolvedTool: string;
   operationId: string;
   operationMode: OperationEvidenceMode;
+  contentCommitMode?: 'documented_atomic_input';
   obligations: EvidenceObligation[];
 }
 
@@ -111,6 +113,7 @@ function refinedEffect(operation: ResolvedOperationFact): RefinedEffectKind {
 const WITHIN_NODE: Partial<Record<EvidenceObligation, EvidenceObligation[]>> = {
   commit_effect: ['derivation_from_current_source'],
   verify_committed_readback: ['commit_effect'],
+  verify_committed_content: ['commit_effect'],
   verify_committed_receipt: ['commit_effect'],
   stale_destination_reconciled: ['commit_effect'],
   execution_terminal: ['commit_effect'],
@@ -256,6 +259,9 @@ export function compileObligationManifest(input: {
       finiteBound: durableGraph.classification.multiItem?.collectThenConstruct === true
         || Number(durableGraph.classification.goalConstraints?.collection?.count) > 0,
     });
+    const contentCommitMode = documentedAtomicInputContentCommit(operation.resolvedTool)
+      ? 'documented_atomic_input' as const
+      : undefined;
     const obligations = attachEvidenceObligations({
       effect: effectKind,
       reversibility: operation.reversibility,
@@ -266,6 +272,7 @@ export function compileObligationManifest(input: {
       requiresStaleReconciliation: evidenceContract.requiresStaleReconciliation,
       observationSufficient: observationSufficientNodeId !== null
         && operation.nodeId === observationSufficientNodeId,
+      ...(contentCommitMode ? { contentCommitMode } : {}),
     }).map((entry: NodeObligation) => entry.obligation);
     if (obligations.length === 0) continue;
     nodes.push({
@@ -275,6 +282,7 @@ export function compileObligationManifest(input: {
       resolvedTool: operation.resolvedTool,
       operationId: operation.operationId,
       operationMode: evidenceContract.mode,
+      ...(contentCommitMode ? { contentCommitMode } : {}),
       obligations,
     });
   }

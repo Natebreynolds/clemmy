@@ -7,6 +7,8 @@ import {
   type TurnSemanticHostViewV1,
   type TurnSemanticProposalV1,
 } from './turn-semantic-proposal.js';
+import { admitTurnSemantics } from './admit-turn-semantics.js';
+import { workTopologyDigest } from '../graph/work-topology.js';
 
 const activeGoal = { goalId: 'goal-17', baseRevision: 4 } as const;
 
@@ -122,6 +124,91 @@ function proposal(overrides: Partial<TurnSemanticProposalV1> = {}): TurnSemantic
 function issueCodes(result: ReturnType<typeof validateTurnSemanticProposalV1>): string[] {
   return result.ok ? [] : result.issues.map((entry) => entry.code);
 }
+
+test('canonical work topology and digest survive semantic checking and admission without reprojection', () => {
+  const topology = {
+    version: 1 as const,
+    operations: [
+      {
+        id: 'op-read',
+        effect: 'read' as const,
+        coverage: 'complete_set' as const,
+        dependsOn: [],
+        dataFrom: [],
+        cardinality: { kind: 'once' as const },
+      },
+      {
+        id: 'op-write',
+        effect: 'external_write' as const,
+        coverage: null,
+        dependsOn: ['op-read'],
+        dataFrom: ['op-read'],
+        cardinality: { kind: 'once' as const },
+      },
+    ],
+    universes: [],
+  };
+  const topologyHash = workTopologyDigest(topology as never);
+
+  // REGRESSION PIN (live 2026-08-24, scorpion-facebook-trends/scrape_and_analyze):
+  // the schema demanded `work.topologyHash` whenever a topology was present.
+  // That digest is HOST-computed and grants no authority, so the model could
+  // never produce it -- every topology-bearing proposal failed admission with
+  // `model_failed` and the workflow step ended blocked, telling a scheduled run
+  // to "restate it". The host must derive the digest; omitting it is legal.
+  {
+    const withoutHash = admitTurnSemantics(
+      proposal({ work: { ...work(), topology } }),
+      host(),
+      {
+        policyRevision: host().policyRevision,
+        audienceHash: host().source.audienceHash,
+        policyMaxCeiling: 'external_write',
+        allowedEffects: ['read', 'external_write'],
+      },
+    );
+    assert.equal(withoutHash.ok, true, `omitted topologyHash must admit: ${JSON.stringify(withoutHash)}`);
+    if (withoutHash.ok) {
+      assert.equal(
+        withoutHash.clamped.workTopologyHash,
+        topologyHash,
+        'the host-derived digest must equal the canonical topology digest',
+      );
+    }
+  }
+
+  const raw = proposal({
+    work: { ...work(), topology, topologyHash },
+  });
+  const admitted = admitTurnSemantics(raw, host(), {
+    policyRevision: host().policyRevision,
+    audienceHash: host().source.audienceHash,
+    policyMaxCeiling: 'external_write',
+    allowedEffects: ['read', 'external_write'],
+  });
+  assert.equal(admitted.ok, true, JSON.stringify(admitted));
+  if (!admitted.ok) return;
+  assert.equal(admitted.clamped.workTopologyHash, topologyHash);
+  assert.deepEqual(admitted.clamped.workTopology, {
+    version: 1,
+    operations: [
+      {
+        id: 'op-read', effect: 'read', coverage: 'complete_set',
+        dependsOn: [], dataFrom: [], cardinality: { kind: 'once' },
+      },
+      {
+        id: 'op-write', effect: 'external_write',
+        dependsOn: ['op-read'], dataFrom: ['op-read'], cardinality: { kind: 'once' },
+      },
+    ],
+    universes: [],
+  });
+
+  const mismatched = validateTurnSemanticProposalV1(proposal({
+    work: { ...work(), topology, topologyHash: '0'.repeat(64) },
+  }), host());
+  assert.equal(mismatched.ok, false, 'a mismatched topology digest crossed semantic admission');
+});
 
 test('plural destinations are canonical and destination is the first-sink projection', () => {
   const result = validateTurnSemanticProposalV1(proposal({
@@ -530,4 +617,167 @@ test('amending a goal cannot also consume an open slot', () => {
   }), host());
   assert.equal(result.ok, false);
   assert.ok(issueCodes(result).includes('illegal_relation_payload'));
+});
+
+test('a conversation whose work object asks for nothing is not carrying work', () => {
+  // LIVE DEFECT 2026-08-22. "Hi Clem. Reply with exactly: HOST ENGINE READY"
+  // terminated `blocked` with "I could not finish planning that, so I stopped
+  // before using any tools."
+  //
+  // The model classified it correctly as `conversation` and asked for nothing —
+  // but it filled the schema's shape instead of sending `work: null`, and the
+  // relation matrix tested `work === null`. Key presence, not content. An empty
+  // work object read as smuggled execution and killed the turn.
+  //
+  // The same shape had already blocked a workflow synthesis on 2026-08-21, so
+  // this is the class, not the incident.
+  const inertWork = {
+    construct: 'none',
+    cardinality: null,
+    destinations: null,
+    destination: null,
+    requestedEffect: 'none',
+    operations: [],
+    deliverables: [],
+    evidenceRequirements: [],
+  } as const;
+
+  const result = validateTurnSemanticProposalV1(
+    proposal({ relation: 'conversation', goal: null, targetGoal: null, work: { ...inertWork } }),
+    host(),
+  );
+  assert.equal(result.ok, true, issueCodes(result).join(','));
+
+  // Every relation that forbids CARRYING work must read emptiness the same way.
+  for (const relation of ['continue_goal', 'abandon_goal', 'ambiguous'] as const) {
+    const swept = validateTurnSemanticProposalV1(
+      proposal({ relation, targetGoal: activeGoal, goal: null, work: { ...inertWork } }),
+      host(),
+    );
+    assert.ok(
+      !issueCodes(swept).includes('illegal_relation_payload'),
+      `${relation} still read an empty work object as carrying work: ${issueCodes(swept).join(',')}`,
+    );
+  }
+});
+
+test('a conversation carrying REAL work is still refused', () => {
+  // The narrowing must not become a hole: emptiness is the test, not shape.
+  // Anything that could actually execute — an operation, a deliverable, a
+  // construct, a declared write — still makes a conversation illegal.
+  const base = { relation: 'conversation', goal: null, targetGoal: null } as const;
+  const empty = {
+    construct: 'none' as const,
+    cardinality: null,
+    destinations: null,
+    destination: null,
+    requestedEffect: 'none' as const,
+    operations: [],
+    deliverables: [],
+    evidenceRequirements: [],
+  };
+
+  const carrying: Array<[string, TurnSemanticProposalV1['work']]> = [
+    ['a declared external write', { ...empty, requestedEffect: 'external_write' }],
+    ['a construct', { ...empty, construct: 'single_act' }],
+    ['a deliverable', { ...empty, deliverables: [{ id: 'deliverable-1', kind: 'workbook' }] }],
+    ['a destination', { ...empty, destination: { posture: 'create_new', family: 'workbook', handleRequired: true } }],
+    ['a cardinality', { ...empty, cardinality: { count: 3, fields: ['name'] } }],
+  ];
+
+  for (const [what, work] of carrying) {
+    const result = validateTurnSemanticProposalV1(proposal({ ...base, work }), host());
+    assert.ok(
+      issueCodes(result).includes('illegal_relation_payload'),
+      `a conversation carrying ${what} must still be refused`,
+    );
+  }
+});
+
+// REGRESSION PIN (live 2026-08-24): three scheduled workflows blocked in ONE
+// batch because the schema made the model restate canonical topology facts in
+// its capability bindings and match them exactly:
+//   daily-standup-email -> "capability binding effect must match the canonical topology"
+//   morning-briefing    -> "capability binding dependencies must match the canonical topology"
+// The topology is canonical (this schema says bindings "do not restate ...
+// lineage"), so admission reconciles instead of refusing. Reconciliation must
+// NARROW ONLY -- a binding may never be widened by the topology.
+test('capability bindings reconcile to the canonical topology and never widen effect', () => {
+  const topology = {
+    version: 1 as const,
+    operations: [
+      {
+        id: 'op-read',
+        effect: 'read' as const,
+        coverage: 'complete_set' as const,
+        dependsOn: [],
+        dataFrom: [],
+        cardinality: { kind: 'once' as const },
+      },
+      {
+        id: 'op-write',
+        effect: 'external_write' as const,
+        coverage: null,
+        dependsOn: ['op-read'],
+        dataFrom: ['op-read'],
+        cardinality: { kind: 'once' as const },
+      },
+    ],
+    universes: [],
+  };
+  const authority = {
+    policyRevision: host().policyRevision,
+    audienceHash: host().source.audienceHash,
+    policyMaxCeiling: 'external_write' as const,
+    allowedEffects: ['read', 'external_write'] as const,
+  };
+
+  // The exact live shapes: a binding whose dependsOn omits the canonical
+  // lineage, and one whose effect disagrees with the canonical topology.
+  const drifted = work();
+  const admitted = admitTurnSemantics(
+    proposal({
+      work: {
+        ...drifted,
+        topology,
+        operations: [
+          { ...drifted.operations[0]!, requestedEffect: 'read' },
+          { ...drifted.operations[1]!, dependsOn: [] },
+        ],
+      },
+    }),
+    host(),
+    authority as never,
+  );
+  assert.equal(admitted.ok, true, `drifted bindings must reconcile, not block: ${JSON.stringify(admitted)}`);
+  if (!admitted.ok) return;
+
+  const byId = new Map((admitted.clamped.operations ?? []).map((op) => [op.id, op]));
+  assert.deepEqual(byId.get('op-write')?.dependsOn, ['op-read'], 'lineage comes from the canonical topology');
+
+  // NARROW-ONLY: when the canonical topology is MORE permissive than the
+  // binding, the binding's narrower effect stands. Reconciliation may only
+  // narrow, never escalate authority. (Built on op-read, whose capabilityRef is
+  // a read capability -- declaring a weaker effect than the ref supports trips
+  // capability_ref_effect_mismatch, a separate and correct check.)
+  const permissiveTopology = {
+    ...topology,
+    operations: [
+      { ...topology.operations[0]!, effect: 'external_write' as const, coverage: null },
+      topology.operations[1]!,
+    ],
+  };
+  const narrowed = admitTurnSemantics(
+    proposal({ work: { ...drifted, topology: permissiveTopology } }),
+    host(),
+    authority as never,
+  );
+  assert.equal(narrowed.ok, true, `narrower binding must admit: ${JSON.stringify(narrowed)}`);
+  if (!narrowed.ok) return;
+  const read = new Map((narrowed.clamped.operations ?? []).map((op) => [op.id, op])).get('op-read');
+  assert.equal(
+    read?.requestedEffect,
+    'read',
+    'a narrower binding is never widened to the more permissive topology effect',
+  );
 });

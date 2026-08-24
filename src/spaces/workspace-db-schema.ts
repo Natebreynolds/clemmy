@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 
-export const WORKSPACE_SCHEMA_VERSION = 3;
+export const WORKSPACE_SCHEMA_VERSION = 5;
 
 export const WORKSPACE_TABLES = [
   'workspaces',
@@ -12,6 +12,10 @@ export const WORKSPACE_TABLES = [
   'workspace_dataset_observations',
   'workspace_dataset_source_retirements',
   'workspace_state_events',
+  'workspace_workflow_bindings',
+  'workspace_run_projections',
+  'workspace_run_partitions',
+  'workspace_canonical_entity_projection_heads',
   'workspace_memory_scope',
   'workspace_embeddings',
 ] as const;
@@ -204,6 +208,103 @@ CREATE INDEX IF NOT EXISTS idx_workspace_state_events_run
 CREATE INDEX IF NOT EXISTS idx_workspace_state_events_session
   ON workspace_state_events(session_id) WHERE session_id IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS workspace_workflow_bindings (
+  binding_id          TEXT PRIMARY KEY,
+  workspace_id        TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  workflow_id         TEXT NOT NULL,
+  role                TEXT NOT NULL CHECK (role IN ('primary','supporting')),
+  projection_version  INTEGER NOT NULL CHECK (projection_version = 1),
+  schedule_authority  TEXT NOT NULL CHECK (schedule_authority = 'workflow'),
+  state               TEXT NOT NULL CHECK (state IN ('active','paused','retired')),
+  revision            INTEGER NOT NULL CHECK (revision >= 1),
+  binding_digest      TEXT NOT NULL,
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL,
+  UNIQUE(workspace_id, workflow_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_workflow_bindings_primary
+  ON workspace_workflow_bindings(workspace_id)
+  WHERE role = 'primary' AND state = 'active';
+CREATE INDEX IF NOT EXISTS idx_workspace_workflow_bindings_workflow
+  ON workspace_workflow_bindings(workflow_id, state, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS workspace_run_projections (
+  binding_id          TEXT PRIMARY KEY
+                      REFERENCES workspace_workflow_bindings(binding_id) ON DELETE CASCADE,
+  run_id              TEXT,
+  binding_digest      TEXT NOT NULL,
+  projection_digest   TEXT NOT NULL,
+  projection_json     TEXT NOT NULL,
+  updated_at          TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_run_projections_run
+  ON workspace_run_projections(run_id, updated_at DESC) WHERE run_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS workspace_run_partitions (
+  binding_id             TEXT NOT NULL
+                         REFERENCES workspace_workflow_bindings(binding_id) ON DELETE CASCADE,
+  run_id                 TEXT,
+  partition_id           TEXT NOT NULL,
+  state                  TEXT NOT NULL
+                         CHECK (state IN ('pending','running','completed','skipped','failed','blocked')),
+  attempt                INTEGER NOT NULL CHECK (attempt >= 0),
+  observations_committed INTEGER NOT NULL CHECK (observations_committed >= 0),
+  canonical_records      INTEGER NOT NULL CHECK (canonical_records >= 0),
+  duplicate_observations INTEGER NOT NULL CHECK (duplicate_observations >= 0),
+  failure_ref            TEXT,
+  updated_at             TEXT NOT NULL,
+  PRIMARY KEY(binding_id, partition_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_run_partitions_state
+  ON workspace_run_partitions(binding_id, state, partition_id);
+
+/**
+ * One rebuildable, reference-only canonical-entity projection head. Entity
+ * bodies and partition collections remain in their normalized authority
+ * stores; this row pins the exact source roots used for one visual snapshot.
+ * It has no schedule, trigger, retry, lease, or execution column.
+ */
+CREATE TABLE IF NOT EXISTS workspace_canonical_entity_projection_heads (
+  binding_id                  TEXT PRIMARY KEY
+                              REFERENCES workspace_workflow_bindings(binding_id) ON DELETE CASCADE,
+  workflow_id                 TEXT NOT NULL,
+  workspace_id                TEXT NOT NULL,
+  run_id                      TEXT NOT NULL,
+  dataset_id                  TEXT NOT NULL,
+  binding_digest              TEXT NOT NULL,
+  dataset_contract_digest     TEXT NOT NULL,
+  resolution_revision         INTEGER NOT NULL
+                              CHECK (resolution_revision BETWEEN 0 AND 9007199254740991),
+  resolution_root             TEXT NOT NULL,
+  coverage_revision           INTEGER NOT NULL
+                              CHECK (coverage_revision BETWEEN 0 AND 9007199254740991),
+  coverage_root               TEXT NOT NULL,
+  canonical_source_digest     TEXT NOT NULL,
+  workspace_projection_digest TEXT NOT NULL,
+  head_digest                 TEXT NOT NULL,
+  sidecar_json                TEXT NOT NULL,
+  projected_at                TEXT NOT NULL,
+  CHECK (length(binding_id) BETWEEN 1 AND 256),
+  CHECK (length(workflow_id) BETWEEN 1 AND 256),
+  CHECK (length(workspace_id) BETWEEN 1 AND 256),
+  CHECK (length(run_id) BETWEEN 1 AND 256),
+  CHECK (length(dataset_id) BETWEEN 1 AND 256),
+  CHECK (length(binding_digest) = 64 AND binding_digest NOT GLOB '*[^0-9a-f]*'),
+  CHECK (length(dataset_contract_digest) = 64 AND dataset_contract_digest NOT GLOB '*[^0-9a-f]*'),
+  CHECK (length(resolution_root) = 64 AND resolution_root NOT GLOB '*[^0-9a-f]*'),
+  CHECK (length(coverage_root) = 64 AND coverage_root NOT GLOB '*[^0-9a-f]*'),
+  CHECK (length(canonical_source_digest) = 64 AND canonical_source_digest NOT GLOB '*[^0-9a-f]*'),
+  CHECK (length(workspace_projection_digest) = 64 AND workspace_projection_digest NOT GLOB '*[^0-9a-f]*'),
+  CHECK (length(head_digest) = 64 AND head_digest NOT GLOB '*[^0-9a-f]*'),
+  CHECK (json_valid(sidecar_json) AND length(CAST(sidecar_json AS BLOB)) <= 131072)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_canonical_entity_heads_dataset
+  ON workspace_canonical_entity_projection_heads(dataset_id, resolution_revision, coverage_revision);
+
 CREATE TABLE IF NOT EXISTS workspace_memory_scope (
   workspace_id  TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   fact_id       INTEGER,
@@ -247,6 +348,12 @@ CREATE INDEX IF NOT EXISTS idx_workspace_embeddings_object
  * into a content-addressed blob store and adds one append-only observations
  * table. Version 3 adds durable source-retirement tombstones so a deleted or
  * renamed source cannot be resurrected from a stale data.json projection.
+ * Version 4 adds an explicit workflow-to-Space projection binding. The
+ * workflow remains the sole schedule/execution authority; no relationship is
+ * inferred from prompt text or matching slugs.
+ * Version 5 adds one bounded canonical-entity projection head that pins the
+ * exact normalized authority roots behind a Workspace visualization. It is a
+ * rebuildable read model and deliberately owns no execution lifecycle.
  * The file-backed Workspace remains compatible throughout.
  */
 export function ensureWorkspaceSchema(db: Database.Database): void {

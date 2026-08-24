@@ -39,6 +39,9 @@ import {
   type SurfaceTerminal,
 } from '../runtime/graph/surface-projection.js';
 import {
+  countInFlightToolCallsForSessions,
+  getSession as getHarnessSession,
+  listLatestActiveChatRunAttempts,
   getLatestEventSeq,
   listLatestRunAttemptsForSessions,
   listSessions as listHarnessSessions,
@@ -47,6 +50,10 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { listPending as listPendingHarnessApprovals } from '../runtime/harness/approval-registry.js';
 import { listBackgroundTasks, type BackgroundTaskRecord } from '../execution/background-tasks.js';
+import {
+  deriveWorkflowTerminalOutcome,
+  type WorkflowTerminalOutcome,
+} from '../execution/workflow-terminal-outcome.js';
 import {
   listFanoutActivations,
   listFanoutPlans,
@@ -66,6 +73,9 @@ interface RawRunRecordLike {
   finishedAt?: unknown;
   source?: unknown;
   error?: unknown;
+  needsAttention?: unknown;
+  terminalOutcome?: unknown;
+  reportBack?: { outcome?: unknown } | null;
   capabilityBlock?: unknown;
   mutationBlock?: unknown;
 }
@@ -86,18 +96,57 @@ const LIFECYCLES: Record<string, SurfaceLifecycle> = {
   awaiting_approval: 'awaiting_approval',
   awaiting_input: 'awaiting_input',
   parked: 'awaiting_approval',
+  blocked: 'blocked',
   completed: 'completed',
   failed: 'failed',
   error: 'failed',
   cancelled: 'cancelled',
 };
 
-const TERMINALS: Record<string, SurfaceTerminal['status']> = {
-  completed: 'completed',
-  failed: 'failed',
-  error: 'failed',
-  cancelled: 'cancelled',
-};
+const CANONICAL_WORKFLOW_TERMINAL_CANDIDATES = new Set([
+  'completed',
+  'completed_with_errors',
+  'blocked',
+  'error',
+  'failed',
+  'cancelled',
+  'dry_run',
+  'creation_test',
+]);
+
+function canonicalWorkflowOutcome(
+  raw: RawRunRecordLike,
+  status: string,
+): WorkflowTerminalOutcome | undefined {
+  if (!CANONICAL_WORKFLOW_TERMINAL_CANDIDATES.has(status)) return undefined;
+  if ((status === 'dry_run' || status === 'creation_test') && !text(raw.finishedAt)) return undefined;
+  return deriveWorkflowTerminalOutcome({
+    status,
+    finishedAt: raw.finishedAt,
+    needsAttention: raw.needsAttention,
+    terminalOutcome: raw.terminalOutcome,
+    reportBack: raw.reportBack,
+  });
+}
+
+function workflowTerminalForOutcome(
+  outcome: WorkflowTerminalOutcome | undefined,
+  raw: RawRunRecordLike,
+): SurfaceTerminal | undefined {
+  switch (outcome) {
+    case 'succeeded':
+      return { status: 'completed', kind: 'succeeded', text: 'Run completed.', resumable: false };
+    case 'partial':
+      return { status: 'failed', kind: 'partial', text: 'Run completed with partial results.', resumable: true };
+    case 'failed':
+      return { status: 'failed', kind: 'failed', text: text(raw.error)?.slice(0, 500) ?? 'Run failed.', resumable: true };
+    case 'cancelled':
+      return { status: 'cancelled', kind: 'cancelled', text: 'Run cancelled.', resumable: false };
+    case 'blocked':
+    case undefined:
+      return undefined;
+  }
+}
 
 /**
  * Project one durable workflow-run record into the shared snapshot shape.
@@ -112,20 +161,17 @@ export function projectWorkflowRunActivity(
   const workflow = text(raw.workflow);
   if (!id || !workflow) return null;
   const status = text(raw.status) ?? 'unknown';
-  const lifecycle = LIFECYCLES[status] ?? 'accepted';
-
-  const terminalStatus = TERMINALS[status];
-  const terminal: SurfaceTerminal | undefined = terminalStatus
-    ? {
-        status: terminalStatus,
-        kind: status,
-        // Bounded, already-public vocabulary only — the run's OUTPUT is
-        // deliberately absent, same as the runs-list projection.
-        text: text(raw.error)?.slice(0, 500)
-          ?? (terminalStatus === 'completed' ? 'Run completed.' : `Run ${status}.`),
-        resumable: false,
-      }
-    : undefined;
+  const terminalOutcome = canonicalWorkflowOutcome(raw, status);
+  const lifecycle: SurfaceLifecycle = terminalOutcome === 'blocked'
+    ? 'blocked'
+    : terminalOutcome === 'succeeded'
+      ? 'completed'
+      : terminalOutcome === 'partial' || terminalOutcome === 'failed'
+        ? 'failed'
+        : terminalOutcome === 'cancelled'
+          ? 'cancelled'
+          : LIFECYCLES[status] ?? 'accepted';
+  const terminal = workflowTerminalForOutcome(terminalOutcome, raw);
 
   const block = raw.capabilityBlock && typeof raw.capabilityBlock === 'object'
     ? raw.capabilityBlock as { message?: unknown; toolkit?: unknown }
@@ -199,6 +245,91 @@ export interface ActivitySnapshot {
   schemaVersion: number;
   observedAt: string;
   entries: ActivityEntry[];
+}
+
+/**
+ * Foreground chat gets a deliberately smaller transport than the operational
+ * Activity screen. It contains only facts the compact affordance renders or
+ * needs for exact control matching. In particular it cannot carry terminal,
+ * blocker, ownership, origin, or next-action prose.
+ */
+export interface ForegroundActivityEntry {
+  schemaVersion: number;
+  runKey: string;
+  attemptId: string;
+  kind: ActivityKind;
+  lifecycle: SurfaceLifecycle;
+  liveness: ActivityEntry['liveness'];
+  needsAttention: boolean;
+  headline: string;
+  activity?: ActivityEntry['activity'];
+  progress?: ActivityEntry['progress'];
+  children?: ActivityEntry['children'];
+  startedAt: string;
+  lastEvidenceAt: string;
+  revision: number;
+  sessionId?: string;
+  taskId?: string;
+  runId?: string;
+  planId?: string;
+}
+
+export interface ForegroundActivitySnapshot {
+  schemaVersion: number;
+  observedAt: string;
+  entries: ForegroundActivityEntry[];
+}
+
+export function projectForegroundWorkingNowEntry(entry: ActivityEntry): ForegroundActivityEntry {
+  const activity = entry.activity
+    ? {
+        phase: entry.activity.phase,
+        text: entry.activity.text,
+        ...(typeof entry.activity.completed === 'number' ? { completed: entry.activity.completed } : {}),
+        ...(typeof entry.activity.total === 'number' ? { total: entry.activity.total } : {}),
+      }
+    : undefined;
+  const progress = entry.progress
+    ? { completed: entry.progress.completed, total: entry.progress.total }
+    : undefined;
+  const children = entry.children
+    ? {
+        running: entry.children.running,
+        completed: entry.children.completed,
+        failed: entry.children.failed,
+        total: entry.children.total,
+      }
+    : undefined;
+  return {
+    schemaVersion: entry.schemaVersion,
+    runKey: entry.runKey,
+    attemptId: entry.attemptId,
+    kind: entry.kind,
+    lifecycle: entry.lifecycle,
+    liveness: entry.liveness,
+    needsAttention: entry.needsAttention,
+    headline: entry.headline,
+    ...(activity ? { activity } : {}),
+    ...(progress ? { progress } : {}),
+    ...(children ? { children } : {}),
+    startedAt: entry.startedAt,
+    lastEvidenceAt: entry.lastEvidenceAt,
+    revision: entry.revision,
+    ...(entry.sessionId ? { sessionId: entry.sessionId } : {}),
+    ...(entry.taskId ? { taskId: entry.taskId } : {}),
+    ...(entry.runId ? { runId: entry.runId } : {}),
+    ...(entry.planId ? { planId: entry.planId } : {}),
+  };
+}
+
+export function projectForegroundWorkingNowSnapshot(
+  snapshot: ActivitySnapshot,
+): ForegroundActivitySnapshot {
+  return {
+    schemaVersion: snapshot.schemaVersion,
+    observedAt: snapshot.observedAt,
+    entries: snapshot.entries.map(projectForegroundWorkingNowEntry),
+  };
 }
 
 /** Lifecycles where the run cannot proceed without a person. */
@@ -548,19 +679,34 @@ function chatOrigin(session: SessionRow): string {
  * with respect to the durable stores — the same stores produce the same entries
  * after a restart, because nothing here is held in process memory.
  */
-export function projectActivitySnapshot(
-  options: {
-    observedAt?: string;
-    sessionLimit?: number;
-    limit?: number;
-    /** Read only these lanes. A caller that needs one kind should not pay for
-     *  a full directory scan of the other two on every poll. */
-    kinds?: readonly ActivityKind[];
-  } = {},
+export interface ProjectActivitySnapshotOptions {
+  observedAt?: string;
+  sessionLimit?: number;
+  limit?: number;
+  /** Read only these lanes. A caller that needs one kind should not pay for
+   *  a full directory scan of the other two on every poll. */
+  kinds?: readonly ActivityKind[];
+}
+
+function projectActivitySnapshotInternal(
+  options: ProjectActivitySnapshotOptions,
+  workingNow: boolean,
 ): ActivitySnapshot {
   const observedAt = options.observedAt ?? new Date().toISOString();
   const wants = (kind: ActivityKind): boolean => !options.kinds || options.kinds.includes(kind);
   const entries: ActivityEntry[] = [];
+  const limit = options.limit ?? 200;
+
+  // A reducer is the final child of its durable fan-out plan. It remains a
+  // normal background task so its ONE terminal report-back is delivered, but
+  // the plan owns its presentation and count while it runs.
+  let fanoutPlans: FanoutPlanRow[] = [];
+  if (wants('background') || wants('fanout')) {
+    try { fanoutPlans = listFanoutPlans(); } catch { /* the fan-out journal is optional */ }
+  }
+  const reducerTaskIds = new Set(
+    fanoutPlans.map((plan) => plan.reducerTaskId).filter((id): id is string => Boolean(id)),
+  );
 
   if (wants('workflow')) try {
     if (fs.existsSync(WORKFLOW_RUNS_DIR)) {
@@ -579,16 +725,16 @@ export function projectActivitySnapshot(
 
   if (wants('background')) try {
     for (const task of listBackgroundTasks()) {
-      // An internal worker task is a SUB-UNIT of a plan, not work in its own
-      // right. Projecting one would put a window on the board beside the plan
-      // that owns it and count the same work twice.
-      if (task.internal) continue;
+      // Worker windows and the exact reducer task are SUB-UNITS of a plan, not
+      // work in their own right. Projecting either would put a child beside the
+      // plan that owns it and count the same work twice.
+      if (task.internal || reducerTaskIds.has(task.id)) continue;
       entries.push(projectBackgroundTaskActivity(task, observedAt));
     }
   } catch { /* the task store is optional */ }
 
   if (wants('fanout')) try {
-    for (const plan of listFanoutPlans()) {
+    for (const plan of fanoutPlans) {
       entries.push(projectFanoutPlanActivity(
         plan,
         listFanoutActivations(plan.planId),
@@ -599,9 +745,23 @@ export function projectActivitySnapshot(
   } catch { /* the fan-out journal is optional */ }
 
   if (wants('chat')) try {
-    const sessions = listHarnessSessions({ limit: options.sessionLimit ?? 60 })
-      .filter((session) => !isBackgroundRunSession(session));
-    const attempts = listLatestRunAttemptsForSessions(sessions.map((session) => session.id));
+    const observedAtMs = Date.parse(observedAt);
+    const eligibleAttempts = workingNow && Number.isFinite(observedAtMs)
+      ? listLatestActiveChatRunAttempts({
+          startedAtOrBefore: new Date(observedAtMs - WORKING_NOW_FOREGROUND_MS).toISOString(),
+          limit,
+        })
+      : [];
+    const sessions = workingNow
+      ? eligibleAttempts
+          .map((attempt) => getHarnessSession(attempt.sessionId))
+          .filter((session): session is SessionRow => Boolean(session))
+          .filter((session) => !isBackgroundRunSession(session))
+      : listHarnessSessions({ limit: options.sessionLimit ?? 60 })
+          .filter((session) => !isBackgroundRunSession(session));
+    const attempts = workingNow
+      ? new Map(eligibleAttempts.map((attempt) => [attempt.sessionId, attempt]))
+      : listLatestRunAttemptsForSessions(sessions.map((session) => session.id));
     // A pending approval is DURABLE truth about who the run is waiting on —
     // the registry says so directly, so no surface has to infer it from how
     // long the message has been quiet.
@@ -611,10 +771,17 @@ export function projectActivitySnapshot(
         awaitingApproval.add(approval.sessionId);
       }
     } catch { /* the approval registry is optional */ }
+    // The parallel wave the loop is running right now. Durable ledger truth, so
+    // a surface never has to infer concurrency from the order events arrived.
+    let inFlight = new Map<string, { open: number; settledForSource: number }>();
+    try {
+      inFlight = countInFlightToolCallsForSessions(sessions.map((session) => session.id));
+    } catch { /* the live-call count is an enrichment; a row still projects */ }
     for (const session of sessions) {
       const attempt = attempts.get(session.id);
       // A session that never ran an attempt has no activity to project.
       if (!attempt) continue;
+      const calls = attempt.finishedAt ? undefined : inFlight.get(session.id);
       entries.push(projectChatAttemptActivity({
         sessionId: session.id,
         headline: chatHeadline(session),
@@ -625,6 +792,16 @@ export function projectActivitySnapshot(
         ...(awaitingApproval.has(session.id) && !attempt.finishedAt
           ? { lifecycleHint: 'awaiting_approval' as SurfaceLifecycle }
           : {}),
+        // Only while calls are actually open — a settled turn is not "calling".
+        ...(calls && calls.open > 0
+          ? {
+              activityLabel: {
+                phase: 'calling' as const,
+                completed: calls.settledForSource,
+                total: calls.open + calls.settledForSource,
+              },
+            }
+          : {}),
       }));
     }
   } catch { /* the event log is optional */ }
@@ -633,11 +810,33 @@ export function projectActivitySnapshot(
   entries.sort((left, right) => right.startedAt.localeCompare(left.startedAt)
     || left.runKey.localeCompare(right.runKey));
 
+  const visibleEntries = workingNow
+    ? entries.filter((entry) => shouldSurfaceInWorkingNow(entry, Date.parse(observedAt)))
+    : entries;
+
   return {
     schemaVersion: SURFACE_PROJECTION_SCHEMA_VERSION,
     observedAt,
-    entries: entries.slice(0, options.limit ?? 200),
+    entries: visibleEntries.slice(0, limit),
   };
+}
+
+export function projectActivitySnapshot(
+  options: ProjectActivitySnapshotOptions = {},
+): ActivitySnapshot {
+  return projectActivitySnapshotInternal(options, false);
+}
+
+/**
+ * The bounded Working Now view. Membership is applied to the complete durable
+ * workflow/background/fan-out set before the response cap. Foreground chat is
+ * read through a bounded active-attempt query at the exact age cutoff, so an
+ * older live turn cannot be hidden by newer terminal session history.
+ */
+export function projectWorkingNowSnapshot(
+  options: Omit<ProjectActivitySnapshotOptions, 'sessionLimit'> = {},
+): ActivitySnapshot {
+  return projectActivitySnapshotInternal(options, true);
 }
 
 function latestSeqFor(sessionId: string): number {
@@ -660,9 +859,34 @@ export const WORKING_NOW_FOREGROUND_MS = 90_000;
  * scheduled runs always, ordinary foreground chat only once it has run long
  * enough to matter. A settled run is never "working".
  */
+/**
+ * Does this row have work a live view could actually render right now?
+ *
+ * A plain answer-in-text turn has none of these: no activity label, no declared
+ * progress denominator, no fan-out children. A turn that is calling tools has at
+ * least one. This is the difference between "Clem is thinking" (nothing to show,
+ * and a row would only flicker) and "Clem is doing three things" (the whole
+ * point of the live view).
+ */
+function hasLiveWorkEvidence(entry: ActivityEntry): boolean {
+  if (entry.activity) return true;
+  if (entry.progress && entry.progress.total > 0) return true;
+  if (entry.children && entry.children.total > 0) return true;
+  return false;
+}
+
 export function shouldSurfaceInWorkingNow(entry: ActivityEntry, observedAtMs: number): boolean {
   if (entry.terminal) return false;
   if (entry.presentationLane !== 'foreground') return true;
+  // The dwell exists so an ordinary turn does not flash a row for two seconds.
+  // It was never meant to hide work in flight: a foreground turn that is ALREADY
+  // doing something visible is exactly what a live run view is for, so it
+  // surfaces immediately. Without this, the interesting part of a turn -- the
+  // parallel tool fan-out -- was routinely over before the 90s dwell let any
+  // surface render it (live 2026-08-24: every desktop canary finished inside it,
+  // so the drawer never appeared on desktop at all while mobile, watching
+  // workflow rows that skip the dwell, showed them fine).
+  if (hasLiveWorkEvidence(entry)) return true;
   const startedMs = Date.parse(entry.startedAt);
   if (!Number.isFinite(startedMs)) return false;
   return observedAtMs - startedMs >= WORKING_NOW_FOREGROUND_MS;

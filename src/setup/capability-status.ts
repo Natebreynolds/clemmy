@@ -41,11 +41,21 @@ function firstLine(value: string): string {
 }
 
 function commandPath(command: string): string | undefined {
-  const result = spawnSync('sh', ['-lc', `command -v ${command}`], {
-    encoding: 'utf-8',
-    timeout: 250,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  // win32 has no `sh`; `where` is the built-in resolver (and understands
+  // PATHEXT, so `gh` finds gh.exe). Without this branch the whole setup
+  // capability panel reported every CLI missing on Windows.
+  const result = process.platform === 'win32'
+    ? spawnSync('where', [command], {
+        encoding: 'utf-8',
+        timeout: 2_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
+    : spawnSync('sh', ['-lc', `command -v ${command}`], {
+        encoding: 'utf-8',
+        timeout: 250,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
   if (result.error) return undefined;
   if (result.status !== 0) return undefined;
   return firstLine(result.stdout);

@@ -78,15 +78,28 @@ async function boot(): Promise<{ url: string; close: () => Promise<void> }> {
   };
 }
 
+async function waitUntil(
+  predicate: () => boolean,
+  message: string,
+  timeoutMs = 3_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(message);
+}
+
 test('Stop before chat acceptance persists a tombstone and the request can never execute later', async () => {
   resetEventLog();
   resetHarnessRuntimeConfig();
   let brainCalls = 0;
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
-    claudeAgentBrain: (async () => {
+    runConversation: (async () => {
       brainCalls += 1;
-      return { text: 'must not run', sessionId: 'none', stoppedReason: 'success' };
+      return { sessionId: 'none', status: 'completed', steps: 1, lastTurn: 1 };
     }) as never,
   });
   const harness = await boot();
@@ -131,10 +144,10 @@ test('pre-ack Stop finds and kills the exact attempt when acceptance won the SQL
   const brainReleased = new Promise<void>((resolve) => { releaseBrain = resolve; });
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
-    claudeAgentBrain: (async (_surface: string, request: { sessionId: string }) => {
+    runConversation: (async (request: { sessionId: string }) => {
       enterBrain();
       await brainReleased;
-      return { text: 'Stopped.', sessionId: request.sessionId, stoppedReason: 'cancelled' };
+      return { sessionId: request.sessionId, status: 'killed', steps: 1, lastTurn: 1 };
     }) as never,
   });
   const harness = await boot();
@@ -143,7 +156,7 @@ test('pre-ack Stop finds and kills the exact attempt when acceptance won the SQL
     const accepted = await fetch(`${harness.url}/api/harness/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input: 'Research the firm and create the document.', clientRequestId }),
+      body: JSON.stringify({ input: 'Please reply with a brief greeting.', clientRequestId }),
     });
     assert.equal(accepted.status, 202);
     await brainEntered;
@@ -171,8 +184,10 @@ test('pre-ack Stop finds and kills the exact attempt when acceptance won the SQL
     assert.equal(isKillRequested(receipt!.sessionId, attempt!), true);
 
     releaseBrain();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await waitUntil(
+      () => getLatestRunAttemptByRunId(receipt!.sessionId, receipt!.runId)?.status === 'cancelled',
+      'timed out waiting for the exact cancelled attempt to settle',
+    );
     assert.equal(getLatestRunAttemptByRunId(receipt!.sessionId, receipt!.runId)?.status, 'cancelled');
   } finally {
     releaseBrain?.();
@@ -190,17 +205,23 @@ test('desktop chat replay reuses the pre-202 session/run and schedules the brain
   const brainReleased = new Promise<void>((resolve) => { releaseBrain = resolve; });
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
-    claudeAgentBrain: (async (_surface: string, request: { sessionId: string; runId?: string }) => {
-      capturedRunIds.push(request.runId ?? '');
+    runConversation: (async (request: { sessionId: string }) => {
+      capturedRunIds.push(getActiveRunAttempt(request.sessionId)?.runId ?? '');
       enterBrain();
       await brainReleased;
-      return { text: 'Current status ready.', sessionId: request.sessionId, stoppedReason: 'success' };
+      return {
+        sessionId: request.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: 'Greeting ready.', done: true, nextAction: 'completed' },
+      };
     }) as never,
   });
 
   const harness = await boot();
   const clientRequestId = 'desktop-request-replay-0001';
-  const requestBody = { input: 'Tell me the current status.', clientRequestId };
+  const requestBody = { input: 'Please reply with a brief greeting.', clientRequestId };
   try {
     const firstResponse = await fetch(`${harness.url}/api/harness/chat`, {
       method: 'POST',
@@ -263,8 +284,10 @@ test('desktop chat replay reuses the pre-202 session/run and schedules the brain
     assert.deepEqual(capturedRunIds, [first.runId], 'active replay never schedules a second brain loop');
 
     releaseBrain();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await waitUntil(
+      () => getLatestRunAttemptByRunId(first.sessionId, first.runId)?.status === 'completed',
+      'timed out waiting for the replay-owned attempt to settle',
+    );
     assert.equal(getLatestRunAttemptByRunId(first.sessionId, first.runId)?.status, 'completed');
 
     const completedReplayResponse = await fetch(`${harness.url}/api/harness/chat`, {
@@ -292,11 +315,96 @@ test('desktop chat replay reuses the pre-202 session/run and schedules the brain
   }
 });
 
+test('desktop ordinary work branches a held session before acceptance and retries the same child once', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  let releaseBrain!: () => void;
+  let enterBrain!: () => void;
+  const brainEntered = new Promise<void>((resolve) => { enterBrain = resolve; });
+  const brainReleased = new Promise<void>((resolve) => { releaseBrain = resolve; });
+  const seenSessions: string[] = [];
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    runConversation: (async (request: { sessionId: string }) => {
+      seenSessions.push(request.sessionId);
+      enterBrain();
+      await brainReleased;
+      return {
+        sessionId: request.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: 'Fresh desktop work completed.', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
+  const harness = await boot();
+  try {
+    const parent = createSession({
+      id: 'sess-desktop-held-parent',
+      kind: 'chat',
+      channel: 'desktop',
+      userId: 'desktop',
+      metadata: {
+        source: 'desktop',
+        ingressProvider: 'desktop',
+        channelId: 'desktop-held-root',
+        userId: 'desktop',
+      },
+    });
+    const approval = approvalRegistry.register({
+      sessionId: parent.id,
+      channel: 'desktop',
+      subject: 'Older desktop request remains pending',
+      tool: 'request_approval',
+      args: { reason: 'hold A while B starts' },
+    });
+    const requestBody = {
+      input: 'Start a completely unrelated desktop request.',
+      sessionId: parent.id,
+      clientRequestId: 'desktop-held-fresh-source',
+    };
+    const send = () => fetch(`${harness.url}/api/harness/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    const firstResponse = await send();
+    const firstRaw = await firstResponse.text();
+    assert.equal(firstResponse.status, 202, firstRaw);
+    const first = JSON.parse(firstRaw) as { sessionId: string; runId: string; replayed: boolean };
+    assert.notEqual(first.sessionId, parent.id);
+    assert.equal(first.replayed, false);
+    assert.equal(listEvents(parent.id, { types: ['user_input_received'] }).length, 0);
+    assert.equal(approvalRegistry.get(approval.approvalId)?.status, 'pending');
+    await brainEntered;
+
+    const replayResponse = await send();
+    const replayRaw = await replayResponse.text();
+    assert.equal(replayResponse.status, 202, replayRaw);
+    const replay = JSON.parse(replayRaw) as typeof first;
+    assert.equal(replay.sessionId, first.sessionId);
+    assert.equal(replay.runId, first.runId);
+    assert.equal(replay.replayed, true);
+    assert.deepEqual(seenSessions, [first.sessionId]);
+    assert.equal(listEvents(first.sessionId, { types: ['user_input_received'] }).length, 1);
+    releaseBrain();
+    await waitUntil(
+      () => getLatestRunAttemptByRunId(first.sessionId, first.runId)?.status === 'completed',
+      'timed out waiting for held-parent child to settle',
+    );
+  } finally {
+    releaseBrain?.();
+    await harness.close();
+  }
+});
+
 test('route startup interrupts a prior-process lease and replay resumes the same durable run', async () => {
   resetEventLog();
   resetHarnessRuntimeConfig();
   const clientRequestId = 'desktop-request-crash-replay-0002';
-  const input = 'What is the current status?';
+  const input = 'Please reply with a brief greeting.';
   const session = createSession({ id: 'sess-crash-replay', kind: 'chat', channel: 'desktop' });
   const runId = 'desktop:crash-replay-stable-run';
   claimHarnessChatRequest({
@@ -319,10 +427,16 @@ test('route startup interrupts a prior-process lease and replay resumes the same
   const entered = new Promise<void>((resolve) => { brainEntered = resolve; });
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
-    claudeAgentBrain: (async (_surface: string, request: { sessionId: string; runId?: string }) => {
-      capturedRunIds.push(request.runId ?? '');
+    runConversation: (async (request: { sessionId: string }) => {
+      capturedRunIds.push(getActiveRunAttempt(request.sessionId)?.runId ?? '');
       brainEntered();
-      return { text: 'Recovered.', sessionId: request.sessionId, stoppedReason: 'success' };
+      return {
+        sessionId: request.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: 'Recovered.', done: true, nextAction: 'completed' },
+      };
     }) as never,
   });
 
@@ -346,8 +460,10 @@ test('route startup interrupts a prior-process lease and replay resumes the same
     assert.equal(replay.runId, runId);
     assert.equal(replay.replayed, true);
     await entered;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await waitUntil(
+      () => getLatestRunAttemptByRunId(session.id, runId)?.status === 'completed',
+      'timed out waiting for the recovered attempt to settle',
+    );
     assert.deepEqual(capturedRunIds, [runId], 'crash replay schedules exactly one replacement executor');
     assert.equal(getLatestRunAttemptByRunId(session.id, runId)?.status, 'completed');
     assert.notEqual(

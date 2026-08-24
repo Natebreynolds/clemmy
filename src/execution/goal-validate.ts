@@ -24,6 +24,7 @@
  * Pure + injectable: the judge and the file-existence check are parameters,
  * so unit tests are deterministic with no model or filesystem dependence.
  */
+import os from 'node:os';
 import { existsSync } from 'node:fs';
 import type { GoalEvidence } from '../agents/plan-proposals.js';
 import {
@@ -164,7 +165,7 @@ export function extractLocalPathFromCriterion(criterion: string): string | null 
   if (!m) return null;
   const raw = m[1].trim();
   if (raw.startsWith('~')) {
-    const home = process.env.HOME ?? '';
+    const home = os.homedir();
     return home ? raw.replace(/^~/, home) : raw;
   }
   return raw;

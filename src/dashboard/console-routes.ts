@@ -74,6 +74,8 @@ import { composeCuratedMemory, IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, splitCurat
 import { resolveWorkingMemoryForConsole } from '../memory/working-memory.js';
 import {
   projectActivitySnapshot,
+  projectForegroundWorkingNowSnapshot,
+  projectWorkingNowSnapshot,
   shouldSurfaceInWorkingNow,
   type ActivityEntry,
 } from './activity-projection.js';
@@ -168,6 +170,7 @@ import {
   getInstallJob,
   openChromeRemoteDebuggingSetup,
   runBrowserHarnessDoctor,
+  runBrowserHarnessUpdate,
   runBrowserHarnessSmokeTest,
   startApprovedInstallCommand,
   startBrowserHarnessInstall,
@@ -214,7 +217,17 @@ import {
 } from '../memory/skill-store.js';
 import { checkAllSkillUpdates, getSkillInstallJob, startSkillInstall, startSkillUpdate } from '../runtime/skill-installer.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
-import { getAuthStatus, loginWithNativeOAuth, beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
+import {
+  getAuthStatus,
+  loginWithNativeOAuth,
+  beginCodexDeviceLogin,
+  pollCodexDeviceLogin,
+  beginXaiDeviceLogin,
+  pollXaiDeviceLogin,
+  getStoredXaiOAuthTokens,
+  xaiAccessTokenExpiresSoon,
+  disconnectXaiOAuth,
+} from '../runtime/auth-store.js';
 import { beginClaudeLogin, completeClaudeLogin } from '../runtime/claude-native-oauth.js';
 import { saveClaudeTokens, getClaudeAuthSnapshot, loadFreshClaudeAccessToken, ClaudeAuthError } from '../runtime/claude-oauth.js';
 import { resetClaudeModelCache } from '../runtime/harness/claude-model.js';
@@ -322,7 +335,11 @@ import { getBackgroundTaskStatus } from '../execution/background-task-status.js'
 import { archiveRun, finishRun, getRun, listRuns } from '../runtime/run-events.js';
 import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
-import { buildWorkspaceContextPrimer } from '../spaces/workspace-context.js';
+import { applySessionMountPrimers, composeSessionFromStore } from '../runtime/harness/session-composition.js';
+import {
+  claimSessionForAcceptedSource,
+  resolveAcceptedSourceIngressLineage,
+} from '../runtime/harness/accepted-source-session-branch.js';
 import {
   SPACE_ACTION_APPROVAL_TOOL,
   SPACE_CLI_SOURCE_TRUST_TOOL,
@@ -331,9 +348,11 @@ import {
 import { initApprovalFocusReconciliation } from '../runtime/harness/approval-focus-reconcile.js';
 import {
   appendEvent as appendHarnessEvent,
+  beginRunAttempt,
   claimRunAttemptLease,
   claimHarnessChatRequest,
   createSession as createHarnessSession,
+  ensureSessionUserId as ensureHarnessSessionUserId,
   finishRunAttempt,
   getActiveRunAttempt as getActiveHarnessRunAttempt,
   getHarnessChatCancellation,
@@ -350,6 +369,7 @@ import {
   requestKill as requestHarnessKill,
   listEvents as listHarnessEvents,
   listSessions as listHarnessSessions,
+  openEventLog,
   summarizeSessionForSignal,
   type EventType,
   type EventRow as HarnessEventRow,
@@ -378,7 +398,6 @@ import { runConversation, runConversationFromResume } from '../runtime/harness/l
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
-import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from '../runtime/harness/claude-agent-brain.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
@@ -397,9 +416,14 @@ import {
   slugifyProviderId,
   serializeExtraProviders,
   discoverProviderModels,
+  providerToBackendConfig,
+  XAI_PROVIDER_ID,
   resolveEffectiveProviderForModel,
   type ByoProvider,
 } from '../runtime/harness/byo-providers.js';
+
+/** The xAI OpenAI-compatible endpoint the OAuth grant is minted against. */
+const XAI_BASE_URL = 'https://api.x.ai/v1';
 import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
 import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
@@ -489,6 +513,7 @@ import {
   queueWorkflowCreationTest,
   queueWorkflowDryRun,
   queueWorkflowRun,
+  readWorkflowRunOriginSessionIds,
   requeueWorkflowFailedItemsFromRun,
   requeueWorkflowFromRun,
   resumeWorkflowRun,
@@ -2815,6 +2840,74 @@ interface BoardCard {
   raw: Record<string, unknown>;
 }
 
+interface ForegroundTaskControlCard {
+  id: string;
+  sourceKind: 'background' | 'run' | 'workflow';
+  title: string;
+  column: BoardColumnId;
+  status: string;
+  progressHint: string;
+  sessionId: string | null;
+  ageMs: number;
+  updatedAt: string;
+  actions: string[];
+  attemptId?: string;
+  runScopeId?: string;
+  cancelEndpoint?: string;
+  raw: { runId?: string; workflowName?: string; workflowSlug?: string };
+}
+
+/**
+ * Minimal server-owned control carrier for the foreground chat affordance.
+ * The ordinary Tasks board intentionally has a rich review model; this route
+ * mode must never transport that model's prompts, results, provider details,
+ * blockers, or previews merely to find an exact Stop/Resume target.
+ */
+export function projectForegroundTaskControlCard(card: BoardCard): ForegroundTaskControlCard | null {
+  if (
+    (card.sourceKind !== 'background' && card.sourceKind !== 'run' && card.sourceKind !== 'workflow')
+    || card.column === 'done'
+  ) return null;
+
+  const raw: ForegroundTaskControlCard['raw'] = {};
+  for (const key of ['runId', 'workflowName', 'workflowSlug'] as const) {
+    const value = card.raw[key];
+    if (typeof value === 'string' && value.trim()) raw[key] = value;
+  }
+  const hasWorkflowTarget = typeof raw.runId === 'string'
+    && (typeof raw.workflowName === 'string' || typeof raw.workflowSlug === 'string');
+  const actions = card.actions.filter((action) => {
+    if (card.sourceKind === 'background') return action === 'cancel' || action === 'resume';
+    if (action === 'resume_safe') return hasWorkflowTarget;
+    if (action === 'cancel') {
+      return card.sourceKind === 'run'
+        || (card.sourceKind === 'workflow' && hasWorkflowTarget);
+    }
+    return false;
+  });
+  const cancelEndpoint = typeof card.cancelEndpoint === 'string'
+    && card.cancelEndpoint.startsWith('/api/')
+    ? card.cancelEndpoint
+    : undefined;
+
+  return {
+    id: card.id,
+    sourceKind: card.sourceKind,
+    title: '',
+    column: card.column,
+    status: card.status,
+    progressHint: '',
+    sessionId: card.sessionId,
+    ageMs: card.ageMs,
+    updatedAt: card.updatedAt,
+    actions,
+    ...(card.attemptId ? { attemptId: card.attemptId } : {}),
+    ...(card.runScopeId ? { runScopeId: card.runScopeId } : {}),
+    ...(cancelEndpoint ? { cancelEndpoint } : {}),
+    raw,
+  };
+}
+
 /**
  * Project executions share the legacy ExecutionRecord envelope, but their
  * public status comes from the durable root workflow (or the cancellation
@@ -2999,6 +3092,155 @@ function harnessChatPayloadHash(input: string, attachmentIds: string[]): string 
     .digest('hex');
 }
 
+interface ConsoleHomeAcceptedSource {
+  sessionId: string;
+  requestId: string;
+  runId: string;
+  clientRequestId: string;
+}
+
+/** One-time upgrade for authenticated single-user Home sessions created by
+ * the old respond bridge. It only fills absent/legacy identity fields and
+ * refuses any contradictory provider, audience, conversation, or scope. This
+ * keeps `/new`/cancel/continue usable after upgrade without treating arbitrary
+ * metadata as cross-principal authority. */
+function normalizeConsoleHomeLegacyIdentity(sessionId: string): void {
+  const row = getHarnessSession(sessionId);
+  if (!row) return;
+  const metadata = row.metadata ?? {};
+  const provider = typeof metadata.ingressProvider === 'string'
+    ? metadata.ingressProvider
+    : typeof metadata.source === 'string'
+      ? metadata.source
+      : row.channel;
+  const legacyProviders = new Set(['desktop', 'bridge:home', 'cli']);
+  const audience = row.userId
+    ?? (typeof metadata.userId === 'string' ? metadata.userId : null);
+  const conversation = typeof metadata.channelId === 'string' ? metadata.channelId : null;
+  const scope = typeof metadata.guildId === 'string' ? metadata.guildId : null;
+  if (
+    !provider
+    || !legacyProviders.has(provider)
+    || (audience !== null && audience !== 'desktop' && audience !== 'console')
+    || (conversation !== null && conversation !== sessionId)
+    || scope !== null
+  ) {
+    throw new Error('legacy Home session has conflicting continuity identity');
+  }
+  const nextMetadata = {
+    ...metadata,
+    source: metadata.source === 'workspace' ? 'workspace' : 'desktop',
+    ingressProvider: 'desktop',
+    channelId: sessionId,
+    userId: 'desktop',
+  };
+  openEventLog().prepare(`
+    UPDATE sessions
+       SET user_id = 'desktop', metadata_json = ?, updated_at = ?
+     WHERE id = ?
+  `).run(JSON.stringify(nextMetadata), new Date().toISOString(), sessionId);
+}
+
+/**
+ * Legacy Home/voice ingress predates `/api/harness/chat` receipts. Give it the
+ * same pre-acceptance branch + receipt boundary without making the physical
+ * successor id part of continuity. A client id is preferred; old callers get
+ * a one-shot server id and therefore remain functional without pretending a
+ * retry can be recognized.
+ */
+function claimConsoleHomeAcceptedSource(input: {
+  req: Request;
+  body: Record<string, unknown>;
+  requestedSessionId: string;
+  message: string;
+  kind: 'ordinary' | 'bound_control';
+}): ConsoleHomeAcceptedSource {
+  const clientIdentity = harnessChatRequestIdentity(input.req, input.body);
+  const clientRequestId = clientIdentity.requestId;
+  const stableDigest = harnessChatStableDigest(`console-home:${clientRequestId}`);
+  const requestId = `home-${stableDigest}`;
+  const runId = `run-home-${stableDigest}`;
+  const priorReceipt = getHarnessChatRequestReceipt(requestId);
+  const entrySessionId = priorReceipt?.sessionId ?? input.requestedSessionId;
+  let entry = getHarnessSession(entrySessionId);
+  if (!entry) {
+    entry = createHarnessSession({
+      id: entrySessionId,
+      kind: 'chat',
+      channel: 'desktop',
+      userId: 'desktop',
+      title: input.message.length > 80 ? `${input.message.slice(0, 77)}...` : input.message,
+      metadata: {
+        source: 'desktop',
+        channelId: entrySessionId,
+        userId: 'desktop',
+      },
+    });
+  }
+  let lineage = resolveAcceptedSourceIngressLineage({
+    sessionId: entry.id,
+    provider: 'desktop',
+    scopeId: null,
+    audienceId: 'desktop',
+  });
+  if (input.kind === 'bound_control' && !lineage) {
+    normalizeConsoleHomeLegacyIdentity(entry.id);
+    entry = getHarnessSession(entry.id) ?? entry;
+    lineage = resolveAcceptedSourceIngressLineage({
+      sessionId: entry.id,
+      provider: 'desktop',
+      scopeId: null,
+      audienceId: 'desktop',
+    });
+    if (!lineage) throw new Error('legacy Home control target could not be normalized');
+  }
+  const workspaceSlug = /^space-[a-z0-9][a-z0-9-]*$/.test(entry.id)
+    ? entry.id.slice('space-'.length)
+    : null;
+  const validatedMount = lineage?.validatedMount ?? (workspaceSlug ? {
+    version: 1 as const,
+    kind: 'workspace' as const,
+    rootSessionId: entry.id,
+    workspaceSlug,
+  } : undefined);
+  const selectionBase = {
+    entrySessionId: entry.id,
+    durableSourceId: runId,
+    continuity: {
+      provider: 'desktop',
+      scopeId: null,
+      conversationId: lineage?.conversationId ?? entry.id,
+      audienceId: 'desktop',
+    },
+    ...(validatedMount ? { validatedMount } : {}),
+    receipt: {
+      requestId,
+      runId,
+      inputHash: harnessChatPayloadHash(input.message, []),
+      sinceSeq: getLatestHarnessEventSeq(entry.id),
+    },
+  };
+  const claimed = input.kind === 'bound_control'
+    ? claimSessionForAcceptedSource({
+      ...selectionBase,
+      kind: 'bound_control',
+      targetSessionId: entry.id,
+    })
+    : claimSessionForAcceptedSource({
+      ...selectionBase,
+      kind: 'ordinary',
+    });
+  if (claimed.selection.sessionId !== claimed.receipt.sessionId) {
+    throw new Error('Home receipt was not claimed on the pre-accepted session');
+  }
+  return {
+    sessionId: claimed.selection.sessionId,
+    requestId,
+    runId: claimed.receipt.runId,
+    clientRequestId,
+  };
+}
+
 type ConsoleTerminalStatus = 'done' | 'needs_input' | 'failed' | 'cancelled';
 
 type ConsoleAcceptedEarlyRoute =
@@ -3127,24 +3369,130 @@ function recordAndCommitConsoleTerminal(input: {
   sessionId: string;
   userText: string;
   reply: string;
+  runId?: string;
   status?: ConsoleTerminalStatus;
   legacyReason: string;
   metadata?: Record<string, unknown>;
 }): string {
-  const accepted = appendHarnessEvent({
+  const attempt = input.runId
+    ? beginRunAttempt(input.sessionId, { runId: input.runId })
+    : null;
+  const accepted = attempt
+    ? recordRunAttemptUserInput(attempt, {
+      turn: 0,
+      role: 'user',
+      data: {
+        text: input.userText,
+        displayText: input.userText,
+        runId: input.runId,
+        attemptId: attempt.attemptId,
+      },
+    }, { armRunInFlight: true })
+    : appendHarnessEvent({
+      sessionId: input.sessionId,
+      turn: 0,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: input.userText, displayText: input.userText },
+    });
+  try {
+    return commitConsoleTerminal({
+      identity: { sessionId: input.sessionId, turn: accepted.turn, sourceUserSeq: accepted.seq },
+      text: input.reply,
+      status: input.status ?? 'done',
+      legacyReason: input.legacyReason,
+      metadata: input.metadata,
+    });
+  } finally {
+    if (attempt) {
+      try { finishRunAttempt(attempt, 'completed'); } catch { /* terminal is authoritative */ }
+      clearConsoleRunMarkerIfIdle(input.sessionId, attempt.attemptId);
+    }
+  }
+}
+
+function consoleHomeTerminalReplay(
+  sessionId: string,
+  runId: string,
+  userText: string,
+): string | null {
+  const attempt = getLatestHarnessRunAttemptByRunId(sessionId, runId);
+  if (!attempt?.sourceUserSeq) return null;
+  const source = listHarnessEvents(sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === attempt.sourceUserSeq);
+  const recordedText = typeof source?.data.displayText === 'string'
+    ? source.data.displayText.trim()
+    : typeof source?.data.text === 'string'
+      ? source.data.text.trim()
+      : '';
+  if (!source || recordedText !== userText.trim()) {
+    throw new Error(`Home run ${runId} is already bound to different input`);
+  }
+  return consoleTerminalForSource(sessionId, source.seq)?.presentation.text ?? null;
+}
+
+function consoleHomeFreshSessionId(runId: string): string {
+  return `sess-home-${harnessChatStableDigest(`home-new:${runId}`).slice(0, 32)}`;
+}
+
+function executeConsoleHomeSessionCommand(input: {
+  command: 'cancel' | 'new';
+  sessionId: string;
+  runId: string;
+  userText: string;
+}): { sessionId: string; text: string } {
+  if (input.command === 'cancel') {
+    let cancelledApprovals = 0;
+    for (const row of approvalRegistry.listPending({ sessionId: input.sessionId, status: 'pending' })) {
+      if (approvalRegistry.resolve(row.approvalId, 'cancelled_by_user', 'console-home-control').ok) {
+        cancelledApprovals += 1;
+      }
+    }
+    const session = HarnessSession.load(input.sessionId);
+    session?.clearInterruptState();
+    const text = cancelledApprovals > 0
+      ? `Cancelled this conversation and abandoned ${cancelledApprovals} pending approval${cancelledApprovals === 1 ? '' : 's'}.`
+      : 'Cancelled this conversation.';
+    const committed = recordAndCommitConsoleTerminal({
+      sessionId: input.sessionId,
+      userText: input.userText,
+      reply: text,
+      runId: input.runId,
+      legacyReason: 'home_session_cancelled',
+    });
+    session?.markStatus('cancelled');
+    return { sessionId: input.sessionId, text: committed };
+  }
+
+  const freshSessionId = consoleHomeFreshSessionId(input.runId);
+  if (!getHarnessSession(freshSessionId)) {
+    createHarnessSession({
+      id: freshSessionId,
+      kind: 'chat',
+      channel: 'desktop',
+      userId: 'desktop',
+      title: 'Fresh conversation',
+      metadata: {
+        source: 'desktop',
+        ingressProvider: 'desktop',
+        channelId: freshSessionId,
+        userId: 'desktop',
+      },
+    });
+  }
+  for (const row of approvalRegistry.listPending({ sessionId: input.sessionId, status: 'pending' })) {
+    if (!approvalRegistry.isFormalApprovalSurface(row)) {
+      approvalRegistry.resolve(row.approvalId, 'cancelled_by_user', 'console-home-new-session');
+    }
+  }
+  const committed = recordAndCommitConsoleTerminal({
     sessionId: input.sessionId,
-    turn: 0,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: input.userText, displayText: input.userText },
+    userText: input.userText,
+    reply: 'Fresh conversation ready.',
+    runId: input.runId,
+    legacyReason: 'home_new_session',
   });
-  return commitConsoleTerminal({
-    identity: { sessionId: input.sessionId, turn: 0, sourceUserSeq: accepted.seq },
-    text: input.reply,
-    status: input.status ?? 'done',
-    legacyReason: input.legacyReason,
-    metadata: input.metadata,
-  });
+  return { sessionId: freshSessionId, text: committed };
 }
 
 function harnessAttemptRunScopeId(
@@ -5764,25 +6112,30 @@ export function registerConsoleRoutes(
   app.get('/api/console/activity/v2', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const snapshot = projectActivitySnapshot({ limit: 100 });
+      const foregroundChat = req.query.surface === 'foreground-chat';
+      const workingNowOnly = foregroundChat
+        || req.query.workingNow === '1'
+        || req.query.workingNow === 'true';
+      const unfilteredSnapshot = projectActivitySnapshot({ limit: 100 });
       // A run that settled takes its linked notebook actions with it. Done over
       // the UNFILTERED snapshot, because the terminals that settle an action are
       // exactly the entries the Working Now filter is about to drop.
       try {
-        settleFocusActionsForTerminals(snapshot.entries);
+        settleFocusActionsForTerminals(unfilteredSnapshot.entries);
       } catch { /* the notebook is best-effort; the projection stays the truth */ }
-      const workingNowOnly = req.query.workingNow === '1' || req.query.workingNow === 'true';
-      const observedAtMs = Date.parse(snapshot.observedAt);
-      const entries = workingNowOnly
-        ? snapshot.entries.filter((entry) => shouldSurfaceInWorkingNow(entry, observedAtMs))
-        : snapshot.entries;
+      const snapshot = workingNowOnly
+        ? projectWorkingNowSnapshot({ observedAt: unfilteredSnapshot.observedAt, limit: 100 })
+        : unfilteredSnapshot;
+      const responseSnapshot = foregroundChat
+        ? projectForegroundWorkingNowSnapshot(snapshot)
+        : snapshot;
       // `snapshots` is the shipped field name; `entries` is the projection's
       // own vocabulary. Both are the same array.
       res.json({
-        schemaVersion: snapshot.schemaVersion,
-        observedAt: snapshot.observedAt,
-        snapshots: entries,
-        entries,
+        schemaVersion: responseSnapshot.schemaVersion,
+        observedAt: responseSnapshot.observedAt,
+        snapshots: responseSnapshot.entries,
+        entries: responseSnapshot.entries,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -7580,6 +7933,15 @@ export function registerConsoleRoutes(
     }
   });
 
+  app.post('/api/console/browser-harness/update', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(await runBrowserHarnessUpdate());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/browser-harness/doctor', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -8548,7 +8910,8 @@ export function registerConsoleRoutes(
         const provider = getByoProviders().find((p) => p.id === providerId);
         if (!provider) { res.status(404).json({ error: 'Unknown provider.' }); return; }
         baseURL = provider.baseURL;
-        apiKey = getByoProviderApiKey(providerId);
+        // Typed key wins; xAI subscription OAuth is the other legitimate source.
+        apiKey = providerToBackendConfig(provider).apiKey;
       } else {
         baseURL = typeof body.baseURL === 'string' ? body.baseURL.trim() : '';
         apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
@@ -10593,6 +10956,62 @@ export function registerConsoleRoutes(
    * approval-registry directly so the dashboard sees the same rich
    * shape the DB stores.
    */
+  app.get('/api/console/automation-pilot/workspace-choosers', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const {
+        automationPilotWorkspaceChooserSurface,
+        listAutomationPilotWorkspaceChoosers,
+      } = await import('../execution/automation-pilot-workspace-destination-authority.js');
+      const choosers = listAutomationPilotWorkspaceChoosers({ status: 'pending', limit: 100 })
+        .map(automationPilotWorkspaceChooserSurface);
+      res.json({ choosers, count: choosers.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/automation-pilot/workspace-choosers/:id/resolve', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const chooserId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      const {
+        automationPilotWorkspaceChooserSurface,
+        resolveAutomationPilotWorkspaceChooser,
+      } = await import('../execution/automation-pilot-workspace-destination-authority.js');
+      const result = resolveAutomationPilotWorkspaceChooser({
+        chooserId,
+        expectedChooserRevision: typeof body.chooserRevision === 'number' ? body.chooserRevision : Number.NaN,
+        expectedChooserDigest: typeof body.chooserDigest === 'string' ? body.chooserDigest : '',
+        choiceId: typeof body.choiceId === 'string' ? body.choiceId : '',
+        actorRef: 'human.console',
+      });
+      if (!result.ok) {
+        const status = result.code === 'workspace_chooser_missing'
+          ? 404
+          : result.code === 'workspace_chooser_request_invalid' ? 400 : 409;
+        res.status(status).json({ error: result.code, message: result.reason });
+        return;
+      }
+      const { reconcileAutomationPilotProductionConvergence } = await import(
+        '../execution/automation-pilot-production-convergence.js'
+      );
+      setImmediate(() => {
+        void reconcileAutomationPilotProductionConvergence().catch(() => {
+          // Durable advancement state is retried by daemon boot/tick convergence.
+        });
+      });
+      res.json({
+        ok: true,
+        status: result.projection.status,
+        chooser: automationPilotWorkspaceChooserSurface(result.projection),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/approvals/list', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -10635,6 +11054,8 @@ export function registerConsoleRoutes(
           sourceKind: undefined as string | undefined,
           tool: r.tool,
           args: r.args,
+          status: r.status,
+          resolution: r.resolution,
           resourceFingerprint: fingerprint.result === 'unknown' ? undefined : {
             result: fingerprint.result,
             candidateId: resourceId,
@@ -10673,6 +11094,8 @@ export function registerConsoleRoutes(
           sourceKind: task ? 'background task' : undefined,
           tool: approval.toolName,
           args,
+          status: 'pending' as const,
+          resolution: null,
         };
       });
 
@@ -11607,7 +12030,14 @@ export function registerConsoleRoutes(
       const DONE_CAP = 40;
       let doneShown = 0;
       const trimmed = cards.filter((c) => c.column !== 'done' || (doneShown += 1) <= DONE_CAP);
-      res.json({ cards: trimmed, generatedAt: new Date(now).toISOString() });
+      const foregroundChat = req.query.surface === 'foreground-chat';
+      const responseCards = foregroundChat
+        ? trimmed
+            .map(projectForegroundTaskControlCard)
+            .filter((card): card is ForegroundTaskControlCard => card !== null)
+            .slice(0, 100)
+        : trimmed;
+      res.json({ cards: responseCards, generatedAt: new Date(now).toISOString() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -12027,9 +12457,13 @@ export function registerConsoleRoutes(
 
         setImmediate(async () => {
           try {
-            const agent = await buildOrchestratorAgentForApprovalResume({ sessionId, allowToolJit: true });
             await runConversationFromResume({
-              agent,
+              buildAgent: (identity) => buildOrchestratorAgentForApprovalResume({
+                sessionId: identity.sessionId,
+                sourceUserSeq: identity.sourceUserSeq,
+                acceptedRoute: identity.route,
+                allowToolJit: true,
+              }),
               sessionId,
               approvalId: id,
               decision,
@@ -12495,7 +12929,6 @@ export function registerConsoleRoutes(
 
     setImmediate(async () => {
       try {
-        const agent = await buildOrchestratorAgentForApprovalResume({ sessionId, allowToolJit: true });
         // A resume can reproduce the SAME durable approval when RunState
         // recovery replays its interrupted call. Reuse the human decision only
         // for that exact duplicate. A different tool, recipient, nested payload,
@@ -12516,7 +12949,12 @@ export function registerConsoleRoutes(
         while (resumeIter < MAX_EXACT_DUPLICATE_RESUMES) {
           resumeIter += 1;
           await runConversationFromResume({
-            agent,
+            buildAgent: (identity) => buildOrchestratorAgentForApprovalResume({
+              sessionId: identity.sessionId,
+              sourceUserSeq: identity.sourceUserSeq,
+              acceptedRoute: identity.route,
+              allowToolJit: true,
+            }),
             sessionId,
             approvalId: currentApprovalId,
             decision: currentDecision,
@@ -13749,10 +14187,75 @@ export function registerConsoleRoutes(
     // Typed capability grounding — the origin chat should see what the
     // promoted run resolved as proven / shaky / disconnected going in.
     'capability_resolution',
+    // Host work-plan card — origin chat should see research complete vs sheet
+    // blocked even when the run was promoted to the background.
+    'expected_work_progress',
     // Files landing in a promoted run belong in the origin chat's live feed —
     // the drafting-emails scenario is exactly the work users background.
     'deliverable_saved',
   ]);
+  const BRIDGED_BACKGROUND_ACTIVITY_TYPE_LIST = [...BRIDGED_BACKGROUND_ACTIVITY_TYPES] as EventType[];
+
+  /** Host-dispatched workflows run under `workflow:<runId>:<step>`, not
+   *  `background:<taskId>`. First colon-separated segment after the prefix
+   *  is the run id (run ids never contain `:`). */
+  const workflowRunIdFromSession = (eventSessionId: string): string | null => {
+    if (!eventSessionId.startsWith('workflow:')) return null;
+    const rest = eventSessionId.slice('workflow:'.length);
+    if (!rest) return null;
+    const colon = rest.indexOf(':');
+    const runId = colon === -1 ? rest : rest.slice(0, colon);
+    return runId || null;
+  };
+
+  const isCanonicalBridgedActivity = (event: HarnessEventRow | { type: string }): boolean => {
+    if (!BRIDGED_BACKGROUND_ACTIVITY_TYPES.has(event.type)) return false;
+    if ((event.type === 'tool_called' || event.type === 'tool_returned')
+      && !isCanonicalTopLevelToolEvent(event as HarnessEventRow)) return false;
+    return true;
+  };
+
+  const collectBridgedWorkflowReplay = (originSessionId: string, originEvents: HarnessEventRow[]): HarnessEventRow[] => {
+    const runIds = new Set<string>();
+    for (const ev of originEvents) {
+      if (ev.type !== 'async_work_dispatched') continue;
+      const ids = (ev.data as { runIds?: unknown } | undefined)?.runIds;
+      if (!Array.isArray(ids)) continue;
+      for (const id of ids) {
+        if (typeof id === 'string' && id.trim()) runIds.add(id.trim());
+      }
+    }
+    if (runIds.size === 0) return [];
+    let workflowSessions: HarnessSessionRow[] = [];
+    try {
+      workflowSessions = listHarnessSessions({ kind: 'workflow', status: 'any', limit: 500 });
+    } catch {
+      return [];
+    }
+    const out: HarnessEventRow[] = [];
+    for (const runId of runIds) {
+      let origins: string[];
+      try {
+        origins = readWorkflowRunOriginSessionIds(runId);
+      } catch {
+        continue;
+      }
+      if (!origins.includes(originSessionId)) continue;
+      const prefix = `workflow:${runId}`;
+      for (const session of workflowSessions) {
+        if (session.id !== prefix && !session.id.startsWith(`${prefix}:`)) continue;
+        try {
+          for (const ev of listHarnessEvents(session.id, {
+            types: BRIDGED_BACKGROUND_ACTIVITY_TYPE_LIST,
+            limit: 200,
+          })) {
+            if (isCanonicalBridgedActivity(ev)) out.push(ev);
+          }
+        } catch { /* a missing step session is not a stream failure */ }
+      }
+    }
+    return out;
+  };
 
   /**
    * Per-session harness event stream.
@@ -13793,11 +14296,16 @@ export function registerConsoleRoutes(
 
     // 1) Replay existing events. Cap at 500 so a very long session
     // doesn't flood the initial frame; subscribers can reconnect
-    // with ?sinceSeq= for older slices if needed.
+    // with ?sinceSeq= for older slices if needed. Host-dispatched
+    // workflow step activity is merged in so a reconnect mid-run
+    // seeds the origin chat's live strip instead of waiting for the
+    // next tool frame.
     try {
-      const replay = projectHarnessEventsForPublic(
-        listHarnessEvents(sessionId, { sinceSeq, limit: 500 }),
-      );
+      const ownEvents = listHarnessEvents(sessionId, { sinceSeq, limit: 500 });
+      const workflowEvents = collectBridgedWorkflowReplay(sessionId, ownEvents)
+        .filter((ev) => ev.seq > sinceSeq);
+      const merged = [...ownEvents, ...workflowEvents].sort((a, b) => a.seq - b.seq);
+      const replay = projectHarnessEventsForPublic(merged.slice(-500));
       writeEvent('replay', { sessionId, sessionStatus: session.status, events: replay });
     } catch (err) {
       console.error('desktop harness replay failed:', err);
@@ -13805,35 +14313,44 @@ export function registerConsoleRoutes(
     }
 
     // 2) Live subscription. Besides the session's own events, forward
-    // activity-shaped events from background tasks this chat spawned: the
-    // promoted run continues under `background:<taskId>`, and without the
-    // bridge this stream is silent for the whole run while the user sits on
-    // the origin chat asking "are you working on this?" (live 2026-08-04).
-    // Turn-lifecycle types are NOT bridged — the origin session owns its own
-    // turn state, and the task's terminal report-back already lands here as
-    // a real turn. Bridged frames keep their own sessionId so clients can
-    // tell delegated work from the foreground turn.
+    // activity-shaped events from background tasks this chat spawned AND
+    // from host-dispatched workflow step sessions (`workflow:<runId>:<step>`)
+    // whose origin observer is this chat. Without the workflow half, ACK +
+    // report-back work but the bubble is silent for the whole run (live
+    // 2026-08-14). Turn-lifecycle types are NOT bridged — the origin session
+    // owns its own turn state, and the workflow's terminal report-back
+    // already lands here as a real turn. Bridged frames keep their own
+    // sessionId so clients can tell delegated work from the foreground turn.
     const bridgeOriginCache = new Map<string, string | null>();
+    const workflowOriginCache = new Map<string, string[]>();
     const bridgesToThisSession = (eventSessionId: string): boolean => {
-      if (!eventSessionId.startsWith('background:')) return false;
-      let origin = bridgeOriginCache.get(eventSessionId);
-      if (origin === undefined) {
-        try {
-          origin = getBackgroundTask(eventSessionId.slice('background:'.length))?.originSessionId ?? null;
-        } catch { origin = null; }
-        bridgeOriginCache.set(eventSessionId, origin);
+      if (eventSessionId.startsWith('background:')) {
+        let origin = bridgeOriginCache.get(eventSessionId);
+        if (origin === undefined) {
+          try {
+            origin = getBackgroundTask(eventSessionId.slice('background:'.length))?.originSessionId ?? null;
+          } catch { origin = null; }
+          bridgeOriginCache.set(eventSessionId, origin);
+        }
+        return origin === sessionId;
       }
-      return origin === sessionId;
+      const runId = workflowRunIdFromSession(eventSessionId);
+      if (!runId) return false;
+      let origins = workflowOriginCache.get(runId);
+      if (origins === undefined) {
+        try {
+          origins = readWorkflowRunOriginSessionIds(runId);
+        } catch { origins = []; }
+        // Cache successful reads, including empty (cron / no chat origin).
+        // Origins are written before the first step session emits.
+        workflowOriginCache.set(runId, origins);
+      }
+      return origins.includes(sessionId);
     };
     const unsubscribe = actionBus.subscribe((event) => {
       if (event.kind !== 'harness.public_event') return;
       if (event.sessionId !== sessionId) {
-        if (!BRIDGED_BACKGROUND_ACTIVITY_TYPES.has(event.event.type)) return;
-        // One logical call = one row: the native lane also logs a transport-
-        // mirror copy of each MCP tool call, which painted every bridged tool
-        // twice in the chat's live strip (seen 2026-08-04).
-        if ((event.event.type === 'tool_called' || event.event.type === 'tool_returned')
-          && !isCanonicalTopLevelToolEvent(event.event)) return;
+        if (!isCanonicalBridgedActivity(event.event)) return;
         if (!bridgesToThisSession(event.sessionId)) return;
       }
       writeEvent('event', event.event);
@@ -14110,6 +14627,94 @@ export function registerConsoleRoutes(
       res.json(result);
     } catch (err) {
       res.status(500).json({ status: 'error', message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // xAI (Grok) subscription OAuth login — RFC 8628 device code, peer to the
+  // Codex device flow above. The raw device_code never leaves the daemon; the
+  // client polls with an opaque loginId.
+  app.post('/api/console/auth/xai-device/begin', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(await beginXaiDeviceLogin());
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/auth/xai-device/poll', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const loginId = typeof req.body?.loginId === 'string' ? req.body.loginId : '';
+    if (!loginId) { res.status(400).json({ error: 'loginId required' }); return; }
+    try {
+      const result = await pollXaiDeviceLogin(loginId);
+      if (result.status === 'complete') {
+        // A grant nobody can SELECT is not a connection. The role dropdowns are
+        // built from a provider's modelIds, so signing in has to register the
+        // provider too — otherwise the user gets "Connected ✓" and an empty
+        // list, which is exactly what shipped first (live 2026-08-14).
+        //
+        // The ids are DISCOVERED from the provider's own /models endpoint using
+        // the grant we just minted, never enumerated here: a hardcoded model
+        // list goes stale the day xAI ships the next Grok, and a fourth model
+        // would be a code edit.
+        try {
+          const token = getStoredXaiOAuthTokens()?.accessToken ?? '';
+          const catalog = await discoverProviderModels({ baseURL: XAI_BASE_URL, apiKey: token });
+          const discovered = catalog.status === 200 && 'models' in catalog.body
+            ? catalog.body.models.map((m) => m.id).filter(Boolean)
+            : [];
+          // Always register the provider. An empty catalog still needs a
+          // handle so Settings can Refresh models — swallowing the miss left
+          // "Connected ✓" with no Grok ids in the dropdowns (live 2026-08-14).
+          const extras = getByoProviders().filter((p) => p.id !== 'default' && p.id !== XAI_PROVIDER_ID);
+          const next = {
+            id: XAI_PROVIDER_ID,
+            label: 'xAI (Grok)',
+            baseURL: XAI_BASE_URL,
+            modelIds: discovered,
+          };
+          updateEnvKey('BYO_PROVIDERS', serializeExtraProviders([...extras, next]));
+          if (getModelRoutingMode() === 'off') updateEnvKey('MODEL_ROUTING_MODE', 'worker');
+        } catch { /* the grant is already saved; Settings refresh can recover the list */ }
+        try {
+          addNotification({
+            id: `xai-connected-${new Date().toISOString()}`,
+            kind: 'system',
+            title: 'xAI (Grok) connected',
+            body: 'Clementine signed in to xAI. Grok models are now selectable for the brain, workers, and judge.',
+            createdAt: new Date().toISOString(),
+            read: false,
+            metadata: { reason: 'xai_oauth_connected' },
+          });
+        } catch { /* notification is best-effort */ }
+      }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ status: 'error', message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/auth/xai/status', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const stored = getStoredXaiOAuthTokens();
+    // Never return the token itself — only whether a usable grant exists and
+    // when it needs refreshing.
+    res.json({
+      connected: stored !== null,
+      ...(stored?.expiresAt ? { expiresAt: stored.expiresAt } : {}),
+      ...(stored?.lastRefresh ? { lastRefresh: stored.lastRefresh } : {}),
+      expiresSoon: xaiAccessTokenExpiresSoon(),
+    });
+  });
+
+  app.post('/api/console/auth/xai/disconnect', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      await disconnectXaiOAuth();
+      res.json({ ok: true, connected: false });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -14640,10 +15245,6 @@ export function registerConsoleRoutes(
     }
 
     const requestedSessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
-    if (priorReceipt && requestedSessionId && priorReceipt.sessionId !== requestedSessionId) {
-      res.status(409).json({ error: 'client request id belongs to a different session' });
-      return;
-    }
     const parsedHarnessCommand = parseHarnessCommand(input);
     if (
       (parsedHarnessCommand === 'cancel' || parsedHarnessCommand === 'new')
@@ -14661,7 +15262,7 @@ export function registerConsoleRoutes(
       });
       return;
     }
-    const existingId = requestedSessionId || priorReceipt?.sessionId || '';
+    const existingId = priorReceipt?.sessionId || requestedSessionId || '';
     const deterministicSessionId = requestIdentity.clientProvided
       ? `sess-desktop-${harnessChatStableDigest(requestIdentity.requestId).slice(0, 24)}`
       : '';
@@ -14681,8 +15282,20 @@ export function registerConsoleRoutes(
       session = createHarnessSession({
         id: existingId,
         kind: 'chat',
+        userId: 'desktop',
         title: seed.length > 80 ? `${seed.slice(0, 77)}...` : seed,
-        metadata: { source: 'workspace', spaceSlug: existingId.slice('space-'.length) },
+        metadata: {
+          source: 'desktop',
+          channelId: existingId,
+          userId: 'desktop',
+          spaceSlug: existingId.slice('space-'.length),
+          __session_mount: {
+            version: 1,
+            kind: 'workspace',
+            rootSessionId: existingId,
+            workspaceSlug: existingId.slice('space-'.length),
+          },
+        },
       });
     }
     if (existingId && !session) { res.status(404).json({ error: 'session not found' }); return; }
@@ -14691,13 +15304,19 @@ export function registerConsoleRoutes(
       session = createHarnessSession({
         ...(deterministicSessionId ? { id: deterministicSessionId } : {}),
         kind: 'chat',
+        userId: 'desktop',
         title: titleSeed.length > 80 ? `${titleSeed.slice(0, 77)}...` : titleSeed,
-        metadata: { source: 'desktop' },
+        metadata: {
+          source: 'desktop',
+          channelId: deterministicSessionId || undefined,
+          userId: 'desktop',
+        },
       });
     }
+    session = ensureHarnessSessionUserId(session.id, 'desktop') ?? session;
 
-    const sessionId = session.id;
-    const streamUrl = `/api/sessions/${sessionId}/events`;
+    let sessionId = session.id;
+    let streamUrl = `/api/sessions/${sessionId}/events`;
 
     // Resolve deterministic route intent before acceptance, but do not mutate
     // anything yet. The selected target is copied onto the accepted user edge
@@ -14754,7 +15373,7 @@ export function registerConsoleRoutes(
     // attachments keep the normal turn path so files are never silently
     // dropped into a note. A dead-leased attempt is NOT running — the normal
     // supersede path is the correct recovery there.
-    if (!proposedEarlyRoute && input && requestedSessionId && attachmentIds.length === 0 && !command) {
+    if (!priorReceipt && !proposedEarlyRoute && input && requestedSessionId && attachmentIds.length === 0 && !command) {
       try {
         const latestAttempt = getLatestHarnessRunAttempt(sessionId);
         const leaseLive = Boolean(
@@ -14810,18 +15429,11 @@ export function registerConsoleRoutes(
     // normal turn path with the rewritten input.
     let turnInput = input;
     if (command === 'continue') {
-      const { isContinueCompletionReason, readLastConversationCompletion } = await import('../channels/discord-harness.js');
+      const { readLastConversationCompletion } = await import('../channels/discord-harness.js');
+      const { isContinueCompletionReason, buildContinueInput } = await import('../runtime/harness/continue-directive.js');
       const lastCompletion = readLastConversationCompletion(sessionId);
       if (lastCompletion && isContinueCompletionReason(lastCompletion.reason)) {
-        const summaryHint = lastCompletion.lastDecisionSummary
-          ? `Your last summary on the prior turn was: "${lastCompletion.lastDecisionSummary.slice(0, 400)}".`
-          : 'Use the conversation history above to figure out where you were.';
-        turnInput = [
-          'You hit a step / time budget on the previous turn and the user has now replied `continue`.',
-          'Pick up where you left off; do not restart the workflow from scratch.',
-          summaryHint,
-          'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.',
-        ].join('\n\n');
+        turnInput = buildContinueInput(lastCompletion.lastDecisionSummary ?? undefined);
       }
     }
 
@@ -14848,21 +15460,6 @@ export function registerConsoleRoutes(
     // dock had no way to resume a paused session, the SEND button sat
     // in THINKING forever, and the user couldn't continue the workflow.
     const harnessSession = HarnessSession.load(sessionId);
-    // Workspace dock: seed a one-time context primer (idempotent by prefix) so
-    // Clem knows WHICH Workspace this thread is about and how to edit it.
-    // Without it the dock is a contextless generic assistant (it asked "which
-    // app? send me the file path" instead of knowing it's this Workspace).
-    if (!proposedEarlyRoute && harnessSession && /^space-[a-z0-9][a-z0-9-]*$/.test(sessionId)) {
-      try {
-        // Single source of truth for BOTH lanes — buildWorkspaceContextPrimer is
-        // the same primer the Claude SDK lane appends to its system prompt. (Was a
-        // hardcoded copy here, which drifted: a primer rewrite missed the Codex
-        // lane until this was collapsed.)
-        const slug = sessionId.slice('space-'.length);
-        const primer = buildWorkspaceContextPrimer(slug);
-        if (primer) harnessSession.setContextPrimer('[workspace-context]', primer);
-      } catch { /* best-effort primer */ }
-    }
     const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
     // Registry-owned approvals have no RunState interrupt. Most belong to a
     // still-alive Agent SDK query; Workspace buttons are standalone continuations
@@ -14960,15 +15557,70 @@ export function registerConsoleRoutes(
 
     const proposedRunId = priorReceipt?.runId
       ?? `desktop:${harnessChatStableDigest(requestIdentity.requestId).slice(0, 40)}`;
-    let requestClaim: ReturnType<typeof claimHarnessChatRequest>;
+    let requestClaim: ReturnType<typeof claimHarnessChatRequest> | ReturnType<typeof claimSessionForAcceptedSource>;
     try {
-      requestClaim = claimHarnessChatRequest({
-        requestId: requestIdentity.requestId,
-        sessionId,
-        runId: proposedRunId,
-        inputHash: payloadHash,
-        sinceSeq,
-      });
+      // A durable receipt is already the immutable desktop-principal binding.
+      // Reclaim it before reclassifying against mutable parked/approval state;
+      // otherwise a lost-response retry can change lanes after the first turn
+      // already consumed that state. Desktop has one authenticated audience,
+      // and `existingId` above intentionally ignores a conflicting body id.
+      if (priorReceipt) {
+        requestClaim = claimHarnessChatRequest({
+          requestId: requestIdentity.requestId,
+          sessionId: priorReceipt.sessionId,
+          runId: priorReceipt.runId,
+          inputHash: payloadHash,
+          sinceSeq: priorReceipt.sinceSeq,
+        });
+      } else if (!proposedEarlyRoute && !intent) {
+        const lineage = resolveAcceptedSourceIngressLineage({
+          sessionId,
+          provider: 'desktop',
+          scopeId: null,
+          audienceId: 'desktop',
+        });
+        const workspaceSlug = /^space-[a-z0-9][a-z0-9-]*$/.test(sessionId)
+          ? sessionId.slice('space-'.length)
+          : null;
+        const validatedMount = lineage?.validatedMount ?? (workspaceSlug ? {
+          version: 1 as const,
+          kind: 'workspace' as const,
+          rootSessionId: sessionId,
+          workspaceSlug,
+        } : undefined);
+        const claimed = claimSessionForAcceptedSource({
+          kind: 'ordinary',
+          entrySessionId: sessionId,
+          durableSourceId: proposedRunId,
+          continuity: {
+            provider: 'desktop',
+            scopeId: null,
+            conversationId: lineage?.conversationId ?? sessionId,
+            audienceId: 'desktop',
+          },
+          ...(validatedMount ? { validatedMount } : {}),
+          receipt: {
+            requestId: requestIdentity.requestId,
+            runId: proposedRunId,
+            inputHash: payloadHash,
+            sinceSeq,
+          },
+        });
+        if (claimed.selection.sessionId !== claimed.receipt.sessionId) {
+          throw new Error('desktop receipt was not claimed on the pre-accepted session');
+        }
+        requestClaim = claimed;
+        sessionId = claimed.selection.sessionId;
+        streamUrl = `/api/sessions/${sessionId}/events`;
+      } else {
+        requestClaim = claimHarnessChatRequest({
+          requestId: requestIdentity.requestId,
+          sessionId,
+          runId: proposedRunId,
+          inputHash: payloadHash,
+          sinceSeq,
+        });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const cancelledBeforeAcceptance = message.includes('cancelled before acceptance');
@@ -14981,6 +15633,9 @@ export function registerConsoleRoutes(
       });
       return;
     }
+    try {
+      applySessionMountPrimers(sessionId, composeSessionFromStore(sessionId));
+    } catch { /* best-effort primer */ }
     const requestRunId = requestClaim.receipt.runId;
     const executionClaim = claimRunAttemptLease({
       sessionId,
@@ -15674,56 +16329,15 @@ export function registerConsoleRoutes(
           }
           return;
         }
-        // Agentic Claude brain lane (claude_oauth + CLEMMY_CLAUDE_AGENT_SDK_BRAIN):
-        // run the turn through the official Anthropic Agent SDK on the user's Claude
-        // subscription. The SDK owns its own tool loop; mutations route through the
-        // harness gate chain (gated-mutating-tools) + the async approval gate
-        // (claude-agent-approval). The brain emits its OWN terminal events —
-        // conversation_completed (desktop SSE stream + session history) and
-        // runtime.completed (Tasks board / report-back / watchdog) — so we do NOT
-        // emit conversation_completed here. A second one double-renders the reply on
-        // reopen, since reconstructHarnessTranscript maps each conversation_completed
-        // to its own assistant turn. Flag-gated + auth-gated, so Codex / API-key
-        // users are byte-identical (branch never taken).
-        if (!intent && claudeAgentSdkBrainEnabled('home')) {
-          const brainReq = {
-            message: effectiveInput,
-            displayMessage: input,
-            sourceUserSeq: requestSourceUserSeq,
-            sessionId,
-            runId: requestRunId,
-            channel: 'desktop',
-            userId: 'desktop',
-          };
-          try {
-            const response = await respondPreferHarness('home', brainReq, (req) => respondViaClaudeAgentSdkBrain('home', req));
-            if (response.stoppedReason === 'cancelled') requestAttemptStatus = 'cancelled';
-          } catch (err) {
-            requestAttemptStatus = 'failed';
-            try {
-              appendHarnessEvent({
-                sessionId,
-                turn: 0,
-                role: 'system',
-                type: 'run_failed',
-                data: {
-                  error: err instanceof Error ? err.message : String(err),
-                  stage: 'respond_bridge',
-                },
-              });
-            } catch { /* private diagnostics are best-effort */ }
-            throw err;
-          }
-          return;
-        }
         if (intent && harnessSession) {
-          const agent = await buildOrchestratorAgentForApprovalResume({
-            userInput: effectiveInput,
-            sessionId,
-            allowToolJit: true,
-          });
           await runConversationFromResume({
-            agent,
+            buildAgent: (identity) => buildOrchestratorAgentForApprovalResume({
+              userInput: effectiveInput,
+              sessionId: identity.sessionId,
+              sourceUserSeq: identity.sourceUserSeq,
+              acceptedRoute: identity.route,
+              allowToolJit: true,
+            }),
             sessionId,
             runAttemptId: requestAttempt.attemptId,
             sourceUserSeq: requestSourceUserSeq,
@@ -15733,16 +16347,13 @@ export function registerConsoleRoutes(
           });
           return;
         }
-        // Non-Claude brains (codex/GLM/BYO) route through the SAME bridge spine
-        // as every other chat surface — turn_model_routed marker, mid-run brain
+        // Every interactive brain (Claude OAuth, Codex OAuth, and BYO) routes
+        // through the SAME bridge spine — turn_model_routed marker, mid-run brain
         // fallover wiring, and the parse-exhaustion recovery that re-runs a
         // no_structured_output dead turn on the next brain instead of shipping
-        // the "couldn't be structured" apology. Previously this path called
-        // runConversation directly, so the desktop dock was the ONE chat
-        // surface without that recovery (live incident 2026-07-03, codex
-        // salesforce turn). The legacy closure preserves the old direct call as
-        // the bridge's own pre-run fallback (surface flag off / unenforceable
-        // excludes / auth not ready) — never taken after a harness run starts.
+        // the "couldn't be structured" apology. The selected model still resolves
+        // through RouterModelProvider, so Claude uses its subscription OAuth
+        // adapter while sharing the host-owned turn/tool loop with Codex.
         const response = await respondPreferHarness(
           'home',
           {
@@ -15823,12 +16434,14 @@ export function registerConsoleRoutes(
     message: string,
     reply: string,
     taskId: string,
+    runId: string,
   ): void => {
     try {
       if (!getHarnessSession(sessionId)) {
         createHarnessSession({
           id: sessionId,
           kind: 'chat',
+          userId: 'desktop',
           title: message.length > 80 ? `${message.slice(0, 77)}...` : message,
           metadata: { source: 'desktop' },
         });
@@ -15837,6 +16450,7 @@ export function registerConsoleRoutes(
         sessionId,
         userText: message,
         reply,
+        runId,
         legacyReason: 'queued_background',
         metadata: { steps: 0, queuedTaskId: taskId },
       });
@@ -15847,7 +16461,9 @@ export function registerConsoleRoutes(
 
   app.post('/api/console/home/chat/stream', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const body = req.body ?? {};
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? req.body as Record<string, unknown>
+      : {};
     const message = typeof body.message === 'string' ? body.message.trim() : '';
     if (!message) { res.status(400).json({ error: 'message required' }); return; }
 
@@ -15860,7 +16476,47 @@ export function registerConsoleRoutes(
       res.status(400).json({ error: 'invalid sessionId' });
       return;
     }
-    const sessionId = requestedId || 'console:home';
+    const requestedSessionId = requestedId || 'console:home';
+    const command = parseHarnessCommand(message);
+    const parkedTask = findSoleAwaitingInputTaskForOrigin(requestedSessionId);
+    const parkedReply = (
+      parkedTask?.pendingQuestionId
+      && command !== 'cancel'
+      && command !== 'new'
+      && command !== 'sessions'
+    ) ? classifyBackgroundInputReply({
+      message,
+      question: parkedTask.pendingQuestion,
+      options: parkedTask.pendingQuestionOptions,
+    }) : null;
+    const continueTask = !parkedTask && /^\/?(continue|resume|keep going)[.!?]*$/i.test(message)
+      ? findSoleAwaitingContinueTaskForOrigin(requestedSessionId)
+      : null;
+    const backgroundAttempt = detectBackgroundItIntent(message)
+      ? getActiveHarnessRunAttempt(requestedSessionId)
+      : null;
+    const boundControl = parkedReply?.kind === 'resume'
+      || !!continueTask
+      || !!backgroundAttempt
+      || command === 'cancel'
+      || command === 'new'
+      || command === 'continue';
+    let acceptedSource: ConsoleHomeAcceptedSource;
+    try {
+      acceptedSource = claimConsoleHomeAcceptedSource({
+        req,
+        body,
+        requestedSessionId,
+        message,
+        kind: boundControl ? 'bound_control' : 'ordinary',
+      });
+    } catch (err) {
+      res.status(409).json({
+        error: err instanceof Error ? err.message : 'Home request could not be accepted',
+      });
+      return;
+    }
+    const sessionId = acceptedSource.sessionId;
 
     res.status(200);
     res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
@@ -15877,6 +16533,96 @@ export function registerConsoleRoutes(
 
     try {
       writeEvent({ type: 'status', text: 'Clementine run started.' });
+      const replay = consoleHomeTerminalReplay(sessionId, acceptedSource.runId, message);
+      if (replay) {
+        const replaySessionId = command === 'new'
+          ? consoleHomeFreshSessionId(acceptedSource.runId)
+          : sessionId;
+        writeEvent({
+          type: 'done',
+          sessionId: replaySessionId,
+          clientRequestId: acceptedSource.clientRequestId,
+          text: replay,
+          pendingApprovalId: null,
+          stoppedReason: 'success',
+          turnsUsed: 0,
+          route: null,
+        });
+        res.end();
+        return;
+      }
+      if (command === 'cancel' || command === 'new') {
+        const control = executeConsoleHomeSessionCommand({
+          command,
+          sessionId,
+          runId: acceptedSource.runId,
+          userText: message,
+        });
+        writeEvent({
+          type: 'done',
+          sessionId: control.sessionId,
+          clientRequestId: acceptedSource.clientRequestId,
+          text: control.text,
+          pendingApprovalId: null,
+          stoppedReason: 'success',
+          turnsUsed: 0,
+          route: null,
+        });
+        res.end();
+        return;
+      }
+      if (parkedTask?.pendingQuestionId && parkedReply?.kind === 'resume') {
+        const queued = queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, message);
+        if (queued) {
+          const text = `Answer sent to "${parkedTask.title}" — resuming now; the result lands here.`;
+          const committed = recordAndCommitConsoleTerminal({
+            sessionId,
+            userText: message,
+            reply: text,
+            runId: acceptedSource.runId,
+            legacyReason: 'home_background_input',
+            metadata: { taskId: parkedTask.id, questionId: parkedTask.pendingQuestionId },
+          });
+          writeEvent({ type: 'done', sessionId, clientRequestId: acceptedSource.clientRequestId, text: committed, pendingApprovalId: null, stoppedReason: 'success', turnsUsed: 0, route: null });
+          res.end();
+          return;
+        }
+      }
+      if (continueTask) {
+        queueBackgroundTaskContinue(continueTask.id);
+        const text = `Continuing background task "${continueTask.title}". It will report back here when it's done.`;
+        const committed = recordAndCommitConsoleTerminal({
+          sessionId,
+          userText: message,
+          reply: text,
+          runId: acceptedSource.runId,
+          legacyReason: 'home_background_continue',
+          metadata: { taskId: continueTask.id },
+        });
+        writeEvent({ type: 'done', sessionId, clientRequestId: acceptedSource.clientRequestId, text: committed, pendingApprovalId: null, stoppedReason: 'success', turnsUsed: 0, route: null });
+        res.end();
+        return;
+      }
+      if (backgroundAttempt) {
+        const detached = detachRunningTurnToBackground(
+          sessionId,
+          backgroundAttempt,
+          { source: 'desktop', channel: 'desktop' },
+        );
+        if (detached) {
+          const committed = recordAndCommitConsoleTerminal({
+            sessionId,
+            userText: message,
+            reply: detached.text,
+            runId: acceptedSource.runId,
+            legacyReason: 'home_background_detach',
+            metadata: { detachedAttemptId: backgroundAttempt.attemptId },
+          });
+          writeEvent({ type: 'done', sessionId, clientRequestId: acceptedSource.clientRequestId, text: committed, pendingApprovalId: null, stoppedReason: 'success', turnsUsed: 0, route: null });
+          res.end();
+          return;
+        }
+      }
       // Explicit `/background …` is a user command, not a suggestion for the
       // model to narrate. Route it through the same durable choke point as the
       // harness chat API so Home cannot acknowledge a background plan without
@@ -15889,8 +16635,8 @@ export function registerConsoleRoutes(
           source: 'desktop',
         });
         const text = renderDurableTaskQueued(task);
-        recordHomeBackgroundHandoff(sessionId, message, text, task.id);
-        writeEvent({ type: 'done', sessionId, text, pendingApprovalId: null, stoppedReason: 'success', turnsUsed: 0, route: null });
+        recordHomeBackgroundHandoff(sessionId, message, text, task.id, acceptedSource.runId);
+        writeEvent({ type: 'done', sessionId, clientRequestId: acceptedSource.clientRequestId, text, pendingApprovalId: null, stoppedReason: 'success', turnsUsed: 0, route: null });
         res.end();
         return;
       }
@@ -15899,6 +16645,7 @@ export function registerConsoleRoutes(
         sessionId,
         channel: 'cli',
         userId: 'console',
+        runId: acceptedSource.runId,
         onToolActivity: (activity) => {
           writeEvent({
             type: 'tool',
@@ -15920,7 +16667,8 @@ export function registerConsoleRoutes(
       }
       writeEvent({
         type: 'done',
-        sessionId,
+        sessionId: response.sessionId || sessionId,
+        clientRequestId: acceptedSource.clientRequestId,
         text: response.text,
         pendingApprovalId: response.pendingApprovalId ?? null,
         // Surface why the run stopped so the dashboard can render the
@@ -16157,7 +16905,9 @@ export function registerConsoleRoutes(
 
   app.post('/api/console/home/chat', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const body = req.body ?? {};
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? req.body as Record<string, unknown>
+      : {};
     const message = typeof body.message === 'string' ? body.message.trim() : '';
     if (!message) { res.status(400).json({ error: 'message required' }); return; }
     const requestedId = typeof body.sessionId === 'string' ? body.sessionId.trim().slice(0, 120) : '';
@@ -16165,63 +16915,127 @@ export function registerConsoleRoutes(
       res.status(400).json({ error: 'invalid sessionId' });
       return;
     }
-    const sessionId = requestedId || 'console:home';
+    const requestedSessionId = requestedId || 'console:home';
     // Background needs_input round-trip: route only a reply that binds to the
     // exact parked question. Commands, declines, compound corrections, and
     // unrelated turns remain normal conversation.
     const command = parseHarnessCommand(message);
-    const parkedTask = findSoleAwaitingInputTaskForOrigin(sessionId);
-    if (
+    const parkedTask = findSoleAwaitingInputTaskForOrigin(requestedSessionId);
+    const parkedReply = (
       parkedTask?.pendingQuestionId
       && command !== 'cancel'
       && command !== 'new'
       && command !== 'sessions'
-    ) {
-      const replyDecision = classifyBackgroundInputReply({
+    ) ? classifyBackgroundInputReply({
         message,
         question: parkedTask.pendingQuestion,
         options: parkedTask.pendingQuestionOptions,
+      }) : null;
+    const continueTask = !parkedTask && /^\/?(continue|resume|keep going)[.!?]*$/i.test(message)
+      ? findSoleAwaitingContinueTaskForOrigin(requestedSessionId)
+      : null;
+    // User-initiated "background it" control (Claude Code ctrl+b model): push the
+    // currently-running foreground task to the background on demand, freeing the
+    // chat. Discovery is read-only; the durable bound-control claim below must
+    // win before the attempt is detached.
+    const backgroundAttempt = detectBackgroundItIntent(message)
+      ? getActiveHarnessRunAttempt(requestedSessionId)
+      : null;
+    const boundControl = parkedReply?.kind === 'resume'
+      || !!continueTask
+      || !!backgroundAttempt
+      || command === 'cancel'
+      || command === 'new'
+      || command === 'continue';
+    let acceptedSource: ConsoleHomeAcceptedSource;
+    try {
+      acceptedSource = claimConsoleHomeAcceptedSource({
+        req,
+        body,
+        requestedSessionId,
+        message,
+        kind: boundControl ? 'bound_control' : 'ordinary',
       });
-      if (replyDecision.kind === 'resume') {
-        const queued = queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, message);
-        if (queued) {
-          res.json({
-            sessionId,
-            text: `Answer sent to "${parkedTask.title}" — resuming now; the result lands here.`,
-          });
-          return;
-        }
-      }
+    } catch (err) {
+      res.status(409).json({
+        error: err instanceof Error ? err.message : 'Home request could not be accepted',
+      });
+      return;
     }
-    if (!parkedTask && /^\/?(continue|resume|keep going)[.!?]*$/i.test(message)) {
-      const continueTask = findSoleAwaitingContinueTaskForOrigin(sessionId);
-      if (continueTask) {
-        queueBackgroundTaskContinue(continueTask.id);
+    const sessionId = acceptedSource.sessionId;
+    try {
+      const replay = consoleHomeTerminalReplay(sessionId, acceptedSource.runId, message);
+      if (replay) {
         res.json({
-          sessionId,
-          text: `Continuing background task "${continueTask.title}". It will report back here when it's done.`,
+          sessionId: command === 'new' ? consoleHomeFreshSessionId(acceptedSource.runId) : sessionId,
+          clientRequestId: acceptedSource.clientRequestId,
+          text: replay,
         });
         return;
       }
-    }
-    // User-initiated "background it" control (Claude Code ctrl+b model): push the
-    // currently-running foreground task to the background on demand, freeing the
-    // chat. Handled here (before the model) so it works even mid-run.
-    if (detectBackgroundItIntent(message)) {
-      const activeAttempt = getActiveHarnessRunAttempt(sessionId);
-      const detached = activeAttempt
-        ? detachRunningTurnToBackground(
+      if (command === 'cancel' || command === 'new') {
+        const control = executeConsoleHomeSessionCommand({
+          command,
           sessionId,
-          activeAttempt,
-          { source: 'desktop', channel: 'desktop' },
-        )
-        : null;
-      if (detached) {
-        res.json({ sessionId, text: detached.text });
+          runId: acceptedSource.runId,
+          userText: message,
+        });
+        res.json({
+          sessionId: control.sessionId,
+          clientRequestId: acceptedSource.clientRequestId,
+          text: control.text,
+        });
         return;
       }
-    }
-    try {
+      if (parkedTask?.pendingQuestionId && parkedReply?.kind === 'resume') {
+        const queued = queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, message);
+        if (queued) {
+          const text = `Answer sent to "${parkedTask.title}" — resuming now; the result lands here.`;
+          const committed = recordAndCommitConsoleTerminal({
+            sessionId,
+            userText: message,
+            reply: text,
+            runId: acceptedSource.runId,
+            legacyReason: 'home_background_input',
+            metadata: { taskId: parkedTask.id, questionId: parkedTask.pendingQuestionId },
+          });
+          res.json({ sessionId, clientRequestId: acceptedSource.clientRequestId, text: committed });
+          return;
+        }
+      }
+      if (continueTask) {
+        queueBackgroundTaskContinue(continueTask.id);
+        const text = `Continuing background task "${continueTask.title}". It will report back here when it's done.`;
+        const committed = recordAndCommitConsoleTerminal({
+          sessionId,
+          userText: message,
+          reply: text,
+          runId: acceptedSource.runId,
+          legacyReason: 'home_background_continue',
+          metadata: { taskId: continueTask.id },
+        });
+        res.json({ sessionId, clientRequestId: acceptedSource.clientRequestId, text: committed });
+        return;
+      }
+      if (backgroundAttempt) {
+        const detached = detachRunningTurnToBackground(
+          sessionId,
+          backgroundAttempt,
+          { source: 'desktop', channel: 'desktop' },
+        );
+        if (detached) {
+          const committed = recordAndCommitConsoleTerminal({
+            sessionId,
+            userText: message,
+            reply: detached.text,
+            runId: acceptedSource.runId,
+            legacyReason: 'home_background_detach',
+            metadata: { detachedAttemptId: backgroundAttempt.attemptId },
+          });
+          res.json({ sessionId, clientRequestId: acceptedSource.clientRequestId, text: committed });
+          return;
+        }
+      }
       // Keep the non-streaming/CLI-compatible Home endpoint behavior identical
       // to the React stream: an explicit durable command must create the task
       // before any model has a chance to stop at plan narration.
@@ -16233,8 +17047,8 @@ export function registerConsoleRoutes(
           source: 'desktop',
         });
         const text = renderDurableTaskQueued(task);
-        recordHomeBackgroundHandoff(sessionId, message, text, task.id);
-        res.json({ sessionId, text });
+        recordHomeBackgroundHandoff(sessionId, message, text, task.id, acceptedSource.runId);
+        res.json({ sessionId, clientRequestId: acceptedSource.clientRequestId, text });
         return;
       }
       // FORK collapse (staged): interactive console home chat through the gated
@@ -16243,14 +17057,25 @@ export function registerConsoleRoutes(
       // CLEMMY_HARNESS_HOME=on, then live-verified + baked in.
       const response = await respondPreferHarness(
         'home',
-        { message, sessionId, channel: 'cli', userId: 'console' },
+        {
+          message,
+          sessionId,
+          channel: 'cli',
+          userId: 'console',
+          runId: acceptedSource.runId,
+        },
         (req) => assistant.respond(req),
       );
       if (response.stoppedReason === 'error') {
         res.status(500).json({ error: PUBLIC_RUN_FAILURE_TEXT });
         return;
       }
-      res.json({ sessionId, text: response.text, pendingApprovalId: response.pendingApprovalId });
+      res.json({
+        sessionId: response.sessionId || sessionId,
+        clientRequestId: acceptedSource.clientRequestId,
+        text: response.text,
+        pendingApprovalId: response.pendingApprovalId,
+      });
     } catch (err) {
       console.error('console chat failed:', err);
       res.status(500).json({ error: PUBLIC_RUN_FAILURE_TEXT });

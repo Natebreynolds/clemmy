@@ -52,8 +52,10 @@ export function admitRequirementCoverage(input: {
   const sinks = destinationsOf(input.goal);
   const projection = input.goal.collection?.projection ?? [];
   const collect = input.goal.construct === 'collect_then_construct'
-    || (input.goal.collection?.count ?? 0) >= 1;
+    || (input.goal.collection?.count ?? 0) >= 1
+    || input.goal.collection?.completeness === 'exhaust';
   const wantsAnalysis = analysisRequested(input.acceptedText);
+  const identitySpecified = (input.goal.collection?.identityFields?.length ?? 0) > 0;
   const entries: CoverageEntryV1[] = [
     {
       kind: 'objective',
@@ -78,13 +80,16 @@ export function admitRequirementCoverage(input: {
     },
     {
       kind: 'transform',
-      posture: wantsAnalysis
-        ? (sinks.length > 1 || collect ? 'specified' : 'unresolved')
-        : 'none',
+      posture: !wantsAnalysis
+        ? 'none'
+        : identitySpecified || sinks.length > 1 || collect
+          ? 'specified'
+          : 'unresolved',
     },
     {
       kind: 'cardinality',
-      posture: input.goal.collection?.count
+      posture: input.goal.collection?.completeness === 'exhaust'
+        || (input.goal.collection?.count ?? 0) > 0
         ? 'specified'
         : collect
           ? 'unresolved'

@@ -50,6 +50,7 @@ const EXPECTED_WORK_REFUSAL_KINDS = new Set([
   'work_already_satisfied',
   'work_evidence_incomplete',
   'work_effect_already_executed',
+  'work_attempt_budget_exhausted',
   'work_authority_unavailable',
 ]);
 

@@ -94,6 +94,57 @@ test('valid IANA timezone → no timezone error', () => {
   }
 });
 
+test('valid exact interval recurrence is accepted', () => {
+  const result = validateWorkflowDefinition({
+    name: 'interval-valid',
+    description: 'Runs on one exact fixed-duration recurrence',
+    enabled: true,
+    trigger: {
+      interval: {
+        version: 1,
+        every: 2,
+        unit: 'hour',
+        anchorAt: '2026-08-22T19:00:00.000Z',
+        overlapPolicy: 'queue_one',
+        catchUpPolicy: 'run_once',
+      },
+    },
+    steps: [{ id: 'read', prompt: 'Read the current source.', sideEffect: 'read' }],
+  });
+  assert.equal(result.errors.some((error) => error.includes('interval')), false, result.errors.join('\n'));
+});
+
+test('interval recurrence rejects malformed anchors and competing cron authority', () => {
+  const base = {
+    version: 1,
+    every: 2,
+    unit: 'hour',
+    anchorAt: '2026-08-22T19:00:30.000Z',
+    overlapPolicy: 'queue_one',
+    catchUpPolicy: 'run_once',
+  };
+  const malformed = validateWorkflowDefinition({
+    name: 'interval-malformed',
+    description: 'Malformed interval should stay inert',
+    trigger: { interval: base },
+    steps: [{ id: 'read', prompt: 'Read the current source.', sideEffect: 'read' }],
+  });
+  assert.ok(malformed.errors.some((error) => error.includes('canonical UTC minute')));
+
+  const competing = validateWorkflowDefinition({
+    name: 'interval-competing',
+    description: 'Two time authorities must not coexist',
+    trigger: {
+      schedule: '0 * * * *',
+      timezone: 'UTC',
+      interval: { ...base, anchorAt: '2026-08-22T19:00:00.000Z' },
+    },
+    steps: [{ id: 'read', prompt: 'Read the current source.', sideEffect: 'read' }],
+  });
+  assert.ok(competing.errors.some((error) => error.includes('mutually exclusive time authorities')));
+  assert.ok(competing.errors.some((error) => error.includes('timezone cannot accompany')));
+});
+
 // ── New semantic checks (2026-05-21) ──────────────────────────────────
 
 test('hand-off language "future turn handles" → error', () => {

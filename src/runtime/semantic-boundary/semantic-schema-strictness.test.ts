@@ -81,6 +81,8 @@ test('production structured-output schemas are strict and parse their own result
     'destinations',
     'destination',
     'requestedEffect',
+    'topology',
+    'topologyHash',
     'operations',
     'deliverables',
     'evidenceRequirements',

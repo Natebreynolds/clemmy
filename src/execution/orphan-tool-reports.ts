@@ -532,8 +532,16 @@ export async function processOrphanedToolReports(): Promise<void> {
       },
       claim: (sessionId) => claimOrphanedToolCompletions(sessionId),
       fire: async (sessionId, report) => {
-        const agent = await buildOrchestratorAgent({ userInput: report.directive, sessionId });
-        const outcome = await runConversation({ agent, sessionId, input: report.directive });
+        const outcome = await runConversation({
+          sessionId,
+          input: report.directive,
+          buildAgent: (identity) => buildOrchestratorAgent({
+            userInput: report.directive,
+            sessionId: identity.sessionId,
+            sourceUserSeq: identity.sourceUserSeq,
+            acceptedRoute: identity.route,
+          }),
+        });
         // RunConversationResult documents completedReason only for a nominal
         // `completed` status that is actually a dead turn (parse exhaustion or
         // sub-agent stall). Ordinary successful completions leave it unset.

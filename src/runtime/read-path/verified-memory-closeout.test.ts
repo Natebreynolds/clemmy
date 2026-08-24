@@ -78,6 +78,30 @@ function withAcceptedTask<T>(sessionId: string, work: () => Promise<T>): Promise
   ) as Promise<T>;
 }
 
+/** Compatibility scaffold for tests that exercise the post-settlement seam
+ * directly. Candidate serving now independently revalidates canonical success,
+ * so the fixture must state the successful dispatch it is intentionally
+ * standing in for. Production tests should prefer governedRead(). */
+function recordCanonicalReadSuccess(sessionId: string, slug: string, callId: string): void {
+  const accepted = acceptedBySession.get(sessionId);
+  if (!accepted) throw new Error(`fixture has no accepted source for ${sessionId}`);
+  eventlog.appendEvent({
+    sessionId,
+    turn: accepted.turn,
+    role: 'system',
+    type: 'tool_attempt_settled',
+    data: {
+      sourceUserSeq: accepted.sourceUserSeq,
+      acceptedTaskId: `task:${sessionId}#${accepted.sourceUserSeq}`,
+      logicalToolCallId: callId,
+      tool: slug,
+      kind: 'succeeded',
+      dispatchState: 'dispatched',
+      mutating: false,
+    },
+  });
+}
+
 function payloadWithItems() {
   return { successful: true, data: { items: [{ id: 'evt-1', summary: 'Standup' }] } };
 }
@@ -218,11 +242,13 @@ test('the same phrase proven against two accounts keeps both, each with its own 
   schemaCache.rememberToolSchema('MAILCO_FETCH_INVOICES', {
     type: 'object', properties: { query: { type: 'string' } },
   }, Date.now());
+  recordCanonicalReadSuccess(sessionId, 'MAILCO_FETCH_INVOICES', 'call:ap@northco.example');
   await composio._settleVerifiedComposioReadForTest({
     toolSlug: 'MAILCO_FETCH_INVOICES', sessionId,
     result: { successful: true, data: { items: [{ id: 'i-1' }] } },
     accountIdentity: 'ap@northco.example',
   });
+  recordCanonicalReadSuccess(sessionId, 'MAILCO_FETCH_INVOICES', 'call:billing@southco.example');
   await composio._settleVerifiedComposioReadForTest({
     toolSlug: 'MAILCO_FETCH_INVOICES', sessionId,
     result: { successful: true, data: { items: [{ id: 'i-9' }] } },

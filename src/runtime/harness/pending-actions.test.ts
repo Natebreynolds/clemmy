@@ -150,7 +150,7 @@ test('only the opaque claim owner can finalize; tokenless/model-callable complet
 });
 
 test('state machine is monotonic: terminals are immutable and late approval cannot resurrect them', () => {
-  const terminalResolutions = ['rejected', 'expired', 'cancelled_by_user'] as const;
+  const terminalResolutions = ['rejected', 'expired', 'cancelled_by_user', 'cancelled_by_system'] as const;
   for (const resolution of terminalResolutions) {
     const record = pending.queuePendingAction({
       title: `Terminal ${resolution}`,

@@ -99,8 +99,12 @@ function settledTask(input: {
   mutating?: boolean;
   requirementId?: string;
   priorPayload?: unknown;
+  /** Freeze the accepted task's contract between acceptance and settlement —
+   * the live ordering (contracts freeze at turn admission, before any call). */
+  beforeSettle?: (task: ReturnType<typeof accept>) => void;
 }) {
   const task = accept(input.text ?? 'Find the current alpha records.');
+  input.beforeSettle?.(task);
   const logicalToolCallId = `logical:${serial}`;
   const args = input.args ?? { query: 'alpha' };
   const chainId = `chain:${serial}`;
@@ -533,7 +537,10 @@ test('corrupt raw bytes fail closed even though settlement and handle ids still 
   }
   const refused = issueFor(settled, manifest);
   assert.equal(refused.status, 'refused');
-  assert.match(refused.status === 'refused' ? refused.reason : '', /corrupt|digest/i);
+  assert.match(
+    refused.status === 'refused' ? refused.reason : '',
+    /corrupt|digest|bytes do not match durable metadata/i,
+  );
 });
 
 function recreateDurableResultImmutableTrigger(): void {
@@ -551,7 +558,7 @@ function recreatePhysicalDispatchImmutableTrigger(): void {
     CREATE TRIGGER IF NOT EXISTS trg_physical_dispatch_identity_immutable
     BEFORE UPDATE OF accepted_task_id, logical_tool_call_id,
                      physical_dispatch_id, ordinal, relation, retry_of,
-                     tool_name, argument_digest
+                     tool_name, argument_digest, lease_scope_id, lease_id
     ON physical_dispatches
     WHEN OLD.accepted_task_id IS NOT NEW.accepted_task_id
       OR OLD.logical_tool_call_id IS NOT NEW.logical_tool_call_id
@@ -561,8 +568,20 @@ function recreatePhysicalDispatchImmutableTrigger(): void {
       OR OLD.retry_of IS NOT NEW.retry_of
       OR OLD.tool_name IS NOT NEW.tool_name
       OR OLD.argument_digest IS NOT NEW.argument_digest
+      OR OLD.lease_scope_id IS NOT NEW.lease_scope_id
+      OR OLD.lease_id IS NOT NEW.lease_id
     BEGIN
       SELECT RAISE(ABORT, 'physical dispatch identity is immutable');
+    END;
+  `);
+}
+
+function recreateLogicalSettlementCrossingImmutableTrigger(): void {
+  eventlog.openEventLog().exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_logical_settlement_crossing_update_immutable
+    BEFORE UPDATE ON logical_call_settlement_crossings
+    BEGIN
+      SELECT RAISE(ABORT, 'logical settlement crossings are immutable');
     END;
   `);
 }
@@ -662,13 +681,19 @@ test('host redemption recomputes the frozen crossing digest', () => {
 
 test('host redemption compares every frozen crossing with its digest', () => {
   const badFrozen = multiCrossingSettlement();
-  eventlog.openEventLog().prepare(`UPDATE logical_call_settlement_crossings
-    SET tool_name = tool_name || '_forged'
-    WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ? AND ordinal = 1`).run(
-    badFrozen.task.sessionId,
-    badFrozen.task.sourceUserSeq,
-    badFrozen.logicalToolCallId,
-  );
+  const db = eventlog.openEventLog();
+  db.exec('DROP TRIGGER IF EXISTS trg_logical_settlement_crossing_update_immutable');
+  try {
+    db.prepare(`UPDATE logical_call_settlement_crossings
+      SET tool_name = tool_name || '_forged'
+      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ? AND ordinal = 1`).run(
+      badFrozen.task.sessionId,
+      badFrozen.task.sourceUserSeq,
+      badFrozen.logicalToolCallId,
+    );
+  } finally {
+    recreateLogicalSettlementCrossingImmutableTrigger();
+  }
   assert.equal(redeemSettlement(badFrozen).status, 'corrupt', 'frozen rows must match their digest');
 });
 
@@ -688,4 +713,57 @@ test('host redemption compares the exact live and frozen crossing sets', () => {
     recreatePhysicalDispatchImmutableTrigger();
   }
   assert.equal(redeemSettlement(badLive).status, 'corrupt', 'live crossing set must equal the frozen set');
+});
+
+test('an observation-sufficient read discharges despite provider-reported partial-ness (live 2026-08-20 slack DMs)', () => {
+  // "Check my last Slack DM" carries the deterministic implicit-retrieve
+  // obligation: source_observed, never source_completeness. A paged provider
+  // ALWAYS reports such a mailbox read as partial (has_more/cursor) —
+  // partial-ness describes source EXHAUSTION, which this node never owed.
+  // The gate refusing it labeled a correct, delivered answer `blocked`.
+  const partialEvidence = {
+    acceptedTaskId: 'task:pin',
+    logicalToolCallId: 'logical:pin',
+    physicalDispatchId: 'dispatch:pin',
+    resultHandleId: 'handle:pin',
+    toolName: 'alpha_records_search',
+    outcomeKind: 'succeeded',
+    executionSite: 'provider',
+    rawPayload: { successful: true, data: { records: [{ id: 'r-newest' }] } },
+    rawPayloadJson: '',
+    rawPayloadSha256: '',
+    rawByteCount: 0,
+    handle: {
+      success: true,
+      recordPath: 'data.records',
+      recordCount: 1,
+      completeness: 'partial',
+      continuationRef: null,
+      continuationRepeated: false,
+    },
+  } as never;
+  const nodeBase = {
+    nodeId: 'n1:execute/read',
+    effectKind: 'read',
+    reversibility: 'reversible',
+    resolvedTool: 'alpha_records_search',
+    operationMode: 'collection_read',
+  };
+  const observed = receipts._readFactsForTest(
+    { ...nodeBase, obligations: ['source_observed'] } as never,
+    partialEvidence,
+  );
+  assert.equal(observed.ok, true, JSON.stringify(observed));
+  if (!observed.ok) return;
+  assert.equal(observed.facts.kind, 'observation');
+  assert.equal(observed.facts.obligation, 'source_observed');
+  assert.equal(observed.facts.completeness, 'partial', 'partial-ness stays recorded as truth in the receipt');
+  // The strict gate is untouched: the same partial result cannot discharge a
+  // node that owes source exhaustion.
+  const exhaustive = receipts._readFactsForTest(
+    { ...nodeBase, obligations: ['source_completeness'] } as never,
+    partialEvidence,
+  );
+  assert.equal(exhaustive.ok, false);
+  assert.match((exhaustive as { reason: string }).reason, /not complete/);
 });

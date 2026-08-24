@@ -10,7 +10,13 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { actionBus } = await import('../action-bus.js');
-const { appendEvent, appendTerminalEventOnce, createSession, listEvents } = await import('./eventlog.js');
+const {
+  AcceptedTaskTerminalPublicationError,
+  appendEvent,
+  appendTerminalEventOnce,
+  createSession,
+  listEvents,
+} = await import('./eventlog.js');
 const { commitTurnOutcome, completionDataForTurnOutcome } = await import('./delivery-committer.js');
 const {
   InvalidTurnOutcomeError,
@@ -102,14 +108,14 @@ test('typed outcome projection ignores runtime-cast internal fields', () => {
 
   const nonWarm = completionDataForTurnOutcome(outcome, {
     metadata: {
-      transport: 'openai_agents_harness',
+      transport: 'host_harness',
       artifactId: 'not-a-procedure-artifact',
       laneDigest: 'not-a-digest',
       counters: { providerPayload: 'must not cross' },
       warmReadPolicyDigest: 'not-a-digest',
     },
   });
-  assert.equal(nonWarm.transport, 'openai_agents_harness');
+  assert.equal(nonWarm.transport, 'host_harness');
   assert.equal('artifactId' in nonWarm, false);
   assert.equal('laneDigest' in nonWarm, false);
   assert.equal('counters' in nonWarm, false);
@@ -340,7 +346,7 @@ test('typed completion decoder validates duplicated id, identity, and status aut
   }
 });
 
-test('a contradictory typed winner is never reinterpreted through the losing proposal', () => {
+test('the public writer rejects a contradictory typed winner before persistence', () => {
   const sessionId = 'contradictory-winner';
   createSession({ id: sessionId, kind: 'chat' });
   const outcome = acceptedAnswer(sessionId, 'Losing retry.');
@@ -349,15 +355,20 @@ test('a contradictory typed winner is never reinterpreted through the losing pro
     presentation: { kind: 'answer', text: 'First writer text.' },
   } as TurnOutcome);
   (corrupt.turnOutcome as Record<string, unknown>).status = 'failed';
-  appendTerminalEventOnce({
-    sessionId,
-    turn: outcome.identity.turn,
-    role: 'system',
-    data: corrupt,
-  }, outcome.id);
-
-  assert.throws(() => commitTurnOutcome(outcome), InvalidTurnOutcomeError);
-  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.throws(
+    () => appendTerminalEventOnce({
+      sessionId,
+      turn: outcome.identity.turn,
+      role: 'system',
+      data: corrupt,
+    }, outcome.id),
+    (error: unknown) => {
+      assert.ok(error instanceof AcceptedTaskTerminalPublicationError);
+      assert.equal(error.status, 'conflict');
+      return true;
+    },
+  );
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
 });
 
 test('an explicit pre-typed terminal winner remains compatible', () => {
@@ -434,21 +445,27 @@ test('committer rejects a source sequence whose accepted event has another turn'
   assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
 });
 
-test('a typed winner whose event envelope names another turn fails closed', () => {
+test('the public writer rejects a typed terminal whose event envelope names another turn', () => {
   const sessionId = 'wrong-turn-winner';
   createSession({ id: sessionId, kind: 'chat' });
   const outcome = acceptedAnswer(sessionId, 'Losing retry.');
-  appendTerminalEventOnce({
-    sessionId,
-    turn: outcome.identity.turn + 1,
-    role: 'system',
-    data: completionDataForTurnOutcome({
-      ...outcome,
-      presentation: { kind: 'answer', text: 'First writer text.' },
-    } as TurnOutcome),
-  }, outcome.id);
-
-  assert.throws(() => commitTurnOutcome(outcome), InvalidTurnOutcomeError);
+  assert.throws(
+    () => appendTerminalEventOnce({
+      sessionId,
+      turn: outcome.identity.turn + 1,
+      role: 'system',
+      data: completionDataForTurnOutcome({
+        ...outcome,
+        presentation: { kind: 'answer', text: 'First writer text.' },
+      } as TurnOutcome),
+    }, outcome.id),
+    (error: unknown) => {
+      assert.ok(error instanceof AcceptedTaskTerminalPublicationError);
+      assert.equal(error.status, 'conflict');
+      return true;
+    },
+  );
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 0);
 });
 
 test('physical attempts racing on one accepted source converge on the first terminal', () => {

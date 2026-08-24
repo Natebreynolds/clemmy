@@ -33,7 +33,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { Agent, Runner } from '@openai/agents';
 import { BASE_DIR } from '../config.js';
-import { dispatchBatchItemTool, READ_ONLY_TOOLS, isMcpNamespacedTool } from '../tools/code-mode-tool.js';
+import { dispatchBatchItemTool, READ_ONLY_TOOLS, isMcpNamespacedTool } from '../tools/inner-dispatch.js';
 import { ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { codexSafeFast } from '../runtime/harness/model-roles.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';

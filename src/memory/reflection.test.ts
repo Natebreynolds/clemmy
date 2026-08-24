@@ -6,9 +6,8 @@
  *   - facts: rememberFact populates derived_from_* fields, trust_level
  *     defaults to 0.6 for derived / 1.0 for direct, listRecentlyLearnedFacts
  *     returns only derived facts ordered by extracted_at DESC
- *   - reflection: scheduleReflection swallows extractor failures so it
- *     never throws from the hook caller; threshold gate short-circuits
- *     tiny outputs
+ *   - reflection: durable terminal-batch extraction stays off the tool-return
+ *     path; threshold gates short-circuit tiny direct inputs
  *
  * Does NOT call the real summarizer model. The extractor path is mocked
  * via CLEMMY_REFLECTION=off so we exercise the threshold + dedup gates
@@ -34,8 +33,6 @@ const {
   storeEpisodicPointer,
   listRecentEpisodicPointers,
   reflectOnToolReturn,
-  scheduleReflection,
-  _testOnly_reflectionPending,
   _testOnly_resetReflectionScopeBudgets,
   isSelfReferentialTool,
   isWriteReceiptTool,
@@ -890,6 +887,60 @@ test('reflection receipts suppress identical replay after a database reopen', as
   }
 });
 
+test('terminal-batch learning spends one grounded extractor call and zero calls on replay', async () => {
+  resetMemoryDb();
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  const priorEmbed = process.env.CLEMMY_EMBED_AT_WRITE;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '999';
+  process.env.CLEMMY_EMBED_AT_WRITE = 'off';
+  let extractorCalls = 0;
+  const input = {
+    sessionId: 'terminal-batch-session',
+    callId: 'terminal-learning:shard-1',
+    tool: 'terminal_learning_batch',
+    output: `Dana owns Project Atlas. ${'The exact source discusses Dana and Project Atlas. '.repeat(25)}`,
+    sourceUri: 'memory-batch://batch-1/shard-1',
+    learningMode: 'terminal_batch' as const,
+  };
+  try {
+    _testOnly_setReflectionExtractor(async () => {
+      extractorCalls += 1;
+      return {
+        facts: [
+          { kind: 'project', text: 'Dana owns Project Atlas', importance: 7 },
+          { kind: 'project', text: 'Morgan owns Project Zephyr', importance: 9 },
+        ],
+        entities: [
+          { type: 'person', name: 'Dana' },
+          { type: 'person', name: 'Morgan' },
+        ],
+        pointers: [{ label: 'invented pointer' }],
+        resources: [{ kind: 'folder', name: 'invented folder', ref: 'invented' }],
+      };
+    });
+    const first = await reflectOnToolReturn(input);
+    assert.equal(first.skipped, undefined);
+    assert.equal(first.factsWritten, 1);
+    assert.equal(first.pointersStored, 0, 'resource/result pointers come from verified receipts, not extraction');
+    closeMemoryDb();
+    openMemoryDb();
+    assert.equal((await reflectOnToolReturn(input)).skipped, 'already_reflected');
+    assert.equal(extractorCalls, 1);
+    const db = openMemoryDb();
+    assert.deepEqual(db.prepare(`
+      SELECT text, status, reason FROM memory_reflection_candidates ORDER BY text
+    `).all(), [
+      { text: 'Dana owns Project Atlas', status: 'promoted', reason: 'consolidation:add' },
+      { text: 'Morgan owns Project Zephyr', status: 'rejected', reason: 'ungrounded_terminal_batch' },
+    ]);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM episodic_pointers').get() as { n: number }).n, 0);
+  } finally {
+    _testOnly_setReflectionExtractor(null);
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+    if (priorEmbed === undefined) delete process.env.CLEMMY_EMBED_AT_WRITE; else process.env.CLEMMY_EMBED_AT_WRITE = priorEmbed;
+  }
+});
+
 test('failed reflection receipts are retryable without duplicating fallback pointers', async () => {
   resetMemoryDb();
   const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
@@ -1464,37 +1515,6 @@ test('reflectOnToolReturn: a focus_get return is skipped before the extractor (n
     if (prevSelf === undefined) delete process.env.CLEMMY_REFLECT_SELF_TOOLS; else process.env.CLEMMY_REFLECT_SELF_TOOLS = prevSelf;
   }
 });
-
-test('scheduleReflection: serial queue drains self-tool returns without concurrent extractor calls', async () => {
-  resetMemoryDb();
-  const prevReflect = process.env.CLEMMY_REFLECTION;
-  const prevSerial = process.env.CLEMMY_REFLECTION_SERIAL;
-  const prevSelf = process.env.CLEMMY_REFLECT_SELF_TOOLS;
-  delete process.env.CLEMMY_REFLECTION;
-  delete process.env.CLEMMY_REFLECTION_SERIAL; // serial ON (default)
-  delete process.env.CLEMMY_REFLECT_SELF_TOOLS;
-  try {
-    // Enqueue several self-tool reflections. They short-circuit (self_tool) so
-    // no real model call fires, but they still exercise the FIFO chain: each
-    // increments pending on enqueue and decrements as the chain drains. After a
-    // microtask flush the queue must be fully drained (pending back to 0).
-    const longBlob = 'recalled fact: '.repeat(40);
-    for (let i = 0; i < 5; i += 1) {
-      scheduleReflection({ sessionId: 'sess-serial', callId: `c-${i}`, tool: 'focus_get', output: longBlob });
-    }
-    assert.ok(_testOnly_reflectionPending() > 0, 'reflections should be queued synchronously on enqueue');
-    // Let the serial chain drain.
-    for (let i = 0; i < 10 && _testOnly_reflectionPending() > 0; i += 1) {
-      await new Promise((r) => setTimeout(r, 5));
-    }
-    assert.equal(_testOnly_reflectionPending(), 0, 'serial queue must fully drain');
-  } finally {
-    if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
-    if (prevSerial === undefined) delete process.env.CLEMMY_REFLECTION_SERIAL; else process.env.CLEMMY_REFLECTION_SERIAL = prevSerial;
-    if (prevSelf === undefined) delete process.env.CLEMMY_REFLECT_SELF_TOOLS; else process.env.CLEMMY_REFLECT_SELF_TOOLS = prevSelf;
-  }
-});
-
 
 test('consolidateActiveFacts (stored embeddings): full-coverage pairwise dedup keeps the higher-scored fact', async () => {
   resetMemoryDb();

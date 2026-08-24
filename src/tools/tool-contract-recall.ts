@@ -134,8 +134,7 @@ export function renderLearnedContracts(hints: readonly LearnedContractHint[]): s
       line += ` — required: ${hint.requiredFields.join(', ')}`;
     }
     if (hint.exampleArgs && Object.keys(hint.exampleArgs).length > 0) {
-      const example = JSON.stringify(hint.exampleArgs);
-      line += ` — worked with: ${example}`;
+      line += ` — worked: ${JSON.stringify(hint.exampleArgs)}`;
     }
     if (line.length > RENDER_BUDGET_CHARS_PER_ENTRY) {
       line = `${line.slice(0, RENDER_BUDGET_CHARS_PER_ENTRY - 1)}…`;

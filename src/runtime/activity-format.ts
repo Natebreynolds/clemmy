@@ -526,11 +526,12 @@ export function friendlyTimeline(
 const NARRATION_SKIPPED =
   /^(?:tool_search|composio_search_tools|composio_list_tools|recall_tool_result|tool_output_query|memory_recall_all|ping)$/i;
 /** Generic dispatchers carry someone else's work. Live 2026-08-09: a Slack
- *  lookup narrated as "running" because `run_tool_program` won the last slot
+ *  lookup narrated as "running" because a dispatcher carrier won the last slot
  *  while `SLACK_FIND_USER_BY_EMAIL_ADDRESS` sat one frame behind it. Skip the
  *  wrapper and let the tool that actually ran speak — the same reason the
  *  ledger reads `effectiveTool` over `tool`. */
-const NARRATION_DISPATCHERS = /^(?:run_tool_program|composio_execute_tool|call_tool|code_mode|run_code|execution_create)$/i;
+// `code_mode` / `run_code` remain solely to render historical activity rows.
+const NARRATION_DISPATCHERS = /^(?:composio_execute_tool|call_tool|code_mode|run_code|execution_create)$/i;
 
 /** Verb families, most specific first. Keyed on how tool slugs are actually
  *  built (VERB_OBJECT / object.verb), not on any provider's catalogue. */

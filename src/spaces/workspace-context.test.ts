@@ -65,6 +65,8 @@ test('buildWorkspaceContextPrimer tells the brain to edit via space_* (never a s
   assert.match(primer!, /space_history\('deal-risk'\)/);
   assert.match(primer!, /space_diff\('deal-risk', '<source id>'\)/);
   assert.match(primer!, /Never infer a delta.*insufficient history/i);
+  assert.match(primer!, /space_action_prepare stages exact approval.*executes only when exact standing approval/i);
+  assert.doesNotMatch(primer!, /space_action_prepare queues approval, never execution/i);
   // Keep the always-injected guide small enough to let the model drive.
   assert.ok(primer!.length < 2_400, `workspace primer grew to ${primer!.length} chars`);
 });

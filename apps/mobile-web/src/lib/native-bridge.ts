@@ -110,6 +110,25 @@ export function setConnectionDoor(door: ConnectionDoor): void {
   window.dispatchEvent(new CustomEvent(CONNECTION_EVENT, { detail: door }));
 }
 
+/**
+ * Tell the native shell that the currently loaded origin stopped answering.
+ *
+ * A failed fetch does not fail the WKWebView navigation that originally
+ * loaded the PWA, so Swift cannot otherwise know it should run the
+ * LAN -> Bonjour -> relay reconnect ladder. Plain browsers have no handler
+ * and simply keep the existing offline/retry behavior.
+ */
+export function reportConnectionLost(): boolean {
+  try {
+    const handler = window.webkit?.messageHandlers?.clemConnectionLost;
+    if (!handler) return false;
+    handler.postMessage('offline');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function tryRegister(deviceToken: string): Promise<boolean> {
   try {
     await registerApnsToken(deviceToken);

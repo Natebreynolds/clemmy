@@ -55,8 +55,10 @@ export type SurfaceConnectivity = 'connected' | 'reconnecting' | 'offline' | 'er
 const RUNNING_LIFECYCLES: ReadonlySet<SurfaceLifecycle> = new Set([
   'reasoning', 'retrieving', 'using_tool', 'fanout', 'reducing', 'verifying', 'retrying', 'completing',
 ]);
+/** True finals only. `blocked` is a host-owned park with a wake condition —
+ *  treating it as terminal is how a retryable hold became an ownerless stall. */
 const TERMINAL_LIFECYCLES: ReadonlySet<SurfaceLifecycle> = new Set([
-  'completed', 'failed', 'blocked', 'cancelled',
+  'completed', 'failed', 'cancelled',
 ]);
 
 export interface SurfaceTerminal {
@@ -64,6 +66,10 @@ export interface SurfaceTerminal {
   kind: string;
   text: string;
   resumable: boolean;
+}
+
+export function isFinalTerminalStatus(status: SurfaceTerminal['status']): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled';
 }
 
 export interface SurfaceRunSnapshot {
@@ -106,6 +112,11 @@ export interface SurfaceActivityLabel {
     | 'recalling_context'
     | 'finding_capability'
     | 'reading'
+    /** Concurrent tool calls in flight within ONE turn. Distinct from
+     *  `working_items`, which counts durable fan-out items across a plan: this
+     *  is the parallel wave the loop dispatched for the current model step, and
+     *  it is the thing a live run view exists to show. */
+    | 'calling'
     | 'working_items'
     | 'combining'
     | 'verifying'
@@ -127,6 +138,14 @@ export function renderActivityLabel(label: SurfaceActivityLabel): string {
     case 'recalling_context': return 'Checking remembered context';
     case 'finding_capability': return 'Finding the connected capability';
     case 'reading': return 'Reading connected data';
+    case 'calling': {
+      const total = typeof label.total === 'number' ? label.total : 0;
+      if (total <= 0) return 'Calling a tool';
+      const done = typeof label.completed === 'number' ? label.completed : 0;
+      return total === 1
+        ? 'Running 1 call'
+        : `Running ${total} calls in parallel${done > 0 ? ` · ${done} settled` : ''}`;
+    }
     case 'working_items': return `Working on${scope || ' the items'}`;
     case 'combining': return 'Combining results';
     case 'verifying': return 'Verifying the result';
@@ -181,8 +200,13 @@ export interface ProjectRunInput {
  * passes a running phase — the terminal is the truth, the phase is not.
  */
 export function projectRunSnapshot(input: ProjectRunInput): SurfaceRunSnapshot {
-  const terminal = input.typedTerminal;
-  const lifecycle: SurfaceLifecycle = terminal ? terminal.status : input.lifecycle;
+  const typed = input.typedTerminal;
+  const terminal = typed && isFinalTerminalStatus(typed.status) ? typed : undefined;
+  const lifecycle: SurfaceLifecycle = terminal
+    ? terminal.status
+    : typed?.status === 'blocked'
+      ? 'blocked'
+      : input.lifecycle;
 
   const liveness = deriveRunLiveness({
     lifecycle,
@@ -282,7 +306,7 @@ export function applyRunDelta(
   if (delta.runKey !== snapshot.runKey) return snapshot;
   if (delta.revision <= snapshot.revision) return snapshot;
   const patch = { ...delta.patch };
-  if (snapshot.terminal) {
+  if (snapshot.terminal && isFinalTerminalStatus(snapshot.terminal.status)) {
     delete patch.terminal;
     delete patch.lifecycle;
   }
@@ -293,6 +317,8 @@ export function applyRunDelta(
     runKey: snapshot.runKey,
     revision: delta.revision,
   };
-  if (next.terminal) next.lifecycle = next.terminal.status;
+  if (next.terminal && isFinalTerminalStatus(next.terminal.status)) {
+    next.lifecycle = next.terminal.status;
+  }
   return next;
 }

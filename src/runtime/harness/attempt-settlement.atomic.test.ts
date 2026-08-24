@@ -106,7 +106,7 @@ test('settleToolAttempt commits once and an exact carrier replay returns the per
   );
 });
 
-test('candidate elimination and its discovery epoch survive process-local cache reset', () => {
+test('candidate elimination survives cache reset without spending an already-unused discovery epoch', () => {
   const task = accept('unsupported candidate');
   const governor = new governorModule.DiscoveryGovernor();
   governor.initializeTask({ ...task, knownCapability: true });
@@ -125,8 +125,8 @@ test('candidate elimination and its discovery epoch survive process-local cache 
     result: { status: 404, successful: false },
   });
   assert.equal(first.outcome.directive.eliminatesCandidate, true);
-  assert.equal(first.openedDiscoveryEpoch, true);
-  assert.equal(governor.getTaskState(task)?.policy.epoch, 1);
+  assert.equal(first.openedDiscoveryEpoch, false);
+  assert.equal(governor.getTaskState(task)?.policy.epoch, 0);
 
   settlement._resetAttemptSettlementStateForTests();
   assert.equal(

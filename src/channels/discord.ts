@@ -30,6 +30,7 @@ import {
   createSession as createHarnessSession,
   finishRunAttempt,
   getActiveRunAttempt,
+  getHarnessChatRequestReceipt,
   getLatestRunAttemptByRunId,
   getSession as getHarnessSession,
   listEvents as listHarnessEvents,
@@ -47,6 +48,10 @@ import {
 } from '../runtime/harness/turn-outcome.js';
 import { publicUserInputText } from '../runtime/harness/public-presentation.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
+import {
+  claimSessionForAcceptedSource,
+  selectSessionForAcceptedSource,
+} from '../runtime/harness/accepted-source-session-branch.js';
 import { buildActivitySnapshot, formatElapsed } from '../shared/activity-snapshot.js';
 import {
   DISCORD_ALLOWED_CHANNELS,
@@ -1534,20 +1539,53 @@ async function runGatewayPrompt(input: {
   /** Tool activity callback surfaced by the runtime when tools start. */
   onToolActivity?: (activity: ToolActivity) => Promise<void> | void;
 }): Promise<GatewayResponse> {
-  const sessionId = getOrCreateDiscordSessionId({
-    channelId: input.channelId,
-    userId: input.userId,
-    guildId: input.guildId ?? undefined,
-  });
-  if (!getHarnessSession(sessionId)) {
+  const priorReceipt = input.runId ? getHarnessChatRequestReceipt(input.runId) : null;
+  const entrySessionId = priorReceipt?.sessionId ?? getOrCreateDiscordSessionId({
+      channelId: input.channelId,
+      userId: input.userId,
+      guildId: input.guildId ?? undefined,
+    });
+  if (!getHarnessSession(entrySessionId)) {
     createHarnessSession({
-      id: sessionId,
+      id: entrySessionId,
       kind: 'chat',
       channel: buildChannelLabelFromParts(input.channelId, input.guildId),
       userId: input.userId,
       title: input.prompt.trim().slice(0, 80),
-      metadata: { source: 'discord-gateway', channelId: input.channelId, guildId: input.guildId ?? null },
+      metadata: {
+        source: 'discord',
+        channelId: input.channelId,
+        userId: input.userId,
+        guildId: input.guildId ?? null,
+      },
     });
+  }
+  const sessionId = input.runId
+    ? claimSessionForAcceptedSource({
+      kind: 'ordinary',
+      entrySessionId,
+      durableSourceId: input.runId,
+      continuity: {
+        provider: 'discord',
+        scopeId: input.guildId ?? null,
+        conversationId: input.channelId,
+        audienceId: input.userId,
+      },
+      receipt: {
+        requestId: input.runId,
+        runId: input.runId,
+        inputHash: durablePayloadHash({
+          provider: 'discord',
+          scopeId: input.guildId ?? null,
+          conversationId: input.channelId,
+          audienceId: input.userId,
+          prompt: input.prompt,
+        }),
+      },
+    }).selection.sessionId
+    : entrySessionId;
+  if (!getHarnessSession(sessionId)) {
+    throw new Error(`accepted-source selector returned missing session ${sessionId}`);
   }
   const activeKey = discordGatewayRunKey(input);
   const activeRuns = activeDiscordGatewayRuns.get(activeKey) ?? new Map<string, { sessionId: string; attempt: RunAttemptRef }>();
@@ -1594,9 +1632,59 @@ async function continueDiscordSessionFromButton(input: {
   });
 }
 
+const MODEL_ENTERING_DISCORD_SLASH_COMMANDS = new Set(['ask', 'status', 'tasks', 'runs']);
+
+function discordSlashRunId(input: {
+  commandName: string;
+  channelId: string;
+  interactionId: string;
+}): string | null {
+  if (!MODEL_ENTERING_DISCORD_SLASH_COMMANDS.has(input.commandName)) return null;
+  return durableRequestIdentity(
+    'discord',
+    `${input.channelId}:${input.interactionId}`,
+  ).runId;
+}
+
+function bindDiscordSessionResumeForInteraction(input: {
+  targetSessionId: string;
+  channelId: string;
+  guildId: string | null;
+  userId: string;
+  interactionId: string;
+}): boolean {
+  if (!getHarnessSession(input.targetSessionId)) return false;
+  const durableSourceId = durableRequestIdentity(
+    'discord',
+    `${input.channelId}:${input.interactionId}`,
+  ).runId;
+  const selected = selectSessionForAcceptedSource({
+    kind: 'bound_control',
+    entrySessionId: input.targetSessionId,
+    targetSessionId: input.targetSessionId,
+    durableSourceId,
+    continuity: {
+      provider: 'discord',
+      scopeId: input.guildId,
+      conversationId: input.channelId,
+      audienceId: input.userId,
+    },
+  });
+  if (selected.sessionId !== input.targetSessionId) return false;
+  return bindDiscordHarnessSession({
+    channelId: input.channelId,
+    sessionId: selected.sessionId,
+    userId: input.userId,
+    guildId: input.guildId,
+    channel: 'discord',
+  });
+}
+
 export const __test__ = {
   claimDiscordInboundRequest,
   continueDiscordSessionFromButton,
+  bindDiscordSessionResumeForInteraction,
+  discordSlashRunId,
   handleDiscordCommand,
   handleDiscordRestCommand,
   runGatewayPrompt,
@@ -1739,10 +1827,13 @@ function backgroundTaskBelongsToDiscordContext(
 ): boolean {
   if (task.originSessionId && contextSessionIds.has(task.originSessionId)) return true;
   if (contextSessionIds.has(task.runSessionId)) return true;
-  if (task.channel === buildChannelLabelFromParts(input.channelId, input.guildId)) return true;
   const target = task.reportBackTarget;
-  if (target?.type === 'discord_channel' && target.channelId === input.channelId) return true;
   if (target?.type === 'discord_user' && target.userId === input.userId) return true;
+  // A channel/thread is shared by multiple humans. Channel-only legacy rows
+  // are not authority for a principal-scoped stop.
+  if (task.userId !== input.userId) return false;
+  if (task.channel === buildChannelLabelFromParts(input.channelId, input.guildId)) return true;
+  if (target?.type === 'discord_channel' && target.channelId === input.channelId) return true;
   return false;
 }
 
@@ -1760,9 +1851,19 @@ function stopDiscordContext(input: {
     targets.set(active.attemptId, { sessionId: active.sessionId, attempt: active });
   }
 
-  const boundHarnessSession = getBoundDiscordHarnessSessionId(input.channelId);
+  const boundHarnessSession = getBoundDiscordHarnessSessionId(
+    input.channelId,
+    'discord',
+    input.userId,
+    input.guildId ?? null,
+  );
   if (boundHarnessSession) contextSessionIds.add(boundHarnessSession);
-  const boundHarnessRun = resolveBoundChannelRunAttempt({ channelId: input.channelId, channel: 'discord' });
+  const boundHarnessRun = resolveBoundChannelRunAttempt({
+    channelId: input.channelId,
+    channel: 'discord',
+    userId: input.userId,
+    guildId: input.guildId ?? null,
+  });
   if (boundHarnessRun) {
     contextSessionIds.add(boundHarnessRun.sessionId);
     // Keying by attempt id intentionally collapses the durable SQLite result
@@ -1872,6 +1973,8 @@ async function handleDiscordCommand(
     await handleHarnessCancel({
       channelId: message.channelId,
       transport: buildDiscordMessageHarnessTransport(message),
+      userId: message.author.id,
+      guildId: message.guildId ?? null,
     });
     return completeControl('Discord session cancelled.');
   }
@@ -1880,6 +1983,8 @@ async function handleDiscordCommand(
     await handleHarnessNew({
       channelId: message.channelId,
       transport: buildDiscordMessageHarnessTransport(message),
+      userId: message.author.id,
+      guildId: message.guildId ?? null,
     });
     return completeControl('Fresh Discord session ready.');
   }
@@ -2123,6 +2228,8 @@ async function handleDiscordRestCommand(input: {
     await handleHarnessCancel({
       channelId: input.channelId,
       transport: buildDiscordRestTransport(input.channelId),
+      userId: input.userId,
+      guildId: input.guildId ?? null,
     });
     return completeControl('Discord session cancelled.');
   }
@@ -2131,6 +2238,8 @@ async function handleDiscordRestCommand(input: {
     await handleHarnessNew({
       channelId: input.channelId,
       transport: buildDiscordRestTransport(input.channelId),
+      userId: input.userId,
+      guildId: input.guildId ?? null,
     });
     return completeControl('Fresh Discord session ready.');
   }
@@ -2788,11 +2897,12 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         await interaction.reply({ content: 'That session button is malformed. Run `/sessions` again.', ephemeral: true });
         return;
       }
-      const bound = bindDiscordHarnessSession({
+      const bound = bindDiscordSessionResumeForInteraction({
+        targetSessionId: targetId,
         channelId: interaction.channelId ?? '',
-        sessionId: targetId,
-        userId: interaction.user.id,
         guildId: interaction.guildId,
+        userId: interaction.user.id,
+        interactionId: interaction.id,
       });
       await interaction.reply({
         content: bound
@@ -3260,6 +3370,11 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
   }
 
   try {
+    const slashRunId = discordSlashRunId({
+      commandName: interaction.commandName,
+      channelId: interaction.channelId,
+      interactionId: interaction.id,
+    });
     if (interaction.commandName === 'ping') {
       await interaction.reply({ content: 'Pong. Discord transport is live.', ephemeral: true });
       return;
@@ -3301,6 +3416,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
           channelId: interaction.channelId,
           userId: interaction.user.id,
           guildId: interaction.guildId,
+          runId: slashRunId!,
         });
         await sendInteractionChunks(interaction, response.text, { ephemeral: true });
         return;
@@ -3325,6 +3441,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
         channelId: interaction.channelId,
         userId: interaction.user.id,
         guildId: interaction.guildId,
+        runId: slashRunId!,
       });
       await sendInteractionChunks(interaction, response.text, { ephemeral: true });
       return;
@@ -3337,6 +3454,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
         channelId: interaction.channelId,
         userId: interaction.user.id,
         guildId: interaction.guildId,
+        runId: slashRunId!,
       });
       await sendInteractionChunks(interaction, response.text, { ephemeral: true });
       return;
@@ -3391,6 +3509,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction, assi
         channelId: interaction.channelId,
         userId: interaction.user.id,
         guildId: interaction.guildId,
+        runId: slashRunId!,
       });
       const suffix = response.pendingApprovalId
         ? `\n\nApproval pending: \`${response.pendingApprovalId}\``
@@ -3453,7 +3572,11 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
   }
   const durableRequest = {
     runId: ingress.identity.runId,
+    requestId: ingress.identity.requestId,
+    inputHash: ingress.payloadHash,
     sessionId: ingress.claim.record.sessionId,
+    userId: message.author.id,
+    scopeId: message.guildId ?? null,
     onSourceAccepted: (source: { sessionId: string; seq: number }) =>
       bindDiscordInboundAcceptedSource(ingress, source),
   };
@@ -3474,6 +3597,7 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
         allowGlobalApprovalFallback: message.channel.type === ChannelType.DM,
         durableRequest,
         userId: message.author.id,
+        scopeId: message.guildId ?? null,
         conversationKey: `discord:${message.channelId}`,
       })) {
         completeInbound({ ...ingress.inboxKey, runId: ingress.identity.runId, status: 'replied' });
@@ -3653,7 +3777,11 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
         }
         const durableRequest = {
           runId: ingress.identity.runId,
+          requestId: ingress.identity.requestId,
+          inputHash: ingress.payloadHash,
           sessionId: ingress.claim.record.sessionId,
+          userId: message.author.id,
+          scopeId: null,
           onSourceAccepted: (source: { sessionId: string; seq: number }) =>
             bindDiscordInboundAcceptedSource(ingress, source),
         };
@@ -3680,6 +3808,7 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
               allowGlobalApprovalFallback: true,
               durableRequest,
               userId: message.author.id,
+              scopeId: null,
               conversationKey: `discord:${dm.id}`,
             });
           } catch (err) {

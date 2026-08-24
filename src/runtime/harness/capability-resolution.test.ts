@@ -53,6 +53,7 @@ const {
   resolveTurnCapabilities,
   renderCapabilityResolutionForContext,
   recordCapabilityResolution,
+  provenComposioSlugForTurn,
   selectWarmableContractIdentifiers,
 } = await import('./capability-resolution.js');
 const { rememberToolChoice, invalidateToolChoice } = await import('../../memory/tool-choice-store.js');
@@ -359,6 +360,41 @@ test('an internal verification retry cannot tighten an unresolved continuation f
   assert.equal(state?.policy.broadDiscoveryAllowance, 1, 'the accepted continuation remains novel');
 });
 
+test('an exact learned CLI phrase can suppress MCP fail-open; weak overlap cannot', async () => {
+  rememberToolChoice({
+    intent: 'sf.data.query',
+    description: 'Auto-remembered: this local CLI read satisfied "What is the net MRR we sold as a team this week?".',
+    aliasSource: 'synthetic',
+    aliases: [{ intent: 'What is the net MRR we sold as a team this week?', source: 'synthetic' }],
+    choice: {
+      kind: 'cli',
+      identifier: 'sf',
+      invocationTemplate: 'sf data query --json --query "{{arg}}"',
+    },
+  });
+
+  const ask = 'What is the net MRR we sold as a team this week?';
+  const resolved = resolveTurnCapabilities(ask);
+  const cli = resolved.entries.find((entry) => entry.kind === 'cli' && entry.identifier === 'sf');
+  assert.ok(cli, 'the learned CLI query must surface from the exact phrase');
+  assert.equal(cli.status, 'proven');
+  const block = renderCapabilityResolutionForContext(resolved);
+  assert.match(block, /proven execution path: cli:sf/);
+  assert.match(block, /run_shell_command/);
+  assert.doesNotMatch(block, /call composio_execute_tool/);
+
+  const { resolveMcpToolScope } = await import('../mcp-tool-scope.js');
+  const exact = resolveMcpToolScope({ userInput: ask });
+  assert.equal(exact.maxTools, 0);
+  assert.deepEqual(exact.allowedServerSlugs, []);
+  assert.ok(!exact.failOpenCandidate);
+  assert.match(exact.reason, /proven local CLI capability/);
+
+  const weak = resolveMcpToolScope({ userInput: "what's on my calendar this week" });
+  assert.ok(weak.failOpenCandidate || (weak.maxTools ?? 0) > 0, 'weak alias overlap must not hide every connector');
+  assert.doesNotMatch(weak.reason, /proven local CLI capability/);
+});
+
 test('caller-constructed resolution data cannot manufacture known-capability authority', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
@@ -416,4 +452,137 @@ test('an unrelated focusInput renders no contract text', () => {
   assert.equal(renderCapabilityResolutionForContext(empty, {
     focusInput: 'tell me a story about clementines',
   }), '');
+});
+
+// ————— provenComposioSlugForTurn: consume the proof at the decision point —————
+// The 2026-08-18 calendar shape: the host proves a capability BEFORE the model
+// speaks; the first model call naming that exact identifier must land on the
+// carrier, not pay refusal tuition. These pin the lookup's authority hygiene:
+// per-source scoping, authoritative-resolution-only, newest-decisive.
+
+function seedResolutionEvent(sessionId: string, opts: {
+  sourceUserSeq?: number;
+  authoritativeForTask?: boolean;
+  identifier?: string;
+  status?: string;
+  connection?: string;
+} = {}) {
+  return appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'system',
+    type: 'capability_resolution',
+    data: {
+      entries: [{
+        intent: 'outlook.calendar.view_day',
+        kind: 'composio',
+        identifier: opts.identifier ?? 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+        status: opts.status ?? 'proven',
+        connection: opts.connection ?? 'active',
+      }],
+      registryAvailable: true,
+      authoritativeForTask: opts.authoritativeForTask ?? true,
+      ...(opts.sourceUserSeq !== undefined ? { sourceUserSeq: opts.sourceUserSeq } : {}),
+    },
+  });
+}
+
+test('a proven, connected identifier for this source resolves to its carrier slug', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  seedResolutionEvent(sess.id, { sourceUserSeq: 7 });
+  const hit = provenComposioSlugForTurn({
+    sessionId: sess.id,
+    sourceUserSeq: 7,
+    requestedTarget: 'outlook_list_calendar_calendar_view',
+  });
+  assert.deepEqual(hit, { slug: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW' }, 'casing must not defeat the proof');
+});
+
+test('an unproven SCREAMING_SNAKE name resolves nothing — the regex widening grants no authority', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  assert.equal(provenComposioSlugForTurn({
+    sessionId: sess.id,
+    sourceUserSeq: 7,
+    requestedTarget: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+  }), null, 'no resolution event → no remap');
+  assert.equal(provenComposioSlugForTurn({
+    sessionId: sess.id,
+    sourceUserSeq: 7,
+    requestedTarget: 'not a slug shape',
+  }), null);
+});
+
+test('proof scope: same-session prior proof carries; future and identity-free never do', () => {
+  // Re-pinned 2026-08-18 (session-fixture-remap-a seq 58306,
+  // session-fixture-remap-b seq 58040):
+  // exact-source-only scope made every continuation turn bounce a PROVEN
+  // slug as not_reachable. Same-session prior authoritative proof now
+  // carries the carrier remap; a source BEFORE the proof and a lookup with
+  // no identity still get nothing. Cross-session is pinned separately in
+  // provision-from-proof.test.ts.
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  seedResolutionEvent(sess.id, { sourceUserSeq: 7 });
+  assert.deepEqual(provenComposioSlugForTurn({
+    sessionId: sess.id,
+    sourceUserSeq: 9,
+    requestedTarget: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+  }), { slug: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW' }, 'same-session prior proof carries the remap');
+  assert.equal(provenComposioSlugForTurn({
+    sessionId: sess.id,
+    sourceUserSeq: 5,
+    requestedTarget: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+  }), null, 'proof recorded after this source is not yet its authority');
+  assert.equal(provenComposioSlugForTurn({
+    sessionId: sess.id,
+    requestedTarget: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+  }), null, 'no source identity → no proof consumption at all');
+});
+
+test('a non-authoritative resolution (internal verification retry) cannot authorize the remap', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  seedResolutionEvent(sess.id, { sourceUserSeq: 7, authoritativeForTask: true });
+  seedResolutionEvent(sess.id, {
+    sourceUserSeq: 7,
+    authoritativeForTask: false,
+    identifier: 'GMAIL_SEND_EMAIL',
+  });
+  assert.equal(provenComposioSlugForTurn({
+    sessionId: sess.id,
+    sourceUserSeq: 7,
+    requestedTarget: 'GMAIL_SEND_EMAIL',
+  }), null, 'the retry\'s capability is context, not task authority');
+  const hit = provenComposioSlugForTurn({
+    sessionId: sess.id,
+    sourceUserSeq: 7,
+    requestedTarget: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+  });
+  assert.deepEqual(hit, { slug: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW' },
+    'the older AUTHORITATIVE resolution for the same source still proves');
+});
+
+test('the newest authoritative resolution for the source is decisive', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  seedResolutionEvent(sess.id, { sourceUserSeq: 7 });
+  seedResolutionEvent(sess.id, { sourceUserSeq: 7, identifier: 'OUTLOOK_GET_EVENT' });
+  assert.equal(provenComposioSlugForTurn({
+    sessionId: sess.id,
+    sourceUserSeq: 7,
+    requestedTarget: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+  }), null, 'superseded by the newer resolution for the same source');
+});
+
+test('a proven identifier with a missing connection does not remap', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  seedResolutionEvent(sess.id, { sourceUserSeq: 7, connection: 'missing' });
+  assert.equal(provenComposioSlugForTurn({
+    sessionId: sess.id,
+    sourceUserSeq: 7,
+    requestedTarget: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
+  }), null);
 });

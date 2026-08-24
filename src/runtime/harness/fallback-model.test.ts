@@ -9,9 +9,12 @@ import {
   isOverloadError,
   isFalloverError,
   fallbackRouteResolution,
+  FallbackModel,
   type FallbackTarget,
   __test__,
 } from './fallback-model.js';
+import { classifyModelError } from './resilient-model.js';
+import { isAuthRecoverableError } from '../../execution/transient-error.js';
 import { BoundaryError } from '../boundary-error.js';
 
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'clemmy-fallback-model-test-'));
@@ -923,4 +926,66 @@ test('L2 (v2.3.0): an OVERLOADED brain joins the cooldown memo — the 529-storm
   const parseErr = BoundaryError.from(new Error('bad json'), { kind: 'model.invalid_output', retryable: false, userMessage: 'x' });
   markBrainRateLimited('claude-clean-test', parseErr);
   assert.equal(isBrainRateLimited('claude-clean-test'), false);
+});
+
+// ── GROK STAYS GROK (live 2026-08-19 daemon 32025): a real 401 on the brain
+// the USER pinned marked it auth-dead and silently preselected codex:rescue.
+// A credential failure on the user's chosen brain is THEIR edge to own — one
+// honest reconnect message, never a silent brain steal. And a tracing bug is
+// NEVER an auth failure. ──
+
+test('an auth failure on the USER-PINNED brain surfaces a reconnect edge — the rescue brain is never silently used', async () => {
+  process.env.BYO_BRAIN_MODEL_ID = 'grok-4.6';
+  try {
+    let rescueCalls = 0;
+    const authError = Object.assign(new Error('401 status code (no body)'), { status: 401 });
+    const chain = [
+      { label: 'grok-4.6', provider: 'byo', model: 'grok-4.6', getModel: () => ({
+        getResponse: async () => { throw authError; },
+        getStreamedResponse: (async function* () { throw authError; }) as never,
+      }) as never },
+      { label: 'codex:rescue', provider: 'codex', model: 'gpt-5.6-terra', getModel: () => ({
+        getResponse: async () => { rescueCalls += 1; return { output: [], usage: { requests: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0 } }; },
+        getStreamedResponse: (async function* () { yield undefined as never; }) as never,
+      }) as never },
+    ];
+    const model = new FallbackModel(chain as never);
+    await assert.rejects(
+      model.getResponse({ input: 'go', modelSettings: {}, tools: [], outputType: 'text', handoffs: [], tracing: false } as never),
+      /Reconnect it .*will not switch to a different brain/i,
+    );
+    assert.equal(rescueCalls, 0, 'the rescue brain never ran — no silent steal');
+  } finally {
+    delete process.env.BYO_BRAIN_MODEL_ID;
+  }
+});
+
+test('the same auth failure on a NON-pinned brain still falls over (rescue behavior preserved)', async () => {
+  delete process.env.BYO_BRAIN_MODEL_ID;
+  let rescueCalls = 0;
+  const authError = Object.assign(new Error('401 status code (no body)'), { status: 401 });
+  const chain = [
+    { label: 'grok-4.6', provider: 'byo', model: 'grok-4.6', getModel: () => ({
+      getResponse: async () => { throw authError; },
+      getStreamedResponse: (async function* () { throw authError; }) as never,
+    }) as never },
+    { label: 'codex:rescue', provider: 'codex', model: 'gpt-5.6-terra', getModel: () => ({
+      getResponse: async () => {
+        rescueCalls += 1;
+        return { output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'rescued' }] }], usage: { requests: 1, inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+      },
+      getStreamedResponse: (async function* () { yield undefined as never; }) as never,
+    }) as never },
+  ];
+  const model = new FallbackModel(chain as never);
+  const res = await model.getResponse({ input: 'go', modelSettings: {}, tools: [], outputType: 'text', handoffs: [], tracing: false } as never);
+  assert.ok(res);
+  assert.equal(rescueCalls, 1);
+});
+
+test('a tracing bug is NEVER an auth failure: "No existing trace found" does not classify auth-dead', () => {
+  const err = new Error('No existing trace found');
+  assert.equal(classifyModelError(err).isAuth, false);
+  assert.notEqual(classifyModelError(err).kind, 'model.auth_expired');
+  assert.equal(isAuthRecoverableError(err), false, 'tracing errors must not read as credential failures');
 });

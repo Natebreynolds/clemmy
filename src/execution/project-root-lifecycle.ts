@@ -30,6 +30,7 @@ import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 type ProjectRootTerminalStatus =
   | 'completed'
   | 'completed_with_errors'
+  | 'blocked'
   | 'error'
   | 'failed'
   | 'cancelled';
@@ -37,6 +38,7 @@ type ProjectRootTerminalStatus =
 const PROJECT_ROOT_TERMINAL_STATUSES = new Set<ProjectRootTerminalStatus>([
   'completed',
   'completed_with_errors',
+  'blocked',
   'error',
   'failed',
   'cancelled',
@@ -192,6 +194,7 @@ function terminalStatusMatchesOutcome(
 ): boolean {
   if (status === 'completed') return outcome === 'succeeded' || outcome === 'blocked';
   if (status === 'completed_with_errors') return outcome === 'partial';
+  if (status === 'blocked') return outcome === 'blocked';
   if (status === 'error' || status === 'failed') return outcome === 'blocked' || outcome === 'failed';
   return outcome === 'cancelled';
 }

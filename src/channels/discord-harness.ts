@@ -18,6 +18,7 @@
  *   wins regardless of how many events fired during the debounce.
  */
 import type { Message } from 'discord.js';
+import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { actionBus } from '../runtime/action-bus.js';
 import {
@@ -31,6 +32,7 @@ import {
   createSession as createHarnessSession,
   finishRunAttempt,
   getActiveRunAttempt,
+  getHarnessChatRequestReceipt,
   getLatestEventSeq,
   getLatestRunAttempt,
   getLatestRunAttemptByRunId,
@@ -50,7 +52,7 @@ import {
   verifiedWorkflowRunDispatchReceipts,
 } from '../runtime/harness/loop.js';
 import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
-import { respondViaClaudeAgentSdkBrain, claudeAgentSdkBrainEnabled } from '../runtime/harness/claude-agent-brain.js';
+import { buildContinueInput } from '../runtime/harness/continue-directive.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import {
   enqueueDurableChatTask,
@@ -71,6 +73,12 @@ import {
 import { classifyBackgroundInputReply } from '../execution/background-input-reply.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
+import {
+  claimSessionForAcceptedSource,
+  resolveAcceptedSourceIngressLineage,
+  selectSessionForAcceptedSource,
+} from '../runtime/harness/accepted-source-session-branch.js';
+import { durablePayloadHash } from './durable-request.js';
 import {
   pullRecentTurnsForSession,
   renderRelevantPriorWorkForModel,
@@ -118,12 +126,14 @@ import {
 } from '../runtime/harness/public-presentation.js';
 import type {
   ConversationPreambleDeliveryCallback,
+  ConversationPreambleDeliveryRequest,
   ConversationPreambleDeliveryResult,
 } from '../types.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
 import {
   advanceTransportProgress,
+  settleTransportProgress,
   shouldPaintChannelBody,
   type TransportProgressAction,
   type TransportProgressState,
@@ -134,6 +144,7 @@ import type {
   SurfaceLifecycle,
   SurfaceTerminal,
 } from '../runtime/graph/surface-projection.js';
+import { composeRunProgressLine, runPlanCounters } from '../runtime/harness/run-progress.js';
 import {
   exactOriginDeliveryTargetDigest,
   exactOriginDeliveryTargetFromSessionSnapshot,
@@ -306,7 +317,10 @@ export function shouldPostExpiryCheckIn(input: {
 
 export function shouldStreamLiveTextToMessage(channel: string, env: NodeJS.ProcessEnv = process.env): boolean {
   if (channel !== 'discord') return true;
-  const raw = (env.CLEMMY_DISCORD_LIVE_TEXT_STREAMING ?? 'off').trim().toLowerCase();
+  // Default ON (COMPOUNDING wave): the brain streams exactly ONE opening
+  // sentence per turn now — her own "on it" reaching the user as she says it
+  // was the felt-latency ask. The env stays as the kill-switch.
+  const raw = (env.CLEMMY_DISCORD_LIVE_TEXT_STREAMING ?? 'on').trim().toLowerCase();
   return raw === 'on' || raw === 'true' || raw === '1' || raw === 'yes';
 }
 
@@ -370,7 +384,24 @@ interface ChannelSessionEntry {
   lastUsedAt: number;
 }
 const channelSessions = new Map<string, ChannelSessionEntry>();
+const audienceChannelSessions = new Map<string, ChannelSessionEntry>();
 const CONTINUITY_WINDOW_MS = 30 * 60_000;
+
+interface ChannelAudienceIdentity {
+  channel: string;
+  channelId: string;
+  userId: string;
+  guildId: string | null;
+}
+
+function channelAudienceKey(input: ChannelAudienceIdentity): string {
+  return JSON.stringify([
+    input.channel.trim().toLowerCase(),
+    input.guildId?.trim() ?? '',
+    input.channelId.trim(),
+    input.userId.trim(),
+  ]);
+}
 
 export interface ActiveDiscordHarnessRun {
   channel: string;
@@ -385,9 +416,16 @@ export interface ActiveDiscordHarnessRun {
 
 export interface DurableChannelRequest {
   runId: string;
+  /** Stable transport receipt identity and the hash of the complete accepted
+   * provider payload. Ordinary ingress supplies both so session occupancy and
+   * receipt ownership commit before the user edge. */
+  requestId?: string;
+  inputHash?: string;
   /** Session chosen on first acceptance and recovered from the provider inbox
    *  on replay. It overrides continuity heuristics. */
   sessionId?: string;
+  userId?: string;
+  scopeId?: string | null;
   onSourceAccepted?: (source: EventRow) => void;
 }
 
@@ -470,6 +508,7 @@ function acceptDurableApprovalControl(input: {
   candidateApprovalIds?: string[];
   decision: 'approve' | 'reject';
   userId?: string;
+  scopeId?: string | null;
   conversationKey?: string;
   source?: 'channel_approval_control' | 'channel_send_consent';
   preserveUnsettledReplay?: boolean;
@@ -642,12 +681,23 @@ function stableApprovalReplySession(input: {
   durableRequest?: DurableChannelRequest;
   channelId: string;
   channel: string;
+  userId?: string;
+  scopeId?: string | null;
   candidateRows?: approvalRegistry.PendingApprovalRow[];
 }): string | null {
   if (input.durableRequest?.sessionId && getHarnessSession(input.durableRequest.sessionId)) {
     return input.durableRequest.sessionId;
   }
-  const bound = getOrHydrateChannelSession(input.channelId, input.channel);
+  const principalUserId = input.userId ?? input.durableRequest?.userId;
+  const principalScopeId = input.scopeId ?? input.durableRequest?.scopeId ?? null;
+  const bound = principalUserId
+    ? getOrHydrateAudienceSession({
+      channel: input.channel,
+      channelId: input.channelId,
+      userId: principalUserId,
+      guildId: principalScopeId,
+    })
+    : null;
   if (bound && getHarnessSession(bound.sessionId)) return bound.sessionId;
   const rows = input.candidateRows ?? [];
   const candidateSessions = [...new Set(rows.map((row) => row.sessionId))];
@@ -660,6 +710,8 @@ async function settleApprovalRoutingReply(input: {
   durableRequest?: DurableChannelRequest;
   channelId: string;
   channel: string;
+  userId?: string;
+  scopeId?: string | null;
   prompt: string;
   decision: 'approve' | 'reject';
   transport: DiscordHarnessTransport;
@@ -777,8 +829,16 @@ async function tryHandleBackgroundItControl(input: {
 }
 
 /** Bound origin session for finding background work dispatched by this chat. */
-export function getBoundDiscordHarnessSessionId(channelId: string, channel: string = 'discord'): string | null {
-  const recent = getOrHydrateChannelSession(channelId, channel);
+export function getBoundDiscordHarnessSessionId(
+  channelId: string,
+  channel: string = 'discord',
+  userId?: string,
+  guildId: string | null = null,
+): string | null {
+  const identity = userId ? { channel, channelId, userId, guildId } : null;
+  const recent = identity
+    ? getOrHydrateAudienceSession(identity)
+    : getOrHydrateChannelSession(channelId, channel);
   if (recent) return recent.sessionId;
 
   // A live attempt can legitimately outlast the conversational continuity
@@ -786,9 +846,18 @@ export function getBoundDiscordHarnessSessionId(channelId: string, channel: stri
   // warm process-local map (or on the user having spoken in the last 30m).
   // Rehydrate the durable channel binding when SQLite still says that exact
   // session owns an active attempt.
-  const durable = findMostRecentChannelSession(channelId, channel);
+  const durable = identity
+    ? findMostRecentAudienceSession(identity)
+    : findMostRecentChannelSession(channelId, channel);
   if (!durable || !getActiveRunAttempt(durable.sessionId)) return null;
-  channelSessions.set(channelId, { sessionId: durable.sessionId, lastUsedAt: durable.updatedAt });
+  if (identity) {
+    audienceChannelSessions.set(channelAudienceKey(identity), {
+      sessionId: durable.sessionId,
+      lastUsedAt: durable.updatedAt,
+    });
+  } else {
+    channelSessions.set(channelId, { sessionId: durable.sessionId, lastUsedAt: durable.updatedAt });
+  }
   return durable.sessionId;
 }
 
@@ -806,8 +875,15 @@ export interface BoundChannelRunAttempt {
 export function resolveBoundChannelRunAttempt(input: {
   channelId: string;
   channel?: string;
+  userId?: string;
+  guildId?: string | null;
 }): BoundChannelRunAttempt | null {
-  const sessionId = getBoundDiscordHarnessSessionId(input.channelId, input.channel ?? 'discord');
+  const sessionId = getBoundDiscordHarnessSessionId(
+    input.channelId,
+    input.channel ?? 'discord',
+    input.userId,
+    input.guildId ?? null,
+  );
   if (!sessionId) return null;
   const attempt = getActiveRunAttempt(sessionId);
   return attempt ? { sessionId, attempt } : null;
@@ -817,6 +893,8 @@ export function resolveBoundChannelRunAttempt(input: {
 export function requestBoundChannelRunStop(input: {
   channelId: string;
   channel?: string;
+  userId?: string;
+  guildId?: string | null;
   reason: string;
 }): BoundChannelRunAttempt | null {
   const target = resolveBoundChannelRunAttempt(input);
@@ -878,6 +956,67 @@ function getOrHydrateChannelSession(channelId: string, channel: string = 'discor
   return entry;
 }
 
+/** Ordinary chat continuity is a closed provider principal, never a
+ * channel-wide guess. The channel-only map above remains for explicit control
+ * discovery; it cannot select an ordinary accepted source. */
+function findMostRecentAudienceSession(
+  identity: ChannelAudienceIdentity,
+): { sessionId: string; updatedAt: number } | null {
+  try {
+    const row = openEventLog().prepare(`
+      SELECT id, updated_at FROM sessions
+       WHERE lower(COALESCE(json_extract(metadata_json, '$.source'), channel, '')) = ?
+         AND COALESCE(
+           json_extract(metadata_json, '$.channelId'),
+           json_extract(metadata_json, '$.discordChannelId'),
+           json_extract(metadata_json, '$.slackChannelId'),
+           ''
+         ) = ?
+         AND COALESCE(
+           user_id,
+           json_extract(metadata_json, '$.userId'),
+           json_extract(metadata_json, '$.discordUserId'),
+           json_extract(metadata_json, '$.slackUserId'),
+           ''
+         ) = ?
+         AND COALESCE(
+           json_extract(metadata_json, '$.guildId'),
+           json_extract(metadata_json, '$.discordGuildId'),
+           json_extract(metadata_json, '$.slackTeamId'),
+           ''
+         ) = ?
+       ORDER BY updated_at DESC
+       LIMIT 1
+    `).get(
+      identity.channel.trim().toLowerCase(),
+      identity.channelId,
+      identity.userId,
+      identity.guildId ?? '',
+    ) as { id?: string; updated_at?: string } | undefined;
+    if (!row?.id || !row.updated_at) return null;
+    return { sessionId: row.id, updatedAt: Date.parse(row.updated_at) };
+  } catch {
+    return null;
+  }
+}
+
+function getOrHydrateAudienceSession(identity: ChannelAudienceIdentity): ChannelSessionEntry | null {
+  const key = channelAudienceKey(identity);
+  const now = Date.now();
+  const existing = audienceChannelSessions.get(key);
+  if (existing && now - existing.lastUsedAt < CONTINUITY_WINDOW_MS) {
+    if (getHarnessSession(existing.sessionId)) return existing;
+    audienceChannelSessions.delete(key);
+  }
+  const recent = findMostRecentAudienceSession(identity);
+  if (!recent || !Number.isFinite(recent.updatedAt) || now - recent.updatedAt > CONTINUITY_WINDOW_MS) {
+    return null;
+  }
+  const entry = { sessionId: recent.sessionId, lastUsedAt: recent.updatedAt };
+  audienceChannelSessions.set(key, entry);
+  return entry;
+}
+
 /**
  * Per-channel staleness window. If the user's last interaction with
  * the channel-cached session was longer ago than this AND a fresh
@@ -908,10 +1047,22 @@ async function resolveOrCreateSession(opts: {
   /** Channel kind for the harness session (default 'discord'). Slack passes
    *  'slack' so sessions/continuity/activity stay correctly attributed. */
   channel?: string;
+  /** Stable provider message/run identity, selected before source acceptance. */
+  durableSourceId: string;
+  /** Present for real provider ingress. Selection, source occupancy, and the
+   * durable receipt then commit atomically before run/source acceptance. */
+  receipt?: { requestId: string; runId: string; inputHash: string };
 }): Promise<{ id: string; isContinuation: boolean }> {
   const channel = opts.channel ?? 'discord';
   const now = Date.now();
-  const existing = getOrHydrateChannelSession(opts.channelId, channel);
+  const identity: ChannelAudienceIdentity = {
+    channel,
+    channelId: opts.channelId,
+    userId: opts.userId,
+    guildId: opts.guildId,
+  };
+  const audienceKey = channelAudienceKey(identity);
+  let existing = getOrHydrateAudienceSession(identity);
   if (existing) {
     // Continuation is intentional ONLY when the channel was actively
     // engaged recently. After STALE_SESSION_MS without traffic, fresh
@@ -922,56 +1073,60 @@ async function resolveOrCreateSession(opts: {
     const elapsed = now - existing.lastUsedAt;
     if (elapsed <= STALE_SESSION_MS) {
       existing.lastUsedAt = now;
-      return { id: existing.sessionId, isContinuation: true };
+    } else {
+      audienceChannelSessions.delete(audienceKey);
+      existing = null;
     }
-    // Stale: drop the cached reference. The old session row + any
-    // pending approvals stay in the DB; they're just no longer the
-    // channel's "default."
-    channelSessions.delete(opts.channelId);
   }
-  const session = createHarnessSession({
-    kind: 'chat',
-    channel,
-    userId: opts.userId,
-    title: opts.prompt.length > 60 ? `${opts.prompt.slice(0, 57)}...` : opts.prompt,
-    metadata: {
-      source: channel,
-      channelId: opts.channelId,
+  // A transport retry may arrive after process restart, when the warm audience
+  // map is empty. Its immutable receipt is the owner and must win before we
+  // create even a blank candidate root.
+  const priorReceipt = opts.receipt
+    ? getHarnessChatRequestReceipt(opts.receipt.requestId)
+    : null;
+  const entrySessionId = priorReceipt?.sessionId ?? existing?.sessionId ?? createHarnessSession({
+      kind: 'chat',
+      channel,
       userId: opts.userId,
-      guildId: opts.guildId,
+      title: opts.prompt.length > 60 ? `${opts.prompt.slice(0, 57)}...` : opts.prompt,
+      metadata: {
+        source: channel,
+        channelId: opts.channelId,
+        userId: opts.userId,
+        guildId: opts.guildId,
+      },
+    }).id;
+  const selectionInput = {
+    kind: 'ordinary',
+    entrySessionId,
+    durableSourceId: opts.durableSourceId,
+    continuity: {
+      provider: channel,
+      scopeId: opts.guildId,
+      conversationId: opts.channelId,
+      audienceId: opts.userId,
     },
-  });
+  } as const;
+  const selected = opts.receipt
+    ? claimSessionForAcceptedSource({
+        ...selectionInput,
+        receipt: opts.receipt,
+      }).selection
+    : selectSessionForAcceptedSource(selectionInput);
+  if (!getHarnessSession(selected.sessionId)) {
+    throw new Error(`accepted-source selector returned missing session ${selected.sessionId}`);
+  }
   bindDiscordHarnessSession({
     channelId: opts.channelId,
-    sessionId: session.id,
+    sessionId: selected.sessionId,
     userId: opts.userId,
     guildId: opts.guildId,
+    channel,
   });
-
-  // Cross-session prefix: a fresh session created within the
-  // CROSS_SESSION_PREFIX_WINDOW of a prior same-channel session gets
-  // a synthetic system event prepended with the prior session's last
-  // user message + agent reply. Without this, session_history returns
-  // empty on turn 1 of the new session and the agent can't interpret
-  // back-references like "first 10 please" against the prior plan.
-  // (Observed 2026-05-24: 5:31s gap fragmented one coherent scoring
-  // conversation; the new session asked for clarification on something
-  // the prior session had already specified — 25/batch via firecrawl.)
-  try {
-    await seedCrossSessionPrefix(
-      session.id,
-      opts.channelId,
-      opts.userId,
-      now,
-      opts.prompt,
-      channel,
-      opts.priorWorkObjective ?? opts.prompt,
-    );
-  } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : String(err), channelId: opts.channelId }, 'cross-session prefix seed failed (non-fatal)');
-  }
-
-  return { id: session.id, isContinuation: false };
+  return {
+    id: selected.sessionId,
+    isContinuation: Boolean(existing) && selected.disposition === 'reused',
+  };
 }
 
 const CROSS_SESSION_PREFIX_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -1266,7 +1421,22 @@ function autoPinFocusFromPriorSessions(
 }
 
 /** Exposed for tests / a future /new command — drop the channel's session. */
-export function clearDiscordHarnessSession(channelId: string): void {
+export function clearDiscordHarnessSession(
+  channelId: string,
+  identity?: { channel?: string; userId: string; guildId?: string | null },
+): void {
+  if (identity) {
+    audienceChannelSessions.delete(channelAudienceKey({
+      channel: identity.channel ?? 'discord',
+      channelId,
+      userId: identity.userId,
+      guildId: identity.guildId ?? null,
+    }));
+    return;
+  }
+  // Legacy callers without a closed audience identity may only clear the
+  // legacy compatibility pointer. Principal-aware ingress must never disturb
+  // another user's exact continuity pointer in the same shared channel.
   channelSessions.delete(channelId);
 }
 
@@ -1275,15 +1445,34 @@ export function bindDiscordHarnessSession(input: {
   sessionId: string;
   userId?: string | null;
   guildId?: string | null;
+  channel?: string;
 }): boolean {
   const row = getHarnessSession(input.sessionId);
   if (!row) return false;
   const now = Date.now();
-  channelSessions.set(input.channelId, { sessionId: input.sessionId, lastUsedAt: now });
+  // Exact provider principals use the audience map exclusively. Mirroring
+  // them into the legacy channel-only pointer lets the last user in a shared
+  // channel overwrite another user's control target.
+  if (!input.userId) {
+    channelSessions.set(input.channelId, { sessionId: input.sessionId, lastUsedAt: now });
+  }
+  const channel = (input.channel ?? row.channel ?? String(row.metadata.source ?? 'discord')).trim().toLowerCase();
+  if (input.userId) {
+    audienceChannelSessions.set(channelAudienceKey({
+      channel,
+      channelId: input.channelId,
+      userId: input.userId,
+      guildId: input.guildId ?? null,
+    }), { sessionId: input.sessionId, lastUsedAt: now });
+  }
   try {
     updateHarnessSession(input.sessionId, {
       metadata: {
         ...row.metadata,
+        source: channel,
+        channelId: input.channelId,
+        userId: input.userId ?? row.metadata.userId ?? row.userId ?? null,
+        guildId: input.guildId ?? row.metadata.guildId ?? null,
         discordChannelId: input.channelId,
         discordUserId: input.userId ?? row.metadata.discordUserId ?? null,
         discordGuildId: input.guildId ?? row.metadata.discordGuildId ?? null,
@@ -1314,16 +1503,24 @@ export async function handleHarnessCancel(opts: {
   channelId: string;
   transport: DiscordHarnessTransport;
   channel?: string;
+  userId?: string;
+  guildId?: string | null;
 }): Promise<void> {
   const channel = opts.channel ?? 'discord';
-  const entry = getOrHydrateChannelSession(opts.channelId, channel);
+  const audienceIdentity = opts.userId
+    ? { channel, channelId: opts.channelId, userId: opts.userId, guildId: opts.guildId ?? null }
+    : null;
+  const entry = audienceIdentity
+    ? getOrHydrateAudienceSession(audienceIdentity)
+    : getOrHydrateChannelSession(opts.channelId, channel);
   if (!entry) {
     await opts.transport.sendError('Nothing to cancel — no paused session on this channel.');
     return;
   }
   const session = HarnessSession.load(entry.sessionId);
   if (!session) {
-    channelSessions.delete(opts.channelId);
+    if (audienceIdentity) audienceChannelSessions.delete(channelAudienceKey(audienceIdentity));
+    if (channelSessions.get(opts.channelId)?.sessionId === entry.sessionId) channelSessions.delete(opts.channelId);
     await opts.transport.sendError('Nothing to cancel — the session is no longer available.');
     return;
   }
@@ -1343,7 +1540,8 @@ export async function handleHarnessCancel(opts: {
   } catch {
     /* best effort — the user-facing confirmation still goes out */
   }
-  channelSessions.delete(opts.channelId);
+  if (audienceIdentity) audienceChannelSessions.delete(channelAudienceKey(audienceIdentity));
+  if (channelSessions.get(opts.channelId)?.sessionId === entry.sessionId) channelSessions.delete(opts.channelId);
 
   // Emit a harness event so the audit log + dashboard see the cancel.
   try {
@@ -1387,9 +1585,41 @@ export async function handleHarnessNew(opts: {
   channelId: string;
   transport: DiscordHarnessTransport;
   channel?: string;
+  userId?: string;
+  guildId?: string | null;
 }): Promise<void> {
-  const entry = getOrHydrateChannelSession(opts.channelId, opts.channel ?? 'discord');
-  channelSessions.delete(opts.channelId);
+  const channel = opts.channel ?? 'discord';
+  const audienceIdentity = opts.userId
+    ? { channel, channelId: opts.channelId, userId: opts.userId, guildId: opts.guildId ?? null }
+    : null;
+  const entry = audienceIdentity
+    ? getOrHydrateAudienceSession(audienceIdentity)
+    : getOrHydrateChannelSession(opts.channelId, channel);
+  if (audienceIdentity) audienceChannelSessions.delete(channelAudienceKey(audienceIdentity));
+  if (entry && channelSessions.get(opts.channelId)?.sessionId === entry.sessionId) {
+    channelSessions.delete(opts.channelId);
+  }
+  if (audienceIdentity) {
+    const fresh = createHarnessSession({
+      kind: 'chat',
+      channel,
+      userId: audienceIdentity.userId,
+      title: 'Fresh conversation',
+      metadata: {
+        source: channel,
+        channelId: audienceIdentity.channelId,
+        userId: audienceIdentity.userId,
+        guildId: audienceIdentity.guildId,
+      },
+    });
+    bindDiscordHarnessSession({
+      channel,
+      channelId: audienceIdentity.channelId,
+      sessionId: fresh.id,
+      userId: audienceIdentity.userId,
+      guildId: audienceIdentity.guildId,
+    });
+  }
 
   if (entry) {
     const pending = approvalRegistry.listPending({ sessionId: entry.sessionId, status: 'pending' });
@@ -1685,28 +1915,11 @@ export function readLastConversationCompletion(sessionId: string): {
   }
 }
 
-export function isContinueCompletionReason(reason: unknown): boolean {
-  return reason === 'awaiting_continue' || reason === 'limit_exceeded';
-}
-
-/**
- * Build the synthetic input the orchestrator sees on a /continue
- * resume. The session history is replayed in full via
- * session.toInputItems, so the model already has all prior turns —
- * this prompt just gives it explicit permission to keep going + a
- * pointer to the last decision's summary so it doesn't restart from
- * scratch.
- */
-function buildContinueInput(lastSummary: string | undefined): string {
-  return [
-    'You hit a step / time budget on the previous turn and the user has now replied `continue`.',
-    'Pick up where you left off; do not restart the workflow from scratch.',
-    lastSummary
-      ? `Your last summary on the prior turn was: "${lastSummary.slice(0, 400)}".`
-      : 'Use the conversation history above to figure out where you were.',
-    'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.',
-  ].join('\n\n');
-}
+// The continue directive is host infrastructure shared by the human resume
+// path (here + console) and the never-resting auto-resume in the bridge; one
+// author lives in continue-directive.ts. Re-exported for existing importers.
+import { isContinueCompletionReason } from '../runtime/harness/continue-directive.js';
+export { isContinueCompletionReason };
 
 /**
  * True if the harness session for this channel is currently paused
@@ -1714,8 +1927,15 @@ function buildContinueInput(lastSummary: string | undefined): string {
  * cleared (e.g. by a daemon restart) so the durable interrupt state
  * stays addressable through "approve" / "reject" replies.
  */
-export function isChannelSessionAwaitingApproval(channelId: string, channel: string = 'discord'): boolean {
-  const entry = getOrHydrateChannelSession(channelId, channel);
+export function isChannelSessionAwaitingApproval(
+  channelId: string,
+  channel: string = 'discord',
+  userId?: string,
+  guildId: string | null = null,
+): boolean {
+  const entry = userId
+    ? getOrHydrateAudienceSession({ channel, channelId, userId, guildId })
+    : getOrHydrateChannelSession(channelId, channel);
   if (!entry) return false;
   const sess = HarnessSession.load(entry.sessionId);
   return !!sess && !!sess.loadInterruptState();
@@ -1746,12 +1966,20 @@ function typedPlanApprovalEnabled(): boolean {
  * can never shadow a registry row. Returns 'approved' | 'rejected' | null
  * (no pending plan / not an approval phrase / disabled).
  */
-export function maybeResolvePendingPlanProposal(channelId: string, prompt: string, channel: string = 'discord'): 'approved' | 'rejected' | null {
+export function maybeResolvePendingPlanProposal(
+  channelId: string,
+  prompt: string,
+  channel: string = 'discord',
+  userId?: string,
+  guildId: string | null = null,
+): 'approved' | 'rejected' | null {
   if (!typedPlanApprovalEnabled()) return null;
   const intent = parseApprovalIntent(prompt);
   // An intent carrying an apr- id is a registry approval, not a plan approval.
   if (!intent || intent.approvalId) return null;
-  const entry = getOrHydrateChannelSession(channelId, channel);
+  const entry = userId
+    ? getOrHydrateAudienceSession({ channel, channelId, userId, guildId })
+    : getOrHydrateChannelSession(channelId, channel);
   if (!entry) return null;
   let pending: ReturnType<typeof listPlanProposals>;
   try {
@@ -1801,6 +2029,37 @@ function approvalOriginMatchesDiscordChannel(
   // without letting old approvals from another thread bleed in.
   const entry = getOrHydrateChannelSession(channelId, channel);
   return entry?.sessionId === row.sessionId;
+}
+
+/** Provider-originated approval discovery is private to the exact audience.
+ * A channel id alone is not an authority boundary in a shared guild/thread.
+ * Explicit IDs may still address an older detached session after `/new`, but
+ * only when that target carries the same closed provider/scope/conversation/
+ * audience identity. */
+function approvalTargetMatchesAudience(input: {
+  row: approvalRegistry.PendingApprovalRow;
+  channelId: string;
+  channel: string;
+  userId: string;
+  scopeId: string | null;
+}): boolean {
+  const lineage = resolveAcceptedSourceIngressLineage({
+    sessionId: input.row.sessionId,
+    provider: input.channel,
+    scopeId: input.scopeId,
+    audienceId: input.userId,
+  });
+  return lineage?.conversationId === input.channelId;
+}
+
+function pendingApprovalsForAudience(input: {
+  channelId: string;
+  channel: string;
+  userId: string;
+  scopeId: string | null;
+}): approvalRegistry.PendingApprovalRow[] {
+  return pendingDiscordApprovalsForChannel(input.channelId, input.channel)
+    .filter((row) => approvalTargetMatchesAudience({ row, ...input }));
 }
 
 function pendingDiscordApprovalsForChannel(channelId: string, channel: string = 'discord'): approvalRegistry.PendingApprovalRow[] {
@@ -1998,16 +2257,32 @@ function exactBareApprovalCandidate(
   return rows.length === 1 ? rows[0] : null;
 }
 
-function globalApprovalRowsForDm(channelId: string, channel: string = 'discord'): approvalRegistry.PendingApprovalRow[] {
-  const boundSessionId = getOrHydrateChannelSession(channelId, channel)?.sessionId ?? null;
-  const activeSessionIds = new Set(resolveActiveDiscordHarnessRuns({ channelId, channel }).map((run) => run.sessionId));
+function globalApprovalRowsForDm(
+  channelId: string,
+  channel: string = 'discord',
+  userId?: string,
+  scopeId: string | null = null,
+): approvalRegistry.PendingApprovalRow[] {
+  const boundSessionId = userId
+    ? getOrHydrateAudienceSession({ channelId, channel, userId, guildId: scopeId })?.sessionId ?? null
+    : getOrHydrateChannelSession(channelId, channel)?.sessionId ?? null;
+  const activeSessionIds = new Set(resolveActiveDiscordHarnessRuns({
+    channelId,
+    channel,
+    userId,
+    guildId: scopeId,
+  }).map((run) => run.sessionId));
   if (boundSessionId) activeSessionIds.add(boundSessionId);
   return approvalRegistry
     .listPending({ status: 'pending' })
     .filter(approvalRegistry.isFormalApprovalSurface)
     .filter((row) => {
       if (!approvalRegistry.isActionable(row)) return false;
-      if (isDiscordApproval(row, channel)) return approvalBelongsToDiscordChannel(row, channelId, channel);
+      if (isDiscordApproval(row, channel)) {
+        return userId
+          ? approvalTargetMatchesAudience({ row, channelId, channel, userId, scopeId })
+          : approvalBelongsToDiscordChannel(row, channelId, channel);
+      }
       if (activeSessionIds.has(row.sessionId)) return true;
 
       // A workflow/background approval is relevant only when its durable run is
@@ -2071,6 +2346,7 @@ async function sendApprovalPicker(
 }
 
 export const __test__ = {
+  resolveOrCreateSessionForTest: resolveOrCreateSession,
   createChannelConversationPreambleDelivery,
   approvalBelongsToDiscordChannel,
   approvalComponentsForState,
@@ -2161,6 +2437,7 @@ export async function tryHandleHarnessApprovalReply(opts: {
   /** Exact provider human and conversation for ordinary-question consent.
    * Formal card/button routes intentionally do not depend on these fields. */
   userId?: string;
+  scopeId?: string | null;
   conversationKey?: string;
 }): Promise<boolean> {
   const channel = opts.channel ?? 'discord';
@@ -2243,6 +2520,32 @@ export async function tryHandleHarnessApprovalReply(opts: {
       });
       return true;
     }
+    if (
+      opts.userId
+      && isDiscordApproval(row, channel)
+      && !approvalTargetMatchesAudience({
+        row,
+        channelId: opts.channelId,
+        channel,
+        userId: opts.userId,
+        scopeId: opts.scopeId ?? null,
+      })
+    ) {
+      await settleApprovalRoutingReply({
+        durableRequest: opts.durableRequest,
+        channelId: opts.channelId,
+        channel,
+        userId: opts.userId,
+        scopeId: opts.scopeId ?? null,
+        prompt: opts.prompt,
+        decision: intent.decision,
+        approvalId: row.approvalId,
+        transport: opts.transport,
+        text: `Approval \`${row.approvalId}\` belongs to a different or stale conversation.`,
+        status: 'needs_input',
+      });
+      return true;
+    }
     if (row.presentation) {
       await settleApprovalRoutingReply({
         durableRequest: opts.durableRequest,
@@ -2312,7 +2615,12 @@ export async function tryHandleHarnessApprovalReply(opts: {
       await opts.transport.sendInitial(text);
       return true;
     }
-    if (canResumeInDiscord && isChannelSessionAwaitingApproval(opts.channelId, channel)) {
+    if (canResumeInDiscord && isChannelSessionAwaitingApproval(
+      opts.channelId,
+      channel,
+      opts.userId,
+      opts.scopeId ?? null,
+    )) {
       await runDiscordHarnessResume({
         channelId: opts.channelId,
         decision: intent.decision,
@@ -2321,6 +2629,8 @@ export async function tryHandleHarnessApprovalReply(opts: {
         transport: opts.transport,
         channel,
         durableRequest: opts.durableRequest,
+        userId: opts.userId,
+        guildId: opts.scopeId ?? null,
       });
       return true;
     }
@@ -2336,6 +2646,8 @@ export async function tryHandleHarnessApprovalReply(opts: {
         allowDetachedNonDiscord: true,
         channel,
         durableRequest: opts.durableRequest,
+        userId: opts.userId,
+        guildId: opts.scopeId ?? null,
       });
       return true;
     }
@@ -2383,7 +2695,12 @@ export async function tryHandleHarnessApprovalReply(opts: {
     return true;
   }
   if (opts.allowGlobalApprovalFallback) {
-    const rows = globalApprovalRowsForDm(opts.channelId, channel);
+    const rows = globalApprovalRowsForDm(
+      opts.channelId,
+      channel,
+      opts.userId,
+      opts.scopeId ?? null,
+    );
     if (rows.length === 1) {
       const row = rows[0];
       const detachedSession = HarnessSession.load(row.sessionId);
@@ -2397,6 +2714,8 @@ export async function tryHandleHarnessApprovalReply(opts: {
           allowDetachedNonDiscord: true,
           channel,
           durableRequest: opts.durableRequest,
+          userId: opts.userId,
+          guildId: opts.scopeId ?? null,
         });
         return true;
       }
@@ -2461,7 +2780,12 @@ export async function tryHandleHarnessApprovalReply(opts: {
       return true;
     }
   }
-  if (!isChannelSessionAwaitingApproval(opts.channelId, channel)) {
+  if (!isChannelSessionAwaitingApproval(
+    opts.channelId,
+    channel,
+    opts.userId,
+    opts.scopeId ?? null,
+  )) {
     if (opts.onlyIfApprovalPending) return false;
     // NOTHING IS PENDING, SO THIS WAS NEVER AN APPROVAL. Without an explicit
     // apr-id, "go ahead" / "do it" / "proceed" is ordinary conversation —
@@ -2493,6 +2817,8 @@ export async function tryHandleHarnessApprovalReply(opts: {
     transport: opts.transport,
     channel,
     durableRequest: opts.durableRequest,
+    userId: opts.userId,
+    guildId: opts.scopeId ?? null,
   });
   return true;
 }
@@ -2548,6 +2874,11 @@ export interface DiscordHarnessTransport {
     deliveryKey: string;
     content: string;
   }): Promise<void>;
+  /** Idempotent edit of the exact placeholder already owned by this request.
+   * The stable deliveryKey is transport correlation, never model authority. */
+  deliverConversationPreamble?(input: ConversationPreambleDeliveryRequest & {
+    content: string;
+  }): Promise<{ target: string }>;
 }
 
 export interface DiscordHarnessReplyHandle {
@@ -2603,6 +2934,9 @@ export interface DisplayState {
    * so every surface says the same thing about the same run.
    */
   activityLine?: string;
+  /** Durable session behind this message. Lets the ticker project ledger
+   * plan truth (composeRunProgressLine) instead of a generic working line. */
+  sessionId?: string;
 }
 
 interface ChannelConversationPreambleDeliveryInput {
@@ -2619,30 +2953,44 @@ interface ChannelConversationPreambleDeliveryInput {
 function createChannelConversationPreambleDelivery(
   input: ChannelConversationPreambleDeliveryInput,
 ): ConversationPreambleDeliveryCallback {
-  return async (value): Promise<ConversationPreambleDeliveryResult> => {
+  return async (request): Promise<ConversationPreambleDeliveryResult> => {
     let text: string;
-    try { text = assertPublicPresentationText(value); } catch {
+    try { text = assertPublicPresentationText(request.text); } catch {
       return { status: 'failed', reason: 'delivery_failed' };
     }
-    if (input.progressPresentation === 'quiet') return { status: 'delivered' };
+    const receipt = (surface: 'channel_message' | 'not_applicable', target: string) => ({
+      version: 1 as const,
+      deliveryKey: request.deliveryKey,
+      eventId: request.eventId,
+      eventDigest: request.eventDigest,
+      surface,
+      target,
+    });
+    if (input.progressPresentation === 'quiet') {
+      return {
+        status: 'not_applicable',
+        reason: 'quiet_presentation',
+        receipt: receipt('not_applicable', 'quiet_presentation'),
+      };
+    }
     if (input.isFinalized()) return { status: 'failed', reason: 'transport_unavailable' };
     input.state.summary = text;
     input.state.done = false;
     if (input.state.toolCount === 0) input.state.status = 'starting';
     const body = renderBody(input.state);
     try {
-      await input.handle.edit(body);
+      const delivered = input.transport.deliverConversationPreamble
+        ? await input.transport.deliverConversationPreamble({ ...request, content: body })
+        : (await input.handle.edit(body), { target: 'active_placeholder' });
+      const target = delivered.target.replace(/\s+/g, ' ').trim().slice(0, 512);
+      if (!target) return { status: 'failed', reason: 'delivery_failed' };
       input.onPaint?.(body);
-      return { status: 'delivered' };
+      return { status: 'delivered', receipt: receipt('channel_message', target) };
     } catch (err) {
       if (isDiscordTokenExpired(err)) input.onTokenExpired?.();
-      if (!input.transport.sendFollowup) return { status: 'failed', reason: 'delivery_failed' };
-      try {
-        await input.transport.sendFollowup(text);
-        return { status: 'delivered' };
-      } catch {
-        return { status: 'failed', reason: 'delivery_failed' };
-      }
+      // A fresh follow-up is not idempotent across send-before-receipt crashes.
+      // Leave the plan inactive so an exact placeholder edit can be retried.
+      return { status: 'failed', reason: 'delivery_failed' };
     }
   };
 }
@@ -2722,6 +3070,14 @@ function createChannelProgressLane(input: {
       attempt = null;
     }
     const activity = channelActivityForState(state);
+    // Project plan truth into the ticker: "Working on 2 of 3" instead of an
+    // unchanging "Working on the items" for a 16-minute run (live 2026-08-18).
+    if (activity.label.phase === 'working_items') {
+      const counters = runPlanCounters(input.sessionId);
+      if (counters) {
+        activity.label = { phase: 'working_items', completed: counters.completed, total: counters.total };
+      }
+    }
     const terminal = withTerminal ? channelTerminalForState(state) : undefined;
     return projectChatAttemptActivity({
       sessionId: input.sessionId,
@@ -2751,7 +3107,13 @@ function createChannelProgressLane(input: {
       return advanced.action;
     },
     settle(state, nowMs) {
-      const advanced = advanceTransportProgress(project(state, nowMs, true), progress, nowMs);
+      const terminal = channelTerminalForState(state);
+      const advanced = settleTransportProgress(
+        project(state, nowMs, true),
+        progress,
+        nowMs,
+        terminal?.status === 'blocked' ? terminal : undefined,
+      );
       progress = advanced.state;
       return advanced.action;
     },
@@ -3183,7 +3545,16 @@ function renderBody(state: DisplayState): string {
   // history — that read as "the agent is confused" in earlier UX.
   // The milestone line is the shared projection's when the lane has asserted
   // one; the raw event status is the fallback for states it does not cover.
-  const line = state.activityLine || state.status || 'working…';
+  // Project the ledger's composed plan line over GENERIC working copy only.
+  // "Working on the items · N tools" for a 16-minute run reads as a stall
+  // while the plan ledger knows "plan 1/3 steps underway · 25-item collection"
+  // (live 2026-08-18 session-fixture-unprovisioned-catalog: 13 ledger heartbeats never reached the
+  // Discord copy). Specific lines (approval waits, watcher steers) are kept;
+  // composeRunProgressLine returns the fallback untouched when no plan exists.
+  const rawLine = state.activityLine || state.status || 'working…';
+  const line = state.sessionId && /^(?:working\b|still working\b|starting\b)/i.test(rawLine)
+    ? composeRunProgressLine({ sessionId: state.sessionId, fallback: rawLine })
+    : rawLine;
   const verb = state.currentAgent ? `${state.currentAgent} · ${line}` : line;
   const elapsed = formatElapsedMs(state.turnStartedAt ? Date.now() - state.turnStartedAt : 0);
   const counter = state.toolCount >= 3 ? ` · ${state.toolCount} tools` : '';
@@ -3485,13 +3856,6 @@ export async function runDiscordHarnessConversation(opts: {
   const rawPromptForIntent = opts.rawPrompt ?? opts.prompt;
   const progressPresentation = progressPresentationForPrompt(rawPromptForIntent);
 
-  const auth = await configureHarnessRuntime();
-  if (!auth.ok) {
-    logger.warn({ reason: auth.reason }, 'Discord/Slack harness start blocked by unavailable model runtime');
-    await transport.sendError(PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT);
-    return;
-  }
-
   // Harness-control commands (/cancel, /new, /continue) — handled
   // BEFORE approval routing so a user-typed "cancel" abandons the
   // pause instead of counting as a reject (the old matcher conflated
@@ -3499,11 +3863,11 @@ export async function runDiscordHarnessConversation(opts: {
   // "resolving" the action).
   const command = parseHarnessCommand(prompt);
   if (command === 'cancel') {
-    await handleHarnessCancel({ channelId, transport, channel });
+    await handleHarnessCancel({ channelId, transport, channel, userId, guildId });
     return;
   }
   if (command === 'new') {
-    await handleHarnessNew({ channelId, transport, channel });
+    await handleHarnessNew({ channelId, transport, channel, userId, guildId });
     // Fall through is intentional — /new just clears the
     // channel-cached session; the rest of this function then creates
     // a fresh one. But the user's actual prompt was "/new", not
@@ -3522,15 +3886,13 @@ export async function runDiscordHarnessConversation(opts: {
     // may still carry limit_exceeded. Rewrite only those cases into a
     // structured continuation directive; otherwise leave `continue` as
     // a regular user message.
-    const entry = getOrHydrateChannelSession(channelId, channel);
+    const entry = getOrHydrateAudienceSession({ channel, channelId, userId, guildId });
     if (entry) {
       if (await maybeRouteParkedBackgroundReply({ sessionId: entry.sessionId, message: prompt, transport })) return;
       const lastCompletion = readLastConversationCompletion(entry.sessionId);
       if (lastCompletion && isContinueCompletionReason(lastCompletion.reason)) {
         prompt = buildContinueInput(lastCompletion.lastDecisionSummary);
       }
-    } else if (await maybeRouteParkedBackgroundReply({ channelLabel, channelId, channel, message: prompt, transport })) {
-      return;
     }
   }
 
@@ -3539,7 +3901,7 @@ export async function runDiscordHarnessConversation(opts: {
   // approval and continue THAT session instead of starting fresh.
   // Anything else while paused is treated as a regular new turn
   // (which will append on top of the existing session via continuity).
-  if (isChannelSessionAwaitingApproval(channelId, channel)) {
+  if (isChannelSessionAwaitingApproval(channelId, channel, userId, guildId)) {
     const intent = parseApprovalIntent(prompt);
     if (intent) {
       await runDiscordHarnessResume({
@@ -3549,6 +3911,9 @@ export async function runDiscordHarnessConversation(opts: {
         userText: rawPromptForIntent,
         transport,
         channel,
+        userId,
+        guildId,
+        durableRequest: opts.durableRequest,
       });
       return;
     }
@@ -3568,11 +3933,8 @@ export async function runDiscordHarnessConversation(opts: {
     transport,
   })) return;
 
-  const parkedEntry = getOrHydrateChannelSession(channelId, channel);
+  const parkedEntry = getOrHydrateAudienceSession({ channel, channelId, userId, guildId });
   if (parkedEntry && await maybeRouteParkedBackgroundReply({ sessionId: parkedEntry.sessionId, message: prompt, transport })) {
-    return;
-  }
-  if (!parkedEntry && await maybeRouteParkedBackgroundReply({ channelLabel, channelId, channel, message: prompt, transport })) {
     return;
   }
 
@@ -3582,11 +3944,18 @@ export async function runDiscordHarnessConversation(opts: {
   // pending plan. Resolve it, then re-engage the SAME turn with a clear
   // directive so Clem proceeds with the now-active goal (approvePlanProposal
   // activated it + opened its scope).
-  const planConsent = maybeResolvePendingPlanProposal(channelId, prompt, channel);
+  const planConsent = maybeResolvePendingPlanProposal(channelId, prompt, channel, userId, guildId);
   if (planConsent === 'approved') {
     prompt = 'Plan approved — proceed with the plan now, and report back when done.';
   } else if (planConsent === 'rejected') {
     prompt = 'I rejected that plan. Do NOT proceed with it — ask me what to change.';
+  }
+
+  const auth = await configureHarnessRuntime();
+  if (!auth.ok) {
+    logger.warn({ reason: auth.reason }, 'Discord/Slack harness start blocked by unavailable model runtime');
+    await transport.sendError(PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT);
+    return;
   }
 
   const durableSession = opts.durableRequest?.sessionId
@@ -3604,10 +3973,24 @@ export async function runDiscordHarnessConversation(opts: {
       prompt,
       channel,
       priorWorkObjective: rawPromptForIntent,
+      durableSourceId: opts.durableRequest?.runId ?? `legacy:${channel}:${randomUUID()}`,
+      ...(opts.durableRequest ? {
+        receipt: {
+          requestId: opts.durableRequest.requestId ?? opts.durableRequest.runId,
+          runId: opts.durableRequest.runId,
+          inputHash: opts.durableRequest.inputHash ?? durablePayloadHash({
+            channel,
+            channelId,
+            guildId,
+            userId,
+            prompt: rawPromptForIntent,
+          }),
+        },
+      } : {}),
     });
-  if (durableSession) {
-    bindDiscordHarnessSession({ channelId, sessionId: durableSession.id, userId, guildId });
-  }
+  // Receipt replay owns this delivery but intentionally does not move the
+  // audience's ordinary pointer (for example an approval replay from a
+  // pre-/new root).
   if (opts.durableRequest) {
     const prior = acceptedSourceForDurableRun({
       sessionId: session.id,
@@ -3639,6 +4022,9 @@ export async function runDiscordHarnessConversation(opts: {
       await transport.sendInitial(failed.presentation.text);
       return;
     }
+  }
+  if (!getHarnessSession(session.id)) {
+    throw new Error(`accepted Discord/Slack source has no selected session ${session.id}`);
   }
   // Register before the placeholder/preflight/model dispatch. A second Discord
   // message saying "stop" can now target this exact attempt even in the small
@@ -3723,6 +4109,7 @@ export async function runDiscordHarnessConversation(opts: {
     progressPresentation,
     toolsCalled: [],
     toolCount: 0,
+    sessionId: session.id,
   };
   // Every progress decision on this message — speak or stay quiet, what the
   // milestone says, whether the run is already settled — comes from the shared
@@ -4138,7 +4525,7 @@ export async function runDiscordHarnessConversation(opts: {
       // `prompt`. Skip when the session is paused on an approval so a stray
       // durable phrase can't orphan an in-flight gated workflow.
       const promoteToDurable = !goalRunInput
-        && !isChannelSessionAwaitingApproval(channelId, channel)
+        && !isChannelSessionAwaitingApproval(channelId, channel, userId, guildId)
         && shouldPromoteToDurable(rawPromptForIntent);
       if (promoteToDurable) {
         const task = enqueueDurableChatTask({
@@ -4170,17 +4557,12 @@ export async function runDiscordHarnessConversation(opts: {
         if (preflight.surfaced) return;
       }
       const effectiveInput = goalRunInput ?? prompt;
-      // Desktop↔Discord continuity: when the agentic Claude brain is enabled
-      // (claude_oauth + CLEMMY_CLAUDE_AGENT_SDK_BRAIN), Discord runs the SAME
-      // brain as desktop instead of the harness loop's text-only headless Claude.
-      // The brain emits conversation_completed + runtime.completed via appendEvent
-      // → actionBus 'harness.public_event' → this handler's subscriber delivers them
-      // identically to runConversation (the brain is the single terminal-event
-      // emitter, so we do NOT also flush — no double-render). Flag off ⇒ the
-      // harness path is byte-identical. Kill-switch = set the brain flag off.
-      // The Codex/GLM harness path for this channel. The bridge decides whether
-      // to use Claude, recover to this harness path, or run this path directly.
-      const runCodexPath = async (): Promise<void> => {
+      // Discord and Slack use the same host-owned model/tool loop for every
+      // interactive brain. RouterModelProvider chooses the wire adapter, so a
+      // Claude selection still bills its subscription OAuth token while its
+      // tool calls, approvals, continuation, and terminal ownership stay on the
+      // same harness path as Codex.
+      const runSharedHarnessPath = async (): Promise<void> => {
         await runConversation({
           buildAgent: (identity) => buildOrchestratorAgent({
             userInput: effectiveInput,
@@ -4207,17 +4589,13 @@ export async function runDiscordHarnessConversation(opts: {
         sessionId: session.id,
         channel: channelLabel,
         userId,
-        runId: activeRun.attemptId,
-        // Live streaming can come from either Claude SDK (plain prose) or from
-        // harness recovery / direct harness (structured JSON). Auto-classify the
-        // first non-space character so Discord never flashes raw `{ "reply": ... }`.
+        runId: activeRun.runId ?? activeRun.attemptId,
+        // Auto-classify the first non-space character so Discord never flashes
+        // a raw structured decision envelope while the shared harness streams.
         onChunk: bridgeOnChunk,
         onConversationPreamble,
-      }, async (req) => {
-        if (claudeAgentSdkBrainEnabled(channel)) {
-          return respondViaClaudeAgentSdkBrain(bridgeSurface, req);
-        }
-        await runCodexPath();
+      }, async () => {
+        await runSharedHarnessPath();
         return { text: '', sessionId: session.id, stoppedReason: 'success' };
       });
     } catch (err) {
@@ -4293,6 +4671,8 @@ async function runDiscordHarnessResume(opts: {
   allowDetachedNonDiscord?: boolean;
   channel?: string;
   durableRequest?: DurableChannelRequest;
+  userId?: string;
+  guildId?: string | null;
 }): Promise<void> {
   const { channelId, decision, transport } = opts;
   let approvalId = opts.approvalId;
@@ -4324,6 +4704,32 @@ async function runDiscordHarnessResume(opts: {
         approvalId,
         transport,
         text: `No pending approval matches \`${approvalId}\`. It may have already been resolved or expired.`,
+        status: 'needs_input',
+      });
+      return;
+    }
+    if (
+      opts.userId
+      && isDiscordApproval(row, channel)
+      && !approvalTargetMatchesAudience({
+        row,
+        channelId,
+        channel,
+        userId: opts.userId,
+        scopeId: opts.guildId ?? null,
+      })
+    ) {
+      await settleApprovalRoutingReply({
+        durableRequest: opts.durableRequest,
+        channelId,
+        channel,
+        userId: opts.userId,
+        scopeId: opts.guildId ?? null,
+        prompt: opts.userText ?? `${decision} ${approvalId}`,
+        decision,
+        approvalId,
+        transport,
+        text: `Approval \`${approvalId}\` belongs to a different or stale conversation.`,
         status: 'needs_input',
       });
       return;
@@ -4390,9 +4796,23 @@ async function runDiscordHarnessResume(opts: {
       return;
     }
   } else {
-    const pendingOnChannel = pendingDiscordApprovalsForChannel(channelId, channel);
+    const pendingOnChannel = opts.userId
+      ? pendingApprovalsForAudience({
+        channelId,
+        channel,
+        userId: opts.userId,
+        scopeId: opts.guildId ?? null,
+      })
+      : pendingDiscordApprovalsForChannel(channelId, channel);
     const distinctSessions = [...new Set(pendingOnChannel.map((r) => r.sessionId))];
-    const fallback = channelSessions.get(channelId);
+    const fallback = opts.userId
+      ? getOrHydrateAudienceSession({
+        channel,
+        channelId,
+        userId: opts.userId,
+        guildId: opts.guildId ?? null,
+      })
+      : channelSessions.get(channelId);
     if (distinctSessions.length > 1) {
       // Multiple paused sessions — make the user pick.
       const summary = distinctSessions.slice(0, 5).map((sid) => {
@@ -4462,15 +4882,44 @@ async function runDiscordHarnessResume(opts: {
   if (opts.durableRequest?.sessionId && opts.durableRequest.sessionId !== sessionId) {
     throw new Error(`durable approval run ${opts.durableRequest.runId} is bound to another session`);
   }
+  if (opts.durableRequest && opts.userId) {
+    const selectedControl = selectSessionForAcceptedSource({
+      kind: 'bound_control',
+      entrySessionId: sessionId,
+      targetSessionId: sessionId,
+      durableSourceId: opts.durableRequest.runId,
+      continuity: {
+        provider: channel,
+        scopeId: opts.guildId ?? null,
+        conversationId: channelId,
+        audienceId: opts.userId,
+      },
+    });
+    if (selectedControl.sessionId !== sessionId) {
+      throw new Error('bound approval control selected a different target session');
+    }
+  }
   const entry = channelSessions.get(channelId);
   if (entry && entry.sessionId === sessionId) {
     entry.lastUsedAt = Date.now();
-    bindDiscordHarnessSession({ channelId, sessionId });
+    bindDiscordHarnessSession({
+      channelId,
+      sessionId,
+      channel,
+      userId: opts.userId,
+      guildId: opts.guildId ?? null,
+    });
   } else {
     // The chosen session may not be the channel-cached one (when
     // routing by approvalId). Update the cache so subsequent
     // interactions in this channel target the now-active session.
-    bindDiscordHarnessSession({ channelId, sessionId });
+    bindDiscordHarnessSession({
+      channelId,
+      sessionId,
+      channel,
+      userId: opts.userId,
+      guildId: opts.guildId ?? null,
+    });
   }
   const progressPresentation = progressPresentationForSession(sessionId);
 
@@ -4622,6 +5071,7 @@ async function runDiscordHarnessResume(opts: {
     progressPresentation,
     toolsCalled: [],
     toolCount: 0,
+    sessionId,
   };
   // The resumed turn narrates from the same shared reducer as the first turn —
   // a resume is not a second progress vocabulary.
@@ -4780,9 +5230,13 @@ async function runDiscordHarnessResume(opts: {
 
   void (async () => {
     try {
-      const agent = await buildOrchestratorAgentForApprovalResume({ sessionId, allowToolJit: true });
       const result = await runConversationFromResume({
-        agent,
+        buildAgent: (identity) => buildOrchestratorAgentForApprovalResume({
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          acceptedRoute: identity.route,
+          allowToolJit: true,
+        }),
         sessionId,
         runAttemptId: resumeAttempt.attemptId,
         sourceUserSeq: acceptedApprovalInput.seq,
@@ -4865,7 +5319,12 @@ export async function handleDiscordHarnessMessage(
   // the normal path so files are never silently folded into a note.
   if (message.attachments.size === 0 && prompt.trim()) {
     try {
-      const boundSessionId = getBoundDiscordHarnessSessionId(message.channelId);
+      const boundSessionId = getBoundDiscordHarnessSessionId(
+        message.channelId,
+        'discord',
+        message.author.id,
+        message.guildId ?? null,
+      );
       const latest = boundSessionId ? getLatestRunAttempt(boundSessionId) : null;
       const leaseLive = Boolean(
         latest

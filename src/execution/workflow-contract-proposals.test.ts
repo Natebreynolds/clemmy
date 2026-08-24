@@ -346,7 +346,7 @@ test('advises when an unattended generic Composio write has neither a pinned act
       {
         id: 'upsert_accounts',
         prompt: 'Upsert every prepared account into the existing tracker, then read the written rows back.',
-        allowedTools: ['composio_execute_tool', 'run_tool_program'],
+        allowedTools: ['composio_execute_tool', 'run_batch'],
         sideEffect: 'write',
       },
     ],
@@ -365,7 +365,7 @@ test('accepts an unattended Composio write with a pinned mutation slug', () => {
       {
         id: 'upsert_accounts',
         prompt: 'Call GOOGLESHEETS_UPDATE_VALUES_BATCH with the pinned spreadsheet_id and exact data ranges, then read them back.',
-        allowedTools: ['composio_execute_tool', 'run_tool_program'],
+        allowedTools: ['composio_execute_tool', 'run_batch'],
         sideEffect: 'write',
       },
     ],

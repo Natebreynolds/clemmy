@@ -40,7 +40,6 @@ test('single-deliverable policy turns the 135-call incident into a 15-call maxim
 
 test('finish phase preserves batching, deliverable writes, render work, and exact read-back', () => {
   const allowed = [
-    ['mcp__clementine-local__run_tool_program', { code: 'await Promise.all(items.map(read))' }],
     ['mcp__clementine-local__write_file', { path: '/tmp/report.md', content: 'done' }],
     ['mcp__googledocs__create_document', { title: 'Firm' }],
     ['mcp__googledocs__get_document', { document_id: 'doc_123' }],
@@ -299,4 +298,36 @@ test('long/unlimited budget presets lift the economy limits to the per-turn tool
     }),
     { kind: 'multi_item', softLimit: 16, hardLimit: 28 },
   );
+});
+
+test('finish phase admits the artifact write through the work_call carrier', () => {
+  // Live 2026-08-18 seq 56357: the finish-phase advisory said "only the
+  // requested artifact write may run now" and then refused the work_call
+  // CARRYING that exact write — the governor classified the carrier envelope
+  // instead of the carried Sheets create, and the model passed the bare
+  // Composio slug tool_search had handed it. Both halves must recognize it.
+  const carried = {
+    proposal: null,
+    requirement_id: 'n7:execute',
+    universe_item_id: null,
+    universe_selector: null,
+    name: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+    args_json: JSON.stringify({ title: 'PI Lawyer Prospects' }),
+  };
+  assert.equal(isFinishPhaseTool('mcp__clementine-local__work_call', carried), true);
+  // The gateway spelling of the same write stays recognized.
+  assert.equal(isFinishPhaseTool('mcp__clementine-local__work_call', {
+    ...carried,
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify({
+      tool_slug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+      arguments: JSON.stringify({ title: 'PI Lawyer Prospects' }),
+    }),
+  }), true);
+  // A carried broad search is still exploration — the clamp keeps its teeth.
+  assert.equal(isFinishPhaseTool('mcp__clementine-local__work_call', {
+    ...carried,
+    name: 'FIRECRAWL_SEARCH',
+    args_json: JSON.stringify({ query: 'more lawyers' }),
+  }), false);
 });

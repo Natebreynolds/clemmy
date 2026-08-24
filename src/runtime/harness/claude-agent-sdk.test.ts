@@ -1811,7 +1811,7 @@ test('agentic schema-on-demand keeps local-runtime-only tools deferred even when
   assert.equal(acquired?.bound.includes('workspace_roots'), true);
 });
 
-test('Claude direct discovery spends one task slot, settles the exact result, and refuses a second broad search', async () => {
+test('Claude direct discovery admits one bounded task slot and denies a second broad search', async () => {
   const { discoveryGovernor } = await import('./discovery-governor.js');
   const session = eventlog.createSession({ kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -1893,7 +1893,8 @@ test('Claude direct discovery spends one task slot, settles the exact result, an
   });
 
   assert.deepEqual(verdicts.map((verdict) => verdict.behavior), ['allow', 'deny']);
-  assert.match(verdicts[1]?.message ?? '', /discovery budget denied.*category_budget_exhausted/i);
+  assert.match(verdicts[1]?.message ?? '', /category_budget_exhausted/,
+    'Claude receives the same provider-neutral bounded-discovery denial as every other lane');
   const state = discoveryGovernor.getTaskState({
     sessionId: session.id,
     sourceUserSeq: source.seq,
@@ -1904,6 +1905,8 @@ test('Claude direct discovery spends one task slot, settles the exact result, an
     eventlog.listEvents(session.id, { types: ['discovery_governor_decision'] }).length,
     2,
   );
+  // Only the admitted search settles an outcome; the denied search performs
+  // no catalog/provider work and therefore cannot mint a nominal result.
   assert.equal(
     eventlog.listEvents(session.id, { types: ['discovery_governor_outcome'] }).length,
     1,
@@ -2473,7 +2476,106 @@ function sdkLocalToolReturnStream(input: {
   ];
 }
 
-test('runClaudeAgentSdk reflects each tool return into the learning pipeline (brain continuity)', async () => {
+test('standalone Claude preserves the bounded full workflow_get result but never an error result', async () => {
+  const metadataResult =
+    'Workflow metadata (step prompts and workflow body omitted):\n'
+    + JSON.stringify({
+      name: 'SDK Metadata Parity',
+      description: 'bounded metadata '.repeat(35),
+      enabled: true,
+      trigger: {
+        schedule: '0 8,12,16 * * 1-5',
+        timezone: 'America/Los_Angeles',
+        manual: false,
+      },
+      step_count: 1,
+      steps: [{ id: 'review', executor: { kind: 'model' } }],
+    }, null, 2);
+  assert.ok(metadataResult.length > 400, 'fixture must exceed the generic SDK preview');
+  assert.ok(metadataResult.length < 4_000, 'fixture stays inside workflow_get metadata bounds');
+
+  const runCase = async (
+    label: string,
+    output: string,
+    isError = false,
+    section: 'metadata' | 'full' = 'metadata',
+    toolName = 'mcp__clementine-local__workflow_get',
+  ) => {
+    const session = eventlog.createSession({ id: `sdk-workflow-get-result-${label}`, kind: 'chat' });
+    const source = eventlog.appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Read the SDK Metadata Parity workflow metadata.' },
+    });
+    setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages(sdkLocalToolReturnStream({
+      callId: `toolu_workflow_get_${label}`,
+      toolName,
+      toolInput: { name: 'SDK Metadata Parity', section },
+      output,
+      isError,
+    }), {})) as any);
+    setClaudeAgentSdkReflectionForTest((() => {}) as any);
+    await runClaudeAgentSdk({
+      prompt: 'Read the SDK Metadata Parity workflow metadata.',
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      agentic: true,
+      directOrchestrator: true,
+      allowedLocalMcpTools: ['workflow_get'],
+    });
+    const returned = eventlog.listEvents(session.id, { types: ['tool_returned'] });
+    assert.equal(returned.length, 1);
+    assert.equal(returned[0]!.data.tool, 'workflow_get');
+    assert.equal(returned[0]!.data.accounting, 'top_level');
+    return returned[0]!;
+  };
+
+  const successful = await runCase('success', metadataResult);
+  assert.equal(successful.data.result, metadataResult, 'full bounded metadata survives beyond the 400-char preview');
+  assert.equal(String(successful.data.preview).length, 400);
+
+  const failed = await runCase(
+    'error',
+    JSON.stringify({ isError: true, content: [{ type: 'text', text: metadataResult }] }),
+  );
+  assert.equal(failed.data.ok, true, 'the transport itself returned normally');
+  assert.equal(failed.data.result, undefined, 'an SDK error envelope never becomes terminal result authority');
+
+  const contradicted = await runCase(
+    'contradicted-success',
+    JSON.stringify({ success: false, content: [{ type: 'text', text: metadataResult }] }),
+  );
+  assert.equal(contradicted.data.ok, true, 'the transport itself returned normally');
+  assert.equal(
+    contradicted.data.result,
+    undefined,
+    'a returned structured failure cannot borrow the successful transport result field',
+  );
+
+  const fullDefinition = await runCase('full-definition', metadataResult, false, 'full');
+  assert.equal(
+    fullDefinition.data.result,
+    undefined,
+    'only the producer-bounded metadata mode receives full-result event storage',
+  );
+
+  const externalSameTail = await runCase(
+    'external-same-tail',
+    metadataResult,
+    false,
+    'metadata',
+    'mcp__other-server__workflow_get',
+  );
+  assert.equal(
+    externalSameTail.data.result,
+    undefined,
+    'an external server cannot borrow the local workflow_get full-result surface by tail name',
+  );
+});
+
+test('runClaudeAgentSdk retains canonical tool results without per-return learning', async () => {
   setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages(streamWithToolReturn(), {})) as any);
   const reflected: Array<{ sessionId: string; callId: string; tool: string | null; output: string }> = [];
   setClaudeAgentSdkReflectionForTest(((input: any) => { reflected.push(input); }) as any);
@@ -2481,13 +2583,7 @@ test('runClaudeAgentSdk reflects each tool return into the learning pipeline (br
 
   await runClaudeAgentSdk({ prompt: 'Look up Acme.', sessionId: sess.id, agentic: true });
 
-  assert.equal(reflected.length, 1);
-  assert.equal(reflected[0].sessionId, sess.id);
-  assert.equal(reflected[0].callId, 'toolu_42');
-  // The MCP-namespaced Composio wrapper is unwrapped to the real action slug
-  // for source-trust parity with the Codex RunHooks path.
-  assert.equal(reflected[0].tool, 'SALESFORCE_QUERY');
-  assert.match(reflected[0].output, /Acme Corp has 3 open opportunities/);
+  assert.equal(reflected.length, 0, 'terminal-batch intake is the sole learning owner');
 
   const returned = eventlog.listEvents(sess.id, { types: ['tool_returned'] });
   const called = eventlog.listEvents(sess.id, { types: ['tool_called'] });
@@ -2779,13 +2875,7 @@ test('Claude local settled-read replay reuses the handler-authored outer occurre
     assert.equal(firstInvocations.length, 1, 'the SDK stream reuses the local bracket invocation instead of parking it twice');
     assert.equal(firstInvocations[0]?.invocationNonce, 'claude-local-inner-first-invocation');
     assert.equal(eventlog.getToolOutput(session.id, replayCallId), null, 'recovered bytes never mint replay authority');
-    assert.deepEqual(reflected, [{
-      sessionId: session.id,
-      callId: firstCallId,
-      tool: 'PROOF_LIST_TASKS',
-      output: providerOutput,
-      scopeId: trackerScopeId,
-    }], 'only physical provider output is reflected, with all harness prose removed');
+    assert.deepEqual(reflected, [], 'neither physical nor replayed returns schedule live learning');
   } finally {
     if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
     else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
@@ -2847,8 +2937,7 @@ test('Claude reflection unwraps deferred call_tool to the real inner capability'
     agentic: true,
   });
 
-  assert.equal(reflected.length, 1);
-  assert.equal(reflected[0].tool, 'SALESFORCE_QUERY');
+  assert.equal(reflected.length, 0, 'deferred carriers also wait for terminal-batch intake');
 });
 
 test('Claude lifecycle preserves effective call_tool identity before an oversized input preview is clipped', async () => {
@@ -3977,7 +4066,10 @@ test('logical-run economy enters finish phase and interrupts repeated exploratio
   // The user-visible reply is first-person and actionable — the internal
   // finish-phase steer directive must never leak into the chat (2026-07-21).
   assert.match(result.text, /stopped myself/i);
-  assert.match(result.text, /continue/i);
+  // NEVER-RESTING: the copy states the evidence is checkpointed for the next
+  // pass; it never asks the user to type `continue`.
+  assert.match(result.text, /checkpointed/i);
+  assert.doesNotMatch(result.text, /say\s+["“`]?continue/i);
   assert.doesNotMatch(result.text, /finish-phase steer/i);
   const trips = eventlog.listEvents('sdk-tool-economy', { types: ['guardrail_tripped'] });
   assert.equal(trips.filter((event) => String(event.data.kind).startsWith('tool_economy_')).length, 3);

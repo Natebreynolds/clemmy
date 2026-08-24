@@ -577,7 +577,7 @@ async function interpretOnce(input: {
     };
   }
 
-  // HOST DETERMINISTIC COMPILE fast lane (live 2026-08-19 sess-mt0c3kkc: the
+  // HOST DETERMINISTIC COMPILE fast lane (live 2026-08-19 session-fixture-fast-lane: the
   // ceremony below cost 97s and six model calls to author a plan the host
   // could prove). When every deterministic classifier fires, the host authors
   // and admits the plan itself — same validator, same receipt binder, zero
@@ -1033,7 +1033,7 @@ async function interpretOnce(input: {
     }
   };
 
-  // HOST-BIND (live 2026-08-19 sess-mszlpidc): an ADMITTED act construct whose
+  // HOST-BIND (live 2026-08-19 session-fixture-host-bind): an ADMITTED act construct whose
   // proposal left operations empty ("pending resolution") is a host bind
   // failure, not a shadow-label excuse. Bind THIS source's registered
   // goal-carrying capabilities into the exact operations shape the rest of the

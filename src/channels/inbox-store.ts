@@ -312,18 +312,26 @@ export function bindInboundSource(input: {
 export function completeInbound(input: CompleteInput): void {
   const db = openMemoryDb();
   const now = new Date().toISOString();
-  db.prepare(
-    `UPDATE inbound_messages
-        SET status = ?, run_id = COALESCE(?, run_id), error = ?, completed_at = ?
-      WHERE channel = ? AND source_message_id = ?`,
-  ).run(
-    input.status,
-    input.runId ?? null,
-    input.error ?? null,
-    now,
-    input.channel,
-    input.sourceMessageId,
-  );
+  const tx = db.transaction(() => {
+    const existing = db.prepare(
+      'SELECT * FROM inbound_messages WHERE channel = ? AND source_message_id = ?',
+    ).get(input.channel, input.sourceMessageId) as InboundRow | undefined;
+    if (!existing) return;
+    assertCompatibleIdentity(existing, { runId: input.runId });
+    db.prepare(
+      `UPDATE inbound_messages
+          SET status = ?, run_id = COALESCE(run_id, ?), error = ?, completed_at = ?
+        WHERE channel = ? AND source_message_id = ?`,
+    ).run(
+      input.status,
+      input.runId ?? null,
+      input.error ?? null,
+      now,
+      input.channel,
+      input.sourceMessageId,
+    );
+  });
+  tx.immediate();
 }
 
 export function getInbound(channel: string, sourceMessageId: string): InboundRecord | undefined {

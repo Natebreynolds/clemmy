@@ -33,6 +33,7 @@
  * harness hands over at turn start — the part we control and can cut.
  */
 import { estimateTokens } from './budget.js';
+import { createHash } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
 
 /** Does this bucket survive unchanged into the next turn's prompt? */
@@ -42,6 +43,12 @@ export interface PromptBucket {
   name: string;
   tokens: number;
   stability: PromptBucketStability;
+  /** Exact byte length of the bucket's text (0 for estimated-only buckets). */
+  bytes?: number;
+  /** sha256 of the bucket's exact bytes — the byte-stability pin's authority
+   *  (a STABLE bucket whose sha moves between consecutive steps is a cache
+   *  bust the estimate would hide). */
+  sha256?: string;
 }
 
 export interface PromptCompositionSummary {
@@ -87,23 +94,32 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
     ? Math.max(0, Math.trunc(input.approxTokensPerToolSchema as number))
     : DEFAULT_TOKENS_PER_TOOL_SCHEMA;
 
-  const raw: Array<[string, number, PromptBucketStability]> = [
+  const digest = (text: string): { bytes: number; sha256: string } => ({
+    bytes: Buffer.byteLength(text, 'utf8'),
+    sha256: createHash('sha256').update(text, 'utf8').digest('hex'),
+  });
+  const raw: Array<[string, number, PromptBucketStability, string | null]> = [
     // STABLE: same bytes every turn for a given session, so the provider keeps
     // them warm. Large is FINE here — that is the whole point of the split.
-    ['instructions', estimateTokens(input.instructions ?? ''), 'stable'],
-    ['toolSchemas', toolNames.length * perSchema, 'stable'],
+    ['instructions', estimateTokens(input.instructions ?? ''), 'stable', input.instructions ?? ''],
+    ['toolSchemas', toolNames.length * perSchema, 'stable', null],
     // History is a stable PREFIX in principle (it only appends) but any change
     // upstream of it re-pays the lot, so it is scored with the variable side
     // where it will be noticed.
-    ['history', estimateTokens(input.history ?? ''), 'variable'],
-    ['contextPacket', estimateTokens(input.contextPacket ?? ''), 'variable'],
-    ['currentMessage', estimateTokens(input.currentMessage ?? ''), 'variable'],
-    ['outputSchema', estimateTokens(input.outputSchema ?? ''), 'variable'],
+    ['history', estimateTokens(input.history ?? ''), 'variable', input.history ?? ''],
+    ['contextPacket', estimateTokens(input.contextPacket ?? ''), 'variable', input.contextPacket ?? ''],
+    ['currentMessage', estimateTokens(input.currentMessage ?? ''), 'variable', input.currentMessage ?? ''],
+    ['outputSchema', estimateTokens(input.outputSchema ?? ''), 'variable', input.outputSchema ?? ''],
   ];
 
   const buckets = raw
     .filter(([, tokens]) => tokens > 0)
-    .map(([name, tokens, stability]) => ({ name, tokens, stability }))
+    .map(([name, tokens, stability, text]) => ({
+      name,
+      tokens,
+      stability,
+      ...(text !== null ? digest(text) : {}),
+    }))
     .sort((a, b) => b.tokens - a.tokens);
 
   const stableTokens = buckets.filter((b) => b.stability === 'stable').reduce((sum, b) => sum + b.tokens, 0);

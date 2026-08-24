@@ -62,7 +62,7 @@ type ClaudeAgentApprovalBoundary = import('../runtime/harness/claude-agent-appro
 const { exactOriginDeliveryTargetDigest } = await import('../runtime/exact-origin-delivery.js');
 const { saveProactivityPolicy } = await import('../agents/proactivity-policy.js');
 const { createMcpNamespaceShim } = await import('../runtime/mcp-namespace-shim.js');
-const { _setCodeModeMcpResolverForTests } = await import('../tools/code-mode-tool.js');
+const { _setInnerDispatchMcpResolverForTests } = await import('../tools/inner-dispatch.js');
 const {
   bindDiscordHarnessSession,
   tryHandleHarnessApprovalReply,
@@ -143,7 +143,7 @@ async function installFakeOutlookProvider(
   } as MCPServer;
   const shim = createMcpNamespaceShim({ servers: [provider], cacheToolsList: false });
   await shim.listTools();
-  _setCodeModeMcpResolverForTests(() => shim);
+  _setInnerDispatchMcpResolverForTests(() => shim);
 }
 
 function legacyExecutionLockPath(pendingActionId: string): string {
@@ -523,7 +523,7 @@ test.before(() => {
 });
 
 test.after(() => {
-  _setCodeModeMcpResolverForTests(null);
+  _setInnerDispatchMcpResolverForTests(null);
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
@@ -715,7 +715,7 @@ test('inbox redelivery adopts B persisted before registry CAS and dispatches the
   } as MCPServer;
   const shim = createMcpNamespaceShim({ servers: [provider], cacheToolsList: false });
   await shim.listTools();
-  _setCodeModeMcpResolverForTests(() => shim);
+  _setInnerDispatchMcpResolverForTests(() => shim);
 
   const parked = await fixture.permission(
     'mcp__outlook__OUTLOOK_SEND_EMAIL',
@@ -1159,11 +1159,16 @@ test('keyed retry heals after a live transition owner dies without new ingress o
     owner.kill('SIGTERM');
     await exited;
 
-    assert.equal(await waitFor(() => (
-      getPendingAction(fixture.pendingActionId)?.status === 'executed'
-      && providerCalls.length === 1
-    ), 6_000), true,
-    'the keyed timer alone must reload the row, recover the dead owner, and execute');
+    assert.equal(await waitFor(() => {
+      const terminals = listEvents(fixture.session.id, { types: ['conversation_completed'] })
+        .filter((event) => event.data.sourceUserSeq === answer.source.seq);
+      const presentation = terminals[0]?.data.presentation as { status?: string } | undefined;
+      return getPendingAction(fixture.pendingActionId)?.status === 'executed'
+        && providerCalls.length === 1
+        && terminals.length === 1
+        && presentation?.status === 'done';
+    }, 6_000), true,
+    'the keyed timer alone must recover the owner, execute once, and settle the exact source');
     assert.equal(readTransitionLock(identity), null);
     assert.equal(providerCalls.length, 1);
     assert.deepEqual(providerCalls[0], { tool: 'OUTLOOK_SEND_EMAIL', args: fixture.payload });
@@ -1221,11 +1226,16 @@ test('keyed retry heals a transition database outage without new ingress or boot
   }
 
   try {
-    assert.equal(await waitFor(() => (
-      getPendingAction(fixture.pendingActionId)?.status === 'executed'
-      && providerCalls.length === 1
-    ), 6_000), true,
-    'the keyed timer alone must retry after the DB returns and execute once');
+    assert.equal(await waitFor(() => {
+      const terminals = listEvents(fixture.session.id, { types: ['conversation_completed'] })
+        .filter((event) => event.data.sourceUserSeq === answer.source.seq);
+      const presentation = terminals[0]?.data.presentation as { status?: string } | undefined;
+      return getPendingAction(fixture.pendingActionId)?.status === 'executed'
+        && providerCalls.length === 1
+        && terminals.length === 1
+        && presentation?.status === 'done';
+    }, 6_000), true,
+    'the keyed timer alone must retry after the DB returns, execute once, and settle the exact source');
     assert.deepEqual(providerCalls[0], { tool: 'OUTLOOK_SEND_EMAIL', args: fixture.payload });
     const terminals = listEvents(fixture.session.id, { types: ['conversation_completed'] })
       .filter((event) => event.data.sourceUserSeq === answer.source.seq);
@@ -1610,7 +1620,7 @@ test(THREE_ENTRYPOINT_TEST_NAME, async () => {
   } as MCPServer;
   const shim = createMcpNamespaceShim({ servers: [provider], cacheToolsList: false });
   await shim.listTools();
-  _setCodeModeMcpResolverForTests(() => shim);
+  _setInnerDispatchMcpResolverForTests(() => shim);
 
   let bootDrains = 0;
   approvalRegistry.onApprovalResolved((row) => {

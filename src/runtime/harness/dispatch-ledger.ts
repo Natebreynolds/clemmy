@@ -19,6 +19,15 @@ import {
   type AcceptedTaskExpectation,
 } from './resolution-ledger.js';
 import {
+  acceptedTurnCallAuthorityFor,
+  admitHostLogicalCallInTransaction,
+  admitWorkflowLogicalCallInTransaction,
+  poisonAcceptedTurnCallAuthorityInTransaction,
+  type AcceptedTurnCallAuthority,
+  type CallAdmissionEffect,
+} from './accepted-turn-call-authority.js';
+import { admitWorkflowPaginatedLogicalCallInTransaction } from './workflow-paginated-read-authority.js';
+import {
   canonicalLogicalToolName,
   durableLogicalCallContract,
   type DurableLogicalCallContract,
@@ -53,11 +62,28 @@ import {
 } from './canonical-graph-node-lease.js';
 import { shippedTransportDigest, verifyShippedImplementationIdentity } from './shipped-implementation-identity.js';
 import { derivePhysicalDispatchId } from './physical-crossing-identity.js';
+import {
+  currentDispatchLease,
+  isDispatchLeaseCurrent,
+  type DispatchLeaseRef,
+} from './dispatch-lease.js';
+import {
+  insertPreparedPhysicalReturnCheckpointInTransaction,
+  persistedPhysicalReturnCheckpointOwns,
+  preparedPhysicalReturnCheckpointOwns,
+  stagedPhysicalReturnCheckpointIdentity,
+  type PreparedPhysicalReturnCheckpoint,
+} from './physical-return-checkpoint.js';
+import {
+  inspectStagedPhysicalDispatchAuthority,
+  type StagedPhysicalDispatchAuthority,
+  type StagedPhysicalDispatchAuthorityState,
+} from './staged-transfer-authority.js';
 export { derivePhysicalDispatchId } from './physical-crossing-identity.js';
 
 const WRITE_EFFECTS = new Set(['local_write', 'external_write', 'admin']);
-const SETTLED_CROSSING_STATES = new Set(['returned', 'threw']);
-const SAFE_RETRY_STATES = new Set(['started']);
+const DEFINITIVE_CROSSING_STATES = new Set(['returned', 'threw']);
+const SAFE_RETRY_STATES = new Set(['started', 'timed_out']);
 const SAFE_RETRY_REASONS = new Set(['uncertain_recovery', 'owner_lost', 'explicit_retry']);
 
 export function retryDispositionFor(
@@ -65,9 +91,14 @@ export function retryDispositionFor(
   effect: string,
   reason: string | undefined,
 ): 'allow' | 'require_reconciliation' | 'refuse' {
-  if (SETTLED_CROSSING_STATES.has(state)) return 'refuse';
-  if (WRITE_EFFECTS.has(effect) && (state === 'started' || state === 'unknown' || !state)) {
+  if (
+    WRITE_EFFECTS.has(effect)
+    && (state === 'started' || state === 'timed_out' || state === 'cancelled' || state === 'unknown' || !state)
+  ) {
     return 'require_reconciliation';
+  }
+  if (DEFINITIVE_CROSSING_STATES.has(state) || state === 'cancelled' || state === 'unknown') {
+    return 'refuse';
   }
   if (SAFE_RETRY_STATES.has(state) && !WRITE_EFFECTS.has(effect) && reason && SAFE_RETRY_REASONS.has(reason)) {
     return 'allow';
@@ -235,7 +266,7 @@ export type LogicalCallAuthorityStateResult =
   | { status: 'settled' }
   | { status: 'closed' | 'missing' | 'conflict' | 'storage_error'; reason: string };
 
-export type CrossingOutcome = 'returned' | 'threw';
+export type CrossingOutcome = 'returned' | 'threw' | 'timed_out' | 'cancelled' | 'unknown';
 
 export type DispatchAdmissionResult =
   | { status: 'inserted'; identity: PhysicalCrossingIdentity }
@@ -248,6 +279,7 @@ export type DispatchAdmissionResult =
 export type DispatchSettlementResult =
   | { status: 'inserted' }
   | { status: 'replayed' }
+  | { status: 'closed'; reason: string }
   | { status: 'missing'; reason: string }
   | { status: 'conflict'; reason: string }
   | { status: 'storage_error'; reason: string };
@@ -279,7 +311,13 @@ interface DispatchRow {
   retry_of: string | null;
   tool_name: string;
   argument_digest: string;
-  state: 'started' | CrossingOutcome | 'timed_out' | 'cancelled' | 'unknown';
+  state: 'started' | CrossingOutcome;
+  execution_site: 'host' | null;
+  authority_digest: string | null;
+  provider_argument_digest: string | null;
+  staged_authority_digest: string | null;
+  lease_scope_id: string | null;
+  lease_id: string | null;
 }
 
 function logicalMatches(
@@ -310,6 +348,11 @@ function poisonResolution(
   logicalToolCallId?: string,
   reason?: string,
 ): void {
+  poisonAcceptedTurnCallAuthorityInTransaction(db, {
+    sessionId,
+    sourceUserSeq,
+    reason: reason ?? 'dispatch authority poisoned without a stated cause',
+  });
   db.prepare(`
     UPDATE accepted_task_resolutions
        SET state = 'legacy_ambiguous', revision = revision + 1
@@ -336,8 +379,99 @@ function poisonResolution(
 
 type LogicalCallAdmissionInTransactionResult = Exclude<
   LogicalCallAdmissionResult,
-  { status: 'missing' | 'storage_error' }
+  { status: 'storage_error' }
 >;
+
+type CallAdmissionAuthority =
+  | {
+      authorityKind: 'turn_graph';
+      acceptedTaskId: string;
+      identity: AcceptedTaskExpectation['identity'];
+      expectation: AcceptedTaskExpectation;
+    }
+  | {
+      authorityKind: 'host_v1';
+      acceptedTaskId: string;
+      identity: { sessionId: string; sourceUserSeq: number; turn: number };
+      authority: AcceptedTurnCallAuthority;
+    }
+  | {
+      authorityKind: 'host_v1_read_only';
+      acceptedTaskId: string;
+      identity: { sessionId: string; sourceUserSeq: number; turn: number };
+      authority: AcceptedTurnCallAuthority;
+    }
+  | {
+      authorityKind: 'workflow_v1_read_only';
+      acceptedTaskId: string;
+      identity: { sessionId: string; sourceUserSeq: number; turn: number };
+      authority: AcceptedTurnCallAuthority;
+    }
+  | {
+      authorityKind: 'workflow_v2_paginated_read';
+      acceptedTaskId: string;
+      identity: { sessionId: string; sourceUserSeq: number; turn: number };
+      authority: AcceptedTurnCallAuthority;
+    };
+
+function ensureCallAdmissionOpenInTransaction(
+  db: ReturnType<typeof openEventLog>,
+  authority: CallAdmissionAuthority,
+  input: DurableLogicalCallIdentity,
+  contract: DurableLogicalCallContract | null,
+  effect: CallAdmissionEffect,
+  isNew: boolean,
+): { status: 'ok' } | Extract<LogicalCallAdmissionResult, { status: 'closed' | 'missing' | 'conflict' }> {
+  if (authority.authorityKind === 'turn_graph') {
+    let open: boolean;
+    try {
+      open = ensureAcceptedTaskResolutionOpenInTransaction(db, authority.expectation);
+    } catch (error) {
+      const reason = boundedReason(error);
+      if (reason.includes('conflicts with its persisted graph') || reason.includes('is ambiguous')) {
+        poisonResolution(db, input.sessionId, input.sourceUserSeq, input.logicalToolCallId, reason);
+        return { status: 'conflict', reason };
+      }
+      throw error;
+    }
+    return open
+      ? { status: 'ok' }
+      : { status: 'closed', reason: 'accepted task resolution is closed' };
+  }
+  const admitted = authority.authorityKind === 'host_v1_read_only' || authority.authorityKind === 'host_v1'
+    ? admitHostLogicalCallInTransaction(db, {
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId: input.acceptedTaskId,
+        logicalToolCallId: input.logicalToolCallId,
+        toolName: contract?.toolName ?? '',
+        argumentDigest: contract?.argumentDigest ?? '',
+        effect,
+        isNew,
+      })
+    : authority.authorityKind === 'workflow_v1_read_only'
+      ? admitWorkflowLogicalCallInTransaction(db, {
+        sessionId: input.sessionId,
+        sourceEventSeq: input.sourceUserSeq,
+        authorityRootId: input.acceptedTaskId,
+        logicalToolCallId: input.logicalToolCallId,
+        toolName: contract?.toolName ?? '',
+        argumentDigest: contract?.argumentDigest ?? '',
+        effect,
+        isNew,
+      })
+      : admitWorkflowPaginatedLogicalCallInTransaction(db, {
+        sessionId: input.sessionId,
+        sourceEventSeq: input.sourceUserSeq,
+        authorityRootId: input.acceptedTaskId,
+        logicalToolCallId: input.logicalToolCallId,
+        toolName: contract?.toolName ?? '',
+        argumentDigest: contract?.argumentDigest ?? '',
+        effect,
+        isNew,
+      });
+  return admitted.status === 'ok' ? { status: 'ok' } : admitted;
+}
 
 /**
  * The one logical-call admission implementation used both before a gate and
@@ -347,38 +481,13 @@ type LogicalCallAdmissionInTransactionResult = Exclude<
  */
 function admitLogicalCallInTransaction(
   db: ReturnType<typeof openEventLog>,
-  expected: AcceptedTaskExpectation,
+  authority: CallAdmissionAuthority,
   input: DurableLogicalCallIdentity,
   contract: DurableLogicalCallContract | null,
   phase: 'logical' | 'physical',
+  effect: CallAdmissionEffect,
 ): LogicalCallAdmissionInTransactionResult {
   const logicalToolCallId = safeLogicalToolCallId(input.logicalToolCallId);
-  let open: boolean;
-  try {
-    open = ensureAcceptedTaskResolutionOpenInTransaction(db, expected);
-  } catch (error) {
-    const reason = boundedReason(error);
-    if (reason.includes('conflicts with its persisted graph') || reason.includes('is ambiguous')) {
-      poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId ?? undefined, reason);
-      return { status: 'conflict', reason };
-    }
-    throw error;
-  }
-  if (!open) return { status: 'closed', reason: 'accepted task resolution is closed' };
-  if (
-    input.acceptedTaskId !== expected.acceptedTaskId
-    || input.sessionId !== expected.identity.sessionId
-    || input.sourceUserSeq !== expected.identity.sourceUserSeq
-    || !logicalToolCallId
-  ) {
-    poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId ?? undefined, 'logical call names a different accepted task or unsafe identity');
-    return { status: 'conflict', reason: 'logical call names a different accepted task or unsafe identity' };
-  }
-  if (!contract) {
-    poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId, 'logical call tool identity is unsafe');
-    return { status: 'conflict', reason: 'logical call tool identity is unsafe' };
-  }
-
   const row = db.prepare(`
     SELECT accepted_task_id, logical_tool_call_id, tool_name, argument_digest,
            raw_argument_digest, effective_argument_digest, state
@@ -389,11 +498,33 @@ function admitLogicalCallInTransaction(
     input.sourceUserSeq,
     logicalToolCallId,
   ) as LogicalRow | undefined;
+  const open = ensureCallAdmissionOpenInTransaction(
+    db,
+    authority,
+    { ...input, logicalToolCallId: logicalToolCallId ?? input.logicalToolCallId },
+    contract,
+    effect,
+    row === undefined,
+  );
+  if (open.status !== 'ok') return open;
+  if (
+    input.acceptedTaskId !== authority.acceptedTaskId
+    || input.sessionId !== authority.identity.sessionId
+    || input.sourceUserSeq !== authority.identity.sourceUserSeq
+    || !logicalToolCallId
+  ) {
+    poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId ?? undefined, 'logical call names a different accepted task or unsafe identity');
+    return { status: 'conflict', reason: 'logical call names a different accepted task or unsafe identity' };
+  }
+  if (!contract) {
+    poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId, 'logical call tool identity is unsafe');
+    return { status: 'conflict', reason: 'logical call tool identity is unsafe' };
+  }
 
   const identity: AdmittedLogicalCall = {
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
-    acceptedTaskId: expected.acceptedTaskId,
+    acceptedTaskId: authority.acceptedTaskId,
     logicalToolCallId,
     toolName: contract.toolName,
     argumentDigest: contract.argumentDigest,
@@ -407,7 +538,7 @@ function admitLogicalCallInTransaction(
     `).run(
       input.sessionId,
       input.sourceUserSeq,
-      expected.acceptedTaskId,
+      authority.acceptedTaskId,
       logicalToolCallId,
       contract.toolName,
       contract.argumentDigest,
@@ -417,7 +548,7 @@ function admitLogicalCallInTransaction(
     return { status: 'inserted', identity };
   }
 
-  if (!logicalMatches(row, expected.acceptedTaskId, contract.toolName, contract.argumentDigest, phase)) {
+  if (!logicalMatches(row, authority.acceptedTaskId, contract.toolName, contract.argumentDigest, phase)) {
     poisonResolution(db, input.sessionId, input.sourceUserSeq, logicalToolCallId, 'logical call identity conflicts with its durable contract');
     return { status: 'conflict', reason: 'logical call identity conflicts with its durable contract' };
   }
@@ -457,10 +588,80 @@ function expectedForAdmission(
   sessionId: string,
   sourceUserSeq: number,
 ):
-  | { status: 'ok'; expectation: AcceptedTaskExpectation }
+  | { status: 'ok'; authority: CallAdmissionAuthority }
   | Extract<LogicalCallAdmissionResult, { status: 'missing' | 'conflict' | 'storage_error' }> {
+  const root = acceptedTurnCallAuthorityFor(sessionId, sourceUserSeq);
+  if (
+    root.status === 'ok'
+    && (root.authority.authorityKind === 'host_v1_read_only' || root.authority.authorityKind === 'host_v1')
+  ) {
+    return {
+      status: 'ok',
+      authority: {
+        authorityKind: root.authority.authorityKind,
+        acceptedTaskId: root.authority.identity.acceptedTaskId,
+        identity: {
+          sessionId: root.authority.identity.sessionId,
+          sourceUserSeq: root.authority.identity.sourceUserSeq,
+          turn: root.authority.identity.sourceTurn,
+        },
+        authority: root.authority,
+      },
+    };
+  }
+  if (root.status === 'ok' && root.authority.authorityKind === 'workflow_v1_read_only') {
+    return {
+      status: 'ok',
+      authority: {
+        authorityKind: 'workflow_v1_read_only',
+        acceptedTaskId: root.authority.identity.acceptedTaskId,
+        identity: {
+          sessionId: root.authority.identity.sessionId,
+          sourceUserSeq: root.authority.identity.sourceUserSeq,
+          turn: root.authority.identity.sourceTurn,
+        },
+        authority: root.authority,
+      },
+    };
+  }
+  if (root.status === 'ok' && root.authority.authorityKind === 'workflow_v2_paginated_read') {
+    return {
+      status: 'ok',
+      authority: {
+        authorityKind: 'workflow_v2_paginated_read',
+        acceptedTaskId: root.authority.identity.acceptedTaskId,
+        identity: {
+          sessionId: root.authority.identity.sessionId,
+          sourceUserSeq: root.authority.identity.sourceUserSeq,
+          turn: root.authority.identity.sourceTurn,
+        },
+        authority: root.authority,
+      },
+    };
+  }
+  if (root.status === 'conflict') return root;
+  if (root.status === 'storage_error') return root;
   const expected = expectedTaskFor(sessionId, sourceUserSeq);
-  if (expected.status === 'ok') return { status: 'ok', expectation: expected.expectation };
+  if (expected.status === 'ok') {
+    if (
+      root.status === 'ok'
+      && (
+        root.authority.authorityKind !== 'turn_graph'
+        || root.authority.identity.acceptedTaskId !== expected.expectation.acceptedTaskId
+        || root.authority.graphEventId !== expected.expectation.graphEventId
+        || root.authority.graphHash !== expected.expectation.graphHash
+      )
+    ) return { status: 'conflict', reason: 'graph call authority conflicts with its persisted graph' };
+    return {
+      status: 'ok',
+      authority: {
+        authorityKind: 'turn_graph',
+        acceptedTaskId: expected.expectation.acceptedTaskId,
+        identity: expected.expectation.identity,
+        expectation: expected.expectation,
+      },
+    };
+  }
   if (expected.status === 'missing') return expected;
   if (expected.reason.startsWith('turn graph store unreadable:')) {
     return { status: 'storage_error', reason: expected.reason };
@@ -480,12 +681,13 @@ export function admitLogicalCall(input: {
 }): LogicalCallAdmissionResult {
   const expectedState = expectedForAdmission(input.identity.sessionId, input.identity.sourceUserSeq);
   if (expectedState.status !== 'ok') return expectedState;
-  const expected = expectedState.expectation;
-  const contract = durableLogicalCallContract(expected.acceptedTaskId, input.tool, input.args);
+  const authority = expectedState.authority;
+  const contract = durableLogicalCallContract(authority.acceptedTaskId, input.tool, input.args);
+  const effect = classifyRuntimeToolEffect(input.tool, input.args).effect;
   try {
     const db = openEventLog();
     const transaction = db.transaction((): LogicalCallAdmissionInTransactionResult => {
-      return admitLogicalCallInTransaction(db, expected, input.identity, contract, 'logical');
+      return admitLogicalCallInTransaction(db, authority, input.identity, contract, 'logical', effect);
     });
     return transaction.immediate();
   } catch (error) {
@@ -510,37 +712,22 @@ export function refineLogicalCallContract(input: {
 }): LogicalCallRefinementResult {
   const expectedState = expectedForAdmission(input.identity.sessionId, input.identity.sourceUserSeq);
   if (expectedState.status !== 'ok') return expectedState;
-  const expected = expectedState.expectation;
+  const authority = expectedState.authority;
   const logicalToolCallId = safeLogicalToolCallId(input.identity.logicalToolCallId);
   const effective = durableLogicalCallContract(
-    expected.acceptedTaskId,
+    authority.acceptedTaskId,
     input.tool,
     input.effectiveArgs,
   );
+  const effectiveEffect = classifyRuntimeToolEffect(input.tool, input.effectiveArgs).effect;
   const db = openEventLog();
   let mirror: EventRow | null = null;
   try {
     const transaction = db.transaction((): LogicalCallRefinementResult => {
-      const resolution = db.prepare(`
-        SELECT accepted_task_id, state
-          FROM accepted_task_resolutions
-         WHERE session_id = ? AND source_user_seq = ?
-      `).get(input.identity.sessionId, input.identity.sourceUserSeq) as {
-        accepted_task_id: string;
-        state: 'open' | 'finalized' | 'legacy_ambiguous';
-      } | undefined;
-      if (!resolution) return { status: 'missing', reason: 'accepted task resolution is missing' };
-      if (resolution.state === 'legacy_ambiguous') {
-        return { status: 'conflict', reason: 'accepted task resolution is ambiguous' };
-      }
-      if (resolution.state !== 'open') {
-        return { status: 'closed', reason: 'accepted task resolution is closed' };
-      }
       if (
-        input.identity.acceptedTaskId !== expected.acceptedTaskId
-        || resolution.accepted_task_id !== expected.acceptedTaskId
-        || input.identity.sessionId !== expected.identity.sessionId
-        || input.identity.sourceUserSeq !== expected.identity.sourceUserSeq
+        input.identity.acceptedTaskId !== authority.acceptedTaskId
+        || input.identity.sessionId !== authority.identity.sessionId
+        || input.identity.sourceUserSeq !== authority.identity.sourceUserSeq
         || !logicalToolCallId
       ) {
         poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, logicalToolCallId ?? undefined, 'contract refinement names a different accepted task or unsafe identity');
@@ -562,8 +749,17 @@ export function refineLogicalCallContract(input: {
         logicalToolCallId,
       ) as LogicalRow | undefined;
       if (!row) return { status: 'missing', reason: 'logical call authority is missing' };
+      const open = ensureCallAdmissionOpenInTransaction(
+        db,
+        authority,
+        { ...input.identity, logicalToolCallId },
+        effective,
+        effectiveEffect,
+        false,
+      );
+      if (open.status !== 'ok') return open;
       if (
-        row.accepted_task_id !== expected.acceptedTaskId
+        row.accepted_task_id !== authority.acceptedTaskId
         || row.tool_name !== effective.toolName
         || row.state === 'conflict'
       ) {
@@ -598,7 +794,7 @@ export function refineLogicalCallContract(input: {
       const identity = (digest: string): RefinedLogicalCall => ({
         sessionId: input.identity.sessionId,
         sourceUserSeq: input.identity.sourceUserSeq,
-        acceptedTaskId: expected.acceptedTaskId,
+        acceptedTaskId: authority.acceptedTaskId,
         logicalToolCallId,
         toolName: row.tool_name,
         argumentDigest: digest,
@@ -625,12 +821,12 @@ export function refineLogicalCallContract(input: {
 
       mirror = insertInternalEventInTransaction(db, {
         sessionId: input.identity.sessionId,
-        turn: input.turn ?? expected.identity.turn,
+        turn: input.turn ?? authority.identity.turn,
         role: 'system',
         type: LOGICAL_CALL_CONTRACT_REFINED_EVENT,
         data: {
           sourceUserSeq: input.identity.sourceUserSeq,
-          acceptedTaskId: expected.acceptedTaskId,
+          acceptedTaskId: authority.acceptedTaskId,
           logicalToolCallId,
           tool: row.tool_name,
           rawArgumentDigest: row.raw_argument_digest,
@@ -683,9 +879,14 @@ export function logicalCallAuthorityState(
 ): LogicalCallAuthorityStateResult {
   try {
     const row = openEventLog().prepare(`
-      SELECT l.accepted_task_id, l.state, l.conflict_reason, r.state AS resolution_state
+      SELECT l.accepted_task_id, l.state, l.conflict_reason,
+             a.accepted_task_id AS authority_accepted_task_id,
+             a.authority_kind, a.state AS authority_state,
+             r.state AS resolution_state
         FROM logical_tool_calls l
-        JOIN accepted_task_resolutions r
+        JOIN accepted_turn_call_authorities a
+          ON a.session_id = l.session_id AND a.source_user_seq = l.source_user_seq
+        LEFT JOIN accepted_task_resolutions r
           ON r.session_id = l.session_id AND r.source_user_seq = l.source_user_seq
        WHERE l.session_id = ? AND l.source_user_seq = ? AND l.logical_tool_call_id = ?
     `).get(
@@ -696,10 +897,23 @@ export function logicalCallAuthorityState(
       accepted_task_id: string;
       state: LogicalRow['state'];
       conflict_reason: string | null;
-      resolution_state: 'open' | 'finalized' | 'legacy_ambiguous';
+      authority_accepted_task_id: string;
+      authority_kind:
+        | 'turn_graph'
+        | 'host_v1'
+        | 'host_v1_read_only'
+        | 'workflow_v1_read_only'
+        | 'workflow_v2_paginated_read';
+      authority_state: 'open' | 'closed' | 'conflict';
+      resolution_state: 'open' | 'finalized' | 'legacy_ambiguous' | null;
     } | undefined;
     if (!row) return { status: 'missing', reason: 'logical call authority is missing' };
-    if (row.accepted_task_id !== identity.acceptedTaskId || row.state === 'conflict') {
+    if (
+      row.accepted_task_id !== identity.acceptedTaskId
+      || row.authority_accepted_task_id !== identity.acceptedTaskId
+      || row.state === 'conflict'
+      || row.authority_state === 'conflict'
+    ) {
       // Report the FIRST cause when one was recorded. Without it every reader
       // of a poisoned call — including the error that ends the run — describes
       // the poisoning rather than the check that failed.
@@ -710,11 +924,17 @@ export function logicalCallAuthorityState(
           : 'logical call authority conflicts with its accepted task',
       };
     }
-    if (row.resolution_state === 'legacy_ambiguous') {
+    if (row.authority_kind === 'turn_graph' && row.resolution_state === 'legacy_ambiguous') {
       return { status: 'conflict', reason: 'accepted task resolution is ambiguous' };
     }
-    if (row.resolution_state !== 'open' && row.state === 'open') {
-      return { status: 'closed', reason: 'accepted task resolution closed before logical settlement' };
+    if (
+      row.state === 'open'
+      && (
+        row.authority_state !== 'open'
+        || (row.authority_kind === 'turn_graph' && row.resolution_state !== 'open')
+      )
+    ) {
+      return { status: 'closed', reason: 'accepted-turn call authority closed before logical settlement' };
     }
     return { status: row.state };
   } catch (error) {
@@ -735,6 +955,9 @@ interface CompatibilityPhysicalDispatchInput {
   relation?: DispatchRelation;
   trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
   executionSite?: 'host';
+  /** Exact host-owned generation authorizing this physical admission. When
+   * omitted, the ambient generation is used. */
+  dispatchLease?: DispatchLeaseRef;
 }
 
 interface TypedPhysicalDispatchPersist {
@@ -742,6 +965,11 @@ interface TypedPhysicalDispatchPersist {
   providerArgumentDigest: string;
   typedAuthorityJson: string;
   argumentCipher: string;
+}
+
+interface StagedPhysicalDispatchPersist {
+  authority: StagedPhysicalDispatchAuthority;
+  state: Readonly<StagedPhysicalDispatchAuthorityState>;
 }
 
 /**
@@ -752,38 +980,168 @@ export function beginPhysicalDispatch(input: CompatibilityPhysicalDispatchInput)
   return beginPhysicalDispatchCore(input);
 }
 
+/**
+ * Consume one process-opaque staged attempt at the final pre-body edge.  The
+ * copyable IDs stored in SQLite are deliberately not accepted by this API;
+ * they are only evidence that the opaque carrier still re-opens exactly.
+ */
+export function beginStagedPhysicalDispatch(input: {
+  authority: StagedPhysicalDispatchAuthority;
+  turn?: number;
+}): DispatchAdmissionResult {
+  const state = inspectStagedPhysicalDispatchAuthority(input.authority);
+  if (!state) {
+    return { status: 'conflict', reason: 'staged physical authority no longer reopens' };
+  }
+  return beginPhysicalDispatchCore({
+    identity: {
+      sessionId: state.sessionId,
+      sourceUserSeq: state.sourceUserSeq,
+      acceptedTaskId: state.acceptedTaskId,
+      logicalToolCallId: state.logicalToolCallId,
+      physicalDispatchId: state.physicalDispatchId,
+      ordinal: 1,
+    },
+    tool: state.toolName,
+    turn: input.turn,
+    relation: 'primary',
+    dispatchLease: state.lease,
+  }, undefined, { authority: input.authority, state });
+}
+
 function beginPhysicalDispatchCore(
   input: CompatibilityPhysicalDispatchInput,
   typed?: TypedPhysicalDispatchPersist,
+  staged?: StagedPhysicalDispatchPersist,
 ): DispatchAdmissionResult {
+  if (typed && staged) {
+    return { status: 'conflict', reason: 'physical dispatch cannot combine graph and staged authority' };
+  }
   const expectedState = expectedForAdmission(input.identity.sessionId, input.identity.sourceUserSeq);
   if (expectedState.status !== 'ok') return expectedState;
-  const expected = expectedState.expectation;
-  const contract = durableLogicalCallContract(expected.acceptedTaskId, input.tool, input.args);
+  const authority = expectedState.authority;
+  const contract = staged
+    ? {
+        toolName: staged.state.toolName,
+        argumentDigest: staged.state.argumentDigest,
+      }
+    : durableLogicalCallContract(authority.acceptedTaskId, input.tool, input.args);
+  const trustedAdmissionCarrier = inspectTrustedRuntimeEffectCarrier(input.trustedEffectCarrier);
+  const trustedAdmissionContract = trustedAdmissionCarrier
+    ? durableLogicalCallContract(
+      authority.acceptedTaskId,
+      trustedAdmissionCarrier.toolName,
+      trustedAdmissionCarrier.args,
+    )
+    : null;
+  // Opaque provenance is authority only for THESE exact canonical bytes. A
+  // trusted carrier accidentally forwarded to a sibling operation must be no
+  // stronger than no carrier at all.
+  const trustedAdmissionDecision = trustedAdmissionCarrier
+    && contract
+    && trustedAdmissionContract?.toolName === contract.toolName
+    && trustedAdmissionContract.argumentDigest === contract.argumentDigest
+    ? trustedAdmissionCarrier.decision
+    : null;
+  const admissionEffect = staged?.state.effect ?? trustedAdmissionDecision?.effect
+    ?? classifyRuntimeToolEffect(input.tool, input.args).effect;
+  const dispatchLease = input.dispatchLease ?? currentDispatchLease();
+  if (
+    dispatchLease
+    && (
+      dispatchLease.sessionId !== input.identity.sessionId
+      || dispatchLease.sourceUserSeq !== input.identity.sourceUserSeq
+      || dispatchLease.acceptedTaskId !== input.identity.acceptedTaskId
+      || dispatchLease.logicalToolCallId !== input.identity.logicalToolCallId
+    )
+  ) {
+    return { status: 'conflict', reason: 'physical dispatch lease does not own the exact logical call' };
+  }
   const db = openEventLog();
   let mirror: EventRow | null = null;
   try {
     const transaction = db.transaction((): DispatchAdmissionResult => {
+      if (dispatchLease && !isDispatchLeaseCurrent(dispatchLease)) {
+        return { status: 'closed', reason: 'physical dispatch lease is no longer current' };
+      }
+      if (typed && authority.authorityKind !== 'turn_graph') {
+        return { status: 'conflict', reason: 'typed graph reservation requires turn-graph call authority' };
+      }
+      if (staged) {
+        const reopened = inspectStagedPhysicalDispatchAuthority(staged.authority);
+        if (
+          !reopened
+          || reopened.authorityDigest !== staged.state.authorityDigest
+          || reopened.physicalDispatchId !== input.identity.physicalDispatchId
+          || reopened.logicalToolCallId !== input.identity.logicalToolCallId
+          || reopened.toolName !== contract?.toolName
+          || reopened.argumentDigest !== contract?.argumentDigest
+          || reopened.providerArgumentDigest !== staged.state.providerArgumentDigest
+          || reopened.lease.scopeId !== dispatchLease?.scopeId
+          || reopened.lease.leaseId !== dispatchLease?.leaseId
+        ) {
+          return { status: 'conflict', reason: 'staged physical authority changed before reservation' };
+        }
+      }
+      const stagedReservationOwner = db.prepare(`
+        SELECT stage_authority_id FROM staged_transfer_stage_authorities
+         WHERE session_id = ? AND source_user_seq = ?
+           AND (physical_dispatch_id = ? OR logical_tool_call_id = ?)
+      `).get(
+        input.identity.sessionId,
+        input.identity.sourceUserSeq,
+        input.identity.physicalDispatchId,
+        input.identity.logicalToolCallId,
+      ) as { stage_authority_id: string } | undefined;
+      // A copyable staged tuple is not a forgery of the host root. Refuse it
+      // before ordinary host admission so the exact opaque carrier can still
+      // consume the same durable attempt.
+      if (stagedReservationOwner && !staged) {
+        return { status: 'conflict', reason: 'staged crossing requires its exact opaque attempt authority' };
+      }
       const existingLogical = db.prepare(`
-        SELECT 1 FROM logical_tool_calls
+        SELECT accepted_task_id, logical_tool_call_id, tool_name,
+               argument_digest, raw_argument_digest,
+               effective_argument_digest, state
+          FROM logical_tool_calls
          WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
       `).get(
         input.identity.sessionId,
         input.identity.sourceUserSeq,
         input.identity.logicalToolCallId,
-      );
-      const logicalAdmission = admitLogicalCallInTransaction(
-        db,
-        expected,
-        input.identity,
-        contract,
-        // Provider I/O is authorized only by the current refined contract.
-        // A host crossing is different: it records execution that already
-        // occurred in-process, and its outer wrapper may still hold the call's
-        // immutable raw contract. An already-admitted logical row is the same
-        // reuse, even when the crossing itself left the machine.
-        input.executionSite === 'host' || existingLogical ? 'logical' : 'physical',
-      );
+      ) as LogicalRow | undefined;
+      const logicalAdmission: LogicalCallAdmissionInTransactionResult = staged
+        ? existingLogical
+          && existingLogical.accepted_task_id === authority.acceptedTaskId
+          && existingLogical.logical_tool_call_id === input.identity.logicalToolCallId
+          && existingLogical.tool_name === contract?.toolName
+          && existingLogical.argument_digest === contract?.argumentDigest
+          && existingLogical.state === 'open'
+          ? {
+              status: 'replayed',
+              identity: {
+                sessionId: input.identity.sessionId,
+                sourceUserSeq: input.identity.sourceUserSeq,
+                acceptedTaskId: authority.acceptedTaskId,
+                logicalToolCallId: input.identity.logicalToolCallId,
+                toolName: existingLogical.tool_name,
+                argumentDigest: existingLogical.argument_digest,
+              },
+            }
+          : { status: 'conflict', reason: 'staged logical call no longer matches its exact persisted contract' }
+        : admitLogicalCallInTransaction(
+            db,
+            authority,
+            input.identity,
+            contract,
+            // Provider I/O is authorized only by the current refined contract.
+            // A host crossing is different: it records execution that already
+            // occurred in-process, and its outer wrapper may still hold the call's
+            // immutable raw contract. An already-admitted logical row is the same
+            // reuse, even when the crossing itself left the machine.
+            input.executionSite === 'host' || existingLogical ? 'logical' : 'physical',
+            admissionEffect,
+          );
       if (logicalAdmission.status !== 'inserted' && logicalAdmission.status !== 'replayed') {
         return logicalAdmission;
       }
@@ -804,7 +1162,7 @@ function beginPhysicalDispatchCore(
         expected_work_required: number;
         work_contract_id: string | null;
       } | undefined;
-      if (expectedWork?.expected_work_required === 1) {
+      if (authority.authorityKind === 'turn_graph' && expectedWork?.expected_work_required === 1) {
         const binding = db.prepare(`
           SELECT 1 FROM expected_work_call_bindings
            WHERE session_id = ? AND source_user_seq = ?
@@ -826,25 +1184,7 @@ function beginPhysicalDispatchCore(
         // expected-work-admission.ts). The mandate below is matched on the RAW
         // carrier call: the approval card stored exactly what the user saw,
         // before logical canonicalization.
-        const trustedCarrier = inspectTrustedRuntimeEffectCarrier(input.trustedEffectCarrier);
-        // Provenance is useful only when it describes THESE exact canonical
-        // bytes. This prevents a host wiring mistake from reusing a read
-        // carrier to bless another provider call. The wrapper and bare provider
-        // forms intentionally share one durable contract, while the row below
-        // continues to store the bare tool/digest supplied at the dispatch edge.
-        const trustedContract = trustedCarrier
-          ? durableLogicalCallContract(
-            expected.acceptedTaskId,
-            trustedCarrier.toolName,
-            trustedCarrier.args,
-          )
-          : null;
-        const trustedDecision = trustedCarrier
-          && trustedContract?.toolName === tool
-          && trustedContract.argumentDigest === digest
-          ? trustedCarrier.decision
-          : null;
-        const dispatchEffect = trustedDecision?.effect
+        const dispatchEffect = trustedAdmissionDecision?.effect
           ?? classifyRuntimeToolEffect(input.tool, input.args).effect;
         const gentleRead = dispatchEffect === 'read' || dispatchEffect === 'compute';
         if (!binding && !gentleRead && !approvedMandateAdmitsCall(
@@ -864,14 +1204,56 @@ function beginPhysicalDispatchCore(
       const prior = db.prepare(`
         SELECT accepted_task_id, logical_tool_call_id, physical_dispatch_id, ordinal,
                relation, retry_of, tool_name, argument_digest, state,
-               authority_digest, provider_argument_digest
+               authority_digest, provider_argument_digest, execution_site,
+               staged_authority_digest, lease_scope_id, lease_id
           FROM physical_dispatches
          WHERE session_id = ? AND source_user_seq = ? AND physical_dispatch_id = ?
       `).get(
         input.identity.sessionId,
         input.identity.sourceUserSeq,
         input.identity.physicalDispatchId,
-      ) as (DispatchRow & { authority_digest?: string | null; provider_argument_digest?: string | null }) | undefined;
+      ) as DispatchRow | undefined;
+      const stagedOwner = db.prepare(`
+        SELECT stage_authority_id, authority_digest, provider_argument_digest,
+               physical_dispatch_id, logical_tool_call_id, tool_name,
+               argument_digest, lease_scope_id, lease_id
+          FROM staged_transfer_stage_authorities
+         WHERE session_id = ? AND source_user_seq = ?
+           AND (physical_dispatch_id = ? OR logical_tool_call_id = ?)
+      `).get(
+        input.identity.sessionId,
+        input.identity.sourceUserSeq,
+        input.identity.physicalDispatchId,
+        input.identity.logicalToolCallId,
+      ) as {
+        stage_authority_id: string;
+        authority_digest: string;
+        provider_argument_digest: string;
+        physical_dispatch_id: string;
+        logical_tool_call_id: string;
+        tool_name: string;
+        argument_digest: string;
+        lease_scope_id: string;
+        lease_id: string;
+      } | undefined;
+      if (stagedOwner) {
+        if (
+          !staged
+          || stagedOwner.stage_authority_id !== staged.state.stageAuthorityId
+          || stagedOwner.authority_digest !== staged.state.authorityDigest
+          || stagedOwner.provider_argument_digest !== staged.state.providerArgumentDigest
+          || stagedOwner.physical_dispatch_id !== input.identity.physicalDispatchId
+          || stagedOwner.logical_tool_call_id !== input.identity.logicalToolCallId
+          || stagedOwner.tool_name !== contract?.toolName
+          || stagedOwner.argument_digest !== contract?.argumentDigest
+          || stagedOwner.lease_scope_id !== dispatchLease?.scopeId
+          || stagedOwner.lease_id !== dispatchLease?.leaseId
+        ) {
+          return { status: 'conflict', reason: 'staged crossing requires its exact opaque attempt authority' };
+        }
+      } else if (staged) {
+        return { status: 'conflict', reason: 'staged attempt row is missing' };
+      }
       if (typed?.authorityDigest) {
         const taken = db.prepare(`
           SELECT physical_dispatch_id FROM physical_dispatches
@@ -883,9 +1265,17 @@ function beginPhysicalDispatchCore(
         }
       }
       if (prior) {
-        const storedTyped = Boolean(prior.authority_digest || prior.provider_argument_digest);
-        const incomingTyped = Boolean(typed?.authorityDigest || typed?.providerArgumentDigest);
-        if (storedTyped && !typed?.typedAuthorityJson && incomingTyped) {
+        const storedTyped = Boolean(
+          prior.authority_digest
+          || prior.provider_argument_digest
+          || prior.staged_authority_digest,
+        );
+        const incomingTyped = Boolean(
+          typed?.authorityDigest
+          || typed?.providerArgumentDigest
+          || staged?.state.authorityDigest,
+        );
+        if (storedTyped && !staged && !typed?.typedAuthorityJson && incomingTyped) {
           poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, input.identity.logicalToolCallId, 'compatibility dispatch cannot consume typed authority rows');
           return { status: 'conflict', reason: 'compatibility dispatch cannot consume typed authority rows' };
         }
@@ -894,22 +1284,32 @@ function beginPhysicalDispatchCore(
           return { status: 'conflict', reason: 'compatibility dispatch cannot consume typed authority rows' };
         }
         if (storedTyped || incomingTyped) {
-          if (
-            !prior.authority_digest
-            || !typed?.authorityDigest
-            || prior.authority_digest !== typed.authorityDigest
-            || !prior.provider_argument_digest
-            || !typed.providerArgumentDigest
-            || prior.provider_argument_digest !== typed.providerArgumentDigest
-          ) {
+          const exactGraph = Boolean(
+            prior.authority_digest
+            && typed?.authorityDigest
+            && prior.authority_digest === typed.authorityDigest
+            && prior.provider_argument_digest
+            && typed.providerArgumentDigest
+            && prior.provider_argument_digest === typed.providerArgumentDigest
+            && prior.staged_authority_digest === null,
+          );
+          const exactStaged = Boolean(
+            staged
+            && prior.authority_digest === null
+            && prior.provider_argument_digest === staged.state.providerArgumentDigest
+            && prior.staged_authority_digest === staged.state.authorityDigest,
+          );
+          if (!exactGraph && !exactStaged) {
             poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, input.identity.logicalToolCallId, 'typed authority replay requires exact digest equality');
             return { status: 'conflict', reason: 'typed authority replay requires exact digest equality' };
           }
         }
-        const same = prior.accepted_task_id === expected.acceptedTaskId
+        const same = prior.accepted_task_id === authority.acceptedTaskId
           && prior.logical_tool_call_id === input.identity.logicalToolCallId
           && prior.tool_name === tool
-          && prior.argument_digest === digest;
+          && prior.argument_digest === digest
+          && prior.lease_scope_id === (dispatchLease?.scopeId ?? null)
+          && prior.lease_id === (dispatchLease?.leaseId ?? null);
         if (!same) {
           poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, input.identity.logicalToolCallId, 'physical dispatch id conflicts with an existing crossing');
           return { status: 'conflict', reason: 'physical dispatch id conflicts with an existing crossing' };
@@ -1015,6 +1415,13 @@ function beginPhysicalDispatchCore(
       }
       let persistOrdinal = ordinal;
       let persistRelation = relation;
+      if (staged) {
+        persistOrdinal = ordinal;
+        persistRelation = relation;
+        if (ordinal !== 1 || relation !== 'primary' || input.identity.retryOf) {
+          return { status: 'conflict', reason: 'staged attempt requires one exact primary crossing' };
+        }
+      }
       if (typed?.typedAuthorityJson) {
         const sealed = parseResolvedCallAuthority(typed.typedAuthorityJson);
         if (!sealed.ok) {
@@ -1076,19 +1483,19 @@ function beginPhysicalDispatchCore(
       reserveWriteEvidenceDispatchInTransaction(db, {
         sessionId: input.identity.sessionId,
         sourceUserSeq: input.identity.sourceUserSeq,
-        acceptedTaskId: expected.acceptedTaskId,
+        acceptedTaskId: authority.acceptedTaskId,
         logicalToolCallId: input.identity.logicalToolCallId,
         physicalDispatchId: input.identity.physicalDispatchId,
         ordinal: persistOrdinal,
       });
       mirror = insertInternalEventInTransaction(db, {
         sessionId: input.identity.sessionId,
-        turn: input.turn ?? expected.identity.turn,
+        turn: input.turn ?? authority.identity.turn,
         role: 'system',
         type: DISPATCH_STARTED_EVENT,
         data: {
           sourceUserSeq: input.identity.sourceUserSeq,
-          acceptedTaskId: expected.acceptedTaskId,
+          acceptedTaskId: authority.acceptedTaskId,
           logicalToolCallId: input.identity.logicalToolCallId,
           physicalDispatchId: input.identity.physicalDispatchId,
           ordinal: persistOrdinal,
@@ -1103,12 +1510,13 @@ function beginPhysicalDispatchCore(
           (session_id, source_user_seq, accepted_task_id, logical_tool_call_id,
            physical_dispatch_id, ordinal, relation, retry_of, tool_name,
            argument_digest, state, started_at, start_event_id, execution_site,
-           authority_digest, provider_argument_digest)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?)
+           authority_digest, provider_argument_digest, staged_authority_digest,
+           lease_scope_id, lease_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         input.identity.sessionId,
         input.identity.sourceUserSeq,
-        expected.acceptedTaskId,
+        authority.acceptedTaskId,
         input.identity.logicalToolCallId,
         input.identity.physicalDispatchId,
         persistOrdinal,
@@ -1120,7 +1528,10 @@ function beginPhysicalDispatchCore(
         mirror.id,
         input.executionSite ?? null,
         typed?.authorityDigest ?? null,
-        typed?.providerArgumentDigest ?? null,
+        typed?.providerArgumentDigest ?? staged?.state.providerArgumentDigest ?? null,
+        staged?.state.authorityDigest ?? null,
+        dispatchLease?.scopeId ?? null,
+        dispatchLease?.leaseId ?? null,
       );
       if (typed) {
         db.prepare(`
@@ -1419,34 +1830,120 @@ export function authorizeTypedReconciliation(input: {
   return { ok: true, authority: persisted.authority };
 }
 
-/** Atomically close one exact crossing. */
-export function settlePhysicalDispatch(input: {
+interface PhysicalDispatchSettlementInput {
   identity: PhysicalCrossingIdentity;
   tool: string;
   outcome: CrossingOutcome;
   turn?: number;
   authorityDigest?: string;
+  /** Exact generation that opened the crossing. Ambient when omitted. */
+  dispatchLease?: DispatchLeaseRef;
+  /** Staged provider-return bytes. Required for a returned staged crossing;
+   * forbidden for ordinary or non-returned crossings. The checkpoint INSERT
+   * shares this settlement's transaction and therefore cannot become an
+   * independent success oracle. */
+  returnCheckpoint?: PreparedPhysicalReturnCheckpoint;
+}
+
+interface StagedPhysicalSettlementPersist {
+  authority: StagedPhysicalDispatchAuthority;
+  state: Readonly<StagedPhysicalDispatchAuthorityState>;
+}
+
+/** Ordinary/graph settlement. Copyable staged IDs cannot use this surface. */
+export function settlePhysicalDispatch(
+  input: PhysicalDispatchSettlementInput,
+): DispatchSettlementResult {
+  return settlePhysicalDispatchCore(input);
+}
+
+/** Exact staged settlement. Returned attempts require the checkpoint minted by
+ * `executeStagedProviderBody`; every terminal state appends one immutable stage
+ * receipt in the same transaction as the physical CAS. */
+export function settleStagedPhysicalDispatch(input: {
+  authority: StagedPhysicalDispatchAuthority;
+  outcome: CrossingOutcome;
+  turn?: number;
+  returnCheckpoint?: PreparedPhysicalReturnCheckpoint;
 }): DispatchSettlementResult {
+  const state = inspectStagedPhysicalDispatchAuthority(input.authority);
+  if (!state) return { status: 'conflict', reason: 'staged settlement authority no longer reopens' };
+  return settlePhysicalDispatchCore({
+    identity: {
+      sessionId: state.sessionId,
+      sourceUserSeq: state.sourceUserSeq,
+      acceptedTaskId: state.acceptedTaskId,
+      logicalToolCallId: state.logicalToolCallId,
+      physicalDispatchId: state.physicalDispatchId,
+      ordinal: 1,
+    },
+    tool: state.toolName,
+    outcome: input.outcome,
+    turn: input.turn,
+    dispatchLease: state.lease,
+    returnCheckpoint: input.returnCheckpoint,
+  }, { authority: input.authority, state });
+}
+
+function settlePhysicalDispatchCore(
+  input: PhysicalDispatchSettlementInput,
+  staged?: StagedPhysicalSettlementPersist,
+): DispatchSettlementResult {
   const tool = safeToolName(input.tool);
   if (!tool) return { status: 'conflict', reason: 'dispatch tool identity is unsafe' };
   if (settlementStorageFault) {
     return { status: 'storage_error', reason: 'forced settlement storage failure' };
   }
+  const dispatchLease = input.dispatchLease ?? currentDispatchLease();
   const db = openEventLog();
   let mirror: EventRow | null = null;
   try {
     const transaction = db.transaction((): DispatchSettlementResult => {
       const row = db.prepare(`
         SELECT accepted_task_id, logical_tool_call_id, physical_dispatch_id, ordinal,
-               relation, retry_of, tool_name, argument_digest, state, authority_digest
+               relation, retry_of, tool_name, argument_digest, state, authority_digest,
+               provider_argument_digest, staged_authority_digest,
+               execution_site, lease_scope_id, lease_id
           FROM physical_dispatches
          WHERE session_id = ? AND source_user_seq = ? AND physical_dispatch_id = ?
       `).get(
         input.identity.sessionId,
         input.identity.sourceUserSeq,
         input.identity.physicalDispatchId,
-      ) as (DispatchRow & { authority_digest?: string | null }) | undefined;
+      ) as DispatchRow | undefined;
       if (!row) return { status: 'missing', reason: 'physical dispatch start is missing' };
+      if (row.staged_authority_digest) {
+        const reopened = staged
+          ? inspectStagedPhysicalDispatchAuthority(staged.authority)
+          : null;
+        if (
+          !staged
+          || !reopened
+          || reopened.authorityDigest !== row.staged_authority_digest
+          || reopened.authorityDigest !== staged.state.authorityDigest
+          || reopened.providerArgumentDigest !== row.provider_argument_digest
+          || reopened.physicalDispatchId !== row.physical_dispatch_id
+          || reopened.logicalToolCallId !== row.logical_tool_call_id
+        ) {
+          return { status: 'conflict', reason: 'staged crossing requires its exact opaque settlement authority' };
+        }
+      } else if (staged) {
+        return { status: 'conflict', reason: 'staged settlement authority does not own this crossing' };
+      }
+      if (row.lease_scope_id !== null || row.lease_id !== null) {
+        if (
+          !dispatchLease
+          || row.lease_scope_id !== dispatchLease.scopeId
+          || row.lease_id !== dispatchLease.leaseId
+          || dispatchLease.sessionId !== input.identity.sessionId
+          || dispatchLease.sourceUserSeq !== input.identity.sourceUserSeq
+          || dispatchLease.acceptedTaskId !== input.identity.acceptedTaskId
+          || dispatchLease.logicalToolCallId !== input.identity.logicalToolCallId
+          || !isDispatchLeaseCurrent(dispatchLease)
+        ) {
+          return { status: 'closed', reason: 'physical settlement lease is no longer current' };
+        }
+      }
       if (row.authority_digest) {
         if (!input.authorityDigest || input.authorityDigest !== row.authority_digest) {
           poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, input.identity.logicalToolCallId, 'settlement authority digest does not match the reservation');
@@ -1461,10 +1958,55 @@ export function settlePhysicalDispatch(input: {
         poisonResolution(db, input.identity.sessionId, input.identity.sourceUserSeq, input.identity.logicalToolCallId, 'physical settlement conflicts with its start');
         return { status: 'conflict', reason: 'physical settlement conflicts with its start' };
       }
+      const stagedReturnIdentity = stagedPhysicalReturnCheckpointIdentity(db, {
+        sessionId: input.identity.sessionId,
+        sourceUserSeq: input.identity.sourceUserSeq,
+        acceptedTaskId: input.identity.acceptedTaskId,
+        logicalToolCallId: input.identity.logicalToolCallId,
+        physicalDispatchId: input.identity.physicalDispatchId,
+        toolName: tool,
+        argumentDigest: row.argument_digest,
+        leaseScopeId: row.lease_scope_id,
+        leaseId: row.lease_id,
+      });
+      if (input.returnCheckpoint && input.outcome !== 'returned') {
+        return { status: 'conflict', reason: 'a physical return checkpoint requires a returned outcome' };
+      }
+      if (stagedReturnIdentity) {
+        if (
+          input.outcome === 'returned'
+          && (!input.returnCheckpoint
+            || !preparedPhysicalReturnCheckpointOwns(input.returnCheckpoint, stagedReturnIdentity))
+        ) {
+          return { status: 'conflict', reason: 'returned staged dispatch requires its exact physical return checkpoint' };
+        }
+      } else if (input.returnCheckpoint) {
+        return { status: 'conflict', reason: 'physical return checkpoint does not own this crossing' };
+      }
       if (row.state !== 'started') {
-        return row.state === input.outcome
-          ? { status: 'replayed' }
-          : { status: 'conflict', reason: `crossing already settled as ${row.state}` };
+        if (row.state !== input.outcome) {
+          return { status: 'conflict', reason: `crossing already settled as ${row.state}` };
+        }
+        if (
+          input.returnCheckpoint
+          && !persistedPhysicalReturnCheckpointOwns(db, input.returnCheckpoint)
+        ) {
+          return { status: 'conflict', reason: 'replayed physical return checkpoint does not match durable authority' };
+        }
+        if (staged) {
+          const receipt = db.prepare(`
+            SELECT terminal_state, result_digest
+              FROM staged_transfer_stage_receipts
+             WHERE stage_authority_id = ?
+          `).get(staged.state.stageAuthorityId) as {
+            terminal_state: string;
+            result_digest: string | null;
+          } | undefined;
+          if (!receipt || receipt.terminal_state !== input.outcome) {
+            return { status: 'conflict', reason: 'staged settlement replay lacks its exact terminal receipt' };
+          }
+        }
+        return { status: 'replayed' };
       }
       mirror = insertInternalEventInTransaction(db, {
         sessionId: input.identity.sessionId,
@@ -1497,6 +2039,23 @@ export function settlePhysicalDispatch(input: {
         input.identity.physicalDispatchId,
       );
       if (updated.changes !== 1) throw new Error('physical dispatch settlement lost its CAS');
+      if (input.returnCheckpoint) {
+        insertPreparedPhysicalReturnCheckpointInTransaction(db, input.returnCheckpoint);
+      } else if (staged) {
+        const receipt = db.prepare(`
+          INSERT INTO staged_transfer_stage_receipts
+            (stage_authority_id, stage_id, plan_id, session_id, source_user_seq,
+             stage_ordinal, attempt_ordinal, physical_dispatch_id, terminal_state,
+             result_digest, recorded_at)
+          SELECT authority.stage_authority_id, authority.stage_id, authority.plan_id,
+                 authority.session_id, authority.source_user_seq,
+                 authority.stage_ordinal, authority.attempt_ordinal,
+                 authority.physical_dispatch_id, ?, NULL, ?
+            FROM staged_transfer_stage_authorities authority
+           WHERE authority.stage_authority_id = ?
+        `).run(input.outcome, mirror.createdAt, staged.state.stageAuthorityId);
+        if (receipt.changes !== 1) throw new Error('staged terminal receipt lost its exact authority');
+      }
       db.prepare(`
         UPDATE physical_dispatch_authority_sealed
            SET retention_class = 'settled'
@@ -1510,6 +2069,169 @@ export function settlePhysicalDispatch(input: {
     });
     const result = transaction.immediate();
     if (result.status === 'inserted' && mirror) publishCommittedInternalEvent(mirror);
+    return result;
+  } catch (error) {
+    return { status: 'storage_error', reason: boundedReason(error) };
+  }
+}
+
+export type StoppedDispatchOutcome = Extract<
+  CrossingOutcome,
+  'timed_out' | 'cancelled' | 'unknown'
+>;
+
+export type DispatchLeaseTerminalizationResult =
+  | { status: 'inserted' | 'replayed'; settled: number; physicalDispatchIds: string[] }
+  | { status: 'closed' | 'missing' | 'conflict' | 'storage_error'; reason: string };
+
+/**
+ * Close every still-started crossing owned by one exact, already-revoked call
+ * generation. This is the only API allowed to terminalize a detached body: it
+ * cannot address a newer generation and it commits every terminal row before
+ * the host is permitted to recover.
+ */
+export function settleStartedPhysicalDispatchesForLease(input: {
+  lease: DispatchLeaseRef;
+  outcome: StoppedDispatchOutcome;
+  turn?: number;
+}): DispatchLeaseTerminalizationResult {
+  const { lease } = input;
+  if (
+    lease.sourceUserSeq === undefined
+    || !lease.acceptedTaskId
+    || !lease.logicalToolCallId
+  ) {
+    return { status: 'conflict', reason: 'terminalization requires an exact call-bound lease' };
+  }
+  if (settlementStorageFault) {
+    return { status: 'storage_error', reason: 'forced settlement storage failure' };
+  }
+  const db = openEventLog();
+  const mirrors: EventRow[] = [];
+  try {
+    const transaction = db.transaction((): DispatchLeaseTerminalizationResult => {
+      const owner = db.prepare(`
+        SELECT revoked_at, source_user_seq, accepted_task_id, logical_tool_call_id
+          FROM run_dispatch_leases
+         WHERE session_id = ? AND scope_id = ? AND lease_id = ?
+      `).get(lease.sessionId, lease.scopeId, lease.leaseId) as {
+        revoked_at: string | null;
+        source_user_seq: number | null;
+        accepted_task_id: string | null;
+        logical_tool_call_id: string | null;
+      } | undefined;
+      if (!owner) return { status: 'missing', reason: 'dispatch lease generation is missing' };
+      if (
+        owner.revoked_at === null
+        || owner.source_user_seq !== lease.sourceUserSeq
+        || owner.accepted_task_id !== lease.acceptedTaskId
+        || owner.logical_tool_call_id !== lease.logicalToolCallId
+      ) {
+        return { status: 'conflict', reason: 'dispatch lease is not the exact revoked call generation' };
+      }
+      const rows = db.prepare(`
+        SELECT accepted_task_id, logical_tool_call_id, physical_dispatch_id,
+               ordinal, relation, retry_of, tool_name, argument_digest, state,
+               authority_digest, provider_argument_digest, staged_authority_digest,
+               execution_site, lease_scope_id, lease_id
+          FROM physical_dispatches
+         WHERE session_id = ? AND source_user_seq = ?
+           AND lease_scope_id = ? AND lease_id = ?
+         ORDER BY logical_tool_call_id, ordinal, physical_dispatch_id
+      `).all(
+        lease.sessionId,
+        lease.sourceUserSeq,
+        lease.scopeId,
+        lease.leaseId,
+      ) as DispatchRow[];
+      if (!rows.length) {
+        return { status: 'missing', reason: 'revoked dispatch lease owns no physical crossing' };
+      }
+      if (rows.some((row) => (
+        row.accepted_task_id !== lease.acceptedTaskId
+        || row.logical_tool_call_id !== lease.logicalToolCallId
+        || row.lease_scope_id !== lease.scopeId
+        || row.lease_id !== lease.leaseId
+      ))) {
+        return { status: 'conflict', reason: 'dispatch rows contradict their lease owner' };
+      }
+      const started = rows.filter((row) => row.state === 'started');
+      for (const row of started) {
+        const mirror = insertInternalEventInTransaction(db, {
+          sessionId: lease.sessionId,
+          turn: input.turn ?? 0,
+          role: 'system',
+          type: DISPATCH_SETTLED_EVENT,
+          data: {
+            sourceUserSeq: lease.sourceUserSeq,
+            acceptedTaskId: lease.acceptedTaskId,
+            logicalToolCallId: lease.logicalToolCallId,
+            physicalDispatchId: row.physical_dispatch_id,
+            ordinal: row.ordinal,
+            relation: row.relation,
+            ...(row.retry_of ? { retryOf: row.retry_of } : {}),
+            tool: row.tool_name,
+            outcome: input.outcome,
+          },
+        });
+        const updated = db.prepare(`
+          UPDATE physical_dispatches
+             SET state = ?, settled_at = ?, settle_event_id = ?
+           WHERE session_id = ? AND source_user_seq = ?
+             AND physical_dispatch_id = ? AND lease_scope_id = ? AND lease_id = ?
+             AND state = 'started'
+        `).run(
+          input.outcome,
+          mirror.createdAt,
+          mirror.id,
+          lease.sessionId,
+          lease.sourceUserSeq,
+          row.physical_dispatch_id,
+          lease.scopeId,
+          lease.leaseId,
+        );
+        if (updated.changes !== 1) throw new Error('lease terminalization lost its physical CAS');
+        if (row.staged_authority_digest) {
+          const receipt = db.prepare(`
+            INSERT INTO staged_transfer_stage_receipts
+              (stage_authority_id, stage_id, plan_id, session_id, source_user_seq,
+               stage_ordinal, attempt_ordinal, physical_dispatch_id, terminal_state,
+               result_digest, recorded_at)
+            SELECT authority.stage_authority_id, authority.stage_id, authority.plan_id,
+                   authority.session_id, authority.source_user_seq,
+                   authority.stage_ordinal, authority.attempt_ordinal,
+                   authority.physical_dispatch_id, ?, NULL, ?
+              FROM staged_transfer_stage_authorities authority
+             WHERE authority.session_id = ? AND authority.source_user_seq = ?
+               AND authority.physical_dispatch_id = ?
+               AND authority.authority_digest = ?
+          `).run(
+            input.outcome,
+            mirror.createdAt,
+            lease.sessionId,
+            lease.sourceUserSeq,
+            row.physical_dispatch_id,
+            row.staged_authority_digest,
+          );
+          if (receipt.changes !== 1) throw new Error('lease terminalization lost its staged receipt authority');
+        }
+        db.prepare(`
+          UPDATE physical_dispatch_authority_sealed
+             SET retention_class = 'settled'
+           WHERE session_id = ? AND source_user_seq = ? AND physical_dispatch_id = ?
+        `).run(lease.sessionId, lease.sourceUserSeq, row.physical_dispatch_id);
+        mirrors.push(mirror);
+      }
+      return {
+        status: started.length ? 'inserted' : 'replayed',
+        settled: started.length,
+        physicalDispatchIds: rows.map((row) => row.physical_dispatch_id),
+      };
+    });
+    const result = transaction.immediate();
+    if (result.status === 'inserted') {
+      for (const mirror of mirrors) publishCommittedInternalEvent(mirror);
+    }
     return result;
   } catch (error) {
     return { status: 'storage_error', reason: boundedReason(error) };
@@ -1545,6 +2267,9 @@ export interface PhysicalCrossing {
   tool: string;
   outcome?: CrossingOutcome;
   settled: boolean;
+  executionSite?: 'host';
+  leaseScopeId?: string;
+  leaseId?: string;
 }
 
 /** Every crossing this accepted task paid for, in database-assigned order. */
@@ -1555,7 +2280,7 @@ export function physicalCrossingsFor(
   try {
     return (openEventLog().prepare(`
       SELECT physical_dispatch_id, logical_tool_call_id, ordinal, relation,
-             retry_of, tool_name, state
+             retry_of, tool_name, state, execution_site, lease_scope_id, lease_id
         FROM physical_dispatches
        WHERE session_id = ? AND source_user_seq = ?
        ORDER BY logical_tool_call_id, ordinal
@@ -1567,6 +2292,9 @@ export function physicalCrossingsFor(
       retry_of: string | null;
       tool_name: string;
       state: DispatchRow['state'];
+      execution_site: 'host' | null;
+      lease_scope_id: string | null;
+      lease_id: string | null;
     }>).map((row) => ({
       physicalDispatchId: row.physical_dispatch_id,
       logicalToolCallId: row.logical_tool_call_id,
@@ -1574,8 +2302,11 @@ export function physicalCrossingsFor(
       relation: row.relation,
       ...(row.retry_of ? { retryOf: row.retry_of } : {}),
       tool: row.tool_name,
-      ...(row.state === 'returned' || row.state === 'threw' ? { outcome: row.state } : {}),
+      ...(row.state !== 'started' ? { outcome: row.state } : {}),
       settled: row.state !== 'started',
+      ...(row.execution_site === 'host' ? { executionSite: 'host' as const } : {}),
+      ...(row.lease_scope_id ? { leaseScopeId: row.lease_scope_id } : {}),
+      ...(row.lease_id ? { leaseId: row.lease_id } : {}),
     }));
   } catch {
     return [];

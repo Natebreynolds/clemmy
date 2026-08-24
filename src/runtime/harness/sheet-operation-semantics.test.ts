@@ -4,7 +4,10 @@ import {
   classifyComposioActionConsequence,
   composioSlugEffectEvidence,
 } from '../../integrations/composio/slug-effect.js';
-import { documentedComposioOperationSemantic } from '../../integrations/composio/operation-semantics.js';
+import {
+  documentedAtomicInputContentCommit,
+  documentedComposioOperationSemantic,
+} from '../../integrations/composio/operation-semantics.js';
 import { canonicalizePendingActionCall } from '../../tools/pending-action-admission.js';
 import { artifactIntentForTool } from './artifact-ledger.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
@@ -43,6 +46,10 @@ test('one documented operation descriptor owns every Sheets constructor alias', 
       reversibility: 'reversible',
       consequence: 'create',
       rootArtifact: { kind: 'resource', provider: 'googlesheets' },
+      atomicInputContentCommit: {
+        kind: 'googlesheets_sheet_from_json_content_v1',
+        evidence: ['receipt', 'content_commit'],
+      },
     }, action);
     assert.equal(classifyComposioActionConsequence(action), 'create', action);
   }
@@ -51,6 +58,58 @@ test('one documented operation descriptor owns every Sheets constructor alias', 
     'write',
     'the noun-shaped constructor has affirmative mutation evidence',
   );
+  assert.deepEqual(documentedAtomicInputContentCommit('GOOGLESHEETS_SHEET_FROM_JSON'), {
+    kind: 'googlesheets_sheet_from_json_content_v1',
+    evidence: ['receipt', 'content_commit'],
+  });
+  assert.deepEqual(documentedAtomicInputContentCommit('googlesheets_sheet_from_json'), {
+    kind: 'googlesheets_sheet_from_json_content_v1',
+    evidence: ['receipt', 'content_commit'],
+  }, 'the call kernel\'s exact case-normalized identity retains the same semantic');
+  for (const lookalike of [
+    'GOOGLE_SHEETS_SHEET_FROM_JSON',
+    'cx_googlesheets_sheet_from_json',
+    'GOOGLESHEETS_SHEET_FROM_JSON_PREVIEW',
+    'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+    'GOOGLESHEETS_UPDATE_SHEET',
+  ]) assert.equal(documentedAtomicInputContentCommit(lookalike), null, lookalike);
+});
+
+test('a blank Sheet creator has no documented reversible content-bearing semantic', () => {
+  for (const action of [
+    'GOOGLESHEETS_CREATE_GOOGLE_SHEET',
+    'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+  ]) {
+    assert.equal(documentedComposioOperationSemantic(action), null, action);
+    const effect = classifyExternalWrite('composio_execute_tool', {
+      tool_slug: action,
+      arguments: JSON.stringify({ title: 'Blank sheet' }),
+    });
+    assert.equal(effect.external, true, action);
+    assert.equal(effect.mutating, true, action);
+    assert.equal(effect.reversibility, 'unknown', action);
+  }
+});
+
+test('the artifact-recognized Google Docs markdown constructor is documented reversible', () => {
+  assert.deepEqual(documentedComposioOperationSemantic('GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN'), {
+    effect: 'write',
+    reversibility: 'reversible',
+    consequence: 'create',
+    rootArtifact: { kind: 'google_doc', provider: 'Google Docs' },
+  });
+  const payload = {
+    tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+    arguments: JSON.stringify({ title: 'Summary', markdown: '# Summary' }),
+  };
+  assert.equal(classifyExternalWrite('composio_execute_tool', payload).reversibility, 'reversible');
+  assert.deepEqual(artifactIntentForTool('composio_execute_tool', payload), {
+    kind: 'google_doc',
+    provider: 'Google Docs',
+    slotKey: 'google_doc:primary',
+    title: 'Summary',
+    createShape: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+  });
 });
 
 test('Ventura Sheet creation is a known reversible mutation on every trusted carrier', () => {

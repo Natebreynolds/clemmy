@@ -179,7 +179,7 @@ export function countSheetRows(result: unknown): number {
 async function defaultSheetRowCount(spreadsheetId: string, sessionId: string): Promise<number> {
   try {
     const [{ dispatchBatchItemTool }, { ToolCallsCounter }] = await Promise.all([
-      import('../tools/code-mode-tool.js'),
+      import('../tools/inner-dispatch.js'),
       import('../runtime/harness/brackets.js'),
     ]);
     const out = await dispatchBatchItemTool(

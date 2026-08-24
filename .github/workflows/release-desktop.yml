@@ -168,6 +168,12 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      - name: Measurement-layer tests
+        run: npm run test:measurement
+
+      - name: Proof self-tests
+        run: npm run proof:selftest
+
       - name: Public repository hygiene
         run: npm run check:public-hygiene
 
@@ -176,6 +182,12 @@ jobs:
 
       - name: Release asset tests
         run: npm run test:release-assets
+
+      - name: Release closure tests
+        run: |
+          command -v sqlite3
+          sqlite3 --version
+          npm run test:release-closure
 
       - name: Typecheck
         run: npm run typecheck

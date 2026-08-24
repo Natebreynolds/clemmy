@@ -36,7 +36,7 @@ const sdk = await import('./claude-agent-sdk.js');
 const claudeLocalCorrelation = await import('./claude-local-tool-correlation.js');
 const brain = await import('./claude-agent-brain.js');
 const terminalRepair = await import('./terminal-presentation-repair.js');
-const codeMode = await import('../../tools/code-mode-tool.js');
+const nestedDispatch = await import('../../tools/inner-dispatch.js');
 
 function writeClaudeToken(): void {
   writeFileSync(path.join(TMP_HOME, 'state', 'claude-auth.json'), JSON.stringify({
@@ -129,7 +129,13 @@ function prepareExactTask(text: string, activateAction = true): {
     sessionId: session.id,
     sourceUserSeq: source.seq,
   });
-  if (known.status === 'action_deferred' && activateAction) {
+  if (
+    activateAction
+    && (
+      known.status === 'action_deferred'
+      || (known.status === 'bound' && graph.classification.route === 'act')
+    )
+  ) {
     actionBoundary.requireActionExpectedWorkActivation({
       sessionId: session.id,
       sourceUserSeq: source.seq,
@@ -150,7 +156,7 @@ beforeEach(() => {
   brain.setClaudeAgentSdkBrainPostTurnHooksForTest(null);
   brain.setClaudeAgentSdkBrainJudgeForTest(null);
   brain.setClaudeAgentSdkBrainTerminalPresentationRepairPortForTest(null);
-  codeMode._setCodeModeToolsForTests(null);
+  nestedDispatch._setInnerDispatchToolsForTests(null);
   brain.setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => ({
     objective: query,
     hits: [],
@@ -167,7 +173,7 @@ after(() => {
   brain.setClaudeAgentSdkBrainJudgeForTest(null);
   brain.setClaudeAgentSdkBrainTerminalPresentationRepairPortForTest(null);
   brain.setClaudeAgentSdkBrainUnifiedPrimerForTest(null);
-  codeMode._setCodeModeToolsForTests(null);
+  nestedDispatch._setInnerDispatchToolsForTests(null);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -208,8 +214,11 @@ test('connected Claude brain accepts the work_call action surface without requir
     assert.ok(registered.memory_recall_all);
     assert.ok(registered.tool_search);
     assert.ok(registered.work_call);
-    assert.equal(registered.call_tool, undefined,
-      'the accepted action keeps work_call as its sole generic business carrier');
+    // work_call stays the sole BUSINESS-WRITE carrier; call_tool mounts in
+    // control+read-only mode (lane parity with Codex, 2026-08-20) so deferred
+    // control/read tools have a direct door instead of proposal grammar.
+    assert.ok(registered.call_tool,
+      'the control/read-only dispatcher mounts beside the bound carrier');
     const messages = successMessages([
       'mcp__clementine-local__memory_recall_all',
       'mcp__clementine-local__tool_search',
@@ -236,6 +245,8 @@ test('connected Claude brain accepts the work_call action surface without requir
     }) as Query;
   }) as never);
 
+  // Final doctrine 2026-08-18: a precise named job is its own approval —
+  // the plan line informs, execution proceeds in the same turn.
   const response = await brain.respondViaClaudeAgentSdkBrain('home', {
     message: 'Read the alpha source, then write every record into a new report.',
     sessionId,
@@ -295,7 +306,7 @@ test('exact Claude act surface exposes work_call as its sole generic business ca
     directOrchestrator: true,
     allowedLocalMcpTools: ['memory_search', 'mcp_list_tools', 'run_shell_command'],
     mcpToolAllowlist: ['memory_search', 'mcp_list_tools', 'run_shell_command'],
-    localMcpToolUniverse: ['memory_search', 'mcp_list_tools', 'run_shell_command'],
+    localMcpToolUniverse: ['memory_search', 'mcp_list_tools', 'run_shell_command', 'workflow_get'],
     nativeMcpToolScope: {
       authority: 'none', reason: 'test', allowedServerSlugs: [], maxTools: 0,
     },
@@ -305,15 +316,20 @@ test('exact Claude act surface exposes work_call as its sole generic business ca
   assert.deepEqual(Object.keys(servers), ['clementine-local'], 'act does not expose a second native business surface');
   const registered = servers['clementine-local'].instance._registeredTools as Record<string, any>;
   assert.ok(registered.work_call);
-  assert.ok(registered.run_tool_program, 'Claude action lane retains the shared code-mode control carrier');
-  assert.match(
-    String(registered.run_tool_program.description ?? ''),
-    /clem\.work/,
-    'Claude action code mode receives the same explicit semantic carrier contract',
-  );
+  assert.equal(registered.run_tool_program, undefined, 'the subtracted program surface never mounts');
   assert.ok(registered.tool_search);
   assert.ok(registered.mcp_list_tools, 'control/discovery remains first-class');
-  assert.equal(registered.call_tool, undefined, 'generic call_tool cannot compete with the bound carrier');
+  // Lane parity (2026-08-20): the Codex action lane always had a control-only
+  // dispatcher; the Claude lane did not, so deferred CONTROL/READ tools had no
+  // direct door and every read paid work_call proposal grammar (live mobile
+  // dashboard turn). call_tool now mounts in control+read-only mode — business
+  // WRITES are still refused by the dispatcher and belong to work_call.
+  assert.ok(registered.call_tool, 'the control/read-only dispatcher mounts beside the bound carrier');
+  assert.match(
+    String(registered.call_tool.description ?? ''),
+    /cannot invoke business\/provider WRITES/,
+    'the mounted dispatcher is the control+read-only carrier, not a second business surface',
+  );
   // memory_search is a harness-STATE read (control role since 320b5947):
   // local recall must never burn work_call carrier attempts, so control
   // reads are first-class on act. World compute/writes remain business and
@@ -321,11 +337,26 @@ test('exact Claude act surface exposes work_call as its sole generic business ca
   assert.ok(registered.memory_search, 'control-role harness-state reads are first-class on act');
   assert.equal(registered.run_shell_command, undefined, 'business compute/writes are inner calls, not an unbound bypass');
 
+  const searchedRead = await registered.tool_search.handler({ query: 'workflow_get', limit: 1 });
+  const readSearchBody = JSON.parse(searchedRead.content[0].text) as {
+    results: Array<{ name: string; carrier?: string }>;
+    hint: string;
+  };
+  assert.equal(readSearchBody.results[0]?.name, 'workflow_get');
+  assert.equal(
+    readSearchBody.results[0]?.carrier,
+    'call_tool',
+    'Claude action discovery routes a registry read through the direct read/control carrier',
+  );
+  assert.match(readSearchBody.hint, /call_tool\(name, args_json\)/);
+
   const searched = await registered.tool_search.handler({ query: 'run_shell_command', limit: 1 });
   const searchBody = JSON.parse(searched.content[0].text) as {
+    results: Array<{ name: string; carrier?: string }>;
     hint: string;
     brokerCoverage: string;
   };
+  assert.equal(searchBody.results[0]?.carrier, 'work_call');
   assert.match(searchBody.hint, /inner name\/args_json of work_call/);
   assert.equal(searchBody.brokerCoverage, 'builtins_only',
     'an explicitly denied external scope cannot arm provider-backed role discovery');
@@ -463,61 +494,6 @@ test('Claude accepted action reconciles background status and continues to work_
     'mcp__clementine-local__work_call',
   ]);
   assert.equal(result.text, 'Continued the accepted action after reconciliation.');
-});
-
-test('Claude local MCP run_tool_program carries scoped work_call through the real sandbox', async () => {
-  const task = prepareExactTask('Read the alpha source and write it into a new local report.');
-  assert.equal(task.route, 'act');
-  let innerExecutions = 0;
-  codeMode._setCodeModeToolsForTests(new Map([['user_profile_read', {
-    name: 'user_profile_read',
-    invoke: async () => {
-      innerExecutions += 1;
-      return { successful: true, data: { name: 'Clem' } };
-    },
-  }]]));
-  const server = localMcpServer.createClementineMcpServer({
-    sessionId: task.sessionId,
-    sourceUserSeq: task.sourceUserSeq,
-    runScopeId: `${task.sessionId}::claude-code-work`,
-    directOrchestrator: true,
-    actionExpectedWork: true,
-    allowedTools: ['run_tool_program', 'work_call', 'tool_search'],
-    deferredTools: ['user_profile_read', 'write_file'],
-    mcpToolScope: null,
-  });
-  const registered = (server as any)._registeredTools as Record<string, any>;
-  const firstWork = {
-    proposal: {
-      version: 1,
-      operations: [
-        { id: 'read-source', effect: 'read', coverage: 'single', dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } },
-        { id: 'write-report', effect: 'local_write', coverage: null, dependsOn: ['read-source'], dataFrom: ['read-source'], cardinality: { kind: 'once' } },
-      ],
-      universes: [],
-    },
-    requirement_id: 'read-source',
-    universe_item_id: null,
-    universe_selector: null,
-    name: 'user_profile_read',
-    args_json: '{}',
-  };
-  const response = await registered.run_tool_program.handler({
-    program: `return await clem.work(${JSON.stringify(firstWork)});`,
-  });
-  assert.notEqual(response.isError, true);
-  assert.match(response.content[0].text, /successful/);
-  assert.equal(innerExecutions, 1);
-  const db = eventlog.openEventLog();
-  const binding = db.prepare(`
-    SELECT requirement_id, tool_name FROM expected_work_call_bindings
-     WHERE session_id = ? AND source_user_seq = ?
-  `).get(task.sessionId, task.sourceUserSeq) as { requirement_id: string; tool_name: string } | undefined;
-  assert.deepEqual(binding, { requirement_id: 'read-source', tool_name: 'user_profile_read' });
-  assert.equal((db.prepare(`
-    SELECT COUNT(*) AS n FROM logical_tool_calls
-     WHERE session_id = ? AND source_user_seq = ? AND state = 'OPEN'
-  `).get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 0);
 });
 
 test('Claude work_call resolves an exact authorized external MCP schema and lets the host read outrank binding-plan ambiguity', async () => {
@@ -908,13 +884,25 @@ test('Claude direct terminal stays byte-identical and spends no presentation rep
   const sessionId = 'claude-direct-terminal-no-presentation-repair';
   const reply = 'Hey — it’s genuinely good to hear from you.';
   eventlog.createSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
-  brain.setClaudeAgentSdkBrainRunForTest(async () => ({
-    text: reply,
-    sessionId: 'sdk-direct-terminal',
-    model: 'claude-sonnet-test',
-    toolUses: [],
-    stoppedReason: 'success',
-  }));
+  let capturedAllowedLocalTools: string[] | undefined;
+  let capturedMcpToolAllowlist: string[] | undefined;
+  let capturedLocalToolUniverse: string[] | undefined;
+  let capturedRequiredLocalTools: string[] | undefined;
+  let capturedNativeScope: { maxTools?: number; allowedServerSlugs?: string[] } | undefined;
+  brain.setClaudeAgentSdkBrainRunForTest(async (options) => {
+    capturedAllowedLocalTools = options.allowedLocalMcpTools;
+    capturedMcpToolAllowlist = options.mcpToolAllowlist;
+    capturedLocalToolUniverse = options.localMcpToolUniverse;
+    capturedRequiredLocalTools = options.requiredLocalMcpTools;
+    capturedNativeScope = options.nativeMcpToolScope;
+    return {
+      text: reply,
+      sessionId: 'sdk-direct-terminal',
+      model: 'claude-sonnet-test',
+      toolUses: [],
+      stoppedReason: 'success',
+    };
+  });
   let repairCalls = 0;
   brain.setClaudeAgentSdkBrainTerminalPresentationRepairPortForTest({
     async render() {
@@ -932,6 +920,12 @@ test('Claude direct terminal stays byte-identical and spends no presentation rep
   assert.equal(response.text, reply);
   assert.equal(response.stoppedReason, 'success');
   assert.equal(repairCalls, 0);
+  assert.deepEqual(capturedAllowedLocalTools, [], 'an admitted direct reply carries no local tool authority');
+  assert.deepEqual(capturedMcpToolAllowlist, [], 'an admitted direct reply registers no local schemas');
+  assert.deepEqual(capturedLocalToolUniverse, [], 'an admitted direct reply has no deferred dispatcher universe');
+  assert.deepEqual(capturedRequiredLocalTools, [], 'an admitted direct reply requires no tool sentinel');
+  assert.equal(capturedNativeScope?.maxTools, 0, 'an admitted direct reply carries no native MCP authority');
+  assert.deepEqual(capturedNativeScope?.allowedServerSlugs, []);
 });
 
 test('direct and retrieve sources do not gain the action carrier', async () => {

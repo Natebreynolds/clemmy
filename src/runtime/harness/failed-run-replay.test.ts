@@ -130,7 +130,7 @@ test('WASTE 4 — the three fan-out refusal rounds cannot recur: guidance and en
     blockAt: 6,
   } as never);
 
-  for (const lane of ['run_tool_program', 'run_worker']) {
+  for (const lane of ['run_worker']) {
     if (refusal.includes(lane)) {
       assert.ok(directive.includes(lane), `the rail refuses toward ${lane}; the directive must offer it`);
     }

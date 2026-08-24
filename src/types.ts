@@ -75,6 +75,11 @@ export type RunStoppedReason =
   // awaiting_continue WITHOUT burning free auto-continues (auto-continue must
   // never tunnel past a budget park; only a user continue opens a new window).
   | 'token-budget'
+  // The exact accepted source is still owned by a peer execution or restart
+  // recovery. This is a nonterminal host state: callers must preserve the
+  // durable attempt and must not reinterpret the acknowledgement as done,
+  // failed, blocked, or awaiting user input.
+  | 'in-progress'
   // The turn produced no publishable terminal because its work could not be
   // verified. DISTINCT from 'awaiting-input': there is no question for the
   // user to answer, so a background run must park BLOCKED (needs attention)
@@ -84,6 +89,7 @@ export type RunStoppedReason =
   // work (live 2026-08-12). Forward-only: callers that do not know this
   // member treat it as success, exactly as before.
   | 'unverified'
+  | 'blocked'
   | 'cancelled'
   | 'error';
 
@@ -285,6 +291,10 @@ export interface AssistantRequest {
   /** Private model directive for this execution. For an ordinary fresh turn it
    * is also the literal user text persisted in the conversation. */
   message: string;
+  /** Host-authored continue directive (auto-resume), never a human message.
+   *  Marks the appended user_input event so attempt counting can distinguish
+   *  the harness continuing itself from a person speaking. */
+  hostDirective?: boolean;
   /** Literal text shown in history when it differs from the model directive.
    * Ignored when sourceUserSeq reuses an already accepted event. */
   displayMessage?: string;
@@ -335,14 +345,40 @@ export interface AssistantRequest {
    * every resulting transition. This never exempts prose or malformed JSON.
    */
   acceptStructuredNoToolResult?: boolean;
+  /** Host-owned capability binder for admitted graph execution. Absent → unresolved roles block. */
+  capabilityCatalog?: import('./runtime/harness/graph-node-capability.js').HostCapabilityCatalog;
+}
+
+export interface ConversationPreambleDeliveryRequest {
+  version: 1;
+  sessionId: string;
+  sourceUserSeq: number;
+  eventId: string;
+  eventDigest: string;
+  deliveryKey: string;
+  text: string;
+}
+
+export interface ConversationPreambleTransportReceipt {
+  version: 1;
+  deliveryKey: string;
+  eventId: string;
+  eventDigest: string;
+  surface: 'channel_message' | 'not_applicable';
+  target: string;
 }
 
 export type ConversationPreambleDeliveryResult =
-  | { status: 'delivered' }
+  | { status: 'delivered'; receipt: ConversationPreambleTransportReceipt }
+  | {
+      status: 'not_applicable';
+      reason: 'quiet_presentation' | 'non_user_surface';
+      receipt: ConversationPreambleTransportReceipt;
+    }
   | { status: 'failed'; reason: 'transport_unavailable' | 'delivery_failed' };
 
 export type ConversationPreambleDeliveryCallback = (
-  text: string,
+  request: ConversationPreambleDeliveryRequest,
 ) => Promise<ConversationPreambleDeliveryResult>;
 
 export interface AssistantResponse {
@@ -502,7 +538,7 @@ export interface ExecutionRecord {
     rootWorkflowTerminal?: {
       version: 1;
       runId: string;
-      status: 'completed' | 'completed_with_errors' | 'error' | 'failed' | 'cancelled';
+      status: 'completed' | 'completed_with_errors' | 'blocked' | 'error' | 'failed' | 'cancelled';
       outcome: 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled';
       finishedAt: string;
       observedAt: string;
@@ -556,7 +592,7 @@ export interface ExecutionRecord {
   workflowBindings?: Array<{
     runId: string;
     workflow: string;
-    status: 'queued' | 'running' | 'completed' | 'error';
+    status: 'queued' | 'running' | 'completed' | 'blocked' | 'error';
     createdAt: string;
     updatedAt: string;
     terminalOutcome?: 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled';
@@ -588,6 +624,7 @@ export interface ExecutionRecord {
       | 'task_completed'
       | 'workflow_queued'
       | 'workflow_completed'
+      | 'workflow_blocked'
       | 'workflow_failed'
       | 'delegation_created'
       | 'delegation_completed'

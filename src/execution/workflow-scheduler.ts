@@ -57,6 +57,7 @@ import {
   workflowRunHasPendingChatDispatchPreparation,
   workflowRunsWithPendingChatDispatchAdmissions,
 } from './workflow-origin-group.js';
+import { processWorkflowIntervalSchedules } from './workflow-interval-scheduler.js';
 
 /**
  * Workflow scheduling tick.
@@ -786,6 +787,11 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       } catch { /* best-effort control-plane receipt */ }
     }
   }
+  const intervalResult = await processWorkflowIntervalSchedules(workflows, now);
+  result.fired.push(...intervalResult.fired);
+  result.held.push(...intervalResult.held);
+  result.deferred.push(...intervalResult.deferred);
+  result.deduped.push(...intervalResult.deduped);
   return result;
 }
 
@@ -799,6 +805,62 @@ function markWorkflowOccurrenceHandled(
   if (state.pendingByWorkflow[dedupeKey]?.atMs === occurrence.atMs) {
     delete state.pendingByWorkflow[dedupeKey];
   }
+}
+
+/**
+ * A user-triggered run of a scheduled workflow satisfies the next remaining
+ * occurrence on the same local calendar day. Setting lastRunAtMs to now at
+ * 07:27 would still leave a 09:00 slot pending; this writes the next slot's
+ * epoch so today's cron does not fire again. Tomorrow is left untouched.
+ */
+export function satisfyNextScheduledWorkflowOccurrence(
+  workflowSlug: string,
+  now: Date = new Date(),
+): { satisfied: boolean; atMs?: number } {
+  const slug = workflowSlug.trim();
+  if (!slug) return { satisfied: false };
+  let entry;
+  try {
+    entry = listWorkflows().find((candidate) => candidate.name === slug);
+  } catch {
+    return { satisfied: false };
+  }
+  if (!entry || !entry.data.enabled) return { satisfied: false };
+  const schedule = entry.data.trigger?.schedule;
+  if (!schedule || typeof schedule !== 'string' || !validateCronExpression(schedule)) {
+    return { satisfied: false };
+  }
+  const timezone = typeof entry.data.trigger?.timezone === 'string'
+    ? entry.data.trigger.timezone
+    : undefined;
+  const state = loadScheduleState();
+  const dedupeKey = `wf:${entry.name}`;
+  migrateLegacyWorkflowScheduleKey(state, `wf:${entry.data.name}`, dedupeKey);
+
+  const nowMs = minuteFloor(now.getTime());
+  const today = wallClockInZone(new Date(nowMs), timezone);
+  let nextAt: Date | undefined;
+  for (let offset = 0; offset <= 24 * 60; offset += 1) {
+    const candidate = new Date(nowMs + offset * 60_000);
+    if (!cronMatches(schedule, candidate, timezone)) continue;
+    const wall = wallClockInZone(candidate, timezone);
+    if (wall.dayOfMonth !== today.dayOfMonth || wall.month !== today.month) continue;
+    nextAt = candidate;
+    break;
+  }
+  if (!nextAt) return { satisfied: false };
+
+  const atMs = minuteFloor(nextAt.getTime());
+  const lastFiredAtMs = state.lastRunAtMs[dedupeKey];
+  if (Number.isFinite(lastFiredAtMs) && lastFiredAtMs >= atMs) {
+    return { satisfied: false, atMs };
+  }
+  state.lastRunByMinute[dedupeKey] = currentMinuteKey(nextAt);
+  state.lastRunAtMs[dedupeKey] = atMs;
+  const pending = state.pendingByWorkflow[dedupeKey];
+  if (pending && pending.atMs <= atMs) delete state.pendingByWorkflow[dedupeKey];
+  saveScheduleState(state);
+  return { satisfied: true, atMs };
 }
 
 function migrateLegacyWorkflowScheduleKey(

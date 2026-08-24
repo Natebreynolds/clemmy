@@ -30,6 +30,7 @@ import { validateArgsAgainstSchema } from '../tools/composio-batch-validator.js'
 import { matchToolChoicesForStep, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
 import { composioSlugEffectEvidence } from '../integrations/composio/slug-effect.js';
 import { validateCronExpression } from '../shared/cron.js';
+import { parseWorkflowInterval } from '../shared/workflow-interval.js';
 import {
   outputContractSuggestionFromPrompt,
   promptLooksDeliverable,
@@ -41,6 +42,11 @@ import {
   isSendTargetArgumentKey,
 } from '../runtime/harness/grounding-gate.js';
 import { textTargetsConfiguredUserRecipient } from '../runtime/user-profile.js';
+import {
+  parseWorkflowNodeInvocationPlan,
+  type WorkflowNodeArgumentSourceV1,
+  type WorkflowNodeInvocationPlanV1,
+} from '../memory/workflow-node-invocation-plan.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -72,6 +78,8 @@ export interface WorkflowStepShape {
   };
   deterministic?: { runner?: string };
   call?: { tool?: string; args?: Record<string, unknown> };
+  invocationPlan?: unknown;
+  invocation_plan?: unknown;
   usesSkill?: string;
   uses_skill?: string;
   allowedTools?: string[];
@@ -109,6 +117,7 @@ export interface WorkflowFrontmatter {
   enabled?: boolean;
   trigger?: {
     schedule?: string;
+    interval?: unknown;
     manual?: boolean;
     timezone?: string;
     webhookPath?: string;
@@ -331,6 +340,63 @@ function forEachSourceStepId(expr: string | undefined): string | null {
   const directPath = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?$/.exec(raw);
   if (directPath) return directPath[1];
   return /^[a-zA-Z0-9_-]+$/.test(raw) ? raw : null;
+}
+
+function invocationPlanSourceReferences(
+  plan: WorkflowNodeInvocationPlanV1,
+): Array<{ where: string; source: WorkflowNodeArgumentSourceV1 }> {
+  const references = Object.entries(plan.arguments).map(([argument, binding]) => ({
+    where: `argument "${argument}"`,
+    source: binding.source,
+  }));
+  if (plan.completeness.kind === 'finite_exhaustive' && plan.completeness.denominator) {
+    references.push({
+      where: 'finite completeness denominator',
+      source: plan.completeness.denominator,
+    });
+  }
+  return references;
+}
+
+function checkInvocationPlanSourceReferences(input: {
+  step: WorkflowStepShape;
+  plan: WorkflowNodeInvocationPlanV1;
+  workflowInputKeys: ReadonlySet<string>;
+  stepIds: ReadonlySet<string>;
+}): string[] {
+  const errors: string[] = [];
+  const dependencies = new Set(input.step.dependsOn ?? []);
+  const partitioned = typeof input.step.forEach === 'string'
+    && input.step.forEach.trim().length > 0;
+  for (const { where, source } of invocationPlanSourceReferences(input.plan)) {
+    if (source.kind === 'workflow_input' && !input.workflowInputKeys.has(source.key)) {
+      errors.push(
+        `Step "${input.step.id}" invocationPlan ${where} references undeclared workflow input "${source.key}".`,
+      );
+    } else if (source.kind === 'upstream_output') {
+      if (!input.stepIds.has(source.stepId)) {
+        errors.push(
+          `Step "${input.step.id}" invocationPlan ${where} references unknown upstream step "${source.stepId}".`,
+        );
+      } else if (!dependencies.has(source.stepId)) {
+        errors.push(
+          `Step "${input.step.id}" invocationPlan ${where} references "${source.stepId}" without naming it in dependsOn.`,
+        );
+      }
+    } else if (source.kind === 'partition_item' && !partitioned) {
+      errors.push(
+        `Step "${input.step.id}" invocationPlan ${where} uses partition_item without a forEach partition.`,
+      );
+    } else if (
+      source.kind === 'continuation_cursor'
+      && where === 'finite completeness denominator'
+    ) {
+      errors.push(
+        `Step "${input.step.id}" invocationPlan finite completeness denominator cannot use the continuation cursor as its population boundary.`,
+      );
+    }
+  }
+  return errors;
 }
 
 // ─── Step output reference resolution ────────────────────────────────
@@ -698,7 +764,6 @@ const STRUCTURED_CALL_MULTIPLEXERS = new Set([
   'call_tool',
   'composio_execute_tool',
   'run_batch',
-  'run_tool_program',
   'work_call',
 ]);
 
@@ -1071,14 +1136,61 @@ export function validateWorkflowDefinition(
 
   const steps = data.steps ?? [];
   const ids = new Set<string>();
+  const workflowInputKeys = new Set(Object.keys(data.inputs ?? {}));
   let duplicates = 0;
   for (const step of steps) {
     if (!step.id) errors.push('A step is missing an id.');
     // A structured call step (or deterministic runner) needs no prompt — its
     // action is the tool call / script, not a model instruction.
     const stepHasCall = Boolean(step.call && typeof step.call === 'object' && typeof step.call.tool === 'string' && step.call.tool.trim());
-    if (!stepHasCall && !step.deterministic && (!step.prompt || step.prompt.trim().length < 3)) {
+    const rawInvocationPlan = step.invocationPlan ?? step.invocation_plan;
+    const stepHasInvocationPlan = rawInvocationPlan !== undefined;
+    if (!stepHasCall && !stepHasInvocationPlan && !step.deterministic && (!step.prompt || step.prompt.trim().length < 3)) {
       errors.push(`Step "${step.id ?? '?'}" has no substantive prompt.`);
+    }
+    if (stepHasInvocationPlan) {
+      const parsedPlan = parseWorkflowNodeInvocationPlan(rawInvocationPlan);
+      if (!parsedPlan.ok) {
+        errors.push(
+          `Step "${step.id ?? '?'}" has an invalid invocation plan: ${parsedPlan.errors.join(' ')}`,
+        );
+      } else if (parsedPlan.plan.binding.effect !== 'read') {
+        errors.push(
+          `Step "${step.id ?? '?'}" invocationPlan effect must be read; provider-neutral compute purity is not represented yet.`,
+        );
+      }
+      if (
+        step.call !== undefined
+        || step.deterministic !== undefined
+        || step.subgraph !== undefined
+        || step.loopUntil !== undefined
+        || step.loop_until !== undefined
+      ) {
+        errors.push(
+          `Step "${step.id ?? '?'}" invocationPlan is mutually exclusive with call, deterministic, subgraph, and loop executors.`,
+        );
+      }
+      const declaredEffect = step.sideEffect ?? step.side_effect;
+      if (declaredEffect !== 'read') {
+        errors.push(
+          `Step "${step.id ?? '?'}" invocationPlan must declare sideEffect: read; v1 refuses write and send authority.`,
+        );
+      }
+      if ((step.allowedTools ?? []).length > 0) {
+        errors.push(
+          `Step "${step.id ?? '?'}" invocationPlan cannot also expose name-based allowedTools.`,
+        );
+      }
+      if (step.requiresApproval === true || step.requires_approval === true) {
+        errors.push(
+          `Step "${step.id ?? '?'}" invocationPlan cannot use generic step approval as pilot authority; consent must bind the exact compiled plan lineage.`,
+        );
+      }
+      if (data.enabled !== false && data.trigger?.interval === undefined) {
+        errors.push(
+          `Step "${step.id ?? '?'}" invocationPlan can only be enabled as an interval definition; runtime still requires exact standing recurrence consent and per-occurrence admission.`,
+        );
+      }
     }
     // CALL-1 structural rules.
     if (step.call !== undefined) {
@@ -1212,6 +1324,18 @@ export function validateWorkflowDefinition(
     for (const dep of step.dependsOn ?? []) {
       if (!ids.has(dep)) errors.push(`Step "${step.id}" depends on unknown step "${dep}".`);
     }
+    const rawInvocationPlan = step.invocationPlan ?? step.invocation_plan;
+    if (rawInvocationPlan !== undefined) {
+      const parsedPlan = parseWorkflowNodeInvocationPlan(rawInvocationPlan);
+      if (parsedPlan.ok) {
+        errors.push(...checkInvocationPlanSourceReferences({
+          step,
+          plan: parsedPlan.plan,
+          workflowInputKeys,
+          stepIds: ids,
+        }));
+      }
+    }
   }
 
   const hasCycles = detectCycles(steps);
@@ -1243,6 +1367,18 @@ export function validateWorkflowDefinition(
 
   if (data.trigger?.schedule && !validateCronExpression(data.trigger.schedule)) {
     errors.push(`Invalid cron expression: "${data.trigger.schedule}"`);
+  }
+  if (data.trigger?.interval !== undefined) {
+    const parsedInterval = parseWorkflowInterval(data.trigger.interval);
+    if (!parsedInterval.ok) {
+      errors.push(`Invalid workflow interval: ${parsedInterval.errors.join(' ')}`);
+    }
+    if (data.trigger.schedule !== undefined) {
+      errors.push('trigger.schedule and trigger.interval are mutually exclusive time authorities.');
+    }
+    if (data.trigger.timezone !== undefined) {
+      errors.push('trigger.timezone cannot accompany trigger.interval; elapsed-time intervals use their exact UTC activation anchor.');
+    }
   }
   if (data.trigger?.timezone && !isValidTimezone(data.trigger.timezone)) {
     errors.push(
@@ -1285,8 +1421,6 @@ export function validateWorkflowDefinition(
   }
 
   // Workflow-level declared input keys (typed-workflow-contract).
-  const workflowInputKeys = new Set(Object.keys(data.inputs ?? {}));
-
   const goalIssue = checkWorkflowGoalHint(data, steps);
   if (goalIssue) warnings.push(goalIssue);
 

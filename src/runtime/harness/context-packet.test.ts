@@ -227,6 +227,22 @@ test('typed decline keeps conversational guidance while skipping semantic enrich
   assert.doesNotMatch(packet.text, /Approval reminder/i);
 });
 
+test('direct_reply skipCapabilityHunt leaves the packet conversational and skips the hunt', () => {
+  const packet = buildAgentContextPacket(
+    "what's 2x2",
+    { enabled: true, hitCount: 0, source: 'unified', injected: false },
+    {
+      sessionKind: 'chat',
+      sessionId: 'context-direct-reply',
+      sourceUserSeq: 1,
+      skipCapabilityHunt: true,
+    },
+  );
+  assert.deepEqual(packet.capabilityResolution.entries, []);
+  assert.equal(packet.semanticEnrichmentSkippedReason, null);
+  assert.match(packet.text, /AGENT CONTEXT PACKET/);
+});
+
 test('compound decline scopes private context to the fresh clause without scripting the reply', () => {
   const fullMessage = 'No—leave that email unsent. Instead, what is 15 × 9? Answer naturally without tools.';
   const activeClause = 'what is 15 × 9? Answer naturally without tools.';
@@ -613,6 +629,51 @@ test('detectMultiItemIntent distinguishes per-row work from aggregate retrieval 
   }
 });
 
+test('a counted set landing in one container is collect-then-construct, not fan-out', () => {
+  const collected = detectMultiItemIntent(
+    'Find the top 5 widgets based on ratings and add them to a new workbook for me.',
+  );
+  assert.equal(collected.isMultiItem, false);
+  assert.equal(collected.collectThenConstruct, true);
+  assert.equal(collected.itemCount, 5);
+  const destinationRowEcho = detectMultiItemIntent(
+    'Find the top 5 restaurants in Pismo Beach by Google review count. Include each restaurant name, review count, and phone number, then create one new Google Sheet containing those 5 rows. Do not email or share it.',
+  );
+  assert.equal(destinationRowEcho.isMultiItem, false);
+  assert.equal(destinationRowEcho.collectThenConstruct, true);
+  assert.equal(destinationRowEcho.itemCount, 5);
+  assert.equal(destinationRowEcho.itemKind, 'restaurants');
+  assert.equal(
+    detectMultiItemIntent('Create one report for each of these 12 prospects.').collectThenConstruct,
+    undefined,
+  );
+  const anaphoricInfo = detectMultiItemIntent(
+    'Find the best widgets with the highest ratings 5 of them and put all the info in a workbook for me and give me the link.',
+  );
+  assert.equal(anaphoricInfo.isMultiItem, false);
+  assert.equal(anaphoricInfo.collectThenConstruct, true);
+  assert.equal(anaphoricInfo.itemCount, 5);
+  const singularMarked = detectMultiItemIntent(
+    'Find the page for example.com and scrape their last 5 facebook post and put them in a new workbook for me.',
+  );
+  assert.equal(singularMarked.isMultiItem, false);
+  assert.equal(singularMarked.collectThenConstruct, true);
+  assert.equal(singularMarked.itemCount, 5);
+  const fieldList = detectMultiItemIntent(
+    'Find the official blog for example.com, grab the last 5 blog post, and put the title, date, and link on a new workbook for me.',
+  );
+  assert.equal(fieldList.isMultiItem, false);
+  assert.equal(fieldList.collectThenConstruct, true);
+  assert.equal(fieldList.itemCount, 5);
+  assert.equal(
+    detectMultiItemIntent(
+      'Find the official blog for example.com, grab the last 5 blog post, and tell me the title, date, and link.',
+    ).collectThenConstruct,
+    undefined,
+    'a field list without a container is not a construct',
+  );
+});
+
 test('detectMultiItemIntent uses size-aware boundaries (soft < 8, imperative >= 8)', () => {
   const small = detectMultiItemIntent('Draft outreach emails for these 4 prospects.');
   assert.equal(small.isMultiItem, true);
@@ -909,7 +970,7 @@ test('packet makes small-N fan-out imperative when the user explicitly asks for 
   // then got blocked mid-run for its own direct reads. The directive now names
   // the same lane discriminator the rails enforce, so pre-turn guidance and
   // mid-turn enforcement can never prescribe different tools again.
-  assert.match(packet.text, /run_tool_program covering all 5/, 'same-shape reads → ONE program');
+  assert.match(packet.text, /PARALLEL tool calls in one response and synthesize/, 'same-shape reads → parallel calls');
   assert.match(packet.text, /run_worker with the full 5-item/, 'per-item multi-step → workers');
   assert.doesNotMatch(packet.text, /do not collapse this into one aggregate program/);
   assert.ok(!/save it as a forEach workflow/.test(packet.text), 'explicit small-N fan-out does not imply workflow offer');
@@ -1027,14 +1088,17 @@ test('packet gives workflow nodes truthful runner-owned topology guidance while 
   }
 });
 
-test('packet keeps the static line for a single-item / no-count request', () => {
+test('packet omits the static parallelism lecture for a single-item / no-count request', () => {
   const packet = buildAgentContextPacket(
     'Audit this law firm’s website and summarize the findings.',
     NO_MEMORY,
     { sessionKind: 'chat', sessionId: 'sess-chat-single' },
   );
   assert.equal(packet.multiItem.detected, false);
-  assert.match(packet.text, /Parallelism reminder:/);
+  assert.doesNotMatch(packet.text, /Parallelism reminder:/);
+  assert.doesNotMatch(packet.text, /Health warnings: none/);
+  assert.doesNotMatch(packet.text, /Approval reminder:/);
+  assert.doesNotMatch(packet.text, /Likely skills: none strongly matched/);
 });
 
 // Provider-access facts (live 2026-07-24): a run filesystem-hunted for an

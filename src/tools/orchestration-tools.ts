@@ -73,23 +73,12 @@ import { queueWorkflowRun, queueWorkflowCreationTest, requeueWorkflowFailedItems
 import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
-  appendEvent,
   listEvents,
   getSession,
-  type AppendEventInput,
-  type EventRow,
 } from '../runtime/harness/eventlog.js';
 import { workflowOriginReplyTargetForSource } from '../runtime/workflow-origin-authority.js';
-import {
-  exactOriginDeliveryTargetDigest,
-  sameExactOriginDeliveryTarget,
-} from '../runtime/exact-origin-delivery.js';
-import {
-  createWorkflowChatDispatchPreparedReceipt,
-  recordWorkflowChatDispatchPreparation,
-  type WorkflowChatDispatchPreparationAuthority,
-  type WorkflowChatDispatchPreparedReceipt,
-} from '../execution/workflow-origin-group.js';
+import { prepareWorkflowChatDispatch } from '../runtime/harness/workflow-chat-dispatch-prepare.js';
+export { _setWorkflowDispatchEventAppenderForTests } from '../runtime/harness/workflow-chat-dispatch-prepare.js';
 import {
   resolveWorkflowName,
   workflowNamesEqual,
@@ -148,86 +137,6 @@ export interface AuthoredWorkflowResult {
   boundNotes: string[];
   advisories: string[];
   gaps: ReturnType<typeof analyzeWorkflowGaps>;
-}
-
-type WorkflowDispatchEventAppender = (input: AppendEventInput) => EventRow;
-let appendWorkflowDispatchEvent: WorkflowDispatchEventAppender = appendEvent;
-
-/** Test seam for proving a queue success cannot become a safe ACK when the
- * load-bearing graph event fails to persist. */
-export function _setWorkflowDispatchEventAppenderForTests(
-  appender?: WorkflowDispatchEventAppender | null,
-): void {
-  appendWorkflowDispatchEvent = appender ?? appendEvent;
-}
-
-function prepareWorkflowChatDispatch(
-  authority: WorkflowChatDispatchPreparationAuthority,
-): WorkflowChatDispatchPreparedReceipt {
-  const source = listEvents(authority.originSessionId, { types: ['user_input_received'] })
-    .find((event) => event.seq === authority.sourceUserSeq);
-  const sourceTarget = workflowOriginReplyTargetForSource({
-    sessionId: authority.originSessionId,
-    sourceUserSeq: authority.sourceUserSeq,
-  });
-  if (
-    !source
-    || source.role !== 'user'
-    || source.data.synthetic === true
-    || !sourceTarget
-    || authority.replyTargetDigest !== exactOriginDeliveryTargetDigest(sourceTarget)
-    || !sameExactOriginDeliveryTarget(authority.replyTarget, sourceTarget)
-  ) {
-    throw new Error('workflow dispatch preparation is not bound to an exact accepted human source');
-  }
-  const evidenceFor = (event: EventRow) => ({
-    eventId: event.id,
-    eventSeq: event.seq,
-    preparedAt: event.createdAt,
-  });
-  const existing = listEvents(authority.originSessionId, { types: ['async_work_dispatch_prepared'] })
-    .find((event) => (
-      event.data.sourceGroupId === authority.sourceGroupId
-      && event.data.runId === authority.runId
-    ));
-  if (existing) {
-    const winner = createWorkflowChatDispatchPreparedReceipt(
-      existing.data as unknown as WorkflowChatDispatchPreparationAuthority,
-      evidenceFor(existing),
-    );
-    if (
-      existing.role !== 'system'
-      || existing.turn !== source.turn
-      || existing.parentEventId !== source.id
-      || winner.preparationDigest !== authority.preparationDigest
-    ) {
-      throw new Error('workflow dispatch preparation has a conflicting durable winner');
-    }
-    return recordWorkflowChatDispatchPreparation(winner);
-  }
-
-  const event = appendWorkflowDispatchEvent({
-    sessionId: authority.originSessionId,
-    turn: source.turn,
-    role: 'system',
-    type: 'async_work_dispatch_prepared',
-    parentEventId: source.id,
-    // Private graph authority. Public projection rejects this event type.
-    data: { ...authority },
-  });
-  const persisted = createWorkflowChatDispatchPreparedReceipt(
-    event.data as unknown as WorkflowChatDispatchPreparationAuthority,
-    evidenceFor(event),
-  );
-  if (
-    event.role !== 'system'
-    || event.turn !== source.turn
-    || event.parentEventId !== source.id
-    || persisted.preparationDigest !== authority.preparationDigest
-  ) {
-    throw new Error('workflow dispatch preparation did not persist with its exact source identity');
-  }
-  return recordWorkflowChatDispatchPreparation(persisted);
 }
 
 /**
@@ -1610,13 +1519,14 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_get',
-    'Fetch the full definition of a single workflow by name. Includes description, trigger, every step with its FULL prompt (line-numbered) + its derived DATA SOURCES (which tools/connectors/scripts it actually uses — e.g. Salesforce vs Composio), dependencies, declared inputs, and synthesis prompt. '
-      + 'Read this BEFORE editing: copy a VERBATIM snippet of a step prompt into workflow_edit_step. Pass step="<id>" to read just one step in full when a workflow is large.',
+    'Read one workflow by name. For its frontmatter/metadata — schedule, timezone, enabled state, description, inputs/resources, or step IDs — use section="metadata"; that bounded view omits every step prompt. '
+      + 'Omit section (or use section="full") only when you need the full definition, including every step\'s line-numbered prompt and derived DATA SOURCES. Read the full or one-step view BEFORE editing so you can copy a VERBATIM prompt snippet into workflow_edit_step.',
     {
       name: z.string().min(1),
+      section: z.enum(['metadata', 'full']).optional().describe('Use "metadata" for a bounded frontmatter/overview read with no step prompt text. Use "full" (the backward-compatible default) only when the complete definition is needed. Do not combine "metadata" with step.'),
       step: z.string().optional().describe('Optional step id — return just this step\'s full text + data sources (use when a workflow is too large to read whole).'),
     },
-    async ({ name, step }) => {
+    async ({ name, section, step }) => {
       const allGet = listWorkflowFiles();
       let entry = allGet.find((w) => w.data.name === name);
       if (!entry) {
@@ -1639,6 +1549,58 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(`Workflow "${name}" not found.${names ? ` Saved workflows: ${names}.` : ''}`);
       }
       const w = entry.data;
+      if (section === 'metadata') {
+        if (step) {
+          return textResult('Choose either section="metadata" for the bounded workflow overview or step="<id>" for one full step; they cannot be combined.');
+        }
+        // A structural, provider-neutral bounded read. Keep the scheduling and
+        // identity fields first, preserve useful top-level authoring metadata,
+        // and deliberately summarize steps without carrying any prompt-shaped
+        // fields (prompt, codifiedFrom.prompt, specialist prompts, call args).
+        // textResult supplies the hard output cap even for an unusually large
+        // resource/input manifest; trigger evidence therefore cannot be pushed
+        // out by the variable-length tail.
+        const metadata = {
+          name: w.name,
+          description: w.description,
+          enabled: w.enabled,
+          trigger: {
+            schedule: w.trigger.schedule ?? null,
+            timezone: w.trigger.timezone ?? null,
+            manual: w.trigger.manual ?? false,
+          },
+          ...(w.whenToUse ? { when_to_use: w.whenToUse } : {}),
+          ...(w.project ? { project: w.project } : {}),
+          ...(w.allowedTools && w.allowedTools.length > 0 ? { allowed_tools: w.allowedTools } : {}),
+          ...(w.resources && Object.keys(w.resources).length > 0 ? { resources: w.resources } : {}),
+          step_count: w.steps.length,
+          steps: w.steps.map((stp) => ({
+            id: stp.id,
+            ...(stp.dependsOn && stp.dependsOn.length > 0 ? { depends_on: stp.dependsOn } : {}),
+            ...(stp.project ? { project: stp.project } : {}),
+            ...(stp.model ? { model: stp.model } : {}),
+            ...(stp.intent ? { intent: stp.intent } : {}),
+            ...(stp.forEach ? { for_each: stp.forEach } : {}),
+            ...(stp.sideEffect ? { side_effect: stp.sideEffect } : {}),
+            ...(stp.requiresApproval ? { requires_approval: true } : {}),
+            executor: stp.deterministic?.runner
+              ? { kind: 'script', runner: stp.deterministic.runner }
+              : stp.call?.tool
+                ? { kind: 'tool', tool: stp.call.tool }
+                : stp.subgraph
+                  ? { kind: 'subgraph', mode: stp.subgraph.mode, specialist_ids: stp.subgraph.specialists.map((specialist) => specialist.id) }
+                  : { kind: 'model' },
+          })),
+          ...(w.inputs && Object.keys(w.inputs).length > 0 ? { inputs: w.inputs } : {}),
+          ...(w.models ? { models: w.models } : {}),
+          ...(w.allowSends === true || w.allowSends === false ? { allow_sends: w.allowSends } : {}),
+          ...(w.goal ? { goal: w.goal } : {}),
+        };
+        return textResult(
+          `Workflow metadata (step prompts and workflow body omitted):\n${JSON.stringify(metadata, null, 2)}`,
+          { maxChars: 4_000 },
+        );
+      }
       // Render one step with its FULL prompt line-numbered (cat -n style, so the
       // agent can copy a VERBATIM snippet into workflow_edit_step) and its
       // derived data sources (the real connectors/scripts it uses — kills the
@@ -1795,6 +1757,11 @@ export function registerOrchestrationTools(server: McpServer): void {
       // enabling an older workflow with a dangling reference fixes it in
       // place instead of refusing.
       if (enabled) {
+        if (entry.data.steps.some((step) => step.invocationPlan !== undefined)) {
+          return textResult(
+            `Workflow "${name}" was NOT enabled — an exact invocation-plan workflow requires a successful one-shot pilot and a separate formal recurrence consent card. Generic workflow_set_enabled cannot grant standing authority.`,
+          );
+        }
         // Enable-time exact-send readiness is self-healing but bounded: refresh
         // only structurally pinned slugs, then let canonical validation decide.
         const enabledCandidate = { ...entry.data, enabled: true };

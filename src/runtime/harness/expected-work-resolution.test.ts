@@ -239,7 +239,7 @@ test('a continued partial read can complete under the same accepted task', () =>
   assert.equal(repaired.status === 'finalized' && repaired.match.status, 'complete');
 });
 
-test('two distinct implicit reads conflict and do not close by first-wins', () => {
+test('two safe implicit read probes close on the latest strongest result, never first-wins', () => {
   const task = accept('What is the current status of the Acme account?');
   for (const suffix of ['one', 'two']) {
     settleProvider({
@@ -251,10 +251,9 @@ test('two distinct implicit reads conflict and do not close by first-wins', () =
     });
   }
   const result = resolution.finalizeResolutionAgainstExpectedWork(task);
-  assert.equal(result.status, 'conflict');
-  assert.ok(result.status === 'conflict' && result.match.gaps.some((gap) =>
-    gap.kind === 'requirement_ambiguous'));
-  assert.equal(state(task), 'open');
+  assert.equal(result.status, 'finalized', JSON.stringify(result));
+  assert.equal(result.status === 'finalized' && result.match.status, 'complete');
+  assert.equal(state(task), 'finalized');
 });
 
 test('an empty discovery call cannot satisfy accepted business retrieval', () => {

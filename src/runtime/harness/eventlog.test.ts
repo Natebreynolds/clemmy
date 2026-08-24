@@ -1272,6 +1272,109 @@ test('recordRunAttemptUserInput atomically inserts once and binding wins over tr
   );
 });
 
+test('recordRunAttemptUserInput upgrades its compatibility owner and preserves a same-source stronger owner', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  const source = acceptUserInputForRun({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    data: { text: 'Bind this exact source.' },
+  });
+  const sourceOnly = getSession(sess.id)?.metadata as {
+    __run_in_flight?: unknown;
+    __run_in_flight_owner?: { sourceUserSeq?: unknown; armedAt?: unknown };
+  };
+  const originalMarker = sourceOnly.__run_in_flight;
+  const originalArmedAt = sourceOnly.__run_in_flight_owner?.armedAt;
+  assert.equal(sourceOnly.__run_in_flight_owner?.sourceUserSeq, source.seq);
+
+  const owner = beginRunAttempt(sess.id, { runId: 'desktop:exact-owner' });
+  recordRunAttemptUserInput(owner, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Transformed execution prompt.' },
+  }, { existingEventSeq: source.seq, armRunInFlight: true });
+  const upgraded = getSession(sess.id)?.metadata as {
+    __run_in_flight?: unknown;
+    __run_in_flight_owner?: { attemptId?: unknown; sourceUserSeq?: unknown; armedAt?: unknown };
+  };
+  assert.equal(upgraded.__run_in_flight, originalMarker);
+  assert.equal(upgraded.__run_in_flight_owner?.armedAt, originalArmedAt);
+  assert.equal(upgraded.__run_in_flight_owner?.attemptId, owner.attemptId);
+  assert.equal(upgraded.__run_in_flight_owner?.sourceUserSeq, source.seq);
+
+  const foreign = beginRunAttempt(sess.id, { runId: 'desktop:foreign-owner' });
+  recordRunAttemptUserInput(foreign, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Another physical attempt for the same source.' },
+  }, { existingEventSeq: source.seq, armRunInFlight: true });
+  const preserved = getSession(sess.id)?.metadata as typeof upgraded;
+  assert.equal(preserved.__run_in_flight, originalMarker);
+  assert.deepEqual(
+    preserved.__run_in_flight_owner,
+    upgraded.__run_in_flight_owner,
+    'a later physical attempt cannot replace the exact recovery owner',
+  );
+});
+
+test('recordRunAttemptUserInput gives only the newest accepted source fresh restart ownership', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  const first = beginRunAttempt(sess.id, { runId: 'desktop:owner-a' });
+  const sourceA = recordRunAttemptUserInput(first, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Turn A.' },
+  }, { armRunInFlight: true });
+
+  const oldArmedAt = '2000-01-01T00:00:00.000Z';
+  const current = getSession(sess.id);
+  assert.ok(current);
+  updateSession(sess.id, {
+    metadata: {
+      ...current.metadata,
+      __run_in_flight: oldArmedAt,
+      __run_in_flight_owner: {
+        attemptId: first.attemptId,
+        sourceUserSeq: sourceA.seq,
+        armedAt: oldArmedAt,
+      },
+    },
+  });
+
+  const second = beginRunAttempt(sess.id, { runId: 'desktop:owner-b' });
+  const sourceB = recordRunAttemptUserInput(second, {
+    turn: 2,
+    role: 'user',
+    data: { text: 'Turn B.' },
+  }, { armRunInFlight: true });
+  assert.ok(sourceB.seq > sourceA.seq);
+  const ownerB = getSession(sess.id)?.metadata.__run_in_flight_owner as {
+    attemptId?: unknown;
+    sourceUserSeq?: unknown;
+    armedAt?: unknown;
+  } | undefined;
+  const markerB = getSession(sess.id)?.metadata.__run_in_flight;
+  assert.equal(ownerB?.attemptId, second.attemptId);
+  assert.equal(ownerB?.sourceUserSeq, sourceB.seq);
+  assert.equal(ownerB?.armedAt, markerB);
+  assert.notEqual(ownerB?.armedAt, oldArmedAt, 'ownership change receives a fresh recovery epoch');
+
+  recordRunAttemptUserInput(first, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Late continuation from Turn A.' },
+  }, { existingEventSeq: sourceA.seq, armRunInFlight: true });
+  assert.deepEqual(
+    getSession(sess.id)?.metadata.__run_in_flight_owner,
+    ownerB,
+    'a stale earlier source cannot steal restart ownership back from the newest source',
+  );
+  assert.equal(getSession(sess.id)?.metadata.__run_in_flight, markerB);
+});
+
 test('acceptUserInputForRun atomically accepts or reuses the source with restart ownership', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat', channel: 'cli' });
@@ -1282,8 +1385,14 @@ test('acceptUserInputForRun atomically accepts or reuses the source with restart
     data: { text: 'Run the direct graph turn.' },
   });
   const acceptedAt = getSession(sess.id)?.metadata.__run_in_flight;
+  const acceptedOwner = getSession(sess.id)?.metadata.__run_in_flight_owner as {
+    sourceUserSeq?: number;
+    armedAt?: string;
+  } | undefined;
 
   assert.equal(typeof acceptedAt, 'string');
+  assert.equal(acceptedOwner?.sourceUserSeq, accepted.seq);
+  assert.equal(typeof acceptedOwner?.armedAt, 'string');
   assert.equal(listEvents(sess.id, { types: ['user_input_received'] }).length, 1);
   assert.equal(
     acceptUserInputForRun({
@@ -1521,6 +1630,49 @@ test('reusing a settled external run id creates a fresh attempt identity', () =>
   assert.notEqual(retry.attemptId, first.attemptId);
   assert.equal(retry.runId, first.runId);
   assert.equal(getLatestRunAttemptByRunId(sess.id, 'run-retried')?.attemptId, retry.attemptId);
+});
+
+test('an active attempt id cannot be relabelled through the run-id alias slot', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'discord' });
+  const first = beginRunAttempt(sess.id, { runId: 'discord:external-request' });
+
+  assert.throws(
+    () => beginRunAttempt(sess.id, { runId: first.attemptId }),
+    /already bound to run discord:external-request/,
+  );
+  assert.throws(
+    () => beginRunAttempt(sess.id, {
+      attemptId: first.attemptId,
+      runId: 'discord:different-request',
+    }),
+    /already bound to run discord:external-request/,
+  );
+  assert.equal(
+    getLatestRunAttemptByRunId(sess.id, 'discord:external-request')?.attemptId,
+    first.attemptId,
+  );
+  assert.equal(getLatestRunAttemptByRunId(sess.id, first.attemptId), null);
+});
+
+test('an uncorrelated active attempt accepts one run id and then freezes it', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const first = beginRunAttempt(sess.id, { attemptId: 'attempt:null-correlation' });
+  assert.equal(first.runId, null);
+
+  const bound = beginRunAttempt(sess.id, {
+    attemptId: first.attemptId,
+    runId: 'desktop:first-correlation',
+  });
+  assert.equal(bound.runId, 'desktop:first-correlation');
+  assert.throws(
+    () => beginRunAttempt(sess.id, {
+      attemptId: first.attemptId,
+      runId: 'desktop:replacement-correlation',
+    }),
+    /already bound to run desktop:first-correlation/,
+  );
 });
 
 test('desktop chat request receipt persists one payload/session/run and replays idempotently', () => {

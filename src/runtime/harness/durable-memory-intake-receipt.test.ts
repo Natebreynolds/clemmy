@@ -140,6 +140,78 @@ test('exact memory intake receipt survives restart, replays, and atomically clos
   assert.equal(replay.event.id, committed.event.id);
 });
 
+test('a direct-reply graph cannot mint an action-only memory receipt', async () => {
+  const { recordAcceptedSourceGraph } = await import('./record-accepted-source-graph.js');
+  const { installTurnSemanticModelPort } = await import('../semantic-boundary/turn-semantic-port-registry.js');
+  const session = eventlog.createSession({
+    id: `memory-host-receipt-direct-${process.pid}-${++serial}`,
+    kind: 'chat',
+  });
+  const message = 'Remember this: Marker is Value-18. Just confirm.';
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: message },
+  });
+  installTurnSemanticModelPort({
+    async interpret() {
+      return {
+        raw: {
+          version: 1,
+          relation: 'conversation',
+          targetGoal: null,
+          goal: null,
+          work: null,
+          slotAnswers: [],
+          rationale: 'fixture',
+        },
+        modelIdentity: 'fixture/direct-reply',
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+      };
+    },
+  });
+  try {
+    const recorded = await recordAcceptedSourceGraph({
+      identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+      surface: 'direct',
+      acceptedText: message,
+    });
+    assert.ok(recorded);
+    assert.equal(recorded?.data.route, 'direct_reply');
+    const armed = authority.requireAcceptedTaskAuthority({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+    });
+    assert.equal(armed.expectedWorkRequired, false);
+    const captured = capture.captureInteractionSignals({
+      message,
+      sessionId: session.id,
+      sourceEventId: `user-source:${source.seq}`,
+      occurredAt: source.createdAt,
+    });
+    assert.equal(captured.queuedCandidateIds?.length, 1);
+
+    const prepared = receipts.prepareDurableMemoryIntakeHostCompletion({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+    });
+    assert.equal(prepared.status, 'ineligible', JSON.stringify(prepared));
+    assert.match('reason' in prepared ? prepared.reason : '', /not an action turn/);
+    const loaded = authority.loadAcceptedTaskAuthority(session.id, source.seq);
+    assert.equal(loaded.status === 'ok' && loaded.authority.state, 'armed');
+    assert.equal(
+      eventlog.listEvents(session.id, { types: ['durable_memory_intake_receipt'] }).length,
+      0,
+    );
+  } finally {
+    installTurnSemanticModelPort(null);
+  }
+});
+
 test('missing intake and compound secondary work fail closed without binding host completion', () => {
   const missing = acceptActivatedMemoryAction(
     'Remember this: Cedar is Cedar-42. A natural acknowledgement is enough.',
@@ -186,7 +258,11 @@ test('candidate, receipt-row, and event tampering are refused and cannot close d
   const committed = delivery.commitTurnOutcome(doneOutcome(task, 'Got it.'));
   assert.equal(committed.presentation.status, 'blocked');
   let loaded = authority.loadAcceptedTaskAuthority(task.sessionId, task.sourceUserSeq);
-  assert.equal(loaded.status === 'ok' && loaded.authority.state, 'manifested_verifying');
+  assert.equal(loaded.status === 'ok' && loaded.authority.state, 'terminal');
+  assert.equal(
+    loaded.status === 'ok' && loaded.authority.terminalEventId,
+    committed.event.id,
+  );
 
   const eventTask = acceptActivatedMemoryAction(
     'Remember this: Cedar is Cedar-45. A natural acknowledgement is enough.',

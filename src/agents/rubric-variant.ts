@@ -4,9 +4,9 @@
  * Selects which Codex/native orchestrator rubric variant a run uses, via
  * `CLEMMY_RUBRIC_VARIANT`, and lets every build path tag the event log with the
  * variant in force so live sessions are attributable to an arm. This is the
- * mechanism the whole engine-over-prompt plan depends on: the LEAN rubric content
- * arrives later (Phase 5, characterization-tested + live A/B), but the switch and
- * the telemetry land now — DEFAULT 'legacy', byte-identical, zero behavior change.
+ * mechanism the whole engine-over-prompt plan depends on: the characterized LEAN
+ * rubric is the production default, while the legacy body remains an attributable
+ * one-flag rollback.
  *
  * Kept dependency-free (no rubric-content imports) so it can't create an import
  * cycle with orchestrator.ts, which owns the variant→instructions map.

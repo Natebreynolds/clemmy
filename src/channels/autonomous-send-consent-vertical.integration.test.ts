@@ -56,8 +56,8 @@ const {
   startChatApprovalResume,
 } = await import('../runtime/harness/chat-approval-resume.js');
 const {
-  _setCodeModeMcpResolverForTests,
-} = await import('../tools/code-mode-tool.js');
+  _setInnerDispatchMcpResolverForTests,
+} = await import('../tools/inner-dispatch.js');
 const {
   bindDiscordHarnessSession,
   tryHandleHarnessApprovalReply,
@@ -96,7 +96,7 @@ function recordingTransport() {
 
 test.after(() => {
   _resetChatApprovalResumeForTest();
-  _setCodeModeMcpResolverForTests(null);
+  _setInnerDispatchMcpResolverForTests(null);
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
@@ -135,7 +135,7 @@ test('Autonomous ordinary Yes executes one frozen Outlook send through the real 
   const payload = {
     to: 'nate@example.com',
     subject: 'Ventura restaurant shortlist',
-    body: 'The sheet is ready: https://docs.google.com/spreadsheets/d/ventura-proof/edit',
+    body: 'The sheet is ready: https://docs.google.com/spreadsheets/d/synthetic-ventura-proof/edit',
   };
 
   const providerCalls: Array<{ tool: string; args: unknown }> = [];
@@ -214,7 +214,7 @@ test('Autonomous ordinary Yes executes one frozen Outlook send through the real 
   } as MCPServer;
   const shim = createMcpNamespaceShim({ servers: [provider], cacheToolsList: false });
   await shim.listTools();
-  _setCodeModeMcpResolverForTests(() => shim);
+  _setInnerDispatchMcpResolverForTests(() => shim);
 
   let deferredBoundary: ClaudeAgentApprovalBoundary | null = null;
   const permission = buildGatedToolPermission(

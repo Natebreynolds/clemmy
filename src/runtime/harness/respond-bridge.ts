@@ -27,9 +27,10 @@
  *      no run-failed→legacy retry (a retry after a partial run is the
  *      double-send class the gates exist to prevent).
  *
- * Legacy fallback still exists as an explicit operator break-glass:
- * `CLEMMY_LEGACY_RESPOND_FALLBACK=on`. It is intentionally global and loud so
- * the old ApprovalStore / assistant.respond path cannot come back accidentally.
+ * Legacy fallback remains an explicit operator break-glass for non-chat
+ * execution owners only: `CLEMMY_LEGACY_RESPOND_FALLBACK=on`. Fresh interactive
+ * chat always blocks instead of handing effect authority back to the old
+ * ApprovalStore / assistant.respond path.
  *
  * Known, accepted contract differences from the legacy loop (same trade the
  * workflow runner accepted when it converged):
@@ -42,8 +43,25 @@ import { runConversation, verifiedWorkflowRunDispatchReceipts, type RunConversat
 import { resolveAcceptedTurnRead, type AcceptedTurnReadPorts, type AcceptedTurnReadResult } from '../read-path/read-lane-chat.js';
 import { buildProductionReadPortsForAcceptedTurn } from '../read-path/read-lane-adapters.js';
 import { currentAcceptedReadAuthority } from '../read-path/accepted-read-authority.js';
-import type { TurnCapabilityCandidates } from '../read-path/capability-candidates.js';
-import { enrichAcceptedRequestWithTaskContinuity } from './task-continuity-runtime.js';
+import {
+  resolveTurnCapabilityCandidates,
+  type TurnCapabilityCandidates,
+} from '../read-path/capability-candidates.js';
+import {
+  enrichAcceptedRequestWithTaskContinuity,
+  inspectDurableMaterialSourceContinuation,
+  mergeTurnCapabilityCandidates,
+} from './task-continuity-runtime.js';
+import {
+  recordTurnPreflightDecision,
+  validatedTurnSourceStrategyBinding,
+  type TurnPreflightDecision,
+  type TurnSourceStrategyBindingV1,
+} from './turn-control.js';
+import {
+  confirmedSourceStrategyBindingForSource,
+  exactSourceStrategyDecisionRowsForSource,
+} from './source-strategy-admission.js';
 import {
   PendingWorkflowChatDispatchOwnershipError,
   readPendingWorkflowChatDispatchOwnership,
@@ -71,6 +89,7 @@ import {
 } from './eventlog.js';
 import { listPending, projectPendingApprovalUserDependency } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
+import { buildContinueInput } from './continue-directive.js';
 import { ClaudeSdkCapacityExhaustedError, ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import { getModelRoutingMode, getRuntimeEnv } from '../../config.js';
@@ -99,8 +118,20 @@ import {
   type PresentationEvent,
   type TurnIdentity,
 } from './turn-outcome.js';
-import { clearRunInFlightAfterTerminal, markRunInFlight } from './restart-recovery.js';
-import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
+import {
+  exactTerminalForAcceptedSource,
+  type AcceptedSourceTerminalOutcome,
+} from './accepted-source-terminal.js';
+import { clearRunInFlightAfterTerminal } from './restart-recovery.js';
+import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
+import {
+  InvalidFreshTurnEngineError,
+  isHostTurnEngine,
+  selectTurnEngine,
+  type TurnEngineMode,
+} from './turn-engine-selection.js';
+import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
+import { typedClassificationFromLastInterpretation } from '../semantic-boundary/interpret-accepted-source.js';
 import { recordWarmProcedureUse } from '../../memory/procedure-receipts.js';
 import { warmReadToolPolicyDigest } from '../read-path/warm-read-policy.js';
 import {
@@ -109,21 +140,82 @@ import {
   readCompletedAnswerReplayProtection,
   type CompletedAnswerReplayProtectionReader,
 } from './completed-answer-replay.js';
-
 export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home' | 'workflow' | 'discord' | 'slack';
 
-function observeAcceptedBridgeTurnGraph(
+export interface RespondHarnessLimits {
+  maxTurns?: number;
+  maxSteps?: number;
+}
+
+const MATERIAL_SOURCE_AUTHORITY_BLOCKED_TEXT =
+  'I stopped before contacting a source because the confirmed source choice could not be reconstructed exactly. No source provider call was started. Please confirm the source again.';
+
+function decisionBytes(value: TurnPreflightDecision & { sourceUserSeq?: number }): string {
+  const { sourceUserSeq: _sourceUserSeq, ...decision } = value;
+  return JSON.stringify(decision);
+}
+
+/** Persist/read back one exact consuming decision. The optional caller binding
+ * may veto a forged disagreement, but can never supply authority: all bytes
+ * written here come from the durable A/Q/B inspection. */
+function persistVerifiedMaterialSourceDecision(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  decision: TurnPreflightDecision;
+  parentBinding: TurnSourceStrategyBindingV1;
+  binding: TurnSourceStrategyBindingV1;
+  callerBinding?: unknown;
+}): boolean {
+  if (input.callerBinding !== undefined) {
+    const caller = validatedTurnSourceStrategyBinding(input.callerBinding);
+    if (
+      !caller
+      || (
+        JSON.stringify(caller) !== JSON.stringify(input.parentBinding)
+        && JSON.stringify(caller) !== JSON.stringify(input.binding)
+      )
+    ) return false;
+  }
+  try {
+    const before = exactSourceStrategyDecisionRowsForSource(input.sessionId, input.sourceUserSeq);
+    if (before.length > 1) return false;
+    if (before.length === 0) {
+      recordTurnPreflightDecision(input.sessionId, input.decision, input.sourceUserSeq);
+    } else if (
+      decisionBytes(before[0]!.data as unknown as TurnPreflightDecision & { sourceUserSeq?: number })
+      !== decisionBytes(input.decision)
+    ) {
+      return false;
+    }
+    const after = exactSourceStrategyDecisionRowsForSource(input.sessionId, input.sourceUserSeq);
+    return after.length === 1
+      && decisionBytes(after[0]!.data as unknown as TurnPreflightDecision & { sourceUserSeq?: number })
+        === decisionBytes(input.decision)
+      && JSON.stringify(confirmedSourceStrategyBindingForSource(
+        input.sessionId,
+        input.sourceUserSeq,
+      )) === JSON.stringify(input.binding);
+  } catch {
+    return false;
+  }
+}
+
+async function observeAcceptedBridgeTurnGraph(
   surface: HarnessSurface,
   request: AssistantRequest,
   source: EventRow,
-): void {
-  recordTurnGraphShadow({
+): Promise<void> {
+  const acceptedText = typeof source.data.text === 'string'
+    ? source.data.text
+    : (request.displayMessage ?? request.message);
+  await recordAcceptedSourceGraph({
     identity: {
       sessionId: request.sessionId,
       turn: source.turn,
       sourceUserSeq: source.seq,
     },
     surface,
+    acceptedText,
     allowedToolNames: request.allowedToolNames,
     excludedToolNames: request.excludeToolNames,
     verifiedTaskContinuation: request.taskContinuation,
@@ -156,7 +248,12 @@ const SURFACE_CONFIG: Record<HarnessSurface, { kind: 'chat' | 'execution'; judge
   webhook: { kind: 'chat', judgeCompletion: true },
   cli: { kind: 'chat', judgeCompletion: true },
   cron: { kind: 'execution', judgeCompletion: false },
-  background: { kind: 'execution', judgeCompletion: false },
+  // ONE LOOP, MANY BRAINS: the async lane honors the model the dispatcher
+  // chose (createBackgroundTask({model}) was stored and then DISCARDED here —
+  // every durable window ran on the global brain regardless of the master's
+  // fleet plan). Same containment as workflow: only surfaces listed with
+  // honorModel read request.model.
+  background: { kind: 'execution', judgeCompletion: false, honorModel: true },
   // Workflow steps: execution lane (no judge — the step contract owns
   // completion). honorModel passes step.model through so forEach fan-out keeps
   // its cheaper worker model. Contained: only THIS surface honors request.model
@@ -203,7 +300,11 @@ function routeForLegacyFallback(surface: HarnessSurface, request: AssistantReque
   };
 }
 
-function legacyRespondFallbackEnabled(): boolean {
+function legacyRespondFallbackEnabled(surface: HarnessSurface): boolean {
+  // Rolling-upgrade compatibility belongs to persisted interruption state.
+  // This operator fallback is retained only for the existing non-chat owners;
+  // it can never admit a new effect-capable interactive turn.
+  if (SURFACE_CONFIG[surface].kind === 'chat') return false;
   const raw = (getRuntimeEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', 'off') ?? 'off').trim().toLowerCase();
   return raw === 'on' || raw === '1' || raw === 'true' || raw === 'yes';
 }
@@ -240,12 +341,12 @@ async function runLegacyBreakGlass(
   }, routeForLegacyFallback(surface, request));
 }
 
-function blockedPreRunResponse(
+async function blockedPreRunResponse(
   surface: HarnessSurface,
   request: AssistantRequest,
   userText: string,
   details?: Record<string, unknown>,
-): AssistantResponse {
+): Promise<AssistantResponse> {
   const route = routeForHarness(surface, request);
   let committedText = PUBLIC_RUN_FAILURE_TEXT;
   let terminalCommitted = false;
@@ -288,11 +389,12 @@ function blockedPreRunResponse(
       data: {
         text: request.displayMessage ?? request.message,
         ...(request.runId ? { runId: request.runId } : {}),
+        ...(request.hostDirective === true ? { hostDirective: true } : {}),
         attemptId: preflightAttempt.attemptId,
         source: `bridge:${surface}`,
       },
     }, { existingEventSeq: request.sourceUserSeq, armRunInFlight: true });
-    observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+    await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
     // recordRunAttemptUserInput atomically accepted this source and armed
     // restart ownership. A failed terminal therefore cannot become live-only.
     const identity: TurnIdentity = {
@@ -312,7 +414,6 @@ function blockedPreRunResponse(
       metadata: { transport: 'harness_preflight_block' },
     }).presentation.text;
     terminalCommitted = true;
-    markRunInFlight(request.sessionId, false);
   } catch {
     // Stable failure copy only. The proposed block text is not deliverable
     // without its durable terminal, and the in-flight marker remains armed.
@@ -324,7 +425,7 @@ function blockedPreRunResponse(
   return withRouteDiagnostics({
     text: committedText,
     sessionId: request.sessionId,
-    stoppedReason: 'error',
+    stoppedReason: terminalCommitted ? 'blocked' : 'error',
     raw: {
       blockedBy: 'harness_preflight',
       terminalCommitted,
@@ -434,10 +535,14 @@ async function serveAcceptedTurnReadUnderAuthority(
       });
       if (!committed.inserted) {
         try { finishRunAttempt(authority.attempt, 'superseded'); } catch { /* telemetry */ }
-        return responseForExactTerminalReplayUnderPolicy(surface, request, committed.event);
+        return responseForExactTerminalReplayUnderPolicy(surface, request, {
+          kind: 'terminal',
+          event: committed.event,
+          presentation: committed.presentation,
+        });
       }
       served.counters.public_terminals = committedCounters.public_terminals;
-      observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+      await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
       try { finishRunAttempt(authority.attempt, 'failed'); } catch { /* telemetry */ }
       clearRunInFlightAfterTerminal(
         request.sessionId,
@@ -538,13 +643,17 @@ async function serveAcceptedTurnReadUnderAuthority(
     });
     if (!committed.inserted) {
       try { finishRunAttempt(authority.attempt, 'superseded'); } catch { /* telemetry */ }
-      return responseForExactTerminalReplayUnderPolicy(surface, request, committed.event);
+      return responseForExactTerminalReplayUnderPolicy(surface, request, {
+        kind: 'terminal',
+        event: committed.event,
+        presentation: committed.presentation,
+      });
     }
     served.counters.public_terminals = committedCounters.public_terminals;
     // A provider receipt is not a served answer. Credit the artifact only
     // after its exact public TurnOutcome has durably won publication.
     try { recordWarmProcedureUse(served.artifactId); } catch { /* telemetry */ }
-    observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+    await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
     try { finishRunAttempt(authority.attempt, 'completed'); } catch { /* telemetry */ }
     clearRunInFlightAfterTerminal(
       request.sessionId,
@@ -691,7 +800,7 @@ function routeForHarness(surface: HarnessSurface, request: AssistantRequest, mod
     requestedModel: request.model,
     effectiveModel,
     provider: providerFor(effectiveModel),
-    transport: 'openai_agents_harness',
+    transport: 'host_harness',
     mode: getModelRoutingMode(),
   };
 }
@@ -719,6 +828,7 @@ type ConfigureFn = typeof configureHarnessRuntime;
 type ClaudeAgentBrainFn = typeof respondViaClaudeAgentSdkBrain;
 type RecoveryListEventsFn = typeof listEvents;
 type CommitTurnOutcomeFn = typeof commitTurnOutcome;
+type ResolveTurnCandidatesFn = typeof resolveTurnCapabilityCandidates;
 /** The shared accepted-turn read resolver (E4). Production default builds
  *  fail-closed ports; tests inject deterministic ones. */
 type AcceptedTurnReadPortsFactory = (
@@ -729,8 +839,15 @@ let runConversationImpl: RunConversationFn = runConversation;
 let buildAgentImpl: BuildAgentFn = buildOrchestratorAgent;
 let configureImpl: ConfigureFn = configureHarnessRuntime;
 let claudeAgentBrainImpl: ClaudeAgentBrainFn = respondViaClaudeAgentSdkBrain;
+// The standalone Claude brain remains an execution-lane transport for cron and
+// background work. Interactive chat is converged on respondViaHarness in
+// production. This test-only override keeps the standalone failure reducer
+// directly exercisable without reopening a production chat fork. Legacy tests
+// must opt in explicitly; injecting a transport stub never changes route policy.
+let allowStandaloneClaudeInteractiveBrainForTests = false;
 let recoveryListEventsImpl: RecoveryListEventsFn = listEvents;
 let commitTurnOutcomeImpl: CommitTurnOutcomeFn = commitTurnOutcome;
+let resolveTurnCandidatesImpl: ResolveTurnCandidatesFn = resolveTurnCapabilityCandidates;
 let completedAnswerReplayProtectionImpl: CompletedAnswerReplayProtectionReader = readCompletedAnswerReplayProtection;
 const productionAcceptedTurnReadPorts: AcceptedTurnReadPortsFactory = async (_surface, request) => {
   const authority = currentAcceptedReadAuthority(
@@ -758,19 +875,23 @@ export function _setBridgeImplsForTests(impls: {
   buildAgent?: BuildAgentFn | null;
   configure?: ConfigureFn | null;
   claudeAgentBrain?: ClaudeAgentBrainFn | null;
+  allowStandaloneClaudeInteractiveBrainForTests?: boolean;
   recoveryListEvents?: RecoveryListEventsFn | null;
   commitTurnOutcome?: CommitTurnOutcomeFn | null;
   completedAnswerReplayProtection?: CompletedAnswerReplayProtectionReader | null;
   acceptedTurnReadPorts?: AcceptedTurnReadPortsFactory | null;
+  resolveTurnCandidates?: ResolveTurnCandidatesFn | null;
 }): void {
   runConversationImpl = impls.runConversation ?? runConversation;
   buildAgentImpl = impls.buildAgent ?? buildOrchestratorAgent;
   configureImpl = impls.configure ?? configureHarnessRuntime;
   claudeAgentBrainImpl = impls.claudeAgentBrain ?? respondViaClaudeAgentSdkBrain;
+  allowStandaloneClaudeInteractiveBrainForTests = impls.allowStandaloneClaudeInteractiveBrainForTests ?? false;
   recoveryListEventsImpl = impls.recoveryListEvents ?? listEvents;
   commitTurnOutcomeImpl = impls.commitTurnOutcome ?? commitTurnOutcome;
   completedAnswerReplayProtectionImpl = impls.completedAnswerReplayProtection ?? readCompletedAnswerReplayProtection;
   acceptedTurnReadPortsImpl = impls.acceptedTurnReadPorts ?? productionAcceptedTurnReadPorts;
+  resolveTurnCandidatesImpl = impls.resolveTurnCandidates ?? resolveTurnCapabilityCandidates;
 }
 
 /** Poll cadence for mapping the legacy `shouldCancel` callback onto the
@@ -909,7 +1030,6 @@ function commitRecoveryCandidateTerminal(input: {
     legacyReason: input.completedReason,
     metadata: { steps: input.steps },
   });
-  markRunInFlight(input.sessionId, false);
   return committed.event;
 }
 
@@ -943,7 +1063,6 @@ function commitBridgeUnverifiedCompletionCandidate(input: {
     presentationAlreadyDiscloses: input.presentationAlreadyDiscloses,
     deliveryConcern: { reason: input.reason },
   });
-  markRunInFlight(input.sessionId, false);
   return committed.event;
 }
 
@@ -973,10 +1092,10 @@ function logicalTurnIdentity(input: {
 /** Resolve the exact accepted event owned by the failed Claude request. In
  * production the SDK brain has already bound it atomically; the insert path is
  * the pre-dispatch-failure fallback and still binds before publication. */
-function ensureAcceptedRecoveryTurn(
+async function ensureAcceptedRecoveryTurn(
   surface: HarnessSurface,
   request: AssistantRequest,
-): AcceptedRecoveryTurn {
+): Promise<AcceptedRecoveryTurn> {
   const displayMessage = request.displayMessage ?? request.message;
   if (!getSession(request.sessionId)) {
     const config = SURFACE_CONFIG[surface];
@@ -1002,7 +1121,9 @@ function ensureAcceptedRecoveryTurn(
   }
   const candidate = request.runId?.trim()
     ? getLatestRunAttemptByRunId(request.sessionId, request.runId.trim())
-    : getLatestRunAttempt(request.sessionId);
+    : requestedSource
+      ? getRunAttemptBySourceUserSeq(request.sessionId, requestedSource.seq)
+      : getLatestRunAttempt(request.sessionId);
   const existing = candidate && (!requestedSource || candidate.sourceUserSeq === requestedSource.seq)
     ? candidate
     : null;
@@ -1024,22 +1145,32 @@ function ensureAcceptedRecoveryTurn(
     data: {
       text: displayMessage,
       ...(request.runId ? { runId: request.runId } : {}),
+      ...(request.hostDirective === true ? { hostDirective: true } : {}),
       attemptId: attempt.attemptId,
       source: 'bridge:recovery',
     },
-  }, { existingEventSeq: source?.seq, armRunInFlight: true });
-  observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+  }, {
+    existingEventSeq: source?.seq,
+    // An existing physical attempt already armed its exact marker at accepted
+    // source binding. Re-arming it here can overwrite a newer turn's owner when
+    // this late wrapper is only replaying or reducing the older attempt.
+    armRunInFlight: existing === null,
+  });
+  await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
   return { attempt, sourceUserSeq: sourceUserEvent.seq, sourceTurn: sourceUserEvent.turn };
 }
 
-function exactTerminalForSource(sessionId: string, sourceUserSeq: number): EventRow | null {
-  const logicalKey = `turn:${sourceUserSeq}`;
-  return listEvents(sessionId, { types: ['conversation_completed'], desc: true })
-    .find((event) => event.data.terminalKey === logicalKey
-      || event.data.sourceUserSeq === sourceUserSeq
-      || (event.data.presentation as { identity?: { sourceUserSeq?: unknown } } | undefined)
-        ?.identity?.sourceUserSeq === sourceUserSeq)
-    ?? null;
+function exactTerminalForSource(
+  sessionId: string,
+  sourceUserSeq: number,
+): AcceptedSourceTerminalOutcome | null {
+  const source = listEvents(sessionId, {
+    sinceSeq: sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === sourceUserSeq);
+  if (!source || source.role !== 'user' || source.data.synthetic === true) return null;
+  return exactTerminalForAcceptedSource(source);
 }
 
 /** A source sequence is not a bearer token. Replay requires the literal
@@ -1068,9 +1199,35 @@ function acceptedSourceIdentityForReplay(request: AssistantRequest): EventRow | 
   return source;
 }
 
-function exactTerminalReplayForRequest(request: AssistantRequest): EventRow | null {
+function exactTerminalReplayForRequest(request: AssistantRequest): AcceptedSourceTerminalOutcome | null {
   const source = acceptedSourceIdentityForReplay(request);
-  return source ? exactTerminalForSource(request.sessionId, source.seq) : null;
+  return source ? exactTerminalForAcceptedSource(source) : null;
+}
+
+function settleExactTerminalReplayOwnership(
+  request: AssistantRequest,
+  terminal: AcceptedSourceTerminalOutcome,
+): void {
+  const source = acceptedSourceIdentityForReplay(request);
+  if (!source) return;
+  const row = getRunAttemptBySourceUserSeq(request.sessionId, source.seq);
+  if (row && !row.finishedAt) {
+    const attempt = {
+      sessionId: row.sessionId,
+      attemptId: row.attemptId,
+      runId: row.runId,
+      startedAt: row.startedAt,
+    };
+    const status = terminal.presentation.status === 'cancelled'
+      ? 'cancelled'
+      : terminal.presentation.status === 'failed'
+          || terminal.presentation.status === 'blocked'
+          || terminal.presentation.status === 'uncertain'
+        ? 'failed'
+        : 'completed';
+    try { finishRunAttempt(attempt, status); } catch { /* terminal remains authoritative */ }
+  }
+  clearRunInFlightAfterTerminal(request.sessionId, row?.attemptId, source.seq);
 }
 
 /** Canonical warm tool lifecycle is also the durable paid-call no-retry
@@ -1101,6 +1258,7 @@ function stoppedReasonForPresentation(
 ): NonNullable<AssistantResponse['stoppedReason']> {
   if (presentation.status === 'done') return 'success';
   if (presentation.status === 'cancelled') return 'cancelled';
+  if (presentation.status === 'blocked' || presentation.status === 'uncertain') return 'blocked';
   if (presentation.status !== 'needs_input') return 'error';
   if (presentation.needs?.kind === 'approval') return 'pending-approval';
   if (presentation.needs?.kind === 'continue') return 'max-turns-with-grace';
@@ -1124,15 +1282,31 @@ function responseForCommittedTerminal(
   };
 }
 
+function responseForAcceptedSourceTerminal(
+  terminal: AcceptedSourceTerminalOutcome,
+  extraRaw?: Record<string, unknown>,
+): AssistantResponse {
+  const { event, presentation } = terminal;
+  return {
+    text: presentation.text,
+    sessionId: event.sessionId,
+    stoppedReason: stoppedReasonForPresentation(presentation),
+    turnsUsed: event.turn,
+    ...(presentation.approvalId ? { pendingApprovalId: presentation.approvalId } : {}),
+    ...(extraRaw ? { raw: extraRaw } : {}),
+  };
+}
+
 /** A transport retry for an already-published accepted source is a pure
  * durable replay. It must not create a new attempt, rebuild warm ports, or run
  * a brain merely to lose a second exactly-once commit race. */
 function responseForExactTerminalReplay(
   surface: HarnessSurface,
   request: AssistantRequest,
-  event: EventRow,
+  terminal: AcceptedSourceTerminalOutcome,
 ): AssistantResponse {
-  const response = responseForCommittedTerminal(event, {
+  const { event } = terminal;
+  const response = responseForAcceptedSourceTerminal(terminal, {
     terminalReplay: true,
     sourceUserSeq: request.sourceUserSeq,
   });
@@ -1163,11 +1337,24 @@ function responseForExactTerminalReplay(
 function responseForExactTerminalReplayUnderPolicy(
   surface: HarnessSurface,
   request: AssistantRequest,
-  event: EventRow,
+  terminal: AcceptedSourceTerminalOutcome,
 ): AssistantResponse {
-  return durableWarmReadPolicyMatches(request, event)
-    ? responseForExactTerminalReplay(surface, request, event)
+  return durableWarmReadPolicyMatches(request, terminal.event)
+    ? responseForExactTerminalReplay(surface, request, terminal)
     : responseForWarmReadPolicyConflict(surface, request);
+}
+
+function responseForUnverifiableTerminalLedger(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+): AssistantResponse {
+  return withRouteDiagnostics({
+    text: 'I could not verify the existing terminal state for this request, so I stopped before running it again.',
+    sessionId: request.sessionId,
+    stoppedReason: 'blocked',
+    turnsUsed: 0,
+    raw: { terminalReplay: true, ledger: 'unreadable' },
+  }, routeForHarness(surface, request));
 }
 
 function responseForWarmProviderSpentReplay(
@@ -1297,9 +1484,13 @@ async function tryServeCompletedAnswerReplay(
         current.attempt.attemptId,
         current.source.seq,
       );
-      return responseForExactTerminalReplayUnderPolicy(surface, request, committed.event);
+      return responseForExactTerminalReplayUnderPolicy(surface, request, {
+        kind: 'terminal',
+        event: committed.event,
+        presentation: committed.presentation,
+      });
     }
-    observeAcceptedBridgeTurnGraph(surface, request, current.source);
+    await observeAcceptedBridgeTurnGraph(surface, request, current.source);
     try { finishRunAttempt(current.attempt, 'completed'); } catch { /* telemetry */ }
     clearRunInFlightAfterTerminal(
       request.sessionId,
@@ -1325,7 +1516,9 @@ async function tryServeCompletedAnswerReplay(
         );
         return responseForExactTerminalReplayUnderPolicy(surface, request, winner);
       }
-    } catch { /* normal authority retains recovery ownership */ }
+    } catch {
+      return responseForUnverifiableTerminalLedger(surface, request);
+    }
     return null;
   }
 }
@@ -1351,6 +1544,9 @@ function exactAsyncDispatchForSource(source: EventRow): ReturnType<typeof public
 
 const RESTART_OWNED_WORKFLOW_DISPATCH_REPLY =
   'Background work was admitted for this request, but its dispatch still needs exact recovery before it can run. I preserved the original request and will resume that same work rather than creating a replacement.';
+
+const TYPED_EXECUTION_HELD_REPLY =
+  'This exact task is still owned by Clem\'s recovery system. I did not start a duplicate attempt; the existing work will continue from its durable checkpoint.';
 
 type RestartOwnedWorkflowDispatchState =
   | { kind: 'pending'; ownership: PendingWorkflowChatDispatchOwnership }
@@ -1437,7 +1633,6 @@ function commitBridgeBlockedTerminal(input: {
     legacyReason: input.reason,
     metadata: input.metadata,
   });
-  markRunInFlight(input.request.sessionId, false);
   return committed.event;
 }
 
@@ -1463,14 +1658,23 @@ function commitBridgeFailedTerminal(input: {
     legacyReason: input.reason,
     metadata: { transport: input.transport },
   });
-  markRunInFlight(input.request.sessionId, false);
   return committed.event;
 }
 
 export async function respondViaHarness(
   surface: HarnessSurface,
   request: AssistantRequest,
-  opts: { reuseRecordedUserInput?: boolean; sourceUserSeq?: number; modelOverride?: string } = {},
+  opts: {
+    reuseRecordedUserInput?: boolean;
+    sourceUserSeq?: number;
+    modelOverride?: string;
+    /** Frozen above eager resolution so one accepted source cannot change
+     * engines after an env reload or a provider fallover. */
+    turnEngine?: TurnEngineMode;
+    /** Optional one-shot smoke/eval limits; ordinary surfaces omit these. */
+    maxTurns?: number;
+    maxSteps?: number;
+  } = {},
 ): Promise<AssistantResponse> {
   const config = SURFACE_CONFIG[surface];
   const sessionId = request.sessionId;
@@ -1505,11 +1709,117 @@ export async function respondViaHarness(
       source: `bridge:${surface}`,
     },
   }, { existingEventSeq: acceptedSourceUserSeq, armRunInFlight: true });
-  // Rehydrate private continuation state only from the exact durable source.
+  // Rehydrate private continuation state only from the exact durable source
+  // BEFORE its first graph is persisted. A clarification answer is semantically
+  // the durable A/Q/B capsule, not the bare B bytes: persisting B first and then
+  // asking runConversation to observe the verified continuation creates two
+  // incompatible lineages for one accepted source and correctly fails closed.
   // Caller-supplied semantic context is stripped when no valid packet exists.
-  request = await enrichAcceptedRequestWithTaskContinuity(request, sourceUserEvent.seq);
-  observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
-  // Source binding and the chat recovery marker committed atomically above, so
+  const hostOwnsTurn = Boolean(opts.turnEngine && isHostTurnEngine(opts.turnEngine));
+  const callerSourceStrategyBinding = request.turnCandidates?.sourceStrategyBinding;
+  const typedClassification = semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
+    ? (typedClassificationFromLastInterpretation(request.sessionId, sourceUserEvent.seq) ?? { keepOpen: true as const })
+    : undefined;
+  request = await enrichAcceptedRequestWithTaskContinuity(request, sourceUserEvent.seq, {
+    ...(hostOwnsTurn ? { continuationOnly: true } : {}),
+    typedClassification,
+  });
+  if (hostOwnsTurn) {
+    const materialSource = inspectDurableMaterialSourceContinuation({
+      sessionId,
+      sourceUserSeq: sourceUserEvent.seq,
+    });
+    let materialSourceAuthorityValid = materialSource.status !== 'refused';
+    if (materialSource.status === 'verified') {
+      materialSourceAuthorityValid = persistVerifiedMaterialSourceDecision({
+        sessionId,
+        sourceUserSeq: sourceUserEvent.seq,
+        decision: materialSource.decision,
+        parentBinding: materialSource.parentBinding,
+        binding: materialSource.binding,
+        ...(callerSourceStrategyBinding !== undefined
+          ? { callerBinding: callerSourceStrategyBinding }
+          : {}),
+      });
+    }
+    if (!materialSourceAuthorityValid) {
+      const terminal = commitBridgeBlockedTerminal({
+        request,
+        turn: {
+          attempt: requestAttempt,
+          sourceUserSeq: sourceUserEvent.seq,
+          sourceTurn: sourceUserEvent.turn,
+        },
+        text: MATERIAL_SOURCE_AUTHORITY_BLOCKED_TEXT,
+        reason: 'material_source_authority_invalid',
+        metadata: { transport: 'host_harness' },
+      });
+      try { finishRunAttempt(requestAttempt, 'failed'); } catch { /* terminal is authoritative */ }
+      clearRunInFlightAfterTerminal(sessionId, requestAttempt.attemptId, sourceUserEvent.seq);
+      return withRouteDiagnostics(
+        responseForCommittedTerminal(terminal, { failure: 'material_source_authority_invalid' }),
+        routeForHarness(surface, request, opts.modelOverride),
+      );
+    }
+  }
+  // Fresh host turns deliberately skip the bridge's eager capability lookup:
+  // accepted source -> context node -> capability_resolve node -> first model
+  // step is the owned order. The old cutover left no replacement lookup at
+  // capability_resolve, however, so learned candidates silently disappeared
+  // from every ordinary host_v1 agent surface. Resolve exactly once, lazily,
+  // from the accepted build callback and share that same promise with every
+  // fallover rebuild. A retrieval failure remains advisory-only: existing
+  // caller/continuation candidates survive, while no candidate ever grants
+  // dispatch authority.
+  const resolveFreshHostCandidates = hostOwnsTurn
+    && request.taskContinuation === undefined
+    && !(typedClassification && 'keepOpen' in typedClassification);
+  if (resolveFreshHostCandidates && request.turnCandidates?.sourceStrategyBinding) {
+    const { sourceStrategyBinding: _callerBinding, ...withoutCallerBinding } = request.turnCandidates;
+    request = { ...request, turnCandidates: withoutCallerBinding };
+  }
+  let acceptedTurnCandidatesPromise: Promise<TurnCapabilityCandidates | undefined> | undefined;
+  const candidatesForAcceptedBuild = (): Promise<TurnCapabilityCandidates | undefined> => {
+    if (!resolveFreshHostCandidates) return Promise.resolve(request.turnCandidates);
+    if (!acceptedTurnCandidatesPromise) {
+      acceptedTurnCandidatesPromise = (async () => {
+        const acceptedText = typeof sourceUserEvent.data.text === 'string'
+          ? sourceUserEvent.data.text
+          : '';
+        let resolved: TurnCapabilityCandidates = {
+          candidates: [],
+          requirements: [],
+          matches: [],
+          pinnedTools: [],
+          semanticApplied: false,
+        };
+        try {
+          resolved = await resolveTurnCandidatesImpl({
+            userInput: acceptedText,
+          });
+        } catch {
+          // Candidate recall is context, never execution authority. A broken
+          // advisory tier must not fail or broaden the accepted turn.
+        }
+        // Candidate recall is advisory context. Fresh turns cannot acquire a
+        // durable source strategy (or historical arguments) from this tier;
+        // exact call authority is minted later from the accepted task and its
+        // current logical call. Explicit, verified A/Q/B continuations were
+        // handled above and remain the only lane that carries a source binding.
+        const { sourceStrategyBinding: _advisoryBinding, ...advisoryResolved } = resolved;
+        const merged = request.turnCandidates
+          ? mergeTurnCapabilityCandidates(request.turnCandidates, advisoryResolved)
+          : advisoryResolved;
+        request = { ...request, turnCandidates: merged };
+        return merged;
+      })();
+    }
+    return acceptedTurnCandidatesPromise;
+  };
+  if (!opts.turnEngine || !isHostTurnEngine(opts.turnEngine)) {
+    await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
+  }
+  // Advisory candidate resolution cannot commit source authority, so
   // failures while building the agent/tool surface remain restart-recoverable.
   preserveCurrentKillAndClearStale(sessionId, requestAttempt);
 
@@ -1543,18 +1853,21 @@ export async function respondViaHarness(
     // is graph work with a real trace step. Same builder, same arguments,
     // moved in time; the fallover wiring keeps its own builder for rebuilds.
     let acceptedBuildIdentity: Parameters<NonNullable<RunConversationOptions['buildAgent']>>[0] | undefined;
-    const buildAgent: NonNullable<RunConversationOptions['buildAgent']> = (identity) => {
+    const buildAgent: NonNullable<RunConversationOptions['buildAgent']> = async (identity) => {
       acceptedBuildIdentity = identity;
+      const turnCandidates = await candidatesForAcceptedBuild();
       return buildAgentImpl({
         userInput: request.message,
         sessionId,
         sourceUserSeq: identity.sourceUserSeq,
-        acceptedRoute: identity.route,
+        ...(identity.route ? { acceptedRoute: identity.route } : {}),
+        ...(identity.hostFreshPlanning ? { hostFreshPlanning: identity.hostFreshPlanning } : {}),
+        ...(identity.hostPlainConversation ? { hostPlainConversation: true as const } : {}),
         allowedToolNames: request.allowedToolNames,
         excludeToolNames: request.excludeToolNames,
         // The turn's advisory capability candidates ride the request into the
         // agent build — the only delivery path, shared by both brains.
-        ...(request.turnCandidates ? { turnCandidates: request.turnCandidates } : {}),
+        ...(turnCandidates ? { turnCandidates } : {}),
         ...(request.taskContinuation ? { taskContinuation: request.taskContinuation } : {}),
         ...(request.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
         // Only surfaces flagged honorModel forward request.model (workflow steps);
@@ -1585,6 +1898,7 @@ export async function respondViaHarness(
           excludeToolNames: request.excludeToolNames,
           allowToolJit: true,
           ...(request.turnCandidates ? { turnCandidates: request.turnCandidates } : {}),
+          ...(resolveFreshHostCandidates ? { turnCandidatesForBuild: candidatesForAcceptedBuild } : {}),
           ...(request.taskContinuation ? { taskContinuation: request.taskContinuation } : {}),
           ...(request.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
           acceptedIdentity: () => acceptedBuildIdentity,
@@ -1633,6 +1947,9 @@ export async function respondViaHarness(
       ...(request.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
       sourceUserSeq: sourceUserEvent.seq,
       runAttemptId: requestAttempt.attemptId,
+      turnEngine: opts.turnEngine,
+      maxTurns: opts.maxTurns,
+      maxSteps: opts.maxSteps,
       maxWallClockMs: request.maxWallClockMs,
       maxRunTokens: request.maxRunTokens,
       runTokenBaseline: request.runTokenBaseline,
@@ -1659,6 +1976,20 @@ export async function respondViaHarness(
       || publicReplyText(result.lastDecision?.reply, '');
 
     switch (result.status) {
+      case 'held': {
+        // No terminal exists: a peer activation or restart reconciler still
+        // owns this exact accepted source. Preserve its attempt and return only
+        // a nonterminal acknowledgement; never reinterpret it as done, failed,
+        // blocked, or a question for the user.
+        preserveRequestAttemptOwnership = true;
+        return withRouteDiagnostics({
+          text: TYPED_EXECUTION_HELD_REPLY,
+          sessionId,
+          stoppedReason: 'in-progress',
+          turnsUsed: result.lastTurn,
+          raw: { transport: 'host_harness', typedExecution: result.hold },
+        }, routeForHarness(surface, request, opts.modelOverride));
+      }
       case 'dispatched': {
         const dispatch = exactAsyncDispatchForSource(sourceUserEvent);
         if (!dispatch) {
@@ -1759,6 +2090,9 @@ export async function respondViaHarness(
                 reuseRecordedUserInput: true,
                 sourceUserSeq: sourceUserEvent.seq,
                 modelOverride: next.modelId,
+                turnEngine: opts.turnEngine,
+                maxTurns: opts.maxTurns,
+                maxSteps: opts.maxSteps,
               });
               const route = routeDiagnosticsFromResponse(recovered);
               return route ? withRouteDiagnostics(recovered, { ...route, falloverFrom: 'harness_parse_exhaustion' }) : recovered;
@@ -1838,17 +2172,24 @@ export async function respondViaHarness(
           turnsUsed: result.lastTurn,
         }, routeForHarness(surface, request, opts.modelOverride));
       }
-      case 'limit_exceeded':
-        // Stage 4: a token-budget park is DISTINCT from turn/step budgets —
-        // the drain must park it awaiting_continue instead of auto-continuing.
+      case 'limit_exceeded': {
+        // HOST TURN LOOP (2026-08-19): step ceilings continue IN-TURN via the
+        // loop's logged next-step claims; a ceiling that reaches this case
+        // chose to REST. The old fire-and-forget drain here synthesized a
+        // user_input_received to fake re-entry — a stall wearing a banner
+        // (live mszlpidc: "pass 1 of 200" with no logged next-step claim and
+        // no continue dispatch). The park copy states progress is saved; it
+        // never asks the user to type `continue` — any next user message
+        // re-enters from the checkpoint.
         return withRouteDiagnostics({
           text: replyText || (result.limitKind === 'token_budget'
-            ? 'I hit this run\'s token budget before finishing — say "continue" to authorize another budget window.'
-            : 'I hit the run budget before finishing — say "continue" to keep going.'),
+            ? 'I hit this run\'s token budget before finishing. Progress is checkpointed — I\'ll pick up from here.'
+            : 'I hit the run budget before finishing. Progress is checkpointed — I\'ll pick up from here.'),
           sessionId,
           stoppedReason: result.limitKind === 'token_budget' ? 'token-budget' : 'max-turns-with-grace',
           turnsUsed: result.lastTurn,
         }, routeForHarness(surface, request, opts.modelOverride));
+      }
       case 'killed':
         // Preserve the legacy cancellation contract: callers (background
         // tasks) classify aborts via this error type.
@@ -1857,6 +2198,15 @@ export async function respondViaHarness(
           text: replyText || 'Run was cancelled.',
           sessionId,
           stoppedReason: 'cancelled',
+          turnsUsed: result.lastTurn,
+        }, routeForHarness(surface, request, opts.modelOverride));
+      case 'blocked':
+        return withRouteDiagnostics({
+          text: result.error
+            || result.publicPresentation?.text
+            || 'I could not admit this turn, so I stopped before using any tools.',
+          sessionId,
+          stoppedReason: 'blocked',
           turnsUsed: result.lastTurn,
         }, routeForHarness(surface, request, opts.modelOverride));
       case 'failed':
@@ -1884,7 +2234,7 @@ export async function respondViaHarness(
         sourceUserSeq: sourceUserEvent.seq,
         sourceTurn: sourceUserEvent.turn,
         state: restartOwned,
-        transport: 'openai_agents_harness',
+        transport: 'host_harness',
       });
       return withRouteDiagnostics(response, routeForHarness(surface, request, opts.modelOverride));
     }
@@ -1902,7 +2252,7 @@ export async function respondViaHarness(
           sourceTurn: sourceUserEvent.turn,
         },
         reason: 'bridge_runtime_failed',
-        transport: 'openai_agents_harness',
+        transport: 'host_harness',
       });
       const response = responseForCommittedTerminal(terminal, {
         failure: 'bridge_runtime_failed',
@@ -1943,6 +2293,7 @@ async function respondPreferHarnessOnce(
   surface: HarnessSurface,
   request: AssistantRequest,
   legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
+  limits: RespondHarnessLimits = {},
 ): Promise<AssistantResponse> {
   // Idempotent transport replay is resolved before runtime availability or
   // tool-surface checks: the durable terminal is already the public winner.
@@ -1954,14 +2305,22 @@ async function respondPreferHarnessOnce(
         return responseForAcceptedSourceIdentityMismatch(surface, request);
       }
       const committed = exactTerminalReplayForRequest(request);
-      if (committed) return responseForExactTerminalReplayUnderPolicy(surface, request, committed);
+      if (committed) {
+        settleExactTerminalReplayOwnership(request, committed);
+        return responseForExactTerminalReplayUnderPolicy(surface, request, committed);
+      }
       const warmSpent = exactWarmProviderSpentForRequest(request);
       if (warmSpent) {
         return durableWarmReadPolicyMatches(request, warmSpent)
           ? responseForWarmProviderSpentReplay(surface, request)
           : responseForWarmReadPolicyConflict(surface, request);
       }
-    } catch { /* no readable exact terminal: proceed through normal authority */ }
+    } catch {
+      // A ledger read failure is not evidence that no terminal exists. Exact
+      // replay callers have already named an accepted source, so retrying via
+      // a brain here could duplicate an effect whose winner is merely unreadable.
+      return responseForUnverifiableTerminalLedger(surface, request);
+    }
   }
   // Do not introduce an async boundary into the established hot path merely
   // to discover that an ordinary request is not an answer-repeat request. Cron and
@@ -1972,11 +2331,11 @@ async function respondPreferHarnessOnce(
     if (completedAnswerReplay) return completedAnswerReplay;
   }
   if (!harnessSurfaceEnabled(surface)) {
-    if (legacyRespondFallbackEnabled() && request.allowedToolNames === undefined) {
+    if (legacyRespondFallbackEnabled(surface) && request.allowedToolNames === undefined) {
       bridgeLogger.warn({ surface, reason: 'surface_disabled' }, 'explicit legacy respond fallback engaged');
       return runLegacyBreakGlass(surface, request, legacyRespond);
     }
-    return blockedPreRunResponse(
+    return await blockedPreRunResponse(
       surface,
       request,
       'That runtime lane is temporarily unavailable, so I did not start the turn. Check runtime settings or try again.',
@@ -1989,12 +2348,12 @@ async function respondPreferHarnessOnce(
   // caller's tool surface or bypass the harness. buildOrchestratorAgent does the
   // actual filtering for enforceable names.
   if (!harnessCanEnforceExcludes(request.excludeToolNames)) {
-    if (legacyRespondFallbackEnabled() && request.allowedToolNames === undefined) {
+    if (legacyRespondFallbackEnabled(surface) && request.allowedToolNames === undefined) {
       bridgeLogger.warn({ surface, excludeToolNames: request.excludeToolNames, reason: 'non_filterable_excludes' }, 'explicit legacy respond fallback engaged');
       return runLegacyBreakGlass(surface, request, legacyRespond);
     }
     const unsafe = nonFilterableToolExcludes(request.excludeToolNames, HARNESS_FILTERABLE_TOOLS);
-    return blockedPreRunResponse(
+    return await blockedPreRunResponse(
       surface,
       request,
       'I could not start this turn because its requested tool boundary is not supported. Please use a scoped tool surface or adjust the request.',
@@ -2008,15 +2367,33 @@ async function respondPreferHarnessOnce(
     auth = { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }
   if (!auth.ok) {
-    if (legacyRespondFallbackEnabled() && request.allowedToolNames === undefined) {
+    if (legacyRespondFallbackEnabled(surface) && request.allowedToolNames === undefined) {
       bridgeLogger.warn({ surface, reason: 'harness_auth_unavailable', authReason: auth.reason }, 'explicit legacy respond fallback engaged');
       return runLegacyBreakGlass(surface, request, legacyRespond);
     }
-    return blockedPreRunResponse(
+    return await blockedPreRunResponse(
       surface,
       request,
       'I could not start this turn because no model runtime is connected. Open Settings > Models, connect a model, and try again.',
       { reason: 'harness_auth_unavailable', authReason: auth.reason },
+    );
+  }
+  // Freeze the fresh-turn owner before any eager resolver can consume the
+  // accepted request. Host chat deliberately starts with the model; memory and
+  // live catalog are context/capability ports inside that loop, not a second
+  // executor in front of it. Non-chat surfaces remain on the legacy owner.
+  let turnEngine: TurnEngineMode;
+  try {
+    turnEngine = selectTurnEngine({
+      sessionKind: SURFACE_CONFIG[surface].kind,
+    });
+  } catch (err) {
+    if (!(err instanceof InvalidFreshTurnEngineError)) throw err;
+    return await blockedPreRunResponse(
+      surface,
+      request,
+      'This interactive runtime is configured for an unsupported turn engine, so I did not start the turn. Use host_v1 or host_v1_read_only.',
+      { reason: 'invalid_turn_engine' },
     );
   }
   // E4: the shared accepted-turn READ resolver — ONE provider-neutral entry
@@ -2024,18 +2401,30 @@ async function respondPreferHarnessOnce(
   // decline costs ordinary chat nothing (no model call, no tool schema, no
   // discovery); a verified warm read commits ONE typed terminal through the
   // existing exactly-once committer and no brain runs at all.
-  const readServed = await tryServeAcceptedTurnRead(surface, request);
-  if (readServed) return readServed;
+  if (!isHostTurnEngine(turnEngine)) {
+    const readServed = await tryServeAcceptedTurnRead(surface, request);
+    if (readServed) return readServed;
+  }
 
-  if (claudeAgentSdkBrainEnabled(surface)) {
-    // Claude diverges before respondViaHarness, so rehydrate only an actual
-    // exact-source continuation here. Ordinary turns avoid a duplicate semantic
-    // candidate-resolution pass; the Claude lane owns their normal routing.
+  const useStandaloneClaudeExecutionBrain = claudeAgentSdkBrainEnabled(surface)
+    && (SURFACE_CONFIG[surface].kind === 'execution' || allowStandaloneClaudeInteractiveBrainForTests);
+  if (useStandaloneClaudeExecutionBrain) {
+    // Cron/background keep their existing subscription-backed execution
+    // transport. Interactive Claude turns never enter this branch: they fall
+    // through to respondViaHarness below and therefore share Codex's host-owned
+    // model -> tool-intent -> host-execution loop. RouterModelProvider still
+    // resolves the selected claude-* model to ClaudeModelProvider, preserving
+    // the OAuth Bearer billing envelope.
     if (Number.isSafeInteger(request.sourceUserSeq) && Number(request.sourceUserSeq) > 0) {
       request = await enrichAcceptedRequestWithTaskContinuity(
         request,
         Number(request.sourceUserSeq),
-        { continuationOnly: true },
+        {
+          continuationOnly: true,
+          typedClassification: semanticPortParticipated(request.sessionId, Number(request.sourceUserSeq))
+            ? { keepOpen: true }
+            : undefined,
+        },
       );
     }
     const detachProgressRelay = attachLegacyProgressRelay(request);
@@ -2055,7 +2444,7 @@ async function respondPreferHarnessOnce(
       // harness-lane emit below; the route carries the model the SDK reported.
       try {
         const routed = routeForClaudeSdkBrain(surface, request, response);
-        const owner = ensureAcceptedRecoveryTurn(surface, request);
+        const owner = await ensureAcceptedRecoveryTurn(surface, request);
         appendEvent({
           sessionId: request.sessionId,
           turn: 0,
@@ -2073,11 +2462,16 @@ async function respondPreferHarnessOnce(
           },
         });
       } catch { /* telemetry only */ }
+      // HOST TURN LOOP (2026-08-19): the Claude one-step transport's step
+      // ceilings continue IN-TURN inside the brain — a logged next_step_claimed
+      // per pipe re-entry, one terminal at the true end. The old drain here
+      // faked re-entry with a synthetic user_input_received; a limitHit that
+      // reaches this return is an honest resting park.
       return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
     } catch (err) {
       let restartOwnershipDetected = false;
       try {
-        const turn = ensureAcceptedRecoveryTurn(surface, request);
+        const turn = await ensureAcceptedRecoveryTurn(surface, request);
         const signaledOwnership = err instanceof PendingWorkflowChatDispatchOwnershipError
           && err.ownership.originSessionId === request.sessionId
           && err.ownership.sourceUserSeq === turn.sourceUserSeq
@@ -2113,7 +2507,7 @@ async function respondPreferHarnessOnce(
       const recovered = await recoverChatBrainFailure(surface, request, err, detach, recoveryBaseline);
       if (recovered) return recovered;
       try {
-        const turn = ensureAcceptedRecoveryTurn(surface, request);
+        const turn = await ensureAcceptedRecoveryTurn(surface, request);
         if (err instanceof Error && (err as { narrationGiveUp?: boolean }).narrationGiveUp === true) {
           const completedWork = synthesizeCompletedWorkReport(request.sessionId, turn.sourceUserSeq);
           const terminal = completedWork
@@ -2168,7 +2562,7 @@ async function respondPreferHarnessOnce(
       detach();
     }
   }
-  return respondViaHarness(surface, request);
+  return respondViaHarness(surface, request, { turnEngine, ...limits });
 }
 
 /** Same-daemon admission for the entire accepted-source response, not merely
@@ -2186,6 +2580,7 @@ export async function respondPreferHarness(
   surface: HarnessSurface,
   request: AssistantRequest,
   legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
+  limits: RespondHarnessLimits = {},
 ): Promise<AssistantResponse> {
   let key: string | null = null;
   try {
@@ -2195,7 +2590,7 @@ export async function respondPreferHarness(
     // that must not split ownership and admit a warm sibling.
     if (source) key = `${request.sessionId}:${source.seq}`;
   } catch { key = null; }
-  if (!key) return respondPreferHarnessOnce(surface, request, legacyRespond);
+  if (!key) return respondPreferHarnessOnce(surface, request, legacyRespond, limits);
 
   const policyDigest = warmReadToolPolicyDigest(request);
   const existing = acceptedSourceInvocationsInFlight.get(key);
@@ -2205,7 +2600,7 @@ export async function respondPreferHarness(
       : responseForWarmReadPolicyConflict(surface, request);
   }
 
-  const promise = respondPreferHarnessOnce(surface, request, legacyRespond);
+  const promise = respondPreferHarnessOnce(surface, request, legacyRespond, limits);
   const entry = { policyDigest, promise };
   acceptedSourceInvocationsInFlight.set(key, entry);
   try {
@@ -2219,7 +2614,7 @@ export async function respondPreferHarness(
 
 const bridgeLogger = pino({ name: 'clementine.respond-bridge' });
 
-type RecoveryLedgerBaseline =
+export type RecoveryLedgerBaseline =
   | { readable: true; afterSeq: number }
   | { readable: false };
 
@@ -2228,7 +2623,7 @@ type RecoveryLedgerCheck =
   | { safeToRerun: false; reason: 'external_write'; evidence: EventRow[] }
   | { safeToRerun: false; reason: 'ledger_unreadable'; evidence: [] };
 
-function captureRecoveryLedgerBaseline(sessionId: string): RecoveryLedgerBaseline {
+export function captureRecoveryLedgerBaseline(sessionId: string): RecoveryLedgerBaseline {
   try {
     // One indexed tail row is enough to bind the recovery check to this
     // attempt; do not load a long session's full history into memory.
@@ -2384,27 +2779,59 @@ export async function recoverChatBrainFailure(
   err: unknown,
   detach?: () => void,
   recoveryBaseline?: RecoveryLedgerBaseline,
+  options?: { via?: 'harness' | 'claude' },
 ): Promise<AssistantResponse | null> {
+  // Pure terminal replay is read-only. Resolve it before the recovery helper can
+  // create or bind an attempt, so a late A callback cannot re-arm A over a newer
+  // active B marker on the same reusable chat session.
+  let replay: AcceptedSourceTerminalOutcome | null;
+  try {
+    replay = exactTerminalReplayForRequest(request);
+  } catch {
+    return responseForUnverifiableTerminalLedger(surface, request);
+  }
+  if (replay) {
+    const source = durableSourceEventForRequest(request);
+    const owner = source
+      ? getRunAttemptBySourceUserSeq(request.sessionId, source.seq)
+      : null;
+    if (source && owner) {
+      clearRunInFlightAfterTerminal(request.sessionId, owner.attemptId, source.seq);
+    }
+    const response = responseForAcceptedSourceTerminal(replay, {
+      recoverySkipped: 'terminal_already_committed',
+      transport: 'claude_agent_sdk_brain',
+    });
+    return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
+  }
   // Resolve logical ownership before checking retry eligibility. A provider can
   // throw after its terminal committed (for example, a learning hook or local
   // DB write). That exact terminal is already the answer and must short-circuit
   // every recovery path, including errors whose provider flags say "committed".
   let turn: AcceptedRecoveryTurn;
   try {
-    turn = ensureAcceptedRecoveryTurn(surface, request);
+    turn = await ensureAcceptedRecoveryTurn(surface, request);
+  } catch {
+    // If exact ownership cannot be established, never authorize a rerun. The
+    // caller's generic failure reducer will make one final fail-closed attempt.
+    return null;
+  }
+  try {
     const committed = exactTerminalForSource(request.sessionId, turn.sourceUserSeq);
     if (committed) {
-      markRunInFlight(request.sessionId, false);
-      const response = responseForCommittedTerminal(committed, {
+      clearRunInFlightAfterTerminal(
+        request.sessionId,
+        turn.attempt.attemptId,
+        turn.sourceUserSeq,
+      );
+      const response = responseForAcceptedSourceTerminal(committed, {
         recoverySkipped: 'terminal_already_committed',
         transport: 'claude_agent_sdk_brain',
       });
       return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
     }
   } catch {
-    // If exact ownership cannot be established, never authorize a rerun. The
-    // caller's generic failure reducer will make one final fail-closed attempt.
-    return null;
+    return responseForUnverifiableTerminalLedger(surface, request);
   }
   if (!isChatBrainFalloverEligible(err)) return null;
   const kind = err instanceof ClaudeSdkCapacityExhaustedError ? 'capacity_exhausted'
@@ -2434,14 +2861,19 @@ export async function recoverChatBrainFailure(
     // attempt that is bound to the same accepted event and therefore shares the
     // logical terminal key without reopening the failed attempt.
     try { finishRunAttempt(turn.attempt, 'superseded'); } catch { /* begin validates the exact source below */ }
-    const recovered = await respondViaHarness(surface, request, {
-      reuseRecordedUserInput: true,
-      sourceUserSeq: turn.sourceUserSeq,
-      modelOverride: recoveryModel,
-    });
-    if (exactTerminalForSource(request.sessionId, turn.sourceUserSeq)) {
-      markRunInFlight(request.sessionId, false);
-    }
+    const recovered = options?.via === 'claude'
+      ? await respondViaClaudeAgentSdkBrain(
+          surface === 'workflow' ? 'home' : surface,
+          {
+            ...request,
+            sourceUserSeq: turn.sourceUserSeq,
+          },
+        )
+      : await respondViaHarness(surface, request, {
+          reuseRecordedUserInput: true,
+          sourceUserSeq: turn.sourceUserSeq,
+          modelOverride: recoveryModel,
+        });
     const route = routeDiagnosticsFromResponse(recovered);
     return route ? withRouteDiagnostics(recovered, { ...route, falloverFrom: 'claude_agent_sdk_brain' }) : recovered;
   } catch (falloverErr) {
@@ -2481,13 +2913,19 @@ export function buildChatFalloverWiring(opts: {
    *  accepted turn — the second brain must not pay rediscovery for state the
    *  first brain already had. */
   turnCandidates?: TurnCapabilityCandidates;
+  /** Host-owned fresh turns resolve candidates only after the accepted
+   *  capability node starts. The supplier is request-scoped and promise-
+   *  memoized by the caller, so every rebuild observes the same resolution. */
+  turnCandidatesForBuild?: () => Promise<TurnCapabilityCandidates | undefined>;
   taskContinuation?: import('../../types.js').TaskContinuationContext;
   taskContinuationResolved?: true;
   acceptedIdentity?: () => {
     sourceUserSeq: number;
-    route: 'direct_reply' | 'retrieve' | 'act';
+    route?: 'direct_reply' | 'retrieve' | 'act';
+    hostFreshPlanning?: NonNullable<Parameters<NonNullable<RunConversationOptions['buildAgent']>>[0]['hostFreshPlanning']>;
+    hostPlainConversation?: true;
   } | undefined;
-  buildAgent: (o: { userInput?: string; sessionId: string; sourceUserSeq?: number; acceptedRoute?: 'direct_reply' | 'retrieve' | 'act'; allowedToolNames?: string[]; excludeToolNames?: string[]; model?: string; allowToolJit?: boolean; turnCandidates?: TurnCapabilityCandidates; taskContinuation?: import('../../types.js').TaskContinuationContext; taskContinuationResolved?: true }) => Promise<BuiltAgent>;
+  buildAgent: (o: { userInput?: string; sessionId: string; sourceUserSeq?: number; acceptedRoute?: 'direct_reply' | 'retrieve' | 'act'; hostFreshPlanning?: NonNullable<Parameters<NonNullable<RunConversationOptions['buildAgent']>>[0]['hostFreshPlanning']>; hostPlainConversation?: true; allowedToolNames?: string[]; excludeToolNames?: string[]; model?: string; allowToolJit?: boolean; turnCandidates?: TurnCapabilityCandidates; taskContinuation?: import('../../types.js').TaskContinuationContext; taskContinuationResolved?: true }) => Promise<BuiltAgent>;
 }): { falloverModelIds?: string[]; rebuildAgentForBrain?: (modelId: string) => Promise<BuiltAgent> } {
   if (!chatBrainFalloverEnabled()) return {};
   try {
@@ -2495,20 +2933,26 @@ export function buildChatFalloverWiring(opts: {
       const modelIds = falloverChainForTest;
       return {
         falloverModelIds: modelIds,
-        rebuildAgentForBrain: (modelId: string) => {
+        rebuildAgentForBrain: async (modelId: string) => {
           const identity = opts.acceptedIdentity?.();
+          const turnCandidates = opts.turnCandidatesForBuild
+            ? await opts.turnCandidatesForBuild()
+            : opts.turnCandidates;
           return opts.buildAgent({
-          userInput: opts.userInput,
-          sessionId: opts.sessionId,
-          ...(identity ? { sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route } : {}),
-          ...(opts.turnCandidates ? { turnCandidates: opts.turnCandidates } : {}),
-          ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
-          ...(opts.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
-          allowedToolNames: opts.allowedToolNames,
-          excludeToolNames: opts.excludeToolNames,
-          model: modelId,
-          allowToolJit: opts.allowToolJit,
-        });
+            userInput: opts.userInput,
+            sessionId: opts.sessionId,
+            ...(identity ? { sourceUserSeq: identity.sourceUserSeq } : {}),
+            ...(identity?.route ? { acceptedRoute: identity.route } : {}),
+            ...(identity?.hostFreshPlanning ? { hostFreshPlanning: identity.hostFreshPlanning } : {}),
+            ...(identity?.hostPlainConversation ? { hostPlainConversation: true as const } : {}),
+            ...(turnCandidates ? { turnCandidates } : {}),
+            ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
+            ...(opts.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
+            allowedToolNames: opts.allowedToolNames,
+            excludeToolNames: opts.excludeToolNames,
+            model: modelId,
+            allowToolJit: opts.allowToolJit,
+          });
         },
       };
     }
@@ -2518,20 +2962,26 @@ export function buildChatFalloverWiring(opts: {
     if (nextBrains.length === 0) return {};
     return {
       falloverModelIds: nextBrains.map((b) => b.modelId),
-      rebuildAgentForBrain: (modelId: string) => {
+      rebuildAgentForBrain: async (modelId: string) => {
         const identity = opts.acceptedIdentity?.();
+        const turnCandidates = opts.turnCandidatesForBuild
+          ? await opts.turnCandidatesForBuild()
+          : opts.turnCandidates;
         return opts.buildAgent({
-        userInput: opts.userInput,
-        sessionId: opts.sessionId,
-        ...(identity ? { sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route } : {}),
-        ...(opts.turnCandidates ? { turnCandidates: opts.turnCandidates } : {}),
-        ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
-        ...(opts.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
-        allowedToolNames: opts.allowedToolNames,
-        excludeToolNames: opts.excludeToolNames,
-        model: modelId,
-        allowToolJit: opts.allowToolJit ?? true,
-      });
+          userInput: opts.userInput,
+          sessionId: opts.sessionId,
+          ...(identity ? { sourceUserSeq: identity.sourceUserSeq } : {}),
+          ...(identity?.route ? { acceptedRoute: identity.route } : {}),
+          ...(identity?.hostFreshPlanning ? { hostFreshPlanning: identity.hostFreshPlanning } : {}),
+          ...(identity?.hostPlainConversation ? { hostPlainConversation: true as const } : {}),
+          ...(turnCandidates ? { turnCandidates } : {}),
+          ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
+          ...(opts.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
+          allowedToolNames: opts.allowedToolNames,
+          excludeToolNames: opts.excludeToolNames,
+          model: modelId,
+          allowToolJit: opts.allowToolJit ?? true,
+        });
       },
     };
   } catch {

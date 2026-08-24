@@ -70,6 +70,7 @@ export function deriveWorkflowTerminalOutcome(
   const report = reportOutcomeFrom(input, reportOutcome);
 
   if (status === 'cancelled') return 'cancelled';
+  if (status === 'blocked') return 'blocked';
   if (report === 'failed') return 'failed';
   if (status === 'completed_with_errors') return 'partial';
   if (report === 'blocked') return 'blocked';

@@ -23,20 +23,23 @@
  *    lanes park with identical verdicts.
  */
 import { createHash } from 'node:crypto';
-import { isKillRequested, appendEvent, getSession, listEvents, type KillRequestTarget } from './eventlog.js';
+import { isKillRequested, appendEvent, getSession, getTurnGraphEventForSource, listEvents, type KillRequestTarget } from './eventlog.js';
 import { evaluateToolCall, applyMode, mandateFor } from './tool-guardrail.js';
 import { checkRunTokenWindow, type RunTokenWindow, type RunTokenStatus } from './run-token-budget.js';
 import type { RuntimeToolEffect } from './tool-effect.js';
 import { getRuntimeEnv } from '../../config.js';
 import { presentationEventFromCompletionData } from './turn-outcome.js';
+import { detectMultiItemIntent } from './multi-item-intent.js';
+import { compileAcceptedGoal } from '../graph/accepted-goal.js';
+import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 
 // The SDK's PermissionResult shape (structural — avoids importing SDK types here).
 export interface ToolGateDeny {
   behavior: 'deny';
   message: string;
   interrupt: boolean;
-  /** True when this deny is the fanout refuse-and-steer (its recovery text
-   *  references run_tool_program — callers without that tool skip it). */
+  /** True when this deny is the fanout refuse-and-steer (its recovery is
+   *  parallel direct calls; callers that opted out of fanout skip it). */
   fanout?: boolean;
 }
 
@@ -74,11 +77,10 @@ export function grindGateVerdict(
     trackerScopeId?: string;
     /** Byte-pinned run_batch execution already certified by the user. */
     approvedBatch?: boolean;
-    /** The caller's recovery skeleton has run_tool_program, so the fanout
-     *  refuse-and-steer is actionable. When false the fanout branch is a
-     *  silent allow — no deny AND no guardrail_tripped event (review
-     *  Turn-control review: emitting a discarded verdict fills the operator view
-     *  with trips that never happened). */
+    /** The caller opted into the fanout refuse-and-steer (recovery: parallel
+     *  direct calls). When false the fanout branch is a silent allow — no deny
+     *  AND no guardrail_tripped event (emitting a discarded verdict fills the
+     *  operator view with trips that never happened). */
     honorFanout?: boolean;
   },
 ): ToolGateDeny | null {
@@ -129,7 +131,7 @@ export function grindGateVerdict(
       // lane prescribed routes the turn could not always take.
       const routes = [
         mandateFor('run_worker') ? 'fan out with run_worker' : null,
-        mandateFor('run_tool_program') ? 'batch the reads with run_tool_program' : null,
+        'issue the remaining reads as PARALLEL tool calls in one response',
       ].filter((route): route is string => route !== null);
       const changeApproach = routes.length
         ? `change approach (${routes.join(', or ')}) instead of retrying one at a time.`
@@ -281,6 +283,35 @@ export type TurnPreflightPhase = 'read' | 'align' | 'execute';
 export const PREFLIGHT_ALIGNMENT_SOURCE = 'preflight_alignment';
 type ConfirmedMutationEffect = Extract<RuntimeToolEffect, 'local_write' | 'external_write' | 'admin'>;
 type ConfirmedActionFamily = 'create' | 'update' | 'delete' | 'send' | 'publish' | 'schedule' | 'upload' | 'commit' | 'merge' | 'import' | 'export' | 'sync' | 'configure';
+export type TurnSourceStrategyPosture = 'materially_variant' | 'confirmed_exact' | 'standing_exact';
+export type TurnConfirmationDisposition = 'material_source_strategy';
+
+export interface TurnSourceCapabilityBindingV1 {
+  /** Exact host capability identity, never a provider name inferred from prose. */
+  capabilityId: string;
+  /** Optional exact connected account boundary for this capability. */
+  accountIdentity?: string;
+  /** Optional exact schema/manifest identity observed by the selector. */
+  schemaFingerprint?: string;
+}
+
+/** Provider-neutral result of source selection. This module transports the
+ * binding; the selector authors it and the dispatch/carrier boundary enforces
+ * it. Equivalent fallbacks are bounded so an approval cannot become a fresh
+ * provider search. */
+export interface TurnSourceStrategyBindingV1 {
+  version: 1;
+  primary: TurnSourceCapabilityBindingV1;
+  equivalentFallbacks: readonly TurnSourceCapabilityBindingV1[];
+  topology: 'single_aggregate_read_then_single_artifact_write';
+  /** Digest of the selector's exact aggregate-read -> artifact-write plan. */
+  topologyDigest: string;
+  destination: {
+    family: string;
+    posture: 'create_new' | 'named_existing';
+  };
+  effect: ConfirmedMutationEffect;
+}
 
 export interface TurnPreflightDecision {
   phase: TurnPreflightPhase;
@@ -301,6 +332,15 @@ export interface TurnPreflightDecision {
   allowedMutationEffects?: ConfirmedMutationEffect[];
   allowedDestinations?: string[];
   allowedActionFamilies?: ConfirmedActionFamily[];
+  /** Host classification of whether the collection source is still a material
+   * choice. This is provider-neutral; the active model authors the proposal. */
+  sourceStrategyPosture?: TurnSourceStrategyPosture;
+  /** A typed stop owned by the host. Model prose cannot silently downgrade it
+   * to a same-turn preamble or upgrade an ordinary settled turn into a stop. */
+  confirmationDisposition?: TurnConfirmationDisposition;
+  /** Optional selector-authored binding carried byte-for-byte through a later
+   * confirmation. Its presence never makes an unconfirmed strategy confirmed. */
+  sourceStrategyBinding?: TurnSourceStrategyBindingV1;
   reason:
     | 'non_chat'
     | 'feature_disabled'
@@ -312,6 +352,7 @@ export interface TurnPreflightDecision {
     | 'external_action'
     | 'multi_item_action'
     | 'noun_shaped_artifact_request'
+    | 'collect_then_construct'
     | 'ordinary_execution';
 }
 
@@ -386,6 +427,11 @@ function genericProviderAliasesFromObjective(text: string): string[] {
   const aliases: string[] = [];
   const patterns = [
     /\b(?:create|update|edit|delete|remove|add|send|schedule|publish|upload)\s+(?:an?\s+)?([A-Za-z][A-Za-z0-9.-]{1,30})\s+(?:record|card|issue|task|ticket|row|page|item|contact|lead|entry|message|event)\b/gi,
+    /\b(?:use|prefer)\s+([A-Za-z][A-Za-z0-9.-]{1,30})\s+(?:to|for|as)\b/gi,
+    // An explicit collection source is already the user's choice. Keep this
+    // provider-neutral: the exact physical capability still has to arrive as
+    // a selector-authored binding before any source call can cross the gate.
+    /\bfrom\s+(?:the\s+)?([A-Za-z][A-Za-z0-9.-]{1,30})\s+api\b/gi,
     // "in/on <word>" is ordinary English far more often than a provider
     // reference ("research in detail", "run on Monday"). Keep only explicit
     // integration prepositions; known providers still resolve through
@@ -463,6 +509,8 @@ const DESTINATION_INSTANCE_ANCHOR_RE = new RegExp([
   '\\b(?:named|called|titled|labelled|labeled|id|ID)\\b\\s*[:=]?\\s*\\S+',
   // "a new spreadsheet" / "create a new base" — creating one IS the decision.
   '\\bnew\\b',
+  // They asked to receive the artifact URL: the instance is the one we create.
+  '\\b(?:give|send|paste|share)\\s+(?:me\\s+)?(?:the\\s+)?link\\b',
   // A reference to one specific existing thing the user has in mind.
   '\\b(?:the\\s+same|same\\s+one|as\\s+(?:last|before)|existing|usual|current)\\b',
 ].join('|'), 'i');
@@ -561,7 +609,170 @@ function decisionAuthoritySignature(decision: TurnPreflightDecision): string {
     allowedMutationEffects: [...(decision.allowedMutationEffects ?? [])].sort(),
     allowedDestinations: [...(decision.allowedDestinations ?? [])].sort(),
     allowedActionFamilies: [...(decision.allowedActionFamilies ?? [])].sort(),
+    sourceStrategyPosture: decision.sourceStrategyPosture,
+    confirmationDisposition: decision.confirmationDisposition,
+    sourceStrategyBinding: decision.sourceStrategyBinding,
   });
+}
+
+const MAX_SOURCE_BINDING_TEXT_CHARS = 512;
+const MAX_EQUIVALENT_SOURCE_FALLBACKS = 3;
+
+function sourceBindingText(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.trim().length > 0
+    && value.length <= MAX_SOURCE_BINDING_TEXT_CHARS;
+}
+
+function validSourceCapabilityBinding(value: unknown): value is TurnSourceCapabilityBindingV1 {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const keys = Object.keys(row);
+  if (keys.some((key) => !['capabilityId', 'accountIdentity', 'schemaFingerprint'].includes(key))) return false;
+  return sourceBindingText(row.capabilityId)
+    && (row.accountIdentity === undefined || sourceBindingText(row.accountIdentity))
+    && (row.schemaFingerprint === undefined || sourceBindingText(row.schemaFingerprint));
+}
+
+/** Runtime decoder for eventlog state. Invalid/expanded bindings never become
+ * confirmation authority. The validated object is returned unchanged so an
+ * exact approval preserves the selector's bytes and field values. */
+export function validatedTurnSourceStrategyBinding(
+  value: unknown,
+): TurnSourceStrategyBindingV1 | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const binding = value as Record<string, unknown>;
+  if (Object.keys(binding).some((key) => ![
+    'version',
+    'primary',
+    'equivalentFallbacks',
+    'topology',
+    'topologyDigest',
+    'destination',
+    'effect',
+  ].includes(key))) return null;
+  if (binding.version !== 1 || !validSourceCapabilityBinding(binding.primary)) return null;
+  if (
+    !Array.isArray(binding.equivalentFallbacks)
+    || binding.equivalentFallbacks.length > MAX_EQUIVALENT_SOURCE_FALLBACKS
+    || !binding.equivalentFallbacks.every(validSourceCapabilityBinding)
+  ) return null;
+  if (binding.topology !== 'single_aggregate_read_then_single_artifact_write') return null;
+  if (typeof binding.topologyDigest !== 'string' || !/^[a-f0-9]{64}$/i.test(binding.topologyDigest)) return null;
+  if (!binding.destination || typeof binding.destination !== 'object' || Array.isArray(binding.destination)) return null;
+  const destination = binding.destination as Record<string, unknown>;
+  if (Object.keys(destination).some((key) => !['family', 'posture'].includes(key))) return null;
+  if (!sourceBindingText(destination.family)) return null;
+  if (destination.posture !== 'create_new' && destination.posture !== 'named_existing') return null;
+  if (binding.effect !== 'local_write' && binding.effect !== 'external_write' && binding.effect !== 'admin') return null;
+  return value as TurnSourceStrategyBindingV1;
+}
+
+/**
+ * The model that authors a material-source confirmation sees only the
+ * selector's validated, structurally eligible binding. General capability
+ * memory is intentionally absent here: an unrelated or originless procedure
+ * may remain useful during ordinary execution, but cannot bias the source
+ * proposal a user is being asked to approve.
+ */
+export function renderSourceStrategyConfirmationContext(value: unknown): string {
+  const binding = validatedTurnSourceStrategyBinding(value);
+  if (!binding) {
+    return [
+      '[source strategy confirmation — host-validated facts only]',
+      'No validated source capability is bound. Do not propose or imply a provider from general capability memory.',
+      'Ask the user to name the source; a bare confirmation cannot authorize execution.',
+    ].join('\n');
+  }
+  const eligible = [binding.primary, ...binding.equivalentFallbacks];
+  return [
+    '[source strategy confirmation — host-validated facts only]',
+    `Primary source: ${binding.primary.capabilityId}`,
+    ...(binding.primary.accountIdentity ? [`Primary account: ${binding.primary.accountIdentity}`] : []),
+    ...(binding.primary.schemaFingerprint ? [`Primary schema: ${binding.primary.schemaFingerprint}`] : []),
+    ...(binding.equivalentFallbacks.length > 0
+      ? [`Structurally eligible fallbacks: ${binding.equivalentFallbacks.map((row) => row.capabilityId).join(', ')}`]
+      : ['Structurally eligible fallbacks: none']),
+    `Bound topology: ${binding.topology}`,
+    `Destination: ${binding.destination.posture} ${binding.destination.family}`,
+    `Only these ${eligible.length} receipt-validated source path${eligible.length === 1 ? '' : 's'} may be named in the source proposal.`,
+  ].join('\n');
+}
+
+function sourceStrategyBindingsEqual(left: unknown, right: unknown): boolean {
+  if (left === undefined && right === undefined) return true;
+  const validatedLeft = validatedTurnSourceStrategyBinding(left);
+  const validatedRight = validatedTurnSourceStrategyBinding(right);
+  return Boolean(validatedLeft && validatedRight
+    && JSON.stringify(validatedLeft) === JSON.stringify(validatedRight));
+}
+
+function sourceProviderAlias(capabilityId: string): string | null {
+  const composio = capabilityId.match(/^capability:composio:([^_:\s]+)(?:_|$)/i);
+  const mcp = capabilityId.match(/^capability:mcp:([^_:\s]+)(?:__|:|$)/i);
+  const provider = normalizeProviderAlias(composio?.[1] ?? mcp?.[1] ?? '');
+  return provider || null;
+}
+
+/** Legacy named-primary selection remains available for ordinary answers such
+ * as "Use Acme as the restaurant source", but the provider phrase must own the
+ * whole answer. Negative constraints and fresh work clauses are not discarded
+ * before matching: only the exact referential grammar below may revoke
+ * fallbacks, and every other compound answer must re-enter alignment. */
+function wholeAnswerNamedSourceProvider(text: string): string | null {
+  const answer = text.trim();
+  // This is a positive grammar, not a growing synonym deny-list. Preserve the
+  // shipped bare/restaurant legacy forms; any other descriptor (including
+  // backup/failover/alternate roles) is a new source-selection clause that
+  // must return to typed alignment.
+  const match = /^(?:use|prefer)\s+([A-Za-z][A-Za-z0-9.-]{1,30})\s+(?:as|for)\s+(?:the\s+)?(?:restaurant\s+)?source[.!]*$/i
+    .exec(answer);
+  const provider = normalizeProviderAlias(match?.[1] ?? '');
+  return provider || null;
+}
+
+/** Deliberately exact grammar for narrowing an already-durable source binding.
+ * The words "primary" and "fallback" are roles in that binding, never provider
+ * names inferred from prose. Requiring the affirmative, same-arguments, and
+ * explicit fallback-revocation clauses keeps this from becoming a generic
+ * "yes, and ..." authority path. */
+export function isPrimaryOnlyBoundSourceConfirmation(text: string): boolean {
+  return /^(?:yes|yep|yeah|ok|okay|sure|go ahead|proceed|continue)\s*(?:[—–-]|[,;:])?\s*use exactly the primary source action you named,?\s+with the same (?:parameters|arguments)[.!]\s*(?:do not|don['’]?t) use (?:the )?fallback[.!]*$/i
+    .test(text.trim());
+}
+
+/** Return the exact source binding B selects, or null. This helper never
+ * grants authority by itself: callers must first prove the exact durable A/Q
+ * edge. A bare confirmation or exact primary provider preserves the binding;
+ * the bounded primary-only form removes every fallback without changing the
+ * primary, topology, destination, effect, account, or schema identity. */
+export function sourceStrategyBindingAffirmedByAnswer(
+  text: string,
+  value: unknown,
+): TurnSourceStrategyBindingV1 | null {
+  const binding = validatedTurnSourceStrategyBinding(value);
+  if (!binding) return null;
+  if (isConfirmationControl(text)) return binding;
+  if (isPrimaryOnlyBoundSourceConfirmation(text)) {
+    return binding.equivalentFallbacks.length === 0
+      ? binding
+      : { ...binding, equivalentFallbacks: [] };
+  }
+  const namedProvider = wholeAnswerNamedSourceProvider(text);
+  if (!namedProvider) return null;
+  // An explicitly named fallback is a new choice: approving it while leaving
+  // the old primary and every fallback callable would widen what B selected.
+  // Until the selector deterministically rebases that binding, only the exact
+  // primary name (or a bare approval above) consumes A/Q.
+  const primaryProvider = sourceProviderAlias(binding.primary.capabilityId);
+  return primaryProvider && namedProvider === primaryProvider
+    ? binding
+    : null;
+}
+
+/** Boolean compatibility surface for callers that only need the verdict. */
+export function answerAffirmsTurnSourceStrategyBinding(text: string, value: unknown): boolean {
+  return sourceStrategyBindingAffirmedByAnswer(text, value) !== null;
 }
 
 function decisionForSource(
@@ -603,6 +814,7 @@ function alignedDecisionForIntent(
 function pendingAlignmentForCurrentInput(
   sessionId: string,
   sourceUserSeq?: number,
+  acceptedText?: string,
 ): TurnPreflightDecision | null {
   try {
     const rows = listEvents(sessionId, {
@@ -613,21 +825,44 @@ function pendingAlignmentForCurrentInput(
         'conversation_completed',
       ],
     });
-    const users = rows.filter((row) => row.type === 'user_input_received');
+    const users = rows.filter((row) => row.type === 'user_input_received'
+      && row.role === 'user'
+      && row.data.synthetic !== true);
     const currentIndex = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
       ? users.findIndex((row) => row.seq === sourceUserSeq)
       : users.length - 1;
     const previousUser = currentIndex > 0 ? users[currentIndex - 1] : undefined;
-    if (!previousUser) return null;
+    const currentUser = currentIndex >= 0 ? users[currentIndex] : undefined;
+    if (!previousUser || !currentUser) return null;
+    if (
+      typeof acceptedText !== 'string'
+      || typeof currentUser.data.text !== 'string'
+      || currentUser.data.text !== acceptedText
+    ) return null;
     const decision = decisionForSource(sessionId, rows, previousUser.seq);
     if (decision?.phase !== 'align' || typeof decision.intentKey !== 'string' || !decision.intentKey) {
       return null;
     }
+    if (
+      decision.confirmationDisposition === 'material_source_strategy'
+      && (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq !== currentUser.seq)
+    ) return null;
     const awaiting = rows.find((row) => row.type === 'awaiting_user_input'
       && row.data.sourceUserSeq === previousUser.seq
       && row.data.source === PREFLIGHT_ALIGNMENT_SOURCE
       && row.data.intentKey === decision.intentKey);
     if (!awaiting) return null;
+    // A material source question with no selector-authored binding is a real
+    // question, but "Yes" cannot approve an unnamed provider. The user must
+    // name a source (which is classified as fresh explicit authority) or the
+    // selector must first persist one exact validated binding.
+    if (decision.confirmationDisposition === 'material_source_strategy'
+      && (!validatedTurnSourceStrategyBinding(decision.sourceStrategyBinding)
+        || !validatedTurnSourceStrategyBinding(awaiting.data.sourceStrategyBinding))) return null;
+    if (!sourceStrategyBindingsEqual(
+      decision.sourceStrategyBinding,
+      awaiting.data.sourceStrategyBinding,
+    )) return null;
     const terminal = rows.find((row) => {
       const currentUserSeq = users[currentIndex]?.seq ?? Number.POSITIVE_INFINITY;
       if (
@@ -650,6 +885,33 @@ function pendingAlignmentForCurrentInput(
   } catch {
     return null;
   }
+}
+
+/** A named source answer is approval only when it selects the primary source
+ * on the exact durable A/Q edge immediately preceding this accepted input.
+ * This is deliberately narrower than general provider detection: the words do
+ * not create authority, they merely consume the already-bound typed choice. */
+function selectedPendingMaterialSourceBinding(
+  text: string,
+  pending: TurnPreflightDecision,
+  currentBinding: unknown,
+): TurnSourceStrategyBindingV1 | null {
+  if (pending.confirmationDisposition !== 'material_source_strategy') return null;
+  const pendingBinding = validatedTurnSourceStrategyBinding(pending.sourceStrategyBinding);
+  const suppliedBinding = validatedTurnSourceStrategyBinding(currentBinding);
+  if (!pendingBinding || !suppliedBinding) return null;
+  const selected = sourceStrategyBindingAffirmedByAnswer(text, pendingBinding);
+  if (!selected) return null;
+  // The continuation resolver normally supplies the already-narrowed binding.
+  // Accepting the original durable bytes as input is also safe: the return
+  // value still narrows the preflight decision before any physical dispatch.
+  if (
+    !sourceStrategyBindingsEqual(suppliedBinding, pendingBinding)
+    && !sourceStrategyBindingsEqual(suppliedBinding, selected)
+  ) {
+    return null;
+  }
+  return selected;
 }
 
 /**
@@ -679,29 +941,88 @@ function destinationFromText(text: string): string | undefined {
   return undefined;
 }
 
+/** Facts the compiled turn graph already proved about this exact source.
+ *  When typed semantics participated, the graph's construct/count/destination
+ *  are semantic classification, not regex guesses — preflight must consume
+ *  them. Live 2026-08-18: the graph said collect_then_construct count=25
+ *  destination=google_sheets while preflight's own regexes read "Find me…"
+ *  as a read-only lead, so a 25-item half-hour run launched with no
+ *  alignment beat. Null when no graph exists (regexes remain the fallback). */
+export interface CompiledGraphPreflightFacts {
+  construct: string;
+  itemCount: number;
+  destinationFamily?: string;
+  destinationPosture?: string;
+  externalEffectRequested: boolean;
+  projection: readonly string[];
+}
+
+export function compiledGraphPreflightFacts(
+  sessionId: string | undefined,
+  sourceUserSeq: number | undefined,
+): CompiledGraphPreflightFacts | null {
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return null;
+  try {
+    const event = getTurnGraphEventForSource(sessionId, sourceUserSeq as number);
+    const graph = turnGraphFromShadowEvent(event);
+    if (!graph) return null;
+    const classification = graph.classification;
+    const goal = classification.goalConstraints;
+    return {
+      construct: goal?.construct ?? 'none',
+      itemCount: classification.multiItem?.itemCount ?? goal?.collection?.count ?? 0,
+      ...(goal?.destination?.family ? { destinationFamily: goal.destination.family } : {}),
+      ...(goal?.destination?.posture ? { destinationPosture: goal.destination.posture } : {}),
+      externalEffectRequested: classification.externalEffectRequested === true,
+      projection: goal?.collection?.projection ?? [],
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Pure, typed preflight decision. Regexes contribute grammatical evidence;
  * they are not themselves authority. Session state and the persisted phase are
  * what the tool boundary ultimately consumes. */
-export function classifyTurnPreflight(input: {
+export interface ClassifyTurnPreflightInput {
   message: string;
   sessionId?: string;
   sessionKind?: string;
   isMultiItem?: boolean;
   itemCount?: number;
+  /** Typed host/memory evidence may close a material source choice without
+   * asking again. Omit when no exact source strategy has been established. */
+  sourceStrategyPosture?: TurnSourceStrategyPosture;
+  /** Optional validated result of a provider-neutral source selector. */
+  sourceStrategyBinding?: TurnSourceStrategyBindingV1;
   /** Exact accepted user event for this attempt. Avoids session-global
    *  "latest user" authority when a transport/fallback is racing. */
   sourceUserSeq?: number;
-}): TurnPreflightDecision {
+}
+
+function classifyTurnPreflightInternal(
+  input: ClassifyTurnPreflightInput,
+  forceFreshMaterialSourceAlignment = false,
+): TurnPreflightDecision {
   const text = (input.message ?? '').trim();
   if (input.sessionKind !== 'chat' || !input.sessionId) {
     return { phase: 'execute', consequential: false, reason: 'non_chat' };
   }
-  if (!confirmBeatEnabled()) {
+  if (!forceFreshMaterialSourceAlignment && !confirmBeatEnabled()) {
     return { phase: 'execute', consequential: false, reason: 'feature_disabled' };
   }
-  if (isConfirmationControl(text)) {
-    const pending = pendingAlignmentForCurrentInput(input.sessionId, input.sourceUserSeq);
-    if (pending) {
+  const confirmationControl = isConfirmationControl(text);
+  const pending = (confirmationControl || Boolean(validatedTurnSourceStrategyBinding(input.sourceStrategyBinding)))
+    ? pendingAlignmentForCurrentInput(input.sessionId, input.sourceUserSeq, input.message)
+    : null;
+  const selectedPendingSourceBinding = pending && !confirmationControl
+    ? selectedPendingMaterialSourceBinding(text, pending, input.sourceStrategyBinding)
+    : null;
+  if (
+    pending
+    && (confirmationControl
+      || selectedPendingSourceBinding)
+  ) {
       return {
         phase: 'execute',
         consequential: true,
@@ -711,13 +1032,16 @@ export function classifyTurnPreflight(input: {
         allowedMutationEffects: pending.allowedMutationEffects,
         allowedDestinations: pending.allowedDestinations,
         allowedActionFamilies: pending.allowedActionFamilies,
+        sourceStrategyPosture: 'confirmed_exact',
+        ...(selectedPendingSourceBinding ?? pending.sourceStrategyBinding
+          ? { sourceStrategyBinding: selectedPendingSourceBinding ?? pending.sourceStrategyBinding }
+          : {}),
         reason: 'continuation_approved',
       };
-    }
   }
 
   // Pre-authorized work never earns a beat: the user already handed it off.
-  if (PRE_AUTHORIZED_RE.test(text)) {
+  if (!forceFreshMaterialSourceAlignment && PRE_AUTHORIZED_RE.test(text)) {
     return { phase: 'execute', consequential: false, reason: 'pre_authorized' };
   }
   const signalText = positivePreflightSignalText(text);
@@ -729,14 +1053,68 @@ export function classifyTurnPreflight(input: {
   const destination = destinationFromText(signalText) ?? genericProviders[0]?.replace(/^provider:/, '');
   const externalAction = requestedAction && (Boolean(destination) || EXTERNAL_ACTION_RE.test(signalText) || genericProviders.length > 0);
   const nounShapedArtifactRequest = Boolean(destination) && NOUN_SHAPED_REQUEST_RE.test(signalText);
-  const authority = mutationAuthorityForObjective(signalText, externalAction, nounShapedArtifactRequest);
+  // The compiled graph is authority when it exists for this exact source —
+  // typed semantic classification outranks this function's own regexes. The
+  // text detectors remain the fallback for turns that never compiled a graph.
+  const graphFacts = compiledGraphPreflightFacts(input.sessionId, input.sourceUserSeq);
+  const collectThenConstruct = graphFacts
+    ? graphFacts.construct === 'collect_then_construct'
+    : detectMultiItemIntent(signalText).collectThenConstruct === true
+      || compileAcceptedGoal({
+        text: signalText,
+        sourceUserSeq: input.sourceUserSeq,
+        multiItem: detectMultiItemIntent(signalText),
+      }).construct === 'collect_then_construct';
+  const sourceStrategyBinding = validatedTurnSourceStrategyBinding(input.sourceStrategyBinding);
+  const sourceStrategyPosture: TurnSourceStrategyPosture | undefined = forceFreshMaterialSourceAlignment
+    ? 'materially_variant'
+    : input.sourceStrategyPosture
+    ?? (genericProviders.length > 0 || /\bhttps?:\/\/\S+/i.test(signalText)
+      ? 'confirmed_exact'
+      : sourceStrategyBinding
+        ? 'materially_variant'
+        : undefined);
+  const graphDestination = graphFacts?.destinationFamily?.replace(/_/g, ' ');
+  const authority = mutationAuthorityForObjective(
+    signalText,
+    externalAction || collectThenConstruct,
+    nounShapedArtifactRequest || collectThenConstruct,
+  );
+  // The ADMITTED destination posture outranks verb sniffing: "add them to a
+  // Google sheet" reads as 'update' from text alone, but a create_new
+  // destination IS a create — the live 2026-08-19 preflight authorized only
+  // ["update"] on a brand-new sheet and starved the create authority.
+  if (graphFacts?.destinationPosture === 'create_new' && !(authority.allowedActionFamilies ?? []).includes('create')) {
+    authority.allowedActionFamilies = [...(authority.allowedActionFamilies ?? []), 'create'];
+  }
   // Item count alone is a parallelism hint, not a consequential action. Pure
   // research/computation should start; only a batch that actually carries
   // mutation authority earns the extra conversational alignment beat.
-  const multiItemAction = input.isMultiItem === true
-    && (input.itemCount ?? 0) >= 3
+  const multiItemAction = (input.isMultiItem === true || (graphFacts?.itemCount ?? 0) >= 3)
+    && ((input.itemCount ?? graphFacts?.itemCount ?? 0) >= 3)
     && (authority.allowedMutationEffects?.length ?? 0) > 0;
 
+  // A counted set landing in one container is a construct, even when the
+  // sentence opens with find/show. That is classification, not a stop:
+  // align speaks the bound how, then autonomous execution continues.
+  if (collectThenConstruct) {
+    const alignDestination = destination ?? graphDestination;
+    return {
+      phase: 'align',
+      consequential: true,
+      destination: alignDestination,
+      objective: text,
+      intentKey: intentKeyFor(text, alignDestination),
+      ...authority,
+      ...(sourceStrategyPosture ? { sourceStrategyPosture } : {}),
+      ...(sourceStrategyPosture === 'materially_variant'
+        ? { confirmationDisposition: 'material_source_strategy' as const }
+        : {}),
+      ...(sourceStrategyBinding ? { sourceStrategyBinding } : {}),
+      destinationInstanceUnstated: destinationInstanceUnstated(signalText, alignDestination),
+      reason: 'collect_then_construct',
+    };
+  }
   // Interrogative/read leads win when the user did not grammatically ask
   // Clementine to perform an action. This keeps “what should I send?” and
   // “can Google Docs create tables?” immediate even though they contain
@@ -778,6 +1156,22 @@ export function classifyTurnPreflight(input: {
     };
   }
   return { phase: 'execute', consequential: false, destination, reason: 'ordinary_execution' };
+}
+
+export function classifyTurnPreflight(
+  input: ClassifyTurnPreflightInput,
+): TurnPreflightDecision {
+  return classifyTurnPreflightInternal(input);
+}
+
+/** Host-owned fresh source alignment ignores the conversational beat kill
+ * switch and pre-authorization shortcut: neither can grant source authority.
+ * It always returns a non-authorizing material posture from exact accepted
+ * text plus a selector-owned binding, ready for the formal durable A/Q/B beat. */
+export function classifyFreshMaterialSourcePreflight(
+  input: Omit<ClassifyTurnPreflightInput, 'sourceStrategyPosture'>,
+): TurnPreflightDecision {
+  return classifyTurnPreflightInternal(input, true);
 }
 
 // ─── Close-the-loop completion nudge (2026-07-30, live miss) ────────────────
@@ -880,6 +1274,7 @@ export function confirmBeatDirective(input: {
   sessionKind?: string;
   isMultiItem?: boolean;
   itemCount?: number;
+  sourceStrategyPosture?: TurnSourceStrategyPosture;
   sourceUserSeq?: number;
 }): string | null {
   try {
@@ -1022,6 +1417,33 @@ export function effectiveTurnObjective(
     const exactSourceUserSeq = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
       ? sourceUserSeq as number
       : latestUserSeq(rows);
+    // An explicit answer to a material clarification (for example, “Use
+    // Apify as the restaurant source”) is not one of the tiny legacy control
+    // words handled below, but its durable graph has already verified the
+    // exact A/Q/B packet and recorded whether B inherits A. Recover the parent
+    // objective only from that hash-validated graph lineage; caller-supplied
+    // continuation fields alone can never widen completion/artifact authority.
+    const graphEvent = getTurnGraphEventForSource(sessionId, exactSourceUserSeq);
+    if (turnGraphFromShadowEvent(graphEvent)) {
+      const lineage = graphEvent?.data.taskContinuationLineage as Record<string, unknown> | undefined;
+      const disposition = lineage?.disposition;
+      const parentSourceUserSeq = lineage?.parentSourceUserSeq;
+      if (
+        lineage?.consumingSourceUserSeq === exactSourceUserSeq
+        && (disposition === 'affirmed' || disposition === 'selected' || disposition === 'provided')
+        && typeof parentSourceUserSeq === 'number'
+        && Number.isSafeInteger(parentSourceUserSeq)
+        && parentSourceUserSeq > 0
+      ) {
+        const parent = rows.find((row) => row.type === 'user_input_received' && row.seq === parentSourceUserSeq);
+        const parentText = typeof parent?.data.displayText === 'string' && parent.data.displayText.trim()
+          ? parent.data.displayText.trim()
+          : typeof parent?.data.text === 'string'
+            ? parent.data.text.trim()
+            : '';
+        if (parentText) return parentText;
+      }
+    }
     const decision = decisionForSource(sessionId, rows, exactSourceUserSeq);
     if (decision?.phase === 'execute' && decision.confirmedIntentKey) {
       const aligned = alignedDecisionForIntent(rows, decision.confirmedIntentKey);

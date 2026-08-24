@@ -10,6 +10,10 @@ import {
   type SessionRow,
   type SessionStatus,
 } from './eventlog.js';
+import {
+  preparePersistedSessionConversationProtocol,
+  type PreparedProviderConversation,
+} from './conversation-protocol-session.js';
 
 /**
  * HarnessSession — Clementine-owned conversation memory.
@@ -122,6 +126,18 @@ export class HarnessSession {
   /** Replay items to feed back into `Runner.run(agent, items, opts)`. */
   toInputItems(): AgentInputItem[] {
     return this.conversation().items;
+  }
+
+  /**
+   * Canonical persisted-session boundary for model replay. Historical repair
+   * and quarantine happen atomically in the eventlog; only a ready transcript
+   * is exposed. Ordinary snapshot readers keep using `toInputItems()` so this
+   * boundary cannot silently mutate non-provider session operations.
+   */
+  prepareProviderHistory(): PreparedProviderConversation {
+    const prepared = preparePersistedSessionConversationProtocol({ sessionId: this.row.id });
+    this.refresh();
+    return prepared;
   }
 
   /** Pass via `RunConfig.previousResponseId` to reuse Responses API state. */

@@ -12,7 +12,9 @@ import assert from 'node:assert/strict';
 import {
   approvalAuthorizes,
   computeEffectIdentity,
+  decideEffectCancel,
   decideEffectResume,
+  decideLateEvidenceAfterCancel,
   validateEffectTransition,
   type EffectIdentityInput,
   type EffectLedgerRow,
@@ -114,6 +116,51 @@ test('an unlawful ledger is a stop, never a guess', () => {
   const decision = decideEffectResume([row('reserved'), row('committed')]);
   assert.equal(decision.action, 'stop');
   assert.match((decision as Extract<typeof decision, { action: 'stop' }>).reason, /not lawful/);
+});
+
+test('cancel before dispatch releases; resume never redispatches', () => {
+  const cancel = decideEffectCancel({ rows: [row('reserved')] });
+  assert.deepEqual(cancel, { report: 'cancelled', action: 'release' });
+  assert.equal(decideEffectResume([row('reserved')], { cancelRequested: true }).action, 'stop');
+  assert.equal(decideEffectResume([], { cancelRequested: true }).action, 'stop');
+});
+
+test('cancel after dispatch, before receipt: uncertain_after_cancel, never redispatch', () => {
+  const rows = [row('reserved'), row('dispatch_started')];
+  const cancel = decideEffectCancel({ rows });
+  assert.equal(cancel.report, 'uncertain_after_cancel');
+  assert.equal(cancel.action, 'observe');
+  assert.notEqual(cancel.action, 'dispatch' as never);
+  assert.equal(validateEffectTransition('dispatch_started', 'uncertain_after_cancel').ok, true);
+  const resume = decideEffectResume(
+    [...rows, row('uncertain_after_cancel')],
+    { cancelRequested: true },
+  );
+  assert.equal(resume.action, 'observe');
+});
+
+test('cancel after a proven write is completed_after_cancel unless the provider undid it', () => {
+  const rows = [
+    row('reserved'), row('dispatch_started'), row('provider_receipt', 'rcpt-9'),
+  ];
+  const kept = decideEffectCancel({ rows });
+  assert.equal(kept.report, 'completed_after_cancel');
+  if (kept.report === 'completed_after_cancel') {
+    assert.equal(kept.action, 'keep');
+    assert.equal(kept.receiptRef, 'rcpt-9');
+  }
+  const undone = decideEffectCancel({ rows, providerCancelProven: true });
+  assert.deepEqual(undone, { report: 'cancelled', action: 'cancel_provider' });
+});
+
+test('late evidence after cancel cannot redispatch or reactivate', () => {
+  const late = decideLateEvidenceAfterCancel();
+  assert.equal(late.action, 'audit_only');
+  assert.equal(late.mayRedispatch, false);
+  assert.equal(late.mayReactivate, false);
+  assert.notEqual(late.action, 'dispatch' as never);
+  assert.equal(validateEffectTransition('uncertain_after_cancel', 'dispatch_started').ok, false);
+  assert.equal(validateEffectTransition('completed_after_cancel', 'reserved').ok, false);
 });
 
 // ── approvals ────────────────────────────────────────────────────────────────

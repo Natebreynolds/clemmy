@@ -191,6 +191,13 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   // passes through its own gates.
   'pending_action_queue',
   'pending_action_record_result',
+  // Creates/reuses an exact disabled-pilot projection and formal approval card.
+  // Approval resolution—not this local staging call—owns the only queue path.
+  'automation_read_pilot_request',
+  'automation_read_pilot_workspace_create_request',
+  'automation_recurrence_request',
+  // Stages a proposal CAS and its human-owned formal decision card only.
+  'automation_opportunity_review_request',
 ]);
 
 /**
@@ -452,6 +459,15 @@ function classifyComposioSlug(slug: string): ToolKind {
 /** Public — used by every tool family's `needsApproval` factory. */
 export function classifyTool(name: string, options: ClassifyOptions = {}): ToolKind {
   if (options.kindHint) return options.kindHint;
+
+  // The embedded word "read" describes the future pilot's effect, not this
+  // call's own effect: requesting the pilot writes a durable projection and
+  // formal approval card. It remains ungated below because that card is the
+  // actual confirmation boundary, but its effect classification stays honest.
+  if (name === 'automation_read_pilot_request') return 'write';
+  if (name === 'automation_read_pilot_workspace_create_request') return 'write';
+  if (name === 'automation_recurrence_request') return 'write';
+  if (name === 'automation_opportunity_review_request') return 'write';
 
   if (ALWAYS_READ.has(name)) return 'read';
 

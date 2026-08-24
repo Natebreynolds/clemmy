@@ -1,8 +1,10 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, chmodSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { WORKFLOWS_DIR } from './vault.js';
 import { emitWorkflowChange } from './workflow-change-bus.js';
+import type { WorkflowNodeInvocationPlanV1 } from './workflow-node-invocation-plan.js';
+import type { WorkflowIntervalV1 } from '../shared/workflow-interval.js';
 
 /**
  * Single source of truth for reading and writing Clementine workflows.
@@ -144,6 +146,13 @@ export interface WorkflowStepInput {
    * blocked until per-call idempotency tracking is live-tested.
    */
   call?: WorkflowStepCall;
+  /**
+   * Exact provider-neutral invocation authority. Unlike `call`, this never
+   * dispatches by a display/tool name and never stores rendered user args.
+   * It is content-addressed and revalidated against the live capability
+   * catalog at every node admission. v1 admits read/compute only.
+   */
+  invocationPlan?: WorkflowNodeInvocationPlanV1;
   /**
    * Set by codify-on-author when a mechanical LLM step was auto-converted to a
    * `call` step. Preserves the original prompt/allowedTools so self-heal can
@@ -333,6 +342,9 @@ export interface WorkflowStepOutputContract {
 
 export interface WorkflowTrigger {
   schedule?: string;
+  /** Exact fixed-duration recurrence. Unlike cron, this is anchored to the
+   * activation instant and is independent of host timezone/civil time. */
+  interval?: WorkflowIntervalV1;
   manual?: boolean;
   /** IANA timezone (e.g. "America/Los_Angeles") the cron `schedule` is
    *  interpreted in. Omitted → the daemon host's local time (byte-identical to
@@ -536,7 +548,10 @@ function parseAllowedTools(raw: unknown): WorkflowAllowedTool[] | undefined {
       }
     }
   }
-  return out.length > 0 ? out : undefined;
+  // An explicit empty allowlist is authority-bearing: it means this workflow
+  // or exact invocation-plan node has no ambient model tool surface. Preserve
+  // [] across SKILL.md round-trips instead of widening it back to undefined.
+  return out;
 }
 
 const WORKFLOW_RESOURCE_KINDS = new Set<WorkflowResourceKind>([
@@ -767,6 +782,14 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
           };
         }
       }
+      // Preserve the exact bytes, including malformed declarations. The
+      // canonical workflow validator owns admission and must be able to fail a
+      // corrupt plan closed; silently dropping it would turn an exact-invoke
+      // node into an unrelated prompt node.
+      const rawInvocationPlan = step.invocation_plan ?? step.invocationPlan;
+      if (rawInvocationPlan !== undefined) {
+        result.invocationPlan = structuredClone(rawInvocationPlan) as WorkflowNodeInvocationPlanV1;
+      }
       // codify-on-author reversibility marker (accept snake_case or camelCase).
       const codifiedFromRaw = (step.codified_from ?? step.codifiedFrom) as Record<string, unknown> | undefined;
       if (codifiedFromRaw && typeof codifiedFromRaw.prompt === 'string') {
@@ -988,6 +1011,29 @@ function materializeWorkflowStepScript(dirPath: string, runner: string, source: 
   try { chmodSync(target, 0o755); } catch { /* best-effort */ }
 }
 
+function writeWorkflowSkillAtomically(skillPath: string, bytes: string): void {
+  const temporary = `${skillPath}.${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporary, 'wx', 0o600);
+    writeFileSync(descriptor, bytes, 'utf8');
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporary, skillPath);
+    if (process.platform !== 'win32') {
+      const directoryDescriptor = openSync(path.dirname(skillPath), 'r');
+      try { fsyncSync(directoryDescriptor); } finally { closeSync(directoryDescriptor); }
+    }
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* best-effort descriptor cleanup */ }
+    }
+    try { if (existsSync(temporary)) unlinkSync(temporary); } catch { /* non-authoritative temp */ }
+    throw error;
+  }
+}
+
 function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   if (!existsSync(dirPath)) mkdirSync(dirPath, { recursive: true });
   const frontmatter: Record<string, unknown> = {
@@ -997,7 +1043,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   };
   if (def.whenToUse) frontmatter.when_to_use = def.whenToUse;
   if (def.project) frontmatter.project = def.project;
-  if (def.allowedTools && def.allowedTools.length > 0) frontmatter.allowed_tools = def.allowedTools;
+  if (def.allowedTools) frontmatter.allowed_tools = def.allowedTools;
   if (def.resources && Object.keys(def.resources).length > 0) frontmatter.resources = def.resources;
   if (def.trigger) frontmatter.trigger = def.trigger;
   // Steps go in frontmatter for typed config (id, deps, model, forEach,
@@ -1039,10 +1085,11 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
         out.deterministic = { runner };
       }
       if (s.call?.tool) out.call = { tool: s.call.tool, ...(s.call.args ? { args: s.call.args } : {}) };
+      if (s.invocationPlan) out.invocation_plan = structuredClone(s.invocationPlan);
       if (s.codifiedFrom?.prompt) {
         out.codified_from = { prompt: s.codifiedFrom.prompt, ...(s.codifiedFrom.allowedTools ? { allowedTools: s.codifiedFrom.allowedTools } : {}) };
       }
-      if (s.allowedTools && s.allowedTools.length > 0) out.allowedTools = s.allowedTools;
+      if (s.allowedTools) out.allowedTools = s.allowedTools;
       if (s.usesSkill) out.uses_skill = s.usesSkill;
       if (s.requiresApproval) out.requires_approval = true;
       if (s.approvalPreview) out.approval_preview = s.approvalPreview;
@@ -1098,7 +1145,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   }
   const body = lines.join('\n').trimEnd() + '\n';
   const skillPath = path.join(dirPath, 'SKILL.md');
-  writeFileSync(skillPath, matter.stringify(body, frontmatter), 'utf-8');
+  writeWorkflowSkillAtomically(skillPath, matter.stringify(body, frontmatter));
 }
 
 /**

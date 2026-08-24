@@ -14,7 +14,7 @@ import {
   type PendingActionExecutionCapability,
   type PendingActionRecord,
 } from '../runtime/harness/pending-actions.js';
-import { dispatchBatchItemTool } from '../tools/code-mode-tool.js';
+import { dispatchBatchItemTool } from '../tools/inner-dispatch.js';
 import { ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';

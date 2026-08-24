@@ -8,7 +8,7 @@
  * receipt added here settles identically on both. Lane adapters translate
  * transport; they do not each decide what completes a turn.
  *
- * Live incident 2026-08-10 (`sess-msmo2312-e8aad2da`, Codex gpt-5.6-sol): the
+ * Live incident 2026-08-10 (`session-fixture-terminal-control`, Codex gpt-5.6-sol): the
  * user asked "How's it going?", the status read succeeded, and a good answer
  * was produced — then the harness treated the still-running CHILD task as
  * unfinished FOREGROUND work and kept going: 58 status calls, 40 conversation

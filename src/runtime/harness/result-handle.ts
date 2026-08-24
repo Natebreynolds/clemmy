@@ -13,6 +13,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import {
+  persistSpilledResultPayload,
+  readDurableResultPayload,
+  RESULT_PAYLOAD_INLINE_MAX_BYTES,
+  RESULT_PAYLOAD_SPILL_SENTINEL,
+  type DurableResultPayloadMetadata,
+} from './result-payload-storage.js';
+import { settlementCrossingAuthorityJson } from './settlement-crossing-authority.js';
+import {
   deriveResultHandleFactsFromRaw as derivePureResultHandleFactsFromRaw,
   reconcileStoredEnvelopeMetadata,
   RESULT_PROJECTION_MAX_BYTES,
@@ -27,7 +35,7 @@ export {
   type RawResultHandleFacts,
   type ResultCompleteness,
 } from './result-facts.js';
-export const RESULT_RAW_MAX_BYTES = 8_000_000;
+export const RESULT_RAW_MAX_BYTES = RESULT_PAYLOAD_INLINE_MAX_BYTES;
 export const RESULT_CURSOR_MAX_BYTES = 65_536;
 
 export interface ResultHandle {
@@ -110,6 +118,39 @@ export interface SuccessfulSettlementResultEvidence {
   rawByteCount: number;
 }
 
+/**
+ * Exact retained bytes behind either a returned call handle or a successful
+ * logical settlement. Consumers which bind artifact lineage need the bytes'
+ * durable digest and length; re-stringifying the decoded value would silently
+ * replace that authority with a new representation.
+ */
+export interface AuthoritativeResultPayloadEvidence {
+  acceptedTaskId: string | null;
+  logicalToolCallId: string | null;
+  physicalDispatchId: string | null;
+  resultHandleId: string;
+  toolName: string;
+  rawLocation: string;
+  rawPayload: unknown;
+  rawPayloadJson: string;
+  rawPayloadSha256: string;
+  rawByteCount: number;
+}
+
+export type AuthoritativeResultPayloadRequest =
+  | {
+      kind: 'returned_handle';
+      rawLocation: string;
+      authority?: ResultHandleAuthority;
+    }
+  | {
+      kind: 'successful_settlement';
+      sessionId: string;
+      sourceUserSeq: number;
+      acceptedTaskId: string;
+      logicalToolCallId: string;
+    };
+
 export class ResultHandleAuthorityError extends Error {
   override readonly name = 'ResultHandleAuthorityError';
 
@@ -160,6 +201,7 @@ interface PersistableResult {
   rawDigest: string | null;
   rawBytes: number;
   rejection: RejectionReason | null;
+  storage: 'inline' | 'spill' | 'none';
 }
 
 function sha256(value: string | Buffer): string {
@@ -174,7 +216,13 @@ function boundedReason(error: unknown): string {
 
 function encodeRaw(result: unknown, skipRawStore: boolean): PersistableResult {
   if (skipRawStore) {
-    return { rawJson: null, rawDigest: null, rawBytes: 0, rejection: 'raw_store_skipped' };
+    return {
+      rawJson: null,
+      rawDigest: null,
+      rawBytes: 0,
+      rejection: 'raw_store_skipped',
+      storage: 'none',
+    };
   }
   try {
     // Canonicalize by stringify, never by shape-policing. The strict
@@ -191,20 +239,39 @@ function encodeRaw(result: unknown, skipRawStore: boolean): PersistableResult {
     // are unchanged.
     const rawJson = JSON.stringify(result);
     if (rawJson === undefined) {
-      return { rawJson: null, rawDigest: null, rawBytes: 0, rejection: 'unserializable' };
+      return {
+        rawJson: null,
+        rawDigest: null,
+        rawBytes: 0,
+        rejection: 'unserializable',
+        storage: 'none',
+      };
     }
     const rawBytes = Buffer.byteLength(rawJson, 'utf8');
     if (rawBytes > RESULT_RAW_MAX_BYTES) {
       return {
-        rawJson: null,
+        rawJson,
         rawDigest: sha256(rawJson),
         rawBytes,
-        rejection: 'oversized',
+        rejection: null,
+        storage: 'spill',
       };
     }
-    return { rawJson, rawDigest: sha256(rawJson), rawBytes, rejection: null };
+    return {
+      rawJson,
+      rawDigest: sha256(rawJson),
+      rawBytes,
+      rejection: null,
+      storage: 'inline',
+    };
   } catch {
-    return { rawJson: null, rawDigest: null, rawBytes: 0, rejection: 'unserializable' };
+    return {
+      rawJson: null,
+      rawDigest: null,
+      rawBytes: 0,
+      rejection: 'unserializable',
+      storage: 'none',
+    };
   }
 }
 
@@ -362,6 +429,27 @@ function persistedHandleForPhysical(
   ) as DurableResultRow | undefined;
 }
 
+function durablePayloadMetadata(row: DurableResultRow): DurableResultPayloadMetadata {
+  return {
+    rawLocation: row.raw_location,
+    rawPayloadJson: row.raw_payload_json,
+    rawPayloadSha256: row.raw_payload_sha256,
+    rawByteCount: row.raw_byte_count,
+    rejectionReason: row.rejection_reason,
+  };
+}
+
+function requireExistingSpillReadable(row: DurableResultRow): void {
+  if (row.raw_payload_json !== RESULT_PAYLOAD_SPILL_SENTINEL) return;
+  const verified = readDurableResultPayload(durablePayloadMetadata(row));
+  if (verified.status !== 'ok' || verified.storage !== 'spill') {
+    throw new ResultHandleAuthorityError(
+      'storage_error',
+      `existing spilled result payload failed verification (${verified.status === 'ok' ? 'wrong storage class' : verified.reason})`,
+    );
+  }
+}
+
 function persistResultHandleInTransaction(
   db: EventLogDatabase,
   result: unknown,
@@ -369,6 +457,18 @@ function persistResultHandleInTransaction(
   options: { skipRawStore: boolean; requireRaw: boolean },
 ): DurableResultRow {
   let encoded = encodeRaw(result, options.skipRawStore);
+  // The spill store is an authority-bearing result seam, not a new unscoped
+  // blob cache. Legacy projection-only callers retain their historical
+  // oversized rejection behavior.
+  if (encoded.storage === 'spill' && scope.kind !== 'authoritative') {
+    encoded = {
+      rawJson: null,
+      rawDigest: encoded.rawDigest,
+      rawBytes: encoded.rawBytes,
+      rejection: 'oversized',
+      storage: 'none',
+    };
+  }
   // Durable projections must describe the exact bytes redemption will later
   // re-derive, not an SDK object that only happens to stringify to those
   // bytes. Provider wrappers routinely carry class instances, `undefined`,
@@ -386,10 +486,14 @@ function persistResultHandleInTransaction(
       rawDigest: encoded.rawDigest,
       rawBytes: encoded.rawBytes,
       rejection: 'cursor_oversized',
+      storage: 'none',
     };
   }
   const rejected = encoded.rejection !== null && encoded.rejection !== 'raw_store_skipped';
-  if (options.requireRaw && (rejected || encoded.rawJson === null || encoded.rawDigest === null)) {
+  if (
+    options.requireRaw
+    && (rejected || encoded.storage === 'none' || encoded.rawJson === null || encoded.rawDigest === null)
+  ) {
     throw new ResultHandleAuthorityError(
       'storage_error',
       `successful provider result is not durably storable (${encoded.rejection ?? 'missing raw bytes'})`,
@@ -399,7 +503,7 @@ function persistResultHandleInTransaction(
   const effectiveCursor = rejected ? null : cursorBytes;
   const fingerprint = encoded.rawDigest ?? `rejected:${encoded.rejection ?? 'unknown'}:${randomUUID()}`;
   const handleId = `rh_${sha256(`${scope.salt}|${scope.argumentDigest}|${fingerprint}`).slice(0, 32)}`;
-  const rawLocation = encoded.rawJson === null ? null : `tool_output:${handleId}`;
+  const rawLocation = encoded.storage === 'none' ? null : `tool_output:${handleId}`;
   const cursorDigest = effectiveCursor ? sha256(effectiveCursor) : null;
   const continuationRef = effectiveCursor
     ? `cont_${sha256(`${handleId}|${scope.baseArgumentDigest}|${cursorDigest}`).slice(0, 24)}`
@@ -420,6 +524,7 @@ function persistResultHandleInTransaction(
             'physical dispatch already owns a different result handle',
           );
         }
+        requireExistingSpillReadable(existingPhysical);
         return existingPhysical;
       }
       const existing = db.prepare('SELECT * FROM durable_result_handles WHERE handle_id = ?')
@@ -434,6 +539,7 @@ function persistResultHandleInTransaction(
         ) {
           throw new ResultHandleAuthorityError('conflict', 'result handle id collided with another result');
         }
+        requireExistingSpillReadable(existing);
         return existing;
       }
       const repeated = cursorDigest !== null && Boolean(db.prepare(`
@@ -451,6 +557,19 @@ function persistResultHandleInTransaction(
         scope.baseArgumentDigest,
         cursorDigest,
       ));
+      if (encoded.storage === 'spill') {
+        if (encoded.rawJson === null || encoded.rawDigest === null) {
+          throw new ResultHandleAuthorityError('storage_error', 'spilled result payload metadata is incomplete');
+        }
+        persistSpilledResultPayload({
+          rawJson: encoded.rawJson,
+          digest: encoded.rawDigest,
+          byteCount: encoded.rawBytes,
+        });
+      }
+      const durableRawJson = encoded.storage === 'spill'
+        ? RESULT_PAYLOAD_SPILL_SENTINEL
+        : encoded.rawJson;
       db.prepare(`
         INSERT INTO durable_result_handles (
           handle_id, scope_kind, session_id, source_user_seq, accepted_task_id,
@@ -476,8 +595,8 @@ function persistResultHandleInTransaction(
         scope.argumentDigest,
         scope.baseArgumentDigest,
         rawLocation,
-        encoded.rawJson,
-        encoded.rawJson === null ? null : encoded.rawDigest,
+        durableRawJson,
+        encoded.storage === 'none' ? null : encoded.rawDigest,
         encoded.rawBytes,
         encoded.rejection,
         inspected.success ? 1 : 0,
@@ -624,6 +743,7 @@ interface SettledResultRow extends DurableResultRow {
   settlement_result_handle_id: string | null;
   settlement_crossing_count: number;
   settlement_host_crossing_count: number;
+  settlement_crossing_authority_version: number;
   settlement_crossings_digest: string;
   settlement_event_id: string;
   frozen_crossing_count: number;
@@ -647,18 +767,24 @@ interface RedemptionCrossingRow {
   retry_of: string | null;
   tool_name: string;
   argument_digest: string;
-  state?: 'started' | 'returned' | 'threw' | 'timed_out' | 'cancelled' | 'unknown';
+  state: 'started' | 'returned' | 'threw' | 'timed_out' | 'cancelled' | 'unknown' | null;
+  execution_site: 'host' | null;
 }
 
-function crossingSetJson(rows: readonly RedemptionCrossingRow[]): string {
-  return JSON.stringify(rows.map((row) => ({
+function crossingSetJson(
+  rows: readonly RedemptionCrossingRow[],
+  version: 1 | 2,
+): string {
+  return settlementCrossingAuthorityJson(rows.map((row) => ({
     physicalDispatchId: row.physical_dispatch_id,
     ordinal: row.ordinal,
     relation: row.relation,
-    retryOf: row.retry_of,
+    retryOf: row.retry_of ?? null,
     toolName: row.tool_name,
     argumentDigest: row.argument_digest,
-  })));
+    terminalState: row.state,
+    executionSite: row.execution_site,
+  })), version);
 }
 
 function canonicalJson(value: unknown): string {
@@ -754,21 +880,28 @@ function crossingAuthorityMatches(
   db: EventLogDatabase,
   row: SettledResultRow,
 ): boolean {
+  const crossingAuthorityVersion = row.settlement_crossing_authority_version === 1
+    || row.settlement_crossing_authority_version === 2
+    ? row.settlement_crossing_authority_version
+    : null;
+  if (crossingAuthorityVersion === null) return false;
   const parameters = [row.session_id, row.source_user_seq, row.logical_tool_call_id] as const;
   const frozen = db.prepare(`
-    SELECT physical_dispatch_id, ordinal, relation, retry_of, tool_name, argument_digest
+    SELECT physical_dispatch_id, ordinal, relation, retry_of, tool_name, argument_digest,
+           terminal_state AS state, execution_site
       FROM logical_call_settlement_crossings
      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
      ORDER BY ordinal
   `).all(...parameters) as RedemptionCrossingRow[];
   const live = db.prepare(`
-    SELECT physical_dispatch_id, ordinal, relation, retry_of, tool_name, argument_digest, state
+    SELECT physical_dispatch_id, ordinal, relation, retry_of, tool_name, argument_digest,
+           state, execution_site
       FROM physical_dispatches
      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
      ORDER BY ordinal
   `).all(...parameters) as RedemptionCrossingRow[];
-  const frozenJson = crossingSetJson(frozen);
-  const liveJson = crossingSetJson(live);
+  const frozenJson = crossingSetJson(frozen, crossingAuthorityVersion);
+  const liveJson = crossingSetJson(live, crossingAuthorityVersion);
   const frozenDigest = sha256(frozenJson);
   // Provider crossings and the host's own crossings are counted separately on
   // the settlement; the frozen and live sets hold both.
@@ -780,6 +913,17 @@ function crossingAuthorityMatches(
     || frozenDigest !== row.settlement_crossings_digest
     || sha256(liveJson) !== row.settlement_crossings_digest
     || live.some((crossing) => crossing.state === 'started')
+    || (crossingAuthorityVersion === 2 && (
+      frozen.some((crossing) => crossing.state === null)
+      || frozen.filter((crossing) => crossing.execution_site === 'host').length
+        !== row.settlement_host_crossing_count
+      || live.filter((crossing) => crossing.execution_site === 'host').length
+        !== row.settlement_host_crossing_count
+      || frozen.filter((crossing) => crossing.execution_site === null).length
+        !== row.settlement_crossing_count
+      || live.filter((crossing) => crossing.execution_site === null).length
+        !== row.settlement_crossing_count
+    ))
     || frozen.at(-1)?.physical_dispatch_id !== row.physical_dispatch_id
   ) return false;
 
@@ -795,6 +939,7 @@ function crossingAuthorityMatches(
     const data = JSON.parse(mirror.data_json) as Record<string, unknown>;
     return data.sourceUserSeq === row.source_user_seq
       && data.logicalToolCallId === row.logical_tool_call_id
+      && (data.crossingAuthorityVersion ?? 1) === crossingAuthorityVersion
       && data.resultHandleId === row.handle_id
       && data.physicalDispatchCount === row.settlement_crossing_count
       && data.physicalCrossingsDigest === row.settlement_crossings_digest
@@ -838,6 +983,7 @@ export function redeemSuccessfulSettlementResultForHost(input: {
              s.result_handle_id AS settlement_result_handle_id,
              s.physical_crossing_count AS settlement_crossing_count,
              COALESCE(s.host_crossing_count, 0) AS settlement_host_crossing_count,
+             COALESCE(s.crossing_authority_version, 1) AS settlement_crossing_authority_version,
              s.physical_crossings_digest AS settlement_crossings_digest,
              s.settlement_event_id AS settlement_event_id,
              l.accepted_task_id AS logical_accepted_task_id,
@@ -925,21 +1071,9 @@ export function redeemSuccessfulSettlementResultForHost(input: {
     ) {
       return { status: 'corrupt', reason: 'settlement, crossing, and result-handle authority disagree' };
     }
-    if (row.raw_payload_json === null || row.raw_payload_sha256 === null || row.raw_location === null) {
-      return { status: 'missing', reason: 'settlement result has no retained raw payload' };
-    }
-    if (
-      Buffer.byteLength(row.raw_payload_json, 'utf8') !== row.raw_byte_count
-      || sha256(row.raw_payload_json) !== row.raw_payload_sha256
-    ) {
-      return { status: 'corrupt', reason: 'settlement result bytes do not match their durable digest' };
-    }
-    let rawPayload: unknown;
-    try {
-      rawPayload = JSON.parse(row.raw_payload_json) as unknown;
-    } catch {
-      return { status: 'corrupt', reason: 'settlement result raw payload is not valid JSON' };
-    }
+    const retained = readDurableResultPayload(durablePayloadMetadata(row));
+    if (retained.status !== 'ok') return retained;
+    const rawPayload = retained.value;
     const verifiedFacts = matchingRawFacts(db, row, rawPayload);
     if (verifiedFacts === null) {
       return { status: 'corrupt', reason: 'settlement result projections disagree with raw bytes' };
@@ -959,7 +1093,82 @@ export function redeemSuccessfulSettlementResultForHost(input: {
         handle: rowToHandle(row, verifiedFacts),
         executionSite: row.dispatch_execution_site === 'host' ? 'host' : 'provider',
         rawPayload,
-        rawPayloadJson: row.raw_payload_json,
+        rawPayloadJson: retained.rawJson,
+        rawPayloadSha256: row.raw_payload_sha256!,
+        rawByteCount: row.raw_byte_count,
+      },
+    };
+  } catch (error) {
+    return { status: 'storage_error', reason: boundedReason(error) };
+  }
+}
+
+/**
+ * One verified payload-redemption seam for artifact lineage.
+ *
+ * `returned_handle` deliberately works before logical settlement so restart
+ * hydration can recover a provider return and finish settling it. The
+ * `successful_settlement` form additionally requires the immutable settlement
+ * binding and is therefore the form used for post-settlement artifact proof.
+ */
+export function redeemAuthoritativeResultPayload(
+  input: AuthoritativeResultPayloadRequest,
+): ResultRedemption<AuthoritativeResultPayloadEvidence> {
+  if (input.kind === 'successful_settlement') {
+    const settled = redeemSuccessfulSettlementResultForHost(input);
+    if (settled.status !== 'ok') return settled;
+    const rawLocation = settled.value.handle.rawLocation;
+    if (!rawLocation) {
+      return { status: 'corrupt', reason: 'settled authoritative result has no raw location' };
+    }
+    return {
+      status: 'ok',
+      value: {
+        acceptedTaskId: settled.value.acceptedTaskId,
+        logicalToolCallId: settled.value.logicalToolCallId,
+        physicalDispatchId: settled.value.physicalDispatchId,
+        resultHandleId: settled.value.resultHandleId,
+        toolName: settled.value.toolName,
+        rawLocation,
+        rawPayload: settled.value.rawPayload,
+        rawPayloadJson: settled.value.rawPayloadJson,
+        rawPayloadSha256: settled.value.rawPayloadSha256,
+        rawByteCount: settled.value.rawByteCount,
+      },
+    };
+  }
+
+  try {
+    const row = openEventLog().prepare(
+      'SELECT * FROM durable_result_handles WHERE raw_location = ?',
+    ).get(input.rawLocation) as DurableResultRow | undefined;
+    if (!row) return { status: 'missing', reason: 'raw result location is missing' };
+    if (!mayRedeem(row, input.authority)) {
+      return { status: 'forbidden', reason: 'raw result belongs to another accepted call' };
+    }
+    const retained = readDurableResultPayload(durablePayloadMetadata(row));
+    if (retained.status !== 'ok') return retained;
+    if (!row.raw_location || !row.raw_payload_sha256) {
+      return { status: 'corrupt', reason: 'authoritative result payload metadata is incomplete' };
+    }
+    if (row.scope_kind === 'authoritative' && (
+      !row.accepted_task_id
+      || !row.logical_tool_call_id
+      || !row.physical_dispatch_id
+    )) {
+      return { status: 'corrupt', reason: 'authoritative result payload identity is incomplete' };
+    }
+    return {
+      status: 'ok',
+      value: {
+        acceptedTaskId: row.accepted_task_id,
+        logicalToolCallId: row.logical_tool_call_id,
+        physicalDispatchId: row.physical_dispatch_id,
+        resultHandleId: row.handle_id,
+        toolName: row.tool_name,
+        rawLocation: row.raw_location,
+        rawPayload: retained.value,
+        rawPayloadJson: retained.rawJson,
         rawPayloadSha256: row.raw_payload_sha256,
         rawByteCount: row.raw_byte_count,
       },
@@ -994,31 +1203,14 @@ export function redeemRawResult(
   location: string,
   authority?: ResultHandleAuthority,
 ): ResultRedemption<unknown> {
-  try {
-    const row = openEventLog().prepare(
-      'SELECT * FROM durable_result_handles WHERE raw_location = ?',
-    ).get(location) as DurableResultRow | undefined;
-    if (!row) return { status: 'missing', reason: 'raw result location is missing' };
-    if (!mayRedeem(row, authority)) {
-      return { status: 'forbidden', reason: 'raw result belongs to another accepted call' };
-    }
-    if (row.raw_payload_json === null || row.raw_payload_sha256 === null) {
-      return { status: 'missing', reason: `raw payload was not stored (${row.rejection_reason ?? 'unknown'})` };
-    }
-    if (
-      Buffer.byteLength(row.raw_payload_json, 'utf8') !== row.raw_byte_count
-      || sha256(row.raw_payload_json) !== row.raw_payload_sha256
-    ) {
-      return { status: 'corrupt', reason: 'raw payload bytes do not match their durable digest' };
-    }
-    try {
-      return { status: 'ok', value: JSON.parse(row.raw_payload_json) as unknown };
-    } catch {
-      return { status: 'corrupt', reason: 'raw payload is not valid JSON' };
-    }
-  } catch (error) {
-    return { status: 'storage_error', reason: boundedReason(error) };
-  }
+  const redeemed = redeemAuthoritativeResultPayload({
+    kind: 'returned_handle',
+    rawLocation: location,
+    ...(authority ? { authority } : {}),
+  });
+  return redeemed.status === 'ok'
+    ? { status: 'ok', value: redeemed.value.rawPayload }
+    : redeemed;
 }
 
 export function redeemContinuation(

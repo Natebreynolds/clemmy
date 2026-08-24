@@ -183,6 +183,14 @@ const MODEL_CONTEXT_LIMITS: ReadonlyMap<string, number> = new Map([
   ['kimi-k3', 1_000_000],
   ['k3', 1_000_000],
   ['kimi', 256_000],
+  // Grok (xAI), 256K per xAI docs — the same window model-wire-registry.ts
+  // declares for the grok family. It was absent here entirely, so a grok brain
+  // silently ran on the 128K unknown-model default: half its real context, and
+  // it compacted or parked at half the work it could carry. This table and the
+  // wire registry are two records of one fact and they drifted; the coupling is
+  // pinned in budget.test.ts so the next divergence fails rather than degrades.
+  ['grok-4', 256_000],
+  ['grok', 256_000],
 ]);
 
 /** Hard floor for the budget threshold. Smaller models with tiny

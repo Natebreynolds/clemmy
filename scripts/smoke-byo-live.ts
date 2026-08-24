@@ -8,7 +8,6 @@
  */
 import { getByoBackendConfig } from '../src/config.js';
 import { getByoModel, resetByoModelCache } from '../src/runtime/harness/byo-model.js';
-import { withTrace } from '@openai/agents-core';
 
 const expected = 'CLEMENTINE_BYO_LIVE_OK';
 
@@ -49,7 +48,9 @@ if (!byo.configured || !byo.primaryId) {
 }
 
 const model = getByoModel(byo.primaryId, byo);
-const response = await withTrace('byo-live-smoke', async () => model.getResponse({
+// BARE call, exactly like the host turn loop — no withTrace. If the traceless
+// step adapter regresses, this smoke fails the same way live does.
+const response = await model.getResponse({
   systemInstructions: 'You are verifying a BYO model backend. Return only the requested sentinel text.',
   input: `Reply with exactly: ${expected}`,
   modelSettings: {},
@@ -57,7 +58,7 @@ const response = await withTrace('byo-live-smoke', async () => model.getResponse
   outputType: 'text',
   handoffs: [],
   tracing: false,
-}));
+});
 
 const text = extractText(response.output).trim();
 if (text !== expected) {

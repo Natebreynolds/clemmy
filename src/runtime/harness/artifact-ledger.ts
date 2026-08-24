@@ -16,7 +16,10 @@ import {
   type GoogleSheetsSheetTarget,
 } from './sheet-from-json-content-contract.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
-import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import {
+  redeemAuthoritativeResultPayload,
+  redeemSuccessfulSettlementResultForHost,
+} from './result-handle.js';
 
 /**
  * Durable artifact transactions for create-style tool calls.
@@ -1873,24 +1876,20 @@ export function authorizeHostSealedArtifactReadback(input: {
       || createSettlement.continues_requirement !== 0
     ) return { status: 'unavailable', reason: 'host create predecessor is not durably settled' };
 
-    const lineage = db.prepare(`
-      SELECT raw_payload_json
-        FROM durable_result_handles
-       WHERE session_id = ? AND source_user_seq = ?
-         AND logical_tool_call_id = ? AND scope_kind = 'authoritative'
-         AND raw_payload_json IS NOT NULL
-       ORDER BY rowid DESC LIMIT 1
-    `).get(
-      input.sessionId,
-      input.sourceUserSeq,
-      `logical:${contract.lineageNodeId}`,
-    ) as { raw_payload_json: string } | undefined;
-    if (!lineage) return { status: 'unavailable', reason: 'host content lineage result is missing' };
-    let lineageValue: unknown;
-    try { lineageValue = JSON.parse(lineage.raw_payload_json); } catch {
-      return { status: 'unavailable', reason: 'host content lineage result is unreadable' };
+    const lineage = redeemAuthoritativeResultPayload({
+      kind: 'successful_settlement',
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: contract.acceptedTaskId,
+      logicalToolCallId: `logical:${contract.lineageNodeId}`,
+    });
+    if (lineage.status !== 'ok') {
+      return {
+        status: 'unavailable',
+        reason: `host content lineage result is unavailable (${lineage.status})`,
+      };
     }
-    const lineageRecords = hostLineageRecords(lineageValue);
+    const lineageRecords = hostLineageRecords(lineage.value.rawPayload);
     if (!lineageRecords || hostArtifactContentDigest(lineageRecords) !== contract.lineageContentDigest) {
       return { status: 'unavailable', reason: 'host content lineage digest does not match the sealed create input' };
     }

@@ -2,7 +2,7 @@
  * eval-case — the reusable EvalCase + pass^k runner (Lane A Phase 2,
  * eval-as-harness).
  *
- * "Eval IS the harness": every other next-level lane (Code Mode gate-parity,
+ * "Eval IS the harness": every other next-level lane (nested-dispatch gate parity,
  * idempotency, abstention, procedure-reuse, firehose-suppression) validates by
  * registering an EvalCase and gating its kill-switch deletion on pass^k — NOT a
  * one-shot pass@1. pass@1 hides the demo-to-prod reliability gap; pass^k (ALL k

@@ -29,11 +29,11 @@ type ToolResult = { content: Array<{ type: 'text'; text: string }> };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
 
 const handlers = new Map<string, ToolHandler>();
-const schemas = new Map<string, Record<string, { parse?: (value: unknown) => unknown }>>();
+const schemas = new Map<string, Record<string, { parse?: (value: unknown) => unknown; description?: string }>>();
 registerOrchestrationTools({
   tool(name: string, _description: string, _schema: unknown, handler: ToolHandler) {
     handlers.set(name, handler);
-    schemas.set(name, _schema as Record<string, { parse?: (value: unknown) => unknown }>);
+    schemas.set(name, _schema as Record<string, { parse?: (value: unknown) => unknown; description?: string }>);
   },
 } as never);
 
@@ -466,6 +466,69 @@ test('workflow_create accepts durable resources separately from run inputs and w
   assert.match(text, /lead_sheet: sheet/);
   assert.match(text, /googlesheets -> sheet-123/);
   assert.match(text, /Inputs:\n  \(none\)/);
+});
+
+test('workflow_get metadata section is structurally selectable and omits large step prompts', async () => {
+  const promptSentinel = 'FULL-PROMPT-MUST-NOT-ENTER-METADATA';
+  writeWorkflow('bounded-metadata-read', {
+    name: 'Bounded Metadata Read',
+    description: 'Inspect the workflow schedule without loading its implementation.',
+    enabled: true,
+    trigger: { schedule: '0 9 * * 1-5', timezone: 'America/Los_Angeles' },
+    resources: {
+      report_sheet: {
+        id: 'report_sheet',
+        kind: 'sheet',
+        toolkit: 'googlesheets',
+        resourceId: 'sheet-123',
+      },
+    },
+    steps: [{
+      id: 'collect',
+      prompt: `${promptSentinel}\n${'large implementation detail '.repeat(700)}`,
+      sideEffect: 'read',
+      allowedTools: ['composio_apify_*'],
+    }, {
+      id: 'publish',
+      prompt: 'Publish the result.',
+      dependsOn: ['collect'],
+      sideEffect: 'write',
+      requiresApproval: true,
+    }],
+    inputs: {
+      query: { type: 'string', description: 'Research query.' },
+    },
+  });
+
+  const sectionSchema = schemas.get('workflow_get')?.section;
+  assert.ok(sectionSchema, 'workflow_get exposes a first-class section choice');
+  assert.equal(sectionSchema.parse?.('metadata'), 'metadata');
+  assert.equal(sectionSchema.parse?.('full'), 'full');
+  assert.throws(() => sectionSchema.parse?.('summary'));
+  assert.match(sectionSchema.description ?? '', /bounded frontmatter\/overview read with no step prompt text/i);
+
+  const metadataText = resultText(await workflowGet()({
+    name: 'Bounded Metadata Read',
+    section: 'metadata',
+  }));
+  assert.match(metadataText, /"schedule": "0 9 \* \* 1-5"/);
+  assert.match(metadataText, /"timezone": "America\/Los_Angeles"/);
+  assert.match(metadataText, /"step_count": 2/);
+  assert.match(metadataText, /"id": "collect"/);
+  assert.match(metadataText, /"id": "publish"/);
+  assert.doesNotMatch(metadataText, new RegExp(promptSentinel));
+  assert.doesNotMatch(metadataText, /"prompt":/);
+  assert.ok(metadataText.length < 2_500, `metadata read should stay compact; got ${metadataText.length} chars`);
+
+  const legacyFullText = resultText(await workflowGet()({ name: 'Bounded Metadata Read' }));
+  assert.match(legacyFullText, new RegExp(promptSentinel), 'omitting section preserves the full-definition behavior');
+
+  const conflictText = resultText(await workflowGet()({
+    name: 'Bounded Metadata Read',
+    section: 'metadata',
+    step: 'collect',
+  }));
+  assert.match(conflictText, /cannot be combined/);
 });
 
 test('workflow_run rejects incomplete required resource bindings without queueing', async () => {

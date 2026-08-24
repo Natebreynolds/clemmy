@@ -195,6 +195,36 @@ test('claim after replied returns shouldProcess=false (idempotent)', () => {
   assert.equal(second.record.runId, 'run-1');
 });
 
+test('completion cannot replace an established provider run identity', () => {
+  claimInbound({
+    channel: 'discord:completion-owner',
+    sourceMessageId: 'm-run-owner',
+    runId: 'run-original',
+    payloadHash: 'payload-original',
+  });
+
+  assert.throws(
+    () => completeInbound({
+      channel: 'discord:completion-owner',
+      sourceMessageId: 'm-run-owner',
+      status: 'replied',
+      runId: 'run-foreign',
+    }),
+    /different inbound request/i,
+  );
+  const afterConflict = getInbound('discord:completion-owner', 'm-run-owner');
+  assert.equal(afterConflict?.status, 'claimed');
+  assert.equal(afterConflict?.runId, 'run-original');
+
+  completeInbound({
+    channel: 'discord:completion-owner',
+    sourceMessageId: 'm-run-owner',
+    status: 'replied',
+    runId: 'run-original',
+  });
+  assert.equal(getInbound('discord:completion-owner', 'm-run-owner')?.status, 'replied');
+});
+
 test('claim after dropped also short-circuits', () => {
   claimInbound({ channel: 'discord:chan1', sourceMessageId: 'm3' });
   completeInbound({ channel: 'discord:chan1', sourceMessageId: 'm3', status: 'dropped' });

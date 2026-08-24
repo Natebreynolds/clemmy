@@ -16,7 +16,7 @@ export function collectRequiredWorkflowInputs(workflow: WorkflowDefinition): str
   const required = new Set<string>();
   const declaredInputs = workflow.inputs ?? {};
   for (const [key, meta] of Object.entries(declaredInputs)) {
-    if (!meta.default || meta.default.trim().length === 0) {
+    if (meta.required !== false && (!meta.default || meta.default.trim().length === 0)) {
       required.add(key);
     }
   }
@@ -47,7 +47,10 @@ export function collectRequiredWorkflowInputs(workflow: WorkflowDefinition): str
   // empty-inputs workflow_run ("required inputs … missing"), which led the
   // chat agent to retry the same call ~137× — a runaway + 429 storm.
   for (const [key, meta] of Object.entries(declaredInputs)) {
-    if (meta.default && meta.default.trim().length > 0) required.delete(key);
+    if (
+      meta.required === false
+      || (meta.default && meta.default.trim().length > 0)
+    ) required.delete(key);
   }
 
   return [...required].sort();

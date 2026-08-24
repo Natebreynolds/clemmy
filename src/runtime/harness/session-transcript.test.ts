@@ -560,17 +560,15 @@ test('relevant prior work uses an exact interrupted attempt fallback without lau
     data: { text: objective },
   });
   finishRunAttempt(attempt, 'interrupted');
-  appendEvent({
-    sessionId: prior.id,
-    turn: 1,
-    role: 'Clem',
-    type: 'conversation_completed',
-    data: {
+  const terminal = typedTerminal(prior.id, source.seq, 'valid terminal before corruption', attempt.attemptId);
+  openEventLog().prepare('UPDATE events SET data_json = ? WHERE seq = ?').run(
+    JSON.stringify({
       sourceUserSeq: source.seq,
       presentation: { status: 'done', text: 'FORGED-TERMINAL-MUST-NOT-SURFACE' },
       reply: 'FORGED-TERMINAL-MUST-NOT-SURFACE',
-    },
-  });
+    }),
+    terminal.seq,
+  );
 
   const projection = await renderRelevantPriorWorkForModel(openEventLog(), {
     currentObjective: objective,

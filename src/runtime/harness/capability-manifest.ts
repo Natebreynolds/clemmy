@@ -31,6 +31,31 @@ export interface CapabilityManifestDestinationV1 {
   posture: string;
 }
 
+/**
+ * Immutable provider-definition facts needed after discovery has ended.
+ *
+ * The schema itself stays on the prepared tool surface/tool-contract store;
+ * this manifest carries its full canonical digest plus the normalized
+ * provider declarations that cannot be reconstructed from an operation name.
+ * Keeping these bytes in the manifest makes restart/replay use the same
+ * definition that was observed before catalog publication.
+ */
+export interface CapabilityManifestExternalDefinitionV1 {
+  version: 1;
+  providerInputSchemaDigest: string;
+  /** Present only when the same provider definition explicitly observed the
+   * output surface. With no digest this attests an explicit null/absence. */
+  providerOutputSchemaObserved?: true;
+  providerOutputSchemaDigest?: string;
+  semanticName: string;
+  behaviorHints: {
+    readOnly: boolean | null;
+    destructive: boolean | null;
+    idempotent: boolean | null;
+    openWorld: boolean | null;
+  };
+}
+
 export interface CapabilityManifestV1 {
   version: typeof CAPABILITY_MANIFEST_VERSION;
   manifestId: string;
@@ -43,6 +68,9 @@ export interface CapabilityManifestV1 {
   operationVersion: string;
   /** Full input schema or complete tool-definition fingerprint. */
   definitionFingerprint: string;
+  /** Exact normalized current external definition. Optional for legacy/local
+   * manifests; new Composio/native-MCP materializers always persist it. */
+  externalDefinition?: CapabilityManifestExternalDefinitionV1;
   effect: ManifestEffect;
   destination?: CapabilityManifestDestinationV1;
   accountId: string;
@@ -163,6 +191,25 @@ export function canonicalManifestBytes(manifest: CapabilityManifestV1): string {
     providerVersion: manifest.providerVersion,
     operationVersion: manifest.operationVersion,
     definitionFingerprint: manifest.definitionFingerprint,
+    // Preserve byte compatibility for already-installed manifests: absence is
+    // omitted rather than encoded as null. New external manifests bind these
+    // facts into their digest.
+    ...(manifest.externalDefinition
+      ? {
+          externalDefinition: {
+            version: manifest.externalDefinition.version,
+            providerInputSchemaDigest: manifest.externalDefinition.providerInputSchemaDigest,
+            ...(manifest.externalDefinition.providerOutputSchemaObserved === true
+              ? { providerOutputSchemaObserved: true as const }
+              : {}),
+            ...(manifest.externalDefinition.providerOutputSchemaDigest
+              ? { providerOutputSchemaDigest: manifest.externalDefinition.providerOutputSchemaDigest }
+              : {}),
+            semanticName: manifest.externalDefinition.semanticName,
+            behaviorHints: { ...manifest.externalDefinition.behaviorHints },
+          },
+        }
+      : {}),
     effect: manifest.effect,
     destination: manifest.destination ?? null,
     accountId: manifest.accountId,
@@ -232,6 +279,30 @@ export function validateCapabilityManifestV1(
   }
   if (!EFFECTS.has(manifest.effect) || manifest.effect === 'unknown') {
     return { ok: false, reason: 'unknown_effect' };
+  }
+  if (manifest.externalDefinition) {
+    const definition = manifest.externalDefinition;
+    const hints = definition.behaviorHints;
+    const hint = (value: unknown): boolean => (
+      value === true || value === false || value === null
+    );
+    if (
+      (manifest.providerKind !== 'composio' && manifest.providerKind !== 'native_mcp')
+      || definition.version !== 1
+      || !/^[a-f0-9]{64}$/.test(definition.providerInputSchemaDigest)
+      || (definition.providerOutputSchemaObserved !== undefined
+        && definition.providerOutputSchemaObserved !== true)
+      || (definition.providerOutputSchemaDigest !== undefined
+        && definition.providerOutputSchemaObserved !== true)
+      || (definition.providerOutputSchemaDigest !== undefined
+        && !/^[a-f0-9]{64}$/.test(definition.providerOutputSchemaDigest))
+      || !nonBlank(definition.semanticName)
+      || !hints
+      || !hint(hints.readOnly)
+      || !hint(hints.destructive)
+      || !hint(hints.idempotent)
+      || !hint(hints.openWorld)
+    ) return { ok: false, reason: 'incomplete' };
   }
   if (manifest.provenance?.trusted !== true || !nonBlank(manifest.provenance.issuer) || !nonBlank(manifest.provenance.issuedAt)) {
     return { ok: false, reason: 'untrusted_provenance' };

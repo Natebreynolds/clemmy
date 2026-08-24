@@ -29,14 +29,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { BASE_DIR, getRuntimeEnv } from '../config.js';
-import {
-  executeComposioTool,
-  listConnectedToolkits,
-  readComposioConnectionSuppressionState,
-  saveComposioConnectionSuppressionState,
-} from '../integrations/composio/client.js';
-import { addNotification, type NotificationRecord } from '../runtime/notifications.js';
+import { BASE_DIR } from '../config.js';
+import type { ConnectedToolkit } from '../integrations/composio/client.js';
+import type { NotificationRecord } from '../runtime/notifications.js';
 import {
   clearConnectionSuppression,
   isConnectionSuppressed,
@@ -46,7 +41,6 @@ import {
   type ComposioConnectionSuppression,
   type ComposioConnectionSuppressionState,
 } from './composio-connection-suppression.js';
-import { getProactivityPolicySnapshot, loadProactivityPolicy } from './proactivity-policy.js';
 import { decideSurface, shouldSurface, type SurfaceDecision } from './surface-decision.js';
 
 const logger = pino({ name: 'clementine-next.inbox-monitor' });
@@ -80,8 +74,12 @@ export interface InboxMonitorState {
 }
 
 export interface InboxMonitorDeps {
-  listConnections: typeof listConnectedToolkits;
-  executeTool: typeof executeComposioTool;
+  listConnections: () => Promise<ConnectedToolkit[]>;
+  executeTool: (
+    operation: string,
+    args: Record<string, unknown>,
+    connectionId?: string,
+  ) => Promise<unknown>;
   notify: (n: NotificationRecord) => void;
   config: () => InboxMonitorConfig;
   proactiveWorkAllowed: () => boolean;
@@ -99,23 +97,6 @@ export interface InboxMonitorConfig {
   maxPerScan: number;
   fetchTop: number;
 }
-/**
- * Read the live settings from the proactivity policy (what the user edits in the
- * dashboard: on/off, how often, how many per check). Active hours come from the
- * policy's quiet-hours window via proactiveWorkAllowed. Surface-only +
- * dashboard-only.
- */
-function realConfig(): InboxMonitorConfig {
-  const policy = loadProactivityPolicy();
-  const fetchOverride = Number.parseInt(getRuntimeEnv('CLEMMY_INBOX_MONITOR_FETCH', '25') || '25', 10);
-  return {
-    enabled: policy.inboxWatchEnabled !== false,
-    intervalMs: Math.max(1, policy.inboxWatchMinutes) * 60_000,
-    maxPerScan: Math.max(1, policy.inboxWatchMax),
-    fetchTop: Number.isFinite(fetchOverride) && fetchOverride >= 1 ? fetchOverride : 25,
-  };
-}
-
 // ── provider catalog (general, per-provider — NOT per-user) ──────────────────
 function asArray(x: unknown): unknown[] {
   return Array.isArray(x) ? x : [];
@@ -255,19 +236,6 @@ function saveStateReal(s: InboxMonitorState): void {
   writeFileSync(STATE_FILE, JSON.stringify(s, null, 2), 'utf-8');
 }
 
-const REAL_DEPS: InboxMonitorDeps = {
-  listConnections: listConnectedToolkits,
-  executeTool: executeComposioTool,
-  notify: addNotification,
-  config: realConfig,
-  proactiveWorkAllowed: () => getProactivityPolicySnapshot().proactiveWorkAllowed,
-  now: () => Date.now(),
-  loadState: loadStateReal,
-  saveState: saveStateReal,
-  readConnectionSuppressions: readComposioConnectionSuppressionState,
-  saveConnectionSuppressions: saveComposioConnectionSuppressionState,
-};
-
 export const inboxMonitorInternalsForTest = { loadStateReal, saveStateReal };
 
 function accountLabel(conn: { accountEmail?: string; accountName?: string; slug: string }): string {
@@ -281,7 +249,7 @@ function accountLabel(conn: { accountEmail?: string; accountName?: string; slug:
  * so stale accounts do not spam the logs. Returns the number of items surfaced.
  * Best-effort: never throws.
  */
-export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): Promise<number> {
+export async function processInboxMonitor(deps: InboxMonitorDeps): Promise<number> {
   const cfg = deps.config();
   if (!cfg.enabled) return 0; // inbox-watch toggled off (or kill-switch)
   if (!deps.proactiveWorkAllowed()) return 0; // proactivity disabled / quiet hours
@@ -300,7 +268,7 @@ export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): P
   }
   if (state.lastScanAt && nowMs - Date.parse(state.lastScanAt) < cfg.intervalMs) return 0;
 
-  let connections: Awaited<ReturnType<typeof listConnectedToolkits>>;
+  let connections: ConnectedToolkit[];
   try {
     connections = await deps.listConnections();
   } catch (err) {

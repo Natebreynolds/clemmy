@@ -363,6 +363,12 @@ test('computeResumeState detects terminal run_failed', () => {
   assert.equal(state.terminal, true);
 });
 
+test('computeResumeState detects terminal run_blocked without calling it failed', () => {
+  appendWorkflowEvent('terminal-blocked', 'r1', { kind: 'run_blocked', error: 'exact capability unavailable' });
+  const state = computeResumeState('terminal-blocked', 'r1');
+  assert.equal(state.terminal, true);
+});
+
 test('computeResumeState detects terminal run_cancelled', () => {
   appendWorkflowEvent('terminal-cancel', 'r1', { kind: 'run_started' });
   appendWorkflowEvent('terminal-cancel', 'r1', { kind: 'run_cancelled', error: 'cancelled by user' });

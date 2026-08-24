@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BASE_DIR, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
+import { CUTOVER_HOLD } from '../runtime/cutover-hold.js';
 import { openMemoryDb, STATE_DIR } from './db.js';
 
 /**
@@ -696,7 +697,8 @@ export function _setLocalProviderForTest(p: EmbeddingProvider | null | undefined
 // before the first recall, instead of reporting "off" for the first turn.
 // Fire-and-forget; failures already degrade to lexical inside loadLocalProvider.
 if (
-  localEmbeddingsAllowed()
+  !CUTOVER_HOLD
+  && localEmbeddingsAllowed()
   && providerOverride() !== 'off'
   && providerOverride() !== 'openai'
   && !embeddingsDisabledByEnv()
@@ -1286,7 +1288,25 @@ export function loadActiveFactEmbeddings(kind?: string): Map<number, Float32Arra
   for (const row of rows) vectors.set(row.id, bufferToVector(row.vector));
   activeFactEmbeddingCache = { key, vectors };
   activeFactEmbeddingCacheDb = db;
+  // Coverage observability (COMPOUNDING wave): an edited fact whose embedding
+  // has not been recomputed silently vanishes from the semantic leg. The
+  // backfill self-heals it, but recall must be able to SAY the leg was
+  // partial instead of quietly degrading.
+  try {
+    const activeCount = (db.prepare(
+      `SELECT COUNT(*) AS n FROM consolidated_facts WHERE active = 1${kind ? ' AND kind = ?' : ''}`,
+    ).get(...(kind ? [kind] : [])) as { n: number }).n;
+    lastActiveFactEmbeddingCoverage = { embedded: vectors.size, active: activeCount };
+  } catch { /* observability must never break recall */ }
   return vectors;
+}
+
+let lastActiveFactEmbeddingCoverage: { embedded: number; active: number } | null = null;
+
+/** Snapshot of the most recent active-fact embedding coverage (embedded vs
+ *  active rows in the current embedding space). Telemetry only. */
+export function activeFactEmbeddingCoverage(): { embedded: number; active: number } | null {
+  return lastActiveFactEmbeddingCoverage;
 }
 
 /** Load vectors for ARCHIVED facts — soft-retired (active=0) rows still inside

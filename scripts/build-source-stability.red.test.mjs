@@ -7,7 +7,7 @@ const buildScript = readFileSync(new URL('./build-candidate.mjs', import.meta.ur
 const stampScript = readFileSync(new URL('./write-build-stamp.mjs', import.meta.url), 'utf8');
 
 test('candidate builds fail closed if source bytes move while TypeScript compiles', () => {
-  assert.match(pkg.scripts.build, /build-candidate\.mjs/);
+  assert.equal(pkg.scripts.build, 'node --import tsx scripts/build-candidate.mjs');
   assert.match(buildScript, /fingerprintBefore/);
   assert.match(buildScript, /fingerprintAfter/);
   assert.match(buildScript, /source changed during candidate build/);

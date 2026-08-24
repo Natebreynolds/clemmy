@@ -231,7 +231,16 @@ test('exact-source preamble is nonterminal, foreign-safe, preserves tool status,
   assert.equal(state.done, true);
 });
 
-test('preamble delivery edits immediately before work and has quiet/fallback/fail-closed results', async () => {
+test('preamble delivery edits one owned placeholder idempotently and has quiet/fail-closed results', async () => {
+  const request = (text: string) => ({
+    version: 1 as const,
+    sessionId: 'discord-preamble-session',
+    sourceUserSeq: 9,
+    eventId: 'discord-preamble-event',
+    eventDigest: 'a'.repeat(64),
+    deliveryKey: `preamble-delivery:v1:${'b'.repeat(64)}`,
+    text,
+  });
   const state = {
     summary: '',
     status: 'starting',
@@ -251,7 +260,17 @@ test('preamble delivery edits immediately before work and has quiet/fallback/fai
     },
     isFinalized: () => false,
   });
-  assert.deepEqual(await delivered('I have the details and I’m starting now.'), { status: 'delivered' });
+  assert.deepEqual(await delivered(request('I have the details and I’m starting now.')), {
+    status: 'delivered',
+    receipt: {
+      version: 1,
+      deliveryKey: `preamble-delivery:v1:${'b'.repeat(64)}`,
+      eventId: 'discord-preamble-event',
+      eventDigest: 'a'.repeat(64),
+      surface: 'channel_message',
+      target: 'active_placeholder',
+    },
+  });
   order.push('tool:start');
   assert.deepEqual(order, [
     'edit:_starting_\n\nI have the details and I’m starting now.',
@@ -270,23 +289,54 @@ test('preamble delivery edits immediately before work and has quiet/fallback/fai
     },
     isFinalized: () => false,
   });
-  assert.deepEqual(await quiet('I will keep the presentation quiet.'), { status: 'delivered' });
+  assert.deepEqual(await quiet(request('I will keep the presentation quiet.')), {
+    status: 'not_applicable',
+    reason: 'quiet_presentation',
+    receipt: {
+      version: 1,
+      deliveryKey: `preamble-delivery:v1:${'b'.repeat(64)}`,
+      eventId: 'discord-preamble-event',
+      eventDigest: 'a'.repeat(64),
+      surface: 'not_applicable',
+      target: 'quiet_presentation',
+    },
+  });
   assert.equal(quietPaints, 0);
 
-  const fallbackOrder: string[] = [];
-  const fallback = __test__.createChannelConversationPreambleDelivery({
+  const retryEdits: string[] = [];
+  const retry = __test__.createChannelConversationPreambleDelivery({
     progressPresentation: 'compact',
     state: { ...state, summary: '' },
-    handle: { async edit() { fallbackOrder.push('edit'); throw new Error('expired'); } },
+    handle: { async edit() { throw new Error('the exact transport hook owns this edit'); } },
     transport: {
       async sendInitial() { throw new Error('unused'); },
       async sendError() {},
-      async sendFollowup(content: string) { fallbackOrder.push(`followup:${content}`); },
+      async deliverConversationPreamble(input) {
+        retryEdits.push(`${input.deliveryKey}:discord:channel-1:placeholder-1`);
+        return { target: 'discord:channel-1:placeholder-1' };
+      },
     },
     isFinalized: () => false,
   });
-  assert.deepEqual(await fallback('Fallback preamble.'), { status: 'delivered' });
-  assert.deepEqual(fallbackOrder, ['edit', 'followup:Fallback preamble.']);
+  const retryRequest = request('Retry-safe preamble.');
+  const firstRetry = await retry(retryRequest);
+  const secondRetry = await retry(retryRequest);
+  assert.deepEqual(firstRetry, secondRetry);
+  assert.deepEqual(firstRetry, {
+    status: 'delivered',
+    receipt: {
+      version: 1,
+      deliveryKey: retryRequest.deliveryKey,
+      eventId: retryRequest.eventId,
+      eventDigest: retryRequest.eventDigest,
+      surface: 'channel_message',
+      target: 'discord:channel-1:placeholder-1',
+    },
+  });
+  assert.deepEqual(retryEdits, [
+    `${retryRequest.deliveryKey}:discord:channel-1:placeholder-1`,
+    `${retryRequest.deliveryKey}:discord:channel-1:placeholder-1`,
+  ], 'recovery re-edits one provider target with the exact stable delivery key');
 
   const failed = __test__.createChannelConversationPreambleDelivery({
     progressPresentation: 'compact',
@@ -299,11 +349,11 @@ test('preamble delivery edits immediately before work and has quiet/fallback/fai
     },
     isFinalized: () => false,
   });
-  assert.deepEqual(await failed('Undeliverable preamble.'), {
+  assert.deepEqual(await failed(request('Undeliverable preamble.')), {
     status: 'failed',
     reason: 'delivery_failed',
   });
-  assert.deepEqual(await failed('{"summary":"x","reply":"x","done":true,"nextAction":"completed"}'), {
+  assert.deepEqual(await failed(request('{"summary":"x","reply":"x","done":true,"nextAction":"completed"}')), {
     status: 'failed',
     reason: 'delivery_failed',
   });

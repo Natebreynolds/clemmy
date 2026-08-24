@@ -1,0 +1,1936 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#08111f">
+  <title>Clementine Universal Harness — Target Architecture</title>
+  <style>
+    :root {
+      --bg: #07101d;
+      --bg-deep: #040a12;
+      --panel: rgba(15, 27, 45, 0.84);
+      --panel-strong: #102039;
+      --panel-soft: rgba(21, 38, 61, 0.66);
+      --ink: #f4f7fb;
+      --muted: #98a8bd;
+      --muted-2: #6f829b;
+      --line: rgba(151, 179, 214, 0.17);
+      --line-strong: rgba(151, 179, 214, 0.34);
+      --cyan: #54d8e8;
+      --cyan-soft: rgba(84, 216, 232, 0.12);
+      --lime: #a9e56e;
+      --lime-soft: rgba(169, 229, 110, 0.12);
+      --violet: #b99cff;
+      --violet-soft: rgba(185, 156, 255, 0.12);
+      --amber: #ffc96b;
+      --amber-soft: rgba(255, 201, 107, 0.12);
+      --rose: #ff8b9d;
+      --rose-soft: rgba(255, 139, 157, 0.12);
+      --blue: #6ca5ff;
+      --blue-soft: rgba(108, 165, 255, 0.12);
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+      --radius: 18px;
+      --radius-sm: 12px;
+      --mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% -5%, rgba(84, 216, 232, 0.12), transparent 30rem),
+        radial-gradient(circle at 88% 4%, rgba(185, 156, 255, 0.13), transparent 30rem),
+        linear-gradient(180deg, #091423 0%, var(--bg) 48%, var(--bg-deep) 100%);
+      font-family: var(--sans);
+      line-height: 1.5;
+    }
+
+    button, select { font: inherit; }
+
+    button { color: inherit; }
+
+    button:focus-visible,
+    select:focus-visible,
+    [tabindex]:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 3px;
+    }
+
+    .app {
+      width: min(1560px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 26px 0 54px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 26px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--ink);
+      text-decoration: none;
+    }
+
+    .brand-mark {
+      position: relative;
+      display: grid;
+      width: 38px;
+      height: 38px;
+      place-items: center;
+      border: 1px solid rgba(84, 216, 232, 0.55);
+      border-radius: 12px;
+      background: linear-gradient(145deg, rgba(84, 216, 232, 0.18), rgba(185, 156, 255, 0.12));
+      box-shadow: inset 0 0 24px rgba(84, 216, 232, 0.08), 0 0 34px rgba(84, 216, 232, 0.1);
+      font-family: var(--mono);
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: -0.08em;
+    }
+
+    .brand-mark::after {
+      position: absolute;
+      right: -3px;
+      bottom: -3px;
+      width: 8px;
+      height: 8px;
+      border: 2px solid var(--bg);
+      border-radius: 50%;
+      background: var(--lime);
+      content: "";
+    }
+
+    .brand-copy strong,
+    .brand-copy span { display: block; }
+
+    .brand-copy strong { font-size: 14px; letter-spacing: 0.01em; }
+
+    .brand-copy span {
+      color: var(--muted-2);
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }
+
+    .topbar-note {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .live-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--lime);
+      box-shadow: 0 0 14px rgba(169, 229, 110, 0.7);
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(28px, 4.5vw, 64px);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background:
+        linear-gradient(120deg, rgba(15, 31, 51, 0.96), rgba(10, 20, 36, 0.82)),
+        repeating-linear-gradient(90deg, transparent 0 68px, rgba(255,255,255,0.02) 69px 70px);
+      box-shadow: var(--shadow);
+    }
+
+    .hero::before,
+    .hero::after {
+      position: absolute;
+      border-radius: 50%;
+      content: "";
+      filter: blur(2px);
+      pointer-events: none;
+    }
+
+    .hero::before {
+      top: -180px;
+      right: -100px;
+      width: 500px;
+      height: 500px;
+      border: 1px solid rgba(84, 216, 232, 0.13);
+      box-shadow: inset 0 0 100px rgba(84, 216, 232, 0.04);
+    }
+
+    .hero::after {
+      right: 170px;
+      bottom: -270px;
+      width: 420px;
+      height: 420px;
+      border: 1px solid rgba(185, 156, 255, 0.12);
+    }
+
+    .eyebrow {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 16px;
+      color: var(--cyan);
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      width: 28px;
+      height: 1px;
+      background: currentColor;
+      content: "";
+    }
+
+    h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 900px;
+      margin: 0;
+      font-size: clamp(38px, 6.2vw, 86px);
+      font-weight: 680;
+      letter-spacing: -0.055em;
+      line-height: 0.98;
+      text-wrap: balance;
+    }
+
+    .hero h1 span {
+      color: transparent;
+      background: linear-gradient(90deg, var(--cyan), #b4eef5 42%, var(--violet));
+      -webkit-background-clip: text;
+      background-clip: text;
+    }
+
+    .hero-copy {
+      position: relative;
+      z-index: 1;
+      max-width: 850px;
+      margin: 22px 0 0;
+      color: #bcc8d8;
+      font-size: clamp(16px, 1.8vw, 21px);
+      text-wrap: balance;
+    }
+
+    .promise-row {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 28px;
+    }
+
+    .promise {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      padding: 9px 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: #d2dce8;
+      background: rgba(4, 11, 21, 0.45);
+      font-size: 12px;
+    }
+
+    .promise::before {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--lime);
+      content: "";
+    }
+
+    .doctrine {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .doctrine-card {
+      padding: 15px 17px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: rgba(10, 21, 36, 0.7);
+    }
+
+    .doctrine-card strong {
+      display: block;
+      margin-bottom: 3px;
+      color: var(--ink);
+      font-size: 13px;
+    }
+
+    .doctrine-card span { color: var(--muted); font-size: 11px; }
+
+    .control-deck {
+      position: sticky;
+      z-index: 30;
+      top: 12px;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 14px;
+      margin: 20px 0;
+      padding: 10px;
+      border: 1px solid var(--line-strong);
+      border-radius: 16px;
+      background: rgba(7, 16, 29, 0.9);
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.24);
+      backdrop-filter: blur(18px);
+    }
+
+    .view-tabs,
+    .scenario-strip,
+    .state-controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .view-tab,
+    .scenario-button,
+    .toggle-button {
+      min-height: 34px;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+      transition: border-color 160ms ease, background 160ms ease, color 160ms ease, transform 160ms ease;
+    }
+
+    .view-tab { padding: 7px 11px; font-size: 11px; font-weight: 700; }
+
+    .view-tab:hover,
+    .scenario-button:hover,
+    .toggle-button:hover { color: var(--ink); background: var(--panel-soft); }
+
+    .view-tab[aria-selected="true"] {
+      border-color: rgba(84, 216, 232, 0.35);
+      color: var(--cyan);
+      background: var(--cyan-soft);
+    }
+
+    .scenario-strip {
+      min-width: 0;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    .scenario-strip::-webkit-scrollbar { display: none; }
+
+    .scenario-button {
+      flex: 0 0 auto;
+      padding: 7px 10px;
+      font-size: 10px;
+      white-space: nowrap;
+    }
+
+    .scenario-button[aria-pressed="true"] {
+      border-color: rgba(169, 229, 110, 0.32);
+      color: var(--lime);
+      background: var(--lime-soft);
+    }
+
+    .state-controls { justify-content: flex-end; }
+
+    .toggle-button {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 10px;
+      border-color: var(--line);
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .toggle-track {
+      position: relative;
+      width: 28px;
+      height: 16px;
+      border-radius: 999px;
+      background: var(--line-strong);
+    }
+
+    .toggle-track::after {
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--ink);
+      content: "";
+      transition: transform 180ms ease, background 180ms ease;
+    }
+
+    .toggle-button[aria-pressed="true"] .toggle-track::after {
+      transform: translateX(12px);
+      background: var(--violet);
+    }
+
+    .failure-select {
+      max-width: 168px;
+      min-height: 34px;
+      padding: 6px 28px 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: var(--muted);
+      background: #0a1626;
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.03em;
+    }
+
+    .view-panel[hidden] { display: none; }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 330px;
+      align-items: start;
+      gap: 16px;
+    }
+
+    .map,
+    .inspector,
+    .walkthrough-shell,
+    .learning-shell {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(8, 18, 31, 0.76);
+      box-shadow: var(--shadow);
+    }
+
+    .map { padding: clamp(16px, 2.2vw, 28px); }
+
+    .inspector {
+      position: sticky;
+      top: 86px;
+      overflow: hidden;
+      min-height: 610px;
+    }
+
+    .inspector-head {
+      padding: 18px 19px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(135deg, rgba(84, 216, 232, 0.09), rgba(185, 156, 255, 0.06));
+    }
+
+    .micro-label {
+      color: var(--muted-2);
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }
+
+    .inspector h2 {
+      margin: 7px 0 5px;
+      font-size: 21px;
+      letter-spacing: -0.025em;
+      line-height: 1.16;
+    }
+
+    .inspector-mode {
+      display: inline-flex;
+      margin-top: 5px;
+      padding: 4px 7px;
+      border: 1px solid rgba(169, 229, 110, 0.28);
+      border-radius: 7px;
+      color: var(--lime);
+      background: var(--lime-soft);
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .inspector-body { padding: 18px 19px 20px; }
+
+    .inspector-summary {
+      margin: 0 0 18px;
+      color: #b7c4d5;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .inspector-section { margin-top: 18px; }
+
+    .inspector-section h3 {
+      margin: 0 0 9px;
+      color: var(--muted-2);
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .path-list,
+    .guarantee-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .path-list { counter-reset: path; }
+
+    .path-list li {
+      position: relative;
+      margin-left: 12px;
+      padding: 0 0 13px 25px;
+      border-left: 1px solid var(--line-strong);
+      color: #c6d0dd;
+      font-size: 11px;
+    }
+
+    .path-list li:last-child { border-left-color: transparent; padding-bottom: 0; }
+
+    .path-list li::before {
+      position: absolute;
+      top: 0;
+      left: -8px;
+      display: grid;
+      width: 15px;
+      height: 15px;
+      place-items: center;
+      border: 1px solid rgba(84, 216, 232, 0.4);
+      border-radius: 50%;
+      color: var(--cyan);
+      background: #0a1728;
+      content: counter(path);
+      counter-increment: path;
+      font-family: var(--mono);
+      font-size: 7px;
+    }
+
+    .guarantee-list li {
+      display: flex;
+      gap: 8px;
+      margin: 7px 0;
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .guarantee-list li::before { color: var(--lime); content: "✓"; }
+
+    .recovery-box {
+      display: none;
+      margin-top: 18px;
+      padding: 12px;
+      border: 1px solid rgba(255, 201, 107, 0.28);
+      border-radius: 11px;
+      background: var(--amber-soft);
+    }
+
+    body.has-failure .recovery-box { display: block; }
+
+    .recovery-box strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--amber);
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .recovery-box p { margin: 0; color: #d5c4a7; font-size: 10px; }
+
+    .map-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 0 12px;
+    }
+
+    .map-label h2 {
+      margin: 0;
+      font-size: 14px;
+      letter-spacing: -0.01em;
+    }
+
+    .map-label span {
+      color: var(--muted-2);
+      font-family: var(--mono);
+      font-size: 8px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .surface-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 9px;
+    }
+
+    .node,
+    .mode-node,
+    .kernel-step,
+    .adapter,
+    .rail-card,
+    .outcome-node,
+    .memory-node {
+      position: relative;
+      border: 1px solid var(--line);
+      color: inherit;
+      background: var(--panel-soft);
+      transition: opacity 180ms ease, transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease, background 180ms ease;
+    }
+
+    button.node,
+    button.mode-node,
+    button.kernel-step,
+    button.adapter,
+    button.rail-card,
+    button.outcome-node,
+    button.memory-node {
+      width: 100%;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .node:hover,
+    .mode-node:hover,
+    .kernel-step:hover,
+    .adapter:hover,
+    .rail-card:hover,
+    .outcome-node:hover,
+    .memory-node:hover { transform: translateY(-2px); border-color: var(--line-strong); }
+
+    .node.is-path,
+    .mode-node.is-path,
+    .kernel-step.is-path,
+    .adapter.is-path,
+    .rail-card.is-path,
+    .outcome-node.is-path,
+    .memory-node.is-path {
+      border-color: rgba(84, 216, 232, 0.48);
+      background: linear-gradient(145deg, rgba(84, 216, 232, 0.1), rgba(16, 31, 50, 0.84));
+      box-shadow: 0 0 0 1px rgba(84, 216, 232, 0.06), 0 8px 28px rgba(30, 166, 184, 0.08);
+    }
+
+    .node.is-selected,
+    .mode-node.is-selected,
+    .kernel-step.is-selected,
+    .adapter.is-selected,
+    .rail-card.is-selected,
+    .outcome-node.is-selected,
+    .memory-node.is-selected {
+      border-color: var(--lime);
+      box-shadow: 0 0 0 2px rgba(169, 229, 110, 0.12);
+    }
+
+    .authority-advisory-hidden [data-authority="advisory"] { opacity: 0.2; filter: saturate(0.3); }
+
+    .surface-card {
+      min-height: 112px;
+      padding: 13px;
+      border-radius: 13px;
+    }
+
+    .node-topline {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 9px;
+      margin-bottom: 18px;
+    }
+
+    .node-icon {
+      display: grid;
+      width: 25px;
+      height: 25px;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      color: var(--cyan);
+      background: rgba(3, 10, 19, 0.45);
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 800;
+    }
+
+    .node-tag {
+      color: var(--muted-2);
+      font-family: var(--mono);
+      font-size: 7px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .node-title { display: block; font-size: 12px; font-weight: 750; }
+
+    .node-copy {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 9px;
+      line-height: 1.42;
+    }
+
+    .vertical-connector {
+      position: relative;
+      width: 1px;
+      height: 26px;
+      margin: 0 auto;
+      background: linear-gradient(var(--line-strong), rgba(84, 216, 232, 0.46));
+    }
+
+    .vertical-connector::after {
+      position: absolute;
+      right: -3px;
+      bottom: 0;
+      width: 7px;
+      height: 7px;
+      border-right: 1px solid var(--cyan);
+      border-bottom: 1px solid var(--cyan);
+      content: "";
+      transform: rotate(45deg);
+    }
+
+    .ingress {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 12px;
+      min-height: 64px;
+      padding: 12px 15px;
+      border-color: rgba(84, 216, 232, 0.34);
+      border-radius: 13px;
+      background: linear-gradient(90deg, rgba(84, 216, 232, 0.08), rgba(15, 30, 49, 0.7));
+    }
+
+    .ingress .node-topline { margin: 0; }
+
+    .ingress .node-copy { margin-top: 2px; }
+
+    .authority-chip {
+      padding: 5px 7px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      color: var(--cyan);
+      background: rgba(4, 12, 22, 0.5);
+      font-family: var(--mono);
+      font-size: 8px;
+      white-space: nowrap;
+    }
+
+    .core-shell {
+      padding: 15px;
+      border: 1px solid rgba(185, 156, 255, 0.27);
+      border-radius: 16px;
+      background: linear-gradient(145deg, rgba(185, 156, 255, 0.05), rgba(8, 18, 31, 0.3));
+    }
+
+    .core-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 12px;
+    }
+
+    .core-header h3 { margin: 2px 0 0; font-size: 15px; }
+
+    .core-header p { max-width: 520px; margin: 0; color: var(--muted); font-size: 9px; text-align: right; }
+
+    .context-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 7px;
+    }
+
+    .context-item {
+      min-height: 56px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(7, 15, 26, 0.58);
+    }
+
+    .context-item strong { display: block; margin-bottom: 2px; font-size: 9px; }
+
+    .context-item span { display: block; color: var(--muted-2); font-size: 8px; }
+
+    .meaning-flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+      margin-top: 12px;
+    }
+
+    .meaning-step {
+      position: relative;
+      padding: 10px 11px;
+      border-radius: 10px;
+    }
+
+    .meaning-step:not(:last-child)::after {
+      position: absolute;
+      top: 50%;
+      right: -15px;
+      width: 11px;
+      height: 1px;
+      background: var(--line-strong);
+      content: "";
+    }
+
+    .meaning-step strong { display: block; font-size: 9px; }
+
+    .meaning-step span { display: block; margin-top: 2px; color: var(--muted); font-size: 8px; }
+
+    .mode-router {
+      padding: 13px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: rgba(11, 23, 39, 0.65);
+    }
+
+    .mode-intro {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 9px;
+    }
+
+    .mode-intro strong { font-size: 11px; }
+
+    .mode-intro span { color: var(--muted-2); font-family: var(--mono); font-size: 8px; }
+
+    .mode-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 7px;
+    }
+
+    .mode-node {
+      min-height: 76px;
+      padding: 10px;
+      border-radius: 10px;
+    }
+
+    .mode-node.is-current {
+      border-color: var(--lime);
+      background: var(--lime-soft);
+      box-shadow: inset 0 -2px 0 rgba(169, 229, 110, 0.52);
+    }
+
+    .mode-node strong { display: block; font-size: 9px; }
+
+    .mode-node span { display: block; margin-top: 4px; color: var(--muted); font-size: 8px; }
+
+    .kernel-layout {
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr) 150px;
+      align-items: stretch;
+      gap: 9px;
+    }
+
+    .rail {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .rail-title {
+      display: flex;
+      min-height: 27px;
+      align-items: center;
+      color: var(--muted-2);
+      font-family: var(--mono);
+      font-size: 8px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+
+    .rail-card {
+      flex: 1;
+      min-height: 56px;
+      padding: 9px;
+      border-radius: 10px;
+    }
+
+    .rail-card strong { display: block; font-size: 8.5px; }
+
+    .rail-card span { display: block; margin-top: 3px; color: var(--muted-2); font-size: 7.5px; }
+
+    .kernel {
+      overflow: hidden;
+      border: 1px solid rgba(84, 216, 232, 0.31);
+      border-radius: 15px;
+      background: linear-gradient(180deg, rgba(84, 216, 232, 0.06), rgba(7, 15, 26, 0.4));
+    }
+
+    .kernel-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .kernel-title strong { font-size: 10px; }
+
+    .kernel-title span { color: var(--cyan); font-family: var(--mono); font-size: 7px; text-transform: uppercase; }
+
+    .kernel-steps {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 0;
+    }
+
+    .kernel-step {
+      min-height: 146px;
+      padding: 12px 8px;
+      border-width: 0 1px 0 0;
+      border-radius: 0;
+      background: transparent;
+    }
+
+    .kernel-step:last-child { border-right: 0; }
+
+    .kernel-index {
+      display: grid;
+      width: 21px;
+      height: 21px;
+      margin-bottom: 23px;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 7px;
+      color: var(--cyan);
+      background: rgba(5, 13, 23, 0.6);
+      font-family: var(--mono);
+      font-size: 7px;
+    }
+
+    .kernel-step strong { display: block; font-size: 8.5px; }
+
+    .kernel-step span { display: block; margin-top: 5px; color: var(--muted); font-size: 7.5px; line-height: 1.45; }
+
+    .kernel-law {
+      padding: 8px 12px;
+      border-top: 1px solid var(--line);
+      color: var(--muted-2);
+      font-family: var(--mono);
+      font-size: 7px;
+      letter-spacing: 0.05em;
+      text-align: center;
+      text-transform: uppercase;
+    }
+
+    .adapter-shell {
+      padding: 13px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: rgba(10, 21, 36, 0.68);
+    }
+
+    .adapter-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 9px;
+    }
+
+    .adapter-head strong { font-size: 10px; }
+
+    .adapter-head span { color: var(--muted-2); font-size: 8px; }
+
+    .adapter-grid {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .adapter {
+      min-height: 48px;
+      padding: 8px 6px;
+      border-radius: 9px;
+      text-align: center !important;
+    }
+
+    .adapter strong { display: block; font-size: 8px; }
+
+    .adapter span { display: block; margin-top: 2px; color: var(--muted-2); font-size: 7px; }
+
+    .truth-strip {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .truth-item {
+      padding: 7px 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(4, 12, 22, 0.43);
+      color: var(--muted);
+      font-size: 7.5px;
+    }
+
+    .truth-item strong { color: var(--ink); }
+
+    .final-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+      gap: 9px;
+    }
+
+    .outcome-node,
+    .memory-node {
+      min-height: 112px;
+      padding: 13px;
+      border-radius: 14px;
+    }
+
+    .outcome-node { border-color: rgba(169, 229, 110, 0.3); background: var(--lime-soft); }
+
+    .memory-node { border-color: rgba(185, 156, 255, 0.3); background: var(--violet-soft); }
+
+    .final-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .final-title strong { font-size: 11px; }
+
+    .final-title span { color: var(--muted-2); font-family: var(--mono); font-size: 7px; text-transform: uppercase; }
+
+    .final-copy { margin: 6px 0 10px; color: var(--muted); font-size: 8.5px; }
+
+    .mini-pills { display: flex; flex-wrap: wrap; gap: 5px; }
+
+    .mini-pill {
+      padding: 3px 5px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: #c2cedc;
+      background: rgba(5, 13, 23, 0.36);
+      font-family: var(--mono);
+      font-size: 6.5px;
+      text-transform: uppercase;
+    }
+
+    .bottom-law {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      margin-top: 13px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      color: #bcc8d7;
+      background: rgba(5, 12, 21, 0.5);
+      font-size: 10px;
+      text-align: center;
+    }
+
+    .bottom-law strong { color: var(--cyan); }
+
+    .walkthrough-shell,
+    .learning-shell { padding: clamp(18px, 2.8vw, 34px); }
+
+    .view-heading {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: end;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+
+    .view-heading h2 { margin: 5px 0 0; font-size: clamp(24px, 4vw, 42px); letter-spacing: -0.04em; }
+
+    .view-heading p { max-width: 660px; margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+
+    .mode-oracle {
+      padding: 10px 13px;
+      border: 1px solid rgba(169, 229, 110, 0.28);
+      border-radius: 11px;
+      color: var(--lime);
+      background: var(--lime-soft);
+      font-family: var(--mono);
+      font-size: 9px;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .task-prompt {
+      margin-bottom: 16px;
+      padding: 15px 17px;
+      border-left: 2px solid var(--cyan);
+      border-radius: 0 12px 12px 0;
+      color: #d3dce8;
+      background: rgba(84, 216, 232, 0.06);
+      font-size: 13px;
+    }
+
+    .journey {
+      display: grid;
+      grid-auto-flow: column;
+      grid-auto-columns: minmax(150px, 1fr);
+      align-items: stretch;
+      gap: 24px;
+      overflow-x: auto;
+      padding: 4px 2px 18px;
+      scrollbar-color: var(--line-strong) transparent;
+    }
+
+    .journey-card {
+      position: relative;
+      min-height: 200px;
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: linear-gradient(160deg, rgba(19, 36, 58, 0.9), rgba(8, 18, 31, 0.85));
+    }
+
+    .journey-card:not(:last-child)::after {
+      position: absolute;
+      top: 50%;
+      right: -19px;
+      width: 13px;
+      height: 1px;
+      background: var(--cyan);
+      content: "";
+    }
+
+    .journey-card:not(:last-child)::before {
+      position: absolute;
+      z-index: 1;
+      top: calc(50% - 3px);
+      right: -19px;
+      width: 6px;
+      height: 6px;
+      border-top: 1px solid var(--cyan);
+      border-right: 1px solid var(--cyan);
+      content: "";
+      transform: rotate(45deg);
+    }
+
+    .journey-type {
+      display: inline-flex;
+      padding: 3px 6px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--cyan);
+      background: rgba(84, 216, 232, 0.07);
+      font-family: var(--mono);
+      font-size: 7px;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .journey-card h3 { margin: 18px 0 6px; font-size: 13px; }
+
+    .journey-card p { margin: 0; color: var(--muted); font-size: 9px; }
+
+    .journey-proof {
+      position: absolute;
+      right: 13px;
+      bottom: 13px;
+      left: 13px;
+      padding-top: 9px;
+      border-top: 1px solid var(--line);
+      color: var(--muted-2);
+      font-family: var(--mono);
+      font-size: 7px;
+    }
+
+    .proof-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 9px;
+      margin-top: 8px;
+    }
+
+    .proof-card {
+      min-height: 112px;
+      padding: 13px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(11, 23, 39, 0.72);
+    }
+
+    .proof-card strong { display: block; margin-bottom: 5px; font-size: 10px; }
+
+    .proof-card p { margin: 0; color: var(--muted); font-size: 8.5px; }
+
+    .proof-value { margin-top: 12px; color: var(--lime); font-family: var(--mono); font-size: 8px; }
+
+    .recovery-sequence {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 8px;
+      margin-top: 18px;
+    }
+
+    .recovery-step {
+      position: relative;
+      padding: 11px;
+      border: 1px solid rgba(255, 201, 107, 0.22);
+      border-radius: 10px;
+      color: #d8cbb5;
+      background: rgba(255, 201, 107, 0.06);
+      font-size: 8px;
+      text-align: center;
+    }
+
+    .learning-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.12fr) minmax(260px, 0.88fr);
+      gap: 14px;
+    }
+
+    .flywheel-card,
+    .space-card,
+    .specialty-card,
+    .comparison-card {
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: rgba(11, 23, 39, 0.68);
+    }
+
+    .flywheel-card { min-height: 500px; padding: 20px; }
+
+    .flywheel-head h3,
+    .space-card h3,
+    .specialty-card h3,
+    .comparison-card h3 { margin: 5px 0 5px; font-size: 16px; }
+
+    .flywheel-head p,
+    .space-card > p,
+    .specialty-card > p,
+    .comparison-card > p { margin: 0; color: var(--muted); font-size: 10px; }
+
+    .flywheel {
+      position: relative;
+      display: grid;
+      width: min(430px, 100%);
+      aspect-ratio: 1;
+      margin: 12px auto 0;
+      place-items: center;
+      border: 1px dashed rgba(185, 156, 255, 0.33);
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(185, 156, 255, 0.08) 0 26%, transparent 27%);
+    }
+
+    .flywheel-center {
+      display: grid;
+      width: 142px;
+      aspect-ratio: 1;
+      place-items: center;
+      padding: 18px;
+      border: 1px solid rgba(84, 216, 232, 0.35);
+      border-radius: 50%;
+      color: var(--cyan);
+      background: #0b1a2c;
+      font-size: 11px;
+      font-weight: 750;
+      text-align: center;
+      box-shadow: 0 0 44px rgba(84, 216, 232, 0.08);
+    }
+
+    .flywheel-point {
+      position: absolute;
+      display: grid;
+      width: 100px;
+      min-height: 52px;
+      place-items: center;
+      padding: 7px;
+      border: 1px solid rgba(185, 156, 255, 0.27);
+      border-radius: 10px;
+      color: #d2c8eb;
+      background: #111c30;
+      font-family: var(--mono);
+      font-size: 8px;
+      text-align: center;
+    }
+
+    .flywheel-point:nth-of-type(2) { top: 3%; left: calc(50% - 50px); }
+    .flywheel-point:nth-of-type(3) { top: 23%; right: 0; }
+    .flywheel-point:nth-of-type(4) { right: 9%; bottom: 8%; }
+    .flywheel-point:nth-of-type(5) { bottom: 3%; left: calc(50% - 50px); }
+    .flywheel-point:nth-of-type(6) { bottom: 20%; left: 0; }
+    .flywheel-point:nth-of-type(7) { top: 20%; left: 0; }
+
+    .learning-side { display: grid; gap: 14px; }
+
+    .space-card,
+    .specialty-card,
+    .comparison-card { padding: 17px; }
+
+    .space-grid,
+    .specialty-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 7px;
+      margin-top: 13px;
+    }
+
+    .space-item,
+    .specialty-item {
+      min-height: 58px;
+      padding: 9px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: rgba(5, 13, 23, 0.45);
+    }
+
+    .space-item strong,
+    .specialty-item strong { display: block; font-size: 8.5px; }
+
+    .space-item span,
+    .specialty-item span { display: block; margin-top: 2px; color: var(--muted-2); font-size: 7.5px; }
+
+    .comparison {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+      margin-top: 12px;
+    }
+
+    .comparison-lane {
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(5, 13, 23, 0.48);
+    }
+
+    .comparison-lane strong { display: block; color: var(--cyan); font-size: 9px; }
+
+    .comparison-lane p { margin: 5px 0 0; color: var(--muted); font-size: 8px; }
+
+    .memory-law {
+      margin-top: 14px;
+      padding: 12px;
+      border: 1px solid rgba(185, 156, 255, 0.26);
+      border-radius: 10px;
+      color: #d3c8ed;
+      background: var(--violet-soft);
+      font-size: 10px;
+      text-align: center;
+    }
+
+    .framework-boundary {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .boundary-card {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(10, 21, 36, 0.72);
+    }
+
+    .boundary-card.core { border-top-color: var(--cyan); }
+    .boundary-card.state { border-top-color: var(--violet); }
+
+    .boundary-card h3 { margin: 0 0 8px; font-size: 13px; }
+
+    .boundary-card ul {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 7px 20px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .boundary-card li { color: var(--muted); font-size: 9px; }
+
+    .boundary-card li::before { margin-right: 6px; color: var(--cyan); content: "—"; }
+    .boundary-card.state li::before { color: var(--violet); }
+
+    footer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 20px;
+      margin-top: 20px;
+      padding: 22px 4px;
+      border-top: 1px solid var(--line);
+      color: var(--muted-2);
+      font-size: 10px;
+    }
+
+    footer strong { color: var(--muted); }
+
+    footer code {
+      color: var(--cyan);
+      font-family: var(--mono);
+      font-size: 9px;
+    }
+
+    @media (max-width: 1180px) {
+      .control-deck { grid-template-columns: auto minmax(0, 1fr); }
+      .state-controls { grid-column: 1 / -1; justify-content: flex-start; }
+      .workspace { grid-template-columns: minmax(0, 1fr) 290px; }
+      .kernel-layout { grid-template-columns: 120px minmax(0, 1fr); }
+      .rail.durable { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, 1fr); }
+      .rail.durable .rail-title { grid-column: 1 / -1; }
+      .adapter-grid { grid-template-columns: repeat(4, 1fr); }
+    }
+
+    @media (max-width: 900px) {
+      .doctrine { grid-template-columns: 1fr; }
+      .control-deck { position: relative; top: auto; grid-template-columns: 1fr; }
+      .view-tabs, .state-controls { justify-content: flex-start; overflow-x: auto; }
+      .workspace { grid-template-columns: 1fr; }
+      .inspector { position: relative; top: auto; min-height: 0; }
+      .surface-grid { grid-template-columns: repeat(2, 1fr); }
+      .mode-grid { grid-template-columns: repeat(3, 1fr); }
+      .kernel-layout { grid-template-columns: 1fr; }
+      .rail.human, .rail.durable { display: grid; grid-template-columns: repeat(2, 1fr); }
+      .rail-title { grid-column: 1 / -1; }
+      .kernel-steps { grid-template-columns: repeat(3, 1fr); }
+      .kernel-step { min-height: 120px; border-bottom: 1px solid var(--line); }
+      .learning-grid { grid-template-columns: 1fr; }
+      .proof-grid { grid-template-columns: repeat(2, 1fr); }
+      .view-heading { grid-template-columns: 1fr; align-items: start; }
+    }
+
+    @media (max-width: 620px) {
+      .app { width: min(100% - 20px, 1560px); padding-top: 14px; }
+      .topbar-note { display: none; }
+      .hero { padding: 28px 20px; border-radius: 20px; }
+      h1 { font-size: clamp(36px, 13vw, 62px); }
+      .hero-copy { font-size: 15px; }
+      .surface-grid, .context-strip, .meaning-flow, .final-row, .framework-boundary { grid-template-columns: 1fr; }
+      .meaning-flow { gap: 7px; }
+      .meaning-step:not(:last-child)::after { display: none; }
+      .mode-grid { grid-template-columns: repeat(2, 1fr); }
+      .kernel-steps { grid-template-columns: repeat(2, 1fr); }
+      .adapter-grid { grid-template-columns: repeat(2, 1fr); }
+      .truth-strip, .proof-grid, .recovery-sequence { grid-template-columns: 1fr; }
+      .rail.human, .rail.durable { grid-template-columns: 1fr; }
+      .flywheel { transform: scale(0.88); margin: -14px auto; }
+      .boundary-card ul { grid-template-columns: 1fr; }
+      footer { grid-template-columns: 1fr; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="Clementine universal harness target architecture">
+        <span class="brand-mark" aria-hidden="true">C</span>
+        <span class="brand-copy"><strong>Clementine</strong><span>Universal harness · target</span></span>
+      </a>
+      <span class="topbar-note"><span class="live-dot" aria-hidden="true"></span>Framework view · provider neutral</span>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <p class="eyebrow">End-state system map</p>
+        <h1 id="hero-title">One harness.<br><span>Every task. Every surface.</span></h1>
+        <p class="hero-copy">A blank install can understand, discover, plan, act, recover, and learn. Prior use makes Clem faster—not capable. Chat, Workflows, Spaces, Memory, plugins, and specialty profiles all enter one governed execution system.</p>
+        <div class="promise-row" aria-label="Permanent product promises">
+          <span class="promise">Cold-start capable</span>
+          <span class="promise">Proportional control</span>
+          <span class="promise">Evidence-backed outcomes</span>
+          <span class="promise">Provider-neutral core</span>
+        </div>
+      </section>
+
+      <section class="doctrine" aria-label="Architecture doctrine">
+        <div class="doctrine-card"><strong>Capability is structural</strong><span>Live contracts and exact instances decide what can run—not task vocabulary or remembered names.</span></div>
+        <div class="doctrine-card"><strong>Complexity must earn control</strong><span>Direct, loop, pipeline, or graph is chosen by recovery and state needs, never by fashion.</span></div>
+        <div class="doctrine-card"><strong>Learning is advisory</strong><span>Memory shortens discovery, but every warm path rejoins the same live validation and authority boundary.</span></div>
+      </section>
+
+      <nav class="control-deck" aria-label="Architecture controls">
+        <div class="view-tabs" role="tablist" aria-label="Architecture views">
+          <button class="view-tab" type="button" role="tab" aria-selected="true" aria-controls="system-view" id="system-tab" data-view="system">System map</button>
+          <button class="view-tab" type="button" role="tab" aria-selected="false" aria-controls="walkthrough-view" id="walkthrough-tab" data-view="walkthrough">Task walkthrough</button>
+          <button class="view-tab" type="button" role="tab" aria-selected="false" aria-controls="learning-view" id="learning-tab" data-view="learning">Memory + Spaces</button>
+        </div>
+
+        <div class="scenario-strip" aria-label="Choose a representative task shape">
+          <button class="scenario-button" type="button" aria-pressed="true" data-scenario="direct">Connected read</button>
+          <button class="scenario-button" type="button" aria-pressed="false" data-scenario="collection">Bounded collection</button>
+          <button class="scenario-button" type="button" aria-pressed="false" data-scenario="compound">Artifact + team update</button>
+          <button class="scenario-button" type="button" aria-pressed="false" data-scenario="async">Async recording</button>
+          <button class="scenario-button" type="button" aria-pressed="false" data-scenario="dependency">Missing capability</button>
+        </div>
+
+        <div class="state-controls">
+          <button class="toggle-button" id="warm-toggle" type="button" aria-pressed="false"><span class="toggle-track" aria-hidden="true"></span><span id="warm-label">Cold start</span></button>
+          <button class="toggle-button" id="authority-toggle" type="button" aria-pressed="false"><span class="toggle-track" aria-hidden="true"></span><span>Authority only</span></button>
+          <label class="micro-label" for="failure-select">Inject</label>
+          <select class="failure-select" id="failure-select">
+            <option value="none">No failure</option>
+            <option value="renamed">Renamed action</option>
+            <option value="schema">Schema drift</option>
+            <option value="connection">Missing connection</option>
+            <option value="crash">Crash after commit</option>
+            <option value="choice">Human choice needed</option>
+          </select>
+        </div>
+      </nav>
+
+      <section class="view-panel" id="system-view" role="tabpanel" aria-labelledby="system-tab">
+        <div class="workspace">
+          <div class="map" id="system-map">
+            <div class="map-label"><h2>Many surfaces, one Clem</h2><span>Entry + projection · never alternate authority</span></div>
+            <div class="surface-grid">
+              <button class="node surface-card" type="button" data-node="chat" data-scenarios="direct collection compound dependency" data-title="Chat" data-detail="Real-time collaboration, progress, dependency resolution, and a presentation of the same canonical Outcome used everywhere else.">
+                <span class="node-topline"><span class="node-icon">CH</span><span class="node-tag">Surface</span></span><span class="node-title">Chat</span><span class="node-copy">Ask, collaborate, resolve, and follow work.</span>
+              </button>
+              <button class="node surface-card" type="button" data-node="workflows" data-scenarios="collection compound async" data-title="Workflows" data-detail="Repeatable or scheduled intentions compile into ordinary task plans. Workflows add durable activation, not a second execution engine.">
+                <span class="node-topline"><span class="node-icon">WF</span><span class="node-tag">Surface</span></span><span class="node-title">Workflows</span><span class="node-copy">Repeatable intentions with durable activation.</span>
+              </button>
+              <button class="node surface-card" type="button" data-node="spaces" data-scenarios="direct collection compound async dependency" data-title="Spaces" data-detail="A governed project context and interactive view over resources, artifacts, policies, notes, and activity. A Space narrows context; it never widens authority.">
+                <span class="node-topline"><span class="node-icon">SP</span><span class="node-tag">Context</span></span><span class="node-title">Spaces</span><span class="node-copy">Shared project context, resources, and views.</span>
+              </button>
+              <button class="node surface-card" type="button" data-node="automations" data-scenarios="async" data-title="Automations" data-detail="Timers, events, background wakeups, and external callbacks enter the same accepted-source and execution lifecycle as interactive requests.">
+                <span class="node-topline"><span class="node-icon">AU</span><span class="node-tag">Activation</span></span><span class="node-title">Automations</span><span class="node-copy">Timers, events, background work, and wakeups.</span>
+              </button>
+            </div>
+
+            <div class="vertical-connector" aria-hidden="true"></div>
+
+            <button class="node ingress" type="button" data-node="ingress" data-scenarios="direct collection compound async dependency" data-title="Accepted Source + Session Lineage" data-detail="Every task begins from exact accepted bytes, a source identity, and a durable lineage. Every continuation, retry, and projection remains bound to it.">
+              <span class="node-icon">01</span>
+              <span><span class="node-title">Accepted Source + Session Lineage</span><span class="node-copy">One immutable ingress for interactive, scheduled, resumed, and event-driven work.</span></span>
+              <span class="authority-chip">CANONICAL</span>
+            </button>
+
+            <div class="vertical-connector" aria-hidden="true"></div>
+
+            <section class="core-shell" aria-labelledby="core-title">
+              <div class="core-header"><div><span class="micro-label">One identity and context layer</span><h3 id="core-title">Clem Core</h3></div><p>Small constitution. Consistent personality. No provider, task noun, or user instance embedded in the framework.</p></div>
+              <div class="context-strip">
+                <div class="context-item"><strong>Constitution</strong><span>Product behavior + safety invariants</span></div>
+                <div class="context-item"><strong>Session + Space</strong><span>Current project and resource context</span></div>
+                <div class="context-item" data-authority="advisory"><strong>Sourced memory</strong><span>Relevant, validated hints only</span></div>
+                <div class="context-item"><strong>Live snapshot</strong><span>Capabilities, accounts, schemas, policy</span></div>
+              </div>
+              <div class="meaning-flow">
+                <button class="node meaning-step" type="button" data-node="understand" data-scenarios="direct collection compound async dependency" data-title="Understand" data-detail="Interpret the task semantically: desired facts, artifacts, changes, constraints, and completion conditions—not provider or domain keywords."><strong>Understand</strong><span>Semantic intent + requirements</span></button>
+                <button class="node meaning-step" type="button" data-node="preserve" data-scenarios="direct collection compound async dependency" data-title="Preserve" data-detail="Freeze requirement coverage and accepted meaning so later planning, models, tools, retries, and surfaces cannot silently erase part of the task."><strong>Preserve</strong><span>Coverage + accepted meaning</span></button>
+                <button class="node meaning-step" type="button" data-node="control" data-scenarios="direct collection compound async dependency" data-title="Decide Control" data-detail="Choose the least complex execution form that can expose the task's state, recovery, effect, and human-boundary needs."><strong>Decide control</strong><span>Complexity assessment</span></button>
+                <button class="node meaning-step" type="button" data-node="admit" data-scenarios="direct collection compound async dependency" data-title="Admit" data-detail="Compile a durable Task Execution Plan or a typed dependency. Nothing crosses externally until the plan and exact call authority agree."><strong>Admit</strong><span>Plan or typed dependency</span></button>
+              </div>
+            </section>
+
+            <div class="vertical-connector" aria-hidden="true"></div>
+
+            <section class="mode-router" aria-labelledby="mode-title">
+              <div class="mode-intro"><strong id="mode-title">Proportional orchestration</strong><span>The least complex truthful controller wins</span></div>
+              <div class="mode-grid">
+                <button class="mode-node" type="button" data-mode="conversation" data-title="Conversation" data-detail="Answer or collaborate without execution machinery when no external work is needed."><strong>Conversation</strong><span>No executor.</span></button>
+                <button class="mode-node" type="button" data-mode="direct" data-title="Direct" data-detail="One fully bound operation with a clear completion proof. No graph is invented around a one-step task."><strong>Direct</strong><span>One ready call.</span></button>
+                <button class="mode-node" type="button" data-mode="loop" data-title="Bounded Loop" data-detail="Homogeneous, typed repetition such as pagination or polling, with explicit budget, continuation state, and terminal conditions."><strong>Bounded loop</strong><span>Typed iteration.</span></button>
+                <button class="mode-node" type="button" data-mode="pipeline" data-title="Durable Pipeline" data-detail="Ordered work with meaningful checkpoints and recovery, but no branches or joins that justify a graph."><strong>Durable pipeline</strong><span>Ordered checkpoints.</span></button>
+                <button class="mode-node" type="button" data-mode="graph" data-title="Durable Graph" data-detail="Branches, joins, plural effects, waits, human gates, or independently recoverable nodes make complexity explicit and controllable."><strong>Durable graph</strong><span>Visible state + transitions.</span></button>
+              </div>
+            </section>
+
+            <div class="vertical-connector" aria-hidden="true"></div>
+
+            <section class="kernel-layout" aria-label="Universal execution kernel and its boundaries">
+              <div class="rail human">
+                <div class="rail-title">Human boundary</div>
+                <button class="rail-card" type="button" data-node="dependency" data-scenarios="dependency compound async" data-title="Typed Dependency" data-detail="Clem parks only when the next safe edge belongs to the person: connection, account/resource choice, essential input, approval, certification, or uncertain effect."><strong>Typed dependency</strong><span>Exact owner + wake condition</span></button>
+                <button class="rail-card" type="button" data-node="ask-once" data-scenarios="dependency compound" data-title="Ask Once" data-detail="A dependency request is generated from typed state. Its authoring can improve wording but cannot change the required answer or crash the task."><strong>Ask once</strong><span>Value-opaque, resumable request</span></button>
+                <button class="rail-card" type="button" data-node="resume" data-scenarios="dependency async compound" data-title="Validated Resume" data-detail="The answer or event is matched to the exact parked node, validated, and compiled into an immutable successor plan before execution resumes."><strong>Validate + resume</strong><span>No ambient “go ahead” authority</span></button>
+              </div>
+
+              <div class="kernel">
+                <div class="kernel-title"><strong>Universal execution kernel</strong><span>Same protocol in every mode</span></div>
+                <div class="kernel-steps">
+                  <button class="kernel-step" type="button" data-node="resolve" data-scenarios="direct collection compound async dependency" data-title="Resolve" data-detail="Use advisory retrieval and bounded live discovery to find structurally eligible capabilities. Names and recipes are hints that must self-heal through the live catalog."><span class="kernel-index">01</span><strong>Resolve</strong><span>Hints → bounded discovery → candidates</span></button>
+                  <button class="kernel-step" type="button" data-node="bind" data-scenarios="direct collection compound async" data-title="Bind" data-detail="Bind a trusted capability contract to a fresh live observation, exact account/resource, and exact arguments with provenance."><span class="kernel-index">02</span><strong>Bind</strong><span>Contract + observation + instance</span></button>
+                  <button class="kernel-step" type="button" data-node="authorize" data-scenarios="direct collection compound async" data-title="Authorize" data-detail="Intersect user authority, effect ceiling, policy, budgets, task requirements, and the plan's exact node scope. This grants one fenced logical call—not broad tool access."><span class="kernel-index">03</span><strong>Authorize</strong><span>Effects + policy + fenced call</span></button>
+                  <button class="kernel-step" type="button" data-node="execute" data-scenarios="direct collection compound async" data-title="Execute" data-detail="The selected runner executes a node through the single dispatch boundary. Direct, loop, pipeline, and graph scheduling differ; physical crossing does not."><span class="kernel-index">04</span><strong>Execute</strong><span>Reserve → cross exactly once</span></button>
+                  <button class="kernel-step" type="button" data-node="settle" data-scenarios="direct collection compound async" data-title="Settle" data-detail="Record returned, refused, uncertain, or failed physical outcomes. Use receipts, readback, reconciliation, and compensation where supported."><span class="kernel-index">05</span><strong>Settle</strong><span>Receipt + reconciliation + proof</span></button>
+                  <button class="kernel-step" type="button" data-node="reduce" data-scenarios="direct collection compound async dependency" data-title="Reduce" data-detail="Reduce requirement coverage and node evidence into one canonical Outcome with current owner, remaining work, external uncertainty, and the next wake action."><span class="kernel-index">06</span><strong>Reduce</strong><span>Evidence → one Outcome truth</span></button>
+                </div>
+                <div class="kernel-law">One plan authority · one dispatch boundary · one effect ledger · one evidence reducer</div>
+              </div>
+
+              <div class="rail durable">
+                <div class="rail-title">Durable control</div>
+                <button class="rail-card" type="button" data-node="journal" data-scenarios="collection compound async dependency" data-title="Event Journal" data-detail="Append-only source, plan, call, settlement, dependency, wake, and outcome facts let Clem explain and recover from the exact frontier."><strong>Event journal</strong><span>Replayable system truth</span></button>
+                <button class="rail-card" type="button" data-node="leases" data-scenarios="collection compound async" data-title="Leases + Checkpoints" data-detail="Logical-call identity, leases, checkpoints, and cancellation generations ensure that retries or restarts do not silently duplicate work."><strong>Leases + checkpoints</strong><span>Restart from exact frontier</span></button>
+                <button class="rail-card" type="button" data-node="recovery" data-scenarios="collection compound async dependency" data-title="Recovery + Wake" data-detail="Every unfinished state has an owner and a wake condition: host retry, provider event, time, human response, discovery, reconciliation, or cancellation."><strong>Recovery + wake</strong><span>Nothing silently stalls</span></button>
+              </div>
+            </section>
+
+            <div class="vertical-connector" aria-hidden="true"></div>
+
+            <section class="adapter-shell" aria-labelledby="adapter-title">
+              <div class="adapter-head"><strong id="adapter-title">Capability + plugin perimeter</strong><span>Adapters translate; the kernel owns meaning, authority, effects, and evidence</span></div>
+              <div class="adapter-grid">
+                <button class="adapter" type="button" data-node="host-tools" data-scenarios="direct collection compound async" data-title="Host-native tools" data-detail="Local product primitives exposed through the same capability contract, call authority, settlement, and evidence protocol as every other carrier."><strong>Host tools</strong><span>Native</span></button>
+                <button class="adapter" type="button" data-node="mcp" data-scenarios="direct collection compound async" data-title="Local MCP" data-detail="Local or remote MCP servers contribute live operations through a bounded adapter; server and tool names remain outside the universal core."><strong>Local MCP</strong><span>Protocol</span></button>
+                <button class="adapter" type="button" data-node="cli" data-scenarios="direct collection compound" data-title="Local CLI" data-detail="CLI capabilities participate only through a typed adapter with explicit effects, inputs, outputs, settlement, and process/network crossing control."><strong>Local CLI</strong><span>Process</span></button>
+                <button class="adapter" type="button" data-node="apps" data-scenarios="direct collection compound async dependency" data-title="Connected Apps" data-detail="Connected app catalogs, accounts, and schemas are observed live. Saved operation names are hints, never permanent dependencies."><strong>Connected apps</strong><span>Catalog</span></button>
+                <button class="adapter" type="button" data-node="recording" data-scenarios="async" data-title="Recording + Recall" data-detail="Recording, transcript, and media events become typed async nodes and evidence, then flow through the same graph, memory, and Outcome system."><strong>Recording</strong><span>Async media</span></button>
+                <button class="adapter" type="button" data-node="browser" data-scenarios="direct collection compound" data-title="Browser + Computer Use" data-detail="Interactive environments are carriers with bounded observation/action effects and explicit evidence, not an escape hatch around the kernel."><strong>Browser</strong><span>Interactive</span></button>
+                <button class="adapter" type="button" data-node="plugins" data-scenarios="direct collection compound async dependency" data-title="Skills + Plugins" data-detail="Plugins add capabilities, policies, runners, renderers, and hints. They compose around a small stable spine and cannot mint ambient authority."><strong>Skills + plugins</strong><span>Extension</span></button>
+              </div>
+              <div class="truth-strip">
+                <div class="truth-item"><strong>Contract</strong> · what an operation is able and allowed to do</div>
+                <div class="truth-item"><strong>Observation</strong> · what is live, compatible, and connected now</div>
+                <div class="truth-item"><strong>Instance</strong> · which exact account, resource, and arguments can act</div>
+              </div>
+            </section>
+
+            <div class="vertical-connector" aria-hidden="true"></div>
+
+            <div class="final-row">
+              <button class="outcome-node" type="button" data-node="outcome" data-scenarios="direct collection compound async dependency" data-title="One Canonical Outcome" data-detail="Done, progress, needs input, host-owned wait, failed with a proven reason, cancelled, or reconciled. Every surface renders the same truth rather than inventing its own terminal.">
+                <span class="final-title"><strong>One canonical Outcome</strong><span>Returns to origin</span></span>
+                <p class="final-copy">What completed · artifacts · evidence · what remains · current owner · next wake · effect uncertainty.</p>
+                <span class="mini-pills"><span class="mini-pill">Chat</span><span class="mini-pill">Workflow history</span><span class="mini-pill">Space activity</span><span class="mini-pill">Notifications</span></span>
+              </button>
+              <button class="memory-node" type="button" data-node="memory" data-scenarios="direct collection compound async dependency" data-authority="advisory" data-title="Validated Memory Flywheel" data-detail="Evidence-backed outcomes can promote sourced facts, preferences, rankings, mappings, topology hints, recovery knowledge, and specialty profiles. Retrieval always rejoins live validation.">
+                <span class="final-title"><strong>Validated memory flywheel</strong><span>Advisory</span></span>
+                <p class="final-copy">Outcome evidence → reflect → validate → promote → retrieve → revalidate live.</p>
+                <span class="mini-pills"><span class="mini-pill">Facts</span><span class="mini-pill">Preferences</span><span class="mini-pill">Mappings</span><span class="mini-pill">Profiles</span><span class="mini-pill">Recovery</span></span>
+              </button>
+            </div>
+
+            <div class="bottom-law"><strong>Chat, Workflows, Spaces, Memory, plugins, and specialty profiles are ways to enter, view, or accelerate one Clem.</strong> None is a separate agent with separate truth.</div>
+          </div>
+
+          <aside class="inspector" aria-live="polite" aria-label="Selected task path and architecture details">
+            <div class="inspector-head"><span class="micro-label">Selected task shape</span><h2 id="scenario-title">One connected read</h2><span class="inspector-mode" id="scenario-mode">Direct</span></div>
+            <div class="inspector-body">
+              <p class="inspector-summary" id="scenario-summary">The request, capability, account, schema, resource, and arguments are already resolvable. One governed call and one evidence reduction are enough.</p>
+              <section class="inspector-section"><h3>Current path</h3><ol class="path-list" id="scenario-path"><li>Freeze the accepted request</li><li>Use bounded live discovery from blank state</li><li>Resolve or revalidate one read capability</li><li>Bind exact account, resource, and arguments</li><li>Cross once and settle the receipt</li><li>Reduce evidence into one Outcome</li></ol></section>
+              <section class="inspector-section"><h3>Permanent guarantees</h3><ul class="guarantee-list" id="scenario-guarantees"><li>No graph invented for a one-step task</li><li>Warm and cold paths share live validation</li><li>Provider latency is not hidden behind model loops</li></ul></section>
+              <div class="recovery-box"><strong id="failure-title">Recovery injected</strong><p id="failure-copy"></p></div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view-panel" id="walkthrough-view" role="tabpanel" aria-labelledby="walkthrough-tab" hidden>
+        <div class="walkthrough-shell">
+          <header class="view-heading"><div><span class="micro-label">One accepted task · one durable lifecycle</span><h2 id="walkthrough-title">Task walkthrough</h2><p id="walkthrough-summary">The control form changes with the task. The authority, dispatch, settlement, evidence, and Outcome protocols do not.</p></div><span class="mode-oracle" id="walkthrough-mode">Selected · Direct</span></header>
+          <div class="task-prompt" id="task-prompt">“Retrieve the requested records from the selected connected source for the specified time window.”</div>
+          <div class="journey" id="journey" aria-label="Selected task execution path">
+            <article class="journey-card"><span class="journey-type">source</span><h3>Accepted request</h3><p>Meaning and constraints are frozen.</p><div class="journey-proof">Exact source lineage</div></article>
+            <article class="journey-card"><span class="journey-type">resolve</span><h3>Resolve + bind</h3><p>One live read capability is structurally validated.</p><div class="journey-proof">Contract + account + schema</div></article>
+            <article class="journey-card"><span class="journey-type">call</span><h3>Exact read</h3><p>A fenced call crosses the universal dispatch boundary.</p><div class="journey-proof">Physical settlement</div></article>
+            <article class="journey-card"><span class="journey-type">proof</span><h3>Reduce evidence</h3><p>Returned data and receipt satisfy the requirement.</p><div class="journey-proof">Evidence coverage</div></article>
+            <article class="journey-card"><span class="journey-type">outcome</span><h3>Publish Outcome</h3><p>The originating surface renders canonical truth.</p><div class="journey-proof">Done / needs input / failed</div></article>
+          </div>
+          <div class="proof-grid">
+            <div class="proof-card"><strong>Requirement coverage</strong><p>Every requested fact, artifact, effect, constraint, and delivery condition remains represented until proved or explicitly blocked.</p><div class="proof-value" id="coverage-value">Complete before terminal</div></div>
+            <div class="proof-card"><strong>Exact authority</strong><p>Capability contract, live schema, account/resource, arguments, effect scope, and logical-call identity agree before crossing.</p><div class="proof-value">Narrower than model access</div></div>
+            <div class="proof-card"><strong>Physical truth</strong><p>Reservations and settlements distinguish no-call, refused, returned, failed, and uncertain effects across crashes and retries.</p><div class="proof-value">No duplicate fallback</div></div>
+            <div class="proof-card"><strong>Evidence terminal</strong><p>Completion is reduced from receipts and readback—not hopeful prose, nominal success envelopes, or model self-report.</p><div class="proof-value">One canonical Outcome</div></div>
+          </div>
+          <div class="recovery-sequence" aria-label="Universal recovery sequence">
+            <div class="recovery-step">Detect exact unfinished frontier</div>
+            <div class="recovery-step">Set owner + wake condition</div>
+            <div class="recovery-step">Reconcile uncertain crossings</div>
+            <div class="recovery-step">Admit immutable successor</div>
+            <div class="recovery-step">Resume without duplicate work</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view-panel" id="learning-view" role="tabpanel" aria-labelledby="learning-tab" hidden>
+        <div class="learning-shell">
+          <header class="view-heading"><div><span class="micro-label">Compounding usefulness without compounding authority</span><h2>Memory, Spaces, and specialty profiles</h2><p>Clem learns what helps, where it came from, when it was valid, and how to recheck it. User state personalizes the framework without entering the framework.</p></div><span class="mode-oracle" id="learning-state">Cold path shown</span></header>
+          <div class="learning-grid">
+            <section class="flywheel-card" aria-labelledby="flywheel-title">
+              <div class="flywheel-head"><span class="micro-label">Advisory learning loop</span><h3 id="flywheel-title">Evidence becomes a faster next path</h3><p>No unsourced success, stale alias, or remembered argument can silently become execution authority.</p></div>
+              <div class="flywheel" aria-label="Outcome evidence to reflect to validate to promote to retrieve to revalidate live">
+                <div class="flywheel-center">Same live validation + execution kernel</div>
+                <div class="flywheel-point">Outcome evidence</div>
+                <div class="flywheel-point">Reflect</div>
+                <div class="flywheel-point">Validate</div>
+                <div class="flywheel-point">Promote</div>
+                <div class="flywheel-point">Retrieve hint</div>
+                <div class="flywheel-point">Revalidate live</div>
+              </div>
+              <div class="memory-law">Memory shortens the path. It never makes cold execution unreachable or changes the safety boundary.</div>
+            </section>
+
+            <div class="learning-side">
+              <section class="space-card" aria-labelledby="space-title"><span class="micro-label">A context boundary, not another agent</span><h3 id="space-title">Spaces</h3><p>Clem-authored project views over governed state.</p><div class="space-grid"><div class="space-item"><strong>Resources</strong><span>Connected accounts, datasets, files, and artifacts</span></div><div class="space-item"><strong>Knowledge</strong><span>Sourced facts, notes, decisions, and documents</span></div><div class="space-item"><strong>Policies</strong><span>Project constraints and explicit standing preferences</span></div><div class="space-item"><strong>Activity</strong><span>Plans, outcomes, dependencies, and current owners</span></div></div></section>
+              <section class="specialty-card" aria-labelledby="specialty-title"><span class="micro-label">Faster expertise · same Clem</span><h3 id="specialty-title">Specialty profiles</h3><p>Inline execution profiles narrow context and prewarm discovery. They do not create a second harness.</p><div class="specialty-grid"><div class="specialty-item"><strong>Can contain</strong><span>Context, schema hints, topology hints, model/cost budgets</span></div><div class="specialty-item"><strong>Cannot own</strong><span>Credentials, dispatcher, memory authority, or final answer</span></div></div></section>
+              <section class="comparison-card" aria-labelledby="comparison-title"><span class="micro-label">Equivalent truth · different distance</span><h3 id="comparison-title">Cold and warm execution</h3><p id="comparison-copy">A blank install begins with bounded live discovery.</p><div class="comparison"><div class="comparison-lane"><strong>Cold</strong><p>Live catalog → structural validation → exact binding → kernel.</p></div><div class="comparison-lane"><strong>Warm</strong><p>Validated hint → live revalidation → exact binding → same kernel.</p></div></div></section>
+            </div>
+          </div>
+
+          <div class="framework-boundary">
+            <section class="boundary-card core"><h3>Framework core — universal and small</h3><ul><li>Accepted source + lineage</li><li>Requirement coverage</li><li>Control complexity</li><li>Task execution plan</li><li>Capability protocol</li><li>Dispatch + settlement</li><li>Evidence + Outcome</li><li>Dependency + recovery</li></ul></section>
+            <section class="boundary-card state"><h3>User and plugin state — learned or installed</h3><ul><li>Connected capabilities</li><li>Accounts + resources</li><li>Space context</li><li>Sourced memories</li><li>Procedure hints</li><li>Specialty profiles</li><li>Provider adapters</li><li>Presentation preferences</li></ul></section>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer><span><strong>Target doctrine:</strong> core owns primitives; plugins own behavior; memory accelerates; live validation authorizes; evidence decides completion.</span><code>NO DOMAIN NOUNS · NO PROVIDER ROUTING · NO PARALLEL CLEMS</code></footer>
+  </div>
+
+  <script>
+    const scenarios = {
+      direct: {
+        title: "One connected read",
+        mode: "Direct",
+        modeKey: "direct",
+        summary: "The request, capability, account, schema, resource, and arguments are already resolvable. One governed call and one evidence reduction are enough.",
+        prompt: "Retrieve the requested records from the selected connected source for the specified time window.",
+        path: ["Freeze the accepted request", "Resolve or revalidate one read capability", "Bind exact account, resource, and arguments", "Cross once and settle the receipt", "Reduce evidence into one Outcome"],
+        guarantees: ["No graph invented for a one-step task", "Warm and cold paths share live validation", "Provider latency is not hidden behind model loops"],
+        journey: [
+          ["source", "Accepted request", "Meaning and constraints are frozen.", "Exact source lineage"],
+          ["resolve", "Resolve + bind", "One live read capability is structurally validated.", "Contract + account + schema"],
+          ["call", "Exact read", "A fenced call crosses the universal dispatch boundary.", "Physical settlement"],
+          ["proof", "Reduce evidence", "Returned data and receipt satisfy the requirement.", "Evidence coverage"],
+          ["outcome", "Publish Outcome", "The originating surface renders canonical truth.", "Done / needs input / failed"]
+        ]
+      },
+      collection: {
+        title: "Bounded collection",
+        mode: "Bounded loop",
+        modeKey: "loop",
+        summary: "The operation repeats homogeneously through pages or a bounded set. Continuation state, budgets, and terminal conditions are explicit without manufacturing a graph.",
+        prompt: "Collect the requested result set, respecting the declared bound, pagination, fields, and completeness conditions.",
+        path: ["Freeze count, fields, and completeness", "Resolve one structurally eligible read", "Iterate with typed cursor and budget", "Reject partial or malformed completion claims", "Publish the evidence-backed collection Outcome"],
+        guarantees: ["Every iteration has the same typed role", "Cursors and pagination are durable state", "No empty or partial result silently funds a later write"],
+        journey: [
+          ["source", "Collection contract", "Bound, projection, and completeness are frozen.", "Requirement coverage"],
+          ["resolve", "Bind source", "The current operation and account are validated.", "Live schema observation"],
+          ["loop", "Typed iteration", "Cursor, page evidence, and attempt budget advance.", "Durable continuation"],
+          ["settle", "Aggregate + verify", "Strongest probes decide complete, partial, or malformed.", "Collection evidence"],
+          ["outcome", "Publish Outcome", "The verified set or exact blocker returns.", "One terminal truth"]
+        ]
+      },
+      compound: {
+        title: "Artifact + team update",
+        mode: "Durable graph",
+        modeKey: "graph",
+        summary: "The task has plural effects and readbacks. Their dependencies, human boundaries, and independent recovery are more understandable as explicit nodes and transitions.",
+        prompt: "Analyze the current source records, create a structured artifact with the requested fields, and update the selected team system with the resulting recommendations.",
+        path: ["Preserve every requested field and effect", "Bind source, artifact, and destination roles", "Read and derive findings", "Write then verify the artifact", "Update then verify the team destination", "Reduce all sink proofs into one Outcome"],
+        guarantees: ["No effect disappears during planning", "Every mutation has its own authority and proof", "A recovered node cannot duplicate a settled sibling"],
+        journey: [
+          ["read", "Read source", "Acquire receipt-backed records and required fields.", "Source evidence"],
+          ["compute", "Derive findings", "Normalize fields and produce grounded recommendations.", "Deterministic/model proof"],
+          ["write", "Write artifact", "Create or update the chosen structured artifact.", "Mutation receipt"],
+          ["readback", "Verify artifact", "Read the exact created resource and compare content.", "Artifact proof"],
+          ["write", "Update destination", "Apply the requested recommendations to the team system.", "Separate call authority"],
+          ["readback", "Verify destination", "Confirm the exact remote state after the effect.", "Destination proof"],
+          ["outcome", "Publish Outcome", "Both effects and all fields must be covered.", "Multi-sink reduction"]
+        ]
+      },
+      async: {
+        title: "Async recording",
+        mode: "Durable graph",
+        modeKey: "graph",
+        summary: "The task spans an external wait, event resumption, processing, and later effects. Durable graph state makes the wait owner and recovery frontier explicit.",
+        prompt: "Capture the selected session, wait for the recording and transcript, derive the requested outputs, and update the governed project state.",
+        path: ["Bind the exact recording context", "Start once and persist the job receipt", "Park on provider event or bounded poll", "Resume from the exact callback frontier", "Transform, write, verify, and publish"],
+        guarantees: ["Waiting is a first-class owned state", "Restarts never start the recording twice", "Callbacks re-enter the same source and task lineage"],
+        journey: [
+          ["start", "Start async work", "Create one provider job under fenced authority.", "Job receipt"],
+          ["wait", "Park + wake", "External event, time, or bounded polling owns the wait.", "Wake condition"],
+          ["resume", "Resume exact node", "Validate event identity and continue the same plan.", "Durable frontier"],
+          ["compute", "Process evidence", "Transcript or recording data becomes typed output.", "Verified input"],
+          ["effect", "Apply outputs", "Downstream nodes execute with separate authority.", "Receipts + readback"],
+          ["outcome", "Publish Outcome", "All finished and waiting states reduce together.", "One task truth"]
+        ]
+      },
+      dependency: {
+        title: "Missing capability",
+        mode: "Typed dependency",
+        modeKey: "none",
+        summary: "The task is understood, but the next safe edge belongs to the person or environment. Clem parks the exact node instead of guessing, failing, or losing the task.",
+        prompt: "Complete the requested task using an appropriate connected capability; ask only if the required capability, account, resource, or authority is genuinely unavailable.",
+        path: ["Freeze the complete task", "Prove the missing capability or choice", "Park the exact blocked node", "Ask one typed question", "Validate the answer or connection", "Compile an immutable successor and resume"],
+        guarantees: ["Authoring failure cannot crash the logical task", "The question cannot widen the accepted task", "The task survives restart and resumes exactly once"],
+        journey: [
+          ["source", "Accepted task", "All requested work remains preserved.", "Requirement coverage"],
+          ["resolve", "Bounded resolution", "No exact eligible instance is available.", "Proven blocker"],
+          ["park", "Park exact node", "Owner and wake condition become durable.", "Dependency record"],
+          ["human", "Ask once", "Request only the missing connection, choice, or input.", "Typed request"],
+          ["resume", "Validate + resume", "The answer admits a successor plan, not ambient authority.", "Exact lineage"],
+          ["outcome", "Continue normally", "Execution rejoins the universal kernel.", "Same final Outcome"]
+        ]
+      }
+    };
+
+    const failureCopy = {
+      none: ["", ""],
+      renamed: ["Renamed action", "The saved operation is only a hint. Clem renews the bounded live catalog, selects a structurally compatible read in the same namespace, rebinds it, and never dispatches the stale name."],
+      schema: ["Schema drift", "Live observation invalidates the stale binding. The node parks for bounded rediscovery or a typed dependency; no old argument shape crosses."],
+      connection: ["Missing connection", "The exact node parks with the person as owner and a connection wake condition. The rest of the task remains durable and unchanged."],
+      crash: ["Crash after external commit", "The physical reservation and receipt frontier force reconciliation or readback before retry. Clem does not fall through to a duplicate mutation."],
+      choice: ["Human choice needed", "Clem presents the bounded eligible choices, validates the selected instance, and compiles an immutable successor for the exact parked node."]
+    };
+
+    const nodePathByScenario = {
+      direct: ["chat", "spaces", "ingress", "understand", "preserve", "control", "admit", "resolve", "bind", "authorize", "execute", "settle", "reduce", "host-tools", "mcp", "apps", "browser", "plugins", "outcome", "memory"],
+      collection: ["chat", "workflows", "spaces", "ingress", "understand", "preserve", "control", "admit", "resolve", "bind", "authorize", "execute", "settle", "reduce", "journal", "leases", "recovery", "mcp", "cli", "apps", "browser", "plugins", "outcome", "memory"],
+      compound: ["chat", "workflows", "spaces", "ingress", "understand", "preserve", "control", "admit", "dependency", "ask-once", "resume", "resolve", "bind", "authorize", "execute", "settle", "reduce", "journal", "leases", "recovery", "host-tools", "mcp", "cli", "apps", "browser", "plugins", "outcome", "memory"],
+      async: ["workflows", "spaces", "automations", "ingress", "understand", "preserve", "control", "admit", "dependency", "resume", "resolve", "bind", "authorize", "execute", "settle", "reduce", "journal", "leases", "recovery", "mcp", "apps", "recording", "plugins", "outcome", "memory"],
+      dependency: ["chat", "spaces", "ingress", "understand", "preserve", "control", "admit", "dependency", "ask-once", "resume", "resolve", "reduce", "apps", "plugins", "outcome", "memory"]
+    };
+
+    let activeScenario = "direct";
+    let warm = false;
+
+    const byId = (id) => document.getElementById(id);
+
+    function renderScenario() {
+      const scenario = scenarios[activeScenario];
+      byId("scenario-title").textContent = scenario.title;
+      byId("scenario-mode").textContent = scenario.mode;
+      byId("scenario-summary").textContent = scenario.summary;
+      byId("task-prompt").textContent = `“${scenario.prompt}”`;
+      byId("walkthrough-title").textContent = scenario.title;
+      byId("walkthrough-mode").textContent = `Selected · ${scenario.mode}`;
+      byId("coverage-value").textContent = activeScenario === "dependency" ? "Preserved while parked" : "Complete before terminal";
+
+      const path = [...scenario.path];
+      if (warm && activeScenario !== "dependency") {
+        path.splice(1, 0, "Retrieve a validated hint, then revalidate it live");
+      } else if (!warm && activeScenario !== "dependency") {
+        path.splice(1, 0, "Use bounded live discovery from blank state");
+      }
+      byId("scenario-path").innerHTML = path.map((item) => `<li>${item}</li>`).join("");
+      byId("scenario-guarantees").innerHTML = scenario.guarantees.map((item) => `<li>${item}</li>`).join("");
+      byId("journey").innerHTML = scenario.journey.map(([type, title, copy, proof]) => `
+        <article class="journey-card">
+          <span class="journey-type">${type}</span>
+          <h3>${title}</h3>
+          <p>${copy}</p>
+          <div class="journey-proof">${proof}</div>
+        </article>`).join("");
+
+      document.querySelectorAll("[data-node]").forEach((node) => {
+        node.classList.toggle("is-path", nodePathByScenario[activeScenario].includes(node.dataset.node));
+      });
+      document.querySelectorAll("[data-mode]").forEach((node) => {
+        node.classList.toggle("is-current", node.dataset.mode === scenario.modeKey);
+        node.classList.toggle("is-path", node.dataset.mode === scenario.modeKey);
+      });
+      document.querySelectorAll(".scenario-button").forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.scenario === activeScenario));
+      });
+    }
+
+    function renderLearningState() {
+      byId("warm-label").textContent = warm ? "Warm path" : "Cold start";
+      byId("learning-state").textContent = warm ? "Warm path shown" : "Cold path shown";
+      byId("comparison-copy").textContent = warm
+        ? "A validated hint shortens candidate discovery, then rejoins current catalog, account, schema, policy, and argument validation."
+        : "A blank install begins with bounded live discovery and reaches the same exact binding and execution kernel.";
+      renderScenario();
+    }
+
+    function renderFailure() {
+      const select = byId("failure-select");
+      const [title, copy] = failureCopy[select.value];
+      document.body.classList.toggle("has-failure", select.value !== "none");
+      byId("failure-title").textContent = title;
+      byId("failure-copy").textContent = copy;
+      ["dependency", "journal", "leases", "recovery", "settle", "reduce"].forEach((id) => {
+        const node = document.querySelector(`[data-node="${id}"]`);
+        if (node) node.classList.toggle("is-path", select.value !== "none" || nodePathByScenario[activeScenario].includes(id));
+      });
+    }
+
+    function selectInspectable(node) {
+      document.querySelectorAll(".is-selected").forEach((item) => item.classList.remove("is-selected"));
+      node.classList.add("is-selected");
+      byId("scenario-title").textContent = node.dataset.title || "Architecture detail";
+      byId("scenario-mode").textContent = node.dataset.authority === "advisory" ? "Advisory" : "System responsibility";
+      byId("scenario-summary").textContent = node.dataset.detail || "This component participates in the selected task path.";
+      byId("scenario-path").innerHTML = `<li>Inspecting one component</li><li>Select a task shape to restore the full path</li>`;
+    }
+
+    document.querySelectorAll(".scenario-button").forEach((button) => {
+      button.addEventListener("click", () => {
+        activeScenario = button.dataset.scenario;
+        document.querySelectorAll(".is-selected").forEach((item) => item.classList.remove("is-selected"));
+        renderScenario();
+        renderFailure();
+      });
+    });
+
+    document.querySelectorAll("[data-node], [data-mode]").forEach((node) => {
+      node.addEventListener("click", () => selectInspectable(node));
+    });
+
+    document.querySelectorAll(".view-tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        const nextView = tab.dataset.view;
+        document.querySelectorAll(".view-tab").forEach((item) => item.setAttribute("aria-selected", String(item === tab)));
+        document.querySelectorAll(".view-panel").forEach((panel) => { panel.hidden = panel.id !== `${nextView}-view`; });
+      });
+    });
+
+    byId("warm-toggle").addEventListener("click", (event) => {
+      warm = !warm;
+      event.currentTarget.setAttribute("aria-pressed", String(warm));
+      renderLearningState();
+    });
+
+    byId("authority-toggle").addEventListener("click", (event) => {
+      const enabled = event.currentTarget.getAttribute("aria-pressed") !== "true";
+      event.currentTarget.setAttribute("aria-pressed", String(enabled));
+      document.body.classList.toggle("authority-advisory-hidden", enabled);
+    });
+
+    byId("failure-select").addEventListener("change", renderFailure);
+
+    renderScenario();
+    renderLearningState();
+    renderFailure();
+  </script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/harness/proof-provisioned-execution.test.ts
  *
  * PROVISION FROM PROOF → THE CONSTRUCT EXECUTES (live 2026-08-18
- * sess-mszdq1uz seq 58753): "top five Big Bear Lake restaurants … new Google
+ * session-fixture-proof-provisioning seq 58753): "top five Big Bear Lake restaurants … new Google
  * sheet" compiled route=act fastPath=fanout_action with 14 nodes and ZERO
  * operationIds — the shadow stayed a label and the SDK loop paid for
  * everything. This pins the executable half: the same proof that already made

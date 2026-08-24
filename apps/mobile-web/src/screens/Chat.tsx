@@ -29,6 +29,7 @@ import {
   sendChatMessageAsync,
 } from '../lib/api';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
+import { RunningTasksSheet } from '../components/RunningTasksSheet';
 
 interface Props {
   sessionId?: string;
@@ -172,6 +173,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           />
         ))}
       </div>
+      <RunningTasksSheet composerRef={textareaRef} />
       <form class="chat-composer" onSubmit={(ev) => { ev.preventDefault(); submitDraft(); }}>
         <textarea
           ref={textareaRef}

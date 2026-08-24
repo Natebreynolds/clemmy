@@ -53,6 +53,17 @@ test('a defaulted input referenced via {{input.X}} is NOT required (the 137x-run
   assert.deepEqual(missingWorkflowRunInputs(def, {}), []);
 });
 
+test('an explicitly optional input stays optional even when the prompt references it', () => {
+  const def = workflow({
+    steps: [{ id: 'main', prompt: 'Use {{input.note}} only when supplied.' }],
+    inputs: {
+      note: { type: 'string', required: false },
+    },
+  });
+  assert.deepEqual(collectRequiredWorkflowInputs(def), []);
+  assert.deepEqual(missingWorkflowRunInputs(def, {}), []);
+});
+
 test('normalizeWorkflowRunInputs trims values and maps website/domain aliases to url', () => {
   assert.deepEqual(normalizeWorkflowRunInputs({ website: ' https://example.com ', empty: '   ' }), {
     website: 'https://example.com',

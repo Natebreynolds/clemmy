@@ -112,22 +112,31 @@ let runnerTrustRefreshHandler: RunnerTrustRefreshHandler | null = null;
  * lets approval resolution request that work without creating an import cycle. */
 export function registerRunnerTrustRefreshHandler(handler: RunnerTrustRefreshHandler): void {
   runnerTrustRefreshHandler = handler;
-  setImmediate(() => {
-    for (const row of listPending({ status: 'resolved' })) {
-      if (row.resolution !== 'approved' || row.consumedAt !== null) continue;
-      if (
-        row.tool === SPACE_DATA_RUNNER_TRUST_TOOL
-        && row.args?.spaceDataRunnerTrustVersion === SPACE_DATA_RUNNER_TRUST_VERSION
-      ) {
-        recordRunnerTrustDecision(row);
-      } else if (
-        row.tool === SPACE_CLI_SOURCE_TRUST_TOOL
-        && row.args?.spaceCliSourceTrustVersion === SPACE_CLI_SOURCE_TRUST_VERSION
-      ) {
-        recordCliSourceTrustDecision(row);
-      }
+}
+
+/** Replay approvals resolved while the daemon was offline. Registration stays
+ * side-effect free: importing a chat surface must never open or migrate the
+ * event log from a background callback. The foreground daemon calls this only
+ * after its synchronous event-log boot fence has completed. */
+export function recoverResolvedRunnerTrustApprovals(): number {
+  let recovered = 0;
+  for (const row of listPending({ status: 'resolved' })) {
+    if (row.resolution !== 'approved' || row.consumedAt !== null) continue;
+    if (
+      row.tool === SPACE_DATA_RUNNER_TRUST_TOOL
+      && row.args?.spaceDataRunnerTrustVersion === SPACE_DATA_RUNNER_TRUST_VERSION
+    ) {
+      recovered += 1;
+      recordRunnerTrustDecision(row);
+    } else if (
+      row.tool === SPACE_CLI_SOURCE_TRUST_TOOL
+      && row.args?.spaceCliSourceTrustVersion === SPACE_CLI_SOURCE_TRUST_VERSION
+    ) {
+      recovered += 1;
+      recordCliSourceTrustDecision(row);
     }
-  });
+  }
+  return recovered;
 }
 
 function normalizedPolicy(source: SpaceDataSource): RunnerTrustSnapshot['schedulePolicy'] {

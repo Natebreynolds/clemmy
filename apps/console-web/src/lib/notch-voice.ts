@@ -299,7 +299,11 @@ export class NotchVoice {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ message, sessionId: 'console:voice' }),
+      body: JSON.stringify({
+        message,
+        sessionId: 'console:voice',
+        clientRequestId: `voice-${crypto.randomUUID()}`,
+      }),
       signal,
     });
     if (!this.isActive(revision)) return { ok: false, text: '', pendingApprovalId: null };

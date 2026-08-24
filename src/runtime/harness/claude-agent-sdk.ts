@@ -2,6 +2,7 @@ import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { query as claudeQuery } from '@anthropic-ai/claude-agent-sdk';
+import type { AgentInputItem } from '@openai/agents-core';
 import type {
   CanUseTool,
   McpServerConfig,
@@ -19,8 +20,6 @@ import {
   deriveSdkProfile,
   terminalAuthoringResultIsProven,
 } from '../../tools/tool-registry.js';
-import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
-import { scheduleReflection } from '../../memory/reflection.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
 import { discoverMcpServers } from '../mcp-config.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
@@ -43,6 +42,7 @@ import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, listEvents, listToolOutputInvocations, writeToolOutput } from './eventlog.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
+import { assertConversationProtocolAtProviderBoundary } from './conversation-protocol-boundary.js';
 import { isAuthRecoverableError } from '../../execution/transient-error.js';
 import { isProviderCapacityExhausted } from '../../shared/provider-capacity.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
@@ -148,6 +148,7 @@ import {
 } from './discovery-boundary.js';
 import { discoveryGovernor } from './discovery-governor.js';
 import { progressNarration } from '../activity-format.js';
+import { composeRunProgressLine } from './run-progress.js';
 import { WorkCallInputSchema } from '../../tools/work-call.js';
 import { withLogicalToolCall } from './attempt-identity.js';
 import { settleToolAttempt } from './attempt-settlement.js';
@@ -159,13 +160,12 @@ export function setClaudeAgentSdkQueryForTest(fn: QueryFn | null): void {
   queryImpl = fn ?? claudeQuery;
 }
 
-// Test seam for the learning-OUT bridge (see runClaudeAgentSdk). Lets a test
-// assert which tool returns get reflected without running the real extractor.
-type ReflectFn = typeof scheduleReflection;
-let reflectImpl: ReflectFn = scheduleReflection;
-export function setClaudeAgentSdkReflectionForTest(fn: ReflectFn | null): void {
-  reflectImpl = fn ?? scheduleReflection;
-}
+/** @deprecated Per-result learning was removed. Retained temporarily as a
+ * source-compatible no-op so downstream test harnesses cannot accidentally
+ * reintroduce a second Claude-owned scheduler. */
+export function setClaudeAgentSdkReflectionForTest(
+  _fn: ((input: unknown) => void) | null,
+): void {}
 
 const LOCAL_MCP_SERVER_SLUG = 'clementine-local';
 
@@ -355,7 +355,7 @@ function sdkWallClockMs(): number {
 
 /** Mutable per-turn bookkeeping shared between the ceiling `canUseTool` wrapper
  *  and the run loop, so a self-imposed stop surfaces as a graceful limitHit
- *  (partial answer + "say continue") instead of a raw error. */
+ *  (partial answer + host checkpoint) instead of a raw error. */
 // pausedMs accumulates time spent INSIDE the base canUseTool — for a gated tool
 // that is dominated by the HUMAN approval wait (canUseTool does no model/tool
 // work, only the permission decision). It is subtracted from the wall clock so a
@@ -394,7 +394,12 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
   return (async (toolName, input, options) => {
     if (opts.countCeiling) {
       if (state.stopped !== null) {
-        return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
+        // interrupt:false — the CLI replaces an interrupting deny's message
+        // with its own "The user doesn't want to proceed… wait for the user"
+        // copy: a fake-user voice the model then obeys (live 2026-08-19
+        // session-fixture-fast-lane). The honest latch text must reach the model; the
+        // HOST ends the turn via selfStopped, not via a swallowed interrupt.
+        return { behavior: 'deny', message: state.stopped, interrupt: false } as PermissionResult;
       }
       const tail = toolName.split('__').at(-1) ?? toolName;
       const effect = classifyRuntimeToolEffect(toolName, input);
@@ -409,7 +414,7 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
         const why = state.mutating > mutCeiling ? `${state.mutating} actions` : `${state.total} tool calls`;
         state.stopped = `I stopped myself after ${why} without finishing — that looked like a loop, so I held off rather than keep going and risk repeating an action. Tell me how you'd like to proceed and I'll pick it back up.`;
         state.stoppedKind = 'loop'; // anti-thrash: auto-continue must NOT re-run this (it just loops again)
-        return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
+        return { behavior: 'deny', message: state.stopped, interrupt: false } as PermissionResult;
       }
     }
     const t0 = Date.now();
@@ -434,9 +439,9 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
  *  (as `mcp__<server>__<tool>`, per the split at line ~220). We register ONLY those
  *  native-external names (the exact clementine-local server is already covered
  *  by brackets — evaluating it here would double-count), stripping the SDK's `mcp__`
- *  prefix so the fanout key + the run_tool_program recovery skeleton name the tool
- *  exactly as code mode dispatches it. On a fanout refusal we DENY (interrupt:false)
- *  with the recovery message so the model reads the "write ONE program" steer. */
+ *  prefix so the fanout key names the tool exactly as nested dispatch does. On a
+ *  fanout refusal we DENY (interrupt:false) with the recovery message so the model
+ *  reads the "issue the remaining reads as PARALLEL calls" steer. */
 export function withReadFanoutGuard(base: CanUseTool, sessionId: string | undefined): CanUseTool {
   return (async (toolName, input, options) => {
     if (sessionId && typeof toolName === 'string') {
@@ -902,6 +907,15 @@ function sdkToolResultText(output: unknown): string {
   try { return JSON.stringify(output ?? '').slice(0, 8_000); } catch { return String(output ?? '').slice(0, 8_000); }
 }
 
+function sdkWorkflowGetUsesBoundedMetadataMode(input: unknown): boolean {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return false;
+  const record = input as Record<string, unknown>;
+  return record.section === 'metadata'
+    && (record.step === undefined || record.step === null || record.step === '');
+}
+
+const CLAUDE_LOCAL_WORKFLOW_GET_SDK_NAME = 'mcp__clementine-local__workflow_get';
+
 /**
  * The visibility-window glimpse of a READ result: how many records landed and
  * what they look like ("12 records · name, website, phone · Acme Roofing").
@@ -973,8 +987,23 @@ function appendSdkTopLevelToolEvent(
   if (!sessionId) return undefined;
   try {
     const name = source?.name ?? '';
+    const toolName = name ? mcpToolTail(name) : '';
     const metadata = runtimeToolAccountingMetadata(name, source?.input);
     const topologyRole = actionTopologyRoleForRuntimeCall(name, source?.input);
+    // The standalone Claude stream owns the same first-class workflow_get
+    // lifecycle as the interactive host, but its generic preview is only 400
+    // chars. Persist the bounded (producer-capped at 4k) direct metadata return
+    // so terminal verification sees the same host-owned evidence on both model
+    // lanes. No other local tool gains a generic full-result event surface.
+    const successfulWorkflowGetResult = type === 'tool_returned'
+      && name === CLAUDE_LOCAL_WORKFLOW_GET_SDK_NAME
+      && sdkWorkflowGetUsesBoundedMetadataMode(source?.input)
+      && result?.isError === false
+      && result.successful === true
+      && typeof result.output === 'string'
+      && !detectStructuredToolFailure(result.output).failed
+      ? sdkToolResultText(result.output)
+      : null;
     const event = appendEvent({
       sessionId,
       turn: 0,
@@ -985,7 +1014,7 @@ function appendSdkTopLevelToolEvent(
         ...(attribution?.sourceUserSeq ? { sourceUserSeq: attribution.sourceUserSeq } : {}),
         ...(attribution?.runScopeId ? { runScopeId: attribution.runScopeId } : {}),
         ...(attribution?.attemptId ? { attemptId: attribution.attemptId } : {}),
-        tool: name ? mcpToolTail(name) : undefined,
+        tool: toolName || undefined,
         callId,
         canonicalCallId: callId,
         accounting: 'top_level',
@@ -1013,6 +1042,9 @@ function appendSdkTopLevelToolEvent(
           ...(result?.output !== undefined ? { preview: sdkToolResultPreview(result.output) } : {}),
           ...(result?.output !== undefined && isClaudeLocalComposioSdkTool(name)
             ? { result: sdkToolResultText(result.output) }
+            : {}),
+          ...(successfulWorkflowGetResult !== null
+            ? { result: successfulWorkflowGetResult }
             : {}),
           ...(result?.providerDispatched === false ? {
             providerDispatched: false,
@@ -1360,7 +1392,7 @@ export interface ClaudeAgentSdkRunOptions {
    *  native external MCP tools dispatch INSIDE the SDK (outside wrapToolForHarness
    *  and outside the harness AsyncLocalStorage), so canUseTool is the only harness
    *  chokepoint that sees them. Set ONLY for the orchestrator brain lane, where
-   *  run_tool_program (the recovery the refusal steers to) exists; workers/steps
+   *  the refusal's recovery (parallel direct calls) is actionable; workers/steps
    *  leave it off so a refusal never strands a run with no recovery. */
   readFanoutGuard?: boolean;
   /** Explicitly marks the foreground conversational orchestrator. Only this
@@ -1438,7 +1470,7 @@ export interface ClaudeAgentSdkRunOptions {
   /**
    * Wall-clock backstop (ms) for the whole turn. The stream loop breaks if the
    * turn outruns it, returning the graceful `limitHit` shape (partial answer +
-   * "say continue") rather than hanging. Absent → the lane default
+   * host checkpoint) rather than hanging. Absent → the lane default
    * (sdkWallClockMs, 15 min, kill-switchable); 0 disables.
    */
   maxWallClockMs?: number;
@@ -1468,7 +1500,7 @@ export interface ClaudeAgentSdkRunResult {
    * lineage to exist. Ordinary SDK turns leave this absent. */
   artifactRunScopeId?: string;
   /** True when the run stopped because it hit the turn budget (error_max_turns)
-   *  rather than finishing. The caller surfaces a graceful "say continue" instead
+   *  rather than finishing. The caller surfaces a graceful host checkpoint instead
    *  of a hard error — parity with the harness loop's auto-continue-on-limit. */
   limitHit?: boolean;
   /** True ONLY for the anti-thrash tool-ceiling self-stop (looked-like-a-loop).
@@ -1598,33 +1630,6 @@ function terminalToolStoppedReason(rawName: string): RunStoppedReason | undefine
   return bareMcpToolName(rawName) === 'ask_user_question' ? 'awaiting-input' : undefined;
 }
 
-function reflectionToolName(rawName: string | null, input: unknown): string | null {
-  if (!rawName) return null;
-  const bare = bareMcpToolName(rawName);
-  if (bare === 'call_tool' || bare === 'work_call') {
-    const deferred = (input as { name?: unknown; args_json?: unknown } | null | undefined)?.name;
-    if (typeof deferred !== 'string' || !deferred.trim()) return bare;
-    let deferredInput: unknown = undefined;
-    const argsJson = (input as { args_json?: unknown } | null | undefined)?.args_json;
-    if (typeof argsJson === 'string' && argsJson.trim()) {
-      try { deferredInput = JSON.parse(argsJson); } catch { /* attribution still uses the inner name */ }
-    }
-    // Recurse so either generic carrier receives the same exact inner action
-    // attribution as a first-class Composio call. This also lets the reflection
-    // deny-list suppress catalog/status tools instead of learning wrapper noise.
-    return reflectionToolName(deferred.trim(), deferredInput);
-  }
-  if (bare === 'composio_execute_tool') {
-    const slug = (input as { tool_slug?: unknown } | null | undefined)?.tool_slug;
-    return typeof slug === 'string' && slug.trim() ? slug.trim() : bare;
-  }
-  if (bare === 'run_shell_command') {
-    const command = (input as { command?: unknown } | null | undefined)?.command;
-    return typeof command === 'string' ? (cliBinaryFromCommand(command) ?? bare) : bare;
-  }
-  return bare;
-}
-
 interface NormalizedToolResultContent {
   output: string;
   valid: boolean;
@@ -1683,13 +1688,6 @@ function extractToolResults(message: SDKMessage): Array<{
     }
   }
   return out;
-}
-
-/** Kill-switch for the Agent SDK learning-OUT bridge (default ON). Off ⇒ Claude
- *  brain/worker turns no longer write facts back (legacy behaviour). The global
- *  reflection disable flag still applies inside scheduleReflection regardless. */
-export function claudeSdkReflectionEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_REFLECTION', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
 /** Flatten an assistant message's text blocks — used to keep the latest partial
@@ -2089,7 +2087,9 @@ function bestLimitHitText(lastAssistantText: string, streamedText: string): stri
   const assistant = lastAssistantText.trim();
   const streamed = streamedText.trim();
   if (streamed && (!assistant || streamed.length >= assistant.length)) return streamed;
-  return assistant || streamed || 'I reached the turn budget before finishing. Say "continue" and I\'ll pick up where I left off.';
+  // NEVER-RESTING: a budget stop is a host checkpoint, never a user chore —
+  // the copy states progress is saved and must not coach typing `continue`.
+  return assistant || streamed || 'I reached this step\'s budget before finishing. The work so far is checkpointed.';
 }
 
 function bestSuccessText(resultText: string | undefined, lastAssistantText: string, streamedText: string): string {
@@ -2133,14 +2133,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // live 2026-07-01 'only SEO tools' incidents). Give startup a real budget;
   // per-call timeouts still come from the server config's own `timeout`.
   if (!env.MCP_TIMEOUT) env.MCP_TIMEOUT = '120000';
-  const configuredAllowedBase = options.allowedLocalMcpTools ?? defaultClaudeAgentSdkAllowedLocalTools();
-  // run_tool_program is a control carrier, so an accepted action may retain it
-  // without exposing a second business surface. Its in-program business calls
-  // are forced through the same scoped work_call authority by the local MCP
-  // server. Keep the addition action-only so other profiles stay byte-identical.
-  const configuredAllowed = actionExpectedWork
-    ? [...new Set([...configuredAllowedBase, 'run_tool_program'])]
-    : configuredAllowedBase;
+  const configuredAllowed = options.allowedLocalMcpTools ?? defaultClaudeAgentSdkAllowedLocalTools();
   const allowed = actionExpectedWork
     ? [...new Set([
         ...configuredAllowed.filter((name) => actionTopologyRoleFor(name) === 'control'),
@@ -2245,8 +2238,8 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   //    enforced. This wrapper REPLACES withReadFanoutGuard so each call is
   //    evaluated exactly once (stacking both would halve every threshold);
   //    the fanout refuse-and-steer verdict is honored only when the caller
-  //    opted in (its recovery skeleton needs run_tool_program — workers/steps
-  //    lack it). Local gated tools already ride the full ladder via
+  //    opted in (workers/steps leave it off so a refusal never strands them).
+  //    Local gated tools already ride the full ladder via
   //    wrapToolForHarness; local reads ride the ambient counter. No double-count.
   const buildCanUseTool = (
     dispatchLease: DispatchLeaseRef | undefined,
@@ -2500,6 +2493,15 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
 
       let admittedForDispatch = false;
       try {
+        if (ceilingState.stopped !== null) {
+          // A latched self-stop already told the model why, once, in its own
+          // words. Every further call is denied with the SAME honest copy and
+          // interrupt:false — an interrupting deny makes the CLI substitute
+          // fake-user rejection text (live 2026-08-19 session-fixture-fast-lane). The
+          // stream-boundary check below ends the run; the host rests on
+          // selfStopped.
+          return { behavior: 'deny', message: ceilingState.stopped, interrupt: false } as PermissionResult;
+        }
         if (options.toolEconomyState) {
           const economy = evaluateToolEconomy({
             state: options.toolEconomyState,
@@ -2538,13 +2540,16 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               ceilingState.stopped =
                 'I stopped myself after using up my tool budget for this reply while still exploring — '
                 + 'rather than keep burning calls, I held on to what I\'ve already gathered. '
-                + 'Say "continue" and I\'ll finish from that evidence, or hand this to a background task for the rest.';
+                + 'That evidence is checkpointed; I\'ll finish from it on the next pass.';
               ceilingState.stoppedKind = 'loop';
             }
+            // The verdict's interrupt flag is the STOP LATCH signal above;
+            // the SDK-level interrupt stays false so the economy's own copy
+            // (not the CLI's fake-user rejection text) is what the model reads.
             return {
               behavior: 'deny',
               message: economy.message,
-              interrupt: economy.interrupt,
+              interrupt: false,
             } as PermissionResult;
           }
         }
@@ -2555,7 +2560,17 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             honorFanout: Boolean(options.readFanoutGuard),
           });
           if (grind) {
-            return { behavior: 'deny', message: grind.message, interrupt: grind.interrupt } as PermissionResult;
+            if (grind.interrupt) {
+              // Terminal guardrail: latch the host stop (selfStopped ends the
+              // turn) and keep the SDK interrupt false so the guardrail's own
+              // copy — not the CLI's fake-user rejection text — reaches the
+              // model. Same class as the economy hard stop (live 2026-08-19).
+              ceilingState.stopped = ceilingState.stopped
+                ?? 'I stopped myself after repeating the same tool call past the hard stop — '
+                + 'continuing would just repeat it again. What I gathered so far is saved.';
+              ceilingState.stoppedKind = ceilingState.stoppedKind ?? 'loop';
+            }
+            return { behavior: 'deny', message: grind.message, interrupt: false } as PermissionResult;
           }
         }
 
@@ -2776,7 +2791,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       : actionExpectedWork
         ? configuredAllowed
         : allowed),
-      ...(actionExpectedWork ? ['run_tool_program'] : []),
     ]
       .map((name) => name.trim())
       .filter((name) => Boolean(name) && name !== 'call_tool' && name !== 'work_call'),
@@ -2843,9 +2857,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     );
     localMcpToolAllowlist = [...new Set([
       ...firstClassControls,
-      'run_tool_program',
       'tool_search',
       'work_call',
+      // The control/read-only dispatcher (mcp-server mounts it with
+      // controlOnlyBuiltins on action turns): deferred CONTROL/READ tools'
+      // direct door. Business writes remain exclusively behind work_call.
+      'call_tool',
     ])];
     localMcpLoading = {
       deferredTools: localUniverse.filter((name) => !localMcpToolAllowlist!.includes(name)),
@@ -2897,7 +2914,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     allowedTools: sdkPreapprovedToolsForMode(allowed, agentic),
     canUseTool: buildCanUseTool(options.dispatchLease),
     permissionMode: 'default',
-    maxTurns: options.maxTurns ?? 3,
+    // ONE-STEP TRANSPORT: the SDK performs one model step per host invocation.
+    // Tool calls inside that step still execute through the host's in-process
+    // MCP surface (brackets + gates); when the model wants another step, the
+    // run returns limitHit and the HOST decides re-entry. A caller may widen
+    // this explicitly (workers/workflow steps own their own budgets), but the
+    // default is the subscription pipe, not a turn owner.
+    maxTurns: options.maxTurns ?? 1,
     // Flip ON only when a delta sink is provided (chat surfaces). Worker/workflow
     // callers omit onDelta → no partial-message traffic → result assembly +
     // error_max_turns handling stay byte-identical.
@@ -2951,17 +2974,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // the SDK spawns a fresh `claude` process per query(), and this is the only
   // place that latency is observable. Latest attempt wins (that one produced the result).
   let firstByteMs: number | null = null;
-  // Learning OUT (brain continuity). The Agent SDK runs its tool loop OUTSIDE
-  // the @openai/agents RunHooks, so the onToolEnd → scheduleReflection path the
-  // Codex loop uses (hooks.ts) never fires here. Without this, a Claude
-  // brain/worker turn READS memory but never writes facts back — Clementine
-  // would stop learning from Claude turns. Re-source the same per-tool-return
-  // reflection from the SDK message stream, in-process (where the extractor +
-  // memory store live). scheduleReflection dedupes on sessionId::callId and
-  // applies the same importance / self-tool / length gates, so this is parity
-  // with Codex, not a second pipeline.
-  const reflectSessionId = options.sessionId?.trim();
-  const reflectLearning = Boolean(reflectSessionId) && claudeSdkReflectionEnabled();
   // Keep the latest assistant text so a turn-budget stop can surface the partial
   // answer (error results carry no `result` field).
   let lastAssistantText = '';
@@ -3149,6 +3161,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       // Tests inject queryImpl for SDK behavior coverage. A forgotten seam must
       // fail locally before the real Claude subprocess can inherit Keychain auth.
       if (queryImpl === claudeQuery) assertLiveModelTransportAllowed('Claude Agent SDK');
+      assertConversationProtocolAtProviderBoundary([
+        ...(options.priorTurns ?? []).map((prior) => ({
+          role: prior.who,
+          content: prior.text,
+        }) as AgentInputItem),
+        { role: 'user', content: options.prompt } as AgentInputItem,
+      ], 'claude.agent_sdk');
       stream = queryImpl({ prompt: effectivePrompt, options: querySdkOptions }) as Query;
       const iterator = (stream as AsyncIterable<SDKMessage>)[Symbol.asyncIterator]();
       while (true) {
@@ -3176,7 +3195,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                     kind: 'progress_check_in',
                     toolCalls: toolCallLedger.length,
                     elapsedMs: now - startedAt,
-                    message: progressNarration(toolCallLedger.map((entry) => entry.name)),
+                    message: composeRunProgressLine({
+                      sessionId: options.sessionId,
+                      fallback: progressNarration(toolCallLedger.map((entry) => entry.name)),
+                    }),
                     transport: 'claude_agent_sdk',
                   },
                 });
@@ -3187,8 +3209,15 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               && ceilingState.stopped === null
               && now - startedAt - effectivePermissionPausedMs(ceilingState, now) > wallClockMs
             ) {
-              ceilingState.stopped = 'I hit my time budget for this turn before finishing. Say "continue" and I\'ll pick up where I left off.';
+              ceilingState.stopped = 'I hit my time budget for this turn before finishing. Progress is checkpointed — I\'ll pick up from here.';
               ceilingState.stoppedKind = 'wallclock';
+              await interruptQuery();
+              return 'stop';
+            }
+            // A latched loop stop (economy/ceiling/grind) ends the run at the
+            // next tick — the model already received the honest copy via the
+            // non-interrupting deny; nothing else may dispatch.
+            if (ceilingState.stopped !== null && String(ceilingState.stoppedKind) === 'loop') {
               await interruptQuery();
               return 'stop';
             }
@@ -3282,7 +3311,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                 kind: 'progress_check_in',
                 toolCalls: toolCallLedger.length,
                 elapsedMs: Date.now() - startedAt,
-                message: progressNarration(toolCallLedger.map((entry) => entry.name)),
+                message: composeRunProgressLine({
+                  sessionId: options.sessionId,
+                  fallback: progressNarration(toolCallLedger.map((entry) => entry.name)),
+                }),
                 transport: 'claude_agent_sdk',
               },
             });
@@ -3297,8 +3329,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           && ceilingState.stopped === null
           && boundaryNow - startedAt - effectivePermissionPausedMs(ceilingState, boundaryNow) > wallClockMs
         ) {
-          ceilingState.stopped = 'I hit my time budget for this turn before finishing. Say "continue" and I\'ll pick up where I left off.';
+          ceilingState.stopped = 'I hit my time budget for this turn before finishing. Progress is checkpointed — I\'ll pick up from here.';
           ceilingState.stoppedKind = 'wallclock';
+          await interruptQuery();
+          break;
+        }
+        if (ceilingState.stopped !== null && String(ceilingState.stoppedKind) === 'loop') {
           await interruptQuery();
           break;
         }
@@ -3602,19 +3638,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               attemptId: options.dispatchLease?.runAttemptId,
             },
           );
-          if (reflectLearning && authorityOutput && !settledReadReplay) {
-            const tool = source ? reflectionToolName(source.name, source.input) : null;
-            reflectImpl({
-              sessionId: reflectSessionId as string,
-              callId: tr.callId,
-              tool,
-              output: authorityOutput,
-              scopeId: options.trackerScopeId
-                ?? (options.sourceUserSeq !== undefined && options.sessionId
-                  ? `${options.sessionId}:user:${options.sourceUserSeq}`
-                  : undefined),
-            });
-          }
           if (resultLooksSuccessful && source && isTerminalAfterTool(source.name)) {
             if (!terminalToolShouldHalt(source.name, tr.output, { actionExpectedWork })) continue;
             // Do not interrupt inside the result loop. Parallel tool uses from
@@ -3848,7 +3871,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   if (!result) throw new Error('Claude Agent SDK finished without a result message.');
   if (result.subtype !== 'success') {
     // Long-running parity: a turn-budget stop is NOT a failure. Surface the
-    // partial answer + a limitHit flag so the brain can offer "say continue"
+    // partial answer + a limitHit flag so the brain can checkpoint the park
     // (mirrors the harness loop's max-turns-with-grace) instead of throwing a
     // raw "Claude Agent SDK failed" error that the caller reports as run_failed.
     if (result.subtype === 'error_max_turns') {

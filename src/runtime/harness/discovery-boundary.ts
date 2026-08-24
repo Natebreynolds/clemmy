@@ -50,8 +50,8 @@ export interface DiscoveryCallClassification {
     | 'local_cli_list'
     | 'local_cli_probe'
     | 'provider_describe_slug'
-    | 'code_mode_list_tools'
-    | 'code_mode_describe';
+    | 'catalog_list_tools'
+    | 'catalog_describe';
 }
 
 export interface DiscoveryBoundaryLease extends DiscoveryCallClassification {
@@ -74,6 +74,10 @@ export interface AdmitDiscoveryBoundaryInput {
   /** Optional lane provenance. Omission is inferred conservatively from the
    * host-visible carrier and never affects admission authority. */
   lane?: SettleToolAttemptInput['lane'];
+  /** Set only by the harness after inspecting the opaque configured-object
+   * marker on the fresh planning broker and proving action work is not yet
+   * active. This opens one bounded metadata claim; it grants no call ref. */
+  freshPlanCatalogDisclosure?: boolean;
 }
 
 const BUILTIN_TOOL_NAMES = TOOL_REGISTRY.map((entry) => entry.name);
@@ -212,7 +216,7 @@ export function classifyDiscoveryCall(
     };
   }
   if (name === 'clem.listtools') {
-    return { category: 'broad_discovery', subject: '', surface: 'code_mode_list_tools' };
+    return { category: 'broad_discovery', subject: '', surface: 'catalog_list_tools' };
   }
   if (name === 'clem.describe') {
     // `clem.describe("read_file")` passes the tool name as a bare string, which
@@ -222,7 +226,7 @@ export function classifyDiscoveryCall(
     return {
       category: 'exact_schema_refresh',
       subject: target ? canonicalExactSubject(target) : '',
-      surface: 'code_mode_describe',
+      surface: 'catalog_describe',
     };
   }
 
@@ -337,13 +341,9 @@ export class DiscoveryBudgetDeniedError extends Error {
 
 function inferredDenialLane(
   input: AdmitDiscoveryBoundaryInput,
-  classification: DiscoveryCallClassification,
+  _classification: DiscoveryCallClassification,
 ): SettleToolAttemptInput['lane'] {
   if (input.lane) return input.lane;
-  if (
-    classification.surface === 'code_mode_list_tools'
-    || classification.surface === 'code_mode_describe'
-  ) return 'code_mode';
   if (canonicalDiscoveryToolName(input.toolName) === 'toolsearch') return 'claude_sdk';
   return 'agents_runner';
 }
@@ -351,8 +351,8 @@ function inferredDenialLane(
 /** A refusal is still one logical tool call. Settle it at the central boundary
  * because provider wrappers return this typed error as a corrective before
  * their ordinary post-dispatch settlement edge. Creating/reusing the logical
- * frame here also covers Claude's permission callback and host code-mode
- * helpers, neither of which dispatches after this refusal. */
+ * frame here also covers Claude's permission callback and catalog helpers;
+ * neither dispatches after this refusal. */
 function terminalizeDiscoveryDenial(
   input: AdmitDiscoveryBoundaryInput,
   classification: DiscoveryCallClassification,
@@ -415,6 +415,9 @@ export function admitDiscoveryBoundary(
       category: classification.category,
       subject: classification.subject,
       callId: input.callId,
+      ...(input.freshPlanCatalogDisclosure && classification.category === 'broad_discovery'
+        ? { authorityClass: 'fresh_plan_catalog_disclosure' as const }
+        : {}),
     });
   } catch (error) {
     const denial = new DiscoveryBudgetDeniedError(

@@ -12,9 +12,97 @@
  * patches one assistant turn per approvalId, so re-parks dedupe naturally.
  * Best-effort by contract: callers keep their prose turn as the baseline.
  */
-import { appendEvent } from './eventlog.js';
+import {
+  appendEvent,
+  getEvent,
+  openEventLog,
+  type EventRow,
+} from './eventlog.js';
 import * as approvalRegistry from './approval-registry.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
+
+export interface AtomicResumableApprovalCardInput
+  extends approvalRegistry.RegisterApprovalInput {
+  resumeKey: string;
+  turn?: number;
+  role?: string;
+  extra?: Record<string, unknown>;
+}
+
+export interface AtomicResumableApprovalCardResult {
+  row: approvalRegistry.PendingApprovalRow;
+  approvalCreated: boolean;
+  event: EventRow;
+  eventCreated: boolean;
+}
+
+/**
+ * Register a formal resumable approval and its visible card in one SQLite
+ * writer transaction. This is intentionally for registry-owned approvals,
+ * not file-backed PendingActions: those have a separate reconciliation state
+ * machine and cannot be made atomic with a filesystem row by pretending the
+ * file is part of SQLite.
+ *
+ * Re-entry repairs a historical row-without-event split and otherwise returns
+ * the exact first event. Reserved card identity always comes from the registry
+ * row; `extra` can add context but cannot override it.
+ */
+export function registerResumableApprovalCardAtomically(
+  input: AtomicResumableApprovalCardInput,
+): AtomicResumableApprovalCardResult {
+  if (pendingActionIdFromArgs(input.args ?? null)) {
+    throw new Error('atomic approval card does not own file-backed PendingAction linkage');
+  }
+  if (input.presentation) {
+    throw new Error('atomic approval card currently owns formal cards only');
+  }
+  const resumeKey = input.resumeKey.trim();
+  if (!resumeKey) throw new Error('atomic approval card requires an exact resume key');
+  const db = openEventLog();
+  const transaction = db.transaction((): AtomicResumableApprovalCardResult => {
+    const registered = approvalRegistry.registerResumable({ ...input, resumeKey });
+    const prior = db.prepare(`
+      SELECT id
+        FROM events
+       WHERE session_id = ?
+         AND type = 'approval_requested'
+         AND json_extract(data_json, '$.approvalId') = ?
+       ORDER BY seq ASC
+       LIMIT 1
+    `).get(input.sessionId, registered.row.approvalId) as { id: string } | undefined;
+    if (prior) {
+      const event = getEvent(prior.id);
+      if (!event) throw new Error('atomic approval card event disappeared during replay');
+      return {
+        row: registered.row,
+        approvalCreated: registered.created,
+        event,
+        eventCreated: false,
+      };
+    }
+    const event = appendEvent({
+      sessionId: input.sessionId,
+      turn: input.turn ?? 0,
+      role: input.role ?? 'Clem',
+      type: 'approval_requested',
+      data: {
+        ...(input.extra ?? {}),
+        tool: registered.row.tool ?? 'approval',
+        subject: registered.row.subject,
+        approvalId: registered.row.approvalId,
+        pendingActionId: null,
+        resumeKey,
+      },
+    });
+    return {
+      row: registered.row,
+      approvalCreated: registered.created,
+      event,
+      eventCreated: true,
+    };
+  });
+  return transaction.immediate();
+}
 
 export function emitApprovalRequestedCard(input: {
   sessionId: string;

@@ -12,7 +12,10 @@ import { fileURLToPath } from 'node:url';
 import type { GraphNodeCapabilityInvoke, GraphNodeCapabilityReconcile } from './graph-node-capability.js';
 import type { IndependentCapabilityObservation } from './independent-capability-observation.js';
 import { isolatedTestContractActive } from './isolated-test-contract.js';
-import type { AttestedTransport } from './implementation-artifacts/attested-transport.js';
+import type {
+  AttestedTransport,
+  AttestedTransportCall,
+} from './implementation-artifacts/attested-transport.js';
 
 export type ShippedImplementationKind = 'invoke' | 'reconcile' | 'observer' | 'transport' | 'transportIsolated';
 
@@ -51,11 +54,7 @@ interface ShippedImplementations {
     expected: Pick<IndependentCapabilityObservation, 'operationId' | 'accountId' | 'definitionFingerprint' | 'providerVersion' | 'operationVersion'>,
     observerImplementationId: string,
   ) => IndependentCapabilityObservation | null;
-  bindIsolatedTransport: (handler: ((call: {
-    operationId: string;
-    args: Record<string, unknown>;
-    accountId: string;
-  }) => Promise<unknown>) | null) => void;
+  bindIsolatedTransport: (handler: ((call: AttestedTransportCall) => Promise<unknown>) | null) => void;
   registerIsolatedObservation: (observation: {
     operationId: string;
     accountId: string;
@@ -184,7 +183,25 @@ function parseBuildStamp(file: string): BuildStamp | null | undefined {
  * build stamp only describes the default root, so consulting it for a
  * disposable root would judge one artifact set by another's identity — which is
  * a false failure, not a safety check. Where both apply, both must agree.
+ *
+ * An ambient stamp qualifies only when it sits BESIDE THE RUNNING MODULE. In a
+ * packaged app that is the packaged stamp, and checking it is the whole point:
+ * the code being executed and the artifacts it loads must come from one build.
+ * A stamp reached by walking OUT of the running tree and into a sibling build
+ * describes a different artifact set, and the rule above already says judging
+ * one set by another's identity is a false failure. Running from source used to
+ * reach `<repo>/dist/runtime/build-stamp.json` that way, so any developer tree
+ * whose `dist` was older than its emitted artifacts failed identity everywhere —
+ * and in the typed-execution modules it threw at import, taking whole files
+ * down before a single test ran. Measured 2026-08-22: one stale ignored file
+ * accounted for ~125 of 163 suite failures.
  */
+export function readBuildStampsForTest(root: string, moduleDir: string): Array<BuildStamp | null> {
+  return readBuildStamps(root, moduleDir);
+}
+
+export const SRC_ARTIFACT_ROOT_FOR_TEST = SRC_ARTIFACT_ROOT;
+
 function readBuildStamps(root: string, moduleDir = MODULE_DIR): Array<BuildStamp | null> {
   const stamps: Array<BuildStamp | null> = [];
   const colocated = parseBuildStamp(path.join(root, 'build-stamp.json'));
@@ -193,7 +210,6 @@ function readBuildStamps(root: string, moduleDir = MODULE_DIR): Array<BuildStamp
     for (const file of [
       path.join(moduleDir, '../build-stamp.json'),
       path.join(moduleDir, 'build-stamp.json'),
-      path.resolve(moduleDir, '../../../dist/runtime/build-stamp.json'),
     ]) {
       const ambient = parseBuildStamp(file);
       if (ambient !== undefined) {
@@ -317,11 +333,7 @@ export function loadShippedImplementations(): ShippedImplementations {
   const transportDigest = verified.digests[transportKind];
   const transportModule = requireArtifact<{
     createAttestedTransport: (digest: string) => AttestedTransport;
-    bindIsolatedTransportHandler?: (handler: ((call: {
-      operationId: string;
-      args: Record<string, unknown>;
-      accountId: string;
-    }) => Promise<unknown>) | null) => void;
+    bindIsolatedTransportHandler?: (handler: ((call: AttestedTransportCall) => Promise<unknown>) | null) => void;
     registerIsolatedObservation?: (observation: {
       operationId: string;
       accountId: string;

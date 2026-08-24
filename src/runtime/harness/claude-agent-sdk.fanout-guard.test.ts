@@ -15,7 +15,7 @@ import { _resetAllTrackersForTests } from './tool-guardrail.js';
 type Result = { behavior: string; message?: string };
 const allowBase = (async () => ({ behavior: 'allow' })) as never;
 
-test('SDK read-fanout guard: serial native-MCP reads are DENIED with the program recovery', async () => {
+test('SDK read-fanout guard: serial native-MCP reads are DENIED with parallel-call recovery', async () => {
   _resetAllTrackersForTests();
   const guard = withReadFanoutGuard(allowBase, 'sess-sdk-fanout');
   const name = 'mcp__dataforseo__serp_organic_live_advanced'; // SDK qualified form
@@ -28,10 +28,10 @@ test('SDK read-fanout guard: serial native-MCP reads are DENIED with the program
   }
   const refused = (await guard(name, { keyword: 'kw-9' }, {} as never)) as Result;
   assert.equal(refused.behavior, 'deny', 'past threshold → denied');
-  assert.match(refused.message ?? '', /run_tool_program/, 'the refusal steers to a program');
-  // The recovery names the tool WITHOUT the mcp__ prefix so code mode can dispatch it.
+  assert.match(refused.message ?? '', /PARALLEL tool calls/, 'the refusal steers to parallel calls');
+  // The recovery names the executable tool without the SDK carrier prefix.
   assert.match(refused.message ?? '', /dataforseo__serp_organic_live_advanced/);
-  assert.doesNotMatch(refused.message ?? '', /mcp__dataforseo/, 'the mcp__ prefix is stripped for the code-mode dispatch name');
+  assert.doesNotMatch(refused.message ?? '', /mcp__dataforseo/, 'the mcp__ prefix is stripped from the executable dispatch name');
 });
 
 test('SDK read-fanout guard: local/clementine + composio tools are NOT registered here (brackets owns them)', async () => {

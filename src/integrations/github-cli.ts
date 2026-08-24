@@ -37,9 +37,12 @@ export function findGitHubCli(): string | null {
     if (isExecutable(candidate)) return candidate;
   }
 
+  const names = process.platform === 'win32' ? ['gh.exe', 'gh.cmd', 'gh.bat', 'gh'] : ['gh'];
   for (const dir of (process.env.PATH ?? '').split(path.delimiter).filter(Boolean)) {
-    const candidate = path.join(dir, 'gh');
-    if (isExecutable(candidate)) return candidate;
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (isExecutable(candidate)) return candidate;
+    }
   }
   return null;
 }

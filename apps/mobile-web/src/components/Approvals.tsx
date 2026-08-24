@@ -9,8 +9,10 @@ import {
   approvePlanProposal,
   rejectApproval,
   rejectPlanProposal,
+  resolveWorkspaceDestinationChooser,
   type ApprovalRow,
   type PlanProposalRow,
+  type WorkspaceDestinationChooser,
 } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
 
@@ -27,10 +29,11 @@ export function relativeTime(iso: string | number): string {
 interface DecisionsProps {
   approvals: ApprovalRow[];
   plans: PlanProposalRow[];
+  workspaceChoosers: WorkspaceDestinationChooser[];
   onResolved: () => void;
 }
 
-export function Decisions({ approvals, plans, onResolved }: DecisionsProps) {
+export function Decisions({ approvals, plans, workspaceChoosers, onResolved }: DecisionsProps) {
   const [acting, setActing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -51,16 +54,28 @@ export function Decisions({ approvals, plans, onResolved }: DecisionsProps) {
     }
   }
 
-  if (approvals.length === 0 && plans.length === 0) return null;
+  if (approvals.length === 0 && plans.length === 0 && workspaceChoosers.length === 0) return null;
 
   return (
     <section class="stack">
       {error ? <div class="global-error">{error}</div> : null}
+      {workspaceChoosers.map((chooser, i) => (
+        <WorkspaceChooserCard
+          key={chooser.chooserId}
+          chooser={chooser}
+          index={i}
+          acting={acting === chooser.chooserId}
+          onChoose={(choiceId) => run(
+            chooser.chooserId,
+            () => resolveWorkspaceDestinationChooser(chooser, choiceId),
+          )}
+        />
+      ))}
       {plans.map((row, i) => (
         <PlanCard
           key={row.id}
           row={row}
-          index={i}
+          index={workspaceChoosers.length + i}
           acting={acting === row.id}
           onAct={(action) => run(row.id, () => action === 'approve' ? approvePlanProposal(row.id) : rejectPlanProposal(row.id))}
         />
@@ -69,12 +84,46 @@ export function Decisions({ approvals, plans, onResolved }: DecisionsProps) {
         <ApprovalCard
           key={row.approvalId}
           row={row}
-          index={plans.length + i}
+          index={workspaceChoosers.length + plans.length + i}
           acting={acting === row.approvalId}
           onAct={(action) => run(row.approvalId, () => action === 'approve' ? approveApproval(row.approvalId) : rejectApproval(row.approvalId))}
         />
       ))}
     </section>
+  );
+}
+
+function WorkspaceChooserCard({ chooser, index, acting, onChoose }: {
+  chooser: WorkspaceDestinationChooser;
+  index: number;
+  acting: boolean;
+  onChoose: (choiceId: string) => void;
+}) {
+  return (
+    <article class="card card-approval rise" style={{ '--i': index }}>
+      <header class="card-head">
+        <span class="chip chip-plan">Workspace</span>
+        <span class="card-when">{relativeTime(chooser.createdAt)}</span>
+      </header>
+      <h3 class="card-title">Where should these records live?</h3>
+      <p class="card-note">
+        Choose the exact existing Workspace, or have Clem stage a separate new-Workspace approval.
+      </p>
+      <footer class="card-actions workspace-choice-actions">
+        {chooser.choices.map((choice) => (
+          <button
+            key={choice.choiceId}
+            class={choice.kind === 'existing' ? 'btn-approve' : 'btn-reject'}
+            disabled={acting}
+            onClick={() => onChoose(choice.choiceId)}
+          >
+            {acting
+              ? 'Working…'
+              : choice.kind === 'existing' ? `${choice.label} (${choice.workspaceId})` : choice.label}
+          </button>
+        ))}
+      </footer>
+    </article>
   );
 }
 

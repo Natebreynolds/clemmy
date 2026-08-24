@@ -516,6 +516,10 @@ export class DaemonSupervisor {
       cwd: this.opts.daemonProjectRoot,
       env,
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      // Node refuses to spawn .cmd/.bat shims without a shell (CVE-2024
+      // hardening). Only the win32 dev path resolves one; packaged runs use
+      // process.execPath and never take this branch.
+      shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(command),
     });
     if (!this.child.stdout || !this.child.stderr) {
       throw new Error('Daemon supervisor failed to open stdout/stderr pipes');
@@ -754,12 +758,21 @@ export class DaemonSupervisor {
       // Prefer the source entry in dev, even when dist/ exists. Running the
       // daemon through Electron-as-Node in dev forces native modules such as
       // better-sqlite3 to match Electron's ABI instead of the repo's Node ABI.
-      const localTsx = path.join(this.opts.daemonProjectRoot, 'node_modules', '.bin', 'tsx');
+      const localTsx = path.join(
+        this.opts.daemonProjectRoot,
+        'node_modules',
+        '.bin',
+        process.platform === 'win32' ? 'tsx.cmd' : 'tsx',
+      );
       if (existsSync(localTsx)) {
         return { command: localTsx, args: [tsEntry, 'service'], runAsNode: false };
       }
       // Fallback to npx (slower first run, but works).
-      return { command: 'npx', args: ['tsx', tsEntry, 'service'], runAsNode: false };
+      return {
+        command: process.platform === 'win32' ? 'npx.cmd' : 'npx',
+        args: ['tsx', tsEntry, 'service'],
+        runAsNode: false,
+      };
     }
     if (existsSync(jsEntry)) {
       // In a packaged Electron app, process.execPath is Electron itself.

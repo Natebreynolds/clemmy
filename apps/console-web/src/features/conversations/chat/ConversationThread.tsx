@@ -4,6 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Pin, Loader2 } from 'lucide-react';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
+import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { chatApprovalReply, useChat, pendingActionFromEvent, type ChatMessage } from '@/lib/useChat';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -87,6 +88,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
   });
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   // Stick to the bottom by default; release the moment the user scrolls up so
   // streaming tokens don't yank them back down mid-read.
   const stickRef = useRef(true);
@@ -128,7 +130,8 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
       </div>
       <div className="border-t border-border bg-canvas/80 backdrop-blur">
         <div className="mx-auto w-full max-w-3xl px-6 py-4">
-          <Composer busy={chat.busy} onSend={send} onStop={chat.stop} />
+          <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
+          <Composer inputRef={composerRef} busy={chat.busy} onSend={send} onStop={chat.stop} />
         </div>
       </div>
     </div>

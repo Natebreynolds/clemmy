@@ -316,19 +316,15 @@ function batchApiHintFor(slug: string): string | undefined {
 
 /** The model-facing refusal for a read serialized past the block threshold. A
  *  STANDING TURN RULE (not "this call failed" — the framing that made the model
- *  keep trying the next item and thrash), with a dispatch-CORRECT, paste-ready
- *  run_tool_program skeleton carrying the arg shape it was varying, plus a hard
- *  distill directive. Composio slugs dispatch via
- *  clem.composio_execute_tool({tool_slug, arguments}) — NOT clem["slug"], which
- *  is not a code-mode method (the 2026-07-11 bug that made every recovery
- *  UNRUNNABLE → "tool not available" → fallback to raw serial reads). Pure +
- *  exported for the regression test that pins the dispatch shapes. */
+ *  keep trying the next item and thrash), steering to PARALLEL direct calls
+ *  with the exact arg shape it was varying, plus a hard distill directive.
+ *  Pure + exported for the regression test that pins the recovery shape. */
 /**
  * A tool name a guardrail is allowed to prescribe. Constructible ONLY from
  * proof (the callable-surface oracle: reachable, un-eliminated, schema in
  * hand) or, during the wiring transition, from the exact legacy heuristic the
  * consumer used before — never from assumption. The live failure this ends:
- * the fan-out refusal mandated run_tool_program while the discovery governor
+ * the fan-out refusal mandated a batching tool while the discovery governor
  * refused its schema (2.62M-token deadlock), and the nudge recommended
  * run_worker in an environment where it returned "unknown tool".
  */
@@ -356,17 +352,11 @@ export function mandateFor(
     return mandate;
   }
   if (entry.eliminatedForTask) return null;
-  // STRUCTURAL arm (not a transition): the two batching primitives the
-  // fan-out ladder prescribes are per-agent closures, permanently outside the
-  // local schema projection the oracle serves (probed 2026-08-11: 161 local
-  // tools, neither present). Their availability semantics stay exactly the
-  // proven ones — run_tool_program gated on the code-mode env, run_worker
-  // unchecked. Every OTHER name resolves through the oracle or mandates
-  // nothing.
-  if (name === 'run_tool_program') {
-    const codeMode = (getRuntimeEnv('CLEMMY_CODE_MODE', 'on') || 'on').trim().toLowerCase() !== 'off';
-    return codeMode ? { name, schema: null, requiredFields: [], source: 'legacy_env' } : null;
-  }
+  // STRUCTURAL arm (not a transition): run_worker is a per-agent closure,
+  // permanently outside the local schema projection the oracle serves
+  // (probed 2026-08-11: 161 local tools, not present). Every OTHER name
+  // resolves through the oracle or mandates nothing. (run_tool_program's arm
+  // was subtracted with the program surface, 2026-08-20.)
   if (name === 'run_worker') {
     return { name, schema: null, requiredFields: [], source: 'legacy_env' };
   }
@@ -392,15 +382,6 @@ export function buildFanoutRecoveryMessage(opts: {
   const innerArgs = slug ? (args as { arguments?: unknown })?.arguments : args;
   let exampleArgs: string;
   try { exampleArgs = JSON.stringify(innerArgs ?? {}).slice(0, 160); } catch { exampleArgs = '{...}'; }
-  // Dispatch-correct fetch line: composio via composio_execute_tool (the fix),
-  // native MCP by its namespaced name.
-  const fetchLine = slug
-    ? `clem.composio_execute_tool({ tool_slug: "${slug}", arguments: a })`
-    : `clem[${JSON.stringify(toolName)}](a)`;
-  const skeleton =
-    `  const items = [/* the ${label} args, one per remaining item you were about to read */];\n`
-    + `  const results = await Promise.all(items.map(a => ${fetchLine}));\n`
-    + `  return Object.fromEntries(results.map(r => [/* key, e.g. r.data?.displayName */, /* value, e.g. r.data?.totalItemCount */]));`;
   // Refusal-count escalation (derived from the tracked set — zero new state):
   // after 2+ ignored refusals, a harder stop for families that ride through one.
   const refusals = distinct - fanoutBlockAt;
@@ -423,29 +404,17 @@ export function buildFanoutRecoveryMessage(opts: {
   const header =
     `[harness fan-out check — REFUSED] ${escalate}`
     + `You have read ${label} one-at-a-time ${distinct} times. STOP — every further one-at-a-time ${label} call is refused for the rest of this turn; this is NOT this item failing, the next one is refused identically. `;
-  // NO PHANTOM MANDATES: when no batching route is proven available this turn,
-  // the refusal keeps the behavioral constraint and prescribes nothing — the
-  // model batches by whatever route it actually has, or checks in. Naming a
-  // tool the turn cannot learn or call produced schema brute-forcing live.
-  if (mandate === null) {
-    return (
-      header
-      + `Cover EVERY remaining item in ONE batched call by a route available to you (a provider batch endpoint that takes an array, or one aggregated request) — do not continue item-by-item. `
-      + `If no batched route exists, stop and tell the user what is done and what remains.`
-    );
-  }
-  // The refusal carries the answer: when the mandate arrived with a real
-  // schema, render what the tool requires and (when banked) a payload that
-  // already worked, so following the instruction needs zero discovery.
-  const contractLine = mandate.schema
-    ? `\n${mandate.name} contract — required: ${mandate.requiredFields.length ? mandate.requiredFields.join(', ') : '(none)'}`
-      + (mandate.exampleArgs ? `; worked before with: ${JSON.stringify(mandate.exampleArgs).slice(0, 200)}` : '')
-    : '';
+  // The prescribed recovery is the model's OWN parallel tool calls — always
+  // available on every lane, so this steer can never point at a phantom door
+  // (the 2.62M-token deadlock class; the previous door, a run_tool_program
+  // skeleton, was subtracted with the program surface 2026-08-20). `mandate`
+  // is retained in the signature for callers that name run_worker.
+  void mandate;
   return (
     header
-    + `Write ONE ${mandate.name} that covers EVERY remaining item in a single array — do NOT write several small programs (that just re-fragments the work into more turns). Build the array from the items you already have (same arg shape as the call just refused: ${exampleArgs}):\n`
-    + `${skeleton}${contractLine}\n`
-    + `Return ONLY that small distilled value (the answering field per item) — returning the raw payloads wastes the exact tokens this redirect exists to save.`
+    + `Issue EVERY remaining ${label} read as PARALLEL tool calls in your ONE next response — one call per item, all in the same message (same arg shape as the call just refused: ${exampleArgs}). They run concurrently, large results are parked as handles (use recall_tool_result/tool_output_query), and you synthesize from those. `
+    + `If the provider has a real batch endpoint that takes an array, one aggregated call is even better. `
+    + `If neither is possible, stop and tell the user what is done and what remains.`
   );
 }
 
@@ -576,7 +545,7 @@ export interface GuardrailDecision {
   /** DETERMINISTIC read-fanout block reason. Set ONLY when the fanout-block
    *  kill-switch is on AND a READ has been serialized past fanoutBlockAt. The
    *  consumer (brackets) throws ToolGuardrailBlocked with this reason — but ONLY
-   *  for the model's direct calls; a call from a code-mode program / worker /
+   *  for the model's direct calls; a nested-dispatch / worker /
    *  certified batch is exempt (that IS the batched execution we're steering to).
    *  Separate from `action` so the existing block/halt demotion logic is
    *  untouched. */
@@ -610,8 +579,8 @@ function readNudgeEnabled(): boolean {
 /** DETERMINISTIC read-fanout enforcement (default OFF). The advisory fan-out
  *  nudge is provably ignored (live 2026-07-11: nudge fired mid-stride, model made
  *  another discrete call). When ON, a model that keeps serializing the SAME read
- *  past fanoutBlockAt is REFUSED and told to batch the remaining reads in ONE
- *  run_tool_program. OFF → the fanoutBlock signal is never set, so the guardrail
+ *  past fanoutBlockAt is REFUSED and told to issue the remaining reads as
+ *  PARALLEL calls. OFF → the fanoutBlock signal is never set, so the guardrail
  *  is byte-identical (no regression). Reads only (idempotent, re-doable via the
  *  program); the block is skipped for calls FROM a program/worker/batch. */
 function fanoutBlockEnabled(): boolean {
@@ -624,7 +593,7 @@ function fanoutBlockEnabled(): boolean {
 }
 
 // codeModeRecoveryAvailable() lived here — an env flag standing in for "can
-// this turn actually call run_tool_program". Replaced by mandateFor(), which
+// this turn actually batch". Replaced by mandateFor(), which
 // answers from the callable-surface oracle (and carries the flag's exact
 // semantics as the transition arm until every lane registers its schemas).
 // The 2026-07-12 strand-hunt property is preserved: no mandate → advisory
@@ -764,7 +733,7 @@ function fingerprintToolResult(result: unknown): string {
  * Live 2026-08-09, a Slack-id lookup for eight reps: six resolved in about five
  * seconds, one per call, and the fan-out block then refused the remaining two
  * for being "serialized". The model complied and wrote the prescribed
- * run_tool_program twenty-eight times; those programs hit their OWN failures
+ * prescribed batch program twenty-eight times; those programs hit their OWN failures
  * (code_mode_describe discovery budget exhausted, invalid JSON input). Nine
  * minutes, thirty-three guardrails, and a turn that ended "I cannot honestly
  * confirm the work went out" — on a job that had been 75% done and finishing at
@@ -778,7 +747,7 @@ interface ScopeSignals {
   /** Result sizes for the fanned tool, newest last. Serial work that returns
    *  small payloads quickly is a JOB, not a thrash. */
   serialResultBytes: number[];
-  /** The prescribed redirect (code-mode program) failed this many times. A
+  /** A prescribed worker redirect failed this many times. A
    *  block may not outlive the alternative it demands. */
   redirectFailures: number;
   /** Fan-out refusals issued in this scope with no successful fan-out since. */
@@ -810,7 +779,7 @@ const FANOUT_EXPENSIVE_RESULT_BYTES = 4_000;
 /** Identical fan-out refusals before the turn ends instead of refusing again. */
 const FANOUT_REFUSAL_TERMINAL_AT = 3;
 
-const FANOUT_REDIRECT_TOOLS = /^(?:run_tool_program|code_mode|run_code|run_worker)$/i;
+const FANOUT_REDIRECT_TOOLS = /^run_worker$/i;
 
 function resultLooksFailed(result: unknown): boolean {
   const text = typeof result === 'string' ? result : (() => {
@@ -1044,7 +1013,7 @@ export function evaluateToolCall(
     }
     // DETERMINISTIC read-fanout block (kill-switch off by default). The nudge is
     // ignored; past fanoutBlockAt, REFUSE a further serialized READ so the model
-    // must batch the remainder in ONE run_tool_program. READ-only, via the
+    // must issue the remainder as PARALLEL calls. READ-only, via the
     // AUTHORITATIVE isMutatingExternalWrite (NOT the guardrail's own
     // composioSlugIsMutating, which over-flags reads like OUTLOOK_LIST_MESSAGES /
     // DataForSEO as mutating — see line ~800 — and would skip the exact reads we
@@ -1097,21 +1066,17 @@ export function evaluateToolCall(
       : Number.POSITIVE_INFINITY; // unmeasured ⇒ behave exactly as before
     const serialIsExpensive = observedMeanBytes >= FANOUT_EXPENSIVE_RESULT_BYTES;
 
-    // (2) A BLOCK MAY NOT OUTLIVE ITS OWN ALTERNATIVE. The ladder prescribes a
-    // code-mode program; that program has independent failure modes (its own
-    // discovery budget, JSON validation). Once the prescribed path has failed
-    // twice, refusing the path that WAS working strands the turn.
+    // (2) A BLOCK MAY NOT OUTLIVE ITS OWN ALTERNATIVE. When the turn also
+    // prescribed a worker redirect, repeated failures there must release the
+    // path that was working instead of stranding the turn.
     const redirectIsWorking = (signals?.redirectFailures ?? 0) < 2;
 
-    // A MANDATE IS CONSTRUCTED FROM PROOF, never assumed: the block fires only
-    // when its prescribed alternative is provably available this turn (oracle
-    // truth once the lane registers its schemas; the exact legacy env
-    // heuristic meanwhile). No mandate → the advisory nudge remains, a refusal
-    // prescribing a phantom does not (the 2.62M-token deadlock class).
-    const fanoutMandate = mandateFor('run_tool_program');
+    // The prescribed recovery is PARALLEL direct calls — the model's own
+    // capability on every lane, so the block never prescribes a phantom
+    // (the 2.62M-token deadlock class needed no mandate check once the
+    // program door was subtracted, 2026-08-20).
     if (
       fanoutBlockEnabled()
-      && fanoutMandate !== null
       && !dangerousWrite
       && distinct >= effectiveBlockAt
       && distinctEntities >= effectiveBlockAt
@@ -1119,7 +1084,7 @@ export function evaluateToolCall(
       && redirectIsWorking
     ) {
       fanoutBlock = buildFanoutRecoveryMessage({
-        toolName, slug, args, distinct, fanoutBlockAt: effectiveBlockAt, mandate: fanoutMandate,
+        toolName, slug, args, distinct, fanoutBlockAt: effectiveBlockAt, mandate: null,
       });
       // (3) The deadlock is broken by RELEASE, not by a turn-kill: once the
       // prescribed program has failed twice, condition (2) lifts this block and

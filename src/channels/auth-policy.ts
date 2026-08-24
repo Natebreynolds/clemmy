@@ -114,6 +114,14 @@ export const AUTH_POLICY: readonly AuthPolicyRule[] = [
   },
   {
     method: 'POST',
+    pattern: '/m/auth/origin-adopt',
+    realm: 'mobile-anon',
+    reason:
+      'Spending a LAN-minted, single-use origin-handoff token IS the authentication '
+      + 'that establishes the same device session at the relay origin.',
+  },
+  {
+    method: 'POST',
     pattern: '/m/auth/logout',
     realm: 'mobile-anon',
     reason: 'Clears the caller own cookie. Nothing to protect; must work with a dead session.',
@@ -147,6 +155,14 @@ export const AUTH_POLICY: readonly AuthPolicyRule[] = [
     pattern: '/m/auth/stream-ticket',
     realm: 'mobile-session',
     reason: 'Enforced by requireMobileSession, including the device proof.',
+  },
+  {
+    method: 'POST',
+    pattern: '/m/auth/origin-handoff',
+    realm: 'mobile-session',
+    reason:
+      'Enforced by requireMobileSession, including the device proof; the route also '
+      + 'refuses relay ingress so the handoff can only be minted from a LAN visit.',
   },
 
   // ---- Mobile: admin-only within the mobile router -------------------------

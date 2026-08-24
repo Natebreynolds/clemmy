@@ -125,7 +125,7 @@ test('one raw-to-effective refinement becomes the only physical and settlement c
   }));
 });
 
-test('raw arguments cannot dispatch after refinement, but the same call may settle under its admission identity', () => {
+test('raw arguments reuse the refined call at dispatch without minting a second identity, and the same call may settle under its admission identity', () => {
   const physicalTask = accept();
   const tool = 'alpha__records_create';
   const rawArgs = { value: 'raw', account_alias: 'ops' };
@@ -136,12 +136,43 @@ test('raw arguments cannot dispatch after refinement, but the same call may sett
     tool,
     effectiveArgs,
   }).status, 'refined');
+  // Retargeted 2026-08-20: an ALREADY-ADMITTED logical row accepts either of
+  // its immutable identities (raw or refined) at dispatch — the outer wrapper
+  // may still hold the call's raw contract, and refusing it poisoned the step
+  // (see beginPhysicalDispatchCore: "An already-admitted logical row is the
+  // same reuse"). The invariant that survives: raw bytes must NEVER mint a
+  // second durable identity — the one crossing stays owned by the canonical
+  // refined contract.
   assert.equal(ledger.beginPhysicalDispatch({
     identity: { ...physicalIdentity, physicalDispatchId: 'dispatch:raw-refused', ordinal: 0 },
     tool,
     args: rawArgs,
-  }).status, 'conflict');
-  assert.deepEqual(ledger.physicalCrossingsFor(physicalTask.sessionId, physicalTask.sourceUserSeq), []);
+  }).status, 'inserted');
+  const crossings = ledger.physicalCrossingsFor(physicalTask.sessionId, physicalTask.sourceUserSeq);
+  assert.equal(crossings.length, 1, 'exactly one crossing for the reused logical call');
+  assert.equal(
+    crossings[0]!.logicalToolCallId,
+    physicalIdentity.logicalToolCallId,
+    'the crossing belongs to the SAME logical call — raw bytes minted no second identity',
+  );
+  const effectiveContract = contracts.durableLogicalCallContract(
+    physicalTask.acceptedTaskId,
+    tool,
+    effectiveArgs,
+  );
+  const durableRow = eventlog.openEventLog().prepare(`
+    SELECT argument_digest FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(
+    physicalTask.sessionId,
+    physicalTask.sourceUserSeq,
+    physicalIdentity.logicalToolCallId,
+  ) as { argument_digest: string };
+  assert.equal(
+    durableRow.argument_digest,
+    effectiveContract!.argumentDigest,
+    'the durable call stays owned by the canonical refined contract, not the raw bytes',
+  );
 
   const settlementTask = accept();
   const settlementIdentity = admit(settlementTask, 'raw-settlement-refused', tool, rawArgs);
@@ -324,11 +355,24 @@ test('refinement after logical settlement or accepted-task finalization refuses'
 
   const finalizedTask = accept();
   assert.equal(resolution.finalizeResolution(finalizedTask), true);
-  assert.equal(ledger.refineLogicalCallContract({
+  const neverAdmitted = ledger.refineLogicalCallContract({
     identity: logicalIdentity(finalizedTask, 'never-admitted'),
     tool: 'alpha__records_search',
     effectiveArgs: { query: 'resolved' },
-  }).status, 'closed');
+  });
+  assert.deepEqual(neverAdmitted, {
+    status: 'missing',
+    reason: 'logical call authority is missing',
+  }, 'finalization cannot turn a never-admitted logical identity into a known closed call');
+  const neverAdmittedRows = eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(
+    finalizedTask.sessionId,
+    finalizedTask.sourceUserSeq,
+    'logical:never-admitted',
+  ) as { n: number };
+  assert.equal(neverAdmittedRows.n, 0);
 });
 
 test('the refinement mirror and normalized authority commit or roll back together', () => {

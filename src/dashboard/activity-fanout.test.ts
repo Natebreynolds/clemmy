@@ -146,7 +146,20 @@ test('an admitted reducer is live, and combining says so', () => {
   assert.equal(reconciled.reduced.includes(plan.planId), true,
     'the durable worker terminals did not admit the reducer');
 
-  const entry = entryFor(plan.planId)!;
+  const reducerTaskId = fanout.loadFanoutPlan(plan.planId)?.reducerTaskId;
+  assert.ok(reducerTaskId, 'the reconciled plan did not retain its reducer identity');
+  assert.notEqual(bg.getBackgroundTask(reducerTaskId!)?.internal, true,
+    'the reducer must remain delivery-capable for the plan’s ONE terminal report-back');
+  const projected = projectActivitySnapshot().entries;
+  const planRows = projected.filter((row) => row.planId === plan.planId);
+  assert.equal(planRows.length, 1, 'the plan must own exactly one visible row while combining');
+  assert.equal(
+    projected.some((row) => row.runKey === `background:${reducerTaskId}`),
+    false,
+    'the plan reducer leaked as a second background row beside its owning plan',
+  );
+
+  const entry = planRows[0]!;
   assert.equal(entry.lifecycle, 'reducing', 'a plan whose items all settled is combining, not fanning out');
   assert.equal(entry.owner, 'reducer-under-test', 'the durable owner is not carried');
   assert.notEqual(entry.liveness, 'stale', 'a newly admitted reducer read as abandoned while it combined');

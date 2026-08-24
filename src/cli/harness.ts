@@ -1,33 +1,28 @@
 /**
- * CLI surface for the 0.3 harness — a local smoke test path for
- * driving the Orchestrator end-to-end without touching the existing
- * v0.2 daemon channels.
+ * One-shot CLI smoke surface for the current accepted-source chat bridge.
  *
- *   clementine harness run "<prompt>"     Multi-step conversation through the loop.
+ *   clementine harness run "<prompt>"     One fresh chat through the host-owned loop.
  *   clementine harness events <session>   Pretty-print all events.
  *
- * `run` creates a HarnessSession (kind=chat), builds the
- * Orchestrator, drives runConversation() — which auto-continues
- * across turns until the Orchestrator emits done=true or a budget
- * trips — and prints each emitted event live as it lands in the
- * event log. This exercises the same code path the desktop chat
- * dock and Discord harness use, so a green smoke test means
- * auto-continuation actually works, not just one turn.
+ * `run` creates a HarnessSession (kind=chat), enters the same
+ * respondPreferHarness admission/selection path as desktop, Discord, Slack,
+ * and the normal CLI, and prints each emitted event live as it lands in the
+ * event log. It cannot fall back to the legacy SDK-owned interactive loop.
  *
  * Authenticates via codex OAuth (`clementine auth login-native`).
  * Raw OPENAI_API_KEYs are intentionally NOT accepted.
  */
-import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
+import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import {
   createSession,
   listEvents,
   getSession,
   type EventRow,
 } from '../runtime/harness/eventlog.js';
-import { runConversation } from '../runtime/harness/loop.js';
 import { actionBus } from '../runtime/action-bus.js';
 import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
+import { harnessBridgeStatus, harnessRunExitCode } from './harness-status.js';
 
 interface HarnessRunOptions {
   prompt: string;
@@ -63,21 +58,16 @@ async function harnessRun(opts: HarnessRunOptions): Promise<number> {
     printEvent(bus.event);
   });
 
-  let result;
+  let response;
   try {
-    result = await runConversation({
-      buildAgent: (identity) => buildOrchestratorAgent({
-        userInput: opts.prompt,
-        sessionId: session.id,
-        sourceUserSeq: identity.sourceUserSeq,
-        acceptedRoute: identity.route,
-        allowToolJit: true,
-      }),
-      sessionId: session.id,
-      input: opts.prompt,
-      maxSteps: opts.maxSteps,
-      maxTurns: opts.maxTurns,
-    });
+    response = await respondPreferHarness(
+      'cli',
+      { sessionId: session.id, channel: 'cli', message: opts.prompt },
+      async () => {
+        throw new Error('Fresh harness CLI chat cannot enter the legacy response loop.');
+      },
+      { maxSteps: opts.maxSteps, maxTurns: opts.maxTurns },
+    );
   } finally {
     unsubscribe();
     // `harness run` is a one-shot process, unlike the daemon. Close any MCP
@@ -86,17 +76,22 @@ async function harnessRun(opts: HarnessRunOptions): Promise<number> {
     await invalidateConfiguredMcpServers();
   }
 
-  process.stdout.write(`\nstatus: ${result.status}\n`);
-  process.stdout.write(`steps:  ${result.steps}\n`);
-  if (result.error) process.stdout.write(`error: ${result.error}\n`);
-  if (result.lastDecision) {
+  const status = harnessBridgeStatus(response.stoppedReason);
+  process.stdout.write(`\nstatus: ${status}\n`);
+  process.stdout.write(`steps:  ${response.turnsUsed ?? 0}\n`);
+  const hold = status === 'held'
+    ? { owner: 'host' as const, wake: 'peer' as const, reason: 'peer_in_progress' as const }
+    : undefined;
+  if (hold) {
+    process.stdout.write(`owner:  ${hold.owner}/${hold.wake} (${hold.reason})\n`);
+  }
+  if (response.text) {
     process.stdout.write('lastDecision:\n');
-    process.stdout.write(formatFinalOutput(result.lastDecision) + '\n');
+    process.stdout.write(formatFinalOutput(response.text) + '\n');
   }
   process.stdout.write(`\nreplay with: clementine harness events ${session.id}\n`);
 
-  if (result.status === 'failed') return 1;
-  return 0;
+  return harnessRunExitCode({ status, hold });
 }
 
 function harnessShowEvents(sessionId: string): number {

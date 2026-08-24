@@ -4,6 +4,7 @@ import {
   type AgentContextPacket,
   type MemoryPrimerSummary,
 } from './context-packet.js';
+import type { TurnSourceStrategyBindingV1 } from './turn-control.js';
 
 export const CANONICAL_CONTEXT_PACK_VERSION = '2026-07-01.report-only-curator';
 
@@ -44,6 +45,9 @@ export interface BuildCanonicalContextPackOptions {
    * fresh clause. This is a policy cue only; provider-visible wording stays
    * byte-exact elsewhere. */
   declinedParentWithNewTask?: boolean;
+  /** Compiled direct_reply: skip capability hunt only. */
+  skipCapabilityHunt?: boolean;
+  sourceStrategyBinding?: TurnSourceStrategyBindingV1;
   includeMemoryDiagnostics?: boolean;
 }
 
@@ -72,6 +76,8 @@ export function buildCanonicalContextPack(opts: BuildCanonicalContextPackOptions
     suppressSemanticEnrichment: opts.suppressSemanticEnrichment,
     authorityInput: opts.authorityInput,
     declinedParentWithNewTask: opts.declinedParentWithNewTask,
+    skipCapabilityHunt: opts.skipCapabilityHunt,
+    sourceStrategyBinding: opts.sourceStrategyBinding,
   });
 
   let stableMemoryAvailable = false;

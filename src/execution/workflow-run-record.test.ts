@@ -15,9 +15,13 @@ import {
 import os from 'node:os';
 import path from 'node:path';
 import {
+  persistWorkflowRunRecordQuarantine,
   readWorkflowRunRecordSnapshot,
+  scanWorkflowRunRecord,
+  scanWorkflowRunRecordSnapshot,
   tryReadWorkflowRunRecord,
   withWorkflowRunRecordLock,
+  workflowRunRecordQuarantinePathForTest,
 } from './workflow-run-record.js';
 
 const MODULE_URL = new URL('./workflow-run-record.ts', import.meta.url).href;
@@ -260,6 +264,111 @@ test('a creator refuses a directory generation with an unexpected extra entry', 
     assert.equal(existsSync(path.join(`${file}.record-lock`, 'unexpected-entry')), true);
   } finally {
     if (child.exitCode === null) child.kill('SIGKILL');
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('canonical scan distinguishes missing, busy, corrupt, and healthy generations', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clem-run-record-scan-'));
+  const missing = path.join(root, 'missing.json');
+  const corrupt = path.join(root, 'corrupt.json');
+  const nonObject = path.join(root, 'non-object.json');
+  const invalidIdentity = path.join(root, 'identity.json');
+  const healthy = path.join(root, 'healthy.json');
+  const busy = path.join(root, 'busy.json');
+  const busyLock = `${busy}.record-lock`;
+  const token = '00000000-0000-4000-8000-000000000000';
+  try {
+    assert.deepEqual(scanWorkflowRunRecord(missing), { status: 'missing' });
+
+    writeFileSync(corrupt, '{"id":"corrupt",', 'utf-8');
+    const corruptScan = scanWorkflowRunRecord(corrupt);
+    assert.equal(corruptScan.status, 'corrupt');
+    if (corruptScan.status === 'corrupt') {
+      assert.equal(corruptScan.evidence.reason, 'invalid_json');
+      assert.equal(corruptScan.evidence.fileName, 'corrupt.json');
+      assert.match(corruptScan.evidence.corruptionId, /^[a-f0-9]{64}$/);
+    }
+
+    writeFileSync(nonObject, '[]', 'utf-8');
+    const nonObjectScan = scanWorkflowRunRecord(nonObject);
+    assert.equal(nonObjectScan.status, 'corrupt');
+    if (nonObjectScan.status === 'corrupt') {
+      assert.equal(nonObjectScan.evidence.reason, 'not_json_object');
+    }
+
+    writeFileSync(invalidIdentity, JSON.stringify({ id: 'other', workflow: 'wf', status: 'queued' }), 'utf-8');
+    const invalidIdentityScan = scanWorkflowRunRecord(invalidIdentity);
+    assert.equal(invalidIdentityScan.status, 'corrupt');
+    if (invalidIdentityScan.status === 'corrupt') {
+      assert.equal(invalidIdentityScan.evidence.reason, 'invalid_canonical_identity');
+    }
+
+    writeFileSync(healthy, JSON.stringify({ id: 'healthy', workflow: 'wf', status: 'queued' }), 'utf-8');
+    assert.deepEqual(scanWorkflowRunRecord(healthy), {
+      status: 'ok',
+      record: { id: 'healthy', workflow: 'wf', status: 'queued' },
+    });
+
+    writeFileSync(busy, JSON.stringify({ id: 'busy', workflow: 'wf', status: 'running' }), 'utf-8');
+    mkdirSync(busyLock, { recursive: true });
+    writeFileSync(path.join(busyLock, `owner-${process.pid}-${token}.json`), JSON.stringify({
+      pid: process.pid,
+      token,
+      acquiredAt: new Date().toISOString(),
+    }), 'utf-8');
+    assert.deepEqual(scanWorkflowRunRecord(busy), { status: 'busy' });
+    assert.equal(
+      scanWorkflowRunRecordSnapshot(busy).status,
+      'ok',
+      'atomic inventory reads the complete published generation without touching a live writer lock',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('quarantine binds path plus raw bytes, preserves the source, and yields only to a valid replacement', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clem-run-record-quarantine-'));
+  const file = path.join(root, 'queued-corrupt.json');
+  const raw = '{"id":"queued-corrupt","workflow":"wf","status":"queued"';
+  try {
+    writeFileSync(file, raw, 'utf-8');
+    const scan = scanWorkflowRunRecord(file);
+    assert.equal(scan.status, 'corrupt');
+    if (scan.status !== 'corrupt') return;
+
+    const marker = persistWorkflowRunRecordQuarantine(
+      file,
+      scan.evidence,
+      '2026-08-22T12:00:00.000Z',
+    );
+    assert.ok(marker);
+    assert.equal(readFileSync(file, 'utf-8'), raw, 'quarantine never rewrites or moves corrupt bytes');
+    const markerPath = workflowRunRecordQuarantinePathForTest(file, scan.evidence.corruptionId);
+    const stored = JSON.parse(readFileSync(markerPath, 'utf-8')) as Record<string, unknown>;
+    assert.equal(stored.state, 'blocked');
+    assert.equal(stored.contentDigest, scan.evidence.contentDigest);
+    assert.equal(stored.pathDigest, scan.evidence.pathDigest);
+    assert.equal(JSON.stringify(stored).includes(raw), false, 'marker never embeds corrupt content');
+
+    const replay = persistWorkflowRunRecordQuarantine(file, scan.evidence, '2099-01-01T00:00:00.000Z');
+    assert.equal(replay?.detectedAt, '2026-08-22T12:00:00.000Z', 'same generation keeps first-winner truth');
+    assert.equal(readdirSync(path.dirname(markerPath)).length, 1);
+
+    writeFileSync(file, JSON.stringify({
+      id: 'queued-corrupt',
+      workflow: 'wf',
+      status: 'queued',
+      createdAt: '2026-08-22T12:01:00.000Z',
+    }), 'utf-8');
+    assert.equal(
+      persistWorkflowRunRecordQuarantine(file, scan.evidence),
+      null,
+      'stale corruption evidence cannot attach to a separately written replacement',
+    );
+    assert.equal(scanWorkflowRunRecord(file).status, 'ok');
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });

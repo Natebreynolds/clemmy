@@ -2,7 +2,7 @@
  * Session-scoped role-model overrides (owner ask, 2026-07-24: pin models per
  * WORKFLOW at authoring to cut tokens). The workflow runner registers a
  * step session's pinned worker model here; the worker dispatch seams
- * (run_worker, code-mode workers, sub-agent builder) consult it before the
+ * (run_worker and the sub-agent builder) consult it before the
  * global role default. In-memory and bounded — an override lives only as
  * long as its step run and is best-effort by design (a missed cleanup is
  * capped out; a daemon restart simply reverts to global routing).

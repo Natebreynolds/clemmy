@@ -16,6 +16,7 @@ import { rememberLastChatSession, unifiedChatSessionId } from './last-session';
 import { apiGet, apiPost, type ApiError } from './api';
 import { getPendingActionStatus } from './pendingActions';
 import { humanToolLabel, salientArgDetail, describeExternalWrite } from './toolLabels';
+import { isWorkPlanRow, workPlanActivityItem, workPlanStepLabel } from './work-plan-presentation';
 import type { ChatPostResult, HarnessEvent, PendingActionApprovalView } from './types';
 
 // Re-exported for callers that historically imported it from here.
@@ -94,6 +95,9 @@ export interface ChatMessage {
    *  workflow run), so the thread can attach evidence + a board deep-link
    *  instead of trusting prose alone. */
   taskRef?: { id: string; label?: string };
+  /** Host-dispatched workflow is still running after the ACK settled the
+   *  foreground turn. Keeps the activity strip live on this same bubble. */
+  workflowLive?: boolean;
 }
 
 export type ChatApprovalDecision = 'approve' | 'reject';
@@ -153,6 +157,20 @@ const EMPTY_ACTIVITY: ActivityItem[] = [];
  *  activity while this chat is idle. Never persisted — the server bridge
  *  re-seeds it on the next bridged frame after a reopen. */
 const DELEGATED_STRIP_ID = 'delegated-work-live';
+
+
+// Contract-grammar negotiation (COMPOUNDING wave): the harness teaching the
+// model its call contract — work_contract_required, effect mismatches,
+// already-satisfied — is internal alignment, not failed user work. A live
+// turn that SUCCEEDED showed three red ✗ rows from these (2026-08-19
+// screenshot), reading as chaos. They render as neutral settled rows; real
+// tool failures keep the ✗.
+const CONTRACT_NEGOTIATION_RE = /"error":"(?:work_contract_required|work_contract_conflict|work_effect_mismatch|work_already_satisfied|work_requirement_unknown|work_binding_required|work_attempt_budget_exhausted)"/;
+function isContractNegotiationReturn(d: Record<string, unknown>): boolean {
+  if (d.ok !== false) return false;
+  const preview = typeof d.preview === 'string' ? d.preview : '';
+  return CONTRACT_NEGOTIATION_RE.test(preview);
+}
 
 function providerFromModel(model: string): ActivityItem['provider'] {
   const id = model.toLowerCase();
@@ -386,20 +404,79 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
   // `.+?` strips the whole `mcp__…__` prefix; `[^_]+` stopped at the first `_`.
   const toolLabel = humanToolLabel(tool, d.args, d.publicSlug, d.innerTool);
   switch (ev.type) {
-    // The compiled turn plan — the graph making itself legible ("see the
-    // team's plan, not just its motion"). One row at turn start; replaced,
-    // never duplicated, if a retry recompiles.
-    case 'turn_graph_compiled': {
-      const nodeCount = typeof d.nodeCount === 'number' ? d.nodeCount : 0;
-      const fastPath = typeof d.fastPath === 'string' ? d.fastPath : '';
-      if (nodeCount <= 0) return prev;
-      const shape = fastPath === 'fanout_action' ? 'fan-out plan'
-        : fastPath === 'single_action' ? 'action plan'
-        : d.route === 'reply' ? 'reply plan'
-        : 'plan';
-      const label = `Planned: ${shape} · ${nodeCount} steps`;
-      const withoutOld = prev.filter((a) => a.id !== 'turn-plan');
-      return [...withoutOld, { id: 'turn-plan', kind: 'event', label, status: 'done', variant: 'lifecycle', tone: 'muted' }];
+    // The compiled graph is internal topology (a retrieve is ~10 nodes every
+    // time). Pinning "Planned: plan · N steps" is generic noise, not work —
+    // the header tracks the live beat, and the strip shows real tools as they
+    // fire. The event stays on the public bus for the drawer / Full trace.
+    case 'turn_graph_compiled':
+      return prev;
+    case 'step_started': {
+      const stepId = typeof d.stepId === 'string' ? d.stepId.trim() : '';
+      const title = typeof d.title === 'string' && d.title.trim()
+        ? d.title.trim()
+        : stepId.replace(/[_-]+/g, ' ').trim();
+      if (!title) return prev;
+      const row: ActivityItem = {
+        id: `step-${stepId || title}`,
+        kind: 'event',
+        variant: 'lifecycle',
+        tone: 'live',
+        label: title,
+        status: 'running',
+      };
+      const index = prev.findIndex((item) => item.id === row.id);
+      return index >= 0 ? prev.map((item, i) => (i === index ? { ...item, ...row } : item)) : [...prev, row];
+    }
+    case 'async_work_dispatched': {
+      const runIds = Array.isArray(d.runIds)
+        ? d.runIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+        : [];
+      if (runIds.length === 0) return prev;
+      const key = typeof d.dispatchKey === 'string' && d.dispatchKey.trim()
+        ? d.dispatchKey.trim()
+        : runIds.join(',');
+      const label = runIds.length > 1
+        ? `Started ${runIds.length} workflows in the background`
+        : 'Started the workflow in the background';
+      const row: ActivityItem = {
+        id: `dispatch-${key}`,
+        kind: 'event',
+        variant: 'lifecycle',
+        tone: 'live',
+        label,
+        detail: 'I’ll post the result here when it’s ready.',
+        status: 'running',
+      };
+      const index = prev.findIndex((item) => item.id === row.id);
+      return index >= 0 ? prev.map((item, i) => (i === index ? row : item)) : [...prev, row];
+    }
+    case 'expected_work_progress': {
+      // Host plan: show the work that is happening. A later write waiting on
+      // the read is sequencing, not a user-facing "blocked" row.
+      const rawLines = Array.isArray(d.lines) ? d.lines : [];
+      if (rawLines.length === 0) return prev;
+      const next = [...prev];
+      for (const raw of rawLines) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+        const line = raw as Record<string, unknown>;
+        const id = typeof line.id === 'string' ? line.id.trim() : '';
+        if (!id) continue;
+        const rowId = `ew-${id}`;
+        const row = workPlanActivityItem({
+          id,
+          effect: line.effect,
+          state: line.state,
+          dependsOn: line.dependsOn,
+        });
+        const index = next.findIndex((item) => item.id === rowId);
+        if (!row) {
+          if (index >= 0) next.splice(index, 1);
+          continue;
+        }
+        if (index >= 0) next[index] = row;
+        else next.push(row);
+      }
+      return next;
     }
     case 'batch_started': {
       const batchId = typeof d.batchId === 'string' ? d.batchId : `${prev.length}`;
@@ -468,36 +545,10 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
         : [...prev, row];
     }
     case 'capability_resolution': {
-      // The typed "what Clem knows going in" frame: proven procedures, paths
-      // that failed before, missing connections — resolved by the runtime at
-      // turn start. One plain-voice row; the trace drawer holds the raw event.
-      const entries = Array.isArray(d.entries) ? (d.entries as Array<Record<string, unknown>>) : [];
-      if (entries.length === 0) return prev;
-      const human = (e: Record<string, unknown>): string =>
-        String(e.intent ?? e.identifier ?? 'a tool').replace(/[._]/g, ' ').trim();
-      const proven = entries.filter((e) => e.status === 'proven');
-      const shaky = entries.filter((e) => e.status === 'previously_failed');
-      const disconnected = entries.filter((e) => e.connection === 'missing');
-      const parts: string[] = [];
-      if (proven.length) parts.push(`${proven.length} proven tool${proven.length === 1 ? '' : 's'}`);
-      if (shaky.length) parts.push(`${shaky.length} need${shaky.length === 1 ? 's' : ''} a re-check`);
-      if (disconnected.length) parts.push(`${disconnected.length} not connected`);
-      const detailParts: string[] = [];
-      for (const e of proven.slice(0, 3)) detailParts.push(`${human(e)} ✓`);
-      for (const e of shaky.slice(0, 2)) {
-        const when = typeof e.failedAt === 'string' ? ` (failed ${e.failedAt.slice(0, 10)})` : '';
-        detailParts.push(`${human(e)} — re-checking${when}`);
-      }
-      for (const e of disconnected.slice(0, 2)) detailParts.push(`${human(e)} — not connected`);
-      return [...prev, {
-        id: `cap-${prev.length}`,
-        kind: 'event',
-        variant: 'lifecycle',
-        tone: disconnected.length ? 'danger' : shaky.length ? 'warning' : 'success',
-        label: `Grounded in what's proven: ${parts.join(', ')}`,
-        ...(detailParts.length ? { detail: detailParts.join(' · ') } : {}),
-        status: 'done',
-      }];
+      // Inventory, not work. The previous turn's Outlook pin showing up on a
+      // sheet job is exactly why this does not belong in the chat strip.
+      // Full trace still has the event.
+      return prev;
     }
     case 'tool_called': {
       if (!tool || tool === 'run_worker' || /run_worker/.test(tool)) return prev; // agents render as agents, not a tool row
@@ -516,7 +567,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     case 'tool_returned': {
       if (d.batchMode === true) return prev; // counted via batch_progress
       // The backend now carries data.ok — a returned tool can have failed.
-      const status: ActivityItem['status'] = d.ok === false ? 'failed' : 'done';
+      const status: ActivityItem['status'] = d.ok === false && !isContractNegotiationReturn(d) ? 'failed' : 'done';
       const reused = d.reused === true;
       // The read-result glimpse: "12 records · name, website, phone — Acme
       // Roofing". Runtime-derived structure, so scraped data visibly ARRIVES
@@ -568,7 +619,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       // the final status so the agent still appears in the strip.
       if (!item) return prev;
       const id = `a-${item}`;
-      const status: ActivityItem['status'] = d.ok === false ? 'failed' : 'done';
+      const status: ActivityItem['status'] = d.ok === false && !isContractNegotiationReturn(d) ? 'failed' : 'done';
       const reason = typeof d.reason === 'string' ? d.reason.trim() : '';
       // Plain-human default: "<item> ✓" or "<item> ✗ — <short reason>". The model
       // id is power-user detail (demoted behind the drawer's "details" toggle).
@@ -646,6 +697,12 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     // ONE row per code-mode program: "Ran a batch program (N tool calls)". The
     // per-call plumbing stays inside the sandbox — the user sees the outcome, not
     // the machinery.
+    case 'conversation_completed':
+      return prev.map((item) => (
+        item.id.startsWith('dispatch-') && item.status === 'running'
+          ? { ...item, status: 'done', tone: 'success' }
+          : item
+      ));
     case 'codemode_program_summary': {
       const rpc = typeof d.rpcCalls === 'number' ? d.rpcCalls : 0;
       const ok = d.ok !== false;
@@ -664,17 +721,124 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
   }
 }
 
+/** Humanize `workflow:<runId>:<stepId>` so a bridged step has a name even
+ *  when the harness never emitted step_started. */
+export function workflowStepLabelFromSession(sessionId?: string): string | null {
+  if (!sessionId?.startsWith('workflow:')) return null;
+  const stepId = sessionId.slice('workflow:'.length).split(':')[1]?.trim();
+  if (!stepId) return null;
+  const label = stepId.replace(/[_-]+/g, ' ').trim();
+  return label || null;
+}
+
+/** Fold a host-dispatched workflow's bridged activity onto the ACK bubble
+ *  that started it. Returns the same array when nothing changed. */
+export function applyBridgedWorkflowActivity(
+  messages: ChatMessage[],
+  ev: HarnessEvent,
+): ChatMessage[] {
+  let dispatchIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m.role === 'assistant'
+      && (m.activity ?? []).some((row) => row.id.startsWith('dispatch-') && row.status === 'running')) {
+      dispatchIdx = i;
+      break;
+    }
+  }
+  if (dispatchIdx < 0) return messages;
+  const cur = messages[dispatchIdx];
+  let before = cur.activity ?? EMPTY_ACTIVITY;
+  const stepLabel = workflowStepLabelFromSession(ev.sessionId);
+  if (stepLabel && !before.some((row) => row.id.startsWith('wf-step-'))) {
+    before = [...before, {
+      id: `wf-step-${stepLabel}`,
+      kind: 'event',
+      variant: 'lifecycle',
+      tone: 'live',
+      label: `Working on ${stepLabel}`,
+      status: 'running',
+    }];
+  }
+  const activity = reduceActivity(before, ev);
+  const label = progressLabel(ev)
+    ?? (stepLabel ? `Working on ${stepLabel}…` : null);
+  if (activity === before && !label && cur.workflowLive) return messages;
+  const next = messages.slice();
+  next[dispatchIdx] = {
+    ...cur,
+    workflowLive: true,
+    ...(activity !== (cur.activity ?? EMPTY_ACTIVITY) ? { activity } : {}),
+    ...(label ? { progress: label } : {}),
+  };
+  return next;
+}
+
+/** Tools that look up *which* tool to use — overhead, not the work itself. */
+const DISCOVERY_TOOL_NAMES = new Set([
+  'tool_search', 'composio_search_tools', 'composio_list_tools',
+  'tool_output_query', 'recall_tool_result', 'composio_status',
+]);
+
+function isDiscoveryToolName(tool: string): boolean {
+  const normalized = tool.trim().toLowerCase().replace(/^mcp__/, '');
+  return DISCOVERY_TOOL_NAMES.has(normalized);
+}
+
 /** A short, human label for an intermediate event (the "working on…" line). */
-function progressLabel(ev: HarnessEvent): string | null {
+export function progressLabel(ev: HarnessEvent): string | null {
   const d = (ev.data ?? {}) as Record<string, unknown>;
   const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
+  const pretty = tool ? humanToolLabel(tool, d.args, d.publicSlug, d.innerTool) : '';
   switch (ev.type) {
     case 'turn_started': return 'Thinking…';
+    case 'turn_graph_compiled': {
+      // Route/fast-path are compiled enums, not user text. Name the kind of
+      // work that is about to start — never the node count.
+      const route = typeof d.route === 'string' ? d.route : '';
+      const fastPath = typeof d.fastPath === 'string' ? d.fastPath : '';
+      if (fastPath === 'fanout_action') return 'Working on several things…';
+      if (route === 'retrieve' || fastPath === 'single_retrieval') return 'Looking this up…';
+      if (route === 'act' || fastPath === 'single_action' || fastPath === 'project') return 'Getting started…';
+      return null;
+    }
+    case 'async_work_dispatched': {
+      const runIds = Array.isArray(d.runIds) ? d.runIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0) : [];
+      return runIds.length > 1
+        ? `Started ${runIds.length} workflows — I’ll post the result here.`
+        : 'Started the workflow — I’ll post the result here.';
+    }
+    case 'expected_work_progress': {
+      const rawLines = Array.isArray(d.lines) ? d.lines : [];
+      for (const raw of rawLines) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+        const line = raw as Record<string, unknown>;
+        const state = typeof line.state === 'string' ? line.state : '';
+        if (state !== 'open' && state !== 'data_in') continue;
+        const id = typeof line.id === 'string' ? line.id.trim() : '';
+        if (!id) continue;
+        return `${workPlanStepLabel({ id, effect: line.effect })}…`;
+      }
+      return null;
+    }
     case 'plan_drafted':
     case 'plan_first_started': return 'Drafting a plan…';
     case 'step_started': return typeof d.title === 'string' ? String(d.title) : 'Working on a step…';
-    case 'tool_called': return tool ? `Using ${tool.replace(/_/g, ' ')}…` : 'Using a tool…';
-    case 'tool_returned': return tool ? `Got results from ${tool.replace(/_/g, ' ')}` : 'Got results';
+    case 'tool_called': {
+      if (!tool) return 'Using a tool…';
+      if (isDiscoveryToolName(tool)) return 'Finding the right tool…';
+      const detail = salientArgDetail(d.args);
+      return detail ? `Using ${pretty} · ${detail}` : `Using ${pretty}…`;
+    }
+    case 'tool_returned': {
+      const g = d.glimpse as { count?: number; key?: string } | undefined;
+      if (g && typeof g.count === 'number' && g.count > 0) {
+        const key = typeof g.key === 'string' && g.key ? g.key : 'results';
+        return `Got ${g.count} ${key}`;
+      }
+      if (isDiscoveryToolName(tool)) return 'Finding the right tool…';
+      return pretty ? `Got results from ${pretty}` : 'Got results';
+    }
     case 'handoff': return 'Handing off…';
     // Structured-decision repair loop (stall retry): without a label these
     // attempts are INVISIBLE — a 2026-07-03 codex turn burned ~51s across three
@@ -692,6 +856,11 @@ function progressLabel(ev: HarnessEvent): string | null {
       if (d.kind === 'watcher_steer' && typeof d.steer === 'string' && d.steer) {
         return `Watcher: ${d.steer}`;
       }
+      // The host composes a ledger-truth progress line into progress check-ins
+      // ("Still working — plan 1/3 steps underway · 25-item collection · …").
+      // Prefer it over the bare pulse: 13 heartbeats of real plan progress
+      // rendered as an unchanging "Still working…" (live 2026-08-18).
+      if (typeof d.message === 'string' && d.message.trim()) return d.message.trim();
       return 'Still working…';
     }
     default: return null;
@@ -821,6 +990,8 @@ export function useChat(options?: UseChatOptions) {
   const pendingBackgroundRef = useRef<{ assistantId: string } | null>(null);
   const backgroundInFlightRef = useRef(false);
   const pendingActionHydrationsRef = useRef(new Set<string>());
+  /** Host dispatch ends the foreground stream; keep watching for the later origin terminal. */
+  const awaitingWorkflowReportRef = useRef(false);
 
   const patch = useCallback((id: string, fields: Partial<ChatMessage>) => {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...fields } : m)));
@@ -1008,6 +1179,10 @@ export function useChat(options?: UseChatOptions) {
         ? ev.sessionId.slice('background:'.length)
         : undefined;
       setMessages((prev) => {
+        if (ev.sessionId?.startsWith('workflow:')) {
+          const onBubble = applyBridgedWorkflowActivity(prev, ev);
+          if (onBubble !== prev) return onBubble;
+        }
         const idx = prev.findIndex((m) => m.id === DELEGATED_STRIP_ID);
         if (idx === -1) {
           const seeded = reduceActivity(EMPTY_ACTIVITY, ev);
@@ -1065,7 +1240,24 @@ export function useChat(options?: UseChatOptions) {
       if (delta) {
         setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: m.text + delta } : m)));
       }
+    } else if (ev.type === 'async_work_dispatched') {
+      awaitingWorkflowReportRef.current = true;
+      const ack = typeof d.text === 'string' && d.text.trim()
+        ? d.text.trim()
+        : 'Started — I’ll post the result here when it’s ready.';
+      setMessages((prev) => prev.map((m) => {
+        if (m.id !== assistantId) return m;
+        const activity = reduceActivity(m.activity ?? EMPTY_ACTIVITY, ev);
+        return {
+          ...m,
+          text: m.text.trim() ? m.text : ack,
+          status: 'complete' as const,
+          progress: undefined,
+          ...(activity !== (m.activity ?? EMPTY_ACTIVITY) ? { activity } : {}),
+        };
+      }));
     } else if (ev.type === 'conversation_completed') {
+      awaitingWorkflowReportRef.current = false;
       const text = humanHarnessText((d.reply ?? d.summary), '');
       const reason = typeof d.reason === 'string' ? d.reason : '';
       const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : '';
@@ -1075,9 +1267,16 @@ export function useChat(options?: UseChatOptions) {
         // Keep already-streamed human output when the terminal envelope omits
         // its duplicate reply. With neither source present, fail closed: an
         // empty/reasoning-only terminal event is not a successful answer.
-        setMessages((prev) => prev.map((m) => (
-          m.id === assistantId ? { ...m, ...terminalCompletionPresentation(d, m.text, m.status) } : m
-        )));
+        setMessages((prev) => prev.map((m) => {
+          if (m.id !== assistantId) return m;
+          const activity = reduceActivity(m.activity ?? EMPTY_ACTIVITY, ev);
+          return {
+            ...m,
+            ...terminalCompletionPresentation(d, m.text, m.status),
+            workflowLive: undefined,
+            ...(activity !== (m.activity ?? EMPTY_ACTIVITY) ? { activity } : {}),
+          };
+        }));
       }
     } else if (ev.type === 'stall_retry_attempted') {
       // The streamed draft was a DETECTED-BAD reply (e.g. the model claiming it
@@ -1103,8 +1302,14 @@ export function useChat(options?: UseChatOptions) {
         const cur = m.activity ?? EMPTY_ACTIVITY;
         const activity = reduceActivity(cur, ev);
         const changed = activity !== cur;
-        if (!changed && !label) return m;
-        return { ...m, ...(changed ? { activity } : {}), ...(label ? { progress: label } : {}) };
+        const keepProgress = label === 'Finding the right tool…'
+          && activity.some((row) => isWorkPlanRow(row));
+        if (!changed && (!label || keepProgress)) return m;
+        return {
+          ...m,
+          ...(changed ? { activity } : {}),
+          ...(label && !keepProgress ? { progress: label } : {}),
+        };
       }));
     }
   }, [patch]);
@@ -1174,6 +1379,7 @@ export function useChat(options?: UseChatOptions) {
     // from a previous stopped turn would misattribute this turn's events.
     lateWatchRef.current?.cancel();
     lateWatchRef.current = null;
+    awaitingWorkflowReportRef.current = false;
     // Do not carry a reusable session's prior attempt into this turn. If Stop
     // wins before the new 202 arrives, onLateAccepted will cancel the exact
     // attempt from that acknowledgement instead of guessing by session id.
@@ -1241,6 +1447,13 @@ export function useChat(options?: UseChatOptions) {
         // result over the "stopped" note instead of stranding a completed run.
         // (Any prior watch was cancelled at the top of this send.)
         lateWatchRef.current = watchForLateCompletion(body.sessionId, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev));
+      } else if (awaitingWorkflowReportRef.current) {
+        lateWatchRef.current = watchForLateCompletion(
+          body.sessionId,
+          handle.getLastSeq(),
+          (ev) => applyEvent(assistantId, ev),
+          { intervalMs: 8_000, maxAttempts: 180 },
+        );
       }
     } catch (err) {
       if (isChatPostCancelledError(err)) return;

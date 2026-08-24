@@ -30,6 +30,7 @@ const {
   MOBILE_SESSION_COOKIE,
   _clearMobileChatInFlightForTests,
   _clearOriginHandoffsForTests,
+  classifyMobileTypedChatControl,
 } = await import('./mobile-routes.js');
 const { _clearIdempotencyForTests } = await import('../runtime/idempotency.js');
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-presentation.js');
@@ -43,16 +44,19 @@ const {
   createSession: createHarnessSession,
   getSession: getHarnessSessionForTest,
   listEvents,
+  openEventLog,
   recordRunAttemptUserInput,
   resetEventLog,
 } = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { registerResumableApprovalCardAtomically } = await import('../runtime/harness/approval-card.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { queuePendingAction, getPendingAction } = await import('../runtime/harness/pending-actions.js');
 const {
   createBackgroundTask,
   getBackgroundTask,
   markBackgroundTaskAwaitingApproval,
+  markBackgroundTaskAwaitingInput,
   markBackgroundTaskRunning,
 } = await import('../execution/background-tasks.js');
 const { resetMemoryDb } = await import('../memory/db.js');
@@ -242,6 +246,39 @@ test('QR pairing creates a session without manual PIN and is one-time use', asyn
   } finally { await h.close(); }
 });
 
+test('Workspace destination chooser is mobile-session gated and malformed decisions fail closed', async () => {
+  const h = await startHarness();
+  try {
+    const anonymous = await fetch(`${h.url}/m/api/automation-pilot/workspace-choosers`);
+    assert.equal(anonymous.status, 401);
+
+    const cookie = await loginMobile(h, 'Chooser phone');
+    const listed = await fetch(`${h.url}/m/api/automation-pilot/workspace-choosers`, {
+      headers: { cookie },
+    });
+    assert.equal(listed.status, 200);
+    assert.deepEqual(await listed.json(), { choosers: [], count: 0 });
+
+    const malformed = await fetch(
+      `${h.url}/m/api/automation-pilot/workspace-choosers/not-valid!/resolve`,
+      {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          chooserRevision: 1,
+          chooserDigest: 'a'.repeat(64),
+          choiceId: 'choice.valid',
+          actorRef: 'model.must_not_choose',
+        }),
+      },
+    );
+    assert.equal(malformed.status, 400);
+    assert.equal((await malformed.json() as { error: string }).error, 'workspace_chooser_request_invalid');
+  } finally {
+    await h.close();
+  }
+});
+
 test('mobile approvals list and approve use /m API without console auth', async () => {
   const h = await startHarness();
   try {
@@ -262,9 +299,20 @@ test('mobile approvals list and approve use /m API without console auth', async 
 
     const list = await fetch(`${h.url}/m/api/approvals`, { headers: { cookie } });
     assert.equal(list.status, 200);
-    const listBody = await list.json() as { approvals: Array<{ approvalId: string; subject: string }>; count: number };
+    const listBody = await list.json() as {
+      approvals: Array<{
+        approvalId: string;
+        subject: string;
+        status: string;
+        resolution: string | null;
+      }>;
+      count: number;
+    };
     assert.equal(listBody.count >= 1, true);
-    assert.ok(listBody.approvals.some((row) => row.approvalId === approval.approvalId && row.subject === 'Run test command?'));
+    const listed = listBody.approvals.find((row) => row.approvalId === approval.approvalId);
+    assert.equal(listed?.subject, 'Run test command?');
+    assert.equal(listed?.status, 'pending');
+    assert.equal(listed?.resolution, null);
 
     const approved = await fetch(`${h.url}/m/api/approvals/${approval.approvalId}/approve`, {
       method: 'POST',
@@ -282,6 +330,52 @@ test('mobile approvals list and approve use /m API without console auth', async 
     assert.equal(reused.status, 200);
     assert.equal(reused.headers.get('idempotent-replay'), '1');
   } finally { await h.close(); }
+});
+
+test('formal recurrence consent is visible and resolvable through the mobile approval surface', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Recurrence phone');
+    const session = createHarnessSession({
+      id: `mobile-recurrence-consent-${Date.now().toString(36)}`,
+      kind: 'chat',
+      channel: 'mobile',
+      title: 'Mobile recurrence consent',
+    });
+    const card = registerResumableApprovalCardAtomically({
+      sessionId: session.id,
+      channel: 'mobile',
+      subject: 'Activate the reviewed read-only interval?',
+      tool: 'automation_recurrence_activate',
+      args: {
+        version: 1,
+        workflowId: 'record-index',
+        previewId: 'preview.record-index',
+        effect: 'read',
+        externalWrites: false,
+        sends: false,
+      },
+      resumeKey: `automation-recurrence-consent:v1:${'b'.repeat(64)}`,
+    });
+    const list = await fetch(`${h.url}/m/api/approvals`, { headers: { cookie } });
+    assert.equal(list.status, 200);
+    const body = await list.json() as {
+      approvals: Array<{ approvalId: string; tool: string; subject: string }>;
+    };
+    assert.ok(body.approvals.some((row) => (
+      row.approvalId === card.row.approvalId
+      && row.tool === 'automation_recurrence_activate'
+      && row.subject === 'Activate the reviewed read-only interval?'
+    )));
+    const approved = await fetch(`${h.url}/m/api/approvals/${card.row.approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(approved.status, 200);
+    assert.equal(approvalRegistry.get(card.row.approvalId)?.resolution, 'approved');
+  } finally {
+    await h.close();
+  }
 });
 
 test('mobile approval B is accepted before mutation and owns B terminal, never approval A source', async () => {
@@ -676,6 +770,64 @@ function cookieFrom(res: Response): string {
   return (res.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
 }
 
+interface RotatedKeySession {
+  pair: CryptoKeyPair;
+  currentCookie: string;
+  currentToken: string;
+  currentFingerprint: string;
+  previousFingerprint: string;
+}
+
+async function pairedDeviceAfterRotation(h: Harness): Promise<RotatedKeySession> {
+  const { pair, publicJwk } = await makeDeviceKey();
+  const { token: pairToken } = await createMobilePairingCode({}, { stateDir: h.stateDir });
+  const paired = await fetch(`${h.url}/m/auth/pair`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ pairToken, devicePublicKeyJwk: publicJwk }),
+  });
+  assert.equal(paired.status, 200);
+  const body = await paired.json() as { sessionFingerprint: string };
+  const pairedToken = cookieFrom(paired).split('=').slice(1).join('=');
+  assert.ok(pairedToken);
+
+  const { rotateSessionToken } = await import('../runtime/mobile-sessions.js');
+  const rotated = await rotateSessionToken(pairedToken, { stateDir: h.stateDir });
+  assert.ok(rotated, 'fixture session must rotate');
+  return {
+    pair,
+    currentCookie: `${MOBILE_SESSION_COOKIE}=${rotated.token}`,
+    currentToken: rotated.token,
+    currentFingerprint: createHash('sha256').update(rotated.token).digest('hex').slice(0, 32),
+    previousFingerprint: body.sessionFingerprint,
+  };
+}
+
+async function mutateRotatedSession(
+  h: Harness,
+  currentToken: string,
+  mutate: (row: {
+    tokenHash: string;
+    previousTokenHash?: string;
+    previousTokenValidUntil?: string;
+  }) => void,
+): Promise<void> {
+  const file = path.join(h.stateDir, 'mobile-sessions.json');
+  const store = JSON.parse(await readFile(file, 'utf8')) as {
+    sessions: Array<{
+      tokenHash: string;
+      previousTokenHash?: string;
+      previousTokenValidUntil?: string;
+    }>;
+  };
+  const currentHash = createHash('sha256').update(currentToken).digest('hex');
+  const row = store.sessions.find((candidate) => candidate.tokenHash === currentHash);
+  assert.ok(row, 'rotated fixture row must exist');
+  mutate(row);
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(file, JSON.stringify(store));
+}
+
 test('a key-bound session requires a valid device proof on every request', async () => {
   const h = await startHarness();
   try {
@@ -703,6 +855,81 @@ test('a key-bound session requires a valid device proof on every request', async
     });
     assert.equal(withProof.status, 200, 'the real device must be served');
   } finally { await h.close(); }
+});
+
+test('parallel pre-rotation proofs follow a post-rotation cookie within the bounded grace', async () => {
+  const h = await startHarness();
+  try {
+    const fixture = await pairedDeviceAfterRotation(h);
+    const proofs = await Promise.all([
+      deviceProof(fixture.pair, 'GET', '/m/api/whoami', fixture.previousFingerprint),
+      deviceProof(fixture.pair, 'GET', '/m/api/whoami', fixture.previousFingerprint),
+    ]);
+    const responses = await Promise.all(proofs.map((proof) => fetch(`${h.url}/m/api/whoami`, {
+      headers: {
+        cookie: fixture.currentCookie,
+        'x-clem-device-proof': proof,
+      },
+    })));
+
+    for (const response of responses) {
+      assert.equal(response.status, 200, 'an independently signed in-flight request must survive rotation');
+      assert.equal(
+        response.headers.get('x-clem-session-fp'),
+        fixture.currentFingerprint,
+        'the response converges the client onto the fingerprint for its current cookie',
+      );
+      await response.body?.cancel();
+    }
+  } finally { await h.close(); }
+});
+
+test('previous-fingerprint compatibility rejects missing, expired, foreign, and near-miss state', async () => {
+  for (const scenario of ['missing', 'expired', 'foreign', 'near-miss', 'superseded'] as const) {
+    const h = await startHarness();
+    try {
+      const fixture = await pairedDeviceAfterRotation(h);
+      let proofFingerprint = fixture.previousFingerprint;
+
+      if (scenario === 'missing') {
+        await mutateRotatedSession(h, fixture.currentToken, (row) => {
+          delete row.previousTokenHash;
+          delete row.previousTokenValidUntil;
+        });
+      } else if (scenario === 'expired') {
+        await mutateRotatedSession(h, fixture.currentToken, (row) => {
+          row.previousTokenValidUntil = new Date(0).toISOString();
+        });
+      } else if (scenario === 'foreign') {
+        const foreign = await pairedDeviceAfterRotation(h);
+        assert.notEqual(foreign.previousFingerprint, fixture.previousFingerprint);
+        proofFingerprint = foreign.previousFingerprint;
+      } else if (scenario === 'near-miss') {
+        const tail = fixture.previousFingerprint.at(-1);
+        proofFingerprint = `${fixture.previousFingerprint.slice(0, -1)}${tail === '0' ? '1' : '0'}`;
+      } else {
+        const { rotateSessionToken } = await import('../runtime/mobile-sessions.js');
+        const rotatedAgain = await rotateSessionToken(fixture.currentToken, { stateDir: h.stateDir });
+        assert.ok(rotatedAgain, 'fixture must rotate a second time');
+        fixture.currentCookie = `${MOBILE_SESSION_COOKIE}=${rotatedAgain.token}`;
+      }
+
+      const proof = await deviceProof(fixture.pair, 'GET', '/m/api/whoami', proofFingerprint);
+      const response = await fetch(`${h.url}/m/api/whoami`, {
+        headers: {
+          cookie: fixture.currentCookie,
+          'x-clem-device-proof': proof,
+        },
+      });
+      assert.equal(response.status, 401, `${scenario} previous-fingerprint state must fail closed`);
+      assert.deepEqual(
+        await response.json(),
+        { error: 'BAD_DEVICE_PROOF', reason: 'SESSION_MISMATCH' },
+        `${scenario} must fail at the session binding without weakening another proof check`,
+      );
+      assert.equal(response.headers.get('x-clem-session-fp'), null);
+    } finally { await h.close(); }
+  }
 });
 
 test('an attacker key cannot sign for a bound session', async () => {
@@ -999,6 +1226,354 @@ test('chat/send rejects without a cookie', async () => {
   } finally { await h.close(); }
 });
 
+test('mobile typed exact approval, cancel, and new controls execute on their bound owner exactly once', async () => {
+  resetEventLog();
+  _clearIdempotencyForTests();
+  _clearMobileChatInFlightForTests();
+  let modelCalls = 0;
+  const h = await startHarness({
+    assistant: {
+      async respond() {
+        modelCalls += 1;
+        throw new Error('route-owned mobile control must not enter the model');
+      },
+    } as Parameters<typeof createMobileRouter>[0]['assistant'],
+  });
+  try {
+    const cookie = await loginMobile(h, 'Typed control phone');
+    const whoami = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const { deviceId } = await whoami.json() as { deviceId: string };
+    const parent = createHarnessSession({
+      id: 'sess-mobile-typed-control-parent',
+      kind: 'chat',
+      channel: 'mobile',
+      userId: deviceId,
+      metadata: {
+        source: 'mobile',
+        ingressProvider: 'mobile',
+        channelId: 'mobile-typed-control-root',
+        userId: deviceId,
+      },
+    });
+    const approval = approvalRegistry.register({
+      sessionId: parent.id,
+      channel: 'mobile',
+      subject: 'Older mobile request remains pending',
+      tool: 'request_approval',
+      args: { reason: 'Confirm the exact older action.' },
+    });
+    assert.deepEqual(classifyMobileTypedChatControl(`Approve ${approval.approvalId}`), {
+      kind: 'formal_approval',
+      decision: 'approve',
+      approvalId: approval.approvalId,
+    });
+    assert.deepEqual(classifyMobileTypedChatControl('/continue'), {
+      kind: 'session_control',
+      command: 'continue',
+    });
+    assert.equal(classifyMobileTypedChatControl('continue with the analysis'), null);
+    const send = (message: string, sessionId: string, key: string) => fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        'idempotency-key': key,
+      },
+      body: JSON.stringify({ message, sessionId, async: true }),
+    });
+
+    const approved = await send(
+      `approve ${approval.approvalId}`,
+      parent.id,
+      'mobile-typed-exact-approval',
+    );
+    assert.equal(approved.status, 200);
+    const approvedBody = await approved.json() as { sessionId: string; runId: string; reply: string };
+    assert.equal(approvedBody.sessionId, parent.id);
+    assert.match(approvedBody.reply, new RegExp(approval.approvalId));
+    assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, 'approved');
+    const approvalReplay = await send(
+      `approve ${approval.approvalId}`,
+      parent.id,
+      'mobile-typed-exact-approval',
+    );
+    assert.equal(approvalReplay.status, 200);
+    assert.equal(approvalReplay.headers.get('idempotent-replay'), '1');
+    assert.deepEqual(await approvalReplay.json(), approvedBody);
+    assert.equal(listEvents(parent.id, { types: ['user_input_received'] }).length, 1);
+
+    const cancelTarget = createHarnessSession({
+      id: 'sess-mobile-typed-cancel-target',
+      kind: 'chat',
+      channel: 'mobile',
+      userId: deviceId,
+      metadata: {
+        source: 'mobile',
+        ingressProvider: 'mobile',
+        channelId: 'mobile-typed-cancel-root',
+        userId: deviceId,
+      },
+    });
+    const cancelledApproval = approvalRegistry.register({
+      sessionId: cancelTarget.id,
+      channel: 'mobile',
+      subject: 'Cancel this exact pending request',
+      tool: 'request_approval',
+      args: { reason: 'cancel test' },
+    });
+    const cancelled = await send('/cancel', cancelTarget.id, 'mobile-typed-exact-cancel');
+    assert.equal(cancelled.status, 200);
+    const cancelledBody = await cancelled.json() as { sessionId: string; runId: string; reply: string };
+    assert.equal(cancelledBody.sessionId, cancelTarget.id);
+    assert.match(cancelledBody.reply, /Cancelled this conversation/);
+    assert.equal(getHarnessSessionForTest(cancelTarget.id)?.status, 'cancelled');
+    assert.equal(approvalRegistry.get(cancelledApproval.approvalId)?.resolution, 'cancelled_by_user');
+    const cancelReplay = await send('/cancel', cancelTarget.id, 'mobile-typed-exact-cancel');
+    assert.equal(cancelReplay.status, 200);
+    assert.deepEqual(await cancelReplay.json(), cancelledBody);
+    assert.equal(listEvents(cancelTarget.id, { types: ['user_input_received'] }).length, 1);
+
+    const newTarget = createHarnessSession({
+      id: 'sess-mobile-typed-new-target',
+      kind: 'chat',
+      channel: 'mobile',
+      userId: deviceId,
+      metadata: {
+        source: 'mobile',
+        ingressProvider: 'mobile',
+        channelId: 'mobile-typed-new-root',
+        userId: deviceId,
+      },
+    });
+    const fresh = await send('/new', newTarget.id, 'mobile-typed-exact-new');
+    assert.equal(fresh.status, 200);
+    const freshBody = await fresh.json() as { sessionId: string; runId: string; reply: string };
+    assert.notEqual(freshBody.sessionId, newTarget.id);
+    assert.equal(getHarnessSessionForTest(freshBody.sessionId)?.metadata.userId, deviceId);
+    const freshReplay = await send('/new', newTarget.id, 'mobile-typed-exact-new');
+    assert.equal(freshReplay.status, 200);
+    assert.deepEqual(await freshReplay.json(), freshBody);
+    assert.equal(listEvents(newTarget.id, { types: ['user_input_received'] }).length, 1);
+    assert.equal(modelCalls, 0);
+
+    const otherDeviceSession = createHarnessSession({
+      id: 'sess-mobile-typed-other-device',
+      kind: 'chat',
+      channel: 'mobile',
+      userId: 'dev-someone-else',
+      metadata: {
+        source: 'mobile',
+        ingressProvider: 'mobile',
+        channelId: 'mobile-other-device-root',
+        userId: 'dev-someone-else',
+      },
+    });
+    for (const message of ['/cancel', '/new', '/continue']) {
+      const response = await fetch(`${h.url}/m/api/chat/send`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie,
+          'idempotency-key': `mobile-cross-device-${message.slice(1)}`,
+        },
+        body: JSON.stringify({ message, sessionId: otherDeviceSession.id, async: true }),
+      });
+      assert.equal(response.status, 409);
+      assert.equal((await response.json() as { error: string }).error, 'MOBILE_CONTROL_TARGET_UNAVAILABLE');
+    }
+    assert.equal(listEvents(otherDeviceSession.id).length, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test('mobile typed continue stays on the exact current session and replays one model dispatch', async () => {
+  resetEventLog();
+  _clearIdempotencyForTests();
+  _clearMobileChatInFlightForTests();
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'on';
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  let dispatches = 0;
+  const seenPrompts: string[] = [];
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (opts: { sessionId: string; input?: string }) => {
+      dispatches += 1;
+      seenPrompts.push(String(opts.input ?? ''));
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 2,
+        lastDecision: {
+          summary: 'Continued exact mobile work.',
+          reply: 'Continued exact mobile work.',
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
+  const h = await startHarness({
+    assistant: {
+      async respond() { throw new Error('mobile continue must use the harness bridge'); },
+    } as Parameters<typeof createMobileRouter>[0]['assistant'],
+  });
+  try {
+    const cookie = await loginMobile(h, 'Continue phone');
+    const whoami = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const { deviceId } = await whoami.json() as { deviceId: string };
+    const target = createHarnessSession({
+      id: 'sess-mobile-typed-continue-target',
+      kind: 'chat',
+      channel: 'mobile',
+      userId: deviceId,
+      metadata: {
+        source: 'mobile',
+        ingressProvider: 'mobile',
+        channelId: 'mobile-typed-continue-root',
+        userId: deviceId,
+      },
+    });
+    appendEvent({
+      sessionId: target.id,
+      turn: 1,
+      role: 'system',
+      type: 'conversation_completed',
+      data: { reply: 'Reply continue.', reason: 'limit_exceeded', lastDecisionSummary: 'Finish the remaining exact work.' },
+    });
+    const send = () => fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        'idempotency-key': 'mobile-typed-exact-continue',
+      },
+      body: JSON.stringify({ message: '/continue', sessionId: target.id }),
+    });
+    const first = await send();
+    assert.equal(first.status, 200);
+    const firstBody = await first.json() as { sessionId: string; runId: string; reply: string };
+    assert.equal(firstBody.sessionId, target.id);
+    assert.equal(dispatches, 1);
+    assert.match(seenPrompts[0] ?? '', /Finish the remaining exact work/);
+    const replay = await send();
+    assert.equal(replay.status, 200);
+    assert.deepEqual(await replay.json(), firstBody);
+    assert.equal(dispatches, 1);
+    assert.equal(listEvents(target.id, { types: ['user_input_received'] }).length, 1);
+  } finally {
+    _setBridgeImplsForTests({});
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
+    await h.close();
+  }
+});
+
+test('mobile ordinary send branches a held parent before acceptance and replays the same child', async () => {
+  resetEventLog();
+  _clearIdempotencyForTests();
+  _clearMobileChatInFlightForTests();
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'on';
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  let modelCalls = 0;
+  const seenSessions: string[] = [];
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (opts: { sessionId: string }) => {
+      modelCalls += 1;
+      seenSessions.push(opts.sessionId);
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          summary: 'Fresh mobile work completed.',
+          reply: 'Fresh mobile work completed.',
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
+  const h = await startHarness({
+    assistant: {
+      async respond() {
+        throw new Error('fresh mobile chat must not dispatch the legacy assistant');
+      },
+    } as Parameters<typeof createMobileRouter>[0]['assistant'],
+  });
+  try {
+    const cookie = await loginMobile(h, 'Held parent phone');
+    const whoami = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const { deviceId } = await whoami.json() as { deviceId: string };
+    const parent = createHarnessSession({
+      id: 'sess-mobile-held-parent',
+      kind: 'chat',
+      channel: 'mobile',
+      userId: deviceId,
+      metadata: {
+        source: 'mobile',
+        ingressProvider: 'mobile',
+        channelId: 'mobile-held-root',
+        userId: deviceId,
+      },
+    });
+    const approval = approvalRegistry.register({
+      sessionId: parent.id,
+      channel: 'mobile',
+      subject: 'Older mobile request remains held',
+    });
+    const send = () => fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        'idempotency-key': 'mobile-held-ordinary-key',
+      },
+      body: JSON.stringify({
+        message: 'Start a completely unrelated mobile request.',
+        sessionId: parent.id,
+        async: true,
+      }),
+    });
+    const first = await send();
+    assert.equal(first.status, 202);
+    const firstBody = await first.json() as { sessionId: string; runId: string };
+    assert.notEqual(firstBody.sessionId, parent.id);
+    for (let index = 0; index < 100 && modelCalls === 0; index++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(seenSessions, [firstBody.sessionId]);
+    assert.equal(listEvents(parent.id, { types: ['user_input_received'] }).length, 0);
+    assert.equal(approvalRegistry.get(approval.approvalId)?.status, 'pending');
+
+    const replay = await send();
+    assert.equal(replay.status, 202);
+    const replayBody = await replay.json() as typeof firstBody;
+    assert.equal(replayBody.sessionId, firstBody.sessionId);
+    assert.equal(replayBody.runId, firstBody.runId);
+    assert.equal(modelCalls, 1);
+    assert.equal(listEvents(firstBody.sessionId, { types: ['user_input_received'] }).length, 1);
+  } finally {
+    _setBridgeImplsForTests({});
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
+    await h.close();
+  }
+});
+
 test('mobile memory search uses unified recall and returns facts absent from the vault', async () => {
   resetMemoryDb();
   const fact = rememberFact({
@@ -1113,14 +1688,32 @@ test('concurrent mobile retries share one durable run, source, dispatch, and ter
   _clearMobileChatInFlightForTests();
   const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
   const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
-  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'on';
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   let dispatches = 0;
-  const assistant = {
-    respond: async (req: { sessionId: string }) => {
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (opts: { sessionId: string }) => {
       dispatches += 1;
       await new Promise((resolve) => setTimeout(resolve, 60));
-      return { text: 'Exactly once.', sessionId: req.sessionId };
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          summary: 'Completed the exact mobile turn.',
+          reply: 'Exactly once.',
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
+  const assistant = {
+    respond: async () => {
+      throw new Error('fresh mobile chat must not dispatch the legacy assistant');
     },
   } as Parameters<typeof createMobileRouter>[0]['assistant'];
   const h = await startHarness({ assistant });
@@ -1141,7 +1734,7 @@ test('concurrent mobile retries share one durable run, source, dispatch, and ter
     const first = await firstResponse.json() as { sessionId: string; runId: string; reply: string };
     const duplicate = await duplicateResponse.json() as typeof first;
     assert.deepEqual(duplicate, first);
-    assert.equal(dispatches, 1, 'concurrent duplicate never dispatches a second gateway executor');
+    assert.equal(dispatches, 1, 'concurrent duplicate never dispatches a second host executor');
 
     const users = listEvents(first.sessionId, { types: ['user_input_received'] });
     const terminals = listEvents(first.sessionId, { types: ['conversation_completed'] });
@@ -1156,6 +1749,7 @@ test('concurrent mobile retries share one durable run, source, dispatch, and ter
     assert.equal(dispatches, 1);
     assert.equal(listEvents(first.sessionId, { types: ['user_input_received'] }).length, 1);
   } finally {
+    _setBridgeImplsForTests({});
     if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
     else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
     if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
@@ -1170,13 +1764,31 @@ test('mobile retry after process-cache loss recovers the original fallback sessi
   _clearMobileChatInFlightForTests();
   const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
   const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
-  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'on';
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   let dispatches = 0;
-  const assistant = {
-    respond: async (req: { sessionId: string }) => {
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (opts: { sessionId: string }) => {
       dispatches += 1;
-      return { text: 'Durable replay result.', sessionId: req.sessionId };
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          summary: 'Completed the durable mobile replay turn.',
+          reply: 'Durable replay result.',
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
+  const assistant = {
+    respond: async () => {
+      throw new Error('fresh mobile chat must not dispatch the legacy assistant');
     },
   } as Parameters<typeof createMobileRouter>[0]['assistant'];
   const firstServer = await startHarness({ assistant });
@@ -1213,6 +1825,7 @@ test('mobile retry after process-cache loss recovers the original fallback sessi
     assert.equal(listEvents(first.sessionId, { types: ['user_input_received'] }).length, 1);
     assert.equal(listEvents(first.sessionId, { types: ['conversation_completed'] }).length, 1);
   } finally {
+    _setBridgeImplsForTests({});
     if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
     else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
     if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
@@ -1317,13 +1930,28 @@ test('mobile retry after crash between acceptance and terminal fails closed with
 test('chat/send includes model route diagnostics and preserves them on idempotent replay', async () => {
   const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
   const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
-  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'on';
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (opts: { sessionId: string }) => ({
+      sessionId: opts.sessionId,
+      status: 'completed',
+      steps: 1,
+      lastTurn: 1,
+      lastDecision: {
+        summary: 'Recorded the route.',
+        reply: 'Done. Route passthrough recorded.',
+        done: true,
+        nextAction: 'completed',
+      },
+    })) as never,
+  });
   const assistant = {
-    respond: async (req: { sessionId: string }) => ({
-      text: 'Done. Route passthrough recorded.',
-      sessionId: req.sessionId,
-    }),
+    respond: async () => {
+      throw new Error('fresh mobile chat must not dispatch the legacy assistant');
+    },
   } as Parameters<typeof createMobileRouter>[0]['assistant'];
   const h = await startHarness({ assistant });
   try {
@@ -1342,9 +1970,9 @@ test('chat/send includes model route diagnostics and preserves them on idempoten
     });
     assert.equal(first.status, 200);
     const firstBody = await first.json() as { route?: { routeKind?: string; surface?: string; transport?: string } };
-    assert.equal(firstBody.route?.routeKind, 'legacy');
+    assert.equal(firstBody.route?.routeKind, 'harness');
     assert.equal(firstBody.route?.surface, 'webhook');
-    assert.equal(firstBody.route?.transport, 'legacy_assistant');
+    assert.equal(firstBody.route?.transport, 'host_harness');
 
     const replay = await fetch(`${h.url}/m/api/chat/send`, {
       method: 'POST',
@@ -1355,6 +1983,7 @@ test('chat/send includes model route diagnostics and preserves them on idempoten
     const replayBody = await replay.json() as { route?: { routeKind?: string; surface?: string; transport?: string } };
     assert.deepEqual(replayBody.route, firstBody.route);
   } finally {
+    _setBridgeImplsForTests({});
     if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
     else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
     if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
@@ -1493,14 +2122,32 @@ test('chat/send async mode: 202 on the durable claim, the run continues, replays
   _clearMobileChatInFlightForTests();
   const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
   const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
-  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'on';
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   let dispatches = 0;
-  const assistant = {
-    respond: async (req: { sessionId: string }) => {
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (opts: { sessionId: string }) => {
       dispatches += 1;
       await new Promise((resolve) => setTimeout(resolve, 80));
-      return { text: 'Landed after the ack.', sessionId: req.sessionId };
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          summary: 'Completed after the mobile acknowledgement.',
+          reply: 'Landed after the ack.',
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
+  const assistant = {
+    respond: async () => {
+      throw new Error('fresh mobile chat must not dispatch the legacy assistant');
     },
   } as Parameters<typeof createMobileRouter>[0]['assistant'];
   const h = await startHarness({ assistant });
@@ -1891,6 +2538,91 @@ test('the Activity feed rides the mobile door: /m/api/runs serves the injected c
   } finally { await h.close(); }
 });
 
+test('/m/api/activity/v2 serves the durable Working Now projection behind mobile auth', async () => {
+  const task = createBackgroundTask({
+    explicitId: `bg-mobile-working-now-${Date.now()}`,
+    title: 'Compare release candidates',
+    prompt: 'MOBILE-PRIVATE-PROMPT-CANARY',
+    source: 'MOBILE-PRIVATE-ORIGIN-CANARY',
+  });
+  assert.ok(markBackgroundTaskRunning(task.id), 'fixture should own a durable running transition');
+  assert.ok(markBackgroundTaskAwaitingInput(
+    task.id,
+    'mobile-private-question-id',
+    'MOBILE-PRIVATE-PENDING-QUESTION-CANARY',
+  ), 'fixture should persist private pending-input prose outside the foreground DTO');
+
+  // More than one response cap of NEWER terminals proves the route requests
+  // canonical Working Now membership before limiting. The old route projected
+  // 100 recent rows first and filtered second, hiding this older live task.
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const terminalFiles: string[] = [];
+  const fixtureKey = Date.now();
+  for (let index = 0; index < 101; index += 1) {
+    const id = `mobile-working-now-terminal-${fixtureKey}-${index}`;
+    const createdAt = new Date(Date.now() + 60_000 + index).toISOString();
+    const file = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
+    writeFileSync(file, JSON.stringify({
+      id,
+      workflow: 'Settled fixture',
+      status: 'completed',
+      createdAt,
+      startedAt: createdAt,
+      finishedAt: createdAt,
+    }));
+    terminalFiles.push(file);
+  }
+
+  const h = await startHarness();
+  try {
+    const anon = await fetch(`${h.url}/m/api/activity/v2?workingNow=1`);
+    assert.equal(anon.status, 401, 'the shared activity projection requires the device session');
+
+    const cookie = await loginMobile(h, 'Working-now phone');
+    const res = await fetch(`${h.url}/m/api/activity/v2?workingNow=1`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const responseBytes = await res.text();
+    for (const canary of [
+      'MOBILE-PRIVATE-PROMPT-CANARY',
+      'MOBILE-PRIVATE-ORIGIN-CANARY',
+      'MOBILE-PRIVATE-PENDING-QUESTION-CANARY',
+    ]) {
+      assert.equal(responseBytes.includes(canary), false, `mobile foreground Activity leaked ${canary}`);
+    }
+    const body = JSON.parse(responseBytes) as {
+      schemaVersion: number;
+      observedAt: string;
+      entries: Array<{
+        runKey: string;
+        kind: string;
+        taskId?: string;
+        headline: string;
+        lifecycle: string;
+        terminal?: unknown;
+      }>;
+      snapshots: unknown[];
+    };
+    const projected = body.entries.find((entry) => entry.taskId === task.id);
+    assert.ok(projected, 'the exact durable task appears in Working Now');
+    assert.equal(projected.runKey, `background:${task.id}`);
+    assert.equal(projected.kind, 'background');
+    assert.equal(projected.headline, 'Compare release candidates');
+    assert.equal(projected.lifecycle, 'awaiting_input');
+    assert.equal(projected.terminal, undefined, 'a running fixture never gains an inferred terminal');
+    for (const forbiddenKey of ['detail', 'origin', 'owner', 'nextAction', 'terminal', 'presentationLane', 'connectivity']) {
+      assert.equal(Object.hasOwn(projected, forbiddenKey), false, forbiddenKey);
+    }
+    assert.equal(body.entries.some((entry) => entry.terminal !== undefined), false,
+      'settled rows are excluded before the bounded mobile response');
+    assert.equal(body.snapshots.length, body.entries.length, 'mobile keeps the console DTO aliases in parity');
+  } finally {
+    await h.close();
+    for (const file of terminalFiles) rmSync(file, { force: true });
+  }
+});
+
 test('/m/api/runs degrades to 503 when no collector is injected (auth-only harnesses)', async () => {
   const h = await startHarness();
   try {
@@ -1973,4 +2705,89 @@ test('mobile chat streams only persisted public graph events, never raw model de
   assert.ok(source.includes('projectHarnessEventsForPublic('));
   assert.ok(!source.includes('addChatStream('));
   assert.ok(!source.includes('pushChatDelta('));
+});
+
+/**
+ * A phone that fell behind must not lose its device chain.
+ *
+ * Rotation is committed server-side mid-request and the retired token stays
+ * good for 30 seconds — a window sized in its own comment for "an in-flight
+ * request or a reconnecting SSE stream". A phone is neither. iOS suspends the
+ * webview on lock, so the response carrying the new token can be dropped and
+ * the device wakes later still holding the old one. That used to revoke every
+ * session for the device, which is how a paired phone lands back on "scan the
+ * QR" with nothing to scan its way out of.
+ *
+ * The device key is the discriminator: a stolen cookie cannot sign.
+ */
+async function pairedDeviceWithRetiredToken(h: Harness): Promise<{
+  pair: CryptoKeyPair; oldCookie: string; sfp: string; deviceId: string;
+}> {
+  const { pair, publicJwk } = await makeDeviceKey();
+  const { token: pairToken } = await createMobilePairingCode({}, { stateDir: h.stateDir });
+  const paired = await fetch(`${h.url}/m/auth/pair`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ pairToken, devicePublicKeyJwk: publicJwk }),
+  });
+  assert.equal(paired.status, 200);
+  const body = await paired.json() as { binding: string; sessionFingerprint: string; deviceId: string };
+  assert.equal(body.binding, 'key');
+  const oldCookie = cookieFrom(paired);
+  const oldToken = oldCookie.split('=').slice(1).join('=');
+
+  const { rotateSessionToken } = await import('../runtime/mobile-sessions.js');
+  assert.ok(await rotateSessionToken(oldToken, { stateDir: h.stateDir }), 'rotation must succeed');
+
+  // Age the grace out deterministically rather than sleeping through it.
+  const file = path.join(h.stateDir, 'mobile-sessions.json');
+  const store = JSON.parse(await readFile(file, 'utf8')) as {
+    sessions: Array<{ previousTokenValidUntil?: string }>;
+  };
+  for (const row of store.sessions) row.previousTokenValidUntil = new Date(Date.now() - 60_000).toISOString();
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(file, JSON.stringify(store));
+
+  return { pair, oldCookie, sfp: body.sessionFingerprint, deviceId: body.deviceId };
+}
+
+test('a retired token WITH a valid device proof re-authenticates without losing the chain', async () => {
+  const h = await startHarness();
+  try {
+    const { pair, oldCookie, sfp, deviceId } = await pairedDeviceWithRetiredToken(h);
+    const proof = await deviceProof(pair, 'GET', '/m/api/whoami', sfp);
+    const res = await fetch(`${h.url}/m/api/whoami`, {
+      headers: { cookie: oldCookie, 'x-clem-device-proof': proof },
+    });
+    assert.equal(res.status, 401, 'the retired token still cannot serve the request');
+    assert.equal(
+      (await res.json() as { error: string }).error,
+      'SESSION_STALE',
+      'a device that proved itself fell behind; it was not a second party',
+    );
+
+    const { listSessions } = await import('../runtime/mobile-sessions.js');
+    assert.ok(
+      listSessions({ stateDir: h.stateDir }).some((row) => row.deviceId === deviceId),
+      'the device chain must survive so the phone can recover without a fresh QR',
+    );
+  } finally { await h.close(); }
+});
+
+test('a retired token WITHOUT a device proof still revokes the whole chain', async () => {
+  // The narrowing must not become a hole. A leaked cookie cannot sign, so the
+  // original destructive reading is exactly right for it.
+  const h = await startHarness();
+  try {
+    const { oldCookie, deviceId } = await pairedDeviceWithRetiredToken(h);
+    const res = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie: oldCookie } });
+    assert.equal(res.status, 401);
+    assert.equal((await res.json() as { error: string }).error, 'SESSION_REVOKED');
+
+    const { listSessions } = await import('../runtime/mobile-sessions.js');
+    assert.ok(
+      !listSessions({ stateDir: h.stateDir }).some((row) => row.deviceId === deviceId),
+      'an unprovable retired token must still take the chain down',
+    );
+  } finally { await h.close(); }
 });

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { recordDeclaredMcpToolEffect } from './mcp-declared-effects.js';
 import type { MCPServer } from '@openai/agents';
 import pino from 'pino';
 import { decideToolApproval } from '../agents/tool-taxonomy.js';
@@ -31,12 +32,18 @@ import {
 } from './harness/output-grounding-gate.js';
 import { looksLikeNativeMcpSend } from './harness/execution-gate.js';
 import { isConfirmFirstEnabled } from './harness/confirm-first-gate.js';
-import { appendEvent, listEvents, writeToolOutput } from './harness/eventlog.js';
+import { appendEvent, listEvents, openEventLog, writeToolOutput } from './harness/eventlog.js';
 import {
   settleToolAttempt,
   ToolAttemptSettlementAuthorityError,
 } from './harness/attempt-settlement.js';
-import { withLogicalToolCall, withPhysicalDispatch } from './harness/attempt-identity.js';
+import {
+  currentLogicalCall,
+  PhysicalDispatchPreDispatchError,
+  preflightPhysicalDispatchSourceAdmission,
+  withLogicalToolCall,
+  withPhysicalDispatch,
+} from './harness/attempt-identity.js';
 import type { AttemptSignals } from './harness/attempt-outcome.js';
 import { classifyDiscoveryCall } from './harness/discovery-boundary.js';
 import { evaluateToolCall, applyMode } from './harness/tool-guardrail.js';
@@ -64,6 +71,8 @@ import {
 } from './harness/tool-error-corrective.js';
 import { creditMatchingRecall, isNonTeachingFailure } from '../memory/procedural-recall-link.js';
 import { assertDispatchLeaseCurrent } from './harness/dispatch-lease.js';
+import { StaleDispatchLeaseError } from './harness/dispatch-lease.js';
+import { noteHostToolInvocationObservation } from './harness/tool-invocation-observation-context.js';
 
 // Bound MCP startup below the SDK's default (~60s), but leave enough
 // room for `npx`/`uvx` based servers on fresh machines. 5s/8s was too
@@ -379,16 +388,16 @@ function clipMcpResultForRecall(toolName: string, result: CallToolResultContent)
       .join('\n');
     if (!combined) return result;
     const outputContext = getToolOutputContext();
-    const exactCodeModeInvocation = Boolean(
-      harnessRunContextStorage.getStore()?.codeMode
+    const exactNestedDispatchInvocation = Boolean(
+      harnessRunContextStorage.getStore()?.nestedDispatch
       && outputContext?.sessionId === sessionId
       && outputContext.callId
       && outputContext.toolName === toolName
       && outputContext.settlementNonce,
     );
-    if (exactCodeModeInvocation) {
+    if (exactNestedDispatchInvocation) {
       // The MCP SDK surface is an array with optional metadata properties.
-      // Persist one ordinary serializable envelope so code mode receives the
+      // Persist one ordinary serializable envelope so nested dispatch receives the
       // complete normalized result (including isError/structuredContent), not
       // merely the concatenated text that presentation clipping operates on.
       const metadata = result as unknown as Record<string, unknown>;
@@ -472,10 +481,10 @@ function appendMcpFanoutAdvisory(
   try {
     const active = harnessRunContextStorage.getStore();
     const sessionId = active?.sessionId;
-    // Code mode is itself the batching primitive. Its callers need the native
+    // Nested dispatch owns the carrier result shape. Its callers need the native
     // MCP content blocks unchanged so they can normalize/parse them; appending
     // a prose fan-out hint here makes a valid structured result ambiguous.
-    if (!sessionId || active.codeMode === true || !Array.isArray(result)) return result;
+    if (!sessionId || active.nestedDispatch === true || !Array.isArray(result)) return result;
     const resultText = result
       .map((block) => {
         const text = (block as { text?: unknown } | null)?.text;
@@ -681,6 +690,16 @@ function settleNativeMcpRefusal(input: {
   mutating: boolean;
 }): void {
   const ctx = harnessRunContextStorage.getStore();
+  if (ctx?.hostOwnsToolDeadlineAndSettlement) {
+    noteHostToolInvocationObservation({
+      thrown: new Error(input.reason),
+      thrownPresent: true,
+      signals: { preDispatch: true },
+      mutating: input.mutating,
+      businessCall: classifyDiscoveryCall(input.toolName, input.args) === null,
+    });
+    return;
+  }
   try {
     settleToolAttempt({
       sessionId: ctx?.sessionId,
@@ -710,6 +729,22 @@ function settleNativeMcpAttempt(input: {
   callId?: string;
 }): void {
   const ctx = harnessRunContextStorage.getStore();
+  if (ctx?.hostOwnsToolDeadlineAndSettlement) {
+    noteHostToolInvocationObservation({
+      ...(Object.prototype.hasOwnProperty.call(input, 'result')
+        ? { result: input.result, resultPresent: true }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(input, 'thrown')
+        ? { thrown: input.thrown, thrownPresent: true }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(input, 'result')
+        ? { signals: nativeMcpSignals(input.result) }
+        : {}),
+      mutating: input.mutating,
+      businessCall: classifyDiscoveryCall(input.toolName, input.args) === null,
+    });
+    return;
+  }
   try {
     settleToolAttempt({
       sessionId: ctx?.sessionId,
@@ -1114,6 +1149,14 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
             ? `[${slug}] ${tool.description}`
             : `[${slug}] tool from ${server.name}`,
         });
+        // A server's own readOnly/destructive/idempotent hints are the only
+        // non-guessed effect evidence a third-party tool ever carries. They
+        // were preserved on the wire and read by nothing; capture them here,
+        // where every listing already passes.
+        recordDeclaredMcpToolEffect(
+          namespaced,
+          (tool as { annotations?: unknown }).annotations,
+        );
         routing.set(namespaced, server);
       }
     }
@@ -1219,10 +1262,15 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // bookkeeping. Native MCP calls bypass wrapToolForHarness, so this is
       // their first physical-attempt authority boundary.
       assertDispatchLeaseCurrent(entryRunContext?.dispatchLease);
-      // Ensure we have a routing map. The SDK always calls listTools()
-      // before callTool() on a given run, but be defensive.
+      // Business execution consumes the exact route map prepared with the model
+      // surface. A cold call must not list tools or start/connect servers inside
+      // the logical call before source admission owns any physical dependency.
       if (!cachedToolToServer) {
-        await this.listTools();
+        const reason = `native MCP route map is not prepared for ${toolName}`;
+        settleNativeMcpRefusal({ toolName, args, mutating: false, reason });
+        throw new PhysicalDispatchPreDispatchError(
+          `${reason}; refresh the MCP tool surface and retry. No provider dispatch was started.`,
+        );
       }
       const server = cachedToolToServer?.get(toolName);
       if (!server) {
@@ -1273,6 +1321,39 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         });
       }
 
+      const activeRunContext = harnessRunContextStorage.getStore();
+      const physicalDispatchInput = {
+        sessionId: entryRunContext?.sessionId ?? '',
+        sourceUserSeq: entryRunContext?.sourceUserSeq ?? 0,
+        turn: entryRunContext?.turn,
+        tool: toolName,
+        args,
+        sourceCapability: {
+          capabilityId: `capability:mcp:${toolName}`,
+        },
+      };
+      let sourceAdmissionProof;
+      try {
+        // Source selection is the first logical execution boundary. Native MCP
+        // integrity judges may themselves call model providers, so a stale or
+        // mismatched source must be refused before any judge, write reservation,
+        // or provider body can spend external I/O. The opaque proof remains
+        // bound to this exact logical frame/lease and is consumed only by the
+        // final withPhysicalDispatch call below.
+        sourceAdmissionProof = preflightPhysicalDispatchSourceAdmission(
+          physicalDispatchInput,
+        );
+      } catch (error) {
+        if (error instanceof StaleDispatchLeaseError) throw error;
+        settleNativeMcpRefusal({
+          toolName,
+          args,
+          mutating: nativeCallIsMutating(toolName, args),
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+
       // Apply the unified approval taxonomy to MCP calls invoked
       // through the SDK Runner path. The Codex runtime gates approval
       // before dispatching here (it has the sessionId + approval-store
@@ -1288,7 +1369,6 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // plan scope — an enumerated send scope authorizes the send; without the
       // id it always fell through to policy and blocked a scoped send
       // (2026-07-09).
-      const activeRunContext = harnessRunContextStorage.getStore();
       const pendingActionExecutionVerified = activeRunContext?.pendingActionExecution
         ? (await import('./harness/pending-actions.js')).verifyPendingActionExecutionCapability({
             capability: activeRunContext.pendingActionExecution,
@@ -1568,8 +1648,8 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // standing-turn-rule recovery message as the tool result. Returned as a
       // text block — NOT thrown — so the model reads the verbatim batching
       // instruction instead of a corrective-wrapped "tool failed" framing.
-      // Exemptions mirror brackets exactly: a code-mode program's own reads
-      // (ctx.codeMode — the sanctioned execution the block steers TO), worker
+      // Exemptions mirror brackets exactly: a nested carrier's own child reads
+      // (ctx.nestedDispatch), worker
       // scope (guardrailScopeId), and certified batch items. Loop-detection
       // actions (exact-repeat block/halt) stay UNENFORCED here — status quo;
       // this mount changes read-fanout behavior only. Registration happens
@@ -1583,7 +1663,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         const guardScopeId = guardCtx ? guardrailScopeKey(guardCtx) : undefined;
         if (guardScopeId) {
           const guardDecision = applyMode(evaluateToolCall(guardScopeId, toolName, args ?? {}));
-          const guardExempt = Boolean(guardCtx?.codeMode || guardCtx?.guardrailScopeId || guardCtx?.certifiedBatch);
+          const guardExempt = Boolean(guardCtx?.nestedDispatch || guardCtx?.guardrailScopeId || guardCtx?.certifiedBatch);
           if (guardDecision.fanoutBlock && !guardExempt) {
             try {
               appendEvent({
@@ -1621,6 +1701,12 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         mcp: true,
       });
       let preRecordedWrite = false;
+      let externalWriteReservationEventId: string | undefined;
+      let providerBodyEntered = false;
+      let providerReturned = false;
+      let returnedProviderResult: unknown;
+      let providerAttemptSettlementStarted = false;
+      let writeOutcomeRecorded = false;
       const reserveWrite = async (): Promise<void> => {
         // This runs inside the shared write-admission lock. If recovery won the
         // race and revoked first, no reservation or provider call can occur. If
@@ -1643,7 +1729,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           });
           // This is admission state, not telemetry. If persistence fails, the
           // provider must not receive an untracked mutation.
-          appendEvent({
+          const reservation = appendEvent({
             sessionId: integritySessionId,
             turn: 0,
             role: 'system',
@@ -1668,6 +1754,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
               } : {}),
             },
           });
+          externalWriteReservationEventId = reservation.id;
           preRecordedWrite = true;
         }
       };
@@ -1678,6 +1765,30 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         );
       } else {
         await reserveWrite();
+      }
+      // Capture the exact logical owner's durable crossing count after source
+      // admission and before physical start. If the start transaction fails,
+      // this lets the reservation owner prove zero crossing without trusting a
+      // thrown provider message (or the in-memory callback flag alone).
+      const physicalOwner = currentLogicalCall();
+      let physicalCrossingsBeforeStart: number | undefined;
+      if (physicalOwner && integritySessionId && activeRunContext?.sourceUserSeq) {
+        try {
+          physicalCrossingsBeforeStart = (openEventLog().prepare(`
+            SELECT COUNT(*) AS count
+              FROM physical_dispatches
+             WHERE session_id = ?
+               AND source_user_seq = ?
+               AND logical_tool_call_id = ?
+          `).get(
+            integritySessionId,
+            activeRunContext.sourceUserSeq,
+            physicalOwner.logicalToolCallId,
+          ) as { count: number }).count;
+        } catch {
+          // Unreadable durable authority can never prove that nothing crossed.
+          physicalCrossingsBeforeStart = undefined;
+        }
       }
       try {
         // Reads have no reservation ledger, so close the async-gate window at
@@ -1690,15 +1801,20 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Forward to the underlying server with the ORIGINAL tool name.
         const rawResult = await withPhysicalDispatch(
           {
-            sessionId: entryRunContext?.sessionId ?? '',
-            sourceUserSeq: entryRunContext?.sourceUserSeq ?? 0,
-            turn: entryRunContext?.turn,
-            tool: toolName,
-            args,
+            ...physicalDispatchInput,
+            sourceAdmissionProof,
           },
-          () => server.callTool(parsed.toolName, args),
+          () => {
+            // This is the exact provider-body boundary. Everything before it
+            // (proof consumption + durable physical start) is still locally
+            // compensable when the database also proves no row was inserted.
+            providerBodyEntered = true;
+            return server.callTool(parsed.toolName, args);
+          },
         );
         const normalized = normalizeMcpCallResult(toolName, rawResult);
+        providerReturned = true;
+        returnedProviderResult = normalized.result;
         const rawText = mcpResultText(normalized.result);
         const failure = normalized.invalid
           ? { failed: true, summary: normalized.summary ?? rawText.slice(0, 240), notFound: false }
@@ -1707,16 +1823,6 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Credit the MCP proven path's outcome (success, or a structured failure
         // envelope) — the ONLY place native MCP results reach procedural memory.
         creditMcpOutcome(toolName, failure.failed, rawText || failure.summary);
-        // Settle from the exact normalized provider envelope, never its later
-        // presentation digest. This preserves structured success/error truth
-        // and lets code mode park the same envelope under its child nonce.
-        settleNativeMcpAttempt({
-          toolName,
-          args,
-          result: normalized.result,
-          mutating: nativeCallIsMutating(toolName, args),
-          callId: externalWriteCallId,
-        });
         // Cap + park a large raw result for recall BEFORE the fan-out nudge, so a
         // 200KB MCP dump can't flood the chat context window unrecoverably.
         const result = clipMcpResultForRecall(toolName, normalized.result);
@@ -1752,7 +1858,20 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
                 : {}),
             },
           });
+          writeOutcomeRecorded = true;
         }
+        // External-write outcome is durable before the logical return is
+        // published. Mark the attempt before entering the settlement writer so
+        // a storage fault or any later presentation error cannot second-settle
+        // the same provider return as a throw.
+        providerAttemptSettlementStarted = true;
+        settleNativeMcpAttempt({
+          toolName,
+          args,
+          result: normalized.result,
+          mutating: nativeCallIsMutating(toolName, args),
+          callId: externalWriteCallId,
+        });
         // Parity with shell/Composio: prepend a self-correcting header when the
         // result is a failure envelope (best-effort; success is byte-identical).
         const flagged = annotateMcpResultFailure(toolName, result);
@@ -1761,40 +1880,114 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // the run_worker advisory appended. Best-effort; no-op when not looping.
         return appendMcpFanoutAdvisory(toolName, args, flagged);
       } catch (err) {
-        if (err instanceof ToolAttemptSettlementAuthorityError) throw err;
-        finish('error', err instanceof Error ? err.message : String(err));
-        // A thrown failure is settled by the same seam as a returned one. This
-        // is the path that used to render its typed kind into English and throw
-        // it away, leaving recovery to whoever regexed the message next.
-        settleNativeMcpAttempt({ toolName, args, thrown: err, mutating: nativeCallIsMutating(toolName, args), callId: externalWriteCallId });
-        // Once the reservation has crossed into server.callTool, every thrown
-        // error is ambiguous. Provider text cannot prove that nothing landed.
-        if (preRecordedWrite && integritySessionId) {
-          const errMsg = (err instanceof Error ? err.message : String(err));
-          const targets = extractExternalWriteIdentityKeys(args ?? {});
-          appendEvent({
-            sessionId: integritySessionId,
-            turn: 0,
-            role: 'system',
-            type: 'external_write_orphaned',
-            data: {
-              ...currentExternalWriteEventAttribution(),
-              shapeKey: integrityShapeKey,
-              actionKey: integrityActionKey,
-              toolName,
-              callId: externalWriteCallId,
-              canonicalCallId: externalWriteCallId,
-              correlationFingerprint,
-              slug: parsed.serverSlug,
-              targets,
-              duplicateIdentityKeys: integrityDuplicateIdentityKeys,
-              mcp: true,
-              reason: errMsg.slice(0, 200),
-            },
-          });
+        let durableZeroCrossing = false;
+        if (
+          preRecordedWrite
+          && !providerBodyEntered
+          && physicalOwner
+          && integritySessionId
+          && activeRunContext?.sourceUserSeq
+          && physicalCrossingsBeforeStart !== undefined
+        ) {
+          try {
+            const after = (openEventLog().prepare(`
+              SELECT COUNT(*) AS count
+                FROM physical_dispatches
+               WHERE session_id = ?
+                 AND source_user_seq = ?
+                 AND logical_tool_call_id = ?
+            `).get(
+              integritySessionId,
+              activeRunContext.sourceUserSeq,
+              physicalOwner.logicalToolCallId,
+            ) as { count: number }).count;
+            durableZeroCrossing = after === physicalCrossingsBeforeStart;
+          } catch {
+            // Storage uncertainty is effect uncertainty. Keep the reservation
+            // uncompensated rather than manufacturing a safe retry.
+          }
         }
-        if (!(err instanceof BoundaryError) && isInvalidMcpCallResultValidationError(err)) {
-          const msg = err instanceof Error ? err.message : String(err);
+        const errMsg = err instanceof Error ? err.message : String(err);
+        let writeOutcomeError: unknown;
+        // Resolve the write reservation BEFORE publishing logical pre-dispatch
+        // settlement. If settlement storage fails, the exact parented
+        // external_write_failed row must already authorize a safe retry.
+        if (preRecordedWrite && integritySessionId && !writeOutcomeRecorded) {
+          const targets = extractExternalWriteIdentityKeys(args ?? {});
+          try {
+            appendEvent({
+              sessionId: integritySessionId,
+              turn: 0,
+              role: 'system',
+              type: durableZeroCrossing ? 'external_write_failed' : 'external_write_orphaned',
+              ...(externalWriteReservationEventId
+                ? { parentEventId: externalWriteReservationEventId }
+                : {}),
+              data: {
+                ...currentExternalWriteEventAttribution(),
+                shapeKey: integrityShapeKey,
+                actionKey: integrityActionKey,
+                toolName,
+                callId: externalWriteCallId,
+                canonicalCallId: externalWriteCallId,
+                correlationFingerprint,
+                slug: parsed.serverSlug,
+                targets,
+                duplicateIdentityKeys: integrityDuplicateIdentityKeys,
+                mcp: true,
+                reason: durableZeroCrossing
+                  ? `physical dispatch did not start: ${errMsg}`.slice(0, 200)
+                  : errMsg.slice(0, 200),
+                ...(durableZeroCrossing
+                  ? { dispatch: 'not_started', effect: 'none', preDispatch: true }
+                  : {}),
+              },
+            });
+            writeOutcomeRecorded = true;
+          } catch (error) {
+            // An unresolved reservation stays conservative. It must not be
+            // followed by a logical pre-dispatch settlement that authorizes a
+            // replay as if compensation had committed.
+            writeOutcomeError = error;
+          }
+        }
+
+        // Never replace a provider return with a thrown settlement merely
+        // because presentation/write-ledger work failed afterwards. One call
+        // gets at most one logical settlement attempt.
+        if (!providerAttemptSettlementStarted) {
+          providerAttemptSettlementStarted = true;
+          if (providerReturned) {
+            settleNativeMcpAttempt({
+              toolName,
+              args,
+              result: returnedProviderResult,
+              mutating: nativeCallIsMutating(toolName, args),
+              callId: externalWriteCallId,
+            });
+          } else if (durableZeroCrossing && writeOutcomeRecorded) {
+            settleNativeMcpRefusal({
+              toolName,
+              args,
+              mutating: nativeCallIsMutating(toolName, args),
+              reason: errMsg,
+            });
+          } else {
+            settleNativeMcpAttempt({
+              toolName,
+              args,
+              thrown: writeOutcomeError ?? err,
+              mutating: nativeCallIsMutating(toolName, args),
+              callId: externalWriteCallId,
+            });
+          }
+        }
+        finish('error', errMsg);
+        const terminalError = writeOutcomeError ?? err;
+        if (terminalError instanceof StaleDispatchLeaseError) throw terminalError;
+        if (terminalError instanceof ToolAttemptSettlementAuthorityError) throw terminalError;
+        if (!(terminalError instanceof BoundaryError) && isInvalidMcpCallResultValidationError(terminalError)) {
+          const msg = terminalError instanceof Error ? terminalError.message : String(terminalError);
           const result = makeInvalidMcpResult(toolName, msg);
           creditMcpOutcome(toolName, true, mcpResultText(result));
           return appendMcpFanoutAdvisory(toolName, args, result);
@@ -1802,8 +1995,12 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Credit a thrown MCP failure to the proven path (transient blips and
         // BoundaryError approval/unavailable states are NOT the path's fault →
         // skipped by creditMcpOutcome / the guard here).
-        if (!(err instanceof BoundaryError)) {
-          creditMcpOutcome(toolName, true, err instanceof Error ? err.message : String(err));
+        if (!(terminalError instanceof BoundaryError)) {
+          creditMcpOutcome(
+            toolName,
+            true,
+            terminalError instanceof Error ? terminalError.message : String(terminalError),
+          );
         }
         // The THROWN MCP failure channel (network / 5xx / bad-param servers that
         // throw): wrap the raw error with a self-correcting corrective so the
@@ -1811,14 +2008,14 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // BoundaryError untouched — the runtime routes approval_blocked /
         // server_unavailable through their own state machines (must keep .kind /
         // .userMessage). Fail-open + flag-gated.
-        if (mcpErrorCorrectiveEnabled() && !(err instanceof BoundaryError)) {
-          const msg = err instanceof Error ? err.message : String(err);
+        if (mcpErrorCorrectiveEnabled() && !(terminalError instanceof BoundaryError)) {
+          const msg = terminalError instanceof Error ? terminalError.message : String(terminalError);
           throw new Error(toolFailureCorrective(msg.slice(0, 240), {
             toolName,
-            kind: classifyToolError(msg, err),
+            kind: classifyToolError(msg, terminalError),
           }));
         }
-        throw err;
+        throw terminalError;
       }
       };
 

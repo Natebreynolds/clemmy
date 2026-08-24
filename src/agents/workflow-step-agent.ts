@@ -111,6 +111,14 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   // Background-task lifecycle belongs to the origin conversation. A child
   // workflow step must not revise the contract of a sibling/parent run.
   'background_task_revise',
+  // Pilot projection and carrier-reference issuance belong to the accepted
+  // origin chat. A workflow step cannot manufacture a new approval boundary.
+  'automation_read_pilot_acquisition_list',
+  'automation_read_pilot_request',
+  'automation_read_pilot_workspace_create_request',
+  'automation_read_pilot_workspace_list',
+  'automation_recurrence_request',
+  'automation_opportunity_review_request',
   // Conversational focus/workstate belongs to the main brain. Stateless
   // workers and workflow steps return evidence; they never steer the user's
   // active thread or rewrite its shared notebook directly.

@@ -785,11 +785,12 @@ export function rootWorkflowReceiptForSource(sessionId: string, sourceUserSeq: n
 }
 
 function projectRootTerminalStatusMatchesOutcome(
-  status: 'completed' | 'completed_with_errors' | 'error' | 'failed' | 'cancelled',
+  status: 'completed' | 'completed_with_errors' | 'blocked' | 'error' | 'failed' | 'cancelled',
   outcome: WorkflowTerminalOutcome,
 ): boolean {
   if (status === 'completed') return outcome === 'succeeded' || outcome === 'blocked';
   if (status === 'completed_with_errors') return outcome === 'partial';
+  if (status === 'blocked') return outcome === 'blocked';
   if (status === 'error' || status === 'failed') return outcome === 'blocked' || outcome === 'failed';
   return outcome === 'cancelled';
 }
@@ -876,9 +877,13 @@ function assertExecutionGraphAdmissionIntegrity(execution: ExecutionRecord): voi
     return;
   }
 
-  const statuses = new Set(['completed', 'completed_with_errors', 'error', 'failed', 'cancelled']);
+  const statuses = new Set(['completed', 'completed_with_errors', 'blocked', 'error', 'failed', 'cancelled']);
   const outcomes = new Set(['succeeded', 'partial', 'blocked', 'failed', 'cancelled']);
-  const expectedBindingStatus = terminal.outcome === 'succeeded' ? 'completed' : 'error';
+  const expectedBindingStatus = terminal.outcome === 'succeeded'
+    ? 'completed'
+    : terminal.outcome === 'blocked'
+      ? 'blocked'
+      : 'error';
   if (
     terminal.version !== 1
     || terminal.runId !== rootRunId
@@ -1404,7 +1409,7 @@ export class ExecutionStore {
           ];
       execution.autoAdvance = false;
       execution.nextReviewAt = undefined;
-      const bindingIsTerminal = existingBinding?.status === 'completed' || existingBinding?.status === 'error';
+      const bindingIsTerminal = existingBinding?.status === 'completed' || existingBinding?.status === 'blocked' || existingBinding?.status === 'error';
       if (!bindingIsTerminal && execution.status !== 'completed' && execution.status !== 'paused') {
         execution.status = 'active';
         execution.blocker = undefined;
@@ -1452,7 +1457,7 @@ export class ExecutionStore {
     compiledContractHash: string;
     normalizedInputsHash: string;
     mutationReceiptProtocolVersion: number;
-    status: 'completed' | 'completed_with_errors' | 'error' | 'failed' | 'cancelled';
+    status: 'completed' | 'completed_with_errors' | 'blocked' | 'error' | 'failed' | 'cancelled';
     terminalOutcome: WorkflowTerminalOutcome;
     finishedAt: string;
     reportBack: {
@@ -1588,7 +1593,11 @@ export class ExecutionStore {
       }
       const binding = bindings[0];
       const successful = input.terminalOutcome === 'succeeded';
-      const bindingStatus: 'completed' | 'error' = successful ? 'completed' : 'error';
+      const bindingStatus: 'completed' | 'blocked' | 'error' = successful
+        ? 'completed'
+        : input.terminalOutcome === 'blocked'
+          ? 'blocked'
+          : 'error';
       const existingTerminal = admission.rootWorkflowTerminal;
       if (existingTerminal) {
         if (
@@ -1605,7 +1614,7 @@ export class ExecutionStore {
         }
         return { kind: 'already_settled', execution };
       }
-      if (binding.status === 'completed' || binding.status === 'error') {
+      if (binding.status === 'completed' || binding.status === 'blocked' || binding.status === 'error') {
         throw new Error('Project workflow binding is terminal without matching root terminal truth.');
       }
 

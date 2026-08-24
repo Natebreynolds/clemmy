@@ -25,6 +25,14 @@ test('a completed turn does not reattach', () => {
   ]), null);
 });
 
+test('a host-dispatched workflow ACK settles the foreground turn', () => {
+  assert.equal(inFlightTurnSince([
+    { seq: 1, type: 'user_input_received', data: { text: 'run facebook trends' } },
+    { seq: 2, type: 'turn_graph_compiled', data: { route: 'act' } },
+    { seq: 3, type: 'async_work_dispatched', data: { runIds: ['wf-1'] } },
+  ]), null);
+});
+
 test('awaiting input and approvals count as settled (the card owns the beat)', () => {
   assert.equal(inFlightTurnSince([
     { seq: 1, type: 'user_input_received', data: { text: 'go' } },

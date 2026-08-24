@@ -897,7 +897,7 @@ test('provider commit with a lost response becomes ambiguous and is never blindl
   const runCountBeforeRequeue = runFiles().length;
   const requeue = requeueWorkflowFromRun(queued.id!);
   assert.equal(requeue.status, 'ambiguous');
-  assert.match(requeue.message, /no rerun was queued/i);
+  assert.match(requeue.message, /no overlapping rerun was queued/i);
   assert.equal(runFiles().length, runCountBeforeRequeue);
 
   await processWorkflowRuns({ respond: async () => ({ text: 'must not run' }) } as never);

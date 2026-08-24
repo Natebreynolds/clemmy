@@ -6,6 +6,7 @@ import { readWorkflow } from '../memory/workflow-store.js';
 import { ensureTasksFile, ensureToolDirectories, replaceFile } from '../tools/shared.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { writeWorkflowAndSyncTriggers } from '../execution/workflow-write.js';
+import { provisionAuthoritySealKey } from '../runtime/harness/authority-argument-seal.js';
 
 function ensureDir(dir: string): void {
   if (!existsSync(dir)) {
@@ -35,6 +36,11 @@ async function main(): Promise<void> {
   ensureDir(goalsDir);
   ensureDir(pluginsDir);
   ensureDir(logsDir);
+
+  // The typed crossing path needs a host-local seal key before its first use.
+  // Scaffolding is the honest home for it: it is install state, not a user
+  // credential, and every other boot path already depends on this running.
+  provisionAuthoritySealKey();
 
   ensureFile(
     path.join(systemDir, 'SOUL.md'),

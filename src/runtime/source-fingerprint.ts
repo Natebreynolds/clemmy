@@ -15,6 +15,19 @@ export const RUNTIME_SOURCE_PATHS = [
 ] as const;
 
 const GIT_OUTPUT_MAX_BYTES = 256 * 1024 * 1024;
+const READ_ONLY_GIT_ENV = {
+  ...process.env,
+  GIT_NO_LAZY_FETCH: '1',
+  GIT_OPTIONAL_LOCKS: '0',
+  GIT_PAGER: 'cat',
+};
+
+function readOnlyGitArgs(command: string, ...args: string[]): string[] {
+  // A configured fsmonitor or diff/textconv driver is executable code. The
+  // held build proof is source inspection, so disable those extension points
+  // and Git's optional index refresh rather than trusting repo/user config.
+  return ['-c', 'core.fsmonitor=false', command, ...args];
+}
 
 export interface RuntimeUntrackedSourceFile {
   path: string;
@@ -50,21 +63,21 @@ export function fingerprintRuntimeSourceFromGit(input: {
   const sourcePaths = input.sourcePaths ?? RUNTIME_SOURCE_PATHS;
   const gitHead = input.gitHead ?? execFileSync(
     'git',
-    ['rev-parse', 'HEAD'],
-    { cwd: input.repoRoot, encoding: 'utf8', maxBuffer: GIT_OUTPUT_MAX_BYTES },
+    readOnlyGitArgs('rev-parse', 'HEAD'),
+    { cwd: input.repoRoot, encoding: 'utf8', env: READ_ONLY_GIT_ENV, maxBuffer: GIT_OUTPUT_MAX_BYTES },
   ).trim();
   if (!/^[0-9a-f]{40}$/.test(gitHead)) {
     throw new Error(`runtime source fingerprint requires a full git sha (got ${JSON.stringify(gitHead)})`);
   }
   const trackedDiff = execFileSync(
     'git',
-    ['diff', '--binary', 'HEAD', '--', ...sourcePaths],
-    { cwd: input.repoRoot, maxBuffer: GIT_OUTPUT_MAX_BYTES },
+    readOnlyGitArgs('diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD', '--', ...sourcePaths),
+    { cwd: input.repoRoot, env: READ_ONLY_GIT_ENV, maxBuffer: GIT_OUTPUT_MAX_BYTES },
   );
   const untrackedRaw = execFileSync(
     'git',
-    ['ls-files', '--others', '--exclude-standard', '-z', '--', ...sourcePaths],
-    { cwd: input.repoRoot, maxBuffer: GIT_OUTPUT_MAX_BYTES },
+    readOnlyGitArgs('ls-files', '--others', '--exclude-standard', '-z', '--', ...sourcePaths),
+    { cwd: input.repoRoot, env: READ_ONLY_GIT_ENV, maxBuffer: GIT_OUTPUT_MAX_BYTES },
   );
   const untrackedFiles = untrackedRaw.toString('utf8').split('\0').filter(Boolean).map((relativePath) => ({
     path: relativePath,

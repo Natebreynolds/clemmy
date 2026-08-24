@@ -260,10 +260,30 @@ function externalDestinationIsBoundMutationTarget(
  * an external-receipt requirement.
  */
 export function objectiveRequiresFreshExternalWrite(objectiveText: string): boolean {
+  // Coherence guard: a turn cannot owe a FRESH EXTERNAL WRITE while the
+  // effect-request classifier finds no requested external effect AND the
+  // mutating-evidence classifier finds nothing to mutate. When the family
+  // disagrees that way, the write vocabulary is incidental — "scan my sent
+  // folder to verify who has been sent the invite" is a read about sends,
+  // not a send (live 2026-08-17: a pure read was answered with external-write
+  // uncertainty copy on the strength of the word "invite"). This can only
+  // flip true -> false; it adds no new vocabulary authority.
+  if (
+    !objectiveRequiresMutatingEvidence(objectiveText)
+    && !classifyExternalEffectRequest(objectiveText).requested
+  ) {
+    return false;
+  }
   const positive = positiveObjectiveActionText(objectiveText);
   return positive
     .split(/[.!?\n;:—–]+/)
-    .some((clause) => {
+    .some((rawClause) => {
+      // The negation stripper deliberately preserves text from a contrast
+      // conjunction onward ("do not X but email me Y"), so a surviving clause
+      // can begin with the bare conjunction. Downstream classifiers are
+      // start-anchored; hand them the clause the user actually wrote after
+      // the pivot.
+      const clause = rawClause.replace(/^[\s,]*(?:but|however|instead|then|yet)\b[\s,]*/i, '');
       if (!clause.trim()) return false;
       const immediateExecution = STAGED_CLAUSE_IMMEDIATE_EXECUTION_RE.test(clause);
       if (

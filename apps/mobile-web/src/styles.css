@@ -541,6 +541,9 @@ input, textarea { font: inherit; }
 }
 .btn-approve:active, .btn-reject:active { transform: scale(0.96); }
 .btn-approve:disabled, .btn-reject:disabled { opacity: 0.5; box-shadow: none; }
+.workspace-choice-actions { flex-direction: column; }
+.workspace-choice-actions .btn-approve,
+.workspace-choice-actions .btn-reject { flex: 1 1 auto; width: 100%; padding: 0 14px; }
 
 /* Live work: a card that is visibly alive. */
 .card-live { display: flex; align-items: center; gap: var(--sp-3); padding-left: calc(var(--sp-4) + 3px); }
@@ -1392,6 +1395,158 @@ input, textarea { font: inherit; }
 }
 .chat-send:active { transform: scale(0.92); }
 .chat-send:disabled { opacity: 0.3; }
+
+/* ── foreground running-task affordance ────────────────────────── */
+/* Chat remains the page. At zero this entire region is absent; at nonzero it
+   is one quiet line above the composer, opening the durable work projection in
+   a bottom sheet. */
+.running-tasks-affordance { flex: 0 0 auto; }
+.running-tasks-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  margin: 2px 0 0;
+  padding: 5px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-2);
+  font-size: var(--t-sm);
+  font-weight: 650;
+  text-align: left;
+}
+.running-tasks-trigger:active { transform: scale(0.98); }
+.running-tasks-spark { color: var(--accent); font-size: 17px; line-height: 1; }
+.running-tasks-layer { position: fixed; inset: 0; z-index: 90; display: flex; align-items: flex-end; justify-content: center; }
+.running-tasks-scrim {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: rgba(5, 3, 2, 0.62);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+}
+.running-tasks-sheet {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(100%, 640px);
+  max-height: min(82dvh, 760px);
+  padding: 8px max(16px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-bottom: 0;
+  border-radius: 28px 28px 0 0;
+  background: rgba(20, 16, 9, 0.98);
+  box-shadow: 0 -22px 80px rgba(0, 0, 0, 0.45);
+  animation: running-sheet-in 0.24s var(--ease-out);
+}
+@keyframes running-sheet-in {
+  from { opacity: 0; transform: translateY(24px); }
+  to { opacity: 1; transform: none; }
+}
+.running-tasks-sheet::before {
+  content: '';
+  align-self: center;
+  width: 38px;
+  height: 4px;
+  margin: 0 0 5px;
+  border-radius: 999px;
+  background: var(--bg-4);
+}
+.running-tasks-sheet-head {
+  display: grid;
+  grid-template-columns: 44px 1fr 44px;
+  align-items: center;
+  min-height: 50px;
+}
+.running-tasks-sheet-head h2 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--t-body);
+  text-align: center;
+}
+.running-tasks-close {
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--bg-2);
+  color: var(--fg-2);
+  font-size: 26px;
+  font-weight: 300;
+  line-height: 1;
+}
+.running-tasks-filter {
+  padding: 8px 4px 12px;
+  color: var(--fg-3);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.running-tasks-list {
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  padding: 0 1px 8px;
+}
+.running-task-card {
+  margin-bottom: 10px;
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg-1);
+  box-shadow: var(--shadow-card);
+}
+.running-task-card.expanded { border-color: var(--line-strong); }
+.running-task-card-head { display: flex; align-items: flex-start; gap: 10px; }
+.running-task-state {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.running-task-identity { min-width: 0; flex: 1; }
+.running-task-identity h3 {
+  margin: 0;
+  overflow: hidden;
+  color: var(--fg);
+  font-family: var(--font-display);
+  font-size: var(--t-sm);
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.running-task-meta { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 5px; color: var(--fg-3); font-size: var(--t-xs); }
+.running-task-facts { margin: 13px 0 0 18px; border-top: 1px solid var(--line); padding-top: 10px; }
+.running-task-fact { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 4px 0; font-size: var(--t-xs); }
+.running-task-fact > span { color: var(--fg-3); }
+.running-task-fact > strong { color: var(--fg-2); font-weight: 650; text-align: right; }
+.running-task-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.running-task-open {
+  min-height: 44px;
+  padding: 8px 15px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-2);
+  font-family: var(--font-display);
+  font-size: var(--t-xs);
+  font-weight: 700;
+}
+.running-task-actions .btn-quiet,
+.running-task-actions .btn-stop-yes { min-height: 44px; }
+.running-tasks-more { margin: 10px 4px; color: var(--fg-3); font-size: var(--t-xs); text-align: center; }
+@media (min-width: 700px) {
+  .running-tasks-sheet { margin-bottom: 18px; border-bottom: 1px solid var(--line-strong); border-radius: 28px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .running-tasks-sheet { animation: none; }
+}
 
 /* ── memory ─────────────────────────────────────────────────────── */
 

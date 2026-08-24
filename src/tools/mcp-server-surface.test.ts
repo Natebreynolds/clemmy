@@ -50,7 +50,7 @@ function anchoredSession(ask: string): { sessionId: string; sourceUserSeq: numbe
   return { sessionId: session.id, sourceUserSeq: source.seq };
 }
 
-test('MCP tool_search is scoped to tools the active server actually registered', async () => {
+test('MCP tool_search finds the whole brain-lane catalog; the registered subset only bounds direct registration', async () => {
   const server = createClementineMcpServer({
     sessionId: 'mcp-surface-test',
     allowedTools: ['memory_recall_all', 'tool_search'],
@@ -62,16 +62,16 @@ test('MCP tool_search is scoped to tools the active server actually registered',
   assert.ok(registered.memory_recall_all);
   assert.ok(registered.tool_search);
   assert.ok(registered.ping, 'the health floor remains available');
+  assert.ok(registered.file_query, 'the landed-result query floor remains available (2026-08-18)');
   assert.equal(registered.workflow_update, undefined);
 
   const result = await registered.tool_search.handler({ query: 'update a workflow', limit: 20 });
   const body = JSON.parse(result.content[0].text) as { results: Array<{ name: string }> };
-  const actualRegisteredCatalogNames = new Set(['memory_recall_all', 'ping', 'tool_search']);
-  assert.ok(
-    body.results.every((hit) => actualRegisteredCatalogNames.has(hit.name)),
-    `unexpected search results: ${JSON.stringify(body.results)}`,
-  );
-  assert.equal(body.results.some((hit) => hit.name === 'workflow_update'), false);
+  // THE CLEAN LOOP (live 2026-08-19 session-fixture-tool-search): search sees the whole
+  // brain-lane catalog — finding is free, the gates gate the CALL. The old
+  // scoping made her own workflow tools unfindable for 40 straight searches.
+  assert.equal(body.results.some((hit) => hit.name === 'workflow_update'), true,
+    'her own catalog is findable even when this surface registered a narrow subset');
 });
 
 test('MCP always-load metadata is additive and leaves unselected tools deferred', () => {

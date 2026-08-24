@@ -143,6 +143,20 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     required: true,
     setupHint: 'Auto-generated on setup. Treat as a session token.',
   },
+  {
+    name: 'authority_seal_v2',
+    description: 'Versioned AES-256-GCM key for sealed typed-authority arguments. Never derived from the machine-id alone.',
+    envVarName: 'CLEMMY_AUTHORITY_SEAL_KEY',
+    required: false,
+    setupHint: 'Provisioned by Clementine into the host vault or OS keychain as a 64-char hex key.',
+  },
+  {
+    name: 'authority_seal_v1',
+    description: 'Previous authority-seal key retained for ciphertext recovery after rotation.',
+    envVarName: 'CLEMMY_AUTHORITY_SEAL_KEY_PREVIOUS',
+    required: false,
+    setupHint: 'Retained automatically when the v2 seal key is rotated.',
+  },
 ];
 
 const BY_NAME = new Map<SecretName, SecretDescriptor>(

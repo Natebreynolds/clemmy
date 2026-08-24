@@ -17,6 +17,9 @@ Design documents describe the repository at the time they were written. They are
 ## Architecture and reliability
 
 - [Agent system design](agent-system-design.md)
+- [Blank-state universal execution](blank-state-universal-execution.md) — canonical execution doctrine
+- [Blank-state amendments](blank-state-amendments.md) — non-normative review record
+- [Migration status 2026-08-21](migration-status-2026-08-21.md) — dated inspection annex
 - [Reliability and trust gates](reliability-trust-gate.md)
 - [Outcome model](outcome-v2.md)
 - [Memory source landscape](source-map-landscape-memory.md)

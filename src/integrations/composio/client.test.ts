@@ -22,12 +22,141 @@ import {
   composioAutoFallbackAllowed,
   composioCliErrorProvesNoDispatch,
   executeComposioTool,
+  executePreparedComposioTool,
+  prepareComposioOneShotDispatch,
   prepareInAppToolkitConnection,
   resetComposioClient,
   selectToolkitCredentialValues,
   toComposioDashboardConnection,
   type ConnectedToolkit,
 } from './client.js';
+
+test('prepared SDK dispatch is one exact no-retry POST with no core schema/modifier/reconnect path', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  const previousUserId = process.env.COMPOSIO_USER_ID;
+  process.env.COMPOSIO_BACKEND = 'sdk';
+  process.env.COMPOSIO_USER_ID = 'fallback-must-not-win';
+  __test__.setComposioApiKeyOverride('prepared-one-shot-key');
+  __test__.setConnectedAccountsLoader(async () => [{
+    id: 'ca_exact',
+    toolkit: { slug: 'outlook' },
+    status: 'ACTIVE',
+    user_id: 'provider-owner-exact',
+  }]);
+  await listConnectedToolkits({ requireFresh: true });
+
+  let coreExecuteCalls = 0;
+  let rawExecuteCalls = 0;
+  const withOptions: unknown[] = [];
+  let capturedBody: Record<string, unknown> | undefined;
+  const rawNoRetry = {
+    tools: {
+      execute: async (_slug: string, body: Record<string, unknown>) => {
+        rawExecuteCalls += 1;
+        capturedBody = body;
+        return {
+          data: { id: 'draft-1' },
+          error: null,
+          successful: true,
+          log_id: 'log-exact',
+          session_info: { source: 'raw' },
+        };
+      },
+    },
+  };
+  __test__.setComposioClient({
+    getClient: () => ({
+      withOptions: (options: unknown) => {
+        withOptions.push(options);
+        return rawNoRetry;
+      },
+    }),
+    tools: {
+      execute: async () => {
+        coreExecuteCalls += 1;
+        throw new Error('core execute must not run');
+      },
+    },
+  });
+  try {
+    const prepared = prepareComposioOneShotDispatch({
+      toolSlug: 'OUTLOOK_CREATE_DRAFT',
+      args: { subject: 'bounded' },
+      connectedAccountId: 'ca_exact',
+      providerOperationVersion: '20260824_01',
+    });
+    const result = await executePreparedComposioTool(prepared);
+    assert.equal(rawExecuteCalls, 1, 'one business POST');
+    assert.equal(coreExecuteCalls, 0, 'no core schema GET, file modifiers, or fallback execute');
+    assert.deepEqual(withOptions, [{ maxRetries: 0 }], 'transport retries are disabled');
+    assert.deepEqual(capturedBody, {
+      arguments: { subject: 'bounded' },
+      user_id: 'provider-owner-exact',
+      version: '20260824_01',
+      connected_account_id: 'ca_exact',
+    });
+    assert.deepEqual(result, {
+      data: { id: 'draft-1' },
+      error: null,
+      successful: true,
+      logId: 'log-exact',
+      sessionInfo: { source: 'raw' },
+    });
+    await assert.rejects(
+      executePreparedComposioTool(prepared),
+      (error: unknown) => error instanceof ComposioPreDispatchError,
+      'the opaque preparation is exactly one-shot',
+    );
+    assert.equal(rawExecuteCalls, 1, 'reuse never crosses');
+  } finally {
+    __test__.setConnectedAccountsLoader(null);
+    __test__.setComposioApiKeyOverride(null);
+    resetComposioClient();
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+    if (previousUserId === undefined) delete process.env.COMPOSIO_USER_ID;
+    else process.env.COMPOSIO_USER_ID = previousUserId;
+  }
+});
+
+test('prepared SDK dispatch refuses missing current account/version before the raw body', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'sdk';
+  __test__.setComposioApiKeyOverride('prepared-zero-crossing-key');
+  let rawCalls = 0;
+  __test__.setComposioClient({
+    getClient: () => ({
+      withOptions: () => ({
+        tools: { execute: async () => { rawCalls += 1; return {}; } },
+      }),
+    }),
+  });
+  try {
+    clearConnectedToolkitsCache();
+    assert.throws(
+      () => prepareComposioOneShotDispatch({
+        toolSlug: 'OUTLOOK_CREATE_DRAFT',
+        args: {},
+        connectedAccountId: 'ca_absent',
+        providerOperationVersion: '20260824_01',
+      }),
+      (error: unknown) => error instanceof ComposioPreDispatchError,
+    );
+    assert.throws(
+      () => prepareComposioOneShotDispatch({
+        toolSlug: 'NOAUTH_SEARCH',
+        args: {},
+      }),
+      (error: unknown) => error instanceof ComposioPreDispatchError,
+    );
+    assert.equal(rawCalls, 0);
+  } finally {
+    __test__.setComposioApiKeyOverride(null);
+    resetComposioClient();
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+  }
+});
 
 function createAuthenticatedFailingComposioCli(
   tmp: string,

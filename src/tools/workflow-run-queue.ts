@@ -42,6 +42,18 @@ import {
   type WorkflowRunDefinitionSnapshot,
 } from '../execution/workflow-run-definition.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
+import {
+  bindWorkflowReadPilotAdmission,
+  workflowReadPilotTriggerReceiptId,
+  type WorkflowReadPilotAdmissionDraftV1,
+} from '../execution/workflow-read-pilot-admission.js';
+import {
+  createWorkflowRecurringReadAdmission,
+  workflowRecurringReadInputsDigest,
+  type WorkflowRecurringReadAdmissionDraftV1,
+} from '../execution/workflow-recurring-read-admission.js';
+import { createSession, getSession } from '../runtime/harness/eventlog.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { ExecutionStore } from '../execution/store.js';
 import {
   settleCompiledProjectRootFromRun,
@@ -1325,11 +1337,21 @@ export interface QueueWorkflowRunOptions {
   autoRetestDepth?: number;
   /** Disable duplicate suppression for sources that intentionally enqueue fresh runs. */
   dedupe?: boolean;
+  /** One-shot user request for a uniquely named catalog workflow. The runner
+   *  may execute this run even when the workflow is still disabled for cron. */
+  acceptDisabled?: boolean;
   /** Internal authority used only by the runner after the source execution has
    *  fully settled but before its terminal run record is installed. External
    *  retry surfaces must leave this unset so a live source can never race a
    *  fresh attempt. */
   sourceExecutionSettled?: boolean;
+  /** Exact disabled one-node read pilot admission. Queueing binds the generated run
+   * id and immutable definition snapshot into this contract before the record
+   * becomes executable. Ordinary workflow callers must leave it absent. */
+  workflowReadPilotAdmission?: WorkflowReadPilotAdmissionDraftV1;
+  /** Scheduler-owned standing read authority. The generated run id and exact
+   * definition snapshot are bound before the queue record becomes visible. */
+  workflowRecurringReadAdmission?: WorkflowRecurringReadAdmissionDraftV1;
 }
 
 const TERMINAL_WORKFLOW_RUN_STATUSES = new Set([
@@ -2161,6 +2183,42 @@ function queueWorkflowRunUnlocked(
     admittedWorkflowDefinition(name, createdAt);
   const source = normalizedOptionalString(opts?.source);
   const triggerReceiptId = normalizedOptionalString(opts?.triggerReceiptId);
+  const targetStepId = normalizedOptionalString(opts?.targetStepId);
+  const readPilotDraft = opts?.workflowReadPilotAdmission;
+  const recurringReadDraft = opts?.workflowRecurringReadAdmission;
+  if (readPilotDraft && recurringReadDraft) {
+    throw new Error('A workflow run cannot carry both one-shot pilot and standing recurrence authority.');
+  }
+  if (readPilotDraft) {
+    if (
+      source !== 'automation_pilot'
+      || opts?.acceptDisabled !== true
+      || targetStepId !== readPilotDraft.nodeId
+      || triggerReceiptId !== workflowReadPilotTriggerReceiptId(readPilotDraft)
+      || !workflowDefinitionSnapshot
+      || !workflowEntry
+    ) {
+      throw new Error(
+        'Exact read pilot queueing requires its disabled catalog snapshot, target node, '
+        + 'automation_pilot source, and deterministic pilot receipt.',
+      );
+    }
+  }
+  if (recurringReadDraft) {
+    if (
+      source !== 'schedule'
+      || opts?.acceptDisabled === true
+      || targetStepId !== undefined
+      || !triggerReceiptId
+      || !workflowDefinitionSnapshot
+      || !workflowEntry
+    ) {
+      throw new Error(
+        'Exact recurring read queueing requires source=schedule, an enabled catalog snapshot, '
+        + 'its occurrence receipt, and no one-shot/TRY bypass.',
+      );
+    }
+  }
   const catchupHold = normalizeCatchupHold(opts, triggerReceiptId);
   const requestedWorkflowSlug = normalizedOptionalString(opts?.workflowSlug);
   if (requestedWorkflowSlug && workflowEntry && requestedWorkflowSlug !== workflowEntry.name) {
@@ -2308,6 +2366,56 @@ function queueWorkflowRunUnlocked(
     if (originObserver && queueRequestDigest && !chatDispatchPreparation) {
       throw new Error('workflow chat dispatch admission completed without a prepared receipt');
     }
+    if (readPilotDraft) {
+      const duplicateFile = workflowRunFile(duplicate.id);
+      const duplicateRecord = JSON.parse(readFileSync(duplicateFile, 'utf8')) as Record<string, unknown>;
+      const duplicateSnapshot = resolveWorkflowRunDefinitionSnapshot(
+        duplicateRecord.workflowDefinitionSnapshot,
+      );
+      if (
+        duplicateSnapshot.status !== 'valid'
+        || !('version' in duplicateSnapshot.snapshot)
+        || duplicateSnapshot.snapshot.version !== 1
+      ) throw new Error('Duplicate pilot run has no exact catalog definition snapshot.');
+      const expected = bindWorkflowReadPilotAdmission({
+        draft: readPilotDraft,
+        runId: duplicate.id,
+        snapshot: duplicateSnapshot.snapshot,
+        approval: approvalRegistry.get(
+          readPilotDraft.oneShotActivationAuthorization.approvalId,
+        ),
+      });
+      if (
+        !expected.ok
+        || JSON.stringify(duplicateRecord.workflowReadPilotAdmission) !== JSON.stringify(expected.admission)
+      ) throw new Error('Duplicate pilot receipt is bound to a different run admission contract.');
+    }
+    if (recurringReadDraft) {
+      const duplicateFile = workflowRunFile(duplicate.id);
+      const duplicateRecord = JSON.parse(readFileSync(duplicateFile, 'utf8')) as Record<string, unknown>;
+      const duplicateSnapshot = resolveWorkflowRunDefinitionSnapshot(
+        duplicateRecord.workflowDefinitionSnapshot,
+      );
+      if (
+        duplicateSnapshot.status !== 'valid'
+        || !('version' in duplicateSnapshot.snapshot)
+        || duplicateSnapshot.snapshot.version !== 1
+      ) throw new Error('Duplicate recurring run has no exact catalog definition snapshot.');
+      const expected = createWorkflowRecurringReadAdmission({
+        activationId: recurringReadDraft.activationId,
+        runId: duplicate.id,
+        occurrenceOrdinal: recurringReadDraft.occurrenceOrdinal,
+        nodeAttempt: recurringReadDraft.nodeAttempt,
+        snapshot: duplicateSnapshot.snapshot,
+        currentAuthoritySnapshot: recurringReadDraft.currentAuthoritySnapshot,
+      });
+      if (
+        !expected.ok
+        || expected.admission.runOccurrenceId !== triggerReceiptId
+        || JSON.stringify(duplicateRecord.workflowRecurringReadAdmission)
+          !== JSON.stringify(expected.admission)
+      ) throw new Error('Duplicate recurrence receipt is bound to a different occurrence admission contract.');
+    }
     attachWorkflowRunOriginsToRun(duplicate.id, origins);
     return {
       status: 'duplicate',
@@ -2340,7 +2448,6 @@ function queueWorkflowRunUnlocked(
     }
   }
   const origin = origins[0];
-  const targetStepId = normalizedOptionalString(opts?.targetStepId);
   const requeuedFromRunId = normalizedOptionalString(opts?.requeuedFromRunId);
   const readinessSnapshot = readiness
     ? workflowRunReadinessSnapshot(readiness, normalizedOptionalString(readinessTargetStepId))
@@ -2405,49 +2512,117 @@ function queueWorkflowRunUnlocked(
     : opts?.catchupFire === true && opts.catchupDisposition === 'resumed'
       ? 'resumed'
       : undefined;
-  const buildRunRecord = (runId: string): Record<string, unknown> => ({
-    id: runId,
-    workflow: name,
-    inputs: normalizedInputs,
-    status: catchupHold
-      ? 'awaiting_catchup_decision'
-      : originObserver
-        ? 'awaiting_chat_dispatch_seal'
-        : 'queued',
-    ...(opts?.catchupFire ? { catchupFire: true } : {}),
-    ...(opts?.catchupFire && catchupOccurrenceAtMs !== undefined ? { catchupOccurrenceAtMs } : {}),
-    ...(workflowSlug ? { workflowSlug } : {}),
-    ...(opts?.catchupFire && catchupFirstDueAtMs !== undefined ? { catchupFirstDueAtMs } : {}),
-    ...(opts?.catchupFire && catchupScheduledAtMs !== undefined ? { catchupScheduledAtMs } : {}),
-    ...(opts?.catchupFire && catchupMissedCount !== undefined ? { catchupMissedCount } : {}),
-    ...(opts?.catchupFire && catchupDisposition ? { catchupDisposition } : {}),
-    ...(catchupHold ? { catchupHeldAt: createdAt } : {}),
-    ...(opts?.catchupFire && normalizedOptionalString(opts?.catchupDecidedAt)
-      ? { catchupDecidedAt: normalizedOptionalString(opts?.catchupDecidedAt) }
-      : {}),
-    mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
-    ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
-    createdAt,
-    ...(source ? { source } : {}),
-    ...(triggerReceiptId ? { triggerReceiptId } : {}),
-    ...(targetStepId ? { targetStepId } : {}),
-    ...(requeuedFromRunId ? { requeuedFromRunId } : {}),
-    ...(recoveryIntent ? { recoveryIntent } : {}),
-    ...(readinessSnapshot ? { readiness: readinessSnapshot } : {}),
-    ...(originObserver ? {
-      chatDispatchSourceGroupId: workflowOriginSourceGroupId(originObserver),
-      chatDispatchQueueRequestDigest: queueRequestDigest,
-    } : {}),
-    // Only written when present: no origin means notification-only, while
-    // chat-dispatched runs can re-enter their originating session on finish.
-    ...(origin ? { originSessionId: origin } : {}),
-    ...(origins.length > 1 ? { originSessionIds: origins } : {}),
-    ...(selfHealAttempt ? { selfHealAttempt } : {}),
-    ...(selfHealAttempt && opts?.selfHealBackupId?.trim() ? { selfHealBackupId: opts.selfHealBackupId.trim() } : {}),
-    ...(goalAttempt ? { goalAttempt } : {}),
-    ...(goalFeedback ? { goalFeedback } : {}),
-    ...(retryFailedItems ? retryFailedItems : {}),
-  });
+  const buildRunRecord = (runId: string): Record<string, unknown> => {
+    const readPilotAdmission = readPilotDraft && workflowDefinitionSnapshot
+      ? bindWorkflowReadPilotAdmission({
+          draft: readPilotDraft,
+          runId,
+          snapshot: workflowDefinitionSnapshot,
+          approval: approvalRegistry.get(
+            readPilotDraft.oneShotActivationAuthorization.approvalId,
+          ),
+        })
+      : undefined;
+    if (readPilotAdmission && !readPilotAdmission.ok) {
+      throw new Error(`Exact read pilot admission refused: ${readPilotAdmission.reason}.`);
+    }
+    const recurringReadAdmission = recurringReadDraft && workflowDefinitionSnapshot
+      ? createWorkflowRecurringReadAdmission({
+          activationId: recurringReadDraft.activationId,
+          runId,
+          occurrenceOrdinal: recurringReadDraft.occurrenceOrdinal,
+          nodeAttempt: recurringReadDraft.nodeAttempt,
+          snapshot: workflowDefinitionSnapshot,
+          currentAuthoritySnapshot: recurringReadDraft.currentAuthoritySnapshot,
+        })
+      : undefined;
+    if (recurringReadAdmission && !recurringReadAdmission.ok) {
+      throw new Error(`Exact recurring read admission refused: ${recurringReadAdmission.reason}.`);
+    }
+    if (
+      recurringReadAdmission?.ok
+      && recurringReadAdmission.admission.runOccurrenceId !== triggerReceiptId
+    ) throw new Error('Recurring read admission does not match the scheduler occurrence receipt.');
+    if (
+      recurringReadAdmission?.ok
+      && recurringReadAdmission.admission.workflowInputsDigest
+        !== workflowRecurringReadInputsDigest(normalizedInputs)
+    ) throw new Error('Recurring read inputs do not match the exact standing-consent receipt.');
+    if (recurringReadAdmission?.ok) {
+      const sessionId = recurringReadAdmission.admission.workflowSessionId;
+      const existing = getSession(sessionId);
+      if (existing && existing.kind !== 'workflow') {
+        throw new Error('Recurring read session identity is already owned by another session kind.');
+      }
+      if (!existing) {
+        try {
+          createSession({
+            id: sessionId,
+            kind: 'workflow',
+            title: `Recurring read ${recurringReadAdmission.admission.workflowId}`,
+            metadata: {
+              protocol: 'automation_recurrence_v1',
+              workflowId: recurringReadAdmission.admission.workflowId,
+            },
+          });
+        } catch {
+          if (getSession(sessionId)?.kind !== 'workflow') {
+            throw new Error('Recurring read workflow session could not be created exactly.');
+          }
+        }
+      }
+    }
+    return {
+      id: runId,
+      workflow: name,
+      inputs: normalizedInputs,
+      status: catchupHold
+        ? 'awaiting_catchup_decision'
+        : originObserver
+          ? 'awaiting_chat_dispatch_seal'
+          : 'queued',
+      ...(opts?.catchupFire ? { catchupFire: true } : {}),
+      ...(opts?.catchupFire && catchupOccurrenceAtMs !== undefined ? { catchupOccurrenceAtMs } : {}),
+      ...(workflowSlug ? { workflowSlug } : {}),
+      ...(opts?.catchupFire && catchupFirstDueAtMs !== undefined ? { catchupFirstDueAtMs } : {}),
+      ...(opts?.catchupFire && catchupScheduledAtMs !== undefined ? { catchupScheduledAtMs } : {}),
+      ...(opts?.catchupFire && catchupMissedCount !== undefined ? { catchupMissedCount } : {}),
+      ...(opts?.catchupFire && catchupDisposition ? { catchupDisposition } : {}),
+      ...(catchupHold ? { catchupHeldAt: createdAt } : {}),
+      ...(opts?.catchupFire && normalizedOptionalString(opts?.catchupDecidedAt)
+        ? { catchupDecidedAt: normalizedOptionalString(opts?.catchupDecidedAt) }
+        : {}),
+      mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+      ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
+      createdAt,
+      ...(source ? { source } : {}),
+      ...(triggerReceiptId ? { triggerReceiptId } : {}),
+      ...(targetStepId ? { targetStepId } : {}),
+      ...(opts?.acceptDisabled === true ? { acceptDisabled: true } : {}),
+      ...(readPilotAdmission?.ok
+        ? { workflowReadPilotAdmission: readPilotAdmission.admission }
+        : {}),
+      ...(recurringReadAdmission?.ok
+        ? { workflowRecurringReadAdmission: recurringReadAdmission.admission }
+        : {}),
+      ...(requeuedFromRunId ? { requeuedFromRunId } : {}),
+      ...(recoveryIntent ? { recoveryIntent } : {}),
+      ...(readinessSnapshot ? { readiness: readinessSnapshot } : {}),
+      ...(originObserver ? {
+        chatDispatchSourceGroupId: workflowOriginSourceGroupId(originObserver),
+        chatDispatchQueueRequestDigest: queueRequestDigest,
+      } : {}),
+      // Only written when present: no origin means notification-only, while
+      // chat-dispatched runs can re-enter their originating session on finish.
+      ...(origin ? { originSessionId: origin } : {}),
+      ...(origins.length > 1 ? { originSessionIds: origins } : {}),
+      ...(selfHealAttempt ? { selfHealAttempt } : {}),
+      ...(selfHealAttempt && opts?.selfHealBackupId?.trim() ? { selfHealBackupId: opts.selfHealBackupId.trim() } : {}),
+      ...(goalAttempt ? { goalAttempt } : {}),
+      ...(goalFeedback ? { goalFeedback } : {}),
+      ...(retryFailedItems ? retryFailedItems : {}),
+    };
+  };
   let id: string;
   let exactAdmission: ExactChatDispatchAdmissionResult | undefined;
   if (triggerReceiptId) {

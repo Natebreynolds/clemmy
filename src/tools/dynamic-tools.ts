@@ -60,6 +60,12 @@ export function registerDynamicTools(server: McpServer): void {
       { args: z.string().nullable().describe(argsDescription) },
       async ({ args }) => {
         try {
+          if (process.platform === 'win32' && file.endsWith('.sh')) {
+            return textResult(
+              `Tool "${file}" is a POSIX shell script and cannot run on Windows. `
+              + 'Recreate it as a .py tool (cross-platform) or a .ps1/.cmd script.',
+            );
+          }
           let command = filePath;
           let commandArgs: string[] = args ? [args] : [];
           if (file.endsWith('.py')) {

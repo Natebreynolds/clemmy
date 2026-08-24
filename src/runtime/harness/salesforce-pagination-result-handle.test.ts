@@ -82,6 +82,255 @@ test('Salesforce-style done/nextRecordsUrl pagination is structural and fail-clo
     assert.equal(derived.cursor, null, JSON.stringify(malformed));
   }
 
+  for (const malformedProtocol of [
+    { result: { totalSize: -1, done: true, records: [{ Id: '001-a' }] } },
+    { result: { totalSize: 1.5, done: true, records: [{ Id: '001-a' }] } },
+    { result: { totalSize: 1, done: true, records: [{ Id: '001-a' }, { Id: '001-b' }] } },
+    { result: { totalSize: 1, done: 'maybe', records: [{ Id: '001-a' }] } },
+  ]) {
+    assert.equal(facts.resultHasMalformedPagination(malformedProtocol), true, JSON.stringify(malformedProtocol));
+  }
+
+  for (const unknownWithoutProtocol of [
+    { successful: true, records: [{ id: 'job-1', done: true }] },
+    { result: { done: true, records: [{ Id: '001-a' }] } },
+    { result: { totalSize: 1, done: true, record: { Id: '001-a' } } },
+  ]) {
+    assert.equal(facts.resultHasMalformedPagination(unknownWithoutProtocol), false, JSON.stringify(unknownWithoutProtocol));
+  }
+
+  assert.equal(
+    facts.resultHasMalformedPagination({ successful: true, data: { items: [{ id: 'opaque-1' }] } }),
+    false,
+    'an opaque result with no pagination assertion remains usable unknown data',
+  );
+
+  for (const malformedGenericPage of [
+    {
+      successful: true,
+      data: { items: [{ id: 1 }, { id: 2 }] },
+      meta: { total: 1, returned: 2, offset: 0 },
+    },
+    {
+      successful: true,
+      data: { items: [{ id: 1 }] },
+      meta: { total: 2, returned: 1, offset: 3 },
+    },
+    {
+      successful: true,
+      data: { items: [{ id: 1 }] },
+      meta: { total: 2, returned: 1, offset: 2 },
+    },
+    {
+      successful: true,
+      data: { items: [{ id: 1 }] },
+      meta: { total: 2, returned: 1, offset: '-1' },
+    },
+    {
+      successful: true,
+      data: { items: [{ id: 1 }] },
+      meta: { page: 3, page_count: 2 },
+    },
+    {
+      successful: true,
+      data: { items: [{ id: 1 }, { id: 2 }] },
+      meta: { pageSize: 1 },
+    },
+  ]) {
+    const derived = facts.deriveResultHandleFactsFromRaw(malformedGenericPage);
+    assert.equal(derived.completeness, 'unknown', JSON.stringify(malformedGenericPage));
+    assert.equal(derived.cursor, null, JSON.stringify(malformedGenericPage));
+    assert.equal(
+      facts.resultHasMalformedPagination(malformedGenericPage),
+      true,
+      JSON.stringify(malformedGenericPage),
+    );
+  }
+
+  const pageSizeIsOnlyACeiling = {
+    successful: true,
+    data: { items: [{ id: 1 }, { id: 2 }] },
+    meta: { total: 5, pageSize: 25, offset: 0 },
+  };
+  assert.equal(
+    facts.deriveResultHandleFactsFromRaw(pageSizeIsOnlyACeiling).completeness,
+    'partial',
+    'a page-size ceiling larger than the returned page is not an actual returned count',
+  );
+  assert.equal(facts.resultHasMalformedPagination(pageSizeIsOnlyACeiling), false);
+
+  const opaqueOffset = {
+    successful: true,
+    records: [{ id: 'rec-airtable-1' }],
+    offset: 'itrNextPageToken/opaque+=',
+  };
+  const opaqueOffsetFacts = facts.deriveResultHandleFactsFromRaw(opaqueOffset);
+  assert.equal(opaqueOffsetFacts.completeness, 'partial');
+  assert.equal(opaqueOffsetFacts.cursor, 'itrNextPageToken/opaque+=');
+  assert.equal(facts.resultHasMalformedPagination(opaqueOffset), false);
+
+  const unrelatedBusinessTotal = {
+    successful: true,
+    data: { items: [{ id: 'account-1' }] },
+    billing: { total: 'USD 25' },
+  };
+  const businessFacts = facts.deriveResultHandleFactsFromRaw(unrelatedBusinessTotal);
+  assert.equal(businessFacts.completeness, 'unknown');
+  assert.equal(businessFacts.cursor, null);
+  assert.equal(
+    facts.resultHasMalformedPagination(unrelatedBusinessTotal),
+    false,
+    'an unrelated nested business total is not pagination metadata',
+  );
+
+  const siblingBusinessFlags = {
+    successful: true,
+    data: { items: [{ id: 'account-1' }] },
+    billing: { complete: true, hasMore: false },
+  };
+  const siblingFlagFacts = facts.deriveResultHandleFactsFromRaw(siblingBusinessFlags);
+  assert.equal(
+    siblingFlagFacts.completeness,
+    'unknown',
+    'business complete/hasMore fields cannot certify a sibling collection',
+  );
+  assert.equal(siblingFlagFacts.cursor, null);
+  assert.equal(facts.resultHasMalformedPagination(siblingBusinessFlags), false);
+
+  for (const fixture of [
+    {
+      label: 'web-root-next-cursor',
+      payload: {
+        successful: true,
+        data: { web: [{ url: 'https://example.test/a' }] },
+        nextCursor: 'web-next-opaque',
+      },
+      recordPath: 'data.web',
+      cursor: 'web-next-opaque',
+    },
+    {
+      label: 'files-owner-has-more',
+      payload: {
+        successful: true,
+        data: { files: [{ id: 'file-1' }], hasMore: true },
+      },
+      recordPath: 'data.files',
+      cursor: null,
+    },
+    {
+      label: 'hits-root-has-more',
+      payload: {
+        successful: true,
+        payload: { hits: [{ id: 'hit-1' }] },
+        hasMore: true,
+      },
+      recordPath: 'payload.hits',
+      cursor: null,
+    },
+  ] as const) {
+    const derived = facts.deriveResultHandleFactsFromRaw(fixture.payload);
+    assert.equal(derived.recordPath, fixture.recordPath, fixture.label);
+    assert.equal(derived.recordCount, 1, fixture.label);
+    assert.equal(derived.completeness, 'partial', fixture.label);
+    assert.equal(derived.cursor, fixture.cursor, fixture.label);
+    assert.equal(facts.resultHasMalformedPagination(fixture.payload), false, fixture.label);
+  }
+
+  for (const fixture of [
+    {
+      label: 'ambiguous-fallback-root-next-cursor',
+      payload: {
+        successful: true,
+        data: {
+          web: [{ url: 'https://example.test/a' }],
+          files: [{ id: 'file-1' }],
+        },
+        next_cursor: 'ambiguous-next-opaque',
+      },
+      cursor: 'ambiguous-next-opaque',
+    },
+    {
+      label: 'ambiguous-fallback-owner-has-more',
+      payload: {
+        successful: true,
+        data: {
+          web: [{ url: 'https://example.test/a' }],
+          files: [{ id: 'file-1' }],
+          hasMore: true,
+        },
+      },
+      cursor: null,
+    },
+  ] as const) {
+    const derived = facts.deriveResultHandleFactsFromRaw(fixture.payload);
+    assert.equal(derived.recordPath, null, `${fixture.label} stays projection-ambiguous`);
+    assert.equal(derived.recordCount, 0, `${fixture.label} does not guess an array`);
+    assert.equal(derived.completeness, 'partial', fixture.label);
+    assert.equal(derived.cursor, fixture.cursor, fixture.label);
+    assert.equal(facts.resultHasMalformedPagination(fixture.payload), false, fixture.label);
+  }
+
+  for (const fixture of [
+    {
+      label: 'ambiguous-page-beyond-count',
+      payload: {
+        successful: true,
+        data: { web: [{ id: 'web-1' }], files: [{ id: 'file-1' }] },
+        page: 3,
+        page_count: 2,
+        complete: true,
+      },
+    },
+    {
+      label: 'ambiguous-returned-over-total',
+      payload: {
+        successful: true,
+        data: { web: [{ id: 'web-1' }], files: [{ id: 'file-1' }] },
+        total: 1,
+        returned: 3,
+        complete: true,
+      },
+    },
+    {
+      label: 'ambiguous-negative-total',
+      payload: {
+        successful: true,
+        data: { web: [{ id: 'web-1' }], files: [{ id: 'file-1' }] },
+        total: -1,
+        complete: true,
+      },
+    },
+    {
+      label: 'ambiguous-offset-window-over-total',
+      payload: {
+        successful: true,
+        data: { web: [{ id: 'web-1' }], files: [{ id: 'file-1' }] },
+        total: 5,
+        returned: 2,
+        offset: 4,
+        complete: true,
+      },
+    },
+  ] as const) {
+    const derived = facts.deriveResultHandleFactsFromRaw(fixture.payload);
+    assert.equal(derived.recordPath, null, fixture.label);
+    assert.equal(derived.completeness, 'unknown', fixture.label);
+    assert.equal(derived.cursor, null, fixture.label);
+    assert.equal(facts.resultHasMalformedPagination(fixture.payload), true, fixture.label);
+  }
+
+  const ambiguousOpaqueOffset = {
+    successful: true,
+    data: { web: [{ id: 'web-1' }], files: [{ id: 'file-1' }] },
+    offset: 'itrAmbiguousNext/opaque+=',
+    complete: true,
+  };
+  const ambiguousOpaqueOffsetFacts = facts.deriveResultHandleFactsFromRaw(ambiguousOpaqueOffset);
+  assert.equal(ambiguousOpaqueOffsetFacts.recordPath, null);
+  assert.equal(ambiguousOpaqueOffsetFacts.completeness, 'partial');
+  assert.equal(ambiguousOpaqueOffsetFacts.cursor, 'itrAmbiguousNext/opaque+=');
+  assert.equal(facts.resultHasMalformedPagination(ambiguousOpaqueOffset), false);
+
   const contradictory = facts.deriveResultHandleFactsFromRaw({
     result: {
       totalSize: 1,
@@ -96,6 +345,147 @@ test('Salesforce-style done/nextRecordsUrl pagination is structural and fail-clo
     'a continuation outranks a contradictory terminal flag',
   );
   assert.equal(contradictory.cursor, '/services/data/v66.0/query/contradiction');
+});
+
+test('nested fallback collections retain owner pagination without provider noun aliases', () => {
+  for (const fixture of [
+    {
+      label: 'nested-web-next-cursor',
+      payload: {
+        successful: true,
+        data: { search: { web: [{ id: 'web-1' }], nextCursor: 'nested-web-next' } },
+      },
+      path: 'data.search.web',
+      cursor: 'nested-web-next',
+    },
+    {
+      label: 'nested-files-has-more',
+      payload: {
+        successful: true,
+        result: { response: { files: [{ id: 'file-1' }], hasMore: true } },
+      },
+      path: 'result.response.files',
+      cursor: null,
+    },
+    {
+      label: 'nested-hits-opaque-offset',
+      payload: {
+        successful: true,
+        payload: { data: { hits: [{ id: 'hit-1' }], offset: 'itrNested/opaque+=' } },
+      },
+      path: 'payload.data.hits',
+      cursor: 'itrNested/opaque+=',
+    },
+  ] as const) {
+    const derived = facts.deriveResultHandleFactsFromRaw(fixture.payload);
+    assert.equal(derived.recordPath, fixture.path, fixture.label);
+    assert.equal(derived.recordCount, 1, fixture.label);
+    assert.equal(derived.completeness, 'partial', fixture.label);
+    assert.equal(derived.cursor, fixture.cursor, fixture.label);
+    assert.equal(facts.resultHasMalformedPagination(fixture.payload), false, fixture.label);
+  }
+
+  const nestedMalformed = {
+    successful: true,
+    data: {
+      search: {
+        web: [{ id: 'web-1' }],
+        page: 3,
+        page_count: 2,
+        complete: true,
+      },
+    },
+  };
+  assert.equal(facts.deriveResultHandleFactsFromRaw(nestedMalformed).completeness, 'unknown');
+  assert.equal(facts.resultHasMalformedPagination(nestedMalformed), true);
+
+  const emptyWithTelemetry = {
+    successful: true,
+    data: { search: { web: [] as unknown[] } },
+    query: 'restaurants',
+    originalRequest: { query: 'restaurants' },
+    elapsedMs: 42,
+  };
+  const emptyFacts = facts.deriveResultHandleFactsFromRaw(emptyWithTelemetry);
+  assert.equal(emptyFacts.recordPath, 'data.search.web');
+  assert.equal(emptyFacts.recordCount, 0);
+  assert.equal(emptyFacts.completeness, 'unknown');
+  assert.deepEqual(emptyFacts.projectedRecords, []);
+});
+
+test('pagination signal types and next-cursor identity fail closed', () => {
+  for (const payload of [
+    { successful: true, records: [{ id: 1 }], hasMore: 'maybe' },
+    { successful: true, records: [{ id: 1 }], complete: null },
+    { successful: true, records: [{ id: 1 }], nextCursor: 42 },
+    { successful: true, records: [{ id: 1 }], nextCursor: { token: 'opaque' } },
+    {
+      successful: true,
+      records: [{ id: 1 }],
+      nextCursor: 'next-a',
+      nextPageToken: 'next-b',
+    },
+    {
+      successful: true,
+      records: [{ id: 1 }],
+      nextCursor: 'next-a',
+      continuation: 'next-b',
+    },
+    {
+      successful: true,
+      records: [{ id: 1 }],
+      nextCursor: 'next-a',
+      nextLink: 'https://example.test/next-b',
+    },
+    {
+      successful: true,
+      records: [{ id: 1 }],
+      nextCursor: 'next-a',
+      offset: 'next-b',
+    },
+    {
+      successful: true,
+      records: [{ id: 1 }],
+      nextCursor: null,
+      nextLink: 'https://example.test/next',
+    },
+  ]) {
+    const derived = facts.deriveResultHandleFactsFromRaw(payload);
+    assert.equal(derived.completeness, 'unknown', JSON.stringify(payload));
+    assert.equal(derived.cursor, null, JSON.stringify(payload));
+    assert.equal(facts.resultHasMalformedPagination(payload), true, JSON.stringify(payload));
+  }
+
+  const currentOnly = facts.deriveResultHandleFactsFromRaw({
+    successful: true,
+    records: [{ id: 1 }],
+    cursor: 'current-position',
+    pageToken: null,
+  });
+  assert.equal(currentOnly.completeness, 'unknown');
+  assert.equal(currentOnly.cursor, null);
+
+  const explicitNextWins = facts.deriveResultHandleFactsFromRaw({
+    successful: true,
+    records: [{ id: 1 }],
+    cursor: 'current-position',
+    nextCursor: 'next-position',
+  });
+  assert.equal(explicitNextWins.completeness, 'partial');
+  assert.equal(explicitNextWins.cursor, 'next-position');
+
+  const identicalNextAliases = {
+    successful: true,
+    records: [{ id: 1 }],
+    nextCursor: 'same-next',
+    nextPageToken: 'same-next',
+    continuation: 'same-next',
+    offset: 'same-next',
+  };
+  const identicalFacts = facts.deriveResultHandleFactsFromRaw(identicalNextAliases);
+  assert.equal(identicalFacts.completeness, 'partial');
+  assert.equal(identicalFacts.cursor, 'same-next');
+  assert.equal(facts.resultHasMalformedPagination(identicalNextAliases), false);
 });
 
 test('a terminal CLI-shaped Salesforce page redeems and discharges its dependent write', () => {

@@ -46,6 +46,9 @@ import {
 } from './result-handle.js';
 import { inspectProviderEnvelope } from './provider-read-evidence.js';
 import { verifyHostSealedArtifactDerivationForWrite } from './artifact-ledger.js';
+import { verifyAtomicContentCommit } from './atomic-content-commit-proof.js';
+import { loadSealedNodeBinding } from './host-capability-catalog-factory.js';
+import { reopenTypedPhysicalAuthorityInTransaction } from './typed-physical-authority-proof.js';
 
 export const EVIDENCE_RECEIPT_EVENT = 'evidence_receipt' as const;
 
@@ -55,6 +58,7 @@ export type EvidenceReceiptKind =
   | 'derivation'
   | 'commit'
   | 'readback'
+  | 'content_commit'
   | 'reconciliation'
   | 'send';
 
@@ -105,6 +109,17 @@ export function digestOf(value: unknown): string {
     return `{${keys.map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(',')}}`;
   };
   return createHash('sha256').update(canonical(value)).digest('hex');
+}
+
+function resolveAtomicSealedNodeAuthority(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  nodeId: string;
+}): ReturnType<Parameters<typeof verifyAtomicContentCommit>[0]['resolveSealedNodeAuthority']> {
+  const binding = loadSealedNodeBinding(input.sessionId, input.sourceUserSeq, input.nodeId);
+  return binding
+    ? { ok: true, binding }
+    : { ok: false, reason: 'sealed graph-node binding is missing or corrupt' };
 }
 
 // ── Normalized host read authority ──────────────────────────────────────────
@@ -1076,6 +1091,7 @@ export function redeemEvidenceReceipt(
         providerReceipt: writeRow.provider_receipt,
         intendedDigest: writeRow.intended_digest,
         observedDigest: writeRow.observed_digest,
+        physicalDispatchId: writeRow.physical_dispatch_id,
       });
       if (!live.ok) return { ok: false, reason: live.reason };
       return {
@@ -1164,7 +1180,7 @@ interface HostWriteReceiptRow {
 }
 
 export interface HostWriteReceipt extends IssuedReceipt {
-  kind: 'commit' | 'readback' | 'derivation' | 'reconciliation' | 'send';
+  kind: 'commit' | 'readback' | 'content_commit' | 'derivation' | 'reconciliation' | 'send';
   obligation: string;
   manifestId: string;
   nodeId: string;
@@ -1253,6 +1269,7 @@ function redeemHostWriteReceiptFacts(input: {
   providerReceipt: string;
   intendedDigest: string | null;
   observedDigest: string | null;
+  physicalDispatchId: string;
 }): { ok: true } | { ok: false; reason: string } {
   const created = redeemSuccessfulSettlementResultForHost({
     sessionId: input.sessionId,
@@ -1262,6 +1279,77 @@ function redeemHostWriteReceiptFacts(input: {
   });
   if (created.status !== 'ok') {
     return { ok: false, reason: `write settlement is no longer redeemable: ${created.reason}` };
+  }
+  const db = openEventLog();
+  const manifestState = authorityManifest(db, {
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    manifestId: input.manifestId,
+  }, { issuing: false });
+  const node = manifestState.ok
+    ? manifestState.manifest.nodes.find((entry) => entry.nodeId === input.nodeId)
+    : undefined;
+  if (manifestState.ok && node?.contentCommitMode === 'documented_atomic_input') {
+    const atomic = verifyAtomicContentCommit({
+      db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: input.acceptedTaskId,
+      manifest: manifestState.manifest,
+      node,
+      logicalToolCallId: input.logicalToolCallId,
+      created: {
+        rawPayload: created.value.rawPayload,
+        toolName: created.value.toolName,
+        executionSite: created.value.executionSite,
+        physicalDispatchId: created.value.physicalDispatchId,
+      },
+      resolveSealedNodeAuthority(authority) {
+        return resolveAtomicSealedNodeAuthority({
+          sessionId: input.sessionId,
+          sourceUserSeq: input.sourceUserSeq,
+          nodeId: authority.nodeId,
+        });
+      },
+      resolveTypedPhysicalAuthority(authority) {
+        return reopenTypedPhysicalAuthorityInTransaction({
+          db,
+          sessionId: input.sessionId,
+          sourceUserSeq: input.sourceUserSeq,
+          physicalDispatchId: authority.physicalDispatchId,
+        });
+      },
+      resolveSuccessfulResult(logicalToolCallId) {
+        const source = redeemSuccessfulSettlementResultForHost({
+          sessionId: input.sessionId,
+          sourceUserSeq: input.sourceUserSeq,
+          acceptedTaskId: input.acceptedTaskId,
+          logicalToolCallId,
+        });
+        return source.status === 'ok'
+          ? { ok: true, rawPayload: source.value.rawPayload }
+          : { ok: false, reason: source.reason };
+      },
+    });
+    if (!atomic.ok) return atomic;
+    if (
+      atomic.facts.createdId !== input.createdId
+      || atomic.facts.providerReceipt !== input.providerReceipt
+      || atomic.facts.intendedDigest !== input.intendedDigest
+      || input.observedDigest !== null
+      || atomic.facts.physicalDispatchId !== input.physicalDispatchId
+      || !['commit', 'derivation', 'content_commit'].includes(input.kind)
+    ) return { ok: false, reason: 'atomic content receipt no longer matches its durable proof facts' };
+    if (input.kind === 'derivation') {
+      const sources = verifyManifestDerivationSources({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        manifestId: input.manifestId,
+        nodeId: input.nodeId,
+      });
+      if (!sources.ok) return sources;
+    }
+    return { ok: true };
   }
   const payload = createdPayloadOf(created.value.rawPayload);
   if (payload.id !== input.createdId) {
@@ -1451,11 +1539,63 @@ export function issueHostWriteEvidenceForManifestNode(input: {
           reason: `manifest write has no authoritative settled result: ${created.reason}`,
         };
       }
-      const payload = createdPayloadOf(created.value.rawPayload);
-      if (!payload.id || !payload.handle) {
-        return { status: 'refused', reason: 'write settlement is missing an exact created id and handle' };
+      const atomic = node.contentCommitMode === 'documented_atomic_input'
+        ? verifyAtomicContentCommit({
+            db,
+            sessionId: input.sessionId,
+            sourceUserSeq: input.sourceUserSeq,
+            acceptedTaskId: manifestState.authority.accepted_task_id,
+            manifest: manifestState.manifest,
+            node,
+            logicalToolCallId,
+            created: {
+              rawPayload: created.value.rawPayload,
+              toolName: created.value.toolName,
+              executionSite: created.value.executionSite,
+              physicalDispatchId: created.value.physicalDispatchId,
+            },
+            resolveSealedNodeAuthority(authority) {
+              return resolveAtomicSealedNodeAuthority({
+                sessionId: input.sessionId,
+                sourceUserSeq: input.sourceUserSeq,
+                nodeId: authority.nodeId,
+              });
+            },
+            resolveTypedPhysicalAuthority(authority) {
+              return reopenTypedPhysicalAuthorityInTransaction({
+                db,
+                sessionId: input.sessionId,
+                sourceUserSeq: input.sourceUserSeq,
+                physicalDispatchId: authority.physicalDispatchId,
+              });
+            },
+            resolveSuccessfulResult(sourceLogicalToolCallId) {
+              const source = redeemSuccessfulSettlementResultForHost({
+                sessionId: input.sessionId,
+                sourceUserSeq: input.sourceUserSeq,
+                acceptedTaskId: manifestState.authority.accepted_task_id,
+                logicalToolCallId: sourceLogicalToolCallId,
+              });
+              return source.status === 'ok'
+                ? { ok: true, rawPayload: source.value.rawPayload }
+                : { ok: false, reason: source.reason };
+            },
+          })
+        : null;
+      if (atomic && !atomic.ok) return { status: 'refused', reason: atomic.reason };
+      const genericPayload = createdPayloadOf(created.value.rawPayload);
+      const payload = atomic?.ok
+        ? {
+            id: atomic.facts.createdId,
+            handle: atomic.facts.handle,
+            receipt: atomic.facts.providerReceipt,
+            writtenDigest: atomic.facts.intendedDigest,
+          }
+        : genericPayload;
+      if (!payload.id || !payload.handle || !payload.receipt) {
+        return { status: 'refused', reason: 'write settlement is missing an exact created id, handle, or receipt' };
       }
-      if (!independentProviderReceipt(payload.receipt, payload.id, created.value.rawPayload)) {
+      if (!atomic?.ok && !independentProviderReceipt(payload.receipt, payload.id, created.value.rawPayload)) {
         return { status: 'refused', reason: 'write settlement did not return an independent provider receipt' };
       }
       let intendedDigest = payload.writtenDigest;
@@ -1469,27 +1609,34 @@ export function issueHostWriteEvidenceForManifestNode(input: {
       if (node.obligations.includes('verify_committed_readback') && !readback) {
         return { status: 'refused', reason: 'write has no content-digest-matched readback' };
       }
+      if (node.obligations.includes('verify_committed_content') && !atomic?.ok) {
+        return { status: 'refused', reason: 'write has no exact documented atomic content acknowledgement' };
+      }
       if (node.obligations.includes('derivation_from_current_source')) {
         const sources = verifyManifestDerivationSources(input);
         if (!sources.ok) {
           return { status: 'refused', reason: `write derivation source proof failed: ${sources.reason}` };
         }
-        if (!readback) {
-          return { status: 'refused', reason: 'write derivation lacks an exact readback content digest' };
-        }
-        const derivation = verifyHostSealedArtifactDerivationForWrite({
-          sessionId: input.sessionId,
-          sourceUserSeq: input.sourceUserSeq,
-          createLogicalToolCallId: logicalToolCallId,
-          createdId: payload.id,
-          intendedContentDigest: intendedDigest ?? readback.digest,
-        });
-        if (derivation.status !== 'verified') {
-          return { status: 'refused', reason: `write derivation is not host-sealed: ${derivation.reason}` };
-        }
-        intendedDigest = derivation.lineageContentDigest;
-        if (readback.digest !== intendedDigest) {
-          return { status: 'refused', reason: 'write derivation and independent readback content differ' };
+        if (atomic?.ok) {
+          intendedDigest = atomic.facts.intendedDigest;
+        } else {
+          if (!readback) {
+            return { status: 'refused', reason: 'write derivation lacks an exact readback content digest' };
+          }
+          const derivation = verifyHostSealedArtifactDerivationForWrite({
+            sessionId: input.sessionId,
+            sourceUserSeq: input.sourceUserSeq,
+            createLogicalToolCallId: logicalToolCallId,
+            createdId: payload.id,
+            intendedContentDigest: intendedDigest ?? readback.digest,
+          });
+          if (derivation.status !== 'verified') {
+            return { status: 'refused', reason: `write derivation is not host-sealed: ${derivation.reason}` };
+          }
+          intendedDigest = derivation.lineageContentDigest;
+          if (readback.digest !== intendedDigest) {
+            return { status: 'refused', reason: 'write derivation and independent readback content differ' };
+          }
         }
       }
       const receipts: HostWriteReceipt[] = [];
@@ -1511,7 +1658,7 @@ export function issueHostWriteEvidenceForManifestNode(input: {
           handle: payload.handle,
           providerReceipt: payload.receipt,
           intendedDigest: intendedDigest ?? null,
-          observedDigest: readback?.digest ?? null,
+          observedDigest: atomic?.ok ? null : readback?.digest ?? null,
           logicalToolCallId,
           physicalDispatchId: created.value.physicalDispatchId,
         };
@@ -1591,7 +1738,7 @@ export function issueHostWriteEvidenceForManifestNode(input: {
           payload.handle,
           payload.receipt,
           intendedDigest ?? null,
-          readback?.digest ?? null,
+          atomic?.ok ? null : readback?.digest ?? null,
           semanticDigest,
           mirror.id,
           mirror.createdAt,
@@ -1631,6 +1778,7 @@ export const OBLIGATION_RECEIPT_KIND: Record<string, EvidenceReceiptKind> = {
   derivation_from_current_source: 'derivation',
   commit_effect: 'commit',
   verify_committed_readback: 'readback',
+  verify_committed_content: 'content_commit',
   verify_committed_receipt: 'send',
   stale_destination_reconciled: 'reconciliation',
 };

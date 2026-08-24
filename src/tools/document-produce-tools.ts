@@ -12,16 +12,26 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { pathToFileURL } from 'node:url';
 import { BASE_DIR } from '../config.js';
 import { textResult } from './shared.js';
 import { htmlDocument, mergeTemplate, renderMarkdown } from './document-produce-core.js';
 
-const CHROME_CANDIDATES = [
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-];
+const CHROME_CANDIDATES = process.platform === 'win32'
+  ? [
+      path.join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env['LOCALAPPDATA'] ?? '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      path.join(process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      path.join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+    ].filter((candidate) => !candidate.startsWith(path.sep))
+  : [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    ];
 
 /** Exported for tests (injectable). */
 export function findChromeBinary(): string | null {
@@ -52,7 +62,7 @@ function defaultChromePdf(htmlPath: string, pdfPath: string): { ok: boolean; err
   if (!chrome) return { ok: false, error: 'no Chromium-family browser found (Chrome/Chromium/Brave/Edge) — produce HTML instead, or install Chrome for PDF output.' };
   const run = spawnSync(chrome, [
     '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
-    `--print-to-pdf=${pdfPath}`, '--no-pdf-header-footer', `file://${htmlPath}`,
+    `--print-to-pdf=${pdfPath}`, '--no-pdf-header-footer', pathToFileURL(htmlPath).href,
   ], { timeout: 45_000, encoding: 'utf-8' });
   if (run.error) return { ok: false, error: run.error.message };
   if (!existsSync(pdfPath)) return { ok: false, error: (run.stderr || 'Chrome produced no PDF').slice(0, 400) };

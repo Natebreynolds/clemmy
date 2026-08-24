@@ -185,7 +185,10 @@ export function LiveFeed({ items, live, showDetails, terminalOutcome }: {
   }
   // Same narration as the inline strip — one visual language means one
   // filter, or the two surfaces disagree about what happened.
-  const view = settleTerminalActivity(narrateActivity(items), live ? undefined : (terminalOutcome ?? 'interrupted'));
+  const view = settleTerminalActivity(narrateActivity(items, { live }), live ? undefined : (terminalOutcome ?? 'interrupted'));
+  if (view.length === 0) {
+    return <p className="text-body text-faint">No activity yet — it streams in as the agent works.</p>;
+  }
   const agents = view.filter((a) => a.kind === 'agent');
   const doneAgents = agents.filter((a) => a.status !== 'running').length;
   return (

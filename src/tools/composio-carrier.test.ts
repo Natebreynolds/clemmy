@@ -288,3 +288,25 @@ test('the args-only normalizer needs no slug at all', () => {
   const bad = normalizeComposioArgsPayload('{ not json');
   assert.equal(bad.ok, false);
 });
+
+test('nested argument objects reach the wire INTACT — a replacer array guts every non-top-level key (live 2026-08-20)', () => {
+  // JSON.stringify(value, keysArray) filters keys at EVERY depth. The wire
+  // once serialized {actorId, runInput:{searchStringsArray,...}} with
+  // runInput:{} — the provider silently received gutted arguments and the
+  // settlement digest no longer matched its admission (poisoned logical call).
+  const nested = {
+    actorId: 'compass/crawler-google-places',
+    runInput: {
+      searchStringsArray: ['restaurants in Ventura CA'],
+      maxCrawledPlacesPerSearch: 5,
+    },
+  };
+  const wire = serializeComposioCarrier(
+    ok({ tool_slug: SLUG, arguments: JSON.stringify(nested) }).canonical,
+  );
+  assert.deepEqual(
+    JSON.parse(wire.arguments as string),
+    nested,
+    'every nested field survives serialization byte-meaning-identical',
+  );
+});

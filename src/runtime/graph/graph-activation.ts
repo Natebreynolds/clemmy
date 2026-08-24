@@ -74,6 +74,18 @@ export function retirePatchGenerations(
  * completion; `failure` only on the node's OWN failure; any other label is
  * opaque — the runner judges, and silence means no.
  */
+/** Convert a runner result observed after abort. Never routes. A finished
+ *  write is completed_after_cancel; an in-flight throw is uncertain. */
+export function outcomeAfterAbort(outcome: NodeOutcome): Extract<NodeOutcome, { status: 'cancelled' }> {
+  if (outcome.status === 'completed') {
+    return { status: 'cancelled', reason: 'completed_after_cancel', settlementClass: 'completed_after_cancel' };
+  }
+  if (outcome.status === 'failed' && outcome.settlementClass === 'infrastructure') {
+    return { status: 'cancelled', reason: 'uncertain_after_cancel', settlementClass: 'uncertain_after_cancel' };
+  }
+  return { status: 'cancelled', reason: 'cancelled while running', settlementClass: 'cancelled' };
+}
+
 export function edgeFires(edge: ExecutableEdge, outcome: NodeOutcome, runner: NodeRunner): boolean {
   const when = edge.when ?? 'success';
   if (when === 'success') return outcome.status === 'completed';

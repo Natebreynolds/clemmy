@@ -18,6 +18,7 @@
  *     the API.
  */
 import { aisdk } from '@openai/agents-extensions/ai-sdk';
+import { withTracelessStep } from './traceless-step-model.js';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { Agent } from 'undici';
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
@@ -31,6 +32,7 @@ import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { resolveModelCapability, estimateTokens, modelParityEnabled, restoreLegacyInstructionOrder, CACHE_BREAK_SENTINEL, type ModelCapability } from './model-wire-registry.js';
 import { claudeSubscriptionTransport, claudeHeadlessCliAvailable, getClaudeHeadlessModel, resetClaudeHeadlessModelCache } from './claude-headless-model.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
+import { withConversationProtocolBoundaryAssertion } from './conversation-protocol-boundary.js';
 import { recordModelUsage } from '../usage-log.js';
 import { harnessRunContextStorage } from './brackets.js';
 import pino from 'pino';
@@ -791,7 +793,7 @@ export function getClaudeModel(modelId: string): Model {
 function buildRawClaudeModel(modelId: string): Model {
   const capability = resolveModelCapability(modelId);
   let model: Model = withClaudeInputSanitizer(
-    withClaudeRequestDefaults(aisdk(getProvider()(modelId)), capability),
+    withClaudeRequestDefaults(withTracelessStep(aisdk(getProvider()(modelId))), capability),
   );
   // Parity layer: provider-agnostic resilience (retry/empty/401) + reasoning
   // translation (effort -> output_config.effort). Wrap BEFORE caching so the
@@ -803,7 +805,10 @@ function buildRawClaudeModel(modelId: string): Model {
       refreshAuth: refreshClaudeAuth,
     });
   }
-  return withRawClaudeUsageRecording(model, modelId);
+  return withConversationProtocolBoundaryAssertion(
+    withRawClaudeUsageRecording(model, modelId),
+    'claude.messages',
+  );
 }
 
 /** Whether the Claude model used by the standard Agents harness can execute

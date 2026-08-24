@@ -21,10 +21,10 @@ const effects = await import('./tool-effect.js');
 const brackets = await import('./brackets.js');
 const composio = await import('../../tools/composio-tools.js');
 const { buildWorkerAgent } = await import('../../agents/sub-agents.js');
-const { _setCodeModeToolsForTests } = await import('../../tools/code-mode-tool.js');
+const { _setInnerDispatchToolsForTests } = await import('../../tools/inner-dispatch.js');
 
 test.after(() => {
-  _setCodeModeToolsForTests(null);
+  _setInnerDispatchToolsForTests(null);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -145,14 +145,22 @@ test('trusted provenance never exempts Composio writes, unknown actions, mismatc
       }),
     },
     {
+      // A structural lookalike (never WeakSet-registered) claiming trusted
+      // READ provenance for a call whose direct classification is a WRITE.
+      // The spoof must be invisible: if a model-mintable object could carry
+      // read authority, this write would dispatch. (Retargeted 2026-08-20:
+      // the original fixture spoofed a bare READ slug, but bare slugs now
+      // classify canonically as composio reads and the admission wall's own
+      // doctrine — reads are never gated — admits them with or without any
+      // carrier, so the spoof no longer changed the outcome there.)
       label: 'structural-spoof',
-      tool: 'APIFY_ACTOR_RUNS_GET',
-      args: { actorId: 'actor-fixture', runId: 'run-fixture' },
+      tool: 'PROVIDER_FROBNICATE_RECORD',
+      args: { id: 'must-not-change' },
       carrier: {
         toolName: 'composio_execute_tool',
         args: {
-          tool_slug: 'APIFY_ACTOR_RUNS_GET',
-          arguments: { actorId: 'actor-fixture', runId: 'run-fixture' },
+          tool_slug: 'PROVIDER_FROBNICATE_RECORD',
+          arguments: { id: 'must-not-change' },
         },
         trusted: true,
         effect: 'read',
@@ -337,7 +345,7 @@ test('the live worker work_call fallback reaches the exact Ventura Apify provide
     },
   };
   let providerEntries = 0;
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['composio_execute_tool', {
       name: 'composio_execute_tool',
       invoke: async (_context: unknown, carrier: string) => {
@@ -416,7 +424,7 @@ test('the live worker work_call fallback reaches the exact Ventura Apify provide
     `).get(task.sessionId, task.sourceUserSeq, workCallId) as { n: number }).n, 0,
     'the conflicting fallback remains truthfully unbound');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 

@@ -110,6 +110,9 @@ export async function buildUnifiedTurnPrimer(input: {
   timeZone?: string;
   /** Optional owning session for prompt-exposure observability. */
   sessionId?: string;
+  /** Optional store subset — the degraded fast pass runs the same primer
+   *  over the synchronous stores only (one retrieval system, less coverage). */
+  stores?: import('./unified-recall.js').UnifiedHitType[];
 }): Promise<UnifiedTurnPrimerResult> {
   const started = Date.now();
   const query = input.query.replace(/\s+/g, ' ').trim();
@@ -124,6 +127,7 @@ export async function buildUnifiedTurnPrimer(input: {
     graphDepth: 1,
     now: input.now,
     timeZone: input.timeZone,
+    ...(input.stores ? { stores: input.stores } : {}),
   }, timeoutMs);
   if (recalled.kind === 'timeout') {
     return { status: 'timeout', query, hitCount: 0, retrievedHitCount: 0, omittedHitCount: 0, injectedBytes: 0, diagnostics: { candidates: 0, stores: [], elapsedMs: Date.now() - started } };
@@ -165,15 +169,25 @@ export async function buildUnifiedTurnPrimer(input: {
   const recallId = createRecallRunId();
   result.recallId = recallId;
   const preamble = '[MEMORY PRIMER]';
-  const useRule = 'Use relevant hits: answer directly from a complete evidence-backed FACT for local-memory questions. Treat partial snippets as leads; load a cited source before external writes or when exact requested values are missing.';
+  // ANSWERABILITY IS CONSUMED (COMPOUNDING wave): the use-rule tells the
+  // model how much to trust this block. Before, one confident sentence
+  // shipped whether recall held a complete roster or a single truncated
+  // stub — and nothing anywhere consumed the answerability verdict.
+  const USE_RULES = {
+    supported: 'Use relevant hits: answer directly from a complete evidence-backed FACT for local-memory questions. Treat partial snippets as leads; load a cited source before external writes or when exact requested values are missing.',
+    partial: 'Recall is PARTIAL for this ask: the hits below are leads, not complete answers. If the answer should live in memory, call memory_recall_all (one call) before answering from assumption.',
+    insufficient: 'Recall found little for this ask. If this depends on remembered context, call memory_recall_all (one call) rather than guessing; otherwise proceed.',
+  } as const;
+  const RULE_RESERVE = Math.max(...Object.values(USE_RULES).map((rule) => rule.length));
   // The [USAGE] mark-used trailer was subtracted 2026-07-16 — usage credit is
   // now attributed in code post-turn (recall-auto-credit.ts). Its budget share
   // goes to the hits themselves.
   const maxChars = Math.max(700, Math.min(12_000, input.maxChars ?? 2_600));
-  const recallBudget = Math.max(0, maxChars - preamble.length - useRule.length - 2);
+  const recallBudget = Math.max(0, maxChars - preamble.length - RULE_RESERVE - 2);
   const retrievedHitCount = result.hits.length;
   result.hits = visibleUnifiedPrimerHits(result, recallBudget);
   result.answerability = projectedRecallAnswerability(result, result.hits);
+  const useRule = USE_RULES[result.answerability ?? 'partial'] ?? USE_RULES.partial;
   if (result.hits.length === 0) {
     recordPrimerExposure(result, query, input.surface, { retrieved: retrievedHitCount, included: 0 }, input.sessionId);
     return {

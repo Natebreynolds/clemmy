@@ -2079,8 +2079,20 @@ export function matchToolChoicesForStep(
     // AND "query") and a concrete tool-identity anchor — so broad old objective
     // prose ("email audit", "summary") cannot bind unrelated tools.
     if (!alreadyBound) {
-      if (matchedIdentity.length === 0) continue;
-      if (!hasStrongIdentity) continue;
+      const matchedAliasContext = [...intentChoiceTokens(rec), ...contextChoiceTokens(rec)]
+        .filter((t) => prompt.has(t) && t.length >= 3 && !STEP_MATCH_WEAK_IDENTITY_TOKENS.has(t));
+      // Advertise-only: a learned ask ("net MRR we sold this week") must
+      // retrieve the proven CLI even when the user did not name the service.
+      // Two distinctive alias/context tokens, one of them length >= 4, is the
+      // floor — a lone generic word still cannot surface a tool.
+      const advertiseFromLearnedAsk = advertiseOnly
+        && matchedIdentity.length === 0
+        && matchedAliasContext.length >= 2
+        && matchedAliasContext.some((t) => t.length >= 4);
+      if (!advertiseFromLearnedAsk) {
+        if (matchedIdentity.length === 0) continue;
+        if (!hasStrongIdentity) continue;
+      }
       if (advertiseOnly) {
         // Advertise tier: the service is clearly named (strong identity incl.
         // aliases) and at least one substantive core token matches. No
@@ -2979,6 +2991,36 @@ export interface InvalidatedChoiceMatch {
   effectClass?: 'read' | 'write' | 'unknown';
 }
 
+function physicalChoiceIdentity(
+  choice: Pick<ToolChoiceRecordChoice, 'kind' | 'identifier'>,
+): string {
+  return `${choice.kind}:${choice.identifier.trim().toLowerCase()}`;
+}
+
+/** New canonical success supersedes an orphaned legacy invalidation for the
+ * exact same physical capability. The orphan remains on disk for audit, but
+ * must not tell a turn that today's active procedure is still failed. */
+function newerActiveCanonicalChoices(
+  records: readonly ToolChoiceRecord[],
+): ReadonlyMap<string, number> {
+  const active = new Map<string, number>();
+  for (const record of records) {
+    if (!record.procedureId || !record.choice) continue;
+    const testedAt = Date.parse(record.choice.testedAt);
+    const lastSuccessAt = record.choice.lastSuccessAt
+      ? Date.parse(record.choice.lastSuccessAt)
+      : Number.NaN;
+    const provedAt = Math.max(
+      Number.isFinite(testedAt) ? testedAt : Number.NEGATIVE_INFINITY,
+      Number.isFinite(lastSuccessAt) ? lastSuccessAt : Number.NEGATIVE_INFINITY,
+    );
+    if (!Number.isFinite(provedAt)) continue;
+    const key = physicalChoiceIdentity(record.choice);
+    active.set(key, Math.max(active.get(key) ?? Number.NEGATIVE_INFINITY, provedAt));
+  }
+  return active;
+}
+
 /**
  * Match the turn's ask against memos whose choice was INVALIDATED (choice:
  * null, failure recorded in fallbacks). These records are invisible to every
@@ -3004,6 +3046,7 @@ export function matchInvalidatedToolChoices(
   } catch {
     return [];
   }
+  const activeCanonical = newerActiveCanonicalChoices(records);
   const out: InvalidatedChoiceMatch[] = [];
   for (const rec of records) {
     if (rec.choice) continue; // active memos belong to the ordinary matchers
@@ -3011,6 +3054,13 @@ export function matchInvalidatedToolChoices(
       .filter((f) => f.identifier && !placeholderChoiceString(f.identifier))
       .sort((a, b) => (b.failedAt ?? '').localeCompare(a.failedAt ?? ''))[0];
     if (!newest) continue;
+    const failedAt = Date.parse(newest.failedAt);
+    const newerActiveAt = activeCanonical.get(physicalChoiceIdentity(newest));
+    if (
+      newerActiveAt !== undefined
+      && Number.isFinite(failedAt)
+      && newerActiveAt > failedAt
+    ) continue;
     const effectClass = rememberedCapabilityEffect(newest);
     if (!capabilityEffectIsCompatible(requestedEffect, effectClass)) continue;
     const identity = new Set<string>();

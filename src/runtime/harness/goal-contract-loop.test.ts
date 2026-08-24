@@ -369,20 +369,21 @@ test('goal validation gate: a casual no-work turn never triggers validation', as
   createDirectGoal({ objective: 'organize the offsite', sessionId: sess.id });
 
   let calls = 0;
-  // Artifact-evidence reply, ZERO tool calls → neither promise-shaped nor
-  // worked → the goal-validation gate stays closed.
+  // Ordinary social reply, ZERO tool calls → neither promise-shaped nor
+  // worked → the goal-validation gate stays closed. Avoid a fabricated
+  // clock answer here: current-time claims correctly require live evidence.
   const casualRunner: RunRunnerFn = async (_runner, _agent, items) => ({
     history: [
       ...items,
-      { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'It is 3pm.' }] },
+      { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Hello.' }] },
     ],
     lastResponseId: 'resp_casual',
-    finalOutput: { summary: 'answered the time', reply: 'It is 3pm.', done: true, nextAction: 'completed' },
+    finalOutput: { summary: 'said hello', reply: 'Hello.', done: true, nextAction: 'completed' },
   });
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
-    input: 'what time is it?',
+    input: 'say hello',
     makeRunner: makeRunnerStub,
     runRunner: casualRunner,
     goalValidator: async () => { calls += 1; return PASS_RESULT; },

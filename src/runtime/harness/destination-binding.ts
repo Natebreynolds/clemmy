@@ -96,7 +96,8 @@ export function bindExecutableDestination(input: {
 }
 
 /** If either the proposal or the trusted manifest requires a handle or
- * exact readback, the host requires it. */
+ * exact readback, the host requires it. A handle proves target identity; it
+ * does not by itself invent a readback obligation. */
 export function evidenceFloorFromManifest(
   manifest: CapabilityManifestV1,
   proposed: { handleRequired: boolean; evidenceRequirements: readonly string[] },
@@ -112,7 +113,6 @@ export function evidenceFloorFromManifest(
   for (const kind of manifest.evidenceContract.kinds) requirements.add(kind);
   if (handleRequired) {
     requirements.add('artifact_handle');
-    requirements.add('readback');
   }
   if (manifest.evidenceContract.readbackRequired || manifest.readbackContract?.required) {
     requirements.add('readback');

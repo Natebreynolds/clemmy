@@ -190,7 +190,7 @@ test('cancelling an ambiguous mutation preserves unresolved external truth witho
 const { isTerminalWorkflowRunStatus } = await import('./workflow-run-cancellation.js');
 
 test('isTerminalWorkflowRunStatus: only genuinely-finished states are terminal', () => {
-  for (const s of ['completed', 'completed_with_errors', 'error', 'failed', 'cancelled', 'dry_run', 'creation_test']) {
+  for (const s of ['completed', 'completed_with_errors', 'blocked', 'error', 'failed', 'cancelled', 'dry_run', 'creation_test']) {
     assert.equal(isTerminalWorkflowRunStatus(s), true, `${s} is terminal`);
   }
   for (const s of ['running', 'queued', 'pending', 'parked', 'blocked_mutation', undefined, null, 'weird']) {

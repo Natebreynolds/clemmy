@@ -193,7 +193,7 @@ test('a deep clean provider ack mints redeemable result authority', () => {
   );
 });
 
-test('a successful new capability may credit the next bounded discovery epoch', () => {
+test('a successful new capability does not manufacture an epoch while discovery budget is still unused', () => {
   const task = accept('no discovery epoch');
   const governor = new governorModule.DiscoveryGovernor();
   // Known capability: the first broad search is already spent, so bogus
@@ -206,14 +206,15 @@ test('a successful new capability may credit the next bounded discovery epoch', 
     args: { limit: 200 },
     result: wideCleanAck(),
   });
-  // TARGET: today the rewrite emits candidate_unsupported governor evidence
-  // and the settlement opens a discovery epoch off a successful response.
+  // Successful progress is durable, but the task already has an unused search
+  // allowance. Opening another epoch here would recreate per-requirement
+  // search choreography without increasing authority.
   assert.equal(
     settled.openedDiscoveryEpoch,
-    true,
-    'successful progress may unlock the next requirement without treating the envelope as a failure',
+    false,
+    'an unused discovery allowance is already sufficient for the next requirement',
   );
-  assert.equal(governor.getTaskState(task)?.policy.epoch, 1, 'progress opens exactly one bounded epoch');
+  assert.equal(governor.getTaskState(task)?.policy.epoch, 0, 'progress does not spend or inflate discovery budget');
 });
 
 test('a contradiction beyond the inspection bound settles the dispatch on the clean top-level ack, and mints no content proof', () => {

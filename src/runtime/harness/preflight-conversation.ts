@@ -4,6 +4,8 @@
  * The openness judge owns the decision. This module only gives that decision a
  * natural voice:
  *   - OPEN asks one concrete question and owns a typed needs-input terminal;
+ *   - a typed material source choice asks for exact confirmation and owns the
+ *     same durable stop, even when every ordinary task slot is settled;
  *   - SETTLED briefly reflects the request, then returns to the execution brain
  *     in the same turn without publishing a terminal.
  */
@@ -20,7 +22,12 @@ import {
   type PresentationEvent,
   type TurnIdentity,
 } from './turn-outcome.js';
-import type { TurnPreflightDecision } from './turn-control.js';
+import {
+  PREFLIGHT_ALIGNMENT_SOURCE,
+  validatedTurnSourceStrategyBinding,
+  type TurnPreflightDecision,
+  type TurnSourceStrategyBindingV1,
+} from './turn-control.js';
 
 const MAX_CONVERSATION_CONTEXT_CHARS = 8_000;
 const MAX_MEMORY_CONTEXT_CHARS = 6_000;
@@ -30,6 +37,11 @@ const MAX_OPEN_DIMENSION_CHARS = 240;
  * execution. The independent openness pass has its own 4s ceiling; keep this
  * one-line voice pass comparably bounded and degrade settled turns to silence. */
 export const DEFAULT_PREFLIGHT_CONVERSATION_AUTHOR_TIMEOUT_MS = 6_000;
+/** A required material-source confirmation is still one tool-less voice pass,
+ * but it has to turn a validated capability binding into a precise question.
+ * Give that required checkpoint a little more provider runway while retaining
+ * a hard wall-clock ceiling. This is packet-kind policy, never provider policy. */
+export const REQUIRED_SOURCE_STRATEGY_CONFIRMATION_AUTHOR_TIMEOUT_MS = 15_000;
 
 /** Exact durable source for questions selected by the openness judge. */
 export const PREFLIGHT_OPENNESS_SOURCE = 'preflight_openness';
@@ -50,6 +62,10 @@ export type PreflightConversationPacketV1 =
     })
   | (PreflightConversationPacketBaseV1 & {
       kind: 'proceed';
+      openness: null;
+    })
+  | (PreflightConversationPacketBaseV1 & {
+      kind: 'confirm_source_strategy';
       openness: null;
     });
 
@@ -89,6 +105,12 @@ function renderAuthority(decision: TurnPreflightDecision): string {
     allowedMutationEffects: decision.allowedMutationEffects ?? [],
     allowedDestinations: decision.allowedDestinations ?? [],
     allowedActionFamilies: decision.allowedActionFamilies ?? [],
+    sourceStrategyPosture: decision.sourceStrategyPosture ?? null,
+    confirmationDisposition: decision.confirmationDisposition ?? null,
+    // Private authoring fact only. The active model turns the host-selected
+    // opaque capability/account/schema binding into natural user language;
+    // code never manufactures provider-facing copy from the identifier.
+    sourceStrategyBinding: decision.sourceStrategyBinding ?? null,
   });
 }
 
@@ -127,6 +149,15 @@ export function preflightConversationPrompt(packet: PreflightConversationPacketV
       'Write only the one conversational question the user should see before execution pauses.',
     ].join('\n');
   }
+  if (packet.kind === 'confirm_source_strategy') {
+    return [
+      ...common,
+      '',
+      'Confirmation disposition: MATERIAL SOURCE STRATEGY — ordinary task slots are settled, but materially different collection sources or procedures can change quality, provenance, cost, or reliability.',
+      '',
+      'Using only the resolved capability and standing-preference facts above, recommend one exact source strategy and one bounded fallback posture. State the aggregate collection and the single destination artifact in plain language. End with one direct question that lets the user confirm the recommendation or name a different source. Do not perform any business work yet.',
+    ].join('\n');
+  }
   return [
     ...common,
     '',
@@ -151,6 +182,14 @@ function preflightConversationInstructions(kind: PreflightConversationPacketV1['
       'Do not ask for generic permission to begin and do not add unrelated questions.',
     ].join(' ');
   }
+  if (kind === 'confirm_source_strategy') {
+    return [
+      ...common,
+      'The host has found a material source-strategy choice. Recommend one exact source or proven procedure from the supplied facts; never invent a provider or connection.',
+      'Describe one aggregate collection followed by one destination artifact, not one write per collected member.',
+      'End with exactly ONE direct confirmation-or-correction question, then stop. Do not begin execution or claim any work ran.',
+    ].join(' ');
+  }
   return [
     ...common,
     'The request is settled. Briefly acknowledge your reading and proceed; this message is a same-turn preamble, not a checkpoint.',
@@ -163,8 +202,12 @@ export function createAgentsPreflightConversationPort(input: {
   model: string | Model;
   /** Test seam; production uses a fresh Runner. */
   runner?: OneTurnRunner;
-  /** Hard wall-clock bound; maxTurns alone does not bound a hung provider. */
+  /** Optional absolute wall override, clamped to the selected packet kind's
+   * production ceiling. maxTurns alone does not bound a hung provider. */
   timeoutMs?: number;
+  /** Test-only proportional clock seam. Production omits it (= 1); values can
+   * shorten, but never extend, either production ceiling. */
+  timeoutScale?: number;
 }): PreflightConversationPort {
   return {
     async render(packet) {
@@ -177,10 +220,22 @@ export function createAgentsPreflightConversationPort(input: {
       });
       const runner = input.runner
         ?? new Runner({ workflowName: 'clementine-preflight-conversation' });
-      const configuredTimeout = input.timeoutMs ?? DEFAULT_PREFLIGHT_CONVERSATION_AUTHOR_TIMEOUT_MS;
-      const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
-        ? Math.trunc(configuredTimeout)
+      const productionCeiling = packet.kind === 'confirm_source_strategy'
+        ? REQUIRED_SOURCE_STRATEGY_CONFIRMATION_AUTHOR_TIMEOUT_MS
         : DEFAULT_PREFLIGHT_CONVERSATION_AUTHOR_TIMEOUT_MS;
+      const requestedTimeout = input.timeoutMs;
+      const configuredTimeout = typeof requestedTimeout === 'number'
+        && Number.isFinite(requestedTimeout)
+        && requestedTimeout > 0
+        ? Math.min(Math.trunc(requestedTimeout), productionCeiling)
+        : productionCeiling;
+      const requestedScale = input.timeoutScale;
+      const timeoutScale = typeof requestedScale === 'number'
+        && Number.isFinite(requestedScale)
+        && requestedScale > 0
+        ? Math.min(requestedScale, 1)
+        : 1;
+      const timeoutMs = Math.max(1, Math.trunc(configuredTimeout * timeoutScale));
       let timer: ReturnType<typeof setTimeout> | undefined;
       const result = await Promise.race([
         runner.run(agent, preflightConversationPrompt(packet), { maxTurns: 1 }),
@@ -207,7 +262,19 @@ function exactAlignmentDecisionIsDurable(
     .some((event) => event.data.sourceUserSeq === identity.sourceUserSeq
       && event.data.phase === 'align'
       && event.data.intentKey === decision.intentKey
-      && event.data.objective === decision.objective);
+      && event.data.objective === decision.objective
+      && sourceStrategyBindingsEqual(
+        event.data.sourceStrategyBinding,
+        decision.sourceStrategyBinding,
+      ));
+}
+
+function sourceStrategyBindingsEqual(left: unknown, right: unknown): boolean {
+  if (left === undefined && right === undefined) return true;
+  const validatedLeft = validatedTurnSourceStrategyBinding(left);
+  const validatedRight = validatedTurnSourceStrategyBinding(right);
+  return Boolean(validatedLeft && validatedRight
+    && JSON.stringify(validatedLeft) === JSON.stringify(validatedRight));
 }
 
 function exactCommittedQuestion(
@@ -262,9 +329,13 @@ function exactPersistedPreamble(
 ): string | null {
   const source = listEvents(identity.sessionId, { types: ['user_input_received'] })
     .find((event) => event.seq === identity.sourceUserSeq);
+  // The accepted source is its seq. The user row's turn is when that input
+  // was recorded; a later loop turn on the same session is not a new source
+  // (live 2026-08-14: second chat crashed red because identity.turn was 2
+  // while the user event stayed on turn 1).
   if (
     !source
-    || source.turn !== identity.turn
+    || source.sessionId !== identity.sessionId
     || source.role !== 'user'
     || source.data.synthetic === true
   ) {
@@ -279,7 +350,7 @@ function exactPersistedPreamble(
   const event = owned[0]!;
   const data = publicConversationPreambleData(event.data);
   if (
-    event.turn !== identity.turn
+    event.turn !== source.turn
     || event.role !== 'Clem'
     || event.parentEventId !== source.id
     || !data
@@ -289,6 +360,78 @@ function exactPersistedPreamble(
     throw new Error('The durable conversation preamble conflicts with the accepted source.');
   }
   return data.text;
+}
+
+function exactAwaitingAlignment(
+  identity: TurnIdentity,
+  decision: TurnPreflightDecision,
+): { question: string; sourceStrategyBinding?: TurnSourceStrategyBindingV1 } | null {
+  const event = listEvents(identity.sessionId, { types: ['awaiting_user_input'], desc: true })
+    .find((candidate) => candidate.data.sourceUserSeq === identity.sourceUserSeq
+      && candidate.data.source === PREFLIGHT_ALIGNMENT_SOURCE
+      && candidate.data.intentKey === decision.intentKey);
+  if (!event) return null;
+  if (!sourceStrategyBindingsEqual(
+    event.data.sourceStrategyBinding,
+    decision.sourceStrategyBinding,
+  )) {
+    throw new Error('Durable source-strategy confirmation conflicts with the accepted binding.');
+  }
+  const question = typeof event.data.question === 'string' ? event.data.question.trim() : '';
+  if (!question) return null;
+  const sourceStrategyBinding = validatedTurnSourceStrategyBinding(event.data.sourceStrategyBinding);
+  return {
+    question,
+    ...(sourceStrategyBinding ? { sourceStrategyBinding } : {}),
+  };
+}
+
+function exactCommittedAlignment(
+  identity: TurnIdentity,
+  decision: TurnPreflightDecision,
+): PresentationEvent | null {
+  const awaiting = listEvents(identity.sessionId, { types: ['awaiting_user_input'] })
+    .find((candidate) => candidate.data.sourceUserSeq === identity.sourceUserSeq
+      && candidate.data.source === PREFLIGHT_ALIGNMENT_SOURCE
+      && candidate.data.intentKey === decision.intentKey);
+  if (!awaiting) return null;
+  if (!sourceStrategyBindingsEqual(
+    awaiting.data.sourceStrategyBinding,
+    decision.sourceStrategyBinding,
+  )) {
+    throw new Error('Committed source-strategy confirmation conflicts with the accepted binding.');
+  }
+  const events = listEvents(identity.sessionId, { types: ['conversation_completed'], desc: true });
+  for (const event of events) {
+    let presentation: PresentationEvent | null = null;
+    try { presentation = presentationEventFromCompletionData(event.data); } catch { continue; }
+    if (presentation?.identity.sourceUserSeq !== identity.sourceUserSeq) continue;
+    if (
+      event.seq > awaiting.seq
+      && presentation.status === 'needs_input'
+      && presentation.kind === 'question'
+      && presentation.needs?.kind === 'input'
+      && presentation.text === awaiting.data.question
+    ) return presentation;
+    return null;
+  }
+  return null;
+}
+
+/** Source confirmation is model-authored UX. The host validates that the
+ * author actually produced the promised question; it never supplies canned
+ * wording or silently turns an acknowledgement into consent. */
+function sourceStrategyQuestion(authored: string): string {
+  const question = authored.trim();
+  if (!question || !/\?\s*$/.test(question)) {
+    throw new Error('Source-strategy confirmation author did not produce one terminal question.');
+  }
+  return question;
+}
+
+function requiresSourceStrategyConfirmation(decision: TurnPreflightDecision): boolean {
+  return decision.confirmationDisposition === 'material_source_strategy'
+    && decision.sourceStrategyPosture === 'materially_variant';
 }
 
 function failedOpenAuthorFallback(openness: TurnOpenness): string {
@@ -304,7 +447,7 @@ export interface PublishPreflightConversationInput {
   memoryContext?: string;
   capabilityContext?: string;
   port: PreflightConversationPort;
-  transport: 'openai_agents_harness' | 'claude_agent_sdk_brain';
+  transport: 'host_harness' | 'claude_agent_sdk_brain';
   /**
    * A SETTLED-only authoring pass launched beside the independent openness
    * judge. The value is consumed only when that judge returns SETTLED; an OPEN
@@ -343,12 +486,18 @@ export function startSettledPreflightConversationAuthor(
   if (!exactAlignmentDecisionIsDurable(input.identity, input.decision)) {
     throw new Error('Structural preflight alignment was not durably anchored to the accepted source.');
   }
-  const persisted = exactPersistedPreamble(input.identity, input.decision);
-  if (persisted) return Promise.resolve(persisted);
+  const confirmationRequired = requiresSourceStrategyConfirmation(input.decision);
+  if (confirmationRequired) {
+    const awaiting = exactAwaitingAlignment(input.identity, input.decision);
+    if (awaiting) return Promise.resolve(awaiting.question);
+  } else {
+    const persisted = exactPersistedPreamble(input.identity, input.decision);
+    if (persisted) return Promise.resolve(persisted);
+  }
 
   const packet: PreflightConversationPacketV1 = {
     version: 1,
-    kind: 'proceed',
+    kind: confirmationRequired ? 'confirm_source_strategy' : 'proceed',
     objective: input.decision.objective,
     decision: input.decision,
     conversationContext: input.conversationContext ?? '',
@@ -359,8 +508,9 @@ export function startSettledPreflightConversationAuthor(
   return (async () => {
     try {
       const authored = assertPublicPresentationText(await input.port.render(packet));
-      // A speculative settled author has no authority to create a checkpoint.
-      return authored.includes('?') ? '' : authored;
+      // A speculative ordinary SETTLED author has no authority to create a
+      // checkpoint. Source-strategy confirmation takes the distinct typed path.
+      return confirmationRequired ? sourceStrategyQuestion(authored) : (authored.includes('?') ? '' : authored);
     } catch {
       return '';
     }
@@ -368,9 +518,9 @@ export function startSettledPreflightConversationAuthor(
 }
 
 /**
- * Author the judged conversational beat. Only OPEN publishes a terminal.
- * SETTLED returns a same-turn preamble and author failure degrades to silence,
- * never to a synthetic confirmation stop.
+ * Author the judged conversational beat. OPEN and a host-typed material source
+ * strategy publish a terminal. An ordinary SETTLED turn returns a same-turn
+ * preamble; model prose alone can never manufacture a confirmation stop.
  */
 export async function publishPreflightConversation(
   input: PublishPreflightConversationInput,
@@ -396,6 +546,91 @@ export async function publishPreflightConversation(
   };
 
   if (!input.openness || boundedOpenDimensions(input.openness).length === 0) {
+    if (requiresSourceStrategyConfirmation(input.decision)) {
+      const committed = exactCommittedAlignment(input.identity, input.decision);
+      if (committed) return { kind: 'ask', presentation: committed };
+
+      const awaiting = exactAwaitingAlignment(input.identity, input.decision);
+      let question = awaiting?.question ?? null;
+      if (!question) {
+        // ONE retry before failing closed. Authoring is a pure, side-effect-free
+        // call, and a transient empty print-mode return killed two consecutive
+        // live turns with the generic failure text (2026-08-21: an ads-scrape
+        // request; the same packet authored fine seconds later). Fabricating
+        // her question stays forbidden — a persistent outage still fails
+        // closed, it just no longer loses the turn to one hiccup.
+        const authorOnce = async (): Promise<string> => sourceStrategyQuestion(
+          assertPublicPresentationText(await (input.settledProceedAuthor
+            ?? input.port.render({
+              ...packetBase,
+              kind: 'confirm_source_strategy',
+              openness: null,
+            }))),
+        );
+        let authoredQuestion: string;
+        try {
+          authoredQuestion = await authorOnce();
+        } catch (first) {
+          try {
+            authoredQuestion = sourceStrategyQuestion(
+              assertPublicPresentationText(await input.port.render({
+                ...packetBase,
+                kind: 'confirm_source_strategy',
+                openness: null,
+              })),
+            );
+          } catch {
+            throw first;
+          }
+        }
+        question = authoredQuestion;
+        appendEvent({
+          sessionId: input.identity.sessionId,
+          turn: input.identity.turn,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: {
+            question,
+            purpose: 'clarification',
+            source: PREFLIGHT_ALIGNMENT_SOURCE,
+            sourceUserSeq: input.identity.sourceUserSeq,
+            intentKey: input.decision.intentKey,
+            confirmationDisposition: input.decision.confirmationDisposition,
+            ...(input.decision.sourceStrategyBinding
+              ? { sourceStrategyBinding: input.decision.sourceStrategyBinding }
+              : {}),
+          },
+        });
+      }
+
+      const presentation = commitTurnOutcome({
+        version: 2,
+        id: turnOutcomeId(input.identity),
+        identity: input.identity,
+        status: 'needs_input',
+        resumable: true,
+        needs: { kind: 'input' },
+        presentation: { kind: 'question', text: question },
+      }, {
+        legacyReason: 'awaiting_user_input',
+        metadata: {
+          transport: input.transport,
+          preflightPhase: 'align',
+          preflightIntentKey: input.decision.intentKey,
+          preflightConversation: 'source_strategy_confirmation',
+        },
+      }).presentation;
+      return { kind: 'ask', presentation };
+    }
+
+    // SETTLED prints the plan line and PROCEEDS. Nathan's product line
+    // (2026-08-18, after six construct runs): "I don't want to have to reply
+    // with stuff like that." A precise named job is its own approval; the
+    // beat informs, it never blocks, and "want me to start" is an illegal
+    // needs_input. (The blocking-gate experiment lived for one day; its
+    // payment machinery — pendingAlignmentForCurrentInput — remains for
+    // OPEN questions only.) Author outage degrades to silence, never to a
+    // synthetic confirmation stop.
     const persisted = exactPersistedPreamble(input.identity, input.decision);
     if (persisted) return { kind: 'proceed', preamble: persisted };
     let preamble = '';

@@ -161,6 +161,41 @@ const ACTION_CUES = [
   "let's", 'lets do', 'go ahead', 'do it',
 ];
 
+/**
+ * Reply-local construction is content the foreground model can return in the
+ * assistant message itself. Construction verbs alone are not action
+ * authority: "write a poem" does not need the catalog, while "write a file"
+ * and "create a workflow" do. Keep this boundary structural and fail closed
+ * around durable objects, hosted/current-world material, compound clauses, and
+ * named systems. The model still owns the content; this predicate only removes
+ * an unusable tool surface from a turn that cannot cross an effect boundary.
+ */
+const REPLY_LOCAL_CONSTRUCTION_START_RE =
+  /^(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+|(?:i(?:'d| would)\s+like|i\s+want)\s+(?:you|clementine)\s+to\s+)*(?:create|write|build|generate|prepare|design|rewrite|make|produce)\b/i;
+const DURABLE_OR_TOOL_BEARING_TARGET_RE =
+  /\b(?:account|app|application|appointment|audio|automation|branch|calendar|chart|connection|contact|dashboard|database|deal|deployment|diagram|document|docx|email|endpoint|event|file|folder|form|graph|image|illustration|integration|issue|lead|message|model|note|notification|pdf|photo|post|presentation|pull\s+request|record|reminder|repo|repository|report|resource|server|service|sheet|slides?|spreadsheet|table|tasks?|ticket|timer|todos?|video|web\s*page|website|workbook|workflow|workspace|xlsx|pptx)\b/i;
+const CURRENT_WORLD_MATERIAL_RE =
+  /\b(?:current|existing|latest|live|named|now|real[- ]?time|today(?:'s)?|tomorrow)\b/i;
+
+function isReplyLocalConstruction(text: string, externalEffectRequested: boolean): boolean {
+  if (externalEffectRequested) return false;
+  const direct = text.replace(ACKNOWLEDGEMENT_PREFIX_RE, '').trim();
+  if (!REPLY_LOCAL_CONSTRUCTION_START_RE.test(direct)) return false;
+  if (requestSemanticSegments(direct).length !== 1) return false;
+  if (hasExplicitActionContinuation(direct, true)) return false;
+  if (refersToUserOrHostedWorld(direct)) return false;
+  if (DURABLE_OR_TOOL_BEARING_TARGET_RE.test(direct)) return false;
+  if (CURRENT_WORLD_MATERIAL_RE.test(direct)) return false;
+
+  // A title-cased token in the requested object is conservatively treated as a
+  // named system/resource (Todoist, Salesforce, Notion, …). Text supplied after
+  // a colon is source material ("Rewrite this sentence: Hello"), not a target.
+  const requestHead = direct.split(':', 1)[0] ?? direct;
+  const afterConstructionVerb = requestHead.replace(REPLY_LOCAL_CONSTRUCTION_START_RE, '').trim();
+  if (/\b[A-Z][A-Za-z0-9._-]{2,}\b/.test(afterConstructionVerb)) return false;
+  return true;
+}
+
 const READ_ONLY_OPERATION_START_RE =
   /^(?:read|review|summarize|search|research|find|list|inspect|analyze|check|look\s+up)\b/i;
 const ADVISORY_ACTION_START_RE =
@@ -388,6 +423,13 @@ export function classifyMessageIntent(
       intent: 'action',
       confidence: 0.85,
       reasons: ['direct read pipeline continues into a concrete result action'],
+    };
+  }
+  if (isReplyLocalConstruction(trimmed, externalEffect.requested)) {
+    return {
+      intent: 'conversation',
+      confidence: 0.82,
+      reasons: ['reply-local construction without a durable target or external effect'],
     };
   }
 

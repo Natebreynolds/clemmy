@@ -27,3 +27,14 @@ test('dev launch bounds the installed-app quit and treats a zombie daemon as sto
   assert.match(devUp, /owned_state=.*ps -p "\$owned_pid" -o state=/);
   assert.match(devUp, /case "\$owned_state" in ""\|Z\*\) break/);
 });
+
+test('dev launch accepts and exports the exact production host engine identity', () => {
+  assert.match(devUp, /DEV_TURN_ENGINE=host_v1 \.\/scripts\/dev-up\.sh/);
+  assert.match(devUp, /""\|host_v1\|host_v1_read_only/);
+  assert.doesNotMatch(devUp, /""\|legacy_sdk\|host_v1/);
+  assert.match(devUp, /legacy_sdk is resume-only/);
+  assert.match(devUp, /export CLEMMY_TURN_ENGINE="\$TURN_ENGINE_LABEL"/);
+  assert.doesNotMatch(devUp, /export CLEMMY_TURN_ENGINE="\$DEV_TURN_ENGINE"/);
+  assert.match(devUp, /TURN_ENGINE_LABEL="\$\{DEV_TURN_ENGINE:-host_v1\}"/);
+  assert.match(devUp, /turn engine \$TURN_ENGINE_LABEL/);
+});

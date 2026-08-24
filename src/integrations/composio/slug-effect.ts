@@ -213,6 +213,26 @@ export function classifyComposioSlugEffect(slug: string | null | undefined): Com
  * with no anchoring read verb is affirmative 'write' (outbound), matching the
  * 2026-07-09 send-gate incident rule.
  */
+/**
+ * Whether a READ verdict for this exact slug comes from a CURATED provider
+ * rule rather than generic verb inference.
+ *
+ * Curated rules (documented semantics, the DataForSEO/Firecrawl research
+ * families, ephemeral compute) are exact provider knowledge and legitimately
+ * key on the provider-qualified slug — `DATAFORSEO_SERP_*` is only meaningful
+ * with its toolkit token. Generic verb inference is different: it must never
+ * see a namespace the user chose, because a read verb in an arbitrary MCP
+ * server name would prove its destructive tools read-only (2026-08-21).
+ */
+export function composioSlugHasCuratedReadRule(slug: string | null | undefined): boolean {
+  const upper = String(slug ?? '').trim().toUpperCase();
+  if (!upper) return false;
+  if (documentedComposioOperationSemantic(upper)?.effect === 'read') return true;
+  return dataForSeoResearchActionIsReadOnly(upper)
+    || firecrawlResearchActionIsReadOnly(upper)
+    || composioActionIsEphemeralCompute(upper);
+}
+
 export function composioSlugEffectEvidence(slug: string | null | undefined): ComposioSlugEffectEvidence {
   const upper = String(slug ?? '').trim().toUpperCase();
   if (!upper) return 'unknown';

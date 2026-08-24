@@ -4,6 +4,7 @@
  * The sealer is not exported. Requested effects are never authority.
  * Standing policy is a maximum ceiling, not a write mandate.
  */
+import { validateWorkTopology, workTopologyDigest } from '../graph/work-topology.js';
 import {
   type AdmittedClampedSemanticsV1,
   type AdmittedTurnSemantics,
@@ -239,14 +240,27 @@ function clampProjection(
       : {}),
     ...(projection.goal?.operations?.length
       ? {
-          operations: projection.goal.operations.map((operation) => ({
-            id: operation.id,
-            role: operation.role,
-            requestedEffect: operation.requestedEffect,
-            capabilityRef: bindCapabilityRefToSuccessor(operation.capabilityRef),
-            dependsOn: [...operation.dependsOn],
-            evidence: [...operation.evidence],
-          })),
+          operations: projection.goal.operations.map((operation) => {
+            const canonical = reconcileOperationToTopology(operation, projection.goal?.topology);
+            return {
+              id: operation.id,
+              role: operation.role,
+              requestedEffect: canonical.requestedEffect,
+              capabilityRef: bindCapabilityRefToSuccessor(operation.capabilityRef),
+              dependsOn: canonical.dependsOn,
+              evidence: [...operation.evidence],
+            };
+          }),
+        }
+      : {}),
+    // HOST-OWNED DIGEST: derive it from the normalized topology rather than
+    // requiring the model to supply one. Gating on the model's value dropped
+    // the whole topology whenever it was absent, which silently discarded the
+    // work a step had proposed.
+    ...(projection.goal?.topology
+      ? {
+          workTopology: projection.goal.topology,
+          workTopologyHash: admittedWorkTopologyDigest(projection.goal.topology),
         }
       : {}),
     ...(projection.goal?.evidenceRequirements
@@ -264,6 +278,49 @@ function clampProjection(
 /**
  * Validate, project, and clamp. Not durable authority.
  */
+/**
+ * Reconcile one capability binding against the canonical topology.
+ *
+ * The topology is authoritative for lineage and for the operation's declared
+ * effect; the binding only annotates it. Where they disagree:
+ *   - `dependsOn` is taken from the topology (lineage is structure, not authority);
+ *   - `requestedEffect` takes the MORE RESTRICTIVE of the two, so reconciling can
+ *     never widen what the turn is allowed to do. The admitted-ceiling check
+ *     downstream still applies on top of this.
+ * With no topology present the binding stands unchanged.
+ */
+function reconcileOperationToTopology<E extends string>(
+  operation: { requestedEffect: E; dependsOn: readonly string[]; id: string },
+  topology: unknown,
+): { requestedEffect: E; dependsOn: string[] } {
+  const fallback = { requestedEffect: operation.requestedEffect, dependsOn: [...operation.dependsOn] };
+  if (!topology) return fallback;
+  const validated = validateWorkTopology(topology as never);
+  if (!validated.ok) return fallback;
+  const canonical = validated.topology.operations.find((entry) => entry.id === operation.id);
+  if (!canonical) return fallback;
+  const boundRank = EFFECT_RANK[operation.requestedEffect] ?? Number.POSITIVE_INFINITY;
+  const canonicalRank = EFFECT_RANK[canonical.effect] ?? Number.POSITIVE_INFINITY;
+  return {
+    // Narrowing only: the canonical effect is adopted when it is at most as
+    // permissive as the binding's. Never the other way round.
+    requestedEffect: canonicalRank <= boundRank
+      ? (canonical.effect as E)
+      : operation.requestedEffect,
+    dependsOn: [...canonical.dependsOn],
+  };
+}
+
+/** The topology digest is host-owned. The proposal already passed
+ * `validateWorkTopology`, so normalize once more here and digest the canonical
+ * form — the same value the proposal validator compares a model-supplied hash
+ * against, so a supplied-and-correct hash is unchanged and a supplied-and-wrong
+ * one is still rejected upstream. */
+function admittedWorkTopologyDigest(topology: unknown): string {
+  const validated = validateWorkTopology(topology as never);
+  return workTopologyDigest(validated.ok ? validated.topology : (topology as never));
+}
+
 export function admitTurnSemantics(
   raw: unknown,
   host: TurnSemanticHostViewV1,
@@ -349,4 +406,3 @@ function validateOperationDag(
   }
   return issues;
 }
-

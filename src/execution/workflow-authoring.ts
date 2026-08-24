@@ -196,6 +196,9 @@ export function normalizeWorkflowSteps(steps: Array<Partial<WorkflowStepInput> &
       subgraph: optionalObject<WorkflowStepInput['subgraph']>(s.subgraph),
       deterministic: optionalObject<WorkflowStepInput['deterministic']>(s.deterministic),
       call: optionalObject<WorkflowStepInput['call']>(s.call),
+      invocationPlan: optionalObject<WorkflowStepInput['invocationPlan']>(
+        s.invocationPlan ?? s.invocation_plan,
+      ),
       codifiedFrom: normalizeCodifiedFrom(s),
       allowedTools: optionalStringList(s.allowedTools),
       sideEffect: optionalSideEffect(s.sideEffect),

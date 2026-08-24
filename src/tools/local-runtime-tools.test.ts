@@ -90,7 +90,7 @@ test('scoped tool_search tells the model to dispatch deferred tools through call
   const search = buildScopedLocalToolSearch(new Set(['write_file']));
   const output = await search.invoke(
     new RunContext({ sessionId: 'scoped-tool-search-dispatch' }),
-    JSON.stringify({ query: 'write_file', limit: null }),
+    JSON.stringify({ query: 'write_file', role_key: null, limit: null }),
   );
   const payload = JSON.parse(String(output)) as { hint?: string; schemas?: Record<string, unknown> };
   assert.ok(payload.schemas?.write_file, 'the exact deferred tool schema is returned');

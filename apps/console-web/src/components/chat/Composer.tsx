@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent } from 'react';
+import { useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent, type RefObject } from 'react';
 import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { uploadAttachment } from '@/lib/chat';
@@ -21,6 +21,7 @@ export function Composer({
   onSend,
   onStop,
   onBackground,
+  inputRef,
   placeholder = 'Ask Clementine anything…',
 }: {
   busy: boolean;
@@ -28,13 +29,16 @@ export function Composer({
   onStop: () => void;
   /** Detach the running turn to a durable background task (keeps the chat free). */
   onBackground?: () => void;
+  /** Explicit adjacent-composer focus target for transient foreground controls. */
+  inputRef?: RefObject<HTMLTextAreaElement | null>;
   placeholder?: string;
 }) {
   const [value, setValue] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
-  const textarea = useRef<HTMLTextAreaElement>(null);
+  const localTextarea = useRef<HTMLTextAreaElement>(null);
+  const textarea = inputRef ?? localTextarea;
 
   const autoGrow = () => {
     const el = textarea.current;

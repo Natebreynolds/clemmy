@@ -44,7 +44,7 @@ import { validateProposedGraph, type ProposedTurnGraphV1 } from './turn-graph-pr
 import type { TurnGraphPolicySnapshot } from './turn-graph-ir.js';
 import type { AcceptedGoalV1 } from './accepted-goal.js';
 
-const { appendEvent, createSession, listEvents, resetEventLog } = await import('../harness/eventlog.js');
+const { appendEvent, createSession, listEvents, openEventLog, resetEventLog } = await import('../harness/eventlog.js');
 const { createTaskContinuityPacket } = await import('../../memory/task-continuity.js');
 const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
 saveProactivityPolicy({ autoApproveScope: 'yolo' });
@@ -732,16 +732,15 @@ test('a novel mock connector is an advisory catalog id, not a production-name gr
 
 
 
-test('a failed admission degrades to an identity-only graph — no carrier can kill the turn', async () => {
-  // Live 2026-08-18 breaker 3: "do it, but make it 5 firms instead of 8"
-  // failed validation as a standalone fragment and the SECOND unadmitted-
-  // terminal door ended the turn ("I could not admit this turn's
-  // interpretation"). The class fix lives at the shared source: a failed
-  // admission returns the identity-only shadow every non-semantic lane runs
-  // on, so every caller keeps a legal tools-in-hand path and the blocked
-  // disposition still withholds typed authority.
-  const { recordAcceptedSourceGraph } = await import('../harness/record-accepted-source-graph.js');
-  const { dispatchAdmittedSource } = await import('../semantic-boundary/typed-source-dispatch.js');
+test('a participated failed admission stays graphless and commits a blocked zero-tool terminal', async () => {
+  // Once the semantic port participates, its refusal is the route decision.
+  // Rebuilding an identity-only compatibility graph here would create a
+  // second tool-bearing executor after that decision. The production caller
+  // reduces the graphless result to one resumable blocked terminal instead.
+  const {
+    commitUnadmittedSemanticTurn,
+    recordAcceptedSourceGraph,
+  } = await import('../harness/record-accepted-source-graph.js');
   resetEventLog();
   const sessionId = 'unadmitted-degrade';
   createSession({ id: sessionId, kind: 'chat', userId: 'user-1' });
@@ -764,13 +763,32 @@ test('a failed admission degrades to an identity-only graph — no carrier can k
     identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
     surface: 'home',
   });
-  assert.ok(graphEvent, 'failed admission must still yield the identity-only graph');
-  const dispatched = await dispatchAdmittedSource({
-    sessionId, turn: source.turn, sourceUserSeq: source.seq,
+  assert.equal(graphEvent, null, 'a participated refusal cannot mint a compatibility graph');
+  assert.equal(listEvents(sessionId, { types: ['turn_graph_compiled'] }).length, 0);
+  assert.equal(listEvents(sessionId, { types: ['accepted_task_authority_armed'] }).length, 0);
+
+  const blocked = commitUnadmittedSemanticTurn({
+    sessionId,
+    turn: source.turn,
+    sourceUserSeq: source.seq,
   });
-  assert.notEqual(dispatched.kind, 'conversation', JSON.stringify(dispatched).slice(0, 200));
-  assert.ok(
-    dispatched.kind === 'blocked' || dispatched.kind === 'needs_input',
-    JSON.stringify(dispatched).slice(0, 200),
-  );
+  assert.match(blocked.text, /stopped before (?:finishing|using any tools)/i);
+  assert.match(blocked.text, /No provider call was made/i);
+  assert.match(blocked.text, /No external change was made/i);
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] })[0];
+  assert.ok(terminal);
+  const outcome = terminal.data.turnOutcome as { status?: string; resumable?: boolean };
+  assert.equal(outcome.status, 'blocked');
+  assert.equal(outcome.resumable, true, 'the exact accepted source has one recoverable public winner');
+  const bodies = openEventLog().prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM logical_tool_calls
+        WHERE session_id = ? AND source_user_seq = ?) AS logical_calls,
+      (SELECT COUNT(*) FROM physical_dispatches
+        WHERE session_id = ? AND source_user_seq = ?) AS physical_dispatches
+  `).get(sessionId, source.seq, sessionId, source.seq) as {
+    logical_calls: number;
+    physical_dispatches: number;
+  };
+  assert.deepEqual(bodies, { logical_calls: 0, physical_dispatches: 0 });
 });

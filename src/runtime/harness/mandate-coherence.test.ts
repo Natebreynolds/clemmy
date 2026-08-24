@@ -1,13 +1,15 @@
 /**
  * Stage 2 pins: no guardrail may mandate a tool the turn cannot follow.
  *
- * Live failure class (Aug 2026): the fan-out refusal mandated run_tool_program
+ * Live failure class (Aug 2026): the fan-out refusal mandated a batching tool
  * while the discovery governor refused its schema (the model brute-forced
- * parameter names — {"code":..}, {}, {"script":"return 1;"}); the nudge
- * recommended run_worker where it returned "unknown tool". A mandate is now a
- * value constructible only from proof (callable-surface oracle), with the
- * legacy env heuristic preserved verbatim until each lane registers its
- * schema projection (transition arm, retired by the per-lane wiring pin).
+ * parameter names); the nudge recommended run_worker where it returned
+ * "unknown tool". A mandate is a value constructible only from proof
+ * (callable-surface oracle), with run_worker keeping its proven env-derived
+ * availability. The fan-out BLOCK's recovery no longer needs a mandate at all:
+ * since the run_tool_program surface was subtracted (2026-08-20), the
+ * prescribed recovery is the model's own PARALLEL tool calls — a door that
+ * exists on every lane, so it can never be a phantom.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { readFileSync } from 'node:fs';
@@ -30,7 +32,6 @@ const { buildFanoutRecoveryMessage, mandateFor } = await import('./tool-guardrai
 
 test.beforeEach(() => {
   _clearLocalSchemaProviderForTests();
-  delete process.env.CLEMMY_CODE_MODE;
 });
 
 test('PHANTOM-MANDATE pin: a projectable name absent from the registered surface mandates nothing', () => {
@@ -40,11 +41,11 @@ test('PHANTOM-MANDATE pin: a projectable name absent from the registered surface
   // The projectable class (local runtime tools): absent from the registered
   // surface → no mandate, no phantom.
   assert.equal(mandateFor('memory_search'), null, 'a registered oracle without the tool must refuse the mandate');
-  // Structural fan-out primitives are per-agent closures, permanently outside
-  // the projection (161 local tools, neither present — probed 2026-08-11);
-  // they keep their proven env-derived availability instead.
-  assert.ok(mandateFor('run_tool_program'), 'structural primitive keeps env-derived availability');
+  // The subtracted program surface must never be mandatable again.
+  assert.equal(mandateFor('run_tool_program'), null, 'the subtracted program door mandates nothing');
+});
 
+test('the fan-out refusal prescribes only the always-available doors', () => {
   const message = buildFanoutRecoveryMessage({
     toolName: 'composio_execute_tool',
     slug: 'SLACK_FIND_USER_BY_EMAIL_ADDRESS',
@@ -53,40 +54,16 @@ test('PHANTOM-MANDATE pin: a projectable name absent from the registered surface
     fanoutBlockAt: 6,
     mandate: null,
   });
-  assert.doesNotMatch(message, /run_tool_program|run_worker/, 'no phantom prescriptions');
   assert.match(message, /REFUSED/, 'the behavioral constraint survives');
-  assert.match(message, /ONE batched call|tell the user/i, 'a viable next action is still named');
+  assert.match(message, /PARALLEL tool calls/, 'the recovery is the model\'s own parallel calls — never a phantom');
+  assert.doesNotMatch(message, /run_tool_program/, 'no steer may reference the subtracted door');
+  assert.match(message, /tell the user/i, 'the check-in escape hatch is still named');
 });
 
-test('oracle-proven mandate renders the contract inline — the refusal contains the answer', () => {
-  registerLocalSchemaProvider(() => new Map([
-    ['run_tool_program', { type: 'object', required: ['program'], properties: { program: { type: 'string' } } }],
-  ]));
-  const mandate = mandateFor('run_tool_program');
-  assert.ok(mandate && mandate.source === 'oracle');
-  assert.deepEqual(mandate.requiredFields, ['program']);
-
-  const message = buildFanoutRecoveryMessage({
-    toolName: 'composio_execute_tool',
-    slug: 'SLACK_FIND_USER_BY_EMAIL_ADDRESS',
-    args: { arguments: { email: 'x@scorpion.co' } },
-    distinct: 7,
-    fanoutBlockAt: 6,
-    mandate,
-  });
-  assert.match(message, /run_tool_program/);
-  assert.match(message, /required: program/, 'schema rides the refusal so zero discovery is needed to comply');
-});
-
-test('STRUCTURAL pin: fan-out primitives keep env-derived availability, wired or not', () => {
-  // Registration state is irrelevant for the structural arm — these are
-  // per-agent closures the projection can never contain.
-  assert.ok(mandateFor('run_tool_program'), 'code mode defaults on → structural mandate stands');
-  assert.equal(mandateFor('run_tool_program')?.source, 'legacy_env');
+test('STRUCTURAL pin: run_worker keeps env-derived availability, wired or not', () => {
+  // Registration state is irrelevant for the structural arm — run_worker is a
+  // per-agent closure the projection can never contain.
   assert.ok(mandateFor('run_worker'), 'the nudge tool keeps its historical (unchecked) availability');
-
-  process.env.CLEMMY_CODE_MODE = 'off';
-  assert.equal(mandateFor('run_tool_program'), null, 'the 2026-07-12 strand-hunt property: code mode off → no refusal-with-phantom');
 });
 
 test('unknown names are never mandatable, wired or not', () => {
@@ -95,20 +72,29 @@ test('unknown names are never mandatable, wired or not', () => {
   assert.equal(mandateFor('definitely_not_a_tool'), null);
 });
 
-test('CONNECTION pin: the env-flag proxy is gone; consumption sites ride mandateFor', () => {
+test('CONNECTION pin: consumption sites prescribe only live doors', () => {
   const guardrailSource = readFileSync(path.join(HERE, 'tool-guardrail.ts'), 'utf8');
   assert.doesNotMatch(
     guardrailSource,
     /function codeModeRecoveryAvailable/,
     'the inlined env-flag reachability proxy must stay deleted',
   );
-  assert.match(guardrailSource, /const fanoutMandate = mandateFor\('run_tool_program'\)/, 'the block consumes a mandate');
+  assert.doesNotMatch(
+    guardrailSource,
+    /mandateFor\('run_tool_program'\)/,
+    'the block must not consult the subtracted door',
+  );
   assert.match(guardrailSource, /const workerMandate = mandateFor\('run_worker'\)/, 'the nudge consumes a mandate');
   const turnControlSource = readFileSync(path.join(HERE, 'turn-control.ts'), 'utf8');
   assert.doesNotMatch(
     turnControlSource,
-    /fan out with run_worker, or batch the reads with run_tool_program\)/,
-    'turn-control must not hardcode prescribed tool names',
+    /batch the reads with run_tool_program/,
+    'turn-control must not prescribe the subtracted tool',
+  );
+  assert.match(
+    turnControlSource,
+    /PARALLEL tool calls in one response/,
+    'turn-control names the always-available recovery',
   );
 });
 

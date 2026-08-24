@@ -37,6 +37,8 @@ import {
   type ExpectedWorkMatchResult,
 } from './expected-work-matcher.js';
 import { projectObservedExpectedWorkHistory } from './expected-work-observed-projector.js';
+import { ensureGraphCallAuthorityInTransaction } from './accepted-turn-call-authority.js';
+import { proveHostPlannedResolutionCoexistenceInTransaction } from './host-planned-resolution-coexistence.js';
 
 export const RESOLUTION_OPERATION_EVENT = 'resolution_operation' as const;
 export const RESOLUTION_FINALIZED_EVENT = 'resolution_finalized' as const;
@@ -92,6 +94,43 @@ function workNodes(graph: TurnGraphIR): TurnGraphNode[] {
   return nodes;
 }
 
+/**
+ * A compound accepted task still needs one task-level resolution owner even
+ * though its immutable expected-work contract owns several member calls. The
+ * graph compiler already emits that owner: one runtime verification
+ * rendezvous with an all-success edge from every primary work node.
+ *
+ * Do not infer an aggregate merely from there being several nodes. A missing,
+ * partial, alternative, or competing join is ambiguous and retains the
+ * historical refusal. This projection changes only the multi-node case; the
+ * zero/one-node contract remains byte-for-byte identical.
+ */
+function aggregateWorkOwner(
+  graph: TurnGraphIR,
+  candidates: readonly TurnGraphNode[],
+): TurnGraphNode | null {
+  if (candidates.length < 2) return null;
+  const verifyNodes = graph.nodes.filter((node) => node.kind === 'verify');
+  if (verifyNodes.length !== 1) return null;
+  const verify = verifyNodes[0]!;
+  if (verify.joinMode === 'any' || verify.runner.kind !== 'runtime') return null;
+
+  const candidateIds = new Set(candidates.map((node) => node.id));
+  if (candidateIds.size !== candidates.length) return null;
+  const incoming = graph.edges.filter((edge) => edge.target === verify.id);
+  if (incoming.length !== candidateIds.size) return null;
+  const covered = new Set<string>();
+  for (const edge of incoming) {
+    if (
+      edge.when !== 'success'
+      || !candidateIds.has(edge.source)
+      || covered.has(edge.source)
+    ) return null;
+    covered.add(edge.source);
+  }
+  return covered.size === candidateIds.size ? verify : null;
+}
+
 /** Load the one accepted-source graph and project only its authority fields. */
 export function expectedTaskFor(sessionId: string, sourceUserSeq: number): ExpectedTaskState {
   let graphEvent: EventRow | null;
@@ -105,16 +144,24 @@ export function expectedTaskFor(sessionId: string, sourceUserSeq: number): Expec
   if (!graph) return { status: 'ambiguous', reason: 'persisted turn graph failed identity or hash validation' };
 
   const candidates = workNodes(graph);
-  if (candidates.length > 1) {
-    return { status: 'ambiguous', reason: `turn graph contains ${candidates.length} primary work nodes` };
+  const aggregate = candidates.length > 1 ? aggregateWorkOwner(graph, candidates) : null;
+  if (candidates.length > 1 && !aggregate) {
+    return {
+      status: 'ambiguous',
+      reason: `turn graph contains ${candidates.length} primary work nodes without one exact verification rendezvous`,
+    };
   }
   if (graph.classification.route !== 'direct_reply' && candidates.length !== 1) {
-    return { status: 'ambiguous', reason: 'non-conversational graph has no unique work node' };
+    if (!aggregate) {
+      return { status: 'ambiguous', reason: 'non-conversational graph has no unique work node' };
+    }
   }
-  const work = candidates[0];
-  const workKind: WorkKind = work
-    ? work.kind as Exclude<WorkKind, 'conversation'>
-    : 'conversation';
+  const work = aggregate ?? candidates[0];
+  const workKind: WorkKind = aggregate
+    ? 'execute'
+    : work
+      ? work.kind as Exclude<WorkKind, 'conversation'>
+      : 'conversation';
   return {
     status: 'ok',
     graph,
@@ -250,6 +297,8 @@ interface ResolutionRow {
   operation_count: number;
   operations_digest: string | null;
   expectations_satisfied: number | null;
+  opened_at: string;
+  finalized_at: string | null;
 }
 
 function rowMatchesExpectation(row: ResolutionRow, expected: AcceptedTaskExpectation): boolean {
@@ -264,6 +313,39 @@ function rowMatchesExpectation(row: ResolutionRow, expected: AcceptedTaskExpecta
     && row.effect_ceiling === expected.effectCeiling
     && row.external_effect_requested === (expected.externalEffectRequested ? 1 : 0)
     && row.external_effect_kinds_json === JSON.stringify(expected.externalEffectKinds);
+}
+
+/**
+ * Keep the accepted-turn call root single-owned.
+ *
+ * Ordinary graph execution continues to create/advance the turn_graph root.
+ * A foreground host turn that durably admitted plan_task already owns host_v1;
+ * its resolution is topology/evidence only, so the exact DB proof skips graph
+ * root creation without mutating the host root.
+ */
+function ensureResolutionCallAuthorityInTransaction(
+  db: ReturnType<typeof openEventLog>,
+  expected: AcceptedTaskExpectation,
+  row: ResolutionRow,
+): void {
+  if (proveHostPlannedResolutionCoexistenceInTransaction({
+    db,
+    sessionId: expected.identity.sessionId,
+    sourceUserSeq: expected.identity.sourceUserSeq,
+    phase: 'existing',
+  })) return;
+  ensureGraphCallAuthorityInTransaction(db, {
+    sessionId: expected.identity.sessionId,
+    sourceUserSeq: expected.identity.sourceUserSeq,
+    acceptedTaskId: expected.acceptedTaskId,
+    graphEventId: expected.graphEventId,
+    graphHash: expected.graphHash,
+    compilerVersion: expected.compilerVersion,
+    effectCeiling: expected.effectCeiling,
+    resolutionState: row.state,
+    openedAt: row.opened_at,
+    finalizedAt: row.finalized_at,
+  });
 }
 
 function ensureOpenResolution(
@@ -305,6 +387,7 @@ function ensureOpenResolution(
   if (!rowMatchesExpectation(row, expected)) {
     throw new Error('accepted task resolution conflicts with its persisted graph');
   }
+  ensureResolutionCallAuthorityInTransaction(db, expected, row);
   if (row.state === 'legacy_ambiguous') throw new Error('accepted task resolution is ambiguous');
   return row;
 }
@@ -1059,6 +1142,14 @@ export function finalizeResolutionAgainstExpectedWork(input: {
         input.sourceUserSeq,
       );
       if (updated.changes !== 1) throw new Error('expected-work resolution finalization lost its CAS');
+      ensureResolutionCallAuthorityInTransaction(db, expected, {
+        ...resolution,
+        state: 'finalized',
+        operation_count: operations.length,
+        operations_digest: digest,
+        expectations_satisfied: 1,
+        finalized_at: mirror.createdAt,
+      });
       return {
         status: 'finalized',
         match: adjudicated.match,
@@ -1143,6 +1234,14 @@ function finalizeResolutionLegacy(input: {
         input.sourceUserSeq,
       );
       if (updated.changes !== 1) throw new Error('resolution finalization lost its CAS');
+      ensureResolutionCallAuthorityInTransaction(db, expected, {
+        ...resolution,
+        state: 'finalized',
+        operation_count: operations.length,
+        operations_digest: digest,
+        expectations_satisfied: satisfied ? 1 : 0,
+        finalized_at: mirror.createdAt,
+      });
       return true;
     });
     const finalized = commit.immediate();

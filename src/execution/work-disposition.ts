@@ -30,6 +30,10 @@ export interface WorkManifest {
   canonicalItems: Array<{ id: string; inputRef?: string }>;
   phases: WorkManifestPhase[];
   reducer: { id: string; requiredPhases: string[]; outputContract: string };
+  /** ONE LOOP, MANY BRAINS: exact model id the fan-out windows run on — the
+   *  master keeps its own brain while the fleet runs here. Unroutable ids
+   *  fall back through worker routing; never refuses. */
+  workerModel?: string;
 }
 
 export interface WorkDisposition {
@@ -197,6 +201,8 @@ export interface DurableWorkPlan {
   requiredPhases: string[];
   manifestId: string;
   contractVersion: string;
+  /** Model the windows run on (ONE LOOP, MANY BRAINS); absent = default routing. */
+  workerModel?: string;
 }
 
 /**
@@ -223,6 +229,7 @@ export function dispositionToDurableWork(disposition: WorkDisposition): DurableW
     requiredPhases: [...manifest.reducer.requiredPhases],
     manifestId: manifest.manifestId,
     contractVersion: manifest.contractVersion,
+    ...(manifest.workerModel ? { workerModel: manifest.workerModel } : {}),
   };
 }
 

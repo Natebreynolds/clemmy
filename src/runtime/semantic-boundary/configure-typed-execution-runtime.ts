@@ -257,7 +257,13 @@ export function configureTypedExecutionRuntime(): void {
 }
 
 export function typedExecutionRuntimeConfigured(): boolean {
-  return configured && peekTurnSemanticModelPort() !== null;
+  return Boolean(
+    configured
+    && peekTurnSemanticModelPort()
+    && peekHostCapabilityCatalogFactory()
+    && peekCapabilityManifestStore()
+    && peekProductionCapabilityAdapter()
+  );
 }
 
 export function typedExecutionCatalogReady(): boolean {

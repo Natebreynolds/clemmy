@@ -9,7 +9,41 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export const PKG_DIR = path.resolve(__dirname, '..');
-const DEFAULT_BASE_DIR = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine-next');
+
+function realUserHome(): string {
+  try {
+    return os.userInfo().homedir;
+  } catch {
+    return os.homedir();
+  }
+}
+
+/** Passwd-backed user home. Independent of a remapped $HOME in isolated tests. */
+export const REAL_USER_HOME = process.env.CLEMMY_REAL_USER_HOME || realUserHome();
+export const REAL_DEFAULT_CLEMENTINE_HOME = path.resolve(path.join(REAL_USER_HOME, '.clementine-next'));
+
+const DEFAULT_BASE_DIR = process.env.CLEMENTINE_HOME || REAL_DEFAULT_CLEMENTINE_HOME;
+
+function isTestProcess(): boolean {
+  return Boolean(
+    process.env.NODE_TEST_CONTEXT
+    || process.env.CLEMMY_TEST_ISOLATED_HOME === '1'
+    || process.argv.includes('--test'),
+  );
+}
+
+if (
+  isTestProcess()
+  && path.resolve(DEFAULT_BASE_DIR) === REAL_DEFAULT_CLEMENTINE_HOME
+  && process.env.CLEMMY_ALLOW_LIVE_HOME_TESTS !== '1'
+) {
+  throw new Error(
+    'Refusing to bind BASE_DIR to the live Clementine home from a test process. '
+    + 'Set CLEMENTINE_HOME to a unique temp directory before importing config, '
+    + 'or set CLEMMY_ALLOW_LIVE_HOME_TESTS=1 for an explicit destructive test.',
+  );
+}
+
 export const BASE_DIR = DEFAULT_BASE_DIR;
 
 function parseEnvFile(envPath: string): Record<string, string> {
@@ -36,11 +70,19 @@ function parseEnvFile(envPath: string): Record<string, string> {
   return result;
 }
 
-export const ACTIVE_ENV_FILES = [
-  path.join(PKG_DIR, '.env'),
-  path.join(process.cwd(), '.env'),
-  path.join(BASE_DIR, '.env'),
-].filter((filePath, index, items) => existsSync(filePath) && items.indexOf(filePath) === index);
+function envSearchPaths(): string[] {
+  if (process.env.CLEMMY_TEST_ISOLATED_HOME === '1') {
+    return [path.join(BASE_DIR, '.env')];
+  }
+  return [
+    path.join(PKG_DIR, '.env'),
+    path.join(process.cwd(), '.env'),
+    path.join(BASE_DIR, '.env'),
+  ];
+}
+
+export const ACTIVE_ENV_FILES = envSearchPaths()
+  .filter((filePath, index, items) => existsSync(filePath) && items.indexOf(filePath) === index);
 
 const env = Object.assign({}, ...ACTIVE_ENV_FILES.map((filePath) => parseEnvFile(filePath)));
 
@@ -69,11 +111,8 @@ export function isLoopbackWebhookHost(host: string): boolean {
 }
 
 export function getRuntimeEnv(key: string, fallback = ''): string {
-  const activeEnvFiles = [
-    path.join(PKG_DIR, '.env'),
-    path.join(process.cwd(), '.env'),
-    path.join(BASE_DIR, '.env'),
-  ].filter((filePath, index, items) => existsSync(filePath) && items.indexOf(filePath) === index);
+  const activeEnvFiles = envSearchPaths()
+    .filter((filePath, index, items) => existsSync(filePath) && items.indexOf(filePath) === index);
   const currentEnv = Object.assign({}, ...activeEnvFiles.map((filePath) => parseEnvFile(filePath)));
   return process.env[key] ?? currentEnv[key] ?? fallback;
 }
@@ -323,6 +362,10 @@ export interface ByoBackendConfig {
   primaryId: string;
   judgeId: string;
   providerLabel: string;
+  /** OAuth-backed providers (xAI): resolve a FRESH bearer per request so an
+   *  expired access token refreshes instead of 401-ing the brain into a
+   *  false auth-dead cooldown (live 2026-08-19: grok stolen by codex). */
+  refreshBearer?: () => Promise<string | null>;
 }
 
 /** Resolve the user-supplied (bring-your-own) OpenAI-compatible backend

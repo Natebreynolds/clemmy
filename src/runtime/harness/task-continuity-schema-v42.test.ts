@@ -11,6 +11,7 @@ process.env.CLEMENTINE_HOME = tempHome;
 mkdirSync(path.join(tempHome, 'state'), { recursive: true });
 
 const eventlog = await import('./eventlog.js');
+const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -38,7 +39,7 @@ test('v42 additively upgrades an existing lazy continuity table without blessing
   const migrated = eventlog.openEventLog();
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    42,
+    HARNESS_SCHEMA_VERSION,
   );
   const columns = new Set(
     (migrated.prepare('PRAGMA table_info(task_continuity_packets)').all() as Array<{ name: string }>)

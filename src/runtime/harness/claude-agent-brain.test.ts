@@ -43,6 +43,7 @@ const {
   beginRunAttempt,
   claimHarnessChatRequest,
   closeEventLog,
+  conversationPreambleDeliveryRequest,
   createSession,
   getLatestRunAttempt,
   getSession,
@@ -89,6 +90,7 @@ const { acceptedTaskIdFor } = await import('./attempt-identity.js');
 const { beginPhysicalDispatch, settlePhysicalDispatch } = await import('./dispatch-ledger.js');
 const { classifyAttemptOutcome } = await import('./attempt-outcome.js');
 const { commitLogicalCallSettlement } = await import('./logical-call-settlement-store.js');
+const { redeemSuccessfulSettlementResultForHost } = await import('./result-handle.js');
 
 /**
  * Settlement anchor for stubbed retrieve turns (authority spine, ffae7dbd).
@@ -109,17 +111,19 @@ function settleAdmittedRead(input: { sessionId: string; sourceUserSeq: number })
     acceptedTaskId: acceptedTaskIdFor(input.sessionId, input.sourceUserSeq),
   };
   const id = `brain-fixture-read:${++fixtureSettledReadSerial}`;
-  const tool = 'alpha_records_search';
-  const args = { query: 'fixture' };
+  const tool = 'read_file';
+  const args = { path: 'fixture.txt', max_chars: 100 };
+  const logicalToolCallId = `logical:${id}`;
   const begun = beginPhysicalDispatch({
     identity: {
       ...task,
-      logicalToolCallId: `logical:${id}`,
+      logicalToolCallId,
       physicalDispatchId: `dispatch:${id}`,
       ordinal: 0,
     },
     tool,
     args,
+    executionSite: 'host',
   });
   assert.equal(begun.status, 'inserted', JSON.stringify(begun));
   if (begun.status !== 'inserted') return;
@@ -129,21 +133,31 @@ function settleAdmittedRead(input: { sessionId: string; sourceUserSeq: number })
     outcome: 'returned',
   }).status, 'inserted');
   const settled = commitLogicalCallSettlement({
-    identity: { ...task, logicalToolCallId: `logical:${id}` },
+    identity: { ...task, logicalToolCallId },
     contract: { toolName: tool, args },
-    execution: { kind: 'provider_execution' },
+    execution: { kind: 'local_execution' },
     result: {
       payload: {
         successful: true,
-        data: { records: [{ id: 'r1' }, { id: 'r2' }] },
+        data: { content: 'fixture answer-bearing content' },
         meta: { complete: true },
       },
     },
     outcome: classifyAttemptOutcome({ envelopeSuccessful: true }),
     recovery: { businessCall: true, mutating: false },
-    observer: { lane: 'composio', turn: task.turn },
+    observer: { lane: 'agents_runner', turn: task.turn },
   });
   assert.equal(settled.status, 'committed', JSON.stringify(settled));
+  const redeemed = redeemSuccessfulSettlementResultForHost({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    logicalToolCallId,
+  });
+  assert.equal(redeemed.status, 'ok', JSON.stringify(redeemed));
+  if (redeemed.status === 'ok') {
+    assert.equal(redeemed.value.executionSite, 'host', JSON.stringify(redeemed.value));
+  }
 }
 
 function installPreparedClaudeWorkflowDispatch(input: {
@@ -282,6 +296,8 @@ test('Claude brain closes a prepared workflow batch as a nonterminal dispatch be
   };
   assert.equal(run.status, 'queued');
   assert.deepEqual((response.raw as { asyncWork?: { runIds?: string[] } }).asyncWork?.runIds, [runId]);
+  assert.equal(getSession(sessionId)?.metadata.__run_in_flight, undefined);
+  assert.equal(getSession(sessionId)?.metadata.__run_in_flight_owner, undefined);
 });
 
 test('Claude brain preserves a prepared workflow handoff when the provider throws after workflow_run', async () => {
@@ -317,6 +333,8 @@ test('Claude brain preserves a prepared workflow handoff when the provider throw
     status?: string;
   };
   assert.equal(run.status, 'queued');
+  assert.equal(getSession(sessionId)?.metadata.__run_in_flight, undefined);
+  assert.equal(getSession(sessionId)?.metadata.__run_in_flight_owner, undefined);
 });
 
 test('JIT monotonic floor: the per-session advertised tool set only GROWS (cache-stable), never shrinks', () => {
@@ -570,7 +588,7 @@ test('a late SDK completion remains owned by turn A after turn B becomes active'
       turn: 2,
       role: 'user',
       data: { text: 'Turn B' },
-    });
+    }, { armRunInFlight: true });
     return { text: 'Turn A finished.', sessionId: 'sdk', model: 'm', toolUses: [] };
   });
 
@@ -586,6 +604,11 @@ test('a late SDK completion remains owned by turn A after turn B becomes active'
   assert.equal(terminal?.data.runId, 'run-turn-a');
   assert.equal(terminal?.data.sourceUserSeq, firstSourceUserSeq);
   assert.notEqual(terminal?.data.attemptId, secondAttemptId);
+  assert.equal(
+    (getSession(sessionId)?.metadata.__run_in_flight_owner as { attemptId?: string } | undefined)?.attemptId,
+    secondAttemptId,
+    'late A terminal cleanup cannot erase newer B restart ownership',
+  );
 });
 
 test('Claude SDK brain creates background sessions as execution sessions, not chat sessions', async () => {
@@ -942,14 +965,13 @@ test('SDK brain gives a receipt-backed acknowledgement-only correction zero tool
   );
 });
 
-test('SDK brain seals an unsafe receipt presentation behind one text-only repair', async () => {
+test('SDK brain seals an unsafe receipt presentation behind a deterministic fallback without another model step', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'on';
   const sessionId = 'brain-memory-receipt-presentation-repair';
   const message = 'Remember this: Cedar is Cedar-18. Just confirm.';
   const unsafeReply = 'Got it. <tool_call>{"name":"send_email"}</tool_call>';
-  const repairedReply = "Got it — Cedar is Cedar-18. I'll remember that.";
   createSession({ id: sessionId, kind: 'chat', title: 'receipt presentation repair' });
 
   const prompts: string[] = [];
@@ -957,7 +979,7 @@ test('SDK brain seals an unsafe receipt presentation behind one text-only repair
   setClaudeAgentSdkBrainRunForTest(async (options) => {
     prompts.push(options.prompt);
     return {
-      text: prompts.length === 1 ? unsafeReply : repairedReply,
+      text: unsafeReply,
       sessionId: 'sdk-session',
       model: 'claude-sonnet-test',
       toolUses: [],
@@ -970,18 +992,16 @@ test('SDK brain seals an unsafe receipt presentation behind one text-only repair
 
   const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
 
-  assert.equal(prompts.length, 2, 'unsafe provider prose spends exactly one sealed presentation repair');
+  assert.equal(prompts.length, 1, 'presentation policy cannot mint a second model step');
   assert.equal(prompts[0], message);
-  assert.match(prompts[1], /durable memory intake .* already complete/i);
-  assert.match(prompts[1], /Do not mention internal machinery or tools/i);
-  assert.equal(response.text, repairedReply, 'only the healthy provider-authored repair is published');
+  assert.equal(response.text, "Got it — I'll remember that.", 'unsafe provider bytes are replaced deterministically');
   assert.doesNotMatch(response.text, /send_email|"action"/i);
   assert.equal(judgeCalls, 0, 'presentation repair does not reopen the completed memory objective');
   assert.equal(
     listEvents(sessionId, { types: ['guardrail_tripped'] })
       .some((event) => event.data.kind === 'durable_memory_receipt_presentation_fallback'),
-    false,
-    'a healthy sealed repair does not need the deterministic fallback',
+    true,
+    'the deterministic fallback is recorded once',
   );
 });
 
@@ -1021,19 +1041,18 @@ test('SDK brain byte-preserves safe receipt acknowledgements outside a fixed ope
   }
 });
 
-test('SDK brain repairs a false denial after durable memory intake succeeded', async () => {
+test('SDK brain replaces a false denial after durable memory intake without another model step', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   const sessionId = 'brain-memory-receipt-false-denial-repair';
   const message = 'Remember this: Cedar is Cedar-20. Just confirm.';
-  const repairedReply = 'Thanks — Cedar-20 is current, and I’ll remember that.';
   createSession({ id: sessionId, kind: 'chat', title: 'receipt denial repair' });
 
   let runCalls = 0;
   setClaudeAgentSdkBrainRunForTest(async () => {
     runCalls += 1;
     return {
-      text: runCalls === 1 ? "Sorry, I can't remember or store that." : repairedReply,
+      text: "Sorry, I can't remember or store that.",
       sessionId: 'sdk-session',
       model: 'claude-sonnet-test',
       toolUses: [],
@@ -1042,24 +1061,23 @@ test('SDK brain repairs a false denial after durable memory intake succeeded', a
 
   const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
 
-  assert.equal(runCalls, 2);
-  assert.equal(response.text, repairedReply);
+  assert.equal(runCalls, 1);
+  assert.equal(response.text, "Got it — I'll remember that.");
   assert.doesNotMatch(response.text, /can(?:not|'t) remember|can't remember/i);
 });
 
-test('SDK brain repairs an unrelated completed-effect claim on a receipt-only turn', async () => {
+test('SDK brain replaces an unrelated completed-effect claim without another model step', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   const sessionId = 'brain-memory-receipt-effect-claim-repair';
   const message = 'Remember this: Cedar is Cedar-21. Just confirm.';
-  const repairedReply = "I've got it — Cedar-21 is current.";
   createSession({ id: sessionId, kind: 'chat', title: 'receipt effect repair' });
 
   let runCalls = 0;
   setClaudeAgentSdkBrainRunForTest(async () => {
     runCalls += 1;
     return {
-      text: runCalls === 1 ? 'Got it — I updated the spreadsheet.' : repairedReply,
+      text: 'Got it — I updated the spreadsheet.',
       sessionId: 'sdk-session',
       model: 'claude-sonnet-test',
       toolUses: [],
@@ -1068,8 +1086,8 @@ test('SDK brain repairs an unrelated completed-effect claim on a receipt-only tu
 
   const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
 
-  assert.equal(runCalls, 2);
-  assert.equal(response.text, repairedReply);
+  assert.equal(runCalls, 1);
+  assert.equal(response.text, "Got it — I'll remember that.");
   assert.doesNotMatch(response.text, /spreadsheet/i);
 });
 
@@ -1094,7 +1112,7 @@ test('SDK brain falls back safely when the sealed receipt repair is still unsafe
 
   const response = await respondViaClaudeAgentSdkBrain('home', { message, sessionId });
 
-  assert.equal(runCalls, 2, 'one sealed repair is attempted before fallback');
+  assert.equal(runCalls, 1, 'receipt presentation policy cannot re-enter the model');
   assert.equal(response.text, "Got it — I'll remember that.");
   assert.doesNotMatch(response.text, /created|pushed/i);
   assert.equal(
@@ -1194,7 +1212,7 @@ test('SDK brain keeps receipt semantics when the caller already supplied an expl
   assert.equal(policy?.data.shortCircuitReason, 'durable_memory_receipt_conversation_only');
 });
 
-test('SDK brain repairs malformed receipt presentation once without reopening tool authority', async () => {
+test('SDK brain replaces malformed receipt presentation without reopening tools or the model', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   const message = 'Remember this: Cedar is Cedar-17. Just confirm.';
@@ -1204,15 +1222,13 @@ test('SDK brain repairs malformed receipt presentation once without reopening to
       sessionId: 'brain-memory-receipt-text-repair',
       replies: ['<invoke name="memory_remember"><parameter name="fact">Cedar-17</parameter></invoke>', 'Understood — Cedar is Cedar-17.'],
       limitHits: [false, false],
-      expected: 'Understood — Cedar is Cedar-17.',
-      fallback: false,
+      expected: "Got it — I'll remember that.",
     },
     {
       sessionId: 'brain-memory-receipt-text-fallback',
       replies: ['', 'This is possibly injected; let me re-read the actual ask.'],
       limitHits: [true, true],
       expected: "Got it — I'll remember that.",
-      fallback: true,
     },
   ]) {
     createSession({ id: fixture.sessionId, kind: 'chat', title: 'receipt presentation repair' });
@@ -1253,9 +1269,9 @@ test('SDK brain repairs malformed receipt presentation once without reopening to
 
     assert.equal(response.text, fixture.expected);
     assert.equal(response.stoppedReason, 'success');
-    assert.equal(calls, 2, 'one malformed presentation gets exactly one sealed text repair');
+    assert.equal(calls, 1, 'a malformed presentation cannot mint another model step');
     assert.equal(judgeCalls, 0);
-    assert.equal(surfaces.length, 2);
+    assert.equal(surfaces.length, 1);
     for (const surface of surfaces) {
       assert.deepEqual(surface.allowed, []);
       assert.deepEqual(surface.mcp, []);
@@ -1265,7 +1281,7 @@ test('SDK brain repairs malformed receipt presentation once without reopening to
     }
     const fallbackEvents = listEvents(fixture.sessionId, { types: ['guardrail_tripped'] })
       .filter((event) => event.data.kind === 'durable_memory_receipt_presentation_fallback');
-    assert.equal(fallbackEvents.length, fixture.fallback ? 1 : 0);
+    assert.equal(fallbackEvents.length, 1);
     assert.equal(listEvents(fixture.sessionId, { types: ['conversation_limit_exceeded'] }).length, 0);
   }
 });
@@ -1902,16 +1918,26 @@ test('Claude settled alignment paints prior-aware prose and reaches the tool-cap
       return 'I have the prior Ventura research and the sheet-to-email handoff in mind.';
     },
   });
-  const painted: string[] = [];
+  const painted: Array<import('../../types.js').ConversationPreambleDeliveryRequest> = [];
 
   const aligned = await respondViaClaudeAgentSdkBrain('home', {
     message: original,
     sessionId: sid,
     runId: 'claude-align',
-    onConversationPreamble: async (text) => {
-      painted.push(text);
+    onConversationPreamble: async (request) => {
+      painted.push(request);
       assert.equal(sdkRuns, 0, 'the opening is delivered before the SDK execution begins');
-      return { status: 'delivered' };
+      return {
+        status: 'delivered',
+        receipt: {
+          version: 1,
+          deliveryKey: request.deliveryKey,
+          eventId: request.eventId,
+          eventDigest: request.eventDigest,
+          surface: 'channel_message',
+          target: 'claude-agent-brain-test',
+        },
+      };
     },
   });
   assert.equal(aligned.stoppedReason, 'awaiting-input');
@@ -1922,10 +1948,11 @@ test('Claude settled alignment paints prior-aware prose and reaches the tool-cap
     'the Claude voice author starts before the Codex-family openness judge settles',
   );
   assert.equal(sdkRuns, 1, 'SETTLED reaches the ordinary Claude SDK brain in the same accepted turn');
-  assert.deepEqual(painted, ['I have the prior Ventura research and the sheet-to-email handoff in mind.']);
+  const preambleEvents = listEvents(sid, { types: ['conversation_preamble'] });
+  assert.equal(preambleEvents.length, 1);
+  assert.deepEqual(painted, [conversationPreambleDeliveryRequest(preambleEvents[0]!)]);
   assert.match(captured[0]?.turnContext ?? '', /VENTURA-CONTEXT/);
   assert.match(captured[0]?.turnContext ?? '', /pre-execution opening already delivered/);
-  assert.equal(listEvents(sid, { types: ['conversation_preamble'] }).length, 1);
   const awaiting = listEvents(sid, { types: ['awaiting_user_input'] });
   assert.equal(awaiting.length, 1);
   assert.notEqual(awaiting[0]?.data.source, 'preflight_openness');
@@ -1974,23 +2001,35 @@ for (const judgeMode of ['settled', 'unavailable'] as const) {
         return 'I have the exact Salesforce org, import source, row bound, and merge key.';
       },
     });
-    const painted: string[] = [];
+    const painted: Array<import('../../types.js').ConversationPreambleDeliveryRequest> = [];
 
     await respondViaClaudeAgentSdkBrain('home', {
       message: prompt,
       sessionId: sid,
       runId: `claude-salesforce-${judgeMode}`,
-      onConversationPreamble: async (text) => {
-        painted.push(text);
+      onConversationPreamble: async (request) => {
+        painted.push(request);
         assert.equal(sdkRuns, 0, 'the preamble is visible before SDK execution');
-        return { status: 'delivered' };
+        return {
+          status: 'delivered',
+          receipt: {
+            version: 1,
+            deliveryKey: request.deliveryKey,
+            eventId: request.eventId,
+            eventDigest: request.eventDigest,
+            surface: 'channel_message',
+            target: `claude-agent-brain-test:${judgeMode}`,
+          },
+        };
       },
     });
 
     assert.equal(judgeCalls, 1);
     assert.equal(authorCalls, 1);
     assert.equal(sdkRuns, 1, 'the accepted request reaches the Claude SDK once');
-    assert.deepEqual(painted, ['I have the exact Salesforce org, import source, row bound, and merge key.']);
+    const preambleEvents = listEvents(sid, { types: ['conversation_preamble'] });
+    assert.equal(preambleEvents.length, 1);
+    assert.deepEqual(painted, [conversationPreambleDeliveryRequest(preambleEvents[0]!)]);
     const decisions = listEvents(sid, { types: ['turn_preflight_decision'] });
     assert.equal(decisions.length, 1);
     assert.equal(
@@ -1998,7 +2037,6 @@ for (const judgeMode of ['settled', 'unavailable'] as const) {
       true,
       'the legacy request-text flag remains context, but is not an openness verdict',
     );
-    assert.equal(listEvents(sid, { types: ['conversation_preamble'] }).length, 1);
     assert.equal(
       listEvents(sid, { types: ['awaiting_user_input'] })
         .filter((event) => event.data.source === 'preflight_openness').length,
@@ -2051,6 +2089,11 @@ test('Claude align terminal cleanup cannot erase an overlapping attempt B restar
     HarnessSession.load(sid)?.runInFlightSince(),
     null,
     'Turn A terminal cleanup must preserve the coarse marker owned by active Turn B',
+  );
+  assert.equal(
+    (getSession(sid)?.metadata.__run_in_flight_owner as { attemptId?: string } | undefined)?.attemptId,
+    secondAttemptId,
+    'the structured marker still belongs to B',
   );
 });
 
@@ -2712,7 +2755,11 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   });
 
   assert.equal(res.text, 'Claude brain reply');
-  assert.equal(res.stoppedReason, 'success');
+  assert.equal(
+    res.stoppedReason,
+    'success',
+    JSON.stringify({ response: res, terminal: listEvents('brain-run', { types: ['conversation_completed'] }).at(-1) }),
+  );
   assert.equal(res.raw?.transport, 'claude_agent_sdk_brain');
   assert.deepEqual(chunks, [], 'provider and terminal text are delivered through the public event plane, not raw callbacks');
   assert.equal(captured.onDelta, undefined);
@@ -2721,7 +2768,7 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   assert.equal(captured.prompt, 'search memory');
   assert.equal(captured.sessionId, 'brain-run');
   assert.match(captured.trackerScopeId, /^brain-run::brain:attempt-/);
-  assert.equal(captured.maxTurns, 24);
+  assert.equal(captured.maxTurns, 12);
   assert.ok(captured.allowedLocalMcpTools.includes('memory_search'));
   assert.ok(captured.allowedLocalMcpTools.includes('memory_remember'));
   assert.equal(captured.allowedLocalMcpTools.includes('memory_read'), false);
@@ -2740,23 +2787,23 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   assert.match(workingMemory, /Claude brain reply/, 'Claude-lane writeback runs after the terminal assistant reply is durable');
 });
 
-test('Claude SDK turn cap adapts only for execution-ready complex artifact work', () => {
-  assert.equal(resolveClaudeAgentBrainMaxTurns('search memory'), 24);
+test('Claude SDK transport window stays flat across objective shapes', () => {
+  assert.equal(resolveClaudeAgentBrainMaxTurns('search memory'), 12);
   assert.equal(
     resolveClaudeAgentBrainMaxTurns('Build me a workspace called Proof Cockpit with a local task runner.'),
-    36,
+    12,
   );
   assert.equal(
     resolveClaudeAgentBrainMaxTurns('Let’s brainstorm how we might build a workspace for this someday.'),
-    24,
-    'exploration is not execution and does not widen the provider runway',
+    12,
+    'prose does not widen provider-owned control flow',
   );
   assert.equal(
     resolveClaudeAgentBrainMaxTurns('Build it now.', [
       'Let’s brainstorm a social media command-center workspace with a local content calendar.',
     ]),
-    36,
-    'an execution follow-up inherits the bounded artifact runway from recent conversation context',
+    12,
+    'conversation history does not widen provider-owned control flow',
   );
 });
 
@@ -3157,7 +3204,7 @@ test('Workspace dock: schema-on-demand loads the common edit kernel and defers s
   }
 });
 
-test('full mode: completion judge bounces a not-done turn into ONE continuation, then returns the finished answer', async () => {
+test('full mode: a not-done judge verdict cannot reopen the SDK', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   const prompts: string[] = [];
@@ -3194,12 +3241,13 @@ test('full mode: completion judge bounces a not-done turn into ONE continuation,
 
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-judge' });
 
-  assert.equal(prompts.length, 2, 'one continuation fired after the not-done verdict');
+  assert.equal(prompts.length, 1, 'the judge classifies but cannot mint another model step');
   assert.equal(new Set(trackerScopes).size, 1, 'initial dispatch and continuation share one durable attempt scope');
   assert.match(trackerScopes[0], /^brain-judge::brain:attempt-/);
-  assert.match(prompts[1], /continue now and FINISH it/i);
-  assert.match(prompts[1], /do NOT proceed on your own/i, 'continuation permits asking before external actions');
-  assert.match(res.text, /Sent all 3 emails/);
+  assert.equal(judged, 1);
+  assert.equal(res.stoppedReason, 'unverified');
+  assert.equal(res.text, "I'll send the emails next.");
+  assert.equal(listEvents('brain-judge', { types: ['external_write'] }).length, 0);
 });
 
 test('Claude turn-wide attribution owns completion-judge usage for the exact accepted source and attempt', async () => {
@@ -3246,7 +3294,7 @@ test('Claude turn-wide attribution owns completion-judge usage for the exact acc
   });
 });
 
-test('full mode: a stale execution lookup cannot certify a newly requested external write', async () => {
+test('full mode: a stale execution lookup cannot certify or trigger a newly requested external write', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   const sessionId = 'brain-request-bound-write';
@@ -3297,11 +3345,11 @@ test('full mode: a stale execution lookup cannot certify a newly requested exter
     sessionId,
   });
 
-  assert.equal(res.stoppedReason, 'success');
-  assert.equal(runs, 2, 'the stale PASS is continued instead of delivered');
-  assert.match(prompts[1] ?? '', /No write receipt exists after source user event/i);
-  assert.match(res.text, /fresh write/);
-  assert.equal(listEvents(sessionId, { types: ['external_write'] }).length, 2);
+  assert.equal(res.stoppedReason, 'unverified');
+  assert.equal(runs, 1, 'a stale claim cannot grant the SDK another execution attempt');
+  assert.equal(prompts.length, 1);
+  assert.match(res.text, /^PASS\b/);
+  assert.equal(listEvents(sessionId, { types: ['external_write'] }).length, 1);
 });
 
 test('full mode: exhausted completion retries never false-green a stale external-write PASS', async () => {
@@ -3463,7 +3511,7 @@ test('full mode: an accepted execution cannot hide a mixed orphaned write', asyn
   );
 });
 
-test('artifact completion performs one exact-ID read-back before reporting success', async () => {
+test('artifact completion stays pending without a second SDK read-back query', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
@@ -3546,14 +3594,14 @@ test('artifact completion performs one exact-ID read-back before reporting succe
     sessionId,
   });
 
-  assert.equal(calls, 2, 'one create query plus one bounded verification query');
-  assert.equal(response.stoppedReason, 'success');
+  assert.equal(calls, 1, 'the SDK cannot mint an exact-ID verification query');
+  assert.equal(response.stoppedReason, 'unverified');
   assert.match(response.text, /Created the firm brief/);
-  assert.equal(artifactLedger.listUnverifiedRunArtifacts(sessionId).length, 0);
-  assert.ok(artifactLedger.listRunArtifacts(sessionId)[0]?.bindingVerifiedAt);
+  assert.equal(artifactLedger.listUnverifiedRunArtifacts(sessionId).length, 1);
+  assert.equal(artifactLedger.listRunArtifacts(sessionId)[0]?.bindingVerifiedAt, null);
 });
 
-test('Google Sheet completion performs one bounded exact-ID read-back but keeps content-unproved synthetic work unverified', async () => {
+test('Google Sheet completion stays unverified without a second SDK read-back query', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
@@ -3628,15 +3676,15 @@ test('Google Sheet completion performs one bounded exact-ID read-back but keeps 
     sessionId,
   });
 
-  assert.equal(calls, 2, 'one create query plus one bounded exact-ID Sheet verification query');
+  assert.equal(calls, 1, 'the SDK cannot mint an exact-ID Sheet verification query');
   assert.equal(
     response.stoppedReason,
     'unverified',
     `exact-id readability cannot upgrade a synthetic Sheet lacking frozen source/content lineage: ${JSON.stringify(response)}`,
   );
   assert.match(response.text, /Created the Ventura restaurant sheet/);
-  assert.equal(artifactLedger.listUnverifiedRunArtifacts(sessionId).length, 0);
-  assert.ok(artifactLedger.listRunArtifacts(sessionId)[0]?.bindingVerifiedAt);
+  assert.equal(artifactLedger.listUnverifiedRunArtifacts(sessionId).length, 1);
+  assert.equal(artifactLedger.listRunArtifacts(sessionId)[0]?.bindingVerifiedAt, null);
 });
 
 test('artifact completion stays honest when exact read-back cannot verify the binding', async () => {
@@ -3696,7 +3744,7 @@ test('artifact completion stays honest when exact read-back cannot verify the bi
     sessionId,
   });
 
-  assert.equal(calls, 2, 'verification is attempted once and never loops');
+  assert.equal(calls, 1, 'artifact verification policy cannot mint another SDK query');
   assert.equal(response.stoppedReason, 'unverified');
   assert.equal(response.text, 'Done — document created.', 'the hold keeps the original model-authored account');
   assert.equal(artifactLedger.listRunArtifacts(sessionId).length, 1, 'no duplicate resource slot');
@@ -3706,7 +3754,7 @@ test('artifact completion stays honest when exact read-back cannot verify the bi
   assert.equal((terminal?.data.artifactVerification as { status?: string } | undefined)?.status, 'pending');
 });
 
-test('Phase 1.3: a SHARED continuation budget caps narration + judge so corrective re-runs cannot stack', async () => {
+test('narration and judge policy cannot mint a corrective SDK run', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   const prevBudget = process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS;
@@ -3726,15 +3774,13 @@ test('Phase 1.3: a SHARED continuation budget caps narration + judge so correcti
     let judged = 0;
     setClaudeAgentSdkBrainJudgeForTest(async () => { judged += 1; return { done: false, reason: 'no evidence shown' }; });
 
-    const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-cont-budget' });
+    await assert.rejects(
+      respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-cont-budget' }),
+      /no real tool call was made/i,
+    );
 
-    // initial + ONE narration continuation = 2 full-context runs. The narration
-    // retry spent the only budgeted continuation, so the judge's not-done verdict
-    // does NOT fire a 3rd full re-run (budget exhausted).
-    assert.equal(prompts.length, 2);
-    assert.match(prompts[1], /INVOKE the real tool now/); // the narration retry prompt, not the judge's
-    assert.ok(judged >= 1, 'the cheap judge still evaluated — only its expensive continuation is budget-gated');
-    assert.ok(res.text.length > 0);
+    assert.equal(prompts.length, 1, 'neither narration policy nor the judge can re-enter the SDK');
+    assert.equal(judged, 0, 'malformed tool text is rejected before completion judgment');
   } finally {
     if (prevBudget === undefined) delete process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS;
     else process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS = prevBudget;
@@ -3846,7 +3892,7 @@ test('default Claude brain issues a learning receipt after clean independent ver
   );
 });
 
-test('judge continuation publishes only the corrected committed answer', async () => {
+test('judge rejection publishes no speculative stream and cannot reopen the SDK', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   const chunks: string[] = [];
@@ -3892,11 +3938,13 @@ test('judge continuation publishes only the corrected committed answer', async (
     onChunk: async (delta) => { chunks.push(delta); },
   });
 
-  assert.equal(res.text, 'Sent all 3 emails — here are the message links.');
+  assert.equal(runs, 1);
+  assert.equal(res.stoppedReason, 'unverified');
+  assert.equal(res.text, "I'll send the emails next.");
   assert.deepEqual(chunks, [], 'speculative and terminal text bypass the raw callback');
 });
 
-test('judge continuation suppresses both speculative attempts and publishes the committed answer', async () => {
+test('judge rejection suppresses speculative provider bytes without an SDK retry', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   const chunks: string[] = [];
@@ -3943,7 +3991,9 @@ test('judge continuation suppresses both speculative attempts and publishes the 
     onChunk: async (delta) => { chunks.push(delta); },
   });
 
-  assert.equal(res.text, 'Sent all 3 emails — here are the message links.');
+  assert.equal(runs, 1);
+  assert.equal(res.stoppedReason, 'unverified');
+  assert.equal(res.text, "I'll send the emails next.");
   assert.deepEqual(chunks, [], 'only the durable public terminal is delivered');
 });
 
@@ -3972,7 +4022,7 @@ test('local_authoring mode: concrete tool-backed completion skips the redundant 
   assert.match(res.text, /wf_daily_digest/);
 });
 
-test('local_authoring mode: zero-tool completion claims are judged before success', async () => {
+test('local_authoring mode: zero-tool completion claims are judged and held without SDK re-entry', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
   const prompts: string[] = [];
@@ -3995,9 +4045,10 @@ test('local_authoring mode: zero-tool completion claims are judged before succes
 
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'create a daily digest workflow', sessionId: 'brain-author-zero-tool-claim' });
 
-  assert.equal(prompts.length, 2, 'zero-tool completion claim must be judged and continued');
-  assert.match(prompts[1], /no workflow_create evidence/);
-  assert.match(res.text, /wf_daily_digest/);
+  assert.equal(prompts.length, 1);
+  assert.equal(judged, 1);
+  assert.equal(res.stoppedReason, 'unverified');
+  assert.equal(res.text, 'Created workflow daily_digest.');
 });
 
 test('full mode: completion-judge kill-switch off ⇒ no judge call, no continuation', async () => {
@@ -4026,7 +4077,8 @@ test('turn-budget stop surfaces as max-turns-with-grace and writes user_input + 
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'a long multi-step task', sessionId: 'brain-limit' });
 
   assert.equal(res.stoppedReason, 'max-turns-with-grace');
-  assert.match(res.text, /Say "continue"/);
+  assert.match(res.text, /Progress is checkpointed/);
+  assert.doesNotMatch(res.text, /say\s+["']?continue/i);
   assert.equal(res.raw?.limitHit, true);
   const events = listEvents('brain-limit');
   const types = events.map((e) => (e as { type?: string }).type);
@@ -4035,14 +4087,15 @@ test('turn-budget stop surfaces as max-turns-with-grace and writes user_input + 
   assert.ok(types.includes('conversation_limit_exceeded'), 'limit event emitted for paused/stopped classification');
   assert.ok(
     types.indexOf('conversation_limit_exceeded') < types.indexOf('conversation_completed'),
-    'limit telemetry lands before the user-facing continue completion',
+    'limit telemetry lands before the user-facing checkpoint terminal',
   );
   const completed = events.find((e) => (e as { type?: string }).type === 'conversation_completed') as { data?: Record<string, unknown> } | undefined;
-  assert.equal(completed?.data?.reason, 'awaiting_continue');
-  assert.match(String(completed?.data?.reply ?? ''), /Say "continue"/);
+  assert.equal(completed?.data?.reason, 'sdk_step_budget_parked');
+  assert.equal((completed?.data?.presentation as { status?: string } | undefined)?.status, 'blocked');
+  assert.match(String(completed?.data?.reply ?? ''), /Progress is checkpointed/);
 });
 
-test('F1: a limit-hit WITH tool progress AUTO-CONTINUES and finishes (no park)', async () => {
+test('a limit-hit with tool progress checkpoints without SDK auto-continuation', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   let calls = 0;
@@ -4056,21 +4109,21 @@ test('F1: a limit-hit WITH tool progress AUTO-CONTINUES and finishes (no park)',
 
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'get deep SEO for 5 firms', sessionId: 'brain-autocont' });
 
-  assert.equal(calls, 2, 'auto-continued exactly once past the turn budget');
-  assert.equal(res.stoppedReason, 'success', 'finished, not parked');
-  assert.doesNotMatch(res.text, /Say "continue"/, 'no park prompt — it finished');
-  assert.match(res.text, /all 5 firms/);
-  assert.ok(listEvents('brain-autocont').some((e) => (e as { type?: string }).type === 'sdk_auto_continue'), 'auto-continue telemetry emitted');
+  assert.equal(calls, 1, 'the SDK cannot mint a second model step');
+  assert.equal(res.stoppedReason, 'max-turns-with-grace');
+  assert.match(res.text, /Did firms 1-2/);
+  assert.match(res.text, /Progress is checkpointed/);
+  assert.equal(listEvents('brain-autocont', { types: ['sdk_auto_continue'] }).length, 0);
 });
 
-test('F1: no forward progress (0 tool calls) does NOT auto-continue — still parks', async () => {
+test('a limit-hit with no progress checkpoints without SDK re-entry', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   let calls = 0;
   setClaudeAgentSdkBrainRunForTest(async () => { calls += 1; return { text: 'stuck', sessionId: 's', toolUses: [], limitHit: true }; });
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'x', sessionId: 'brain-autocont-noprog' });
-  assert.equal(calls, 1, 'a limit-hit with NO tool progress must not auto-continue (anti-loop)');
-  assert.match(res.text, /Say "continue"/);
+  assert.equal(calls, 1);
+  assert.match(res.text, /Progress is checkpointed/);
 });
 
 test('Stage 4 G1: the FOREGROUND brain inherits the preset run-token ceiling — exhaustion stops auto-continue', async () => {
@@ -4101,7 +4154,7 @@ test('Stage 4 G1: the FOREGROUND brain inherits the preset run-token ceiling —
   }
 });
 
-test('Stage 4 G1: session HISTORY never counts against the foreground window (self-baseline)', async () => {
+test('Stage 4 G1: session history does not grant the SDK another model step', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   process.env.HARNESS_MAX_RUN_TOKENS = '1000';
@@ -4116,14 +4169,15 @@ test('Stage 4 G1: session HISTORY never counts against the foreground window (se
       return { text: 'done', sessionId: 's', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: false };
     });
     const res = await respondViaClaudeAgentSdkBrain('home', { message: 'small task', sessionId: 'brain-budget-hist' });
-    assert.equal(calls, 2, 'history behind the baseline: the chain continues normally');
-    assert.equal(res.stoppedReason, 'success');
+    assert.equal(calls, 1, 'history cannot widen the one-window transport contract');
+    assert.equal(res.stoppedReason, 'max-turns-with-grace');
+    assert.match(res.text, /Progress is checkpointed/);
   } finally {
     delete process.env.HARNESS_MAX_RUN_TOKENS;
   }
 });
 
-test('H2: a skill loaded before the turn cap is RE-INJECTED into the auto-continue (not dropped)', async () => {
+test('a loaded skill cannot cause an SDK auto-continuation after the turn cap', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   createSession({ id: 'brain-skill-cont', kind: 'chat', title: 's' });
@@ -4164,14 +4218,12 @@ test('H2: a skill loaded before the turn cap is RE-INJECTED into the auto-contin
 
   await respondViaClaudeAgentSdkBrain('home', { message: 'run the seo report skill for the firm', sessionId: 'brain-skill-cont' });
 
-  assert.equal(calls, 2, 'auto-continued once');
-  // The continuation prompt (call 2) must carry the skill body — else the model
-  // would hand-roll the deliverable and get bounced by the skill-execution gate.
-  assert.match(prompts[1], /SEO_MAGIC_SCORE_XYZ/, 'the skill procedure was re-injected into the continuation');
-  assert.match(prompts[1], /KEEP FOLLOWING/);
+  assert.equal(calls, 1, 'loaded skill state cannot mint another SDK query');
+  assert.equal(prompts.length, 1);
+  assert.equal(listEvents('brain-skill-cont', { types: ['sdk_auto_continue'] }).length, 0);
 });
 
-test('F1: kill-switch CLEMMY_CLAUDE_SDK_AUTO_CONTINUE=off ⇒ parks on limit (prior behavior)', async () => {
+test('the retired SDK auto-continue setting cannot reopen a limit-hit turn', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   process.env.CLEMMY_CLAUDE_SDK_AUTO_CONTINUE = 'off';
@@ -4180,13 +4232,13 @@ test('F1: kill-switch CLEMMY_CLAUDE_SDK_AUTO_CONTINUE=off ⇒ parks on limit (pr
   try {
     const res = await respondViaClaudeAgentSdkBrain('home', { message: 'long task', sessionId: 'brain-autocont-off' });
     assert.equal(calls, 1, 'no auto-continue when the kill-switch is off');
-    assert.match(res.text, /Say "continue"/);
+    assert.match(res.text, /Progress is checkpointed/);
   } finally {
     delete process.env.CLEMMY_CLAUDE_SDK_AUTO_CONTINUE;
   }
 });
 
-test('max-turn stop publishes the complete committed continue guidance', async () => {
+test('max-turn stop publishes the complete committed checkpoint', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   const chunks: string[] = [];
@@ -4203,8 +4255,9 @@ test('max-turn stop publishes the complete committed continue guidance', async (
 
   assert.equal(res.stoppedReason, 'max-turns-with-grace');
   assert.deepEqual(chunks, []);
-  assert.match(res.text, /partial work so far\n\nI hit the turn budget/);
-  assert.match(res.text, /Say "continue"/);
+  assert.match(res.text, /partial work so far\n\nI paused at this step's budget/);
+  assert.match(res.text, /Progress is checkpointed/);
+  assert.doesNotMatch(res.text, /say\s+["']?continue/i);
 });
 
 test('looksLikeToolNarration flags described-but-not-called tool protocol, ignores real tool calls', () => {
@@ -4304,12 +4357,14 @@ test('renderClaudeAgentBrainSystemAppend injects the workspace primer for a "spa
     'dashboard', { sessionId: 'space-deal-risk', message: 'add a close-date filter' } as never, 'full');
   assert.match(out, /space_edit_view\('deal-risk'/);
   assert.match(out, /Deal Risk/);
-  // a plain (non-space) session gets no workspace primer
+  // A plain session still sees the names-only tool index, but it gets no
+  // workspace-specific primer or pre-bound workspace argument.
   const plain = renderClaudeAgentBrainSystemAppend('dashboard', { sessionId: 'sess-abc', message: 'hi' } as never, 'full');
-  assert.ok(!/space_edit_view/.test(plain));
+  assert.doesNotMatch(plain, /space_edit_view\('deal-risk'/);
+  assert.doesNotMatch(plain, /Deal Risk/);
 });
 
-test('full mode: a narrated (no-tool-call) turn triggers ONE retry that actually invokes the tool', async () => {
+test('full mode: narrated tool text fails over without another SDK query', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off'; // isolate the narration retry
@@ -4321,11 +4376,12 @@ test('full mode: a narrated (no-tool-call) turn triggers ONE retry that actually
       : { text: 'Pulled 5 accounts: Acme, Globex, Initech, Umbrella, Stark.', sessionId: 's', toolUses: ['mcp__clementine-local__run_shell_command'] };
   });
 
-  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 salesforce accounts', sessionId: 'brain-narrate' });
+  await assert.rejects(
+    respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 salesforce accounts', sessionId: 'brain-narrate' }),
+    /no real tool call was made/i,
+  );
 
-  assert.equal(calls.length, 2, 'narration triggered exactly one retry');
-  assert.match(calls[1], /INVOKE the real tool now/);
-  assert.match(res.text, /Pulled 5 accounts/);
+  assert.equal(calls.length, 1, 'narration cannot re-enter the standalone SDK');
 });
 
 test('limit-hit tool narration parks for continue instead of retrying inside the same turn', async () => {
@@ -4347,10 +4403,10 @@ test('limit-hit tool narration parks for continue instead of retrying inside the
 
   assert.equal(runs, 1, 'max-turn pause must not spend another SDK turn on narration retry');
   assert.equal(res.stoppedReason, 'max-turns-with-grace');
-  assert.match(res.text, /Say "continue"/);
+  assert.match(res.text, /Progress is checkpointed/);
 });
 
-test('local_authoring mode: a narrated workflow tool call triggers ONE retry', async () => {
+test('local_authoring mode: narrated workflow text fails over without another SDK query', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on'; // local_authoring
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off'; // isolate narration retry
@@ -4362,11 +4418,12 @@ test('local_authoring mode: a narrated workflow tool call triggers ONE retry', a
       : { text: 'Created workflow daily_digest.', sessionId: 's', toolUses: ['mcp__clementine-local__workflow_create'] };
   });
 
-  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'create a daily digest workflow', sessionId: 'brain-author-narrate' });
+  await assert.rejects(
+    respondViaClaudeAgentSdkBrain('home', { message: 'create a daily digest workflow', sessionId: 'brain-author-narrate' }),
+    /no real tool call was made/i,
+  );
 
-  assert.equal(calls.length, 2, 'local-authoring narration triggered exactly one retry');
-  assert.match(calls[1], /INVOKE the real tool now/);
-  assert.match(res.text, /Created workflow daily_digest/);
+  assert.equal(calls.length, 1);
 });
 
 // The verbatim internal-narration leak regression: the brain
@@ -4391,7 +4448,7 @@ test('looksLikeReasoningLeak flags injected-context deliberation with no work, i
   assert.equal(looksLikeReasoningLeak('', []), false);
 });
 
-test('a reasoning-leak (no-tool-call) turn triggers ONE retry that does the task', async () => {
+test('a reasoning leak cannot mint another SDK query', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off'; // isolate the leak retry
@@ -4405,9 +4462,9 @@ test('a reasoning-leak (no-tool-call) turn triggers ONE retry that does the task
 
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 priority accounts in SF', sessionId: 'brain-leak' });
 
-  assert.equal(calls.length, 2, 'reasoning leak triggered exactly one retry');
-  assert.match(calls[1], /TRUSTED context you OWN/);
-  assert.match(res.text, /Pulled 5 accounts/);
+  assert.equal(calls.length, 1);
+  assert.equal(res.stoppedReason, 'unverified');
+  assert.doesNotMatch(res.text, /Pulled 5 accounts/);
 });
 
 test('limit-hit reasoning leak parks for continue instead of retrying inside the same turn', async () => {
@@ -4424,7 +4481,7 @@ test('limit-hit reasoning leak parks for continue instead of retrying inside the
 
   assert.equal(runs, 1, 'max-turn pause must not spend another SDK turn on reasoning-leak retry');
   assert.equal(res.stoppedReason, 'max-turns-with-grace');
-  assert.match(res.text, /Say "continue"/);
+  assert.match(res.text, /Progress is checkpointed/);
 });
 
 test('frameTrustedMemory labels non-empty memory as trusted, passes empty through', () => {
@@ -4860,7 +4917,7 @@ test('Claude brain materializes one card per distinct request-owned payload and 
   );
 });
 
-test('Claude brain reconciles a queued approval edge created by a corrective continuation', async () => {
+test('Claude brain cannot create a queued approval from a corrective SDK continuation', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
@@ -4914,19 +4971,18 @@ test('Claude brain reconciles a queued approval edge created by a corrective con
     };
   });
 
-  const response = await respondViaClaudeAgentSdkBrain('home', {
-    message: 'Queue this exact email and ask whether I want it sent.',
-    sessionId,
-  });
+  await assert.rejects(
+    respondViaClaudeAgentSdkBrain('home', {
+      message: 'Queue this exact email and ask whether I want it sent.',
+      sessionId,
+    }),
+    /no real tool call was made/i,
+  );
 
-  assert.equal(calls, 2, 'the existing narration repair is the only continuation spent');
-  assert.equal(response.stoppedReason, 'pending-approval');
-  assert.ok(response.pendingApprovalId);
-  assert.equal(approvalRegistry.listPending({ sessionId, status: 'pending' }).length, 1);
-  assert.equal(pendingActions.getPendingAction(pendingActionId)?.approvalId, response.pendingApprovalId);
-  assert.equal(listEvents(sessionId, { types: ['approval_requested'] }).length, 1);
-  assert.equal(listEvents(sessionId, { types: ['approval_parked'] }).length, 1);
-  assert.equal(listEvents(sessionId, { types: ['awaiting_user_input'] }).length, 0);
+  assert.equal(calls, 1);
+  assert.equal(pendingActionId, '');
+  assert.equal(approvalRegistry.listPending({ sessionId, status: 'pending' }).length, 0);
+  assert.equal(listEvents(sessionId, { types: ['approval_requested', 'approval_parked'] }).length, 0);
 });
 
 test('Claude brain keeps a premature queued payload inert while asking for missing account scope', async () => {
@@ -5281,7 +5337,7 @@ test('overflow A2: an UNCOMMITTED context overflow retries ONCE with reduced con
   assert.ok(!(retry.turnContext ?? '').includes('[MEMORY PRIMER]'), 'unified recall section dropped on the retry');
 });
 
-test('A3: the auto-continue prompt carries the tool-call recall ledger (callIds for tool_output_query)', async () => {
+test('a limit-hit tool ledger cannot cause SDK auto-continuation', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   let calls = 0;
@@ -5303,12 +5359,12 @@ test('A3: the auto-continue prompt carries the tool-call recall ledger (callIds 
     return { text: 'All 100 leads done.', sessionId: 's', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: false };
   });
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'scrape 100 leads', sessionId: 'brain-ledger' });
-  assert.equal(calls, 2);
-  assert.match(res.text, /All 100 leads done/);
-  const contPrompt = prompts[1];
-  assert.match(contPrompt, /tool_output_query/, 'ledger instruction present');
-  assert.match(contPrompt, /toolu_abc123/, 'earlier callId handed to the continuation');
-  assert.match(contPrompt, /APIFY_GET_DATASET_ITEMS/, 'args preview present');
+  assert.equal(calls, 1);
+  assert.equal(prompts.length, 1);
+  assert.equal(res.stoppedReason, 'max-turns-with-grace');
+  assert.match(res.text, /Scraped 60 of 100 leads/);
+  assert.match(res.text, /Progress is checkpointed/);
+  assert.equal(listEvents('brain-ledger', { types: ['sdk_auto_continue'] }).length, 0);
 });
 
 test('overflow A2: committed overflow with ZERO external writes falls through to the reduced retry (reads are safe)', async () => {
@@ -5330,19 +5386,49 @@ test('overflow A2: committed overflow with ZERO external writes falls through to
   assert.match(res.text, /finished after retry/);
 });
 
-test('brain runOptions demand the recovery/acquisition kernel so tool starvation throws instead of running blind', async () => {
+test('brain runOptions mount no tools for direct replies and retain the recovery/acquisition kernel for retrieval', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
-  let seen: string[] | undefined;
+  const seen: Array<{
+    message: string;
+    allowed: string[] | undefined;
+    mcp: string[] | undefined;
+    universe: string[] | undefined;
+    required: string[] | undefined;
+    nativeMaxTools: number | undefined;
+    nativeSlugs: string[] | undefined;
+  }> = [];
   setClaudeAgentSdkBrainRunForTest(async (opts: any) => {
-    seen = opts.requiredLocalMcpTools;
+    seen.push({
+      message: String(opts.prompt ?? ''),
+      allowed: opts.allowedLocalMcpTools,
+      mcp: opts.mcpToolAllowlist,
+      universe: opts.localMcpToolUniverse,
+      required: opts.requiredLocalMcpTools,
+      nativeMaxTools: opts.nativeMcpToolScope?.maxTools,
+      nativeSlugs: opts.nativeMcpToolScope?.allowedServerSlugs,
+    });
     return { text: 'ok', toolUses: [] };
   });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'ok' }));
   await respondViaClaudeAgentSdkBrain('home', { message: 'hi', sessionId: 'sentinel-check' });
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Summarize the notes about project alpha.',
+    sessionId: 'sentinel-retrieve-check',
+  });
   assert.deepEqual(
-    seen,
+    seen[0]?.required,
+    [],
+    'a direct reply cannot inherit an acquisition or business tool surface',
+  );
+  assert.deepEqual(seen[0]?.allowed, [], 'a direct reply permits no local runtime tool');
+  assert.deepEqual(seen[0]?.mcp, [], 'a direct reply loads no local MCP schema');
+  assert.deepEqual(seen[0]?.universe, [], 'a direct reply has no deferred local capability universe');
+  assert.equal(seen[0]?.nativeMaxTools, 0, 'a direct reply permits no external native MCP tool');
+  assert.deepEqual(seen[0]?.nativeSlugs, [], 'a direct reply permits no external MCP server');
+  assert.deepEqual(
+    seen[1]?.required,
     ['memory_recall_all', 'tool_search', 'call_tool'],
-    'memory plus schema-on-demand acquisition must exist on every full brain run',
+    'a retrieval turn retains the bounded recovery and schema-on-demand kernel',
   );
 });

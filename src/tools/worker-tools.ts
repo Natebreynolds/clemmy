@@ -105,14 +105,27 @@ export function pickSdkBrainWorkerLane(
   };
 }
 
-/** Pick the worker model + execution lane for the Claude SDK brain, honoring an
- *  intent-scoped WORKER binding. Fails open to the Claude brain model. */
-export function resolveSdkBrainWorker(intent?: string): SdkBrainWorkerRoute {
+/** Pick the worker model + execution lane for the Claude SDK brain, honoring
+ *  (in order) an exact per-packet model, then an intent-scoped WORKER binding.
+ *  Fails open to the Claude brain model — NEVER refuses a dispatch (ONE LOOP,
+ *  MANY BRAINS: an unroutable packet model falls through the chain). */
+export function resolveSdkBrainWorker(intent?: string, packetModel?: string): SdkBrainWorkerRoute {
   let resolvedId: string | undefined;
   let resolvedProvider: ModelProviderClass | undefined;
   let resolvedSource: ModelRouteDecisionSource | undefined;
   let resolvedPolicy: SdkBrainWorkerRoute['policy'];
-  try {
+  const exact = packetModel?.trim();
+  if (exact) {
+    try {
+      const provider = resolveEffectiveProviderForModel(exact);
+      if (provider) {
+        resolvedId = exact;
+        resolvedProvider = provider;
+        resolvedSource = 'binding';
+      }
+    } catch { /* unroutable packet model → intent/role chain below */ }
+  }
+  if (!resolvedId) try {
     const resolved = resolveRoleModel('worker', intent);
     resolvedId = resolved.modelId;
     resolvedProvider = resolved.provider;
@@ -204,7 +217,7 @@ export function registerWorkerTools(server: McpServer): void {
         : null;
       const { items: _batch, ...packetRaw } = call;
       // One authority-derived packet shape across SDK-brain, orchestrator and
-      // code-mode worker lanes. Model-provided expectedWork is only a hint;
+      // nested carrier worker lanes. Model-provided expectedWork is only a hint;
       // the durable accepted-task contract supplies the binding when proven.
       const packetBase = bindWorkerPacketExpectedWork({
         packet: packetRaw,
@@ -452,12 +465,12 @@ export function registerWorkerTools(server: McpServer): void {
       // kill) — the item routes into the honest N-of-M partial path. Fail-open.
       const fanoutBudget = fanoutBudgetStatus(sessionId);
       if (fanoutBudget?.exceeded) {
-        const msg = `ERROR: worker for "${input.item}" was NOT started — this run's token budget is exhausted (${formatTokens(fanoutBudget.usedWindow)}/${formatTokens(fanoutBudget.ceiling)} uncached tokens used). Report this item as not-attempted; the user can say "continue" to open a fresh budget window.`;
+        const msg = `ERROR: worker for "${input.item}" was NOT started — this run's token budget is exhausted (${formatTokens(fanoutBudget.usedWindow)}/${formatTokens(fanoutBudget.ceiling)} uncached tokens used). Report this item as not-attempted; a fresh budget window opens on the run's next pass.`;
         recordResult(false, firstLine(msg));
         return textResult(msg);
       }
 
-      const route = resolveSdkBrainWorker(input.intent || undefined);
+      const route = resolveSdkBrainWorker(input.intent || undefined, input.model || undefined);
       let workerModel = getSessionWorkerModelOverride(getToolOutputContext()?.sessionId) ?? route.modelId;
       const transport = route.claudeLane ? 'claude_agent_sdk' : 'cross_provider';
       // Visible warning when a configured non-Claude worker model is IGNORED
@@ -595,7 +608,7 @@ export function registerWorkerTools(server: McpServer): void {
         // cross-provider @openai/agents Worker the orchestrator lane fans out
         // (lazy import: worker-tools loads into the SDK-brain MCP child; the
         // cross-provider runner drags in the whole agent surface, so keep it out
-        // of the module graph — mirrors code-mode-tool's runtime imports).
+        // of the module graph — mirrors inner-dispatch's runtime imports).
         assertWorkerMayStart();
         const result: { text: string; model?: string } = route.claudeLane
           ? await runClaudeAgentSdkWorker(

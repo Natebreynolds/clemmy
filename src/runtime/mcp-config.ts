@@ -168,4 +168,63 @@ export function saveUserMcpServers(servers: Record<string, Partial<ManagedMcpSer
   writeFileSync(MCP_SERVERS_FILE, JSON.stringify(servers, null, 2), { encoding: 'utf-8', mode: 0o600 });
   hardenUserMcpConfigPermissions();
   invalidateMcpServerDiscoveryCache();
+  // CONNECT-TIME INDEXING. This is the single config-write funnel — console
+  // routes, the agent's own mcp_add/mcp_configure, and plugin installs all pass
+  // through here — so it is where a newly added server becomes indexable. The
+  // listing itself is detached: adding a server must not block on starting it.
+  scheduleUserMcpCapabilityIndex();
+}
+
+/**
+ * Enumerate every enabled MCP server's tools into the capability index.
+ * Detached and best-effort: a server that will not start simply stays
+ * unindexed, and retrieval falls back to live discovery.
+ */
+export function scheduleUserMcpCapabilityIndex(): void {
+  void (async () => {
+    try {
+      const [{ getOrCreateExternalMcpServers }, { slugifyServerName }, { indexMcpServerTools }] =
+        await Promise.all([
+          import('./mcp-servers.js'),
+          import('./mcp-namespace-shim.js'),
+          import('./local-capability-enumeration.js'),
+        ]);
+      // The exact provisioned set, named explicitly: a scope with no slugs is a
+      // denial, not "everything", so enumeration must list what the user
+      // actually enabled. Read from this module's own config — enabled state
+      // lives here, so no import back through the server factory is needed.
+      const allowedServerSlugs = Object.entries(loadUserMcpServers())
+        .filter(([, server]) => server?.enabled !== false)
+        .map(([name, server]) => slugifyServerName(server?.name ?? name))
+        .filter(Boolean);
+      if (allowedServerSlugs.length === 0) return;
+      const shim = getOrCreateExternalMcpServers({
+        reason: 'capability index: enumerate provisioned MCP servers',
+        authority: 'catalog',
+        allowedServerSlugs,
+      }) as unknown as { listTools?: () => Promise<Array<{ name: string; description?: unknown }>> };
+      if (typeof shim?.listTools !== 'function') return;
+      const tools = await shim.listTools();
+      // `inputSchema` is named here on purpose: the whole tool object is
+      // bucketed, and the indexer deposits the schema the server already
+      // published (CAT-7). A narrower type would erase the field from view and
+      // invite a future tidy-up that silently reopens the discard.
+      const byServer = new Map<string, Array<{
+        name: string;
+        description?: unknown;
+        inputSchema?: unknown;
+      }>>();
+      for (const tool of tools ?? []) {
+        const name = String(tool?.name ?? '').replace(/^mcp__/, '');
+        const server = name.includes('__') ? name.split('__')[0] ?? '' : '';
+        if (!server) continue;
+        const bucket = byServer.get(server) ?? [];
+        bucket.push(tool);
+        byServer.set(server, bucket);
+      }
+      for (const [server, serverTools] of byServer) {
+        indexMcpServerTools(server, serverTools);
+      }
+    } catch { /* connect-time indexing is best-effort by construction */ }
+  })();
 }

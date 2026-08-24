@@ -10,6 +10,10 @@ import type {
   WorkflowStepInputBinding,
   WorkflowStepOutputContract,
 } from '../memory/workflow-store.js';
+import {
+  parseWorkflowNodeInvocationPlan,
+  type WorkflowNodeInvocationPlanV1,
+} from '../memory/workflow-node-invocation-plan.js';
 
 export type WorkflowGraphNodeType =
   | 'step'
@@ -39,6 +43,7 @@ export interface WorkflowGraphNode {
   maxTurns?: number;
   forEach?: string;
   deterministic?: { runner: string };
+  invocationPlan?: WorkflowNodeInvocationPlanV1;
   allowedTools?: string[];
   sideEffect?: 'read' | 'write' | 'send';
   usesSkill?: string;
@@ -195,10 +200,12 @@ export function compileWorkflowStepsToGraph(
           specialist.prompt.trim(),
           `Return a compact, evidence-grounded result for reducer "${step.id}". Do not perform external writes or sends.`,
         ].join('\n\n'),
-        model: specialist.model,
-        intent: specialist.intent ?? step.intent,
-        maxTurns: specialist.maxTurns,
-        inputs: step.inputs,
+        ...(specialist.model ? { model: specialist.model } : {}),
+        ...(specialist.intent ?? step.intent
+          ? { intent: specialist.intent ?? step.intent }
+          : {}),
+        ...(specialist.maxTurns !== undefined ? { maxTurns: specialist.maxTurns } : {}),
+        ...(step.inputs ? { inputs: step.inputs } : {}),
         sideEffect: 'read',
         allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS],
         requiresApproval: false,
@@ -245,13 +252,13 @@ export function compileWorkflowStepsToGraph(
   }
 
   return {
-    id: opts.id,
-    name: opts.name,
-    version: opts.version,
+    ...(opts.id !== undefined ? { id: opts.id } : {}),
+    ...(opts.name !== undefined ? { name: opts.name } : {}),
+    ...(opts.version !== undefined ? { version: opts.version } : {}),
     nodes,
     edges,
     entryNodeIds: computeEntryNodeIds(nodes, edges),
-    metadata: opts.metadata,
+    ...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
   };
 }
 
@@ -286,6 +293,28 @@ export function validateWorkflowGraph(graph: WorkflowGraphDefinition): WorkflowG
 
     if (node.type === 'side_effect' && !node.sideEffect) {
       errors.push(`Side-effect node "${id}" must declare sideEffect.`);
+    }
+    if (node.invocationPlan !== undefined) {
+      const parsed = parseWorkflowNodeInvocationPlan(node.invocationPlan);
+      if (!parsed.ok) {
+        errors.push(`Node "${id}" has an invalid invocation plan: ${parsed.errors.join(' ')}`);
+      } else if (parsed.plan.binding.effect !== 'read') {
+        errors.push(`Node "${id}" invocation plan effect must be read; compute purity is not represented yet.`);
+      }
+      if (node.type !== 'step') {
+        errors.push(`Node "${id}" invocation plan must remain a first-class step node.`);
+      }
+      if (node.sideEffect !== 'read') {
+        errors.push(`Node "${id}" invocation plan must remain read-class in workflow graph v1.`);
+      }
+      if (
+        node.deterministic
+        || node.loopUntil
+        || node.requiresApproval
+        || (node.allowedTools?.length ?? 0) > 0
+      ) {
+        errors.push(`Node "${id}" invocation plan cannot combine with script, loop, generic approval, or name-based tool authority.`);
+      }
     }
     if (node.sideEffect === 'send' && node.requiresApproval !== true) {
       warnings.push(`Send-class node "${id}" has no declarative approval gate.`);
@@ -467,23 +496,28 @@ function stepToGraphNode(step: WorkflowStepInput): WorkflowGraphNode {
     type: isReducer ? 'join' : 'step',
     stepId: step.id,
     label: step.id,
-    prompt: step.prompt,
-    model: step.model,
-    intent: step.intent,
-    tier: step.tier,
-    maxTurns: step.maxTurns,
-    forEach: isReducer ? undefined : step.forEach,
-    deterministic: isReducer ? undefined : step.deterministic,
-    allowedTools: isReducer ? [...WORKFLOW_GRAPH_ALLOWED_TOOLS] : step.allowedTools,
-    sideEffect: isReducer ? 'read' : step.sideEffect,
-    usesSkill: isReducer ? undefined : step.usesSkill,
-    requiresApproval: isReducer ? false : step.requiresApproval,
-    approvalPreview: isReducer ? undefined : step.approvalPreview,
-    inputs: step.inputs,
-    output: step.output,
-    retryBudget: step.retryBudget,
-    loopUntil: isReducer ? undefined : step.loopUntil,
-    loopSafe: isReducer ? undefined : step.loopSafe,
+    ...(step.prompt !== undefined ? { prompt: step.prompt } : {}),
+    ...(step.model !== undefined ? { model: step.model } : {}),
+    ...(step.intent !== undefined ? { intent: step.intent } : {}),
+    ...(step.tier !== undefined ? { tier: step.tier } : {}),
+    ...(step.maxTurns !== undefined ? { maxTurns: step.maxTurns } : {}),
+    ...(!isReducer && step.forEach !== undefined ? { forEach: step.forEach } : {}),
+    ...(!isReducer && step.deterministic !== undefined ? { deterministic: step.deterministic } : {}),
+    ...(!isReducer && step.invocationPlan !== undefined ? { invocationPlan: step.invocationPlan } : {}),
+    ...(isReducer
+      ? { allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS] }
+      : step.allowedTools !== undefined
+        ? { allowedTools: step.allowedTools }
+        : {}),
+    ...(isReducer ? { sideEffect: 'read' as const } : step.sideEffect !== undefined ? { sideEffect: step.sideEffect } : {}),
+    ...(!isReducer && step.usesSkill !== undefined ? { usesSkill: step.usesSkill } : {}),
+    ...(isReducer ? { requiresApproval: false } : step.requiresApproval !== undefined ? { requiresApproval: step.requiresApproval } : {}),
+    ...(!isReducer && step.approvalPreview !== undefined ? { approvalPreview: step.approvalPreview } : {}),
+    ...(step.inputs !== undefined ? { inputs: step.inputs } : {}),
+    ...(step.output !== undefined ? { output: step.output } : {}),
+    ...(step.retryBudget !== undefined ? { retryBudget: step.retryBudget } : {}),
+    ...(!isReducer && step.loopUntil !== undefined ? { loopUntil: step.loopUntil } : {}),
+    ...(!isReducer && step.loopSafe !== undefined ? { loopSafe: step.loopSafe } : {}),
     ...(isReducer
       ? {
           config: {
@@ -548,6 +582,9 @@ function cloneNode(node: WorkflowGraphNode): WorkflowGraphNode {
   return {
     ...node,
     deterministic: node.deterministic ? { ...node.deterministic } : undefined,
+    invocationPlan: node.invocationPlan
+      ? structuredClone(node.invocationPlan)
+      : undefined,
     allowedTools: node.allowedTools ? [...node.allowedTools] : undefined,
     inputs: cloneRecord(node.inputs) as Record<string, WorkflowStepInputBinding> | undefined,
     output: cloneRecord(node.output) as WorkflowStepOutputContract | undefined,

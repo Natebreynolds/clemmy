@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
@@ -18,6 +19,7 @@ const identities = await import('./attempt-identity.js');
 const outcomes = await import('./attempt-outcome.js');
 const store = await import('./logical-call-settlement-store.js');
 const contracts = await import('./logical-call-contract.js');
+const crossingAuthority = await import('./settlement-crossing-authority.js');
 const governorModule = await import('./discovery-governor.js');
 const resultHandles = await import('./result-handle.js');
 
@@ -243,6 +245,464 @@ test('one transaction freezes exact paid crossings, mirrors once, closes by CAS,
   );
 });
 
+test('v2 provider crossing result redemption verifies terminal state and provider site', () => {
+  const task = accept('Read the current provider records.');
+  const call = admitProviderCall({
+    task,
+    logicalToolCallId: 'logical:v2-provider-redemption',
+    physicalDispatchId: 'dispatch:v2-provider-redemption',
+    args: { query: 'provider-v2' },
+  });
+  const committed = store.commitLogicalCallSettlement(successInput({
+    task,
+    logicalToolCallId: call.identity.logicalToolCallId,
+    tool: call.tool,
+    args: call.args,
+  }));
+  assert.equal(committed.status, 'committed');
+  if (committed.status !== 'committed') return;
+  assert.equal(committed.settlement.crossingAuthorityVersion, 2);
+  assert.equal(committed.settlement.physicalCrossingCount, 1);
+  assert.equal(committed.settlement.hostCrossingCount, 0);
+  assert.deepEqual(committed.settlement.crossings.map((crossing) => ({
+    terminalState: crossing.terminalState,
+    executionSite: crossing.executionSite ?? null,
+  })), [{ terminalState: 'returned', executionSite: null }]);
+
+  const redeemed = resultHandles.redeemSuccessfulSettlementResultForHost({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    logicalToolCallId: call.identity.logicalToolCallId,
+  });
+  assert.equal(redeemed.status, 'ok', JSON.stringify(redeemed));
+  if (redeemed.status === 'ok') assert.equal(redeemed.value.executionSite, 'provider');
+});
+
+test('returned uncertain write retains one forensic raw handle without becoming success authority', () => {
+  const task = accept('Create one Sheet, but do not repeat an ambiguous provider return.');
+  const tool = 'GOOGLESHEETS_SHEET_FROM_JSON';
+  const args = { title: 'Restaurants', sheet_json: '[{"name":"A"}]' };
+  const call = admitProviderCall({
+    task,
+    logicalToolCallId: 'logical:uncertain-returned',
+    physicalDispatchId: 'dispatch:uncertain-returned',
+    tool,
+    args,
+  });
+  const payload = { successful: true, message: 'created', opaque: { token: 'raw-return-7' } };
+  const input: store.CommitLogicalCallSettlementInput = {
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId: call.identity.logicalToolCallId,
+    },
+    contract: { toolName: tool, args },
+    execution: { kind: 'provider_execution' },
+    result: { payload },
+    outcome: outcomes.classifyAttemptOutcome({ mutating: true, acknowledged: false }),
+    recovery: { businessCall: true, mutating: true },
+    observer: { lane: 'composio', turn: task.turn },
+  };
+  const committed = store.commitLogicalCallSettlement(input);
+  assert.equal(committed.status, 'committed', JSON.stringify(committed));
+  if (committed.status !== 'committed') return;
+  assert.equal(committed.settlement.outcome.kind, 'uncertain_write');
+  assert.equal(committed.settlement.outcome.directive.retrySameCandidate, false);
+  assert.equal(committed.settlement.resultHandleId, undefined);
+  assert.equal(committed.settlement.physicalCrossingCount, 1);
+  assert.equal(committed.settlement.hostCrossingCount, 0);
+
+  const db = eventlog.openEventLog();
+  const row = db.prepare(`
+    SELECT h.handle_id, h.raw_location, h.raw_payload_json, h.raw_payload_sha256,
+           h.raw_byte_count, s.result_handle_id
+      FROM durable_result_handles h
+      JOIN logical_call_settlements s
+        ON s.session_id = h.session_id
+       AND s.source_user_seq = h.source_user_seq
+       AND s.logical_tool_call_id = h.logical_tool_call_id
+     WHERE h.session_id = ? AND h.source_user_seq = ?
+       AND h.logical_tool_call_id = ? AND h.physical_dispatch_id = ?
+  `).get(
+    task.sessionId,
+    task.sourceUserSeq,
+    call.identity.logicalToolCallId,
+    call.identity.physicalDispatchId,
+  ) as {
+    handle_id: string;
+    raw_location: string;
+    raw_payload_json: string;
+    raw_payload_sha256: string;
+    raw_byte_count: number;
+    result_handle_id: string | null;
+  };
+  const rawJson = JSON.stringify(payload);
+  const canonicalToolName = contracts.durableLogicalCallContract(task.acceptedTaskId, tool, args)?.toolName;
+  assert.ok(canonicalToolName);
+  assert.deepEqual({
+    settlementHandle: row.result_handle_id,
+    rawJson: row.raw_payload_json,
+    rawDigest: row.raw_payload_sha256,
+    rawBytes: row.raw_byte_count,
+  }, {
+    settlementHandle: null,
+    rawJson,
+    rawDigest: createHash('sha256').update(rawJson).digest('hex'),
+    rawBytes: Buffer.byteLength(rawJson, 'utf8'),
+  });
+  const mirror = eventlog.listEvents(task.sessionId, { types: ['tool_attempt_settled'] })[0];
+  assert.equal(mirror?.data.resultHandleId, undefined,
+    'uncertain forensic bytes are never advertised as settlement success authority');
+  assert.equal(resultHandles.redeemSuccessfulSettlementResultForHost({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    logicalToolCallId: call.identity.logicalToolCallId,
+  }).status, 'missing');
+
+  eventlog.closeEventLog();
+  const exactAuthority: resultHandles.ResultHandleAuthority = {
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    logicalToolCallId: call.identity.logicalToolCallId,
+    physicalDispatchId: call.identity.physicalDispatchId,
+    toolName: tool,
+    args,
+  };
+  assert.deepEqual(resultHandles.redeemAuthoritativeResultPayload({
+    kind: 'returned_handle',
+    rawLocation: row.raw_location,
+    authority: exactAuthority,
+  }), {
+    status: 'ok',
+    value: {
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId: call.identity.logicalToolCallId,
+      physicalDispatchId: call.identity.physicalDispatchId,
+      resultHandleId: row.handle_id,
+      toolName: canonicalToolName,
+      rawLocation: row.raw_location,
+      rawPayload: payload,
+      rawPayloadJson: rawJson,
+      rawPayloadSha256: row.raw_payload_sha256,
+      rawByteCount: row.raw_byte_count,
+    },
+  });
+  for (const changed of [
+    { ...exactAuthority, acceptedTaskId: 'task:other' },
+    { ...exactAuthority, logicalToolCallId: 'logical:other' },
+    { ...exactAuthority, physicalDispatchId: 'dispatch:other' },
+    { ...exactAuthority, toolName: 'GOOGLESHEETS_SHEET_FROM_JSON_LOOKALIKE' },
+    { ...exactAuthority, args: { ...args, title: 'Other' } },
+  ]) {
+    assert.notEqual(resultHandles.redeemAuthoritativeResultPayload({
+      kind: 'returned_handle',
+      rawLocation: row.raw_location,
+      authority: changed,
+    }).status, 'ok');
+  }
+
+  const replay = store.commitLogicalCallSettlement(input);
+  assert.equal(replay.status, 'replayed');
+  assert.equal((eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM durable_result_handles
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, call.identity.logicalToolCallId) as { n: number }).n, 1);
+  assert.equal((eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, call.identity.logicalToolCallId) as { n: number }).n, 1);
+
+  const conflicting = store.commitLogicalCallSettlement({
+    ...input,
+    result: { payload: { ...payload, opaque: { token: 'different-return' } } },
+  });
+  assert.equal(conflicting.status, 'conflict');
+});
+
+test('thrown or timed-out uncertain writes retain no result handle', () => {
+  for (const terminalState of ['threw', 'timed_out'] as const) {
+    const task = accept(`Do not fabricate bytes for a ${terminalState} write.`);
+    const tool = 'GOOGLESHEETS_SHEET_FROM_JSON';
+    const args = { title: terminalState };
+    const logicalToolCallId = `logical:uncertain-${terminalState}`;
+    const started = dispatch.beginPhysicalDispatch({
+      identity: {
+        ...task,
+        logicalToolCallId,
+        physicalDispatchId: `dispatch:uncertain-${terminalState}`,
+        ordinal: 0,
+      },
+      tool,
+      args,
+    });
+    assert.equal(started.status, 'inserted');
+    if (started.status !== 'inserted') continue;
+    assert.equal(dispatch.settlePhysicalDispatch({
+      identity: started.identity,
+      tool,
+      outcome: terminalState,
+    }).status, 'inserted');
+    const committed = store.commitLogicalCallSettlement({
+      identity: {
+        sessionId: task.sessionId,
+        sourceUserSeq: task.sourceUserSeq,
+        acceptedTaskId: task.acceptedTaskId,
+        logicalToolCallId,
+      },
+      contract: { toolName: tool, args },
+      execution: { kind: 'provider_execution' },
+      outcome: outcomes.classifyAttemptOutcome({ mutating: true, acknowledged: false }),
+      recovery: { businessCall: true, mutating: true },
+      observer: { lane: 'composio', turn: task.turn },
+    });
+    assert.equal(committed.status, 'committed', JSON.stringify(committed));
+    if (committed.status !== 'committed') continue;
+    assert.equal(committed.settlement.resultHandleId, undefined);
+    assert.equal((eventlog.openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM durable_result_handles
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(task.sessionId, task.sourceUserSeq, logicalToolCallId) as { n: number }).n, 0);
+  }
+});
+
+test('a returned uncertain write with no actual provider payload retains no handle', () => {
+  const task = accept('Do not fabricate reconciliation bytes when the adapter has no returned payload.');
+  const tool = 'GOOGLESHEETS_SHEET_FROM_JSON';
+  const args = { title: 'No payload' };
+  const call = admitProviderCall({
+    task,
+    logicalToolCallId: 'logical:uncertain-returned-without-payload',
+    physicalDispatchId: 'dispatch:uncertain-returned-without-payload',
+    tool,
+    args,
+  });
+  const committed = store.commitLogicalCallSettlement({
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId: call.identity.logicalToolCallId,
+    },
+    contract: { toolName: tool, args },
+    execution: { kind: 'provider_execution' },
+    result: { payload: undefined },
+    outcome: outcomes.classifyAttemptOutcome({ mutating: true, acknowledged: false }),
+    recovery: { businessCall: true, mutating: true },
+    observer: { lane: 'composio', turn: task.turn },
+  });
+  assert.equal(committed.status, 'committed', JSON.stringify(committed));
+  if (committed.status !== 'committed') return;
+  assert.equal(committed.settlement.outcome.kind, 'uncertain_write');
+  assert.equal(committed.settlement.resultHandleId, undefined);
+  assert.equal((eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM durable_result_handles
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, call.identity.logicalToolCallId) as { n: number }).n, 0);
+});
+
+test('oversized settlement binds off-row digest, byte count, location, and crossing authority across restart', () => {
+  const task = accept('Read the one authoritative oversized provider result.');
+  const call = admitProviderCall({
+    task,
+    logicalToolCallId: 'logical:oversized-settlement-redemption',
+    physicalDispatchId: 'dispatch:oversized-settlement-redemption',
+    args: { query: 'oversized-settlement' },
+  });
+  const tail = 'SETTLEMENT_RAW_TAIL_EXACT';
+  const payload = {
+    successful: true,
+    data: {
+      records: [{
+        id: 'oversized-settlement-row',
+        blob: `${'s'.repeat(resultHandles.RESULT_RAW_MAX_BYTES + 1)}${tail}`,
+      }],
+    },
+    meta: { complete: true },
+  };
+  const rawJson = JSON.stringify(payload);
+  const input = {
+    ...successInput({
+      task,
+      logicalToolCallId: call.identity.logicalToolCallId,
+      tool: call.tool,
+      args: call.args,
+    }),
+    result: { payload },
+  } satisfies store.CommitLogicalCallSettlementInput;
+  const committed = store.commitLogicalCallSettlement(input);
+  assert.equal(committed.status, 'committed', JSON.stringify(committed));
+  if (committed.status !== 'committed') return;
+
+  const row = eventlog.openEventLog().prepare(`
+    SELECT h.raw_location, h.raw_payload_json, h.raw_payload_sha256,
+           h.raw_byte_count, h.rejection_reason,
+           s.result_handle_id, s.crossing_authority_version
+      FROM logical_call_settlements s
+      JOIN durable_result_handles h ON h.handle_id = s.result_handle_id
+     WHERE s.session_id = ? AND s.source_user_seq = ? AND s.logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, call.identity.logicalToolCallId) as {
+    raw_location: string;
+    raw_payload_json: string;
+    raw_payload_sha256: string;
+    raw_byte_count: number;
+    rejection_reason: string | null;
+    result_handle_id: string;
+    crossing_authority_version: number;
+  };
+  assert.deepEqual({
+    location: row.raw_location,
+    sentinel: row.raw_payload_json,
+    digest: row.raw_payload_sha256,
+    bytes: row.raw_byte_count,
+    rejection: row.rejection_reason,
+    handle: row.result_handle_id,
+    authorityVersion: row.crossing_authority_version,
+  }, {
+    location: `tool_output:${row.result_handle_id}`,
+    sentinel: '',
+    digest: createHash('sha256').update(rawJson).digest('hex'),
+    bytes: Buffer.byteLength(rawJson, 'utf8'),
+    rejection: null,
+    handle: committed.settlement.resultHandleId,
+    authorityVersion: 2,
+  });
+
+  eventlog.closeEventLog();
+  const redeemed = resultHandles.redeemAuthoritativeResultPayload({
+    kind: 'successful_settlement',
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    logicalToolCallId: call.identity.logicalToolCallId,
+  });
+  assert.equal(redeemed.status, 'ok', JSON.stringify(redeemed));
+  if (redeemed.status === 'ok') {
+    assert.equal((redeemed.value.rawPayload as typeof payload).data.records[0]?.blob.endsWith(tail), true);
+    assert.equal(redeemed.value.rawPayloadJson, rawJson);
+    assert.equal(redeemed.value.rawPayloadSha256, row.raw_payload_sha256);
+    assert.equal(redeemed.value.rawByteCount, row.raw_byte_count);
+  }
+});
+
+test('v2 host crossing result redemption verifies terminal state and host site', () => {
+  const task = accept('Read the current local records.');
+  const tool = 'workspace_roots';
+  const args = {};
+  const logicalToolCallId = 'logical:v2-host-redemption';
+  const started = dispatch.beginPhysicalDispatch({
+    identity: {
+      ...task,
+      logicalToolCallId,
+      physicalDispatchId: 'dispatch:v2-host-redemption',
+      ordinal: 0,
+    },
+    tool,
+    args,
+    executionSite: 'host',
+  });
+  assert.equal(started.status, 'inserted');
+  if (started.status !== 'inserted') return;
+  assert.equal(dispatch.settlePhysicalDispatch({
+    identity: started.identity,
+    tool,
+    outcome: 'returned',
+  }).status, 'inserted');
+  const committed = store.commitLogicalCallSettlement({
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId,
+    },
+    contract: { toolName: tool, args },
+    execution: { kind: 'local_execution' },
+    result: { payload: { successful: true, data: { roots: ['/workspace'] } } },
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: false },
+    observer: { lane: 'byo', turn: task.turn },
+  });
+  assert.equal(committed.status, 'committed');
+  if (committed.status !== 'committed') return;
+  assert.equal(committed.settlement.crossingAuthorityVersion, 2);
+  assert.equal(committed.settlement.physicalCrossingCount, 0);
+  assert.equal(committed.settlement.hostCrossingCount, 1);
+  assert.deepEqual(committed.settlement.crossings.map((crossing) => ({
+    terminalState: crossing.terminalState,
+    executionSite: crossing.executionSite ?? null,
+  })), [{ terminalState: 'returned', executionSite: 'host' }]);
+
+  const redeemed = resultHandles.redeemSuccessfulSettlementResultForHost({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    logicalToolCallId,
+  });
+  assert.equal(redeemed.status, 'ok', JSON.stringify(redeemed));
+  if (redeemed.status === 'ok') assert.equal(redeemed.value.executionSite, 'host');
+});
+
+test('historical v1 provider crossing result redemption remains exact after v53 migration', () => {
+  const task = accept('Read the historical provider records.');
+  const call = admitProviderCall({
+    task,
+    logicalToolCallId: 'logical:v1-provider-redemption',
+    physicalDispatchId: 'dispatch:v1-provider-redemption',
+    args: { query: 'provider-v1' },
+  });
+  const committed = store.commitLogicalCallSettlement(successInput({
+    task,
+    logicalToolCallId: call.identity.logicalToolCallId,
+    tool: call.tool,
+    args: call.args,
+  }));
+  assert.equal(committed.status, 'committed');
+  if (committed.status !== 'committed') return;
+  const v1Digest = crossingAuthority.settlementCrossingAuthorityDigest(
+    committed.settlement.crossings,
+    1,
+  );
+  const db = eventlog.openEventLog();
+  db.exec('DROP TRIGGER trg_logical_call_settlement_row_immutable');
+  try {
+    db.prepare(`
+      UPDATE logical_call_settlements
+         SET crossing_authority_version = 1, physical_crossings_digest = ?
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).run(v1Digest, task.sessionId, task.sourceUserSeq, call.identity.logicalToolCallId);
+  } finally {
+    db.exec(`
+      CREATE TRIGGER trg_logical_call_settlement_row_immutable
+      BEFORE UPDATE ON logical_call_settlements
+      BEGIN
+        SELECT RAISE(ABORT, 'logical call settlements are immutable');
+      END;
+    `);
+  }
+  const mirror = db.prepare('SELECT data_json FROM events WHERE id = ?').get(
+    committed.settlement.settlementEventId,
+  ) as { data_json: string };
+  const mirrorData = JSON.parse(mirror.data_json) as Record<string, unknown>;
+  delete mirrorData.crossingAuthorityVersion;
+  mirrorData.physicalCrossingsDigest = v1Digest;
+  db.prepare('UPDATE events SET data_json = ? WHERE id = ?').run(
+    JSON.stringify(mirrorData),
+    committed.settlement.settlementEventId,
+  );
+
+  const redeemed = resultHandles.redeemSuccessfulSettlementResultForHost({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    logicalToolCallId: call.identity.logicalToolCallId,
+  });
+  assert.equal(redeemed.status, 'ok', JSON.stringify(redeemed));
+  if (redeemed.status === 'ok') assert.equal(redeemed.value.executionSite, 'provider');
+});
+
 test('a logical settlement cannot close over a paid crossing that is still in flight', () => {
   const task = accept();
   const tool = 'alpha_records_search';
@@ -293,7 +753,7 @@ test('a logical settlement cannot close over a paid crossing that is still in fl
   })).status, 'committed');
 });
 
-test('candidate failure, discovery recovery, settlement, and mirror commit as one verdict', () => {
+test('candidate failure preserves an already-fresh discovery epoch in the settlement verdict', () => {
   const task = accept();
   const governor = new governorModule.DiscoveryGovernor();
   assert.equal(governor.initializeTask({ ...task, knownCapability: true }).status, 'initialized');
@@ -320,13 +780,14 @@ test('candidate failure, discovery recovery, settlement, and mirror commit as on
   assert.equal(first.status, 'committed');
   if (first.status !== 'committed') return;
   assert.equal(first.settlement.recovery.governorEvidenceKind, 'candidate_unsupported');
-  assert.equal(first.settlement.recovery.governorOutcome, 'epoch_opened');
-  assert.equal(first.settlement.recovery.openedDiscoveryEpoch, true);
-  assert.equal(governor.getTaskState(task)?.policy.epoch, 1);
+  assert.equal(first.settlement.recovery.governorOutcome, 'epoch_already_fresh');
+  assert.equal(first.settlement.recovery.openedDiscoveryEpoch, false);
+  assert.equal(governor.getTaskState(task)?.policy.epoch, 0,
+    'an unused bounded search slot is already the recovery authority');
 
   const replay = store.commitLogicalCallSettlement(input);
   assert.equal(replay.status, 'replayed');
-  assert.equal(governor.getTaskState(task)?.policy.epoch, 1, 'exact replay cannot mint another epoch');
+  assert.equal(governor.getTaskState(task)?.policy.epoch, 0, 'exact replay cannot mint another epoch');
   assert.equal(eventlog.listEvents(task.sessionId, { types: ['tool_attempt_settled'] }).length, 1);
 });
 

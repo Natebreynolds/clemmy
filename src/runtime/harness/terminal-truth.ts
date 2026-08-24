@@ -175,6 +175,7 @@ const OBLIGATION_MISSING_CLASS: Readonly<Record<string, MissingEvidence>> = {
   derivation_from_current_source: 'derivation_from_current_source',
   commit_effect: 'commit_effect',
   verify_committed_readback: 'exact_read_back',
+  verify_committed_content: 'commit_effect',
   verify_committed_receipt: 'exact_read_back',
   stale_destination_reconciled: 'stale_destination_reconciled',
   execution_terminal: 'execution_terminal',

@@ -6,10 +6,55 @@ import type {
   ExpectedWorkUniverseV1,
 } from './expected-work-contract.js';
 import {
+  computeResultHasSubstance,
   matchExpectedWork,
   type ObservedExpectedWorkHistoryV1,
   type ObservedExpectedWorkOperationV1,
 } from './expected-work-matcher.js';
+
+test('substance is recursive for arbitrary collections while scalar compute results remain useful', () => {
+  for (const empty of [
+    [],
+    [{}],
+    { successful: true, data: { leads: [] } },
+    { data: { contacts: [{}] } },
+    { payload: { arbitrary_provider_noun: [null, {}] } },
+    { successful: true, data: { web: [] }, total: 0, returned: 0, complete: true },
+    { data: { files: [] }, page: 1, page_count: 1, hasMore: false },
+    { payload: { hits: [] }, pagination: { total: 0, complete: true } },
+    { contacts: [], count: 0 },
+    { web: [], itemCount: 0 },
+    { files: [], recordCount: 0 },
+    { hits: [], size: 0 },
+    {
+      data: { search: { web: [] } },
+      query: 'restaurants',
+      originalRequest: { query: 'restaurants' },
+      elapsedMs: 42,
+    },
+    { requestInput: { ids: ['echo-id'] } },
+    { requestArguments: { queries: ['echo-query'] } },
+    { submittedInput: { rows: [{ id: 'echo-row' }] } },
+    { warnings: ['rate limit approaching'] },
+    {
+      ...Object.fromEntries(Array.from({ length: 129 }, (_, index) => [`field${index}`, index])),
+      web: [{ id: 'hidden-after-cap' }],
+      nextCursor: 'hidden-next-cursor',
+    },
+  ]) {
+    assert.equal(computeResultHasSubstance(empty), false, JSON.stringify(empty));
+  }
+  for (const substantive of [
+    [0],
+    [false],
+    { data: { total: 0 } },
+    { data: { count: 0 } },
+    { payload: { size: 0 } },
+    { payload: { values: [42] } },
+  ]) {
+    assert.equal(computeResultHasSubstance(substantive), true, JSON.stringify(substantive));
+  }
+});
 
 function contract(input: {
   operations: ExpectedWorkOperationV1[];
@@ -176,7 +221,11 @@ test('implicit binding is limited to the deterministic one-operation retrieve co
   assert.ok(refused.gaps.some((gap) => gap.kind === 'requirement_unobserved'));
 });
 
-test('implicit retrieve conflicts instead of arbitrarily choosing among multiple eligible reads', () => {
+test('implicit retrieve SETTLES equally observed successful reads on the latest — over-reading is not a double-send', () => {
+  // LABEL TRUTH (live 2026-08-19 seq 63350): several successful reads matched
+  // one once-cardinality read requirement and a COMPLETE answer was held as
+  // "more than one observed operation claims…". Reads are free to redo by
+  // effect class; the strongest/latest binds, the rest stay extras.
   const retrieve = contract({
     plannerSource: 'deterministic',
     operations: [once({ id: 'retrieve', effect: 'read', coverage: 'resolved_operation' })],
@@ -185,10 +234,41 @@ test('implicit retrieve conflicts instead of arbitrarily choosing among multiple
     observed({ id: 'first-read', effect: 'read', evidenceMode: 'point_read' }),
     observed({ id: 'second-read', effect: 'read', evidenceMode: 'point_read' }),
   ]));
-  assert.equal(result.status, 'conflict');
+  assert.equal(result.status, 'complete', JSON.stringify(result.gaps));
+  assert.deepEqual(result.bindings, [{ requirementId: 'retrieve', observedOperationId: 'second-read' }]);
+  assert.deepEqual(result.extras.sort(), ['first-read']);
+});
+
+test('implicit retrieve binds the unique strongest coverage among several probes', () => {
+  const retrieve = contract({
+    plannerSource: 'deterministic',
+    operations: [once({ id: 'retrieve', effect: 'read', coverage: 'resolved_operation' })],
+  });
+  const result = matchExpectedWork(retrieve, finalized([
+    observed({ id: 'describe', effect: 'compute', coverage: 'observed' }),
+    observed({ id: 'sum-query', effect: 'compute', coverage: 'complete' }),
+    observed({ id: 'row-list', effect: 'compute', coverage: 'observed' }),
+  ]));
+  assert.equal(result.status, 'complete', JSON.stringify(result.gaps));
+  assert.deepEqual(result.bindings, [{
+    requirementId: 'retrieve',
+    observedOperationId: 'sum-query',
+  }]);
+  assert.deepEqual(result.extras.sort(), ['describe', 'row-list']);
+});
+
+test('a stronger-looking invalid probe cannot discharge an implicit retrieve', () => {
+  const retrieve = contract({
+    plannerSource: 'deterministic',
+    operations: [once({ id: 'retrieve', effect: 'read', coverage: 'resolved_operation' })],
+  });
+  const result = matchExpectedWork(retrieve, finalized([
+    observed({ id: 'valid-point', effect: 'read', evidenceMode: 'point_read', coverage: 'observed' }),
+    observed({ id: 'invalid-complete', effect: 'read', evidenceMode: 'compute', coverage: 'complete' }),
+  ]));
+  assert.equal(result.status, 'incomplete');
   assert.ok(result.gaps.some((gap) =>
-    gap.kind === 'requirement_ambiguous' && gap.requirementId === 'retrieve'));
-  assert.deepEqual(result.bindings, []);
+    gap.kind === 'coverage_unproven' && gap.observedOperationId === 'invalid-complete'));
 });
 
 test('an undeclared effectful business operation conflicts with otherwise complete work', () => {
@@ -355,7 +435,7 @@ test('source-derived fanout fails closed until its universe is completely sealed
   assert.equal(complete.status, 'complete');
 });
 
-test('duplicate once bindings, unknown requirement ids, and an open history fail closed', () => {
+test('repeat read probes settle latest strongest while unknown ids and open history fail closed', () => {
   const retrieve = contract({
     plannerSource: 'deterministic',
     operations: [once({ id: 'retrieve', effect: 'read', coverage: 'resolved_operation' })],
@@ -364,8 +444,12 @@ test('duplicate once bindings, unknown requirement ids, and an open history fail
     observed({ id: 'read-one', requirementId: 'retrieve', effect: 'read' }),
     observed({ id: 'read-two', requirementId: 'retrieve', effect: 'read' }),
   ]));
-  assert.equal(duplicate.status, 'conflict');
-  assert.ok(duplicate.gaps.some((gap) => gap.kind === 'requirement_ambiguous'));
+  assert.equal(duplicate.status, 'complete', JSON.stringify(duplicate.gaps));
+  assert.deepEqual(duplicate.bindings, [{
+    requirementId: 'retrieve',
+    observedOperationId: 'read-two',
+  }]);
+  assert.deepEqual(duplicate.extras, ['read-one']);
 
   const unknown = matchExpectedWork(retrieve, finalized([
     observed({ id: 'read-one', requirementId: 'not-in-contract', effect: 'read' }),
@@ -437,17 +521,19 @@ test('the compute door stays scoped to the deterministic implicit-retrieve shape
   assert.equal(bound.status, 'conflict');
   assert.ok(bound.gaps.some((gap) => gap.kind === 'effect_mismatch'));
 
-  // Two eligible carriers stay ambiguous rather than arbitrarily chosen.
+  // Several implicit probes with the same coverage cannot certify the goal.
   const retrieve = contract({
     plannerSource: 'deterministic',
     operations: [once({ id: 'retrieve', effect: 'read', coverage: 'resolved_operation' })],
   });
-  const ambiguous = matchExpectedWork(retrieve, finalized([
+  const probed = matchExpectedWork(retrieve, finalized([
     observed({ id: 'shell-call', effect: 'compute', evidenceMode: 'compute', coverage: 'observed' }),
     observed({ id: 'read-call', effect: 'read', evidenceMode: 'point_read' }),
   ]));
-  assert.equal(ambiguous.status, 'conflict');
-  assert.ok(ambiguous.gaps.some((gap) => gap.kind === 'requirement_ambiguous'));
+  // Same doctrine as above: equally-covered successful probes settle on the
+  // latest; over-probing a read requirement never blocks a finished answer.
+  assert.equal(probed.status, 'complete', JSON.stringify(probed.gaps));
+  assert.deepEqual(probed.bindings, [{ requirementId: 'retrieve', observedOperationId: 'read-call' }]);
 });
 
 test('resolved-operation coverage accepts an observed collection read that cannot prove exhaustion', () => {
@@ -481,6 +567,59 @@ test('resolved-operation coverage accepts an observed collection read that canno
   ]));
   assert.equal(refused.status, 'incomplete');
   assert.ok(refused.gaps.some((gap) => gap.kind === 'coverage_unproven'));
+
+  // Repeating an incomplete collection read is still not proof of exhaustion.
+  // Pure reads may explore without creating a cardinality conflict, but the
+  // latest equally-covered probe remains subject to the complete-set bar.
+  const repeatedIncomplete = matchExpectedWork(completeSet, finalized([
+    observed({
+      id: 'calendar-view-one',
+      requirementId: 'retrieve',
+      effect: 'read',
+      evidenceMode: 'collection_read',
+      coverage: 'observed',
+    }),
+    observed({
+      id: 'calendar-view-two',
+      requirementId: 'retrieve',
+      effect: 'read',
+      evidenceMode: 'collection_read',
+      coverage: 'observed',
+    }),
+  ]));
+  assert.equal(repeatedIncomplete.status, 'incomplete');
+  assert.ok(repeatedIncomplete.gaps.some((gap) =>
+    gap.kind === 'coverage_unproven' && gap.observedOperationId === 'calendar-view-two'));
+  assert.equal(repeatedIncomplete.gaps.some((gap) => gap.kind === 'requirement_ambiguous'), false);
+
+  const laterComplete = matchExpectedWork(completeSet, finalized([
+    observed({
+      id: 'calendar-view-one',
+      requirementId: 'retrieve',
+      effect: 'read',
+      evidenceMode: 'collection_read',
+      coverage: 'observed',
+    }),
+    observed({
+      id: 'calendar-view-two',
+      requirementId: 'retrieve',
+      effect: 'read',
+      evidenceMode: 'collection_read',
+      coverage: 'observed',
+    }),
+    observed({
+      id: 'calendar-view-complete',
+      requirementId: 'retrieve',
+      effect: 'read',
+      evidenceMode: 'collection_read',
+      coverage: 'complete',
+    }),
+  ]));
+  assert.equal(laterComplete.status, 'complete', JSON.stringify(laterComplete.gaps));
+  assert.deepEqual(laterComplete.bindings, [{
+    requirementId: 'retrieve',
+    observedOperationId: 'calendar-view-complete',
+  }]);
 });
 
 test('off-plan REVERSIBLE work is extra, not a contract violation (live 2026-08-12)', () => {

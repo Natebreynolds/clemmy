@@ -33,6 +33,7 @@ import {
 import {
   addNotification,
   getNotification,
+  markNotificationsReadByApprovalId,
   markNotificationsReadByQuestionId,
   type NotificationRecord,
 } from '../runtime/notifications.js';
@@ -84,6 +85,7 @@ import {
   recordLearningDecision,
 } from '../memory/learning-receipt.js';
 import { stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
+import { hasActiveLegacyComposioJobForTask } from '../integrations/composio/legacy-job-record.js';
 import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
 import {
   reviseWorkContract,
@@ -100,6 +102,14 @@ import {
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
+type DrainApprovalResolver = typeof import('./approval-drain.js')['resolveDrainApproval'];
+let drainApprovalResolverForTests: DrainApprovalResolver | null = null;
+
+/** Test-only seam for the post-approval status consumer. */
+export function _setDrainApprovalResolverForTests(resolver: DrainApprovalResolver | null): void {
+  drainApprovalResolverForTests = resolver;
+}
+
 /** A worker has one terminal owner. Verification/report-back failures after a
  * terminal write must not append a second contradictory completion event. */
 function finishRun(
@@ -108,7 +118,7 @@ function finishRun(
 ): ReturnType<typeof persistFinishRun> {
   if (runId) {
     const existing = getRun(runId);
-    if (existing && (existing.status === 'completed' || existing.status === 'failed' || existing.status === 'cancelled')) {
+    if (existing && (existing.status === 'completed' || existing.status === 'blocked' || existing.status === 'failed' || existing.status === 'cancelled')) {
       return existing;
     }
   }
@@ -332,7 +342,7 @@ export interface BackgroundTaskRecord {
    * human verification and can be resumed explicitly, still in place. */
   restartRecovery?: {
     disposition: 'auto_resumed_in_place' | 'parked_for_verification' | 'manual_resumed_in_place';
-    reason: 'safe_no_external_write' | 'external_write_history' | 'ambiguous_external_write' | 'receipt_history_unavailable';
+    reason: 'safe_no_external_write' | 'external_write_history' | 'ambiguous_external_write' | 'receipt_history_unavailable' | 'automatic_retry_limit_reached';
     decidedAt: string;
     externalWriteCount: number;
     ambiguousWriteCount: number;
@@ -2051,6 +2061,11 @@ function handoffBindingFailure(task: BackgroundTaskRecord): string | null {
 }
 
 export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | null {
+  // A pre-containment async-job record is a second durable execution owner.
+  // The record owner migrates it into a typed repair terminal at boot; this
+  // operation-neutral fence simply prevents a pending task from reaching a
+  // model while those legacy ownership bytes are still active.
+  if (hasActiveLegacyComposioJobForTask(id)) return null;
   // Validate the continuation BEFORE the status CAS. A task that flips to
   // running has an owner; parking after the flip would mean the unverified
   // resume already started.
@@ -3048,10 +3063,19 @@ export function markBackgroundTaskAwaitingContinue(id: string, reason: string, r
  * would just re-block); the user explicitly resumes the same saved task once
  * the blocker is cleared.
  */
-export function markBackgroundTaskBlocked(id: string, reason: string, resultText: string, knownBlockerType?: BlockerType): BackgroundTaskRecord | null {
-  if (!prepareWorkerSettlementForCas(id)) return null;
+function markBackgroundTaskBlockedWhere(
+  id: string,
+  predicate: (task: BackgroundTaskRecord) => boolean,
+  reason: string,
+  resultText: string,
+  knownBlockerType?: BlockerType,
+  opts: {
+    nextAction?: string;
+    metadata?: Record<string, unknown>;
+  } = {},
+): BackgroundTaskRecord | null {
   const blockerType = knownBlockerType ?? classifyBlocker(reason);
-  const updated = updateBackgroundTaskWhere(id, workerBlockedMayProceed, (task) => ({
+  const updated = updateBackgroundTaskWhere(id, predicate, (task) => ({
     ...clearParkedBackgroundState(),
     status: 'blocked',
     completedAt: nowIso(),
@@ -3060,17 +3084,19 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
     outcomeSnapshot: buildBackgroundTaskOutcomeSnapshot(task, 'blocked', {
       blocker: reason,
       blockerType,
+      ...(opts.nextAction ? { nextAction: opts.nextAction, resumable: true } : {}),
     }),
   }));
   if (updated) {
     // Tag the blocker by KIND (deterministic, zero-token) so the dashboard /
     // proactive brief / future routing can act on the class, not just the prose.
+    const nextAction = opts.nextAction ?? 'Resolve the remaining blocker before starting another run.';
     const reportDetail = progressPreservingPauseDetail(
-      'Resolve the remaining blocker before starting another run.',
+      nextAction,
       { resultText, blockerReason: reason, blockerType },
     );
     const notificationBody = progressPreservingPauseDetail(
-      'Resolve the remaining blocker before starting another run.',
+      nextAction,
       { resultText, blockerReason: reason, blockerType },
       2000,
     );
@@ -3099,12 +3125,85 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
         ].join('\n'),
       createdAt: nowIso(),
       read: false,
-      metadata: taskNotificationMetadata(updated, { status: 'blocked', blockerType, terminalReportBack: true }),
+      metadata: taskNotificationMetadata(updated, {
+        status: 'blocked',
+        blockerType,
+        terminalReportBack: true,
+        ...opts.metadata,
+      }),
     });
     // Report-back without fail: a BLOCKED task must reach Clementine's context,
     // not just a notification — so she can surface the blocker or resolve it.
     enqueueBackgroundTaskOutcomeTurn(updated, 'blocked', reportDetail);
-    emitBackgroundTaskOperational('background_task_parked', updated, { reason: 'blocked' }, 'warn');
+    emitBackgroundTaskOperational('background_task_parked', updated, {
+      reason: 'blocked',
+      ...opts.metadata,
+    }, 'warn');
+  }
+  return updated;
+}
+
+export function markBackgroundTaskBlocked(id: string, reason: string, resultText: string, knownBlockerType?: BlockerType): BackgroundTaskRecord | null {
+  if (!prepareWorkerSettlementForCas(id)) return null;
+  return markBackgroundTaskBlockedWhere(
+    id,
+    workerBlockedMayProceed,
+    reason,
+    resultText,
+    knownBlockerType,
+  );
+}
+
+export type BackgroundApprovalBindingBlockCode =
+  | 'approval_registry_missing'
+  | 'approval_binding_mismatch'
+  | 'approval_binding_ambiguous'
+  | 'approval_decision_invalid';
+
+/**
+ * Fail closed when a parked background task no longer has one exact canonical
+ * approval owner. The CAS is bound to BOTH the parked state and the approval id,
+ * so a concurrent legitimate decision can never be overwritten by this repair.
+ */
+export function markBackgroundTaskApprovalBindingBlocked(input: {
+  taskId: string;
+  approvalId: string | null;
+  code: BackgroundApprovalBindingBlockCode;
+  detail: string;
+}): BackgroundTaskRecord | null {
+  if (!prepareWorkerSettlementForCas(input.taskId)) return null;
+  const nextAction = 'Cancel this task, or restart it from Tasks to request a fresh exact approval. Do not treat the old approval card as authority for this run.';
+  const updated = markBackgroundTaskBlockedWhere(
+    input.taskId,
+    (task) => task.status === 'awaiting_approval'
+      && (input.approvalId === null
+        ? !task.pendingApprovalId
+        : task.pendingApprovalId === input.approvalId),
+    input.detail,
+    input.detail,
+    'needs_approval',
+    {
+      nextAction,
+      metadata: {
+        approvalReconciliation: input.code,
+        // Deliberately not the generic `approvalId` key: the cleanup below
+        // marks the detached approval card read by that key, while this new
+        // blocked recovery surface must remain actionable.
+        ...(input.approvalId ? { blockedApprovalId: input.approvalId } : {}),
+      },
+    },
+  );
+  if (updated && input.approvalId) {
+    try {
+      markNotificationsReadByApprovalId(input.approvalId, {
+        backgroundTaskId: updated.id,
+        backgroundTaskStatus: 'blocked',
+        approvalReconciliation: input.code,
+      });
+    } catch {
+      // The task record and its new blocked report are canonical. A later
+      // notification sweep can repair an old attention projection.
+    }
   }
   return updated;
 }
@@ -3138,15 +3237,28 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
   const updated = updateBackgroundTaskWhere(
     id,
     (task) => workerFailureMayProceed(task, status),
-    (task) => ({
-      ...clearParkedBackgroundState(),
-      status,
-      completedAt: nowIso(),
-      error: clean(error, 1000),
-      outcomeSnapshot: status === 'failed'
-        ? buildBackgroundTaskOutcomeSnapshot(task, 'failed', { blocker: error })
-        : undefined,
-    }),
+    (task) => {
+      const interruptedApprovalResolution = status === 'interrupted'
+        && task.approvalResolution
+        ? { ...task.approvalResolution }
+        : undefined;
+      return {
+        ...clearParkedBackgroundState(),
+        // A boot interruption after the exact decision was queued must not turn
+        // into a generic model continuation. Keep the frozen decision long
+        // enough for restart safety to inspect the physical-crossing ledger.
+        // The unsafe branch clears it before parking for human verification.
+        ...(interruptedApprovalResolution
+          ? { approvalResolution: interruptedApprovalResolution }
+          : {}),
+        status,
+        completedAt: nowIso(),
+        error: clean(error, 1000),
+        outcomeSnapshot: status === 'failed'
+          ? buildBackgroundTaskOutcomeSnapshot(task, 'failed', { blocker: error })
+          : undefined,
+      };
+    },
   );
   if (updated) emitBackgroundTaskFailedTransition(updated, error, status);
   return updated;
@@ -3224,6 +3336,13 @@ export function classifyBackgroundTaskOutcome(
       outcome: 'blocked',
       reason: (text || 'The run hit its turn budget before finishing; continue is required.').slice(0, 400),
       blockerType: 'budget',
+    };
+  }
+  if (stoppedReason === 'in-progress') {
+    return {
+      outcome: 'blocked',
+      reason: 'The exact accepted source is still owned by host recovery.',
+      blockerType: 'unknown',
     };
   }
 
@@ -4179,8 +4298,14 @@ export function assessBackgroundTaskRestartSafety(
 function parkInterruptedTaskForVerification(
   task: BackgroundTaskRecord,
   assessment: BackgroundRestartSafetyAssessment,
+  options: { automaticRetryCap?: number } = {},
 ): BackgroundTaskRecord | null {
-  const decidedAt = nowIso();
+  const prior = task.restartRecovery;
+  const priorIsExact = prior?.disposition === 'parked_for_verification'
+    && prior.reason === assessment.reason
+    && prior.externalWriteCount === assessment.externalWriteCount
+    && prior.ambiguousWriteCount === assessment.ambiguousWriteCount;
+  const decidedAt = priorIsExact ? prior.decidedAt : nowIso();
   const restartRecovery: NonNullable<BackgroundTaskRecord['restartRecovery']> = {
     disposition: 'parked_for_verification',
     reason: assessment.reason,
@@ -4188,15 +4313,65 @@ function parkInterruptedTaskForVerification(
     externalWriteCount: assessment.externalWriteCount,
     ambiguousWriteCount: assessment.ambiguousWriteCount,
   };
-  const updated = updateBackgroundTask(task.id, {
-    error: RESTART_VERIFICATION_ERROR,
-    restartRecovery,
-    lastCheckInAt: decidedAt,
-    lastCheckInMessage: 'Restart recovery parked for external-outcome verification.',
-  });
+  const retryLimitReached = assessment.reason === 'automatic_retry_limit_reached';
+  const recoveryError = retryLimitReached
+    ? `Automatic restart retry limit reached (${options.automaticRetryCap ?? task.resumeCount ?? 0}). Review the retained run before choosing Resume, or choose Cancel to stop it.`
+    : RESTART_VERIFICATION_ERROR;
+  let newlyPersisted = false;
+  let updated: BackgroundTaskRecord | null;
+  if (priorIsExact) {
+    const latest = getBackgroundTask(task.id);
+    const latestRecovery = latest?.restartRecovery;
+    updated = latest?.status === 'interrupted'
+      && latest.runSessionId === task.runSessionId
+      && (latest.resumeCount ?? 0) === (task.resumeCount ?? 0)
+      && latestRecovery?.disposition === 'parked_for_verification'
+      && latestRecovery.reason === assessment.reason
+      && latestRecovery.externalWriteCount === assessment.externalWriteCount
+      && latestRecovery.ambiguousWriteCount === assessment.ambiguousWriteCount
+      ? latest
+      : null;
+  } else {
+    updated = updateBackgroundTaskWhere(
+      task.id,
+      (latest) => latest.status === 'interrupted'
+        && latest.runSessionId === task.runSessionId
+        && (latest.resumeCount ?? 0) === (task.resumeCount ?? 0)
+        && latest.error === task.error
+        && latest.restartRecovery?.disposition === task.restartRecovery?.disposition
+        && latest.restartRecovery?.reason === task.restartRecovery?.reason
+        && latest.restartRecovery?.decidedAt === task.restartRecovery?.decidedAt,
+      {
+        error: recoveryError,
+        restartRecovery,
+        lastCheckInAt: decidedAt,
+        lastCheckInMessage: retryLimitReached
+          ? 'Automatic restart limit reached. Waiting for Resume or Cancel.'
+          : 'Restart recovery parked for external-outcome verification.',
+      },
+    );
+  }
+  if (updated) newlyPersisted = !priorIsExact;
+  if (!updated) {
+    const latest = getBackgroundTask(task.id);
+    const latestRecovery = latest?.restartRecovery;
+    if (
+      latest?.status !== 'interrupted'
+      || latest.runSessionId !== task.runSessionId
+      || latestRecovery?.disposition !== 'parked_for_verification'
+      || latestRecovery.reason !== assessment.reason
+      || latestRecovery.externalWriteCount !== assessment.externalWriteCount
+      || latestRecovery.ambiguousWriteCount !== assessment.ambiguousWriteCount
+    ) return null;
+    updated = latest;
+  }
   if (!updated) return null;
 
-  try {
+  const crossingSummary = assessment.reason === 'receipt_history_unavailable'
+    ? 'The durable receipt ledger could not prove that physical dispatch stayed at zero.'
+    : `Durable crossing evidence: ${assessment.externalWriteCount} confirmed physical write(s), ${assessment.ambiguousWriteCount} ambiguous write(s).`;
+
+  if (newlyPersisted) try {
     appendEvent({
       sessionId: updated.runSessionId,
       turn: 0,
@@ -4213,14 +4388,36 @@ function parkInterruptedTaskForVerification(
     });
   } catch { /* the task record remains the recovery authority */ }
 
+  const notificationId = [
+    'background',
+    updated.id,
+    'restart-verification',
+    updated.runSessionId,
+    updated.resumeCount ?? 0,
+    restartRecovery.reason,
+    restartRecovery.externalWriteCount,
+    restartRecovery.ambiguousWriteCount,
+  ].join('-');
+  const capBody = retryLimitReached
+    ? [
+      `Task ${updated.id} reached its automatic restart limit (${options.automaticRetryCap ?? updated.resumeCount ?? 0}) and was NOT started again.`,
+      crossingSummary,
+      `Its original run session (${updated.runSessionId}) and receipt history are preserved for review.`,
+      'Choose Resume to retry this same task after reviewing the retained run, or choose Cancel to stop it. Clementine will not retry it automatically.',
+    ]
+    : null;
+
   addNotification({
-    id: `${Date.now()}-background-${updated.id}-restart-verification`,
+    id: notificationId,
     kind: 'approval',
-    title: `Verify before resuming: ${updated.title}`,
-    body: [
+    title: retryLimitReached
+      ? `Automatic retry limit reached: ${updated.title}`
+      : `Verify before resuming: ${updated.title}`,
+    body: (capBody ?? [
       `Task ${updated.id} was interrupted after an external write was attempted or could not be ruled out. It was NOT auto-resumed.`,
-      `Verify the destination first, then choose Resume. The task will continue on its original run session (${updated.runSessionId}) with the prior receipts and duplicate-write safeguards intact.`,
-    ].join('\n\n'),
+      crossingSummary,
+      `Verify the destination first, then choose Resume to retry the same task, or choose Cancel to stop it. Resume continues on the original run session (${updated.runSessionId}) with the prior receipts and duplicate-write safeguards intact.`,
+    ]).join('\n\n'),
     createdAt: decidedAt,
     read: false,
     metadata: taskNotificationMetadata(updated, {
@@ -4228,16 +4425,26 @@ function parkInterruptedTaskForVerification(
       verificationRequired: true,
       restartRecoveryReason: restartRecovery.reason,
       runSessionId: updated.runSessionId,
+      availableActions: ['resume', 'cancel'],
+      ...(options.automaticRetryCap !== undefined
+        ? { automaticRetryCap: options.automaticRetryCap }
+        : {}),
     }),
   });
-  emitBackgroundTaskOperational('background_task_parked', updated, {
-    reason: 'restart_verification_required',
-    restartRecoveryReason: restartRecovery.reason,
-  }, 'warn');
+  if (newlyPersisted) {
+    emitBackgroundTaskOperational('background_task_parked', updated, {
+      reason: retryLimitReached ? 'automatic_retry_limit_reached' : 'restart_verification_required',
+      restartRecoveryReason: restartRecovery.reason,
+    }, 'warn');
+  }
   return updated;
 }
 
 export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
+  // Explicit Resume cannot outrun the synchronous legacy-record migration and
+  // recreate the old watcher/model ownership race. Once quarantine commits,
+  // the same task remains normally resumable with its id-bearing repair text.
+  if (hasActiveLegacyComposioJobForTask(id)) return null;
   const resolved = resolveLatestBackgroundResumeOwner(id);
   if (!resolved) return null;
   const { task, followed } = resolved;
@@ -4309,7 +4516,8 @@ function resolveLatestBackgroundResumeOwner(
  *
  * Bounded two ways so a task that reliably crashes the daemon can't loop
  * forever: we skip tasks already carried forward (`resumedIntoTaskId`) and
- * tasks whose `resumeCount` has reached `cap`. Returns the number resumed.
+ * visibly park tasks whose `resumeCount` has reached `cap`. Returns the number
+ * resumed.
  */
 export function resumeInterruptedBackgroundTasks(opts: { cap?: number } = {}): number {
   // Boot recovery begins with already-finished work. A task that reached its
@@ -4326,12 +4534,44 @@ export function resumeInterruptedBackgroundTasks(opts: { cap?: number } = {}): n
   const cap = Math.max(1, opts.cap ?? 2);
   let resumedCount = 0;
   for (const task of listBackgroundTasks({ status: 'interrupted' })) {
-    if (task.error !== DAEMON_RESTART_INTERRUPT_REASON) continue;
+    if (
+      task.error !== DAEMON_RESTART_INTERRUPT_REASON
+      && task.restartRecovery?.disposition !== 'parked_for_verification'
+    ) continue;
     if (task.resumedIntoTaskId) continue;          // already carried forward (clone path)
-    if ((task.resumeCount ?? 0) >= cap) continue;  // give up after cap retries
     const assessment = assessBackgroundTaskRestartSafety(task);
+    // An exact approval decision is replay authority only when the ledger
+    // proves zero physical crossing. Retaining it through an ambiguous/manual
+    // recovery would let the ordinary drain blindly redispatch an already
+    // consumed mutation. This applies at the retry ceiling too: reaching the
+    // cap cannot weaken the same duplicate-write boundary.
+    const approvalResolution = task.approvalResolution;
+    const approvalId = approvalResolution?.approvalId;
+    const approvalApproved = approvalResolution?.approved;
+    const verificationTask = !assessment.safeToAutoResume
+      && approvalId !== undefined
+      && approvalApproved !== undefined
+      ? updateBackgroundTaskWhere(
+          task.id,
+          (latest) => latest.status === 'interrupted'
+            && latest.approvalResolution?.approvalId === approvalId
+            && latest.approvalResolution?.approved === approvalApproved,
+          { approvalResolution: undefined },
+        ) ?? getBackgroundTask(task.id) ?? task
+      : task;
+    if ((task.resumeCount ?? 0) >= cap) {
+      parkInterruptedTaskForVerification(verificationTask, {
+        safeToAutoResume: false,
+        reason: 'automatic_retry_limit_reached',
+        externalWriteCount: assessment.externalWriteCount,
+        ambiguousWriteCount: assessment.ambiguousWriteCount,
+      }, { automaticRetryCap: cap });
+      continue;
+    }
     if (!assessment.safeToAutoResume) {
-      parkInterruptedTaskForVerification(task, assessment);
+      // The helper re-presents an unchanged durable hold under one stable ID,
+      // repairing a crash after the task CAS without duplicating cards/events.
+      parkInterruptedTaskForVerification(verificationTask, assessment);
       continue;
     }
     // Safe read-only recovery still reattaches IN PLACE. Even this branch never
@@ -4516,6 +4756,10 @@ export function queueBackgroundTaskApprovalResolution(approvalId: string, approv
       read: false,
       metadata: taskNotificationMetadata(updated, { approvalId, approved, status: 'pending' }),
     });
+    // Keep every approval surface on one continuation path. The durable
+    // pending CAS above remains the authority; this kick only removes the
+    // otherwise-visible 15s wait and is a no-op before daemon wiring exists.
+    requestBackgroundDrain(1);
   }
   return updated;
 }
@@ -4724,6 +4968,13 @@ async function finishWorkerRun(
       },
     });
     logger.info({ taskId: task.id, questionId }, 'Background task paused for clarifying input');
+    return;
+  }
+  if (response.stoppedReason === 'in-progress') {
+    // The exact source is still host-owned. Do not close the worker run, clear
+    // its ledger, manufacture a user dependency, or mark the task done. Its
+    // lease/restart reconciler will continue the same accepted source.
+    logger.info({ taskId: task.id }, 'Background task remains owned by exact-source recovery');
     return;
   }
   if (response.stoppedReason === 'unverified') {
@@ -5103,7 +5354,8 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        // Registry-first: a harness-lane approval lives in the sqlite registry,
 	        // which the legacy runtime store never sees (live 2026-07-22: board
 	        // approve → "Approval not found" → task failed, row still pending).
-	        const { resolveDrainApproval } = await import('./approval-drain.js');
+	        const resolveDrainApproval = drainApprovalResolverForTests
+              ?? (await import('./approval-drain.js')).resolveDrainApproval;
 	        const result = await resolveDrainApproval({
 	          approvalId: resolution.approvalId,
 	          approved: resolution.approved,
@@ -5111,16 +5363,101 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        });
         if (heartbeatTimer) clearInterval(heartbeatTimer);
 
-        if (!resolution.approved) {
-          const aborted = markBackgroundTaskFailed(task.id, result.text || `Approval ${resolution.approvalId} rejected.`, 'aborted');
-          if (!acceptApprovalTransition(aborted, 'aborted', result.text)) continue;
-          finishRun(run.id, {
-            status: 'cancelled',
-            message: `Background task stopped after approval ${resolution.approvalId} was rejected.`,
-            outputPreview: result.text,
-          });
-          logger.info({ taskId: task.id, approvalId: resolution.approvalId }, 'Background task stopped after rejected approval');
-          continue;
+        switch (result.status) {
+          case 'rejected': {
+            const aborted = markBackgroundTaskFailed(task.id, result.text || `Approval ${resolution.approvalId} rejected.`, 'aborted');
+            if (!acceptApprovalTransition(aborted, 'aborted', result.text)) continue;
+            finishRun(run.id, {
+              status: 'cancelled',
+              message: `Background task stopped after approval ${resolution.approvalId} was rejected.`,
+              outputPreview: result.text,
+            });
+            logger.info({ taskId: task.id, approvalId: resolution.approvalId }, 'Background task stopped after rejected approval');
+            continue;
+          }
+          case 'in_progress': {
+            const held = updateBackgroundTaskWhere(task.id, (latest) => latest.status === 'running', {
+              lastCheckInAt: nowIso(),
+              lastCheckInMessage: result.execution.kind === 'held'
+                ? `Execution remains ${result.execution.hold.wake}-owned (${result.execution.hold.reason}).`
+                : 'Execution was dispatched and remains owned by the host runtime.',
+            });
+            if (!held) {
+              const latest = getBackgroundTask(task.id);
+              if (latest?.status === 'cancelling' || latest?.status === 'aborted') {
+                settleApprovalCancellation(latest, result.text);
+                continue;
+              }
+              throw new Error(`Background task ${task.id} lost its in-progress approval continuation; latest durable state is ${latest?.status ?? 'missing'}.`);
+            }
+            addRunEvent(run.id, {
+              type: 'status',
+              status: 'running',
+              message: result.execution.kind === 'held'
+                ? `Approval continuation is still owned by ${result.execution.hold.wake}; waiting for the exact source owner.`
+                : 'Approval continuation dispatched; waiting for its exact-source owner.',
+              data: {
+                approvalId: resolution.approvalId,
+                execution: result.execution,
+              },
+            });
+            logger.info(
+              { taskId: task.id, approvalId: resolution.approvalId, execution: result.execution },
+              'Background task approval continuation remains in progress under host ownership',
+            );
+            continue;
+          }
+          case 'blocked': {
+            const blocked = markBackgroundTaskBlocked(task.id, result.reason, result.text);
+            if (!acceptApprovalTransition(blocked, 'blocked', result.text)) continue;
+            finishRun(run.id, {
+              status: 'blocked',
+              message: `Background task ${task.id} blocked after approval ${resolution.approvalId}: ${result.reason}`,
+              outputPreview: result.text,
+              needsAttention: true,
+            });
+            clearLedger(task.runSessionId);
+            logger.warn(
+              { taskId: task.id, approvalId: resolution.approvalId, reason: result.reason },
+              'Background task remained blocked after approval continuation',
+            );
+            continue;
+          }
+          case 'awaiting_continue': {
+            const parked = markBackgroundTaskAwaitingContinue(task.id, result.reason, result.text);
+            if (!acceptApprovalTransition(parked, 'awaiting_continue', result.text)) continue;
+            finishRun(run.id, {
+              status: 'awaiting_input',
+              message: `Background task ${task.id} reached its execution limit after approval ${resolution.approvalId}.`,
+              outputPreview: result.text,
+              pendingInput: {
+                kind: 'continue_authorization',
+                questionId: `continue:${task.id}`,
+                question: result.reason,
+                source: { kind: 'background_task', taskId: task.id },
+                nextAction: parked?.outcomeSnapshot?.nextAction ?? result.reason,
+              },
+            });
+            clearLedger(task.runSessionId);
+            continue;
+          }
+          case 'cancelled': {
+            const aborted = markBackgroundTaskFailed(task.id, result.reason, 'aborted');
+            if (!acceptApprovalTransition(aborted, 'aborted', result.text)) continue;
+            finishRun(run.id, {
+              status: 'cancelled',
+              message: `Background task ${task.id} approval continuation was cancelled.`,
+              outputPreview: result.text,
+            });
+            clearLedger(task.runSessionId);
+            continue;
+          }
+          case 'approved':
+            break;
+        }
+        if (result.status !== 'approved') {
+          const unhandled: never = result.status;
+          throw new Error(`Unhandled approval drain result: ${String(unhandled)}`);
         }
 
         if (result.nextApprovalId) {
@@ -5247,9 +5584,10 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
           const blocked = markBackgroundTaskBlocked(task.id, postApprovalOutcome.reason ?? 'Task could not be completed.', result.text, postApprovalOutcome.blockerType);
           if (!acceptApprovalTransition(blocked, 'blocked', result.text)) continue;
           finishRun(run.id, {
-            status: 'failed',
+            status: 'blocked',
             message: `Background task ${task.id} blocked after approval ${resolution.approvalId}: ${postApprovalOutcome.reason ?? 'could not complete'}`,
             outputPreview: result.text,
+            needsAttention: true,
           });
           clearLedger(task.runSessionId);
           logger.warn({ taskId: task.id, approvalId: resolution.approvalId, reason: postApprovalOutcome.reason }, 'Background task blocked after approval continuation (not marked done)');

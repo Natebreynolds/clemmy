@@ -18,8 +18,6 @@ import { ClementineAssistant } from '../assistant/core.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { processAgentAutonomyV2 } from '../agents/autonomy-v2.js';
 import { processMonitors } from '../agents/monitors.js';
-import { processInboxMonitor } from '../agents/inbox-monitor.js';
-import { processCalendarMonitor } from '../agents/calendar-monitor.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
@@ -31,6 +29,10 @@ import { warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, reapStaleBackgroundTasks, registerBackgroundDrainKick, sweepInvalidDoneBackgroundTasks, listBackgroundTasks } from '../execution/background-tasks.js';
+import {
+  installBackgroundTaskApprovalReconciler,
+  reconcileBackgroundTaskApprovals,
+} from '../execution/background-approval-reconciler.js';
 import { reconcileDurableFanout } from '../execution/durable-fanout.js';
 import { scheduleLearningDrain } from '../memory/learning-worker.js';
 
@@ -44,14 +46,33 @@ function fanoutTaskState(taskId: string): 'alive' | 'done' | 'failed' | 'missing
 }
 import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRuns } from '../execution/workflow-runner.js';
 import {
+  installAutomationReadPilotControlPlaneReconciler,
+  reconcileAutomationReadPilotProjections,
+} from '../execution/automation-read-pilot-control-plane.js';
+import {
+  installAutomationReadPilotWorkspaceControlPlaneReconciler,
+  reconcileAutomationReadPilotWorkspaceCreations,
+} from '../execution/automation-read-pilot-workspace-control-plane.js';
+import {
+  installAutomationOpportunityReviewControlPlaneReconciler,
+  reconcileAutomationOpportunityReviewProjections,
+} from '../execution/automation-opportunity-review-control-plane.js';
+import {
+  installAutomationRecurrenceReconciler,
+  reconcileAutomationRecurrences,
+} from '../execution/automation-recurrence-runtime.js';
+import {
+  installAutomationPilotProductionConvergenceListener,
+  reconcileAutomationPilotProductionConvergence,
+} from '../execution/automation-pilot-production-convergence.js';
+import {
   registerWorkflowRunDrainKick,
 } from '../execution/workflow-origin-group.js';
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runAttentionWatchdog } from '../execution/attention-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
-import { processComposioJobWatchTick } from '../integrations/composio/job-watcher.js';
+import { migrateLegacyComposioJobRecords } from '../integrations/composio/job-watcher.js';
 import { runRoutePolicyJob } from '../runtime/harness/route-policy.js';
-import { executeComposioTool } from '../integrations/composio/client.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
@@ -70,6 +91,7 @@ import { recoverPendingWorkflowTriggerEvents, syncWorkflowTriggerRegistry } from
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
 import { processSpaceSchedules, retryPausedSpaces } from '../spaces/scheduler.js';
+import { recoverResolvedRunnerTrustApprovals } from '../spaces/space-data-runner-trust.js';
 import { maybeOfferStarterWorkspace } from '../spaces/starter-recipes.js';
 import { initializeWorkspaceTemporalStorage } from '../spaces/workspace-temporal-init.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
@@ -82,6 +104,7 @@ import {
   getLatestRunAttemptByRunId,
   interruptOrphanedRunAttemptsAtBoot,
 } from '../runtime/harness/eventlog.js';
+import { reconcileHistoricalHarnessStateOnBoot } from '../runtime/harness/historical-state-reconciler.js';
 import { reconcileDormantTerminalWorkSessions } from '../runtime/harness/session-reconcile.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
@@ -1784,6 +1807,61 @@ export async function startDaemon(
   options: StartDaemonOptions = {},
 ): Promise<void> {
   setDaemonRuntimePhase('daemon.boot.start', { build: describeBuild() });
+  // Upgrade containment runs before runtime configuration, model discovery,
+  // background drains, or network ingress. A legacy async-job JSON is evidence
+  // of a remote handle, never fresh dispatch authority; migrate it into one
+  // visible repair terminal and quarantine its bounded canonical hints. Any
+  // migration error is a readiness error so Resume cannot race these bytes.
+  const legacyComposioJobs = migrateLegacyComposioJobRecords();
+  if (legacyComposioJobs.migrated > 0) {
+    logger.warn(legacyComposioJobs, 'Contained legacy Composio job-watch records without provider or model execution');
+    recordOperationalEvent({
+      source: 'harness',
+      type: 'gate_verdict',
+      severity: 'warn',
+      actor: 'daemon-boot',
+      payload: {
+        gate: 'legacy_composio_hidden_io_containment',
+        decision: 'blocked_and_quarantined',
+        migrated: legacyComposioJobs.migrated,
+        repairTaskIds: legacyComposioJobs.repairTaskIds,
+      },
+    });
+  }
+  // The old ambient inbox/calendar implementations call the raw provider
+  // client and have no accepted logical/physical read authority. Keep their
+  // user settings intact, but do not schedule them until they are migrated to
+  // the prepared terminal path. This warning is explicit readiness truth, not
+  // a fabricated claim that monitoring is active.
+  const configuredAmbientComposioMonitors = (() => {
+    try {
+      const policy = getProactivityPolicySnapshot().policy;
+      return [
+        ...(policy.enabled && policy.inboxWatchEnabled ? ['inbox'] : []),
+        ...(policy.enabled && policy.calendarWatchEnabled ? ['calendar'] : []),
+      ];
+    } catch {
+      return [];
+    }
+  })();
+  if (configuredAmbientComposioMonitors.length > 0) {
+    logger.warn(
+      { monitors: configuredAmbientComposioMonitors, reason: 'prepared_read_authority_unavailable' },
+      'Ambient Composio monitors are disabled; configured watches are preserved but not executing',
+    );
+    recordOperationalEvent({
+      source: 'harness',
+      type: 'gate_verdict',
+      severity: 'warn',
+      actor: 'daemon-boot',
+      payload: {
+        gate: 'composio_ambient_monitor_prepared_authority',
+        decision: 'disabled',
+        monitors: configuredAmbientComposioMonitors,
+        reason: 'prepared_read_authority_unavailable',
+      },
+    });
+  }
   try {
     await configureHarnessRuntime();
   } catch {
@@ -1955,6 +2033,73 @@ export async function startDaemon(
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot run-attempt sweep failed');
   }
+  // Importing a chat/Workspace surface only registers the runner-trust refresh
+  // handler. Recover decisions made while the daemon was offline here, after
+  // the synchronous event-log boot fence has completed, so a background import
+  // callback can never race schema migration or bypass foreground ownership.
+  try {
+    const recoveredRunnerTrustApprovals = recoverResolvedRunnerTrustApprovals();
+    if (recoveredRunnerTrustApprovals > 0) {
+      logger.info(
+        { recoveredRunnerTrustApprovals },
+        'Recovered resolved Workspace runner-trust approvals on boot',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Workspace runner-trust approval boot recovery failed',
+    );
+  }
+  // Background workers are execution-kind sessions, so the chat approval
+  // resumer below intentionally ignores them. Reconcile their exact card rows
+  // before either generic restart recovery or the first worker drain. The
+  // listener is latency-only; this boot pass and the ordinary tick close every
+  // crash window around a registry decision.
+  try {
+    installBackgroundTaskApprovalReconciler();
+    const approvals = reconcileBackgroundTaskApprovals();
+    if (
+      approvals.queuedApproved > 0
+      || approvals.queuedRejected > 0
+      || approvals.blockedMissing > 0
+      || approvals.blockedMismatch > 0
+      || approvals.blockedAmbiguous > 0
+      || approvals.blockedInvalid > 0
+      || approvals.failed > 0
+    ) logger.warn(approvals, 'Reconciled background-task approval ownership on boot');
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Background-task approval boot reconcile failed; ordinary tick will retry',
+    );
+  }
+  // Old releases could publish an exact terminal while leaving the graph call
+  // root or interrupt projection open. This bounded pass is projection-only:
+  // it never resumes, dispatches, or fabricates task-resolution/effect bytes.
+  // Run it after dead attempts and background approval ownership are settled,
+  // but before any chat or generic restart resumer can inspect stale state.
+  try {
+    const historical = reconcileHistoricalHarnessStateOnBoot();
+    if (
+      historical.roots.closed > 0
+      || historical.roots.conflicted > 0
+      || historical.roots.held > 0
+      || historical.interrupts.cleared > 0
+      || historical.interrupts.held > 0
+      || historical.roots.casLost > 0
+      || historical.interrupts.casLost > 0
+      || historical.rootPageLimitReached
+      || historical.interruptPageLimitReached
+    ) {
+      logger.warn(historical, 'Reconciled bounded historical harness state on boot');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Historical harness-state boot reconcile failed closed',
+    );
+  }
   // Register the live approval listener and drain decisions that landed before
   // this daemon existed. This must run after orphan attempts are interrupted
   // (so a dead executor cannot still own the session) and before generic chat
@@ -2044,12 +2189,12 @@ export async function startDaemon(
   // through the same harness spine a user's `continue` uses (2026-07-09: users
   // sat on "reply continue" banners after every restart; the resume path itself
   // was live-verified to work). Write-touched / stale runs keep the manual banner.
-  const recoveredChats = reportInterruptedChatRuns(Date.now, async (sessionId, directive, sourceUserSeq) => {
-    await respondPreferHarness('background', {
-      sessionId,
-      channel: 'daemon',
-      message: directive,
-      sourceUserSeq,
+  const recoveredChats = reportInterruptedChatRuns(Date.now, async (restart) => {
+    await respondPreferHarness(restart.surface, {
+      sessionId: restart.sessionId,
+      channel: restart.channel ?? restart.surface,
+      message: restart.acceptedInput,
+      sourceUserSeq: restart.sourceUserSeq,
       model: MODELS.primary,
     }, (req) => assistant.respond(req));
   }, { bootCutoffMs: performance.timeOrigin });
@@ -2155,6 +2300,83 @@ export async function startDaemon(
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Workflow legacy migration failed (continuing)');
   }
 
+  // The automation proposal remains inert until this exact projection sees its
+  // own formal approval row. Install the row listener and close any crash gap
+  // from approval registration/queue acceptance before ordinary workflow runs
+  // drain. The reconciler reads only its versioned projection table and exact
+  // approval/compilation/binding/control lineage; it never scans chat prose or
+  // infers cadence/recurrence authority.
+  try {
+    installAutomationOpportunityReviewControlPlaneReconciler();
+    const reviewed = reconcileAutomationOpportunityReviewProjections();
+    if (reviewed.approved > 0 || reviewed.rejected > 0 || reviewed.refused > 0 || reviewed.failed > 0) {
+      logger.info(reviewed, 'Reconciled exact automation opportunity review projections on boot');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Automation opportunity review control-plane boot reconcile failed',
+    );
+  }
+  try {
+    installAutomationReadPilotWorkspaceControlPlaneReconciler();
+    const workspaces = reconcileAutomationReadPilotWorkspaceCreations();
+    if (workspaces.created > 0 || workspaces.refused > 0 || workspaces.failed > 0) {
+      logger.info(workspaces, 'Reconciled exact automation read-pilot Workspace creations on boot');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Automation read-pilot Workspace creation boot reconcile failed',
+    );
+  }
+  try {
+    installAutomationReadPilotControlPlaneReconciler();
+    const projected = reconcileAutomationReadPilotProjections();
+    if (projected.queued > 0 || projected.refused > 0 || projected.failed > 0) {
+      logger.info(projected, 'Reconciled exact automation read-pilot projections on boot');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Automation read-pilot control-plane boot reconcile failed',
+    );
+  }
+  try {
+    installAutomationPilotProductionConvergenceListener();
+    const converged = await reconcileAutomationPilotProductionConvergence();
+    if (
+      converged.chooserCreated > 0
+      || converged.chooserBlocked > 0
+      || converged.chooserRecovered > 0
+      || converged.authoringSubmitted > 0
+      || converged.authoringBlocked > 0
+      || converged.advancementsQueued > 0
+      || converged.failures > 0
+    ) logger.info(converged, 'Converged approved automation pilots on boot');
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Automation pilot production convergence boot pass failed',
+    );
+  }
+  try {
+    installAutomationRecurrenceReconciler();
+    const recurrences = reconcileAutomationRecurrences();
+    if (
+      recurrences.active > 0
+      || recurrences.refused > 0
+      || recurrences.repairedCards > 0
+      || recurrences.installed > 0
+      || recurrences.failed > 0
+    ) logger.info(recurrences, 'Reconciled exact automation recurrence control plane on boot');
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Automation recurrence control-plane boot reconcile failed',
+    );
+  }
+
   // Surface any in-flight workflow runs that didn't reach a terminal
   // state — daemon restart, crash, or kill mid-run. The runner picks
   // these up on the next tick and resumes from the last successful
@@ -2229,6 +2451,23 @@ export async function startDaemon(
   // itself has an in-flight guard, so explicit approval kicks and this
   // timer cannot double-run the same task.
   const drainBackgroundTasks = () => {
+    try {
+      const approvals = reconcileBackgroundTaskApprovals();
+      if (
+        approvals.queuedApproved > 0
+        || approvals.queuedRejected > 0
+        || approvals.blockedMissing > 0
+        || approvals.blockedMismatch > 0
+        || approvals.blockedAmbiguous > 0
+        || approvals.blockedInvalid > 0
+        || approvals.failed > 0
+      ) logger.warn(approvals, 'Reconciled background-task approval ownership');
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Background-task approval tick failed; parked tasks remain non-dispatching',
+      );
+    }
     withDaemonRuntimePhase('daemon.timer.background_tasks', {}, () => processBackgroundTasks(assistant)).catch((err) => {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
@@ -2285,25 +2524,6 @@ export async function startDaemon(
       });
     });
   });
-
-  // Composio background job-watcher: a DETERMINISTIC poller (not an LLM worker) for
-  // queued Composio jobs the tool call-site parked — a genuinely-long Apify scrape,
-  // or a DataForSEO/Firecrawl async job whose result-getter needs a live lookup. Runs
-  // on its OWN 15s timer (like the background drain) so it never waits behind the main
-  // loop; each due record is polled once and its owning background task reports the
-  // REAL result back to the origin session on completion. The exec binds the record's
-  // connectionId (executeComposioTool's 3rd arg). Fail-open.
-  const tickComposioJobs = () => {
-    withDaemonRuntimePhase('daemon.timer.composio_job_watch', {}, () => processComposioJobWatchTick((slug, args, connectionId) => executeComposioTool(slug, args, connectionId)))
-      .catch((err) => {
-        logger.warn(
-          { err: err instanceof Error ? err.message : String(err) },
-          'Composio job-watch tick failed',
-        );
-      });
-  };
-  const composioJobTimer = setInterval(tickComposioJobs, 15_000);
-  composioJobTimer.unref?.();
 
   // Adaptive route policy — the periodic OFFLINE learning job (Phase E). Groups
   // recent route outcomes by (role, intent, model), scores them with the
@@ -2535,6 +2755,56 @@ export async function startDaemon(
         try { reapResolvedParkedRuns(); } catch (err) {
           logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reapResolvedParkedRuns tick failed');
         }
+        try {
+          const reviewed = reconcileAutomationOpportunityReviewProjections();
+          if (reviewed.approved > 0 || reviewed.rejected > 0 || reviewed.refused > 0 || reviewed.failed > 0) {
+            logger.info(reviewed, 'Reconciled exact automation opportunity review projections');
+          }
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Automation opportunity review control-plane tick failed',
+          );
+        }
+        try {
+          const workspaces = reconcileAutomationReadPilotWorkspaceCreations();
+          if (workspaces.created > 0 || workspaces.refused > 0 || workspaces.failed > 0) {
+            logger.info(workspaces, 'Reconciled exact automation read-pilot Workspace creations');
+          }
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Automation read-pilot Workspace creation control-plane tick failed',
+          );
+        }
+        try {
+          const projected = reconcileAutomationReadPilotProjections();
+          if (projected.queued > 0 || projected.refused > 0 || projected.failed > 0) {
+            logger.info(projected, 'Reconciled exact automation read-pilot projections');
+          }
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Automation read-pilot control-plane tick failed',
+          );
+        }
+        try {
+          const converged = await reconcileAutomationPilotProductionConvergence();
+          if (
+            converged.chooserCreated > 0
+            || converged.chooserBlocked > 0
+            || converged.chooserRecovered > 0
+            || converged.authoringSubmitted > 0
+            || converged.authoringBlocked > 0
+            || converged.advancementsQueued > 0
+            || converged.failures > 0
+          ) logger.info(converged, 'Converged approved automation pilots');
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Automation pilot production convergence tick failed',
+          );
+        }
         await processWorkflowRuns(assistant);
       }).catch((err) => {
         logger.warn(
@@ -2608,8 +2878,27 @@ export async function startDaemon(
     // due-compare (fireAt <= now) → survives restart AND laptop sleep — the
     // tool used to be WRITE-ONLY (no consumer; every reminder silently lost).
     await withDaemonRuntimePhase('daemon.loop.timers', { tickCount }, async () => { fireDueTimers(); });
-    // Match workflows with trigger.schedule against the wall clock and
-    // enqueue runs. processWorkflowRuns (below) then drains the queue.
+    // Standing interval consent is repaired/installed before schedule
+    // discovery. A workflow definition alone is configuration, never runtime
+    // authority; the scheduler independently rechecks the active receipt.
+    await withDaemonRuntimePhase('daemon.loop.automation_recurrence', { tickCount }, async () => {
+      try {
+        const recurrences = reconcileAutomationRecurrences();
+        if (
+          recurrences.refused > 0
+          || recurrences.repairedCards > 0
+          || recurrences.installed > 0
+          || recurrences.failed > 0
+        ) logger.info(recurrences, 'Reconciled exact automation recurrence control plane');
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Automation recurrence control-plane tick failed',
+        );
+      }
+    });
+    // Match workflows with trigger.schedule/interval against wall-clock time
+    // and enqueue runs. processWorkflowRuns (below) then drains the queue.
     await withDaemonRuntimePhase('daemon.loop.workflow_schedules', { tickCount }, () => processWorkflowSchedules());
     // T2.1: keep the trigger registry in sync with each enabled workflow's
     // declared event/webhook triggers so fireWorkflowSystemEvent / the
@@ -2670,6 +2959,56 @@ export async function startDaemon(
         try { reapResolvedParkedRuns(); } catch (err) {
           logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reapResolvedParkedRuns inline tick failed');
         }
+        try {
+          const reviewed = reconcileAutomationOpportunityReviewProjections();
+          if (reviewed.approved > 0 || reviewed.rejected > 0 || reviewed.refused > 0 || reviewed.failed > 0) {
+            logger.info(reviewed, 'Reconciled exact automation opportunity review projections inline');
+          }
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Automation opportunity review control-plane inline reconcile failed',
+          );
+        }
+        try {
+          const workspaces = reconcileAutomationReadPilotWorkspaceCreations();
+          if (workspaces.created > 0 || workspaces.refused > 0 || workspaces.failed > 0) {
+            logger.info(workspaces, 'Reconciled exact automation read-pilot Workspace creations inline');
+          }
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Automation read-pilot Workspace creation control-plane inline reconcile failed',
+          );
+        }
+        try {
+          const projected = reconcileAutomationReadPilotProjections();
+          if (projected.queued > 0 || projected.refused > 0 || projected.failed > 0) {
+            logger.info(projected, 'Reconciled exact automation read-pilot projections inline');
+          }
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Automation read-pilot control-plane inline reconcile failed',
+          );
+        }
+        try {
+          const converged = await reconcileAutomationPilotProductionConvergence();
+          if (
+            converged.chooserCreated > 0
+            || converged.chooserBlocked > 0
+            || converged.chooserRecovered > 0
+            || converged.authoringSubmitted > 0
+            || converged.authoringBlocked > 0
+            || converged.advancementsQueued > 0
+            || converged.failures > 0
+          ) logger.info(converged, 'Converged approved automation pilots inline');
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Automation pilot production convergence inline tick failed',
+          );
+        }
         await processWorkflowRuns(assistant);
       });
     }
@@ -2680,15 +3019,6 @@ export async function startDaemon(
       await withDaemonRuntimePhase('daemon.loop.monitors', { tickCount }, async () => {
         processMonitors();
       });
-      // C2 ambient inbox watch (general, read-only). Self-rate-limited (own
-      // cadence) + surface-only; fire-and-forget so its mailbox reads never block
-      // the tick. Best-effort.
-      void withDaemonRuntimePhase('daemon.fire_and_forget.inbox_monitor', { tickCount }, () => processInboxMonitor())
-        .catch((err) => logger.warn({ err }, 'inbox monitor tick failed'));
-      // C2 ambient calendar watch — same pattern (general, read-only).
-      // Self-rate-limited; fire-and-forget.
-      void withDaemonRuntimePhase('daemon.fire_and_forget.calendar_monitor', { tickCount }, () => processCalendarMonitor())
-        .catch((err) => logger.warn({ err }, 'calendar monitor tick failed'));
     }
 
     if (proactivity.proactiveWorkAllowed) {

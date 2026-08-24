@@ -3,11 +3,16 @@ import { Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
 import { randomUUID } from 'node:crypto';
 import { HarnessSession } from './session.js';
-import { clearRunInFlightAfterTerminal } from './restart-recovery.js';
+import { applySessionMountPrimers, composeSession } from './session-composition.js';
+import {
+  clearRunInFlightAfterTerminal,
+  releaseRunInFlightAfterWorkflowTransfer,
+} from './restart-recovery.js';
 import { uncompensatedExternalWriteEvents } from './external-write-admission.js';
 import {
   acceptUserInputForRun,
   appendConversationPreambleOnce,
+  conversationPreambleDeliveryRequest,
   appendAsyncWorkDispatchBatchClosedOnce,
   appendAsyncWorkDispatchedOnce,
   appendEvent,
@@ -17,6 +22,7 @@ import {
   getLatestCanonicalTopLevelToolEvent,
   getLatestRunAttempt,
   getSession,
+  getTurnGraphEventForSource,
   getToolOutput,
   isKillRequested,
   listEvents,
@@ -48,6 +54,7 @@ import {
   startGate,
   type HarnessRunContext,
 } from './brackets.js';
+import { recoverSettledPlanTaskActivation } from './plan-task-post-settlement.js';
 import {
   compactInFlightToolContext,
   compactSessionIfNeeded,
@@ -101,6 +108,7 @@ import {
   deliveryMustHoldForHuman,
 } from './delivery-committer.js';
 import { auditAcceptedSourceSettlementTruth } from './accepted-source-settlement-audit.js';
+import { exactTerminalForAcceptedSource } from './accepted-source-terminal.js';
 import {
   repairActionTerminalBeforeCommit,
   repairTerminalPresentation,
@@ -212,7 +220,17 @@ import type {
   ConversationPreambleDeliveryCallback,
   TaskContinuationContext,
 } from '../../types.js';
-import { classifyTurnPreflight, effectiveTurnObjective } from './turn-control.js';
+import {
+  freshHostConversationSurfaceOnly,
+  primePrimaryModelPlanningCatalog,
+  type HostFreshPlanningContextV1,
+} from '../semantic-boundary/admit-and-compile-accepted-source.js';
+import {
+  classifyTurnPreflight,
+  effectiveTurnObjective,
+  validatedTurnSourceStrategyBinding,
+} from './turn-control.js';
+import { confirmedSourceStrategyDecisionForSource } from './source-strategy-admission.js';
 import {
   createAgentsPreflightConversationPort,
   publishPreflightConversation,
@@ -224,8 +242,18 @@ import {
   commitUnadmittedSemanticTurn,
   recordAcceptedSourceGraph,
 } from './record-accepted-source-graph.js';
-import { dispatchAdmittedSource } from '../semantic-boundary/typed-source-dispatch.js';
-import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
+import {
+  dispatchAdmittedSource,
+} from '../semantic-boundary/typed-source-dispatch.js';
+import { HostInterruptState, hostRunRunner } from './host-turn-runner.js';
+import { hostInteractiveConsentApprovalResumeKey } from './host-interactive-consent.js';
+import { isHostTurnEngine, selectTurnEngine, type TurnEngineMode } from './turn-engine-selection.js';
+import {
+  ModelStreamStalledError,
+  modelFirstByteStallMs,
+  modelStreamStallMs,
+  modelStreamStallRetries,
+} from './model-stall-policy.js';
 import { heldExecutionTextForInternalReason, isHostAuthorityHeldReason } from './public-presentation.js';
 // Lane wiring: the callable-surface oracle serves exact local schemas on this
 // lane (guardrail mandates are constructible only from proof).
@@ -396,6 +424,58 @@ function safeAppend(input: AppendEventInput): void {
   }
 }
 
+/**
+ * Seal fresh host ownership before the semantic port can participate. The
+ * accepted source is the identity: runConversation and runTurn cross this
+ * boundary at different physical layers, but may never append two owners.
+ */
+function requireFreshHostTurnOwnership(input: {
+  sessionId: string;
+  turn: number;
+  sourceUserSeq: number;
+  engine: TurnEngineMode;
+}): void {
+  if (!isHostTurnEngine(input.engine)) {
+    throw new Error(`Fresh host ownership requires a host engine, received ${input.engine}.`);
+  }
+  const rows = (): EventRow[] => listEvents(input.sessionId, {
+    sinceSeq: input.sourceUserSeq,
+    types: ['turn_engine_selected'],
+  }).filter((event) => (
+    event.data.sourceUserSeq === input.sourceUserSeq
+    && event.data.resumed === false
+  ));
+  const assertExact = (owned: EventRow[]): boolean => {
+    if (owned.length !== 1) return false;
+    const event = owned[0]!;
+    return event.role === 'system'
+      && event.data.engine === input.engine
+      && event.data.sourceUserSeq === input.sourceUserSeq
+      && event.data.resumed === false;
+  };
+  const before = rows();
+  if (before.length > 0) {
+    if (!assertExact(before)) {
+      throw new Error('Fresh host turn ownership is duplicated or conflicts with the accepted source.');
+    }
+    return;
+  }
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'system',
+    type: 'turn_engine_selected',
+    data: {
+      engine: input.engine,
+      sourceUserSeq: input.sourceUserSeq,
+      resumed: false,
+    },
+  });
+  if (!assertExact(rows())) {
+    throw new Error('Fresh host turn ownership could not be sealed exactly.');
+  }
+}
+
 interface StandardArtifactTerminalState {
   rootScopeId: string;
   artifacts: RunArtifact[];
@@ -493,6 +573,25 @@ function acceptedUserEvent(
   return event;
 }
 
+function runConversationStatusForPresentation(
+  presentation: PresentationEvent,
+): RunConversationStatus {
+  if (presentation.status === 'done') return 'completed';
+  if (presentation.status === 'needs_input') {
+    if (presentation.needs?.kind === 'approval') return 'awaiting_approval';
+    if (presentation.needs?.kind === 'continue') return 'limit_exceeded';
+    return 'awaiting_user_input';
+  }
+  if (presentation.status === 'cancelled') return 'killed';
+  // `dispatched` is the nonterminal async edge returned before any public
+  // completion exists. A durable `transferred` presentation has already
+  // terminalized the foreground turn, even though another owner continues the
+  // work, so its compatibility run status is completed.
+  if (presentation.status === 'transferred') return 'completed';
+  if (presentation.status === 'failed') return 'failed';
+  return 'blocked';
+}
+
 function acceptExistingConversationInput(sessionId: string, sourceUserSeq: number): number {
   const accepted = acceptedUserEvent(sessionId, sourceUserSeq);
   return acceptUserInputForRun({
@@ -531,12 +630,14 @@ function approvalDecisionMatches(text: unknown, decision: 'approve' | 'reject' |
     : /\b(?:approve|approved|yes|confirm|go ahead|proceed)\b/.test(normalized);
 }
 
-function acceptResumeConversationInput(opts: {
+type ResumeConversationInput = {
   sessionId: string;
   sourceUserSeq?: number;
   approvalId?: string;
   decision: 'approve' | 'reject' | 'approve_with_edits';
-}): number {
+};
+
+function existingResumeConversationSource(opts: ResumeConversationInput): EventRow | null {
   const explicitApprovalId = opts.approvalId?.trim();
   if (explicitApprovalId) {
     const exact = listEvents(opts.sessionId, {
@@ -554,10 +655,34 @@ function acceptResumeConversationInput(opts: {
       if (exact.length !== 1 || exact[0].seq !== sourceUserSeq) {
         throw new Error(`Accepted source ${sourceUserSeq} does not own approval ${explicitApprovalId}.`);
       }
-      return acceptExistingConversationInput(opts.sessionId, sourceUserSeq);
+      return exact[0];
     }
-    if (exact.length === 1) return acceptExistingConversationInput(opts.sessionId, exact[0].seq);
+    return exact[0] ?? null;
+  }
+  if (Number.isSafeInteger(opts.sourceUserSeq) && (opts.sourceUserSeq ?? 0) > 0) {
+    return acceptedUserEvent(opts.sessionId, Number(opts.sourceUserSeq));
+  }
+  const lastApprovalSeq = listEvents(opts.sessionId, { types: ['approval_requested'], desc: true, limit: 1 })[0]?.seq ?? 0;
+  const attemptSource = (() => {
+    try { return getLatestRunAttempt(opts.sessionId)?.sourceUserSeq; } catch { return undefined; }
+  })();
+  const candidates = listEvents(opts.sessionId, { types: ['user_input_received'], desc: true, limit: 20 });
+  const alreadyAccepted = candidates.find((event) => {
+    if (event.seq <= lastApprovalSeq) return false;
+    if (attemptSource && event.seq === attemptSource) return true;
+    const eventApprovalId = typeof event.data.approvalId === 'string' ? event.data.approvalId : undefined;
+    if (opts.approvalId && eventApprovalId === opts.approvalId) return true;
+    return approvalDecisionMatches(event.data.text, opts.decision);
+  });
+  return alreadyAccepted ?? null;
+}
 
+function acceptResumeConversationInput(opts: ResumeConversationInput): number {
+  const existing = existingResumeConversationSource(opts);
+  if (existing) return acceptExistingConversationInput(opts.sessionId, existing.seq);
+
+  const explicitApprovalId = opts.approvalId?.trim();
+  if (explicitApprovalId) {
     const row = getSession(opts.sessionId);
     if (!row) throw new Error(`unknown session: ${opts.sessionId}`);
     return acceptUserInputForRun({
@@ -578,22 +703,6 @@ function acceptResumeConversationInput(opts: {
       },
     }).seq;
   }
-  if (Number.isSafeInteger(opts.sourceUserSeq) && (opts.sourceUserSeq ?? 0) > 0) {
-    return acceptExistingConversationInput(opts.sessionId, Number(opts.sourceUserSeq));
-  }
-  const lastApprovalSeq = listEvents(opts.sessionId, { types: ['approval_requested'], desc: true, limit: 1 })[0]?.seq ?? 0;
-  const attemptSource = (() => {
-    try { return getLatestRunAttempt(opts.sessionId)?.sourceUserSeq; } catch { return undefined; }
-  })();
-  const candidates = listEvents(opts.sessionId, { types: ['user_input_received'], desc: true, limit: 20 });
-  const alreadyAccepted = candidates.find((event) => {
-    if (event.seq <= lastApprovalSeq) return false;
-    if (attemptSource && event.seq === attemptSource) return true;
-    const eventApprovalId = typeof event.data.approvalId === 'string' ? event.data.approvalId : undefined;
-    if (opts.approvalId && eventApprovalId === opts.approvalId) return true;
-    return approvalDecisionMatches(event.data.text, opts.decision);
-  });
-  if (alreadyAccepted) return acceptExistingConversationInput(opts.sessionId, alreadyAccepted.seq);
 
   const row = getSession(opts.sessionId);
   if (!row) throw new Error(`unknown session: ${opts.sessionId}`);
@@ -698,12 +807,19 @@ function reduceStandardConversationTerminal(input: {
     ) {
       throw new Error('Persisted public presentation is not bound to the exact accepted standard turn.');
     }
-    return result;
+    // The first durable presentation is the public state machine. A lane may
+    // have proposed `awaiting_user_input` immediately before the shared
+    // committer deterministically converted that proposal to `blocked` (or the
+    // inverse for a real judge-authored question). Never let the compatibility
+    // status contradict the exact persisted winner returned to callers.
+    return {
+      ...result,
+      status: runConversationStatusForPresentation(persisted),
+    };
   }
 
   let outcome: TurnOutcome;
   let legacyReason: string;
-  let reducedStatus = result.status;
   let failureDetail: string | undefined;
   let transferredToTaskId: string | undefined;
   switch (result.status) {
@@ -742,7 +858,6 @@ function reduceStandardConversationTerminal(input: {
           presentation: { kind: 'question', text: MISSING_REPLY_USER_FALLBACK },
         };
         legacyReason = 'awaiting_user_input';
-        reducedStatus = 'awaiting_user_input';
       }
       break;
     }
@@ -798,15 +913,14 @@ function reduceStandardConversationTerminal(input: {
         version: 2,
         id: turnOutcomeId(identity),
         identity,
-        status: 'needs_input',
+        status: 'blocked',
         resumable: true,
-        needs: { kind: 'continue' },
         presentation: {
-          kind: 'continue',
-          text: 'This run reached its current budget with more work remaining. Reply `continue` to keep going.',
+          kind: 'blocked',
+          text: 'This run reached its current budget with more work remaining. Progress is checkpointed.',
         },
       };
-      legacyReason = 'awaiting_continue';
+      legacyReason = 'step_budget_parked';
       break;
     case 'killed': {
       // A stop that handed this turn to a durable background owner is a
@@ -838,6 +952,33 @@ function reduceStandardConversationTerminal(input: {
       transferredToTaskId = transfer?.backgroundTaskId;
       break;
     }
+    case 'held':
+      // Held is deliberately nonterminal and is returned before the spine's
+      // publication reducer. Reaching this function would manufacture a
+      // terminal over peer/restart ownership, so fail the programmer boundary.
+      throw new Error('nonterminal held execution cannot enter terminal reduction');
+    case 'blocked':
+      // A refusal the host can EXPLAIN is not a failure. It keeps its own
+      // words — the admission reason or the committed public presentation —
+      // because collapsing it into PUBLIC_RUN_FAILURE_TEXT is what turned a
+      // legible "I could not admit this turn" into a bare "something went
+      // wrong". Resumable: the user can answer or rephrase and continue.
+      outcome = {
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'blocked',
+        resumable: true,
+        presentation: {
+          kind: 'blocked',
+          // A committed public presentation already returned above, so the
+          // admission reason is what is left to carry the explanation.
+          text: publicReplyText(result.error, '')
+            || 'I could not admit this turn, so I stopped before using any tools.',
+        },
+      };
+      legacyReason = 'blocked';
+      break;
     case 'failed':
       outcome = {
         version: 2,
@@ -874,7 +1015,11 @@ function reduceStandardConversationTerminal(input: {
       ...(failureDetail ? { failureDetail } : {}),
     },
   });
-  return { ...result, status: reducedStatus, publicPresentation: committed.presentation };
+  return {
+    ...result,
+    status: runConversationStatusForPresentation(committed.presentation),
+    publicPresentation: committed.presentation,
+  };
 }
 
 export const _testOnly_reduceStandardConversationTerminal = reduceStandardConversationTerminal;
@@ -1189,9 +1334,7 @@ function finalizeStandardConversation(input: {
     // authority. In particular, a disclosed `done` can be sent back to the
     // hold when the accepted-task state machine refuses to close authority
     // that never entered manifested verification.
-    ...(committed.presentation.status === 'blocked'
-      ? { status: 'awaiting_user_input' as const }
-      : {}),
+    status: runConversationStatusForPresentation(committed.presentation),
     publicPresentation: committed.presentation,
   };
 }
@@ -1803,22 +1946,36 @@ function registerAndEmitApprovals(
       : null;
     let approvalId: string | null = null;
     let approvalPresentation: approvalRegistry.PendingApprovalRow['presentation'] = null;
+    let approvalCreated = false;
     try {
+      const approvalResumeKey = typeof interruption.approvalResumeKey === 'string'
+        && interruption.approvalResumeKey.trim()
+        ? interruption.approvalResumeKey.trim()
+        : null;
       const authority = {
         approvalId: '',
         sessionId: options.sessionId,
         tool: interruption.toolName,
         args: approvalArgs ?? null,
-        resumeKey: null,
+        resumeKey: approvalResumeKey,
       };
       // A partial RunState resume can surface the still-unresolved sibling
       // interruption again. Reuse its exact pending card instead of minting a
       // duplicate; a changed payload intentionally receives a fresh card.
-      const existingExact = linkedExactApproval ?? approvalRegistry.listPending({
-        sessionId: options.sessionId,
-        status: 'pending',
-      }).find((candidate) => exactApprovalAuthorityMatches(candidate, authority));
-      const row = existingExact ?? approvalRegistry.register({
+      const reopenedResumable = approvalResumeKey
+        ? approvalRegistry.inspectResumableApproval(approvalResumeKey)
+        : { state: 'none' as const };
+      const reopenedExact = reopenedResumable.state !== 'none'
+        && exactApprovalAuthorityMatches(reopenedResumable.row, authority)
+        ? reopenedResumable.row
+        : null;
+      const existingExact = linkedExactApproval
+        ?? approvalRegistry.listPending({
+          sessionId: options.sessionId,
+          status: 'pending',
+        }).find((candidate) => exactApprovalAuthorityMatches(candidate, authority))
+        ?? reopenedExact;
+      const registration = {
         sessionId: options.sessionId,
         channel,
         channelId,
@@ -1826,7 +1983,18 @@ function registerAndEmitApprovals(
         tool: interruption.toolName,
         args: approvalArgs ?? null,
         presentation,
-      });
+      };
+      const resumable = !existingExact && approvalResumeKey
+        ? approvalRegistry.registerResumable({
+            ...registration,
+            resumeKey: approvalResumeKey,
+          })
+        : null;
+      const row = existingExact
+        ?? resumable?.row
+        ?? approvalRegistry.register(registration);
+      const created = !existingExact && (resumable?.created ?? true);
+      approvalCreated = created;
       approvalId = row.approvalId;
       approvalPresentation = row.presentation;
       // Fan out to the notification delivery queue so every enabled
@@ -1835,7 +2003,7 @@ function registerAndEmitApprovals(
       // dedupe in addNotification keys on the stable approvalId
       // metadata so multiple harness turns registering the same
       // approval don't spam.
-      if (!existingExact) {
+      if (created) {
         try {
           if (!row.presentation) addNotification({
             id: `approval-${row.approvalId}`,
@@ -1883,7 +2051,9 @@ function registerAndEmitApprovals(
       });
     }
     if (approvalId) approvalIds.push(approvalId);
-    const approvalEvent = (() => {
+    const approvalEvent = (!approvalCreated && interruption.approvalResumeKey)
+      ? null
+      : (() => {
       try {
         return appendEvent({
       sessionId: options.sessionId,
@@ -1913,7 +2083,7 @@ function registerAndEmitApprovals(
         });
         return null;
       }
-    })();
+      })();
     if (approvalEvent && approvalPresentation && approvalId) {
       try {
         approvalRegistry.bindConversationalApprovalPrompt({
@@ -1959,6 +2129,8 @@ export interface InterruptionInfo {
   args: Record<string, unknown> | null;
   /** Raw argument string, untouched. */
   rawArgs: string;
+  /** Opaque host-minted identity for one exact reducer consent subject. */
+  approvalResumeKey?: string;
 }
 
 export interface RunOutcome {
@@ -1973,6 +2145,19 @@ export interface RunOutcome {
   hasInterruptions?: boolean;
   /** Per-interruption details, extracted from RunToolApprovalItem.rawItem. */
   interruptions?: InterruptionInfo[];
+  /**
+   * Set when the step ended in a terminal, explained refusal rather than a
+   * model answer — today a durable stop-and-explain frame in host-turn-runner.
+   * The status travels with the outcome so the caller does not have to
+   * re-derive "was this blocked?" from the text it produced.
+   */
+  terminal?: { status: 'blocked'; reason: string };
+  /** Internal nonterminal recovery ownership. No public terminal is authored. */
+  hold?: {
+    owner: 'host';
+    wake: 'recovery';
+    reason: 'recovery_pending';
+  };
 }
 
 export type RunRunnerFn = (
@@ -2147,10 +2332,18 @@ export interface RunTurnOptions {
   agent: Agent<any, any>;
   sessionId: string;
   input: string;
+  /** Caller-owned cancellation for this physical turn. The host maps it to
+   * the same typed killed terminal as an observed kill request, while tool
+   * deadlines and uncertain writes retain their distinct outcomes. */
+  signal?: AbortSignal;
   /** The turn's memory warm already ran at the spine's context_resolve node.
    *  Set only by the spine; a turn reached any other way still warms here, so
    *  the extraction can never leave a lane cold. */
   contextWarmedAtNode?: boolean;
+  /** High-confidence graph-neutral conversation surface: skip both the hidden
+   * query embedding and the visible vault primer. This is a cost optimization
+   * only; any uncertain/action-shaped turn omits it and retains full recall. */
+  skipAutomaticMemoryPrimer?: true;
   /** Runtime-owned semantic context for a verified resumed task. It may steer
    * retrieval/classification, but it never replaces `input` in model-visible
    * user history and never grants tool or approval authority. */
@@ -2172,6 +2365,9 @@ export interface RunTurnOptions {
   makeRunner?: () => Runner;
   /** Test injection: run the Runner. Defaults to a real runner.run(). */
   runRunner?: RunRunnerFn;
+  /** Frozen by the accepted-turn entry boundary. A caller may omit this only
+   * when it deliberately wants runTurn to select from the process policy. */
+  turnEngine?: TurnEngineMode;
   /** Test injection for the structural one-turn/no-tool alignment author. */
   preflightConversationPort?: PreflightConversationPort;
   /** Awaited transport delivery for the nonterminal pre-execution prose. */
@@ -2205,7 +2401,7 @@ export interface RunTurnOptions {
   mcpToolScope?: McpToolScope | null;
 }
 
-export type RunTurnStatus = 'completed' | 'awaiting_approval' | 'awaiting_user_input' | 'killed' | 'limit_exceeded' | 'failed';
+export type RunTurnStatus = 'completed' | 'held' | 'awaiting_approval' | 'awaiting_user_input' | 'blocked' | 'killed' | 'limit_exceeded' | 'failed';
 
 export interface RunTurnResult {
   sessionId: string;
@@ -2229,6 +2425,12 @@ export interface RunTurnResult {
    *  absent human instead auto-retries. The outer loop re-runs the SAME step with
    *  `directive` (bounded by decideInfraRecovery). Never written for attended runs. */
   infraAutoRetry?: { kind: string; directive: string };
+  /** Nonterminal protocol/restart ownership. No public terminal is authored. */
+  hold?: {
+    owner: 'host';
+    wake: 'recovery';
+    reason: 'recovery_pending';
+  };
 }
 
 // ---------- runConversation ----------
@@ -2283,10 +2485,16 @@ export interface OrchestratorDecisionShape {
 export type RunConversationStatus =
   | 'completed'
   | 'dispatched'
+  | 'held'
   | 'awaiting_user_input'
   | 'awaiting_approval'
   | 'killed'
   | 'limit_exceeded'
+  // A turn the host refused to admit, or a typed construct that failed its own
+  // evidence contract. It is a TERMINAL, EXPLAINED outcome — not a failure — so
+  // it carries its own public presentation and must never reach the bridge's
+  // `default:` throw, which renders as a bare "something went wrong".
+  | 'blocked'
   | 'failed';
 
 /**
@@ -2316,7 +2524,15 @@ export interface RunConversationOptions {
   buildAgent?: (identity: {
     sessionId: string;
     sourceUserSeq: number;
-    route: 'direct_reply' | 'retrieve' | 'act';
+    /** Present only on the legacy admitted-graph lane. The host engine owns
+     * ordinary reasoning and must not be handed a fabricated semantic route. */
+    route?: 'direct_reply' | 'retrieve' | 'act';
+    /** Graph-neutral host entry: mount the in-loop plan control and its exact
+     * advisory catalog without fabricating a semantic route. */
+    hostFreshPlanning?: HostFreshPlanningContextV1;
+    /** High-confidence, surface-only optimization. It removes every tool
+     * schema but grants no route/terminal authority. */
+    hostPlainConversation?: true;
   }) => Promise<Agent<any, any>>;
   sessionId: string;
   input: string;
@@ -2364,6 +2580,9 @@ export interface RunConversationOptions {
   makeRunner?: () => Runner;
   /** Test injection. */
   runRunner?: RunRunnerFn;
+  /** One immutable engine decision for this accepted source. The bridge sets
+   * it before any eager resolver; direct callers may omit it. */
+  turnEngine?: TurnEngineMode;
   /** Test injection for the structural one-turn/no-tool alignment author. */
   preflightConversationPort?: PreflightConversationPort;
   /** Awaited transport delivery for the nonterminal pre-execution prose. */
@@ -2417,6 +2636,13 @@ export interface RunConversationResult {
   lastDecision?: OrchestratorDecisionShape;
   lastTurn: number;
   error?: string;
+  /** Nonterminal exact-source ownership retained by a peer or restart
+   * reconciler. No public terminal or user-input dependency exists yet. */
+  hold?: {
+    owner: 'host';
+    wake: 'peer' | 'recovery';
+    reason: 'peer_in_progress' | 'recovery_pending';
+  };
   /** Set when a 'completed' status is actually a DEAD turn (parse retries
    *  exhausted / stall give-up) — the respond bridge uses it to re-run the
    *  turn ONCE on the next brain instead of shipping the apology. */
@@ -2427,6 +2653,87 @@ export interface RunConversationResult {
    *  'token_budget' to its own distinct stoppedReason so the background
    *  drain parks instead of misclassifying the run (Stage 4). */
   limitKind?: 'wall_clock' | 'max_steps' | 'token_budget';
+}
+
+/**
+ * A host activation already owns its complete model -> tools -> model loop.
+ * Project that one activation into the shared conversation terminal algebra;
+ * never feed it through the legacy outer continuation/judge loop.
+ */
+function hostActivationConversationResult(turnResult: RunTurnResult): RunConversationResult {
+  if (turnResult.status === 'held') {
+    return {
+      sessionId: turnResult.sessionId,
+      status: 'held',
+      steps: 1,
+      lastTurn: turnResult.turn,
+      hold: turnResult.hold ?? {
+        owner: 'host',
+        wake: 'recovery',
+        reason: 'recovery_pending',
+      },
+    };
+  }
+  const authoredText = publicReplyText(turnResult.finalOutput, '');
+  const nextAction = turnResult.status === 'awaiting_approval'
+    ? 'awaiting_approval' as const
+    : turnResult.status === 'awaiting_user_input'
+      ? 'awaiting_user_input' as const
+      : turnResult.status === 'completed'
+        ? 'completed' as const
+        : 'abandoned' as const;
+  const lastDecision = authoredText
+    ? {
+        summary: authoredText,
+        reply: authoredText,
+        done: turnResult.status === 'completed',
+        nextAction,
+        reason: turnResult.status === 'completed' ? null : turnResult.error ?? null,
+      }
+    : undefined;
+  return {
+    sessionId: turnResult.sessionId,
+    status: turnResult.status,
+    steps: 1,
+    lastTurn: turnResult.turn,
+    ...(lastDecision ? { lastDecision } : {}),
+    ...(turnResult.error ? { error: turnResult.error } : {}),
+  };
+}
+
+/**
+ * Project an already-committed exact-source terminal back into the loop's
+ * compatibility result without re-entering admission, model construction, or
+ * execution. A retry is a read of the durable winner, never a second attempt
+ * to earn authority for work whose outcome is already public.
+ */
+function replayedRunConversationResult(source: EventRow): RunConversationResult | null {
+  const terminal = exactTerminalForAcceptedSource(source);
+  if (!terminal) return null;
+  const presentation = terminal.presentation;
+  const status = runConversationStatusForPresentation(presentation);
+  return {
+    sessionId: source.sessionId,
+    status,
+    steps: 0,
+    lastTurn: source.turn,
+    publicPresentation: presentation,
+    ...(status === 'failed' || status === 'blocked'
+      ? { error: presentation.text }
+      : {}),
+  };
+}
+
+function existingFreshConversationSource(options: RunConversationOptions): EventRow | null {
+  if (Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0) {
+    return acceptedUserEvent(options.sessionId, Number(options.sourceUserSeq));
+  }
+  if (!options.reuseRecordedUserInput) return null;
+  return listEvents(options.sessionId, {
+    types: ['user_input_received'],
+    desc: true,
+    limit: 1,
+  })[0] ?? null;
 }
 
 /**
@@ -3471,7 +3778,7 @@ function buildStallRecoverySummaryMessage(userInput: string): string {
 /** The absolute floor when even the recovery summary failed: plain language,
  *  anchored to the user's ask, no tri-choice jargon. */
 const STALL_FLOOR_QUESTION =
-  "Something on my side kept that reply from coming together. Say “continue” and I'll pick it back up fresh — or rephrase what you'd like and I'll start from there.";
+  "Something on my side kept that reply from coming together. Progress is saved; send another message to resume it, or rephrase what you'd like and I'll start from there.";
 const STALL_FLOOR_OPTIONS = ['Continue', 'Start over'];
 
 function buildMissingReplyRetryMessage(decision: OrchestratorDecisionShape, path: 'conversation' | 'resume'): string {
@@ -3857,6 +4164,15 @@ export function shouldElevateOnStepProgress(opts: {
 export async function runConversation(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
+  // Provider/fallover retries explicitly identify an already-accepted source.
+  // If that source has a public winner, return it before acceptUserInputForRun
+  // can re-arm restart metadata and before graph/authority/model execution can
+  // replay an effect-capable turn.
+  const replaySource = existingFreshConversationSource(options);
+  if (replaySource) {
+    const replay = replayedRunConversationResult(replaySource);
+    if (replay) return replay;
+  }
   // Accept first: a marker with no accepted source has no logical turn to
   // recover. Once armed, clear it only after the typed terminal commits. A
   // reducer/SQLite failure must stay recoverable, and a completedReason
@@ -3864,38 +4180,83 @@ export async function runConversation(
   const sourceUserSeq = acceptFreshConversationInput(options);
   const acceptedSource = acceptedUserEvent(options.sessionId, sourceUserSeq);
   const acceptedText = typeof acceptedSource.data.text === 'string' ? acceptedSource.data.text : options.input;
-  const graphEvent = await recordAcceptedSourceGraph({
-    identity: {
+  const sessionKind = getSession(options.sessionId)?.kind ?? '';
+  // Only the accepted interactive bridge may opt a fresh conversation into
+  // the canary. Internal/background callers also use runConversation with
+  // chat-shaped sessions; allowing an omitted option to consult the process
+  // environment would silently move those owners off their durable path.
+  const frozenTurnEngine: TurnEngineMode = options.turnEngine ?? 'legacy_sdk';
+  const hostOwnsFreshTurn = options.runRunner === undefined
+    && isHostTurnEngine(frozenTurnEngine)
+    && sessionKind === 'chat';
+  // The host engine is the ordinary-chat owner. Seal that ownership before the
+  // semantic port participates, then compile exactly one durable graph. The
+  // graph describes accepted work; it does not transfer execution to the
+  // legacy typed dispatcher.
+  if (hostOwnsFreshTurn) {
+    requireFreshHostTurnOwnership({
       sessionId: options.sessionId,
       turn: acceptedSource.turn,
       sourceUserSeq,
-    },
-    surface: 'direct',
-    acceptedText,
-    verifiedTaskContinuation: options.taskContinuation,
+      engine: frozenTurnEngine,
+    });
+    const recoveredPlan = await recoverSettledPlanTaskActivation({
+      sessionId: options.sessionId,
+      sourceUserSeq,
+      onConversationPreamble: options.onConversationPreamble,
+    });
+    if (recoveredPlan.status === 'delivery_required') {
+      return {
+        sessionId: options.sessionId,
+        status: 'blocked',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        error: 'I could not safely confirm that the pre-work acknowledgement reached this conversation. Please retry.',
+      };
+    }
+  }
+  const hostPlainConversation = hostOwnsFreshTurn && freshHostConversationSurfaceOnly({
+    sessionId: options.sessionId,
+    sourceUserSeq,
   });
-  const acceptedTurnGraph = turnGraphFromShadowEvent(graphEvent);
-  if (!acceptedTurnGraph) {
-    if (semanticPortParticipated(options.sessionId, sourceUserSeq)) {
-      const refused = commitUnadmittedSemanticTurn({
+  const hostPlanningCatalog = hostOwnsFreshTurn && !hostPlainConversation
+    ? await primePrimaryModelPlanningCatalog({
+        sessionId: options.sessionId,
+        sourceUserSeq,
+      })
+    : null;
+  if (hostPlanningCatalog && !hostPlanningCatalog.ok) {
+    return {
+      sessionId: options.sessionId,
+      status: 'blocked',
+      steps: 0,
+      lastTurn: acceptedSource.turn,
+      error: 'I could not safely load the current capability catalog for this request. Please retry.',
+    };
+  }
+  const graphEvent = hostOwnsFreshTurn ? null : await recordAcceptedSourceGraph({
+      identity: {
         sessionId: options.sessionId,
         turn: acceptedSource.turn,
         sourceUserSeq,
-      });
-      return {
-        sessionId: options.sessionId,
-        status: 'failed',
-        steps: 0,
-        lastTurn: acceptedSource.turn,
-        error: refused.text,
-      };
-    }
+      },
+      surface: 'direct',
+      acceptedText,
+      verifiedTaskContinuation: options.taskContinuation,
+    });
+  const acceptedTurnGraph = turnGraphFromShadowEvent(graphEvent);
+  if (!hostOwnsFreshTurn && !acceptedTurnGraph) {
+    const refused = commitUnadmittedSemanticTurn({
+      sessionId: options.sessionId,
+      turn: acceptedSource.turn,
+      sourceUserSeq,
+    });
     return {
       sessionId: options.sessionId,
-      status: 'failed',
+      status: 'blocked',
       steps: 0,
       lastTurn: acceptedSource.turn,
-      error: 'The accepted turn could not be admitted for execution.',
+      error: refused.text,
     };
   }
   // The route comes from the graph wherever one exists — the chat-only
@@ -3903,7 +4264,7 @@ export async function runConversation(
   // never ACTIVATED (expected_work_required stayed 0), so every fan-out
   // worker failed 'accepted action was not durably activated before
   // execution' (live 2026-08-11, long-horizon-manifest run 3: 12/12 workers).
-  const acceptedCapabilityRoute = acceptedTurnGraph?.classification.route ?? 'direct_reply';
+  const acceptedCapabilityRoute = acceptedTurnGraph?.classification.route;
   // The graph is now execution authority rather than best-effort telemetry.
   // Arm its exact accepted source before capability construction, context
   // warming, model invocation, or any tool can run. A bridge/fallover may enter
@@ -3917,11 +4278,14 @@ export async function runConversation(
   // closed before any model call — gating on the event turned a storage
   // failure into a silent unarmed model run. Contract compilation and
   // terminal adjudication keep their own route/kind scoping unchanged.
-  {
+  if (!hostOwnsFreshTurn) {
     requireAcceptedTaskAuthority({
       sessionId: options.sessionId,
       sourceUserSeq,
     });
+  }
+  let providerCapabilityRoute = acceptedCapabilityRoute;
+  if (!hostOwnsFreshTurn) {
     const dispatched = await dispatchAdmittedSource({
       sessionId: options.sessionId,
       turn: acceptedSource.turn,
@@ -3930,7 +4294,7 @@ export async function runConversation(
     if (dispatched.kind === 'blocked') {
       return {
         sessionId: options.sessionId,
-        status: 'failed',
+        status: 'blocked',
         steps: 0,
         lastTurn: acceptedSource.turn,
         error: dispatched.text,
@@ -3945,12 +4309,21 @@ export async function runConversation(
         error: dispatched.text,
       };
     }
+    if (dispatched.kind === 'held') {
+      return {
+        sessionId: options.sessionId,
+        status: 'held',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        hold: dispatched.hold,
+      };
+    }
     if (dispatched.kind === 'typed') {
       const ran = dispatched.result;
       if (ran.status !== 'success' || !ran.artifactHandle) {
         return {
           sessionId: options.sessionId,
-          status: 'failed',
+          status: 'blocked',
           steps: 0,
           lastTurn: acceptedSource.turn,
           error: (() => {
@@ -3969,29 +4342,23 @@ export async function runConversation(
         lastTurn: acceptedSource.turn,
       };
     }
-    const expectedWork = requireKnownExpectedWorkContract({
+    providerCapabilityRoute = dispatched.capabilityRoute;
+  }
+  if (!hostOwnsFreshTurn) {
+    requireKnownExpectedWorkContract({
       sessionId: options.sessionId,
       sourceUserSeq,
     });
-    // Workflow-controller sessions never activate act expected-work: the
-    // step's authority is the workflow controller (admission, validation,
-    // report-back), and its agent surface mounts no work_call carrier — so
-    // activation raised a wall with no door and 500'd plain step dispatch
-    // (live 2026-08-11 sweep: capability-reconnect 'prepare' and a cron step
-    // both died ExpectedWorkBindingRequiredError on write_file).
-    const workflowControllerOwned = getSession(options.sessionId)?.kind === 'workflow';
-    if (acceptedCapabilityRoute === 'act' && !workflowControllerOwned && dispatched.kind !== 'conversation') {
-      if (expectedWork.status !== 'action_deferred') {
-        throw new BoundaryError({
-          kind: 'state.read_corrupted',
-          retryable: false,
-          userMessage: 'I could not safely start that action because its local work authority conflicted. Please retry.',
-          operatorMessage: 'accepted action unexpectedly owned a deterministic expected-work contract',
-          context: { sessionId: options.sessionId, sourceUserSeq },
-        });
-      }
-      requireActionExpectedWorkActivation({ sessionId: options.sessionId, sourceUserSeq });
-    }
+  }
+  // Workflow-controller sessions never activate act expected-work: the
+  // step's authority is the workflow controller (admission, validation,
+  // report-back), and its agent surface mounts no work_call carrier — so
+  // activation raised a wall with no door and 500'd plain step dispatch.
+  const workflowControllerOwned = getSession(options.sessionId)?.kind === 'workflow';
+  if (!hostOwnsFreshTurn && providerCapabilityRoute === 'act' && !workflowControllerOwned) {
+    // Both host and legacy action routes cross the same durable carrier wall
+    // before agent construction. The host projection above cannot execute.
+    requireActionExpectedWorkActivation({ sessionId: options.sessionId, sourceUserSeq });
   }
   // Semantic recall state is turn-local. Concurrent graph activations may
   // share this daemon process, but they must never share the opportunistic
@@ -4003,7 +4370,7 @@ export async function runConversation(
       ...(options.runAttemptId ? { attemptId: options.runAttemptId } : {}),
     },
     () => withTurnQueryVectorScope(async () => {
-    let foregroundReleased = false;
+    let foregroundRelease: 'terminal' | 'transfer' | null = null;
     try {
     // G5b slice 1: the compiled turn graph DRIVES the spine instead of being
     // observed and discarded. The provider core remains one interim node
@@ -4013,6 +4380,7 @@ export async function runConversation(
     // publish node. An uncompilable turn runs the identical legacy order.
     type SpineCore =
       | { kind: 'dispatched'; result: Awaited<ReturnType<typeof runConversationCore>> }
+      | { kind: 'held'; result: Awaited<ReturnType<typeof runConversationCore>> }
       | { kind: 'reduced'; reduced: ReturnType<typeof reduceStandardConversationTerminal> };
     let activeAgent = options.agent;
     if (!activeAgent && !options.buildAgent) {
@@ -4024,7 +4392,14 @@ export async function runConversation(
             activeAgent = await options.buildAgent!({
               sessionId: options.sessionId,
               sourceUserSeq,
-              route: acceptedCapabilityRoute,
+              // The shared dispatcher owns the provider-facing route. Callers
+              // may not reinterpret an admitted action as a retrieve merely to
+              // obtain a different tool surface.
+              ...(providerCapabilityRoute ? { route: providerCapabilityRoute } : {}),
+              ...(hostPlanningCatalog?.ok
+                ? { hostFreshPlanning: hostPlanningCatalog.planning }
+                : {}),
+              ...(hostPlainConversation ? { hostPlainConversation: true as const } : {}),
             });
           }
         }
@@ -4040,6 +4415,43 @@ export async function runConversation(
       contextWarmedAtNode = true;
       void primeTurnRecallVector(options.semanticTaskInput ?? options.input).catch(() => {});
     };
+    if (hostOwnsFreshTurn) {
+      if (hostPlainConversation) {
+        // Mark the context node complete without running it so runTurn cannot
+        // reintroduce the same hidden embedding warm at its fallback seam.
+        contextWarmedAtNode = true;
+      } else {
+        await resolveContext();
+      }
+      await resolveCapability?.();
+      if (!activeAgent) throw new Error('capability resolution did not produce an agent before the host core.');
+      const turnResult = await runTurn({
+        agent: activeAgent,
+        sessionId: options.sessionId,
+        input: options.input,
+        sourceUserSeq,
+        runAttemptId: options.runAttemptId,
+        turnEngine: frozenTurnEngine,
+        reuseRecordedUserInput: true,
+        maxTurns: options.maxTurns,
+        toolCallsPerTurn: options.toolCallsPerTurn,
+        makeRunner: options.makeRunner,
+        preflightConversationPort: options.preflightConversationPort,
+        onConversationPreamble: options.onConversationPreamble,
+        mcpToolScope: options.mcpToolScope,
+        ...(options.semanticTaskInput ? { semanticTaskInput: options.semanticTaskInput } : {}),
+        ...(options.taskContinuation ? { taskContinuation: options.taskContinuation } : {}),
+        ...(contextWarmedAtNode ? { contextWarmedAtNode: true } : {}),
+        ...(hostPlainConversation ? { skipAutomaticMemoryPrimer: true as const } : {}),
+      });
+      const result = hostActivationConversationResult(turnResult);
+      if (result.status === 'held') return result;
+      const reduced = reduceStandardConversationTerminal({ result, sourceUserSeq });
+      emitRuntimeTerminalEvent(options.sessionId, reduced);
+      refreshTerminalWorkingMemory(options.sessionId);
+      foregroundRelease = reduced.publicPresentation ? 'terminal' : null;
+      return reduced;
+    }
     const spine = await driveChatTurnSpine<SpineCore>({
       identity: { sessionId: options.sessionId, turn: acceptedSource.turn, sourceUserSeq },
       // Graph topology follows the exact runtime-classified fresh clause after
@@ -4060,10 +4472,12 @@ export async function runConversation(
             ...options,
             agent: activeAgent,
             sourceUserSeq,
+            turnEngine: frozenTurnEngine,
             reuseRecordedUserInput: true,
             ...(contextWarmedAtNode ? { contextWarmedAtNode: true } : {}),
           });
           if (result.status === 'dispatched') return { kind: 'dispatched', result };
+          if (result.status === 'held') return { kind: 'held', result };
           return { kind: 'reduced', reduced: reduceStandardConversationTerminal({ result, sourceUserSeq }) };
         },
         shouldPublish: (core) => core.kind === 'reduced' && !core.reduced.completedReason,
@@ -4077,7 +4491,7 @@ export async function runConversation(
         // question) is the needs-input route; a dispatched turn's public edge
         // is its ACK, which counts as delivered for routing.
         delivered: (core) => core.kind === 'dispatched'
-          || core.reduced.status === 'completed',
+          || (core.kind === 'reduced' && core.reduced.status === 'completed'),
       },
     });
     if (spine.engine === 'legacy_order') {
@@ -4091,14 +4505,21 @@ export async function runConversation(
       // The exact async_work_dispatched row remains the pending logical edge.
       // This releases only the coarse foreground marker; provider inbox rows
       // may become `replied` once their compact dispatch ACK is delivered.
-      foregroundReleased = true;
+      foregroundRelease = 'transfer';
       return core.result;
     }
+    if (core.kind === 'held') return core.result;
     if (core.reduced.completedReason) return core.reduced;
-    foregroundReleased = Boolean(core.reduced.publicPresentation);
+    foregroundRelease = core.reduced.publicPresentation ? 'terminal' : null;
     return core.reduced;
     } finally {
-      if (foregroundReleased) {
+      if (foregroundRelease === 'transfer') {
+        releaseRunInFlightAfterWorkflowTransfer(
+          options.sessionId,
+          options.runAttemptId,
+          sourceUserSeq,
+        );
+      } else if (foregroundRelease === 'terminal') {
         clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId, sourceUserSeq);
       }
     }
@@ -4421,6 +4842,7 @@ async function runConversationCore(
       toolCallsPerTurn,
       makeRunner: options.makeRunner,
       runRunner: options.runRunner,
+      turnEngine: options.turnEngine,
       preflightConversationPort: options.preflightConversationPort,
       onConversationPreamble: options.onConversationPreamble,
       // Defer the infra ask only while another brain is still available to try.
@@ -4939,6 +5361,7 @@ async function runConversationCore(
         lastDecision,
         lastTurn,
         error: turnResult.error,
+        ...(turnResult.hold ? { hold: turnResult.hold } : {}),
       };
     }
 
@@ -6865,7 +7288,7 @@ async function runConversationCore(
               });
               return {
                 sessionId: options.sessionId,
-                status: 'awaiting_user_input',
+                status: 'blocked',
                 steps: stepIndex,
                 lastDecision: decision,
                 lastTurn,
@@ -7440,22 +7863,16 @@ async function runConversationCore(
 
 /**
  * Emit BOTH the audit-trail `conversation_limit_exceeded` event AND a
- * user-facing `conversation_completed` event that carries a synthesized
- * reply asking the user whether to keep going.
+ * user-facing `conversation_completed` event that records an honest blocked
+ * checkpoint. A budget ceiling is not a user question and never grants this
+ * loop permission to synthesize another user turn.
  *
  * Before this helper, the loop emitted only the audit event, which
  * the chat surface had no good way to render — the user saw silence
- * or "Continuing." (the sub-agent stall pattern). The synthetic
- * conversation_completed flows through the existing chat-dock +
- * Discord rendering path, so the user sees: "I've been working on
- * this for N steps and there's more to do. Reply `continue` to keep
- * going, or break it into a smaller piece."
- *
- * When the user replies `continue`, the entry-point handlers
- * (discord-harness, console-routes /api/harness/chat) detect that
- * keyword and start a fresh runConversation on the SAME session with
- * the prior decision's summary prepended so the orchestrator picks
- * up where it left off.
+ * or "Continuing." (the sub-agent stall pattern). The terminal flows through
+ * the existing chat-dock + Discord rendering path with saved-progress truth;
+ * any later user message may re-enter through the ordinary accepted-turn
+ * boundary.
  */
 function emitLimitExceededWithContinuePrompt(opts: {
   sessionId: string;
@@ -7474,19 +7891,18 @@ function emitLimitExceededWithContinuePrompt(opts: {
     data: { steps: opts.steps, reason: opts.reason, ...opts.limitDetail },
   });
 
-  const continueReply = opts.reason === 'wall_clock'
-    ? `I hit the time budget on this conversation after ${opts.steps} step${opts.steps === 1 ? '' : 's'} and there's more to do. Reply \`continue\` to keep going, or break it into a smaller piece.`
+  const checkpointReply = opts.reason === 'wall_clock'
+    ? `I hit the time budget on this conversation after ${opts.steps} step${opts.steps === 1 ? '' : 's'} and there is more to do. Progress is checkpointed.`
     : opts.reason === 'token_budget'
-      ? `This run has used its token budget (${formatTokens(Number(opts.limitDetail.tokensUsedWindow ?? 0))} of ${formatTokens(Number(opts.limitDetail.tokenCeiling ?? 0))}) after ${opts.steps} step${opts.steps === 1 ? '' : 's'}, with more to do. Reply \`continue\` to authorize another budget window, or break it into a smaller piece.`
-      : `I've been working on this for ${opts.steps} step${opts.steps === 1 ? '' : 's'} and hit the step budget — there's more to do. Reply \`continue\` to keep going, or break it into a smaller piece.`;
+      ? `This run used its token budget (${formatTokens(Number(opts.limitDetail.tokensUsedWindow ?? 0))} of ${formatTokens(Number(opts.limitDetail.tokenCeiling ?? 0))}) after ${opts.steps} step${opts.steps === 1 ? '' : 's'}, with more to do. Progress is checkpointed.`
+      : `I reached the step budget after ${opts.steps} step${opts.steps === 1 ? '' : 's'}, with more work remaining. Progress is checkpointed.`;
   const artifactState = standardArtifactTerminalState(opts.sessionId, opts.sourceUserSeq);
-  commitStandardNeedsInputTerminal({
+  commitStandardBlockedTerminal({
     sessionId: opts.sessionId,
     sourceUserSeq: opts.sourceUserSeq,
     turn: opts.turn,
-    text: continueReply,
-    need: 'continue',
-    legacyReason: 'awaiting_continue',
+    text: checkpointReply,
+    legacyReason: 'step_budget_parked',
     metadata: {
       steps: opts.steps,
       lastDecisionSummary: opts.lastDecision?.summary ?? null,
@@ -7539,72 +7955,6 @@ async function withActiveTurnHeartbeat<T>(
 
 function goalContractEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
-}
-
-/** Stream-inactivity threshold for the turn-stall watchdog. Default 5 min —
- *  observed first-byte on big prompts is ~35s, so 8x margin; every stream
- *  event (token, tool call) resets the timer, so long multi-tool turns are
- *  never cut while ANYTHING is happening. 0 disables. */
-function modelStreamStallMs(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_MODEL_STREAM_STALL_MS', '300000') ?? '300000', 10);
-  if (!Number.isFinite(raw)) return 300_000;
-  return raw <= 0 ? 0 : raw;
-}
-
-/** Pre-content (first-byte) stall window. A model call that produces ZERO
- *  stream events for this long has not started — distinct from a long, ACTIVE
- *  tool turn (which keeps resetting the timer and is governed by the longer
- *  modelStreamStallMs ceiling). Shorter so a wedged/silent stream (the Claude
- *  tool-turn hang regression) fails fast and RETRIES instead of pinning the
- *  user for the full 5 min. 0 falls back to the stream-stall ceiling. */
-function modelFirstByteStallMs(): number {
-  const ceiling = modelStreamStallMs();
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_MODEL_FIRST_BYTE_STALL_MS', '75000') ?? '75000', 10);
-  if (!Number.isFinite(raw) || raw <= 0) return ceiling;
-  // Never exceed the stream-stall ceiling (so a tiny configured ceiling — e.g.
-  // in tests — keeps the pre-content window tiny too).
-  return ceiling > 0 ? Math.min(raw, ceiling) : raw;
-}
-
-/** How many times to retry a model call that stalled BEFORE producing any
- *  content (pre-content stall only — safe because zero events means zero tool
- *  side effects, so the run can be replayed cleanly). Default 3: Anthropic
- *  intermittently sends HTTP 200 then no body for >75s on a heavy first call
- *  (the retry hits the now-warm prompt cache and starts in ~12s), and a single
- *  retry isn't enough when the hang recurs within a turn. Replays are clean and
- *  cheap (cache reads), and Codex rarely reaches this backstop (its own
- *  dispatcher fails fast first), so a higher budget is safe for every brain.
- *  0 disables. */
-function modelStreamStallRetries(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_MODEL_STREAM_STALL_RETRIES', '3') ?? '3', 10);
-  if (!Number.isFinite(raw) || raw < 0) return 3;
-  return raw;
-}
-
-/** Typed marker for a stalled model stream so the runner can distinguish a
- *  retryable pre-content stall from a real failure. */
-class ModelStreamStalledError extends Error {
-  constructor(
-    public readonly seconds: number,
-    public readonly preContent: boolean,
-    /** A paid non-streaming provider request was still owned by the adapter at
-     * timeout. Transport abort is best-effort and does not prove billing stopped,
-     * so this physical attempt must never be replayed automatically in parallel. */
-    public readonly bufferedProviderRequestInFlight = false,
-  ) {
-    // User-facing message: name the REAL cause (the model provider/brain didn't
-    // respond), not internal stream-watchdog env-var jargon. A pre-content hang
-    // (no first byte) is almost always the provider being overloaded or a
-    // transient network issue on their end — not the user's request.
-    super(
-      preContent
-        ? `Your model provider didn't start responding within ${seconds}s, so the request timed out before any output. `
-          + `This is almost always the provider being overloaded or a transient network hiccup on their end — not your request. Re-send to retry.`
-        : `Your model provider stopped responding mid-answer (no output for ${seconds}s) and the call timed out. `
-          + `This is usually a provider or network hiccup. Re-send to retry.`,
-    );
-    this.name = 'ModelStreamStalledError';
-  }
 }
 
 /** Store read must never break a turn. */
@@ -7725,6 +8075,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   if (!row) throw new Error(`unknown session: ${options.sessionId}`);
   const session = HarnessSession.load(options.sessionId);
   if (!session) throw new Error(`unable to load session: ${options.sessionId}`);
+  applySessionMountPrimers(options.sessionId, composeSession({
+    sessionId: options.sessionId,
+    sessionKind: row.kind,
+    metadata: row.metadata,
+  }));
   // Anchor for the post-turn recall-run sweep (cross-process credit recovery).
   const turnStartedAtIso = new Date().toISOString();
 
@@ -7753,6 +8108,39 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     // re-read session-global latest-user state.
     sourceUserSeq = listEvents(options.sessionId, { types: ['user_input_received'] }).at(-1)?.seq;
   }
+
+  const selectedTurnEngine: TurnEngineMode = options.turnEngine ?? selectTurnEngine({
+    sessionKind: session.sessionRow.kind,
+  });
+  const usesHostTurnEngine = options.runRunner === undefined
+    && isHostTurnEngine(selectedTurnEngine);
+  if (usesHostTurnEngine) {
+    if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
+      throw new Error('Fresh host turn ownership requires an exact accepted user source.');
+    }
+    // runConversation already sealed this before semantic admission. Direct
+    // runTurn callers seal it here; the helper proves there is exactly one
+    // owner for the accepted source in either case.
+    requireFreshHostTurnOwnership({
+      sessionId: options.sessionId,
+      turn,
+      sourceUserSeq: sourceUserSeq as number,
+      engine: selectedTurnEngine,
+    });
+  }
+  const hostSourceAlignmentDecision = usesHostTurnEngine && sourceUserSeq
+    ? confirmedSourceStrategyDecisionForSource(options.sessionId, sourceUserSeq)
+    : null;
+  const hostSourceConfirmationRequired = Boolean(
+    hostSourceAlignmentDecision
+    && hostSourceAlignmentDecision.phase === 'align'
+    && hostSourceAlignmentDecision.reason === 'collect_then_construct'
+    && hostSourceAlignmentDecision.sourceStrategyPosture === 'materially_variant'
+    && hostSourceAlignmentDecision.confirmationDisposition === 'material_source_strategy'
+    && hostSourceAlignmentDecision.intentKey
+    && hostSourceAlignmentDecision.objective?.trim()
+    && validatedTurnSourceStrategyBinding(hostSourceAlignmentDecision.sourceStrategyBinding),
+  );
 
   // Every accepted loop task gets a durable default discovery policy before
   // any provider can call a tool. The capability resolver later in preflight
@@ -7950,12 +8338,21 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // context_resolve node owns this warm and has already fired it upstream of
   // capability construction. Skipping here is what makes the node a MOVE
   // rather than an addition — two warms would double the embed for one turn.
-  if (!options.contextWarmedAtNode
+  if (!options.skipAutomaticMemoryPrimer
+    && !options.contextWarmedAtNode
     && !declinedContinuation
     && !explicitlyOptsOutOfAutomaticMemoryRecall(semanticInput)) {
     void primeTurnRecallVector(semanticInput).catch(() => {});
   }
-  const assemblyPromise: Promise<TurnMemoryPrimer | null> = declinedContinuation
+  const assemblyPromise: Promise<TurnMemoryPrimer | null> = options.skipAutomaticMemoryPrimer
+    ? Promise.resolve({
+        enabled: true,
+        query: semanticInput.replace(/\s+/g, ' ').trim(),
+        hitCount: 0,
+        injectedBytes: 0,
+        skippedReason: 'plain_conversation_surface',
+      })
+    : declinedContinuation
     ? Promise.resolve({
         enabled: true,
         query: semanticInput.replace(/\s+/g, ' ').trim(),
@@ -7985,7 +8382,21 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // would emit a phantom turn_ended pre-turn. The natural end-of-turn
   // recordTurnResult call (downstream of runner.run) handles the real
   // turn_ended emission.
-  const sessionItems = session.toInputItems();
+  // Canonical persisted-session boundary. Repair/quarantine is durable and
+  // evidence-driven; a pending approval or uncertain physical effect remains
+  // a nonterminal internal hold and never reaches compaction or any provider.
+  // This runs before appending `options.input`, so an ambiguous historical
+  // suffix cannot swallow the currently accepted fresh source.
+  const preparedConversation = session.prepareProviderHistory();
+  if (preparedConversation.status === 'held') {
+    return {
+      sessionId: options.sessionId,
+      turn,
+      status: 'held',
+      hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+    };
+  }
+  const sessionItems = preparedConversation.providerHistory;
   let compactedItems = sessionItems;
   let layer3WarningInjected = false;
   // Compaction budget from the ROUTED model's real context window (the fixed
@@ -8309,10 +8720,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     // The confirm beat only ever evaluates a REAL user message: synthetic
     // continuation nudges (classified against the goal objective above) and
     // stall-retry boilerplate must not trip it mid-run (turn-control review).
-    suppressConfirmBeat: options.input === CONTINUATION_INPUT
+    suppressConfirmBeat: (usesHostTurnEngine
+      && !hostSourceConfirmationRequired)
+      || options.input === CONTINUATION_INPUT
       || Boolean(syntheticRetryOriginalInput)
       || Boolean(options.semanticTaskInput)
       || options.internalContinuation === true,
+    // Host chat discovers from the live catalog inside its own loop. Re-running
+    // the legacy cached capability hunt here adds latency and can inject stale
+    // domain receipts before the first model step without granting authority.
+    skipCapabilityHunt: usesHostTurnEngine,
     suppressSemanticEnrichment: declinedContinuation,
     declinedParentWithNewTask,
     sourceUserSeq,
@@ -8334,7 +8751,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     port: PreflightConversationPort;
     settledProceedAuthor?: Promise<string>;
   } | null = null;
-  if (options.internalContinuation !== true && contextPacket.preflightPhase === 'align') {
+  if ((!usesHostTurnEngine || hostSourceConfirmationRequired)
+    && options.internalContinuation !== true
+    && (contextPacket.preflightPhase === 'align' || hostSourceConfirmationRequired)) {
     if (Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0) {
       const exactSourceUserSeq = sourceUserSeq as number;
       const authorityInput = declinedContinuation
@@ -8344,14 +8763,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           : (options.authoritativeUserInput
             ?? syntheticRetryOriginalInput
             ?? options.input);
-      const decision = classifyTurnPreflight({
-        message: authorityInput,
-        sessionId: options.sessionId,
-        sessionKind: session.sessionRow.kind,
-        isMultiItem: contextPacket.multiItem.detected,
-        itemCount: contextPacket.multiItem.itemCount,
-        sourceUserSeq: exactSourceUserSeq,
-      });
+      const decision = hostSourceConfirmationRequired
+        ? hostSourceAlignmentDecision!
+        : classifyTurnPreflight({
+            message: authorityInput,
+            sessionId: options.sessionId,
+            sessionKind: session.sessionRow.kind,
+            isMultiItem: contextPacket.multiItem.detected,
+            itemCount: contextPacket.multiItem.itemCount,
+            sourceUserSeq: exactSourceUserSeq,
+          });
       const activeModel = (options.agent as { model?: string | Model }).model ?? MODELS.primary;
       const prepared = {
         identity: {
@@ -8387,6 +8808,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // never delay or break it.
   let turnOpenness: TurnOpenness | null = null;
   if (
+    !usesHostTurnEngine
+    &&
     session.sessionRow.kind === 'chat'
     && !declinedContinuation
     && options.internalContinuation !== true
@@ -8682,6 +9105,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     toolExecution: { maxFunctionToolConcurrency: 8 },
     toolNotFoundBehavior: 'return_error_to_model',
     toolErrorFormatter: formatMissingToolForModel,
+    ...(options.signal ? { signal: options.signal } : {}),
   };
   // Provider deltas intentionally stay inside the execution plane. A model
   // token stream is neither a verified result nor publication authority; the
@@ -8736,7 +9160,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   }
 
   try {
-    if (options.internalContinuation !== true && contextPacket.preflightPhase === 'align') {
+    if ((!usesHostTurnEngine || hostSourceConfirmationRequired)
+      && options.internalContinuation !== true
+      && (contextPacket.preflightPhase === 'align' || hostSourceConfirmationRequired)) {
       if (!preparedPreflight) {
         if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
           throw new Error('Structural preflight alignment requires an exact accepted user source.');
@@ -8747,7 +9173,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       const disposition = await publishPreflightConversation({
         ...preparedPreflight,
         openness: turnOpenness,
-        transport: 'openai_agents_harness',
+        transport: 'host_harness',
       });
       if (disposition.kind === 'ask') {
         bumpTurnNumber(options.sessionId, turn);
@@ -8771,7 +9197,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           ? persisted.event.data.text
           : disposition.preamble;
         if (options.onConversationPreamble) {
-          const delivered = await options.onConversationPreamble(sameTurnPreamble);
+          const delivered = await options.onConversationPreamble(
+            conversationPreambleDeliveryRequest(persisted.event),
+          );
           if (delivered.status === 'failed') {
             safeAppend({
               sessionId: options.sessionId,
@@ -8796,7 +9224,13 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         }
       }
     }
-    const run = options.runRunner ?? defaultRunRunner;
+    const run = options.runRunner
+      ?? (usesHostTurnEngine ? hostRunRunner : defaultRunRunner);
+    if (usesHostTurnEngine) {
+      opts.hostTurnEngine = selectedTurnEngine;
+      if (selectedTurnEngine === 'host_v1_read_only') opts.hostReadOnlyCanary = true;
+      opts.hostPreviousResponseId = session.previousResponseId();
+    }
     // Hoisted so the post-turn auto-credit hook can read the recall runs the
     // turn's tool handlers registered (turnRecallRunIds). Built lazily inside
     // the heartbeat callback where recallBudget exists.
@@ -8832,6 +9266,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           turn,
           counter: toolCounter,
           sourceUserSeq,
+          ...(options.onConversationPreamble
+            ? { onConversationPreamble: options.onConversationPreamble }
+            : {}),
           ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
           behaviorScopeId: `${options.sessionId}::turn:${turn}`,
           recallBudget,
@@ -8859,16 +9296,48 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // approval_requested. registerAndEmitApprovals registers each
       // interruption in the addressable approval registry AND emits
       // the audit-log event with the approval ID inlined.
+      session.saveInterruptState(outcome.serializedState, {
+        mcpToolScope: harnessCtx?.mcpToolScope,
+      });
       registerAndEmitApprovals(
         { sessionId: options.sessionId, turn },
         session,
         outcome.interruptions ?? [],
       );
-      session.saveInterruptState(outcome.serializedState, {
-        mcpToolScope: harnessCtx?.mcpToolScope,
-      });
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
+    }
+
+    if (outcome.hold) {
+      // The durable restart owner remains armed. Do not snapshot a carrier,
+      // bump the logical conversation, or manufacture a public terminal.
+      return {
+        sessionId: options.sessionId,
+        turn,
+        status: 'held',
+        hold: outcome.hold,
+      };
+    }
+
+    if (outcome.terminal?.status === 'blocked') {
+      // A host-owned terminal is control data, not a model-authored ordinary
+      // completion. Preserve private history for replay/debugging but do not
+      // emit run_completed or run post-turn success/learning hooks. The outer
+      // conversation reducer commits the one typed public blocked terminal.
+      session.recordTurnResult({
+        history: outcome.history,
+        lastResponseId: outcome.lastResponseId,
+        turn,
+      });
+      bumpTurnNumber(options.sessionId, turn);
+      return {
+        sessionId: options.sessionId,
+        turn,
+        status: 'blocked',
+        error: publicReplyText(outcome.finalOutput, '')
+          || 'The host stopped this turn at a durable execution boundary.',
+        toolCalls: toolCounter.currentCount,
+      };
     }
 
     const compactionRewrite = rewriteHistoryWithNativeCompaction(outcome.history, outcome.rawResponses);
@@ -9039,6 +9508,11 @@ export async function resumePendingApproval(
   if (!row) throw new Error(`unknown session: ${options.sessionId}`);
   const session = HarnessSession.load(options.sessionId);
   if (!session) throw new Error(`unable to load session: ${options.sessionId}`);
+  applySessionMountPrimers(options.sessionId, composeSession({
+    sessionId: options.sessionId,
+    sessionKind: row.kind,
+    metadata: row.metadata,
+  }));
   // Anchor for the post-turn recall-run sweep (cross-process credit recovery).
   const turnStartedAtIso = new Date().toISOString();
 
@@ -9076,7 +9550,7 @@ export async function resumePendingApproval(
 
   const turn = nextTurnNumber(row);
 
-  const resumeSourceUserSeq = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+  let resumeSourceUserSeq = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
     ? options.sourceUserSeq
     : (() => {
         try { return getLatestRunAttempt(options.sessionId)?.sourceUserSeq ?? undefined; } catch { return undefined; }
@@ -9090,12 +9564,16 @@ export async function resumePendingApproval(
     return { sessionId: options.sessionId, turn, status: 'killed' };
   }
 
-  // Deserialize the paused RunState. Lazy-imported so the SDK module
-  // graph doesn't force-load on every loop import (RunState is heavy).
-  const { RunState } = await import('@openai/agents');
   let state;
   try {
-    state = await RunState.fromString(options.agent, blob);
+    if (HostInterruptState.isHostState(blob)) {
+      state = HostInterruptState.fromString(blob);
+    } else {
+      // Legacy SDK pauses remain readable during the host-runner cutover.
+      // Keep the heavy SDK state module off the host-native resume path.
+      const { RunState } = await import('@openai/agents');
+      state = await RunState.fromString(options.agent, blob);
+    }
   } catch (err) {
     const message = normalizeError(err);
     safeAppend({
@@ -9111,6 +9589,32 @@ export async function resumePendingApproval(
     return { sessionId: options.sessionId, turn, status: 'failed', error: message };
   }
 
+  if (state instanceof HostInterruptState) {
+    const consentSubjects = state.pending
+      .map((call) => call.consentSubject)
+      .filter((subject): subject is NonNullable<typeof subject> => Boolean(subject));
+    if (consentSubjects.length > 0) {
+      const exactSources = new Set(consentSubjects.map((subject) => (
+        `${subject.sessionId}\0${subject.sourceUserSeq}`
+      )));
+      if (
+        exactSources.size !== 1
+        || consentSubjects.some((subject) => subject.sessionId !== options.sessionId)
+      ) {
+        const message = 'Paused host approvals do not share one exact accepted source.';
+        safeAppend({
+          sessionId: options.sessionId,
+          turn,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: { kind: 'approval_authority_mismatch', reason: message },
+        });
+        return { sessionId: options.sessionId, turn, status: 'awaiting_approval', error: message };
+      }
+      resumeSourceUserSeq = consentSubjects[0]!.sourceUserSeq;
+    }
+  }
+
   // Resolve each interruption. The SDK's RunState exposes pending
   // tool-approval items via getInterruptions() (a METHOD, not a
   // property — the property `interruptions` only exists on
@@ -9124,6 +9628,42 @@ export async function resumePendingApproval(
     reject(i: unknown, opts?: { alwaysReject?: boolean }): void;
   };
   const pending: unknown[] = stateApi.getInterruptions() ?? [];
+  if (state instanceof HostInterruptState && pending.length > 0) {
+    // The paused state is committed before card registration. Re-running this
+    // idempotent registration on resume closes the crash window where the
+    // process died after serializing the exact subject but before surfacing
+    // its card. Subject-bound resume keys prevent duplicate cards/prompts.
+    registerAndEmitApprovals(
+      { sessionId: options.sessionId, turn },
+      session,
+      pending.map((item) => {
+        const interruption = item as {
+          rawItem?: { name?: unknown; arguments?: unknown };
+          toolName?: unknown;
+          approvalResumeKey?: unknown;
+        };
+        const rawName = interruption.rawItem?.name ?? interruption.toolName;
+        const rawArgs = interruption.rawItem?.arguments;
+        const toolName = typeof rawName === 'string' ? rawName : 'unknown';
+        const rawArguments = typeof rawArgs === 'string' ? rawArgs : '';
+        let args: Record<string, unknown> | null = null;
+        try {
+          const parsed = JSON.parse(rawArguments) as unknown;
+          args = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed as Record<string, unknown>
+            : null;
+        } catch { /* unparseable arguments remain exact raw bytes */ }
+        return {
+          toolName,
+          args,
+          rawArgs: rawArguments,
+          ...(typeof interruption.approvalResumeKey === 'string'
+            ? { approvalResumeKey: interruption.approvalResumeKey }
+            : {}),
+        };
+      }),
+    );
+  }
   const approvalRowsAtResume = pending.length > 0
     ? approvalRegistry.listPending({ sessionId: options.sessionId, status: 'pending' })
     : [];
@@ -9316,6 +9856,28 @@ export async function resumePendingApproval(
       }));
   const runner = makeRunner();
 
+  const hostApprovalIds = state instanceof HostInterruptState
+    ? [...new Set(state.pending.flatMap((call) => {
+        if (call.decision !== 'approved' || !call.consentSubject) return [];
+        const resumeKey = hostInteractiveConsentApprovalResumeKey(call.consentSubject);
+        if (!resumeKey) return [];
+        const matches = approvalRegistry.listPending({
+          sessionId: options.sessionId,
+          status: 'any',
+        }).filter((row) => (
+          row.resumeKey === resumeKey
+          && row.status === 'resolved'
+          && row.resolution === 'approved'
+          && approvalAuthorityMatchesToolCall(
+            row,
+            call.rawItem.name,
+            call.rawItem.arguments,
+          )
+        ));
+        return matches.length === 1 ? [matches[0]!.approvalId] : [];
+      }))]
+    : [];
+
   const detachLogHooks = attachEventLogHooks(runner as unknown as RunHooksLike, {
     getSessionId: extractSessionIdFromContext,
     getTurn: () => turn,
@@ -9351,10 +9913,33 @@ export async function resumePendingApproval(
     // approved external write fires a SECOND time (integrity audit #2.1). Surface
     // the stall as an error (the user re-sends) instead of silently duplicating.
     disablePreContentRetry: true,
+    ...(hostApprovalIds.length > 0 ? { hostApprovalIds } : {}),
   };
 
   try {
-    const run = options.runRunner ?? defaultRunRunner;
+    const selectedTurnEngine: TurnEngineMode = selectTurnEngine({
+      sessionKind: row.kind,
+      persistedState: state instanceof HostInterruptState ? state.turnEngine : 'legacy_sdk',
+    });
+    const usesHostTurnEngine = options.runRunner === undefined
+      && isHostTurnEngine(selectedTurnEngine);
+    const run = options.runRunner
+      ?? (usesHostTurnEngine ? hostRunRunner : defaultRunRunner);
+    if (usesHostTurnEngine) {
+      opts.hostTurnEngine = selectedTurnEngine;
+      if (selectedTurnEngine === 'host_v1_read_only') opts.hostReadOnlyCanary = true;
+      safeAppend({
+        sessionId: options.sessionId,
+        turn,
+        role: 'system',
+        type: 'turn_engine_selected',
+        data: {
+          engine: selectedTurnEngine,
+          sourceUserSeq: resumeSourceUserSeq ?? null,
+          resumed: true,
+        },
+      });
+    }
     // Hoisted so the post-turn auto-credit hook can read the recall runs the
     // resumed turn's tool handlers registered (turnRecallRunIds).
     let resumeCtx: HarnessRunContext | undefined;
@@ -9371,47 +9956,61 @@ export async function resumePendingApproval(
         stage: 'approval_resume',
       },
       async () => {
-        if (useToolWrapper) {
-          resumeCtx = {
-            sessionId: options.sessionId,
-            turn,
-            counter: toolCounter,
-            ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
-            ...(resumeAgentScopeBinding.bound ? { mcpToolScope: resumeAgentScopeBinding.scope } : {}),
-            ...(resumeSourceUserSeq ? { sourceUserSeq: resumeSourceUserSeq } : {}),
-          };
-          return await withHarnessRunContext(
-            resumeCtx,
-            () => run(
-              runner,
-              options.agent,
-              state as unknown as AgentInputItem[],
-              { ...opts, stream: true },
-            ),
-          ) as RunOutcome;
-        }
-        return await run(
-          runner,
-          options.agent,
-          state as unknown as AgentInputItem[],
-          { ...opts, stream: true },
-        );
+        // Resume needs the exact physical-attempt context even when the legacy
+        // bracket wrapper is disabled. The host runner acquires its dispatch
+        // lease from this ALS identity; omitting it would make an approved
+        // provider call execute without the generation fence. Fresh runTurn
+        // already installs this context unconditionally.
+        resumeCtx = {
+          sessionId: options.sessionId,
+          turn,
+          counter: toolCounter,
+          ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
+          ...(resumeAgentScopeBinding.bound ? { mcpToolScope: resumeAgentScopeBinding.scope } : {}),
+          ...(resumeSourceUserSeq ? { sourceUserSeq: resumeSourceUserSeq } : {}),
+        };
+        return await withHarnessRunContext(
+          resumeCtx,
+          () => run(
+            runner,
+            options.agent,
+            state as unknown as AgentInputItem[],
+            { ...opts, stream: true },
+          ),
+        ) as RunOutcome;
       },
     );
 
     if (outcome.hasInterruptions && outcome.serializedState) {
       // Same registry + emit pattern as runTurn; consolidated in
       // registerAndEmitApprovals so both surfaces stay in sync.
+      session.saveInterruptState(outcome.serializedState, {
+        mcpToolScope: resumeAgentScopeBinding.bound ? resumeAgentScopeBinding.scope : undefined,
+      });
       registerAndEmitApprovals(
         { sessionId: options.sessionId, turn },
         session,
         outcome.interruptions ?? [],
       );
-      session.saveInterruptState(outcome.serializedState, {
-        mcpToolScope: resumeAgentScopeBinding.bound ? resumeAgentScopeBinding.scope : undefined,
-      });
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
+    }
+
+    if (outcome.terminal?.status === 'blocked') {
+      session.recordTurnResult({
+        history: outcome.history,
+        lastResponseId: outcome.lastResponseId,
+        turn,
+      });
+      bumpTurnNumber(options.sessionId, turn);
+      return {
+        sessionId: options.sessionId,
+        turn,
+        status: 'blocked',
+        error: publicReplyText(outcome.finalOutput, '')
+          || 'The host stopped this resumed turn at a durable execution boundary.',
+        toolCalls: toolCounter.currentCount,
+      };
     }
 
     const compactionRewrite = rewriteHistoryWithNativeCompaction(outcome.history, outcome.rawResponses);
@@ -9523,7 +10122,17 @@ export async function resumePendingApproval(
  * shape whether the resume was one-shot or multi-step.
  */
 export async function runConversationFromResume(opts: {
-  agent: Agent<any, any>;
+  /** Pre-built agent retained for isolated tests and legacy callers. Production
+   * surfaces should use `buildAgent` so accepted route authority exists before
+   * any tool surface is assembled. */
+  agent?: Agent<any, any>;
+  /** Construct the resume agent at the graph's capability_resolve phase, after
+   * exact accepted-source admission selected the provider-facing route. */
+  buildAgent?: (identity: {
+    sessionId: string;
+    sourceUserSeq: number;
+    route: 'direct_reply' | 'retrieve' | 'act';
+  }) => Promise<Agent<any, any>>;
   sessionId: string;
   /** Durable outer request attempt, retained across the resumed SDK state and
    * every synthetic continuation that follows it. */
@@ -9553,6 +10162,11 @@ export async function runConversationFromResume(opts: {
    * compatibility; terminal delivery occurs through committed public events. */
   onChunk?: (delta: string) => void | Promise<void>;
 }): Promise<RunConversationResult> {
+  const replaySource = existingResumeConversationSource(opts);
+  if (replaySource) {
+    const replay = replayedRunConversationResult(replaySource);
+    if (replay) return replay;
+  }
   const sourceUserSeq = acceptResumeConversationInput(opts);
   const acceptedSource = acceptedUserEvent(opts.sessionId, sourceUserSeq);
   const graphEvent = await recordAcceptedSourceGraph({
@@ -9565,26 +10179,17 @@ export async function runConversationFromResume(opts: {
   });
   const acceptedTurnGraph = turnGraphFromShadowEvent(graphEvent);
   if (!acceptedTurnGraph) {
-    if (semanticPortParticipated(opts.sessionId, sourceUserSeq)) {
-      const refused = commitUnadmittedSemanticTurn({
-        sessionId: opts.sessionId,
-        turn: acceptedSource.turn,
-        sourceUserSeq,
-      });
-      return {
-        sessionId: opts.sessionId,
-        status: 'failed',
-        steps: 0,
-        lastTurn: acceptedSource.turn,
-        error: refused.text,
-      };
-    }
+    const refused = commitUnadmittedSemanticTurn({
+      sessionId: opts.sessionId,
+      turn: acceptedSource.turn,
+      sourceUserSeq,
+    });
     return {
       sessionId: opts.sessionId,
-      status: 'failed',
+      status: 'blocked',
       steps: 0,
       lastTurn: acceptedSource.turn,
-      error: 'The accepted turn could not be admitted for execution.',
+      error: refused.text,
     };
   }
   // Arm the RESUME source exactly like a fresh turn (loop.ts fresh-turn twin).
@@ -9593,6 +10198,7 @@ export async function runConversationFromResume(opts: {
   // mobile approve, console, drain — seven callers) ran its tool dispatches
   // with the expected-work wall silently open: assertExpectedWorkLogicalAdmission
   // returns when no authority row exists (sweep-confirmed 2026-08-11).
+  let resumeCapabilityRoute = acceptedTurnGraph.classification.route ?? 'direct_reply';
   {
     requireAcceptedTaskAuthority({
       sessionId: opts.sessionId,
@@ -9606,7 +10212,7 @@ export async function runConversationFromResume(opts: {
     if (resumeDispatched.kind === 'blocked') {
       return {
         sessionId: opts.sessionId,
-        status: 'failed',
+        status: 'blocked',
         steps: 0,
         lastTurn: acceptedSource.turn,
         error: resumeDispatched.text,
@@ -9621,12 +10227,21 @@ export async function runConversationFromResume(opts: {
         error: resumeDispatched.text,
       };
     }
+    if (resumeDispatched.kind === 'held') {
+      return {
+        sessionId: opts.sessionId,
+        status: 'held',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        hold: resumeDispatched.hold,
+      };
+    }
     if (resumeDispatched.kind === 'typed') {
       const ran = resumeDispatched.result;
       if (ran.status !== 'success' || !ran.artifactHandle) {
         return {
           sessionId: opts.sessionId,
-          status: 'failed',
+          status: 'blocked',
           steps: 0,
           lastTurn: acceptedSource.turn,
           error: ran.error ?? 'typed construct failed closed',
@@ -9639,21 +10254,32 @@ export async function runConversationFromResume(opts: {
         lastTurn: acceptedSource.turn,
       };
     }
+    resumeCapabilityRoute = resumeDispatched.capabilityRoute;
     const resumeExpectedWork = requireKnownExpectedWorkContract({
       sessionId: opts.sessionId,
       sourceUserSeq,
     });
-    const resumeRoute = acceptedTurnGraph.classification.route ?? 'direct_reply';
     if (
-      resumeRoute === 'act'
-      && resumeExpectedWork.status === 'action_deferred'
+      resumeCapabilityRoute === 'act'
       && getSession(opts.sessionId)?.kind !== 'workflow'
-      && resumeDispatched.kind !== 'conversation'
     ) {
       requireActionExpectedWorkActivation({ sessionId: opts.sessionId, sourceUserSeq });
     }
   }
-  let foregroundReleased = false;
+  let activeAgent = opts.agent;
+  if (!activeAgent && !opts.buildAgent) {
+    throw new Error('runConversationFromResume requires either agent or buildAgent.');
+  }
+  const resolveCapability = opts.buildAgent
+    ? async () => {
+        activeAgent = await opts.buildAgent!({
+          sessionId: opts.sessionId,
+          sourceUserSeq,
+          route: resumeCapabilityRoute,
+        });
+      }
+    : undefined;
+  let foregroundRelease: 'terminal' | 'transfer' | null = null;
   return withModelUsageAttribution(
     {
       sessionId: opts.sessionId,
@@ -9678,8 +10304,14 @@ export async function runConversationFromResume(opts: {
       policy: getProactivityPolicySnapshot(),
       ...(acceptedTurnGraph ? { graph: acceptedTurnGraph } : {}),
       phases: {
+        ...(resolveCapability ? { resolveCapability } : {}),
         runCore: async () => {
-          const result = await runConversationFromResumeCore({ ...opts, sourceUserSeq });
+          if (!activeAgent) throw new Error('capability_resolve did not produce a resume agent before the core.');
+          const result = await runConversationFromResumeCore({
+            ...opts,
+            agent: activeAgent,
+            sourceUserSeq,
+          });
           if (result.status === 'dispatched') return { kind: 'dispatched', result };
           return {
             kind: 'reduced',
@@ -9708,14 +10340,20 @@ export async function runConversationFromResume(opts: {
     }
     const core = spine.core;
     if (core.kind === 'dispatched') {
-      foregroundReleased = true;
+      foregroundRelease = 'transfer';
       return core.result;
     }
     if (core.reduced.completedReason) return core.reduced;
-    foregroundReleased = Boolean(core.reduced.publicPresentation);
+    foregroundRelease = core.reduced.publicPresentation ? 'terminal' : null;
     return core.reduced;
   } finally {
-    if (foregroundReleased) {
+    if (foregroundRelease === 'transfer') {
+      releaseRunInFlightAfterWorkflowTransfer(
+        opts.sessionId,
+        opts.runAttemptId,
+        sourceUserSeq,
+      );
+    } else if (foregroundRelease === 'terminal') {
       clearRunInFlightAfterTerminal(opts.sessionId, opts.runAttemptId, sourceUserSeq);
     }
   }
@@ -10161,7 +10799,7 @@ async function runConversationFromResumeCore(opts: {
               });
               return {
                 sessionId: opts.sessionId,
-                status: 'awaiting_user_input',
+                status: 'blocked',
                 steps: stepIndex,
                 lastDecision: decision ?? undefined,
                 lastTurn,
@@ -11181,7 +11819,7 @@ function handleRunError(
   // its maxTurns budget. That escaped to the generic terminal run_failed below —
   // a dead-end that strands the session with no recourse. Treat it as a graceful
   // CAP (like ToolCallsLimitExceeded and the Claude-SDK limitHit path): a soft
-  // limit_exceeded the caller can offer "continue" on. Match the class by name
+  // limit_exceeded the caller can render as a saved-progress park. Match the class by name
   // AND the wrapped message (the SDK re-wraps thrown errors). Kill-switch =off.
   const maxTurnsHit =
     (err instanceof Error && err.name === 'MaxTurnsExceededError')
@@ -11194,7 +11832,7 @@ function handleRunError(
       sessionId,
       turn,
       status: 'limit_exceeded',
-      error: 'Reached the per-turn step budget before finishing — say "continue" to pick up where it left off.',
+      error: 'Reached the per-turn step budget before finishing; progress is checkpointed.',
     };
   }
   // A mutating tool was called with byte-identical args past the escalate

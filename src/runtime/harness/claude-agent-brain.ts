@@ -1,6 +1,6 @@
 import { renderCanonicalMemoryContext } from './canonical-context.js';
 import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
-import { codeModeMandateDirective } from '../../tools/code-mode-tool.js';
+import { batchShapeDirective } from '../../tools/batch-shape-directive.js';
 import { getComposio } from '../../integrations/composio/client.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from '../../agents/tool-jit.js';
 import {
@@ -9,9 +9,14 @@ import {
 } from '../read-path/capability-candidates.js';
 import { resolveHotSet } from '../../agents/tool-catalog.js';
 import {
-  buildWorkspaceContextPrimer, workspaceSlugFromSessionId,
-  WORKSPACE_DOCK_HOT_TOOLS, WORKSPACE_DOCK_TOOLS,
-} from '../../spaces/workspace-context.js';
+  composeSession,
+  composeSessionFromStore,
+  durableSessionKind,
+  pinCompositionHotTools,
+  pinCompositionTools,
+  renderSessionMountPrimers,
+} from './session-composition.js';
+import { renderSessionToolIndex } from './session-tool-index.js';
 import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import { stableContextGeneration } from '../stable-context-generation.js';
@@ -41,6 +46,7 @@ import { withModelUsageAttribution } from '../usage-log.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import {
   appendConversationPreambleOnce,
+  conversationPreambleDeliveryRequest,
   beginRunAttempt,
   clearKill,
   createSession,
@@ -141,7 +147,7 @@ import {
 import { turnOutcomeId, type TurnIdentity, type TurnOutcome } from './turn-outcome.js';
 import {
   clearRunInFlightAfterTerminal,
-  markRunInFlight,
+  releaseRunInFlightAfterWorkflowTransfer,
 } from './restart-recovery.js';
 import { actionBus } from '../action-bus.js';
 import {
@@ -223,7 +229,6 @@ import {
   recordAcceptedSourceGraph,
 } from './record-accepted-source-graph.js';
 import { dispatchAdmittedSource } from '../semantic-boundary/typed-source-dispatch.js';
-import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
 
 import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { requireKnownExpectedWorkContract } from './expected-work-contract.js';
@@ -491,8 +496,8 @@ function salvageCommittedResult(sessionId: string, sinceSeq = 0): ClaudeAgentSdk
 
 function renderLimitHitReply(text: string): string {
   const base = text.trim() || 'I reached the turn budget before finishing.';
-  if (/\bcontinue\b/i.test(base)) return base;
-  return `${base}\n\nI hit the turn budget before finishing. Say "continue" and I will pick up where I left off.`;
+  if (/\bpaused\b|\bcheckpoint(?:ed)?\b/i.test(base)) return base;
+  return `${base}\n\nI paused at this step's budget. Progress is checkpointed, and no additional model step was started.`;
 }
 
 /** Detect the "narrate-instead-of-call" failure: the brain produced NO real tool
@@ -549,8 +554,11 @@ function judgeMaxContinuations(): number {
  * all correctives, higher re-widens.
  */
 function maxTurnContinuations(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS', '2') ?? '2', 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+  // The standalone Claude lane is a bounded transport window, never a second
+  // host loop. Corrective judges may classify or hold its result, but cannot
+  // mint another query(). Durable continuation belongs to the host/workflow
+  // owner on a later invocation.
+  return 0;
 }
 
 /** DEFAULT ON. When the SDK brain hits its per-query turn budget (maxTurns) on a run
@@ -560,7 +568,10 @@ function maxTurnContinuations(): number {
  *  main loop's auto-continue-on-limit ratchet. Off (CLEMMY_CLAUDE_SDK_AUTO_CONTINUE=off)
  *  ⇒ the prior park-on-limit behavior. */
 function sdkAutoContinueEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_AUTO_CONTINUE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+  // Kept as a named policy seam while rolling-upgrade tests drain. The former
+  // internal auto-continue chain was an SDK-owned loop hidden inside one host
+  // invocation; it is now structurally disabled.
+  return false;
 }
 /** Max auto-continues per run (each re-runs with a fresh turn budget). The per-query
  *  tool-ceiling + wall-clock remain the hard backstops. */
@@ -626,25 +637,17 @@ export function resolveClaudeAgentBrainMaxTurns(
   objective: string,
   recentUserInputs: readonly string[] = [],
 ): number {
-  // Each SDK "turn" is one assistant message (which may carry tool calls). Real
-  // agentic work needs headroom: a single gated send alone is execution_create →
-  // composio_execute_tool → execution_complete → final (~5 turns), and a
-  // multi-step read/transform/report is more. The old default of 6 starved
-  // legitimate flows — they hit the cap mid-task, returned a hard "Reached
-  // maximum number of turns" error, and the brain thrashed (retrying the same
-  // send) trying to finish in time. The loop-guard + duplicate-write gates bound
-  // any runaway, so a generous cap is safe.
+  // One host invocation gets one flat SDK transport window. Objective size or
+  // prior prose cannot widen it; larger work earns durable host/workflow
+  // re-entry, not a larger provider-owned loop.
+  void objective;
+  void recentUserInputs;
   const configured = (getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_BRAIN_MAX_TURNS', '') ?? '').trim();
   if (configured) {
     const raw = Number.parseInt(configured, 10);
-    return Number.isFinite(raw) && raw >= 1 ? raw : 24;
+    return Number.isFinite(raw) && raw >= 1 && raw <= 12 ? raw : 12;
   }
-  // SDK turns include assistant/tool-result message cycles, not only canonical
-  // top-level tool calls. A 24-turn provider cap therefore stopped the live
-  // Workspace proof at only 16 calls, before its already-discovered space_save.
-  // Widen only execution-ready complex artifacts; the independent 24-call
-  // economy rail, mutation gates, wall clock, and kill switch remain intact.
-  return isComplexArtifactExecutionObjective(objective, recentUserInputs) ? 36 : 24;
+  return 12;
 }
 
 /** The SDK brain's final reply was SHAPED like a printed tool call with zero
@@ -1032,8 +1035,7 @@ export function renderClaudeAgentBrainSystemAppend(
         partition: 'all',
         includeSessionActions: false,
       });
-  const spaceSlug = workspaceSlugFromSessionId(request.sessionId);
-  const workspacePrimer = spaceSlug ? buildWorkspaceContextPrimer(spaceSlug) : null;
+  const compositionPrimers = renderSessionMountPrimers(composeSession({ sessionId: request.sessionId }));
   // Visibility into THIS session's completed irreversible actions. The text
   // transcript doesn't carry tool results, so without this the brain is blind to
   // its own prior sends and can re-run them (the 2026-06-29 double-send). Gated by
@@ -1049,19 +1051,25 @@ export function renderClaudeAgentBrainSystemAppend(
     '',
     renderCapabilityBoundary(mode),
     '',
+    // Full agentic parity with the Codex/BYO schema-on-demand lanes: names stay
+    // in the stable prefix while schemas remain behind tool_search/call_tool.
+    // The renderer is deterministic and performs no provider round-trip.
+    mode === 'full' ? renderSessionToolIndex() : '',
+    '',
     sessionActions,
     '',
     `Surface: ${surface}`,
     `Session: ${request.sessionId}`,
     `Claude brain mode: ${mode}`,
     '',
-    // The turn's advisory candidate card: capabilities this workspace already
-    // proved for requests like this one. Volatile per turn by nature, but tiny
-    // and bounded (≤5 lines) — never invocation arguments.
-    renderCapabilityCandidateCard(request.turnCandidates),
-    // Dock chat (session "space-<slug>"): tell the brain it is EDITING this
-    // Workspace and to change it via space_* tools, never a sandbox/scratch file.
-    workspacePrimer ?? '',
+    // The turn's advisory candidate card is volatile. With the context split
+    // enabled it rides the per-turn user context below so the system prefix is
+    // byte-stable and remains cacheable. Split-off preserves the historical
+    // single-append byte shape.
+    split ? '' : renderCapabilityCandidateCard(request.turnCandidates),
+    // Session composition (workspace contract, saved-bundle notes): identity
+    // mount, not a job type. Chat mounts nothing extra here.
+    compositionPrimers,
     '',
     frameTrustedMemory(persistentContext),
     '',
@@ -1070,14 +1078,14 @@ export function renderClaudeAgentBrainSystemAppend(
     // the installed catalog in the cacheable system prefix.
     renderClaudeBrainSkillsBlock(persistentContext),
     '',
-    // Code-mode BATCH-SHAPE RULE (Move 3 / adoption): the brain lane had the
-    // run_tool_program tool but NO steer, so it ground multi-fetch turns through
-    // discrete calls (live: 6 discrete Outlook calls, 0 programs). The base rule
-    // is a constant and getComposio() is session-stable, so this stays in the
+    // BATCH-SHAPE RULE: the brain lane ground multi-fetch turns through discrete
+    // calls (live: 6 discrete Outlook calls) without a steer. The base rule is a
+    // constant and getComposio() is session-stable, so this stays in the
     // cacheable stable append. Fires whenever composio data tools are in scope
     // (the common chat case) — the per-turn fan-out sharpening stays in the
     // turn context. '' (dropped by filter) when composio isn't configured.
-    codeModeMandateDirective({ composioInScope: getComposio() != null }),
+    // Same directive the workflow-step lane appends, so the lanes steer alike.
+    batchShapeDirective({ composioInScope: getComposio() != null }),
     '',
     'How you operate here:',
     CLAUDE_BRAIN_RUBRIC,
@@ -1502,10 +1510,14 @@ async function buildClaudeAgentBrainTurnContext(
   const declinedParentPolicy = declinedParentWithNewTask
     ? 'Typed continuation result: the user declined the prior proposal and supplied separate new work. Keep the full reply conversationally intact, but treat only the fresh clause as active authority; do not revive, retrieve for, or prepare tools from the declined parent.'
     : '';
+  const capabilityCandidateCard = splitContext
+    ? renderCapabilityCandidateCard(request.turnCandidates)
+    : '';
   return {
     text: [
       convergenceSteer,
       declinedParentPolicy,
+      capabilityCandidateCard,
       volatile,
       relevantSkills,
       continuationContext,
@@ -1663,6 +1675,8 @@ function cancelledBrainResponse(
     sessionId,
     turn: sourceTurn,
     sourceUserSeq,
+    attemptId: attempt.attemptId,
+    ...(attempt.runId ? { runId: attempt.runId } : {}),
   };
   // A stop that handed this attempt to a durable background owner is a
   // TRANSFER, not a cancellation. Reporting it as cancelled tells the user
@@ -1701,7 +1715,7 @@ function cancelledBrainResponse(
     try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
   }
   try { updateSession(sessionId, { status: 'cancelled' }); } catch { /* observability metadata */ }
-  markRunInFlight(sessionId, false);
+  clearRunInFlightAfterTerminal(sessionId, attempt.attemptId, sourceUserSeq);
   return {
     text: committedText,
     sessionId,
@@ -1726,10 +1740,9 @@ export async function respondViaClaudeAgentSdkBrain(
   const mode = claudeAgentSdkBrainMode() ?? 'read_only';
   if (!getSession(sessionId)) {
     const titleSeed = displayMessage.trim().replace(/\s+/g, ' ');
-    const sessionKind = surface === 'background' || surface === 'cron' ? 'execution' : 'chat';
     createSession({
       id: sessionId,
-      kind: sessionKind,
+      kind: durableSessionKind(composeSession({ sessionId }), { surface }),
       channel: request.channel,
       userId: request.userId,
       title: titleSeed.length > 80 ? `${titleSeed.slice(0, 77)}...` : titleSeed,
@@ -1805,7 +1818,11 @@ export async function respondViaClaudeAgentSdkBrain(
       sourceUserSeq: acceptedSource.seq,
       attemptId: attempt.attemptId,
     }, () => respondViaClaudeAgentSdkBrainAttempt(surface, scopedRequest, attempt));
-    status = response.stoppedReason === 'cancelled' ? 'cancelled' : 'completed';
+    if (response.stoppedReason === 'in-progress') {
+      preserveAttemptOwnership = true;
+    } else {
+      status = response.stoppedReason === 'cancelled' ? 'cancelled' : 'completed';
+    }
     return response;
   } catch (err) {
     const acceptedSource = routeAcceptedSource ?? getRunAttemptSourceUserEvent(attempt);
@@ -1860,13 +1877,12 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   const turnStartedAt = new Date().toISOString();
   const mode = claudeAgentSdkBrainMode() ?? 'read_only';
   const completionJudgeForSurface = surface !== 'background' && surface !== 'cron' && completionJudgeEnabled();
-  const isSpaceSession = workspaceSlugFromSessionId(sessionId) != null;
+  const sessionMount = composeSessionFromStore(sessionId, { toolAllowlist: request.allowedToolNames });
   if (!getSession(sessionId)) {
     const titleSeed = displayMessage.trim().replace(/\s+/g, ' ');
-    const sessionKind = surface === 'background' || surface === 'cron' ? 'execution' : 'chat';
     createSession({
       id: sessionId,
-      kind: sessionKind,
+      kind: durableSessionKind(sessionMount, { surface }),
       channel: request.channel,
       userId: request.userId,
       title: titleSeed.length > 80 ? `${titleSeed.slice(0, 77)}...` : titleSeed,
@@ -1945,28 +1961,22 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   });
   const compiledGraph = turnGraphFromShadowEvent(graphEvent);
   if (!compiledGraph) {
-    if (semanticPortParticipated(sessionId, userInputEvent.seq)) {
-      const refused = commitUnadmittedSemanticTurn({
-        sessionId,
-        turn: userInputEvent.turn,
-        sourceUserSeq: userInputEvent.seq,
-      });
-      return {
-        sessionId,
-        text: refused.text,
-        stoppedReason: 'error',
-      };
-    }
+    const refused = commitUnadmittedSemanticTurn({
+      sessionId,
+      turn: userInputEvent.turn,
+      sourceUserSeq: userInputEvent.seq,
+    });
     return {
       sessionId,
-      text: 'The accepted turn could not be admitted for execution.',
-      stoppedReason: 'error',
+      text: refused.text,
+      stoppedReason: 'blocked',
     };
   }
   // Match the standard harness seam: no provider/model/tool work begins until
   // this exact source's hash-validated graph has durable cutover authority.
   // Re-entry from the bridge or a brain fallover observes the existing marker;
   // it never arms an independent task.
+  let providerCapabilityRoute = compiledGraph.classification.route ?? 'direct_reply';
   {
     requireAcceptedTaskAuthority({
       sessionId,
@@ -1981,7 +1991,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       return {
         sessionId,
         text: dispatched.text,
-        stoppedReason: 'error',
+        stoppedReason: 'blocked',
       };
     }
     if (dispatched.kind === 'needs_input') {
@@ -1989,6 +1999,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         sessionId,
         text: dispatched.text,
         stoppedReason: 'awaiting-input',
+      };
+    }
+    if (dispatched.kind === 'held') {
+      return {
+        sessionId,
+        text: 'This exact task is still owned by Clem\'s recovery system. I did not start a duplicate attempt; the existing work will continue from its durable checkpoint.',
+        stoppedReason: 'in-progress',
+        raw: { transport: 'claude_agent_sdk_brain', typedExecution: dispatched.hold },
       };
     }
     if (dispatched.kind === 'typed') {
@@ -2000,26 +2018,27 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           text: isHostAuthorityHeldReason(raw)
             ? heldExecutionTextForInternalReason(raw, ran.status === 'uncertain' ? 'uncertain' : 'blocked')
             : raw,
-          stoppedReason: 'error',
+          stoppedReason: 'blocked',
         };
       }
       return { sessionId, text: ran.artifactHandle, stoppedReason: 'success' };
     }
-    const expectedWork = requireKnownExpectedWorkContract({
+    providerCapabilityRoute = dispatched.capabilityRoute;
+    requireKnownExpectedWorkContract({
       sessionId,
       sourceUserSeq: userInputEvent.seq,
     });
-    if (expectedWork.status === 'action_deferred' && dispatched.kind !== 'conversation') {
+    if (providerCapabilityRoute === 'act') {
       requireActionExpectedWorkActivation({
         sessionId,
         sourceUserSeq: userInputEvent.seq,
       });
     }
   }
-  // Past the dispatch block this lane is conversation. An `act` sketch must
-  // not demand expected-work activation (live: calendar 500). Typed work
-  // already returned above.
-  const acceptedActionSurface = false;
+  // The shared dispatcher owns the provider-facing route. An accepted action
+  // retains its expected-work carrier; callers may not downgrade it to the
+  // generic conversation dispatcher to keep tools mounted.
+  const acceptedActionSurface = providerCapabilityRoute === 'act';
   // The standard lane receives this provider-neutral requirement projection at
   // its capability-resolve node. Claude diverges before that node, so derive
   // the same bounded advisory projection here when the caller did not already
@@ -2233,7 +2252,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         ? persisted.event.data.text
         : disposition.preamble;
       if (request.onConversationPreamble) {
-        const delivered = await request.onConversationPreamble(persistedText);
+        const delivered = await request.onConversationPreamble(
+          conversationPreambleDeliveryRequest(persisted.event),
+        );
         if (delivered.status === 'failed') {
           const identity: TurnIdentity = {
             sessionId,
@@ -2288,11 +2309,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // definitions never enter provider accounting. This is an acquisition
   // mechanism, not permission pruning. If disabled, fall back to the legacy
   // semantic JIT behavior byte-for-byte.
-  // A pure, runtime-typed decline needs conversation, not an agent surface.
-  // Give the provider no local schemas and do no acquisition/ranking work. A
-  // compound correction is not classified as `declined`, so it keeps the
-  // normal tool path.
-  const conversationOnlyToolBoundary = declinedContinuation || durableMemoryConversationOnly;
+  // An admitted direct reply is conversation, not an agent surface. Give the
+  // provider no local or external tool authority and do no acquisition/ranking
+  // work. Retrieve retains its read carrier; act retains work_call. A pure,
+  // runtime-typed decline and a host-completed memory receipt are sealed by the
+  // same zero-tool boundary.
+  const conversationOnlyToolBoundary = providerCapabilityRoute === 'direct_reply'
+    || declinedContinuation
+    || durableMemoryConversationOnly;
   const explicitToolAuthority = request.allowedToolNames !== undefined || conversationOnlyToolBoundary;
   const fullToolPolicy = toolPolicyForRequest(
     conversationOnlyToolBoundary ? { ...request, allowedToolNames: [] } : request,
@@ -2332,7 +2356,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           ? {
               shortCircuitReason: declinedContinuation
                 ? 'declined_continuation'
-                : 'durable_memory_receipt_conversation_only',
+                : durableMemoryConversationOnly
+                  ? 'durable_memory_receipt_conversation_only'
+                  : 'direct_reply_conversation_only',
               semanticAcquisitionSkipped: true,
               schemaWarmSkipped: true,
               advertisedSchemaCount: 0,
@@ -2380,11 +2406,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       // same-turn reachable through tool_search → call_tool. Pinning the entire
       // feature group here defeated schema-on-demand specifically in Workspace
       // chats—the surface where the prompt is already carrying a living brief.
-      if (isSpaceSession) {
-        for (const toolName of WORKSPACE_DOCK_HOT_TOOLS) {
-          if (advertisedUniverse.includes(toolName)) hot.add(toolName);
-        }
-      }
+      pinCompositionHotTools(hot, sessionMount, advertisedUniverse);
       // MONOTONIC FLOOR — the cache lever, which this branch was missing.
       //
       // The hot set is recomputed per turn from the tools the user happened to
@@ -2446,11 +2468,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           ...(request.turnCandidates?.pinnedTools ?? []),
         ],
       });
-      // H1c: a dock chat IS editing a Workspace — pin the space tools so the JIT
-      // never drops them (else the model can't persist the edit and sandboxes it).
-      if (isSpaceSession) {
-        for (const t of WORKSPACE_DOCK_TOOLS) if (fullAllowed.includes(t)) selection.exposed.add(t);
-      }
+      pinCompositionTools(selection.exposed, sessionMount, fullAllowed);
       jitReason = selection.reason;
       if (selection.reduced) {
         // Monotonic JIT (cache lever): union this turn's selection into the
@@ -2503,9 +2521,16 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // completion gates and corrective prompts. Only the exact accepted B (or an
   // exact typed preflight acknowledgement recovered from durable state) may
   // authorize effects and define completion.
+  const materialClarificationAnswer = request.taskContinuation
+    && (
+      request.taskContinuation.disposition === 'selected'
+      || request.taskContinuation.disposition === 'provided'
+    )
+    ? request.taskContinuation.answer.trim()
+    : '';
   const turnObjective = declinedParentWithNewTask
     ? taskInput
-    : effectiveTurnObjective(
+    : materialClarificationAnswer || effectiveTurnObjective(
         sessionId,
         request.message,
         userInputEvent.seq,
@@ -2900,10 +2925,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   const finalizedWorkflowDispatchResponse = (): AssistantResponse | null => {
     const dispatch = finalizePreparedWorkflowDispatchForSource(sessionId, userInputEvent.seq);
     if (!dispatch) return null;
-    // This clears only the foreground chat attempt. The public dispatch row is
-    // deliberately nonterminal; the workflow reducer owns the later exact
-    // terminal and provider delivery.
-    markRunInFlight(sessionId, false);
+    // The public dispatch row is deliberately nonterminal; the workflow reducer
+    // owns the later exact terminal and provider delivery. Release only this
+    // accepted foreground owner after its source group is durably activated.
+    releaseRunInFlightAfterWorkflowTransfer(
+      sessionId,
+      attempt.attemptId,
+      userInputEvent.seq,
+    );
     return {
       text: dispatch.presentation.text,
       sessionId,
@@ -3032,7 +3061,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     } else if (durableMemoryConversationOnly && result.limitHit) {
       // A valid acknowledgement is the complete presentation for this already
       // satisfied objective; a provider bookkeeping flag cannot turn it into a
-      // false "say continue" horizon.
+      // false user-owned continuation horizon.
       result = {
         ...result,
         limitHit: false,
@@ -3084,6 +3113,17 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         result = mergeClaudeRunEvidence(result, retry);
         reconcileQueuedApprovalEdge();
       }
+    }
+    if (
+      !durableMemoryConversationOnly
+      && !resultIsAwaitingInput()
+      && !result.limitHit
+      && looksLikeReasoningLeak(result.text, result.toolUses)
+    ) {
+      notePreterminalDeliveryConcern({
+        reason: 'the provider returned private reasoning instead of completing the accepted task',
+        missing: ['reasoning_leak_no_work'],
+      });
     }
 
     // Objective-completion judge (parity with the harness loop): on an authoring
@@ -3299,55 +3339,62 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // evidence that no render script ran and still passed hand-rolled output).
     // This lane re-injected skill bodies but never verified EXECUTION, so a
     // skill that prescribes bundled scripts could be treated as reading
-    // material — and a single-model user has no judge to catch it either. One
-    // continuation, conservative zero-ran threshold, kill-switch and fail-open
-    // identical to the loop lane.
+    // material — and a single-model user has no judge to catch it either. The
+    // one-step lane records the shortfall as a terminal concern; it never mints
+    // a corrective provider query.
     if (!durableMemoryConversationOnly && !result.limitHit && !resultIsAwaitingInput()
       && (getRuntimeEnv('HARNESS_SKILL_EXEC_GATE', 'on') ?? 'on').toLowerCase() !== 'off') {
       const skillGap = skillExecutionShortfall(sessionId);
       if (skillGap) {
-        try {
-          appendEvent({
-            sessionId,
-            turn: 0,
-            role: 'system',
-            type: 'heartbeat',
-            data: { kind: 'skill_execution_repair', skill: skillGap.skill, prescribed: skillGap.prescribed },
+        if (continuationsUsed >= continuationBudget) {
+          notePreterminalDeliveryConcern({
+            reason: `the required skill pipeline "${skillGap.skill}" was not executed`,
+            missing: skillGap.prescribed.map((script) => `skill_execution:${skillGap.skill}:${script}`),
           });
-        } catch { /* telemetry best-effort */ }
-        const priorSkillResult = result;
-        try {
-          const repaired = await runContinuation({
-            prompt: [
-              `You treated this as finished, but the "${skillGap.skill}" skill was NOT executed: you ran none of its prescribed scripts (${skillGap.prescribed.join(', ')}).`,
-              "Do NOT hand-roll the deliverable. Run the skill's actual pipeline — its bundled render script and any mandatory validate script (re-read it with skill_read if needed) — so the output matches the skill's template exactly, then finish.",
-              "Only treat this as complete once the skill's own scripts have produced and validated the artifact.",
-            ].join(' '),
-            ...runOptions,
-          });
-          // A null continuation (cancelled / budget-exhausted) leaves the
-          // original result intact rather than erasing completed work.
-          result = repaired
-            ? {
-                ...repaired,
-                toolUses: [...priorSkillResult.toolUses, ...repaired.toolUses],
-                text: repaired.text?.trim() ? repaired.text : priorSkillResult.text,
-              }
-            : priorSkillResult;
-        } catch {
-          // Repair is best-effort: a failed continuation must never swallow the
-          // work already done.
-          result = priorSkillResult;
+        } else {
+          try {
+            appendEvent({
+              sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'heartbeat',
+              data: { kind: 'skill_execution_repair', skill: skillGap.skill, prescribed: skillGap.prescribed },
+            });
+          } catch { /* telemetry best-effort */ }
+          const priorSkillResult = result;
+          try {
+            const repaired = await runContinuation({
+              prompt: [
+                `You treated this as finished, but the "${skillGap.skill}" skill was NOT executed: you ran none of its prescribed scripts (${skillGap.prescribed.join(', ')}).`,
+                "Do NOT hand-roll the deliverable. Run the skill's actual pipeline — its bundled render script and any mandatory validate script (re-read it with skill_read if needed) — so the output matches the skill's template exactly, then finish.",
+                "Only treat this as complete once the skill's own scripts have produced and validated the artifact.",
+              ].join(' '),
+              ...runOptions,
+            });
+            // A null continuation (cancelled / budget-exhausted) leaves the
+            // original result intact rather than erasing completed work.
+            result = repaired
+              ? {
+                  ...repaired,
+                  toolUses: [...priorSkillResult.toolUses, ...repaired.toolUses],
+                  text: repaired.text?.trim() ? repaired.text : priorSkillResult.text,
+                }
+              : priorSkillResult;
+          } catch {
+            // Repair is best-effort: a failed continuation must never swallow the
+            // work already done.
+            result = priorSkillResult;
+          }
+          const dispatch = finalizedWorkflowDispatchResponse();
+          if (dispatch) return dispatch;
         }
-        const dispatch = finalizedWorkflowDispatchResponse();
-        if (dispatch) return dispatch;
       }
     }
 
     // A parsed create response is not enough to claim a document/site exists.
-    // Give bound-but-unverified pointers ONE deterministic exact-ID read-back
-    // query after all ordinary continuations. This query cannot create or list;
-    // the durable ledger prevents a retry from duplicating the resource.
+    // Unverified pointers always become a terminal concern. A legacy bounded
+    // read-back remains behind the continuation budget while rolling-upgrade
+    // state drains; the one-step policy leaves that budget at zero.
     if (!durableMemoryConversationOnly && !result.limitHit && !resultIsAwaitingInput()) {
       let unresolved = logicalRunScopeId
         ? listUnverifiedRunArtifacts(sessionId, logicalRunScopeId)
@@ -3361,7 +3408,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
             || (artifact.kind === 'resource' && artifact.provider === 'googlesheets')
           ),
       );
-      if (repairable.length > 0) {
+      if (continuationsUsed < continuationBudget && repairable.length > 0) {
         try {
           appendEvent({
             sessionId,
@@ -3420,6 +3467,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       }
       if (unresolved.length > 0) {
         artifactVerificationPending = unresolved;
+        result = { ...result, stoppedReason: 'unverified' };
         notePreterminalDeliveryConcern({
           reason: 'one or more created artifacts could not be verified by exact-ID read-back',
           missing: unresolved.map((artifact) =>
@@ -3594,7 +3642,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'narration_giveup_fallover', preview: text.slice(0, 120) } });
       } catch { /* telemetry best-effort */ }
       throw new ClaudeSdkNarrationGiveUpError(
-        'I started to turn that into an action but it did not go through as a real tool call. Say the word and I will run it properly.',
+        'I could not execute the described action because no real tool call was made. No action was recorded.',
       );
     }
     // MIXED TURN (live 2026-07-24): real tools ran, then the model printed a
@@ -3935,8 +3983,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       }
     : undefined;
 
-  // Long-running parity: a turn-budget stop surfaces as a graceful
-  // "say continue", not a failure (claude-agent-sdk.ts returns limitHit).
+  // A transport-window ceiling is a typed rest, not permission for this lane
+  // to re-enter itself and not a question the user must answer.
   const stoppedReason: AssistantResponse['stoppedReason'] =
     result.stoppedReason
     ?? (result.limitHit
@@ -4016,7 +4064,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   const publicText = conversationalApprovalQuestion ?? publicReplyText(
     text,
     result.limitHit
-      ? 'I hit this run\'s budget before finishing. Say "continue" to keep going.'
+      ? 'I paused at this run\'s current budget. Progress is checkpointed.'
       : awaitingApproval
         ? 'I need your approval before I can continue.'
         : awaitingInput
@@ -4027,9 +4075,11 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     sessionId,
     turn: userInputEvent.turn,
     sourceUserSeq: userInputEvent.seq,
+    attemptId: attempt.attemptId,
+    ...(attempt.runId ? { runId: attempt.runId } : {}),
   };
   let outcome: TurnOutcome;
-  if (terminalPresentationRepair && terminalRepairHolds) {
+  if ((terminalPresentationRepair && terminalRepairHolds) || result.stoppedReason === 'unverified') {
     outcome = {
       version: 2,
       id: turnOutcomeId(identity),
@@ -4043,10 +4093,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       version: 2,
       id: turnOutcomeId(identity),
       identity,
-      status: 'needs_input',
+      status: 'blocked',
       resumable: true,
-      needs: { kind: 'continue' },
-      presentation: { kind: 'continue', text: publicText },
+      presentation: { kind: 'blocked', text: publicText },
     };
   } else if (awaitingApproval && graphApprovalDependency?.kind === 'approval') {
     outcome = {
@@ -4092,10 +4141,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     ),
     ...(deliveryConcernForCommit ? { deliveryConcern: deliveryConcernForCommit } : {}),
     ...(terminalJudgeDisposition ? { terminalJudgeDisposition } : {}),
-    legacyReason: terminalPresentationRepair && terminalRepairHolds
+    legacyReason: (terminalPresentationRepair && terminalRepairHolds) || result.stoppedReason === 'unverified'
       ? 'verification_required'
       : result.limitHit
-      ? 'awaiting_continue'
+      ? 'sdk_step_budget_parked'
       : awaitingInput || awaitingConversationalApproval
         ? 'awaiting_user_input'
         : awaitingApproval
@@ -4120,7 +4169,15 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         : {}),
       ...(completionVerification ? { verification: completionVerification } : {}),
       ...terminalJudgeMetadata,
-      ...(terminalPresentationRepair && terminalRepairHolds
+      ...(result.stoppedReason === 'unverified' && deliveryConcernForCommit
+        ? {
+            verificationDetail: deliveryConcernForCommit.reason,
+            ...(deliveryConcernForCommit.missing?.length
+              ? { verificationMissing: deliveryConcernForCommit.missing }
+              : {}),
+          }
+        : {}),
+      ...(((terminalPresentationRepair && terminalRepairHolds) || result.stoppedReason === 'unverified')
         ? { blockedReason: 'authoritative_terminal_verification_incomplete' }
         : {}),
       ...(result.limitHit ? { transport: 'claude_agent_sdk_brain', maxTurns: sdkMaxTurns } : {}),
@@ -4140,7 +4197,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   if (terminalEventInserted) {
     try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
   }
-  if (terminalEventRecorded) markRunInFlight(sessionId, false);
+  if (terminalEventRecorded) {
+    clearRunInFlightAfterTerminal(sessionId, attempt.attemptId, userInputEvent.seq);
+  }
   // The transcript reader consumes conversation_completed, so refresh only
   // after that terminal row is durable. The old pre-dispatch hook always wrote
   // a user-only snapshot and lagged the assistant by one turn. Keep this

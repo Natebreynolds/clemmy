@@ -1,12 +1,12 @@
 import type { Runner } from '@openai/agents';
 import { appendEvent, writeToolOutput, type EventRow } from './eventlog.js';
-import { scheduleReflection, type ReflectionInput } from '../../memory/reflection.js';
 import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { autoInvalidateOnFailure } from './auto-invalidate.js';
 import { autoRememberOnSuccess } from './auto-remember.js';
 import { fanoutLedgerEnabled, recordWorkerResult } from './fanout-ledger.js';
 import {
   actionTopologyRoleForRuntimeCall,
+  canonicalRuntimeEffectiveToolName,
   runtimeToolAccountingMetadata,
   unwrapRuntimeEffectiveToolIdentity,
   type RuntimeEffectiveToolIdentity,
@@ -58,8 +58,6 @@ export interface AttachHooksOptions {
   maxResultChars?: number;
   /** Cap on agent_end output size persisted in the event. */
   maxOutputChars?: number;
-  /** Test/integration seam for observing the exact clean reflection payload. */
-  scheduleReflection?: (input: ReflectionInput) => void;
 }
 
 interface NamedAgent {
@@ -230,7 +228,10 @@ export function effectiveReflectionTool(toolName: string | null, details: ToolDe
       if (binary) return binary;
     }
   }
-  return identity.toolName;
+  // Reflection is telemetry, not execution authority. A malformed trusted
+  // carrier deliberately has no effective inner identity, but losing even the
+  // safe canonical outer wrapper would make the lifecycle unattributable.
+  return identity.toolName ?? canonicalRuntimeEffectiveToolName(toolName) ?? null;
 }
 
 /**
@@ -246,7 +247,6 @@ export function attachEventLogHooks(
   const getTurn = options.getTurn ?? (() => 0);
   const maxResultChars = options.maxResultChars ?? 8000;
   const maxOutputChars = options.maxOutputChars ?? 4000;
-  const scheduleReflectionForHook = options.scheduleReflection ?? scheduleReflection;
   // SDK call ids are presentation identifiers, not globally unique invocation
   // identities. Scope correlation to the harness session and keep only the
   // currently-open occurrence. A closed id may legitimately be reused by a
@@ -542,24 +542,6 @@ export function attachEventLogHooks(
         // the event-log write below.
       }
 
-      // Phase 1 brain architecture (v0.5.11+): fire-and-forget reflection
-      // on every non-empty tool return. The length + importance gates
-      // live inside reflection.ts so even skipped runs emit a
-      // `cancelled` telemetry event — that's what feeds the Brain ->
-      // Evolution panel's calibration story. Scheduling is
-      // microtask-deferred so the SDK's tool result is unblocked.
-      if (authorityResultStr.length > 0) {
-        scheduleReflectionForHook({
-          sessionId,
-          callId,
-          // Unwrap composio_execute_tool → its action slug so the fact's
-          // provenance is specific and the source-trust classifier can see
-          // the system of record.
-          tool: effectiveReflectionTool(tool?.name ?? null, details),
-          output: authorityResultStr,
-          scopeId: harnessRunContextStorage.getStore()?.behaviorScopeId,
-        });
-      }
     }
     // FIX 7 — per-run fan-out coverage ledger. Record every run_worker outcome
     // (ok = result does NOT start with ERROR:) so a partial batch can report
@@ -666,6 +648,9 @@ export function attachEventLogHooks(
       autoRememberOnSuccess({
         toolName: tool?.name ?? null,
         resultStr: authorityResultStr,
+        args: (details as { toolCall?: { arguments?: unknown } } | undefined)?.toolCall?.arguments,
+        sessionId: harnessRunContextStorage.getStore()?.sessionId,
+        sourceUserSeq: harnessRunContextStorage.getStore()?.sourceUserSeq,
       });
     }
   };

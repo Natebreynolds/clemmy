@@ -11,7 +11,7 @@
  * wrong-site clobber; confirm-first-batch = send-without-approval; grounding =
  * recall-stale payload; goal-fidelity = per-firm-research-skipped; plus
  * execution-wrap, loop-guardrail-runaway, duplicate-target. Every other
- * next-level lane (Code Mode gate-parity, idempotency, abstention, procedure
+ * next-level lane (nested-dispatch gate parity, idempotency, abstention, procedure
  * reuse, firehose suppression) registers its own EvalCase here and gates its
  * kill-switch deletion on pass^k.
  *

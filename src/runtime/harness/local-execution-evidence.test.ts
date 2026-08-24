@@ -23,6 +23,9 @@ const outcomes = await import('./attempt-outcome.js');
 const settlement = await import('./attempt-settlement.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const resolution = await import('./resolution-ledger.js');
+const delivery = await import('./delivery-committer.js');
+const recoveryPresentation = await import('./recovery-presentation-truth.js');
+const continuityRuntime = await import('./task-continuity-runtime.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -1335,6 +1338,80 @@ test('an unbound local execution under the deterministic retrieve contract carri
   assert.equal(finalizedResolution.match.status, 'complete');
 });
 
+test('a Salesforce CLI read piped through 2>/dev/null still records retrieve evidence', () => {
+  // Live 2026-08-14: "what is the net MRR we sold this week" ran
+  // `sf data query … 2>/dev/null | python3 -c`. The stderr redirect used to
+  // classify the call as local_write, so the host minted no crossing and the
+  // retrieve stayed requirement_unobserved even after the judge accepted the
+  // number.
+  const session = eventlog.createSession({
+    id: `local-evidence-sf-retrieve-${++serial}`,
+    kind: 'chat',
+  });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'What is the net MRR we sold this week' },
+  });
+  const task: LocalTask = {
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq),
+    label: `sf-retrieve-${serial}`,
+  };
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: task.turn },
+  }));
+  const fixed = contracts.freezeDeterministicExpectedWorkContract({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.ok(fixed.status === 'fixed' || fixed.status === 'replayed', JSON.stringify(fixed));
+
+  const args = {
+    command: 'sf data query --json --query "SELECT COUNT(Id) cnt, SUM(Net_MRR__c) mrr FROM Opportunity WHERE IsWon = true AND CloseDate = THIS_WEEK" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin))"',
+  };
+  const call = `logical:${task.label}:sf`;
+  assert.equal(dispatch.admitLogicalCall({
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      turn: task.turn,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId: call,
+    },
+    tool: 'run_shell_command',
+    args,
+  }).status, 'inserted');
+  const settled = settleLocal({
+    task,
+    logicalToolCallId: call,
+    tool: 'run_shell_command',
+    args,
+    result: 'exit_code: 0\n\nstdout:\n{"result":{"records":[{"cnt":13,"mrr":62947}]},"done":true}\n',
+  });
+  assert.equal(settled.outcome.kind, 'succeeded', JSON.stringify(settled.outcome));
+  const row = settlementRow(task, call);
+  assert.equal(row?.host_crossing_count, 1, 'the sf read records its host crossing');
+  assert.ok(row?.result_handle_id);
+
+  const finalizedResolution = resolution.finalizeResolutionAgainstExpectedWork({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    turn: task.turn,
+  });
+  assert.equal(
+    finalizedResolution.status,
+    'finalized',
+    JSON.stringify(finalizedResolution.status === 'incomplete'
+      ? finalizedResolution.match.gaps
+      : finalizedResolution),
+  );
+});
+
 test('an unbound local business call under an ACTION contract still records no crossing', () => {
   // The widened door is scoped to the implicit one-read retrieve shape. An
   // action contract's business calls must still bind before their local
@@ -1515,4 +1592,218 @@ test('corrective failure prose crossing a carrier never settles as succeeded hos
     result: JSON.stringify({ records: [{ id: 'alpha-1', note: 'previous attempt FAILED but retried fine' }] }),
   });
   assert.equal(benignSettled.outcome.kind, 'succeeded', JSON.stringify(benignSettled.outcome));
+});
+
+test('repair_arguments refuses an identical effective digest before dispatch and admits one changed digest', () => {
+  const firstArgs = { path: 'leads.json', encoding: 'utf8' };
+
+  const settleFirstRepair = (task: LocalTask, suffix: string): void => {
+    const first = openAndBind({
+      task,
+      suffix: `${suffix}-first`,
+      tool: SOURCE_TOOL,
+      args: firstArgs,
+      requirementId: 'read_leads',
+      withProposal: true,
+    });
+    const committed = settlements.commitLogicalCallSettlement({
+      identity: {
+        sessionId: task.sessionId,
+        sourceUserSeq: task.sourceUserSeq,
+        acceptedTaskId: task.acceptedTaskId,
+        logicalToolCallId: first,
+      },
+      contract: { toolName: SOURCE_TOOL, args: firstArgs },
+      execution: { kind: 'refused_pre_dispatch' },
+      outcome: outcomes.classifyAttemptOutcome({ argumentValidationFailed: true }),
+      recovery: { businessCall: true, mutating: false },
+      observer: { lane: 'agents_runner', turn: task.turn },
+    });
+    assert.equal(committed.status, 'committed', JSON.stringify(committed));
+  };
+
+  const admitRepair = (task: LocalTask, suffix: string, args: unknown) => {
+    const logicalToolCallId = `logical:${task.label}:${suffix}`;
+    assert.equal(dispatch.admitLogicalCall({
+      identity: {
+        sessionId: task.sessionId,
+        sourceUserSeq: task.sourceUserSeq,
+        acceptedTaskId: task.acceptedTaskId,
+        logicalToolCallId,
+      },
+      tool: SOURCE_TOOL,
+      args,
+    }).status, 'inserted');
+    return {
+      logicalToolCallId,
+      admission: admissionModule.admitExpectedWorkInvocation({
+        sessionId: task.sessionId,
+        sourceUserSeq: task.sourceUserSeq,
+        logicalToolCallId,
+        requirementId: 'read_leads',
+        tool: SOURCE_TOOL,
+        args,
+      }),
+    };
+  };
+
+  const identicalTask = acceptLocalAction('repair-identical');
+  settleFirstRepair(identicalTask, 'identical');
+  const identical = admitRepair(identicalTask, 'identical-retry', firstArgs);
+  assert.equal(identical.admission.status, 'refused', JSON.stringify(identical.admission));
+  if (identical.admission.status === 'refused') {
+    assert.equal(identical.admission.kind, 'work_attempt_budget_exhausted');
+    assert.match(identical.admission.reason, /identical replay is not a repair/i);
+  }
+  const identicalCrossings = eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(
+    identicalTask.sessionId,
+    identicalTask.sourceUserSeq,
+    identical.logicalToolCallId,
+  ) as { n: number };
+  assert.equal(identicalCrossings.n, 0, 'the unchanged repair is refused before dispatch');
+
+  const changedTask = acceptLocalAction('repair-changed');
+  settleFirstRepair(changedTask, 'changed');
+  const changed = admitRepair(changedTask, 'changed-retry', {
+    path: 'leads.ndjson',
+    encoding: 'utf8',
+  });
+  assert.equal(changed.admission.status, 'bound', JSON.stringify(changed.admission));
+});
+
+test('a durable repair continuation refuses parent-equivalent args and admits corrected args', async () => {
+  const firstArgs = { path: 'leads.json', encoding: 'utf8' };
+  const parent = acceptLocalAction('repair-continuation');
+  const firstCall = openAndBind({
+    task: parent,
+    suffix: 'parent-invalid',
+    tool: SOURCE_TOOL,
+    args: firstArgs,
+    requirementId: 'read_leads',
+    withProposal: true,
+  });
+  const settled = settlements.commitLogicalCallSettlement({
+    identity: {
+      sessionId: parent.sessionId,
+      sourceUserSeq: parent.sourceUserSeq,
+      acceptedTaskId: parent.acceptedTaskId,
+      logicalToolCallId: firstCall,
+    },
+    contract: { toolName: SOURCE_TOOL, args: firstArgs },
+    execution: { kind: 'refused_pre_dispatch' },
+    outcome: outcomes.classifyAttemptOutcome({ argumentValidationFailed: true }),
+    recovery: { businessCall: true, mutating: false },
+    observer: { lane: 'agents_runner', turn: parent.turn },
+  });
+  assert.equal(settled.status, 'committed', JSON.stringify(settled));
+  eventlog.appendEvent({
+    sessionId: parent.sessionId,
+    turn: parent.turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: recoveryPresentation.REPAIR_ARGUMENTS_NEEDS_INPUT_TEXT,
+      source: 'argument_repair_recovery',
+      sourceUserSeq: parent.sourceUserSeq,
+    },
+  });
+  delivery.commitTurnOutcome({
+    version: 2,
+    id: `turn:${parent.sourceUserSeq}`,
+    identity: parent,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: {
+      kind: 'question',
+      text: recoveryPresentation.REPAIR_ARGUMENTS_NEEDS_INPUT_TEXT,
+    },
+  });
+
+  const answerText = 'Proceed.';
+  const answer = eventlog.appendEvent({
+    sessionId: parent.sessionId,
+    turn: parent.turn + 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: answerText },
+  });
+  const enriched = await continuityRuntime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId: parent.sessionId,
+    sourceUserSeq: answer.seq,
+    message: answerText,
+  }, answer.seq, { typedClassification: { disposition: 'affirmed' } });
+  assert.equal(enriched.taskContinuation?.parentSourceUserSeq, parent.sourceUserSeq);
+  assert.equal(enriched.taskContinuation?.disposition, 'affirmed');
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: {
+      sessionId: parent.sessionId,
+      sourceUserSeq: answer.seq,
+      turn: answer.turn,
+    },
+    verifiedTaskContinuation: enriched.taskContinuation,
+  }));
+  const activated = admissionModule.activateActionExpectedWork({
+    sessionId: parent.sessionId,
+    sourceUserSeq: answer.seq,
+    turn: answer.turn,
+  });
+  assert.ok(activated.status === 'activated' || activated.status === 'replayed', JSON.stringify(activated));
+  const child: LocalTask = {
+    sessionId: parent.sessionId,
+    sourceUserSeq: answer.seq,
+    turn: answer.turn,
+    acceptedTaskId: identities.acceptedTaskIdFor(parent.sessionId, answer.seq),
+    label: `${parent.label}-child`,
+  };
+
+  const identicalCall = `logical:${child.label}:identical`;
+  assert.equal(dispatch.admitLogicalCall({
+    identity: { ...child, logicalToolCallId: identicalCall },
+    tool: SOURCE_TOOL,
+    // Canonically identical despite a different object-key order: the
+    // cross-source invariant compares effective contracts, not JSON bytes or
+    // the child accepted-task salt.
+    args: { encoding: 'utf8', path: 'leads.json' },
+  }).status, 'inserted');
+  const identical = admissionModule.admitExpectedWorkInvocation({
+    sessionId: child.sessionId,
+    sourceUserSeq: child.sourceUserSeq,
+    logicalToolCallId: identicalCall,
+    proposal: proposal(),
+    requirementId: 'read_leads',
+    tool: SOURCE_TOOL,
+    args: { encoding: 'utf8', path: 'leads.json' },
+  });
+  assert.equal(identical.status, 'refused', JSON.stringify(identical));
+  if (identical.status === 'refused') {
+    assert.equal(identical.kind, 'work_attempt_budget_exhausted');
+    assert.match(identical.reason, /durable parent outcome requires corrected arguments/i);
+  }
+  const identicalCrossings = eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(child.sessionId, child.sourceUserSeq, identicalCall) as { n: number };
+  assert.equal(identicalCrossings.n, 0);
+
+  const changedArgs = { path: 'leads.ndjson', encoding: 'utf8' };
+  const changedCall = `logical:${child.label}:changed`;
+  assert.equal(dispatch.admitLogicalCall({
+    identity: { ...child, logicalToolCallId: changedCall },
+    tool: SOURCE_TOOL,
+    args: changedArgs,
+  }).status, 'inserted');
+  const changed = admissionModule.admitExpectedWorkInvocation({
+    sessionId: child.sessionId,
+    sourceUserSeq: child.sourceUserSeq,
+    logicalToolCallId: changedCall,
+    proposal: proposal(),
+    requirementId: 'read_leads',
+    tool: SOURCE_TOOL,
+    args: changedArgs,
+  });
+  assert.equal(changed.status, 'bound', JSON.stringify(changed));
 });

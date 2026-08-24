@@ -152,12 +152,12 @@ test('SMOKE: chat multi-item turn injects the fan-out directive into the real mo
   assert.equal(workersDelivered.size, N, 'fan-out coverage N/N');
 });
 
-test('SMOKE: single-item chat turn sends only the static line (no directive) — no-fire regression', async () => {
+test('SMOKE: single-item chat turn sends no parallelism lecture and no directive — no-fire regression', async () => {
   const { modelInputText } = await runTurnCapturingModelInput({
     kind: 'chat',
     input: 'Audit this law firm’s website and summarize the findings.',
   });
-  assert.match(modelInputText, /Parallelism reminder:/, 'single-item keeps the static line');
+  assert.doesNotMatch(modelInputText, /Parallelism reminder:/, 'single-item must not pay the static lecture');
   assert.ok(!/Fan-out directive/.test(modelInputText), 'single-item must NOT inject the directive');
 });
 
@@ -166,7 +166,7 @@ test('SMOKE: paginated one-table chat turn does NOT inject the directive — no-
     kind: 'chat',
     input: 'Pull the 200 rows from the leads table and show them to me.',
   });
-  assert.match(modelInputText, /Parallelism reminder:/);
+  assert.doesNotMatch(modelInputText, /Parallelism reminder:/);
   assert.ok(!/Fan-out directive/.test(modelInputText), 'paginated read must NOT fan out');
 });
 
@@ -201,10 +201,8 @@ test('the fan-out directive names the SAME recovery lane the read-fanout rail re
   const { fanoutDirectiveLine } = await import('./context-packet.js');
   const { buildFanoutRecoveryMessage } = await import('./tool-guardrail.js');
 
-  // Live 2026-08-07 (50-firm Arizona scrape): the directive said "call
-  // run_worker … do not collapse this into one aggregate program"; the rail
-  // then refused her reads demanding ONE run_tool_program. Two subsystems,
-  // opposite instructions, three wasted refusal rounds mid-run.
+  // Live 2026-08-07 (50-firm Arizona scrape): two subsystems prescribed
+  // incompatible recovery shapes, causing three wasted refusal rounds mid-run.
   const directive = fanoutDirectiveLine(
     { isMultiItem: true, itemCount: 50, itemKind: 'firms' } as never,
   );
@@ -216,7 +214,7 @@ test('the fan-out directive names the SAME recovery lane the read-fanout rail re
   } as never);
 
   // Whatever tool the refusal prescribes must already be offered by the directive.
-  for (const lane of ['run_tool_program', 'run_worker']) {
+  for (const lane of ['run_worker']) {
     if (refusal.includes(lane)) {
       assert.ok(
         directive.includes(lane),
@@ -227,7 +225,7 @@ test('the fan-out directive names the SAME recovery lane the read-fanout rail re
   // And the directive must never forbid the rail's own recovery.
   assert.doesNotMatch(directive, /do not collapse this into one aggregate program/i);
   // The discriminator itself is what makes the two agree: same-shape reads →
-  // one program; per-item multi-step work → workers.
+  // parallel direct calls; per-item multi-step work → workers.
   assert.match(directive, /SAME shape of read\/lookup/i);
   assert.match(directive, /multi-step work/i);
 });

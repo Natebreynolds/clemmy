@@ -14,7 +14,9 @@ export type ActivityKind = 'chat' | 'background' | 'workflow' | 'fanout';
 export type ActivityLiveness = 'live' | 'stale' | 'unknown';
 
 export interface ActivityEntry {
+  schemaVersion: number;
   runKey: string;
+  attemptId: string;
   kind: ActivityKind;
   lifecycle: string;
   /** Server-owned: lease truth, never "no event for N seconds". */
@@ -40,11 +42,39 @@ export interface ActivityEntry {
   planId?: string;
 }
 
-interface ActivityResponse {
+export interface ActivityResponse {
   schemaVersion: number;
   observedAt: string;
   entries?: ActivityEntry[];
   snapshots?: ActivityEntry[];
+}
+
+export type ForegroundActivityEntry = Pick<ActivityEntry,
+  | 'schemaVersion'
+  | 'runKey'
+  | 'attemptId'
+  | 'kind'
+  | 'lifecycle'
+  | 'liveness'
+  | 'needsAttention'
+  | 'headline'
+  | 'activity'
+  | 'progress'
+  | 'children'
+  | 'startedAt'
+  | 'lastEvidenceAt'
+  | 'revision'
+  | 'sessionId'
+  | 'taskId'
+  | 'runId'
+  | 'planId'
+>;
+
+interface ForegroundActivityResponse {
+  schemaVersion: number;
+  observedAt: string;
+  entries?: ForegroundActivityEntry[];
+  snapshots?: ForegroundActivityEntry[];
 }
 
 /**
@@ -53,8 +83,29 @@ interface ActivityResponse {
  * only once it has run long enough to be work the user may have left behind.
  */
 export async function listWorkingNow(): Promise<ActivityEntry[]> {
+  return (await listWorkingNowSnapshot()).entries;
+}
+
+export function workingNowSnapshotFromResponse(
+  body: ActivityResponse,
+): { observedAt: string; entries: ActivityEntry[] } {
+  return { observedAt: body.observedAt, entries: body.entries ?? body.snapshots ?? [] };
+}
+
+export async function listWorkingNowSnapshot(): Promise<{ observedAt: string; entries: ActivityEntry[] }> {
   const body = await apiGet<ActivityResponse>('/api/console/activity/v2?workingNow=1');
-  return body.entries ?? body.snapshots ?? [];
+  // The server projection is already bounded. Keep every returned row for the
+  // exact count while the drawer separately caps how many cards it renders.
+  return workingNowSnapshotFromResponse(body);
+}
+
+/** Compact chat transport: same durable membership, with the server's strict
+ * foreground whitelist instead of the operational Activity DTO. */
+export async function listForegroundWorkingNowSnapshot(): Promise<{ observedAt: string; entries: ForegroundActivityEntry[] }> {
+  const body = await apiGet<ForegroundActivityResponse>(
+    '/api/console/activity/v2?workingNow=1&surface=foreground-chat',
+  );
+  return { observedAt: body.observedAt, entries: body.entries ?? body.snapshots ?? [] };
 }
 
 /** The count line a row shows, when the server owns a real denominator. */

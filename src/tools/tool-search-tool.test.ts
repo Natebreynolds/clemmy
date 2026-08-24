@@ -245,3 +245,26 @@ test('one federated broker returns an authorized provider candidate with exact s
   assert.deepEqual((out.schemas.crm__mass_read as { required?: string[] }).required, ['query']);
   assert.match(out.hint, /work_call/);
 });
+
+test('TIERED RANKING: her own workflow_schedule outranks a third-party scheduler for the live query', async () => {
+  const { registerToolSearchTool } = await import('./tool-search-tool.js');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'rank-pin', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [{
+      search: async () => [
+        { name: 'APIFY_SCHEDULE_PUT', summary: 'Tool to update an existing schedule with new settings.', score: 0.95 },
+        { name: 'dataforseo__docs_index', summary: 'Fetch the DataForSEO API documentation index.', score: 0.9 },
+      ],
+    }],
+  } as never);
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+  const result = await handler({ query: 'update workflow schedule cron interval', limit: 8 });
+  const body = JSON.parse(result.content[0].text) as { results: Array<{ name: string }> };
+  const names = body.results.map((hit) => hit.name);
+  const own = names.indexOf('workflow_schedule');
+  const foreign = names.indexOf('APIFY_SCHEDULE_PUT');
+  assert.ok(own >= 0, `workflow_schedule missing from: ${names.join(', ')}`);
+  assert.ok(foreign === -1 || own < foreign,
+    'her own tool outranks the third-party scheduler (live 2026-08-19 session-fixture-tool-search)');
+});

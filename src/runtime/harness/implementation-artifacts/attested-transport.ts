@@ -6,6 +6,20 @@ export interface AttestedTransportCall {
   operationId: string;
   args: Record<string, unknown>;
   accountId: string;
+  /**
+   * Optional exact live identity sealed by a generic manifest-backed port.
+   * Legacy curated adapters predate this field. Open-ended carriers must send
+   * it so the transport can re-list/re-observe immediately before dispatch.
+   */
+  expected?: {
+    providerKind: string;
+    providerIdentity: string;
+    providerVersion: string;
+    operationVersion: string;
+    definitionFingerprint: string;
+    invokePortId: string;
+    argumentCompiler: { id: string; version: string };
+  };
 }
 
 export interface AttestedTransportObservation {

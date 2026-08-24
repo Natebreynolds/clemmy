@@ -50,6 +50,9 @@ const IMPORT_EXCEPTIONS: Record<string, string[]> = {
   // The compiler consumes the pure classifier seams — deterministic string
   // classifiers, not providers or IO.
   'turn-graph-compiler.ts': ['node:crypto', '../../assistant/project-shape.js', '../../assistant/external-effect-taxonomy.js', '../../assistant/message-intent.js', '../harness/multi-item-intent.js'],
+  // The accepted-goal compiler is the same deterministic string classifier
+  // the turn-graph compiler already uses. It does not call providers or IO.
+  'accepted-goal.ts': ['../../assistant/external-effect-taxonomy.js'],
 };
 
 const AMBIENT_FORBIDDEN = ['process.env', 'Date.now', 'Math.random', 'fetch('];
@@ -106,6 +109,14 @@ test('graph modules import only builtins, siblings, and listed exceptions', () =
         + 'If this import is genuinely lawful, list it in IMPORT_EXCEPTIONS with its reason.');
     }
   }
+});
+
+test('the compiler emits an admitted capability ref unchanged', () => {
+  const source = codeOnly(readFileSync(path.join(HERE, 'turn-graph-compiler.ts'), 'utf-8'));
+  assert.doesNotMatch(source, /capability-manifest-store|resolveCurrentSuccessorManifest|peekCapabilityManifestStore/,
+    'successor selection belongs to admission, not graph compile');
+  assert.match(source, /names:\s*\[operation\.capabilityRef\]/,
+    'the opaque capability ref admitted by the host was not emitted verbatim');
 });
 
 test('the exception list cannot rot silently', () => {

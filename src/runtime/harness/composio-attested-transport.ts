@@ -22,18 +22,21 @@
  *  - `reconcile` is conservative: an unproven recovery probe reports
  *    not-found, which fails toward admission, never toward a second invoke.
  */
-import { createHash } from 'node:crypto';
 import {
   bindAttestedTransport,
   peekAttestedTransport,
   type AttestedTransport,
 } from './implementation-artifacts/attested-transport.js';
-import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
+import {
+  getCachedToolSchema,
+  liveComposioOperationVersion,
+  liveComposioOutputSchema,
+} from '../../tools/composio-schema-cache.js';
+import {
+  COMPOSIO_PROVIDER_SURFACE_VERSION,
+  fingerprintComposioProviderDefinition,
+} from '../../integrations/composio/provider-definition-identity.js';
 import { isolatedTestContractActive } from './isolated-test-contract.js';
-
-function sha256(value: string): string {
-  return createHash('sha256').update(value, 'utf8').digest('hex');
-}
 
 /** Exported for pins: the transport itself, without binding it. */
 export function buildComposioAttestedTransport(): AttestedTransport {
@@ -43,22 +46,40 @@ export function buildComposioAttestedTransport(): AttestedTransport {
       // Deferred import: this module is reached from typed-runtime boot, and
       // the composio toolset imports broadly across the harness.
       const { resolveComposioDispatch } = await import('../../tools/composio-tools.js');
-      const { executeComposioTool } = await import('../../integrations/composio/client.js');
-      const resolved = await resolveComposioDispatch(operationId, { ...args }, undefined, {});
+      const { executePreparedComposioTool } = await import('../../integrations/composio/client.js');
+      const resolved = await resolveComposioDispatch(operationId, { ...args }, undefined, {
+        preparedExecution: true,
+      });
       if (!resolved.ok) {
         throw new Error(`${operationId} refused pre-dispatch (${resolved.reason}): ${resolved.message}`);
       }
-      return executeComposioTool(operationId, resolved.args, resolved.connectionId, resolved.identity);
+      if (!resolved.preparedDispatch) {
+        throw new Error(`${operationId} refused pre-dispatch: terminal one-shot preparation is absent`);
+      }
+      return executePreparedComposioTool(resolved.preparedDispatch);
     },
     observe({ operationId, accountId }) {
       const schema = getCachedToolSchema(operationId);
       if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return null;
+      const operationVersion = liveComposioOperationVersion(operationId);
+      const outputSchema = liveComposioOutputSchema(operationId);
+      if (!operationVersion || outputSchema === undefined) return null;
+      const invokePortId = `port:cap:resolved:${operationId.toLowerCase()}:${operationId}`;
+      const definitionFingerprint = fingerprintComposioProviderDefinition({
+        operationId,
+        operationVersion,
+        accountId,
+        invokePortId,
+        inputSchema: schema,
+        outputSchema,
+      });
+      if (!definitionFingerprint) return null;
       return {
         operationId,
         accountId,
-        definitionFingerprint: sha256(JSON.stringify(schema)),
-        providerVersion: 'composio-proof-v1',
-        operationVersion: '1',
+        definitionFingerprint,
+        providerVersion: COMPOSIO_PROVIDER_SURFACE_VERSION,
+        operationVersion,
         observedAt: Date.now(),
       };
     },

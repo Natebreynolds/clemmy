@@ -16,7 +16,7 @@
  * new dependencies; the child is supervised with bounded backoff and killed
  * on daemon shutdown.
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import os from 'node:os';
 import pino from 'pino';
 
@@ -52,6 +52,51 @@ export function bonjourArgs(opts: Pick<BonjourOptions, 'port' | 'fingerprint' | 
 const RESPAWN_BASE_MS = 2000;
 const RESPAWN_MAX_MS = 60_000;
 
+/**
+ * Kill advertisements left behind by daemons that are no longer running.
+ *
+ * `stop()` below reaps the child on a graceful shutdown, but a daemon that is
+ * SIGKILLed, crashes, or is restarted abruptly never reaches it — and mDNS
+ * registrations live in the child, so the orphan keeps advertising a
+ * fingerprint that no longer matches any running daemon. Measured on a
+ * development machine 2026-08-22: 220 orphaned advertisers publishing 17
+ * different fingerprints for one service.
+ *
+ * The discriminator is parentage, not the command line. An advertisement whose
+ * parent is init has outlived whoever spawned it; one with a live parent
+ * belongs to a running daemon and is left strictly alone, so a second
+ * Clementine on the same machine never has its service torn down.
+ */
+export function orphanedAdvertisementPids(psOutput: string, selfPid: number): number[] {
+  const pids: number[] = [];
+  for (const line of psOutput.split('\n')) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (!match) continue;
+    const [, pidText, ppidText, command] = match;
+    if (!command?.includes('dns-sd') || !command.includes(BONJOUR_SERVICE_TYPE)) continue;
+    if (Number(ppidText) !== 1) continue; // a live daemon still owns this one
+    const pid = Number(pidText);
+    if (!Number.isInteger(pid) || pid <= 1 || pid === selfPid) continue;
+    pids.push(pid);
+  }
+  return pids;
+}
+
+function reapOrphanedAdvertisements(): number {
+  let reaped = 0;
+  try {
+    const listing = spawnSync('ps', ['-eo', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 5_000 });
+    if (listing.status !== 0 || !listing.stdout) return 0;
+    for (const pid of orphanedAdvertisementPids(listing.stdout, process.pid)) {
+      try {
+        process.kill(pid, 'SIGTERM');
+        reaped += 1;
+      } catch { /* already gone, or not ours to signal */ }
+    }
+  } catch { /* reaping is hygiene, never a reason to fail to advertise */ }
+  return reaped;
+}
+
 export function startBonjourAdvertisement(opts: BonjourOptions): BonjourAdvertisement {
   const spawnImpl = opts.spawnImpl ?? spawn;
   let child: ChildProcess | null = null;
@@ -84,6 +129,13 @@ export function startBonjourAdvertisement(opts: BonjourOptions): BonjourAdvertis
     });
     backoffMs = RESPAWN_BASE_MS;
   };
+
+  // Only when this is managing real processes. A test that injects a fake
+  // spawn is not responsible for anything on the host's process table.
+  if (!opts.spawnImpl) {
+    const reaped = reapOrphanedAdvertisements();
+    if (reaped > 0) logger.info({ reaped }, 'reaped orphaned Bonjour advertisements from earlier daemons');
+  }
 
   start();
 

@@ -25,8 +25,17 @@ export interface DocumentedComposioOperationSemantic {
   consequence: DocumentedComposioConsequence;
   /** Present only when the operation creates the root deliverable itself. */
   rootArtifact?: {
-    kind: 'resource';
+    kind: 'resource' | 'google_doc';
     provider: string;
+  };
+  /**
+   * The provider documents this exact operation as one atomic
+   * input-to-created-content commit. This is deliberately narrower than
+   * `consequence: create`: most creates still owe an independent readback.
+   */
+  atomicInputContentCommit?: {
+    kind: 'googlesheets_sheet_from_json_content_v1';
+    evidence: readonly ['receipt', 'content_commit'];
   };
 }
 
@@ -56,6 +65,20 @@ const GOOGLE_SHEETS_SHEET_FROM_JSON = Object.freeze({
     kind: 'resource',
     provider: 'googlesheets',
   }),
+  atomicInputContentCommit: Object.freeze({
+    kind: 'googlesheets_sheet_from_json_content_v1',
+    evidence: Object.freeze(['receipt', 'content_commit'] as const),
+  }),
+} satisfies DocumentedComposioOperationSemantic);
+
+const GOOGLE_DOCS_CREATE_DOCUMENT_MARKDOWN = Object.freeze({
+  effect: 'write',
+  reversibility: 'reversible',
+  consequence: 'create',
+  rootArtifact: Object.freeze({
+    kind: 'google_doc',
+    provider: 'Google Docs',
+  }),
 } satisfies DocumentedComposioOperationSemantic);
 
 const DOCUMENTED_OPERATION_SEMANTICS: ReadonlyMap<string, DocumentedComposioOperationSemantic> = new Map<string, DocumentedComposioOperationSemantic>([
@@ -65,6 +88,7 @@ const DOCUMENTED_OPERATION_SEMANTICS: ReadonlyMap<string, DocumentedComposioOper
   // Composio has exposed both GOOGLE_SHEET and GOOGLE_SHEETS toolkit spellings.
   ['GOOGLESHEETSHEETFROMJSON', GOOGLE_SHEETS_SHEET_FROM_JSON],
   ['GOOGLESHEETSSHEETFROMJSON', GOOGLE_SHEETS_SHEET_FROM_JSON],
+  ['GOOGLEDOCSCREATEDOCUMENTMARKDOWN', GOOGLE_DOCS_CREATE_DOCUMENT_MARKDOWN],
 ]);
 
 function documentedOperationKey(action: string): string {
@@ -84,4 +108,20 @@ export function documentedComposioOperationSemantic(
 ): DocumentedComposioOperationSemantic | null {
   const key = documentedOperationKey(String(action ?? '').trim());
   return key ? DOCUMENTED_OPERATION_SEMANTICS.get(key) ?? null : null;
+}
+
+/**
+ * Exact opt-in for the one reviewed atomic-input create. Unlike the broader
+ * documented-operation lookup, this function intentionally accepts neither
+ * aliases nor suffix/name-shape inference: an adjacent create/update cannot
+ * borrow the content-commit contract.
+ */
+export function documentedAtomicInputContentCommit(
+  action: string | null | undefined,
+): NonNullable<DocumentedComposioOperationSemantic['atomicInputContentCommit']> | null {
+  // Durable call identity is case-normalized by the call kernel. Accept that
+  // byte-equivalent canonical spelling, but no toolkit alias, transport
+  // prefix, suffix, or token-shape approximation.
+  if (String(action ?? '').trim().toUpperCase() !== 'GOOGLESHEETS_SHEET_FROM_JSON') return null;
+  return GOOGLE_SHEETS_SHEET_FROM_JSON.atomicInputContentCommit;
 }

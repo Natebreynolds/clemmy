@@ -6,6 +6,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { Composio, ComposioToolNotFoundError } from '@composio/core';
@@ -20,11 +21,13 @@ import {
   executeComposioCliTool,
   getComposioCliStatus,
   invalidateComposioCliStatusCache,
+  peekCurrentComposioCliStatus,
   searchComposioCliTools,
   type ComposioCliStatus,
 } from './cli.js';
 import { composioSlugIsReadOnly } from './slug-effect.js';
 import { aliasLabelFor } from '../../memory/account-alias-store.js';
+import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 
 const ENV_FILE = path.join(BASE_DIR, '.env');
 const CACHE_DIR = path.join(BASE_DIR, 'state');
@@ -144,6 +147,36 @@ export interface ComposioToolkitTool {
   description?: string;
   toolkitSlug?: string;
   inputParameters?: unknown;
+  /** Exact provider result payload schema from the same definition row as
+   * inputParameters. This describes `execute(...).data`, never Clementine's
+   * outer `{successful,data,error}` envelope. */
+  outputParameters?: unknown;
+  /** Exact operation version returned with this provider definition. */
+  version?: string;
+}
+
+/** The live discovery boundary is deliberately smaller than the foreground
+ * result surface. One server-side query may oversample for ranking/dedupe, but
+ * it never enumerates a toolkit page. */
+export const COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT = 16;
+export const COMPOSIO_LIVE_SEARCH_RETURN_LIMIT = 8;
+
+export class ComposioSearchProviderContractError extends Error {
+  readonly code = 'composio_search_provider_contract_refused' as const;
+
+  constructor() {
+    super(`Composio filtered search exceeded the ${COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT}-definition provider contract.`);
+    this.name = 'ComposioSearchProviderContractError';
+  }
+}
+
+export class ComposioExactToolProviderContractError extends Error {
+  readonly code = 'composio_exact_tool_provider_contract_refused' as const;
+
+  constructor() {
+    super('Composio exact-tool metadata lookup returned more than one definition.');
+    this.name = 'ComposioExactToolProviderContractError';
+  }
 }
 
 function normalizeSuppression(value: unknown): ComposioConnectionSuppression | undefined {
@@ -332,6 +365,13 @@ const toolSchemaObservedAt = new WeakMap<object, number>();
 export function composioToolSchemaObservedAt(tool: ComposioToolkitTool): number | undefined {
   return tool && typeof tool === 'object' ? toolSchemaObservedAt.get(tool) : undefined;
 }
+
+export function composioToolOperationVersion(tool: ComposioToolkitTool): string | undefined {
+  const version = tool && typeof tool === 'object' ? tool.version?.trim() : '';
+  return version && version.length <= 160 && /^[A-Za-z0-9_.:-]+$/.test(version)
+    ? version
+    : undefined;
+}
 /** Clear the per-toolkit tool-list cache. Exported for tests + connection busts. */
 export function bustToolkitToolsCache(): void {
   toolkitToolsCache.clear();
@@ -467,7 +507,7 @@ export class ComposioDispatchUncertainError extends Error {
  * mutation committed; it cannot become an instance created by this process
  * before dispatch. */
 export class ComposioPreDispatchError extends ExternalWritePreDispatchError {
-  readonly reason: 'cli-unavailable' | 'cli-auth' | 'sdk-unavailable' | 'tool-not-found' | 'connection-ambiguous';
+  readonly reason: 'cli-unavailable' | 'cli-auth' | 'sdk-unavailable' | 'tool-not-found' | 'connection-ambiguous' | 'preparation-required';
 
   constructor(
     reason: ComposioPreDispatchError['reason'],
@@ -547,13 +587,16 @@ export function getComposio(): Composio | null {
       // deterministic fetch/abort accounting harder, and is unnecessary for a
       // user-controlled local agent.
       allowTracking: false,
+      // The SDK otherwise starts an unawaited NPM-registry version check during
+      // construction. Provider clients must never create an unowned crossing.
+      disableVersionCheck: true,
       dangerouslyAllowAutoUploadDownloadFiles: true,
       fileDownloadDir: filesDir,
       fileUploadDirs: [filesDir, os.homedir()],
       // sensitiveFileUploadProtection stays default ON.
     });
   } else {
-    singleton = new Composio({ apiKey, allowTracking: false });
+    singleton = new Composio({ apiKey, allowTracking: false, disableVersionCheck: true });
   }
   installAbortAwareFetch(singleton);
   return singleton;
@@ -664,6 +707,13 @@ function composioCliOptions(): { apiKey?: string; userId?: string } {
     ...(apiKey ? { apiKey } : {}),
     ...(userId ? { userId } : {}),
   };
+}
+
+/** Completed CLI readiness for a business dispatch. This is deliberately a
+ * synchronous peek: preparing/executing a call may never start `--version` or
+ * `whoami` inside the business logical call. */
+export function peekCurrentComposioCliExecutionStatus(): ComposioCliStatus | null {
+  return peekCurrentComposioCliStatus(composioCliOptions());
 }
 
 async function getComposioRuntimeStatusLive(): Promise<ReturnType<typeof getComposioCredentialStatus> & {
@@ -1058,6 +1108,11 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
         data,
       };
       lastGoodConnections = data;
+      // Connection publication stays metadata-only. Starting an unawaited
+      // 200-definition enumeration here still competes with the foreground
+      // role search (and can outlive its turn); the bounded live search owns
+      // cold discovery. Offline maintenance may call the explicit index
+      // reconciler, but a connection read never starts catalog fan-out.
       return data;
   })().finally(() => {
     if (connectionsInflight?.promise === promise) connectionsInflight = null;
@@ -1108,6 +1163,51 @@ export async function listUsableConnectedToolkits(
     await listConnectedToolkits(options),
     readComposioConnectionSuppressionState(),
   );
+}
+
+export type SelectedComposioConnectionRevalidation =
+  | { ok: true }
+  | {
+      ok: false;
+      identifier: string;
+      reason: 'missing_or_changed' | 'inactive_or_suppressed';
+    };
+
+/**
+ * One strict live account snapshot for the selected definition set. This does
+ * not serve last-good/cache state: executable authority must still point at
+ * the same active, unsuppressed connection id staged during discovery.
+ */
+export async function revalidateSelectedComposioConnections(
+  selections: readonly { identifier: string; connectionId: string }[],
+): Promise<SelectedComposioConnectionRevalidation> {
+  if (selections.length === 0) return { ok: true };
+  const fresh = await refreshConnectedToolkits();
+  const usable = filterSuppressedConnectedToolkits(
+    fresh,
+    readComposioConnectionSuppressionState(),
+  );
+  for (const selection of selections) {
+    const identifier = selection.identifier.trim();
+    const connectionId = selection.connectionId.trim();
+    const current = fresh.find((connection) => connection.connectionId === connectionId);
+    if (
+      !identifier
+      || !connectionId
+      || connectionId === 'runtime'
+      || !current
+      || !toolMatchesConnection(identifier.toLowerCase(), current.slug.trim().toLowerCase())
+    ) {
+      return { ok: false, identifier, reason: 'missing_or_changed' };
+    }
+    if (
+      !usable.some((connection) => connection.connectionId === connectionId)
+      || !/^(?:active|enabled)$/i.test(current.status.trim())
+    ) {
+      return { ok: false, identifier, reason: 'inactive_or_suppressed' };
+    }
+  }
+  return { ok: true };
 }
 
 export async function listSuppressedConnectedToolkits(): Promise<Array<ConnectedToolkit & { suppression: ComposioConnectionSuppression }>> {
@@ -1901,6 +2001,39 @@ async function getComposioToolBySlugViaCli(wanted: string): Promise<ComposioTool
 }
 
 /**
+ * Re-read one selected action through an exact provider filter. Unlike the
+ * compatibility getter below, this final authority check never falls back to
+ * a toolkit listing: a missing, renamed, ambiguous, or unsupported exact
+ * response is a refusal, not permission to enumerate hundreds of definitions.
+ */
+export async function getExactComposioToolBySlug(slug: string): Promise<ComposioToolkitTool | null> {
+  if (!slug) return null;
+  const wanted = slug.toUpperCase();
+  if (normalizedComposioActionSlug(wanted) !== wanted) return null;
+  const composio = getComposio() as any;
+  if (!composio) return getComposioToolBySlugViaCli(wanted);
+
+  const observedAt = Date.now();
+  const raw = await composio.tools.getRawComposioTools({ tools: [wanted], limit: 1 });
+  const list = Array.isArray(raw)
+    ? raw
+    : (Array.isArray(raw?.items) ? raw.items : []);
+  if (list.length > 1) throw new ComposioExactToolProviderContractError();
+  const item = list[0];
+  if (!item || String(item.slug ?? '').toUpperCase() !== wanted) return null;
+    const tool = {
+      slug: item.slug,
+      name: item.name ?? item.slug,
+      description: item.description ?? '',
+      inputParameters: item.inputParameters ?? item.input_parameters,
+      outputParameters: item.outputParameters ?? item.output_parameters,
+      version: str(item.version),
+    } as ComposioToolkitTool;
+  toolSchemaObservedAt.set(tool, observedAt);
+  return tool;
+}
+
+/**
  * Fetch ONE tool's raw definition by exact slug. The per-toolkit listing is
  * capped and large toolkits (Outlook alone clears 200 actions) can miss the
  * one slug a settlement needs to bind its contract to — the exact-slug filter
@@ -1924,7 +2057,14 @@ export async function getComposioToolBySlug(slug: string): Promise<ComposioToolk
     const list = Array.isArray(raw) ? raw : (raw?.items ?? []);
     for (const item of list) {
       if (String(item?.slug ?? '').toUpperCase() === wanted) {
-        const tool = { slug: item.slug, name: item.name ?? item.slug, description: item.description ?? '', inputParameters: item.inputParameters ?? item.input_parameters } as ComposioToolkitTool;
+        const tool = {
+          slug: item.slug,
+          name: item.name ?? item.slug,
+          description: item.description ?? '',
+          inputParameters: item.inputParameters ?? item.input_parameters,
+          outputParameters: item.outputParameters ?? item.output_parameters,
+          version: str(item.version),
+        } as ComposioToolkitTool;
         toolSchemaObservedAt.set(tool, observedAt);
         return tool;
       }
@@ -1977,6 +2117,8 @@ export async function listComposioToolkitTools(
         description: str(item.description),
         toolkitSlug: str(toolkit.slug) ?? slug,
         inputParameters: item.inputParameters ?? item.input_parameters ?? item.parameters,
+        outputParameters: item.outputParameters ?? item.output_parameters,
+        version: str(item.version),
       };
       toolSchemaObservedAt.set(tool, observedAt);
       tools.push(tool);
@@ -2033,6 +2175,94 @@ export async function listComposioToolkitTools(
 }
 
 /**
+ * Search the installed SDK's live catalog across only the user's connected
+ * toolkits. This is the cold-path counterpart to the advisory local index:
+ * the provider performs the text filter, Clementine bounds/filter/dedupes the
+ * returned definitions, and there is deliberately no unfiltered list fallback.
+ *
+ * The returned rows are exact provider definitions observed by this request.
+ * Plan admission still re-reads the model-selected definitions before it mints
+ * executable authority, so discovery metadata can never become a stale invoke
+ * port by itself.
+ */
+export async function searchConnectedComposioTools(
+  toolkitSlugs: readonly string[],
+  query: string,
+  limit = COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT,
+): Promise<ComposioToolkitTool[]> {
+  const normalizedQuery = query.replace(/\s+/g, ' ').trim();
+  if (!normalizedQuery) return [];
+  const connected = [...new Set(toolkitSlugs
+    .map((slug) => slug.trim().toLowerCase())
+    .filter(Boolean))]
+    .sort();
+  if (connected.length === 0) return [];
+  const composio = getComposio() as any;
+  if (!composio?.tools?.getRawComposioTools) return [];
+
+  const requestedLimit = Number.isFinite(limit) ? Math.trunc(limit) : 1;
+  const returnLimit = Math.max(1, Math.min(
+    requestedLimit,
+    COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT,
+  ));
+  const observedAt = Date.now();
+  const raw = await composio.tools.getRawComposioTools({
+    toolkits: connected,
+    search: normalizedQuery,
+    limit: COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT,
+  } as never);
+  const items = Array.isArray(raw)
+    ? raw
+    : (Array.isArray((raw as { items?: unknown[] } | null)?.items)
+        ? (raw as { items: unknown[] }).items
+        : []);
+  if (items.length > COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT) {
+    throw new ComposioSearchProviderContractError();
+  }
+  const connectedSet = new Set(connected);
+  const seen = new Set<string>();
+  const out: ComposioToolkitTool[] = [];
+
+  for (const value of items) {
+    const item = obj(value);
+    const slug = str(item.slug)?.trim();
+    if (!slug) continue;
+    const toolkit = obj(item.toolkit);
+    let toolkitSlug = (
+      str(toolkit.slug)
+      ?? str(item.toolkitSlug)
+      ?? str(item.toolkit_slug)
+      ?? ''
+    ).trim().toLowerCase();
+    if (!toolkitSlug) {
+      const upperSlug = slug.toUpperCase();
+      toolkitSlug = connected
+        .filter((candidate) => upperSlug.startsWith(`${candidate.toUpperCase()}_`))
+        .sort((left, right) => right.length - left.length)[0] ?? '';
+    }
+    if (!connectedSet.has(toolkitSlug)) continue;
+    const identity = slug.toUpperCase();
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    const tool: ComposioToolkitTool = {
+      slug,
+      name: str(item.name) ?? slug,
+      description: str(item.description),
+      toolkitSlug,
+      inputParameters: item.inputParameters
+        ?? item.input_parameters
+        ?? item.parameters,
+      outputParameters: item.outputParameters ?? item.output_parameters,
+      version: str(item.version),
+    };
+    toolSchemaObservedAt.set(tool, observedAt);
+    out.push(tool);
+    if (out.length >= returnLimit) break;
+  }
+  return out;
+}
+
+/**
  * Resolve a tool's OWN version via a direct version-free v3 retrieve.
  *
  * Curated Composio actions (e.g. OUTLOOK_OUTLOOK_SEND_EMAIL) live in the
@@ -2077,6 +2307,418 @@ export async function resolveComposioToolVersion(slug: string): Promise<string |
   } catch {
     return undefined;
   }
+}
+
+/** Opaque, process-local preparation for exactly one provider crossing. The
+ * model/tool payload cannot mint one; only the provider adapter's synchronous
+ * current-state preflight can. */
+export interface PreparedComposioOneShotDispatch {
+  readonly __preparedComposioOneShotDispatch: unique symbol;
+}
+
+/** Opaque preparation for one raw `/files/upload/request` POST. This lane is
+ * SDK-only: a CLI subprocess cannot prove its internal network cardinality. */
+export interface PreparedComposioPresignOneShot {
+  readonly __preparedComposioPresignOneShot: unique symbol;
+}
+
+interface PreparedComposioOneShotState {
+  lane: 'sdk' | 'cli';
+  toolSlug: string;
+  args: Record<string, unknown>;
+  connectedAccountId?: string;
+  userId: string;
+  providerOperationVersion?: string;
+  cliOptions?: { apiKey?: string; userId?: string };
+  rawClient?: {
+    tools?: {
+      execute?: (
+        slug: string,
+        body: Record<string, unknown>,
+        options?: { signal?: AbortSignal },
+      ) => Promise<unknown>;
+    };
+  };
+}
+
+const preparedComposioOneShots = new WeakMap<object, PreparedComposioOneShotState>();
+
+interface PreparedComposioPresignOneShotState {
+  args: Readonly<{
+    filename: string;
+    mimetype: string;
+    md5: string;
+    tool_slug: string;
+    toolkit_slug: string;
+  }>;
+  rawClient: {
+    files: {
+      createPresignedURL: (
+        body: Record<string, unknown>,
+        options?: { signal?: AbortSignal },
+      ) => Promise<unknown>;
+    };
+  };
+}
+
+const preparedComposioPresignOneShots = new WeakMap<object, PreparedComposioPresignOneShotState>();
+
+export interface PreparedComposioOneShotIdentity {
+  lane: 'sdk' | 'cli';
+  toolSlug: string;
+  providerArgumentDigest: string;
+  connectedAccountId: string | null;
+  providerOperationVersion: string | null;
+}
+
+export interface PreparedComposioPresignOneShotIdentity {
+  providerArgumentDigest: string;
+  toolSlug: string;
+  toolkitSlug: string;
+}
+
+function preparedProviderArgumentDigest(args: Record<string, unknown>): string {
+  return createHash('sha256').update(closedCanonicalJson(args, {
+    maxDepth: 96,
+    maxNodes: 500_000,
+    maxStringBytes: 32 * 1024 * 1024,
+    maxTotalBytes: 32 * 1024 * 1024,
+  })).digest('hex');
+}
+
+/** Copy-safe identity for binding an opaque one-shot to a separate execution
+ * authority. Provider arguments and credentials never leave this module. */
+export function inspectPreparedComposioOneShotDispatch(
+  prepared: PreparedComposioOneShotDispatch,
+): Readonly<PreparedComposioOneShotIdentity> | null {
+  const state = preparedComposioOneShots.get(prepared as object);
+  if (!state) return null;
+  let providerArgumentDigest: string;
+  try {
+    providerArgumentDigest = preparedProviderArgumentDigest(state.args);
+  } catch {
+    return null;
+  }
+  return Object.freeze({
+    lane: state.lane,
+    toolSlug: state.toolSlug,
+    providerArgumentDigest,
+    connectedAccountId: state.connectedAccountId ?? null,
+    providerOperationVersion: state.providerOperationVersion ?? null,
+  });
+}
+
+/** Copy-safe identity; filename and content digests remain behind the token. */
+export function inspectPreparedComposioPresignOneShot(
+  prepared: PreparedComposioPresignOneShot,
+): Readonly<PreparedComposioPresignOneShotIdentity> | null {
+  const state = preparedComposioPresignOneShots.get(prepared as object);
+  if (!state) return null;
+  try {
+    return Object.freeze({
+      providerArgumentDigest: preparedProviderArgumentDigest(state.args),
+      toolSlug: state.args.tool_slug,
+      toolkitSlug: state.args.toolkit_slug,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function normalizePreparedConnectionId(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized && !/^(?:null|undefined|none)$/i.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+function exactPreparedOperationVersion(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized && normalized.length <= 160 && /^[A-Za-z0-9_.:-]+$/.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+/** Pure/current preparation for the terminal adapter. It starts no provider
+ * work: CLI readiness and connected-account ownership must already be cached,
+ * and SDK construction has telemetry/version checks disabled. */
+export function prepareComposioOneShotDispatch(input: {
+  toolSlug: string;
+  args: Record<string, unknown>;
+  connectedAccountId?: string;
+  providerOperationVersion?: string;
+}): PreparedComposioOneShotDispatch {
+  const toolSlug = input.toolSlug.trim();
+  if (!toolSlug) {
+    throw new ComposioPreDispatchError('preparation-required', 'Composio operation identity is not prepared.');
+  }
+  let args: Record<string, unknown>;
+  try {
+    args = structuredClone(input.args);
+  } catch (cause) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      `${toolSlug} arguments could not be frozen before dispatch.`,
+      cause,
+    );
+  }
+
+  const credentials = getComposioCredentialStatus();
+  const connectedAccountId = normalizePreparedConnectionId(input.connectedAccountId);
+  let state: PreparedComposioOneShotState;
+  if (composioExecutionUsesCliOnlyLane(credentials)) {
+    if (connectedAccountId) {
+      throw new ComposioPreDispatchError(
+        'preparation-required',
+        `${toolSlug} selected a connected account that the CLI lane cannot address.`,
+      );
+    }
+    const cliOptions = { ...composioCliOptions(), userId: credentials.userId };
+    const cli = peekCurrentComposioCliStatus(cliOptions);
+    if (!cli) {
+      throw new ComposioPreDispatchError(
+        'preparation-required',
+        `${toolSlug} has no completed current Composio CLI status observation.`,
+      );
+    }
+    if (!cli.installed || !cli.authenticated) {
+      throw new ComposioPreDispatchError(
+        cli.installed ? 'cli-auth' : 'cli-unavailable',
+        cli.installed
+          ? 'The prepared Composio CLI session is not authenticated.'
+          : 'The prepared Composio CLI binary is unavailable.',
+      );
+    }
+    state = {
+      lane: 'cli',
+      toolSlug,
+      args,
+      userId: credentials.userId,
+      cliOptions,
+    };
+  } else {
+    const providerOperationVersion = exactPreparedOperationVersion(input.providerOperationVersion);
+    if (!providerOperationVersion) {
+      throw new ComposioPreDispatchError(
+        'preparation-required',
+        `${toolSlug} has no exact current provider operation version.`,
+      );
+    }
+    const snapshot = peekCurrentConnectedToolkits();
+    let userId = credentials.userId;
+    if (connectedAccountId) {
+      if (!snapshot) {
+        throw new ComposioPreDispatchError(
+          'preparation-required',
+          `${toolSlug} has no current connected-account observation.`,
+        );
+      }
+      const connection = snapshot.find((row) => row.connectionId === connectedAccountId);
+      if (!connection || !/active|enabled|initiat/i.test(connection.status ?? '')) {
+        throw new ComposioPreDispatchError(
+          'preparation-required',
+          `${toolSlug} connected account ${connectedAccountId} is not current and usable.`,
+        );
+      }
+      const owner = connection.ownerUserId ?? cachedConnectionOwner(connectedAccountId);
+      if (!owner?.trim()) {
+        throw new ComposioPreDispatchError(
+          'preparation-required',
+          `${toolSlug} connected account ${connectedAccountId} has no prepared owning provider identity.`,
+        );
+      }
+      userId = owner.trim();
+    }
+    const composio = getComposio();
+    if (!composio) {
+      throw new ComposioPreDispatchError('sdk-unavailable', 'COMPOSIO_API_KEY is not configured.');
+    }
+    const raw = rawComposioClient(composio);
+    const rawNoRetry = raw && typeof raw.withOptions === 'function'
+      ? raw.withOptions({ maxRetries: 0 })
+      : null;
+    if (!rawNoRetry || typeof rawNoRetry.tools?.execute !== 'function') {
+      throw new ComposioPreDispatchError(
+        'preparation-required',
+        `${toolSlug} has no exact one-request Composio transport.`,
+      );
+    }
+    state = {
+      lane: 'sdk',
+      toolSlug,
+      args,
+      connectedAccountId,
+      userId,
+      providerOperationVersion,
+      rawClient: rawNoRetry,
+    };
+  }
+
+  const prepared = Object.freeze(Object.create(null)) as PreparedComposioOneShotDispatch;
+  preparedComposioOneShots.set(prepared, state);
+  return prepared;
+}
+
+function exactPresignPreparationArgs(
+  input: Record<string, unknown>,
+): PreparedComposioPresignOneShotState['args'] | null {
+  const filename = input.filename;
+  const mimetype = input.mimetype;
+  const md5 = input.md5;
+  const toolSlug = input.tool_slug;
+  const toolkitSlug = input.toolkit_slug;
+  if (
+    Object.keys(input).sort().join('\0') !== ['filename', 'md5', 'mimetype', 'tool_slug', 'toolkit_slug'].sort().join('\0')
+    || typeof filename !== 'string'
+    || filename.length < 1
+    || filename.length > 255
+    || filename !== filename.trim()
+    || /[\\/\u0000-\u001f\u007f]/.test(filename)
+    || filename === '.'
+    || filename === '..'
+    || typeof mimetype !== 'string'
+    || mimetype.length < 1
+    || mimetype.length > 512
+    || mimetype !== mimetype.trim()
+    || /[\u0000-\u001f\u007f]/.test(mimetype)
+    || typeof md5 !== 'string'
+    || !/^[a-f0-9]{32}$/.test(md5)
+    || typeof toolSlug !== 'string'
+    || toolSlug.length < 1
+    || toolSlug.length > 512
+    || !/^[A-Za-z0-9_.:-]+$/.test(toolSlug)
+    || typeof toolkitSlug !== 'string'
+    || toolkitSlug.length < 1
+    || toolkitSlug.length > 160
+    || !/^[a-z0-9_-]+$/.test(toolkitSlug)
+  ) return null;
+  return Object.freeze({
+    filename,
+    mimetype,
+    md5,
+    tool_slug: toolSlug,
+    toolkit_slug: toolkitSlug,
+  });
+}
+
+/** Pure/current preparation for one no-retry presign POST. */
+export function prepareComposioPresignOneShot(input: {
+  args: Record<string, unknown>;
+}): PreparedComposioPresignOneShot {
+  let cloned: Record<string, unknown>;
+  try {
+    cloned = structuredClone(input.args);
+  } catch (cause) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      'Composio presign arguments could not be frozen before dispatch.',
+      cause,
+    );
+  }
+  const args = exactPresignPreparationArgs(cloned);
+  if (!args) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      'Composio presign arguments are not exact.',
+    );
+  }
+  const credentials = getComposioCredentialStatus();
+  if (composioExecutionUsesCliOnlyLane(credentials)) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      'Staged Composio file transfer requires the exact SDK transport.',
+    );
+  }
+  const composio = getComposio();
+  if (!composio) {
+    throw new ComposioPreDispatchError('sdk-unavailable', 'COMPOSIO_API_KEY is not configured.');
+  }
+  const raw = rawComposioClient(composio);
+  const rawNoRetry = raw && typeof raw.withOptions === 'function'
+    ? raw.withOptions({ maxRetries: 0 })
+    : null;
+  if (!rawNoRetry || typeof rawNoRetry.files?.createPresignedURL !== 'function') {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      'Composio has no exact one-request staged-file presign transport.',
+    );
+  }
+  const prepared = Object.freeze(Object.create(null)) as PreparedComposioPresignOneShot;
+  preparedComposioPresignOneShots.set(prepared, {
+    args,
+    rawClient: rawNoRetry as PreparedComposioPresignOneShotState['rawClient'],
+  });
+  return prepared;
+}
+
+/** One `/api/v3.1/files/upload/request` POST, no SDK retry or modifier. */
+export async function executePreparedComposioPresign(
+  prepared: PreparedComposioPresignOneShot,
+): Promise<unknown> {
+  const state = preparedComposioPresignOneShots.get(prepared as object);
+  if (!state) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      'Composio staged-file presign requires an opaque prepared one-shot.',
+    );
+  }
+  preparedComposioPresignOneShots.delete(prepared as object);
+  const signal = currentToolAbortSignal();
+  return state.rawClient.files.createPresignedURL(
+    { ...state.args },
+    signal ? { signal } : undefined,
+  );
+}
+
+/** The terminal body: one CLI execute subprocess OR one no-retry v3.1 POST.
+ * It performs no schema lookup, account listing, reconnect, version fetch,
+ * fallback, upload/download modifier, or retry. */
+export async function executePreparedComposioTool(
+  prepared: PreparedComposioOneShotDispatch,
+): Promise<unknown> {
+  const state = preparedComposioOneShots.get(prepared);
+  if (!state) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      'Composio terminal dispatch requires an opaque prepared one-shot.',
+    );
+  }
+  // One-shot ownership: consume before entering the terminal body so neither a
+  // returned failure nor a throw can reuse the same preparation.
+  preparedComposioOneShots.delete(prepared);
+  if (state.lane === 'cli') {
+    return executeComposioCliTool(state.toolSlug, state.args, state.cliOptions);
+  }
+  const execute = state.rawClient?.tools?.execute;
+  if (!execute || !state.providerOperationVersion) {
+    throw new ComposioPreDispatchError('preparation-required', 'Prepared Composio SDK transport was lost.');
+  }
+  const body: Record<string, unknown> = {
+    arguments: state.args,
+    user_id: state.userId,
+    version: state.providerOperationVersion,
+    ...(state.connectedAccountId
+      ? { connected_account_id: state.connectedAccountId }
+      : {}),
+  };
+  const signal = currentToolAbortSignal();
+  const raw = await execute.call(
+    state.rawClient!.tools,
+    state.toolSlug,
+    body,
+    signal ? { signal } : undefined,
+  ) as Record<string, unknown>;
+  return {
+    data: raw?.data,
+    error: raw?.error ?? null,
+    successful: raw?.successful === true,
+    ...(raw?.log_id !== undefined || raw?.logId !== undefined
+      ? { logId: raw.log_id ?? raw.logId }
+      : {}),
+    ...(raw?.session_info !== undefined || raw?.sessionInfo !== undefined
+      ? { sessionInfo: raw.session_info ?? raw.sessionInfo }
+      : {}),
+  };
 }
 
 export async function executeComposioTool(
@@ -2623,4 +3265,20 @@ export const __test__ = {
  */
 export function peekConnectedToolkits(): ConnectedToolkit[] {
   return connectionsCache?.data ?? lastGoodConnections ?? [];
+}
+
+/**
+ * Synchronous execution-preparation view of the connection registry.
+ *
+ * Unlike `peekConnectedToolkits()`, this never falls back to an arbitrarily old
+ * last-good snapshot. `null` means no current provider observation is prepared;
+ * an empty array means a current observation proved there are no connections.
+ * Provider adapters use this after planning/discovery so resolving a business
+ * call cannot start a hidden account-list request before its physical attempt.
+ */
+export function peekCurrentConnectedToolkits(nowMs = Date.now()): ConnectedToolkit[] | null {
+  if (!connectionsCache) return null;
+  const age = nowMs - connectionsCache.at;
+  if (!Number.isFinite(age) || age < 0 || age >= CONNECTIONS_TTL_MS) return null;
+  return connectionsCache.data;
 }

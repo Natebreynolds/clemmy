@@ -223,6 +223,72 @@ test('collapseOldCompletedToolPairs — skips old pairs that are not recallable 
   assert.equal(remainingCallIds.has('call_1'), true, 'unrecallable old pair should stay verbatim');
 });
 
+test('compactInFlightToolContext — deduplicates identical results below the pressure threshold without losing recall ids', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const payload = `stable-result::${'r'.repeat(700)}`;
+  const items: AgentInputItem[] = [userMessage('read twelve stable partitions')];
+  const callIds: string[] = [];
+  for (let index = 0; index < 12; index += 1) {
+    const callId = `stable_${index + 1}`;
+    callIds.push(callId);
+    items.push(toolCall(callId, 'partition.read', JSON.stringify({ partition: index + 1 })));
+    items.push(toolResult(callId, payload));
+    writeToolOutput({ sessionId: sess.id, callId, tool: 'partition.read', output: payload });
+  }
+
+  const compacted = compactInFlightToolContext(items, sess.id);
+  const visible = JSON.stringify(compacted.nextItems);
+  assert.equal(compacted.applied, true);
+  assert.equal(visible.split(payload).length - 1, 1, 'one canonical raw result stays visible');
+  assert.equal((visible.match(/recall_tool_result/g) ?? []).length, 11);
+  assert.ok(callIds.every((callId) => visible.includes(callId)), 'every duplicate keeps an addressable call id');
+  assert.ok(callIds.every((callId) => getToolOutput(sess.id, callId)?.output === payload));
+});
+
+test('compactInFlightToolContext — equal visible stubs never deduplicate distinct durable raw outputs', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const visibleStub = '[clipped: partition.read — exact output remains recallable]';
+  const items: AgentInputItem[] = [];
+  for (let index = 0; index < 3; index += 1) {
+    const callId = `distinct_${index + 1}`;
+    items.push(toolCall(callId, 'partition.read', JSON.stringify({ partition: index + 1 })));
+    items.push(toolResult(callId, visibleStub));
+    writeToolOutput({
+      sessionId: sess.id,
+      callId,
+      tool: 'partition.read',
+      output: `different-raw-${index + 1}::${String.fromCharCode(65 + index).repeat(900)}`,
+    });
+  }
+
+  const compacted = compactInFlightToolContext(items, sess.id);
+  assert.equal(compacted.applied, false);
+  assert.equal(compacted.nextItems, items);
+});
+
+test('collapseOldCompletedToolPairs — reserves a complete call-id index even when detail prose hits its cap', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const items: AgentInputItem[] = [];
+  const collapsedIds: string[] = [];
+  for (let index = 0; index < 84; index += 1) {
+    const callId = `indexed_${String(index + 1).padStart(2, '0')}`;
+    collapsedIds.push(callId);
+    const output = `unique-${index}::${String.fromCharCode(65 + (index % 26)).repeat(900)}`;
+    items.push(toolCall(callId, 'evidence.read', JSON.stringify({ index })));
+    items.push(toolResult(callId, output));
+    writeToolOutput({ sessionId: sess.id, callId, tool: 'evidence.read', output });
+  }
+
+  const collapsed = collapseOldCompletedToolPairs(items, 1, sess.id);
+  const visible = JSON.stringify(collapsed.nextItems);
+  assert.equal(collapsed.collapsed, 83);
+  assert.ok(collapsedIds.slice(0, -1).every((callId) => visible.includes(callId)));
+  assert.match(visible, /complete collapsed call-id index JSON/);
+});
+
 test('compactInFlightToolContext — bounds same-turn results without mutating durable history', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
@@ -623,4 +689,62 @@ test('capSummarizerInput: the Layer-2 summarizer can never be fed more than its 
 
   const small = 'short history';
   assert.equal(capSummarizerInput(small, 'gpt-5.4'), small, 'under-budget input passes through byte-identical');
+});
+
+// REGRESSION PIN (live 2026-08-24, mobile canary seq 71391): two concurrent
+// tool_search calls returned byte-identical bytes, duplicate-collapse fired,
+// and the NEXT model step died with
+//   run_failed: conversation protocol assertion failed at codex.responses
+// even though both calls had crossed and settled cleanly. Cause: the collapse
+// summary was inserted where the first collapsed item stood. In a PARALLEL
+// frame (call, call, result, result) that position splits a still-open pair,
+// leaving `call A | summary | result A` -> `conversation_advanced_with_open_call`.
+// A sequential frame (call, result, call, result) never lands there, which is
+// why the 12-pair gate passed while real fan-out failed.
+//
+// Parallel fan-out is exactly the shape long agentic work produces, so pin BOTH
+// orderings: dedup must still collapse, and the frame must stay protocol-valid.
+test('duplicate collapse keeps a parallel call frame protocol-valid', async () => {
+  const { inspectConversationProtocol } = await import('./conversation-protocol.js');
+  const session = createSession({ id: 'dedup-parallel-frame', kind: 'chat' });
+  const payload = `IDENTICAL::${'p'.repeat(400)}`;
+  for (const callId of ['par-a', 'par-b']) {
+    writeToolOutput({ sessionId: session.id, callId, tool: 'tool_search', output: payload });
+  }
+
+  // call, call, result, result — the frame a parallel model step emits.
+  const parallel: AgentInputItem[] = [
+    userMessage('Collect the same fact from two sources.'),
+    toolCall('par-a', 'tool_search', '{"q":"a"}'),
+    toolCall('par-b', 'tool_search', '{"q":"b"}'),
+    toolResult('par-a', payload),
+    toolResult('par-b', payload),
+  ];
+  assert.equal(inspectConversationProtocol(parallel).status, 'valid');
+
+  const collapsed = compactInFlightToolContext(parallel, session.id);
+  assert.equal(collapsed.applied, true, 'dedup must still collapse the identical pair');
+  assert.equal(collapsed.collapsed, 1);
+  const after = inspectConversationProtocol(collapsed.nextItems);
+  assert.equal(
+    after.status,
+    'valid',
+    `parallel frame must survive collapse: ${JSON.stringify(after.status === 'invalid' ? after.issues : [])}`,
+  );
+
+  // Sequential frames must keep working too — that is the shape the 12-pair
+  // gate exercises, and the fix must not move the summary for it.
+  for (const callId of ['seq-a', 'seq-b']) {
+    writeToolOutput({ sessionId: session.id, callId, tool: 'tool_search', output: payload });
+  }
+  const sequential: AgentInputItem[] = [
+    userMessage('Collect the same fact twice in a row.'),
+    toolCall('seq-a', 'tool_search', '{"q":"a"}'),
+    toolResult('seq-a', payload),
+    toolCall('seq-b', 'tool_search', '{"q":"b"}'),
+    toolResult('seq-b', payload),
+  ];
+  const seqCollapsed = compactInFlightToolContext(sequential, session.id);
+  assert.equal(seqCollapsed.collapsed, 1);
+  assert.equal(inspectConversationProtocol(seqCollapsed.nextItems).status, 'valid');
 });

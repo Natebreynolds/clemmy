@@ -50,7 +50,7 @@ test('Workspace waiting badge includes data-runner cards and clears on every ter
   ];
 
   assert.equal(openApprovalCount(notes('pending')), 1);
-  for (const status of ['approved', 'rejected', 'expired', 'cancelled_by_user']) {
+  for (const status of ['approved', 'rejected', 'expired', 'cancelled_by_user', 'cancelled_by_system']) {
     assert.equal(openApprovalCount(notes(status)), 0, `${status} must clear the badge`);
   }
 });

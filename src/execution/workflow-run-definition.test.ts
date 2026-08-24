@@ -278,4 +278,25 @@ test('compiled workflow snapshots require an enabled manual-only definition', ()
     }),
     /enabled and manual-only/i,
   );
+  assert.throws(
+    () => createCompiledWorkflowRunDefinitionSnapshot({
+      workflowSlug: `compiled-${'7'.repeat(32)}`,
+      sourceTurnKeyHash: '8'.repeat(64),
+      definition: {
+        ...workflow(),
+        trigger: {
+          manual: true,
+          interval: {
+            version: 1,
+            every: 2,
+            unit: 'hour',
+            anchorAt: '2026-08-22T19:00:00.000Z',
+            overlapPolicy: 'queue_one',
+            catchUpPolicy: 'run_once',
+          },
+        },
+      },
+    }),
+    /enabled and manual-only/i,
+  );
 });

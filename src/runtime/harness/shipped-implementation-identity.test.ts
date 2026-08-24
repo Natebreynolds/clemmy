@@ -1,7 +1,7 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/harness/shipped-implementation-identity.test.ts */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -22,7 +22,47 @@ const {
   isShippedInvoke,
   isShippedReconcile,
   peekShippedProvenance,
+  readBuildStampsForTest,
+  SRC_ARTIFACT_ROOT_FOR_TEST,
 } = await import('./shipped-implementation-identity.js');
+
+test('an ambient stamp beside the running module is consulted; one in a sibling build tree is not', () => {
+  // A stamp that sits next to the running module describes the build that
+  // produced it, and checking it is the point: packaged code and the artifacts
+  // it loads must come from one build. A stamp reached by walking OUT of the
+  // running tree describes a DIFFERENT artifact set.
+  //
+  // Running from source used to walk out to `<repo>/dist/runtime/build-stamp.json`.
+  // Any developer tree whose dist was older than its emitted artifacts then
+  // failed identity everywhere, and the typed-execution modules threw at import
+  // so whole files died before a test ran — measured 2026-08-22 at ~125 of 163
+  // suite failures from that one ignored, stale file.
+  const tree = mkdtempSync(path.join(os.tmpdir(), 'clem-ambient-stamp-'));
+  const moduleDir = path.join(tree, 'src', 'runtime', 'harness');
+  const siblingBuild = path.join(tree, 'dist', 'runtime');
+  mkdirSync(moduleDir, { recursive: true });
+  mkdirSync(siblingBuild, { recursive: true });
+
+  const foreign = { implementationManifestDigest: 'a'.repeat(64) };
+  writeFileSync(path.join(siblingBuild, 'build-stamp.json'), JSON.stringify(foreign));
+
+  assert.deepEqual(
+    readBuildStampsForTest(SRC_ARTIFACT_ROOT_FOR_TEST, moduleDir)
+      .filter((stamp) => stamp?.implementationManifestDigest === foreign.implementationManifestDigest),
+    [],
+    'a sibling build tree never judges the set being loaded',
+  );
+
+  // The packaged shape: the stamp lives one level above the running module,
+  // which is exactly where an installed app puts it. That one still counts.
+  const adjacent = { implementationManifestDigest: 'b'.repeat(64) };
+  writeFileSync(path.join(tree, 'src', 'runtime', 'build-stamp.json'), JSON.stringify(adjacent));
+  assert.ok(
+    readBuildStampsForTest(SRC_ARTIFACT_ROOT_FOR_TEST, moduleDir)
+      .some((stamp) => stamp?.implementationManifestDigest === adjacent.implementationManifestDigest),
+    'a module-adjacent stamp is still enforced',
+  );
+});
 const { registerProductionCapabilityPort, portImplementationDigest } = await import('./production-capability-ports.js');
 const { attachSemanticContract } = await import('./capability-manifest.js');
 

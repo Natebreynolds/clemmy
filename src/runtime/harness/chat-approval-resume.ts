@@ -50,7 +50,7 @@ import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { publicUserInputText } from './public-presentation.js';
 import { freshExternalWriteEvidenceStatus } from './tool-evidence.js';
 import { executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
-import { recordTurnGraphShadow } from '../graph/turn-graph-shadow.js';
+import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { turnOutcomeId, type TurnIdentity } from './turn-outcome.js';
 import { reprojectUndeliveredConversationalApproval } from './claude-agent-approval.js';
@@ -320,18 +320,22 @@ function approvalSourceIsSafeToDispatch(row: approvalRegistry.PendingApprovalRow
   }
 }
 
-function settleConversationalSource(
+async function settleConversationalSource(
   row: approvalRegistry.PendingApprovalRow,
   source: EventRow,
   input: { text: string; status: 'done' | 'failed' | 'needs_input' },
-): boolean {
+): Promise<boolean> {
   const identity: TurnIdentity = {
     sessionId: source.sessionId,
     turn: source.turn,
     sourceUserSeq: source.seq,
   };
   try {
-    recordTurnGraphShadow({ identity });
+    await recordAcceptedSourceGraph({
+      identity,
+      surface: 'approval_resume',
+      acceptedText: typeof source.data.text === 'string' ? source.data.text : '',
+    });
     const common = { version: 2 as const, id: turnOutcomeId(identity), identity };
     const outcome = input.status === 'done'
       ? {
@@ -401,7 +405,7 @@ async function settleConversationalApprovalDecisionOnce(
       scheduleConversationalDecisionRetry(row, 'pending-action-denial-transition');
       return false;
     }
-    return settleConversationalSource(row, source, {
+    return await settleConversationalSource(row, source, {
       status: 'done',
       text: `I left the exact ${row.presentation.actionLabel} unsent.`,
     });
@@ -409,7 +413,7 @@ async function settleConversationalApprovalDecisionOnce(
   const pendingActionId = pendingActionIdFromArgs(row.args);
   let pendingAction = pendingActionId ? getPendingAction(pendingActionId) : null;
   if (!pendingActionId || !pendingAction || pendingAction.approvalId !== row.approvalId) {
-    return settleConversationalSource(row, source, {
+    return await settleConversationalSource(row, source, {
       status: 'failed',
       text: 'The frozen send record could not be verified. Nothing was dispatched.',
     });
@@ -423,7 +427,11 @@ async function settleConversationalApprovalDecisionOnce(
   }
   if (pendingAction.status === 'approved') {
     const approvedPendingAction = pendingAction;
-    recordTurnGraphShadow({ identity: { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq } });
+    await recordAcceptedSourceGraph({
+      identity: { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq },
+      surface: 'approval_resume',
+      acceptedText: typeof source.data.text === 'string' ? source.data.text : '',
+    });
     // The ordinary "Yes" is a typed control edge over the immutable pending
     // action, not a fresh conversational task. Rehydrate that exact action
     // graph and arm the same accepted-task/expected-work authority every other
@@ -462,25 +470,25 @@ async function settleConversationalApprovalDecisionOnce(
   }
   if (!pendingAction) return false;
   if (pendingAction.status === 'executed') {
-    return settleConversationalSource(row, source, {
+    return await settleConversationalSource(row, source, {
       status: 'done',
       text: pendingAction.resultSummary ?? `Executed the exact approved ${pendingAction.toolName} call.`,
     });
   }
   if (pendingAction.status === 'executing') {
-    return settleConversationalSource(row, source, {
+    return await settleConversationalSource(row, source, {
       status: 'failed',
       text: pendingAction.resultSummary
         ?? 'The send crossed into an execution attempt, but its outcome is uncertain. I will not retry it automatically.',
     });
   }
   if (pendingAction.status === 'failed') {
-    return settleConversationalSource(row, source, {
+    return await settleConversationalSource(row, source, {
       status: 'failed',
       text: pendingAction.resultSummary ?? 'The exact approved send failed or became uncertain. I will not retry it automatically.',
     });
   }
-  return settleConversationalSource(row, source, {
+  return await settleConversationalSource(row, source, {
     status: 'needs_input',
     text: `The frozen send is ${pendingAction.status} and was not dispatched. Please ask me to prepare a fresh version if you still want it sent.`,
   });

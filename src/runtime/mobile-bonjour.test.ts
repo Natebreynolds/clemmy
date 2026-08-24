@@ -2,7 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import type { spawn } from 'node:child_process';
-import { BONJOUR_SERVICE_TYPE, bonjourArgs, startBonjourAdvertisement } from './mobile-bonjour.js';
+import {
+  BONJOUR_SERVICE_TYPE,
+  bonjourArgs,
+  orphanedAdvertisementPids,
+  startBonjourAdvertisement,
+} from './mobile-bonjour.js';
 
 class FakeChild extends EventEmitter {
   killed = false;
@@ -52,4 +57,36 @@ test('a missing dns-sd binary degrades to no advertisement, never a crash', () =
   const impl = ((() => { throw new Error('ENOENT'); }) as unknown) as typeof spawn;
   const ad = startBonjourAdvertisement({ port: 8421, fingerprint: 'fp1', spawnImpl: impl, hostname: 'Test' });
   ad.stop(); // no throw = pass
+});
+
+test('orphan reaping targets dead daemons only, never a live one', () => {
+  // A daemon that is SIGKILLed or restarted abruptly never reaches stop(), and
+  // the mDNS registration lives in the child — so the orphan keeps advertising
+  // a fingerprint no running daemon can present. Measured on a development
+  // machine 2026-08-22: 220 orphaned advertisers, 17 distinct fingerprints,
+  // one service.
+  //
+  // Parentage is the discriminator, NOT the command line. Reaping by pattern
+  // would tear down a second Clementine's live service on the same machine.
+  const ps = [
+    '  501     1 /usr/bin/dns-sd -R Clementine (host) _clemmy._tcp local 8421 fp=stale-one',
+    '  502     1 /usr/bin/dns-sd -R Clementine (host) _clemmy._tcp local 8421 fp=stale-two',
+    '  503  9001 /usr/bin/dns-sd -R Clementine (host) _clemmy._tcp local 8421 fp=live',
+    '  504     1 /usr/bin/dns-sd -R SomethingElse _other._tcp local 9999',
+    '  505     1 node --import tsx src/index.ts daemon --foreground',
+    '    1     0 /sbin/launchd',
+  ].join('\n');
+
+  assert.deepEqual(
+    orphanedAdvertisementPids(ps, 999),
+    [501, 502],
+    'only parentless advertisements for OUR service type are reaped',
+  );
+
+  // pid 503 has a live parent; 504 is a different service; 505 is not dns-sd;
+  // pid 1 is never a target.
+  assert.ok(!orphanedAdvertisementPids(ps, 999).includes(503), 'a live daemon keeps its advertisement');
+  assert.ok(!orphanedAdvertisementPids(ps, 999).includes(504), 'another service is untouched');
+  assert.deepEqual(orphanedAdvertisementPids(ps, 501), [502], 'never signals itself');
+  assert.deepEqual(orphanedAdvertisementPids('', 999), [], 'empty ps output reaps nothing');
 });

@@ -24,6 +24,7 @@ import {
 } from './guest-harness.js';
 import { listWorkspaceProjects, type WorkspaceProject } from '../tools/shared.js';
 import { BASE_DIR } from '../config.js';
+import { CUTOVER_HOLD } from '../runtime/cutover-hold.js';
 
 export type GuestRunStatus = 'running' | 'succeeded' | 'failed' | 'killed';
 
@@ -110,7 +111,7 @@ function loadPersistedJobs(): void {
   } catch { /* a corrupt file only costs history, never boot */ }
 }
 
-loadPersistedJobs();
+if (!CUTOVER_HOLD) loadPersistedJobs();
 
 /** Test seam: simulate a daemon restart — drop the live map and re-run the
  *  boot-time load + orphan sweep against whatever is on disk. */
@@ -169,8 +170,10 @@ export function _checkGuestRunStalls(now = Date.now()): string[] {
   return stalled;
 }
 
-const stallTimer = setInterval(() => { try { _checkGuestRunStalls(); } catch { /* never crash the timer */ } }, STALL_CHECK_INTERVAL_MS);
-stallTimer.unref?.();
+const stallTimer = CUTOVER_HOLD
+  ? null
+  : setInterval(() => { try { _checkGuestRunStalls(); } catch { /* never crash the timer */ } }, STALL_CHECK_INTERVAL_MS);
+stallTimer?.unref?.();
 
 /** Resolve a user-supplied project reference (name or path) against the
  *  workspace roster. Returns null when it is not a detected project. */

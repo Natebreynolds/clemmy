@@ -259,7 +259,7 @@ test('dispatch_background_task cannot cross a genuine OPEN needs-input terminal'
     decision: fixture.decision,
     openness: { open: ['which connected workspace should own the artifact'] },
     port: { async render() { return 'Which connected workspace should own the artifact?'; } },
-    transport: 'openai_agents_harness',
+    transport: 'host_harness',
   });
   assert.equal(disposition.kind, 'ask');
   // Impossible through the normal discriminated publisher, but pin the safety

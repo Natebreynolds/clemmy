@@ -613,3 +613,37 @@ export function consumeTerminalRepairGrant(input: {
     return { status: 'storage_error', reason: boundedReason(error) };
   }
 }
+
+export type AbandonAcceptedTaskAuthorityResult =
+  | { status: 'abandoned' | 'already_closed' }
+  | { status: 'missing' | 'storage_error'; reason: string };
+
+/** Close armed authority in the same commit path as a non-resumable failure. */
+export function abandonAcceptedTaskAuthority(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): AbandonAcceptedTaskAuthorityResult {
+  try {
+    const db = openEventLog();
+    return db.transaction((): AbandonAcceptedTaskAuthorityResult => {
+      const row = readRow(db, input.sessionId, input.sourceUserSeq);
+      if (!row) return { status: 'missing', reason: 'accepted task authority is missing' };
+      if (row.state === 'terminal' || row.state === 'conflict') {
+        return { status: 'already_closed' };
+      }
+      const updated = db.prepare(`
+        UPDATE accepted_task_authority
+           SET state = 'conflict', revision = revision + 1, updated_at = ?
+         WHERE session_id = ? AND source_user_seq = ?
+           AND state IN ('armed', 'manifested_verifying')
+           AND revision = ?
+      `).run(new Date().toISOString(), input.sessionId, input.sourceUserSeq, row.revision);
+      if (updated.changes !== 1) {
+        return { status: 'storage_error', reason: 'accepted task abandon lost its CAS' };
+      }
+      return { status: 'abandoned' };
+    }).immediate();
+  } catch (error) {
+    return { status: 'storage_error', reason: boundedReason(error) };
+  }
+}

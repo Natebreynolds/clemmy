@@ -33,7 +33,9 @@
 
 import {
   composioSlugEffectEvidence,
+  composioSlugHasCuratedReadRule,
 } from '../../integrations/composio/slug-effect.js';
+import { declaredMcpToolEffect, type DeclaredMcpToolEffect } from '../mcp-declared-effects.js';
 import {
   documentedComposioOperationSemantic,
   type DocumentedComposioReversibility,
@@ -136,6 +138,24 @@ const DISPATCH_VERBS: ReadonlySet<string> = new Set(['CREATE', 'MAKE', 'RESPOND'
 interface CanonicalExternalAction {
   /** Canonical provider action, not its transport wrapper. */
   action?: string;
+  /**
+   * The token EFFECT VOCABULARY is read from, when it differs from the
+   * identity above. A native MCP action's identity must carry its server
+   * (two servers can expose the same tool name), but the SERVER NAME IS NOT
+   * EVIDENCE OF EFFECT: fusing them let a read verb in the server slug prove
+   * a destructive tool read-only — `mcp__audit-log__purge`,
+   * `mcp__list-monk__unsubscribe`, `mcp__get-things-done__complete_task` and
+   * `mcp__browse-ai__run_robot` ALL classified `mutating:false,
+   * reversibility:'read_only', classificationKnown:true` (verified
+   * 2026-08-21). Effect is inferred from the operation, identity from both.
+   */
+  effectToken?: string;
+  /**
+   * What the owning MCP server declared for this exact tool
+   * (readOnly/destructive/idempotent). Declared, never proven: it may admit a
+   * read, and it may raise risk, but it can never override contrary evidence.
+   */
+  declaredEffect?: DeclaredMcpToolEffect;
   /** True only when the carrier is known to cross an external boundary. */
   external: boolean;
 }
@@ -242,7 +262,13 @@ function canonicalExternalAction(
     // Only its explicit external carriers above cross the provider boundary.
     if (isClementineLocalMcpName(toolName)) return { external: false };
     const action = [server, tail].filter(Boolean).join('_');
-    return { external: true, ...(action ? { action } : {}) };
+    const declaredEffect = declaredMcpToolEffect(toolName);
+    return {
+      external: true,
+      ...(action ? { action } : {}),
+      ...(tail ? { effectToken: tail } : {}),
+      ...(declaredEffect ? { declaredEffect } : {}),
+    };
   }
 
   // Bare native tools are not distinguishable from local runtime tools. Keep
@@ -253,7 +279,17 @@ function canonicalExternalAction(
 }
 
 /** One shared effect classifier after transport normalization. */
-function canonicalExternalActionWriteClassification(action: string | undefined): {
+function canonicalExternalActionWriteClassification(
+  action: string | undefined,
+  /** Heuristic verb evidence is read from THIS token when supplied (the
+   *  operation without its server segment). The CURATED lookup above keeps the
+   *  full provider-qualified identity: `slack_conversations_history` matching
+   *  the documented SLACK_CONVERSATIONS_HISTORY semantic is an exact table hit,
+   *  not an inference. Verb heuristics get the operation only. */
+  effectToken?: string,
+  /** What the owning server declared. Admits a read; never overrides. */
+  declaredEffect?: DeclaredMcpToolEffect,
+): {
   mutating: boolean;
   classificationKnown: boolean;
 } {
@@ -265,17 +301,46 @@ function canonicalExternalActionWriteClassification(action: string | undefined):
   if (documented) {
     return { mutating: documented.effect === 'write', classificationKnown: true };
   }
-  const evidence = composioSlugEffectEvidence(action);
-  if (evidence === 'read') return { mutating: false, classificationKnown: true };
-  if (evidence === 'write') return { mutating: true, classificationKnown: true };
+  // PRECEDENCE, unchanged from the single-token original:
+  //   1. curated provider rules on the QUALIFIED identity (research families,
+  //      ephemeral compute, documented reads) — exact provider knowledge that
+  //      outranks a generic verb, e.g. DATAFORSEO_CREATE_*_TASK is a research
+  //      read, not a durable write;
+  //   2. an unambiguous WRITE verb from either token — the fail-safe direction;
+  //   3. a READ verb from the OPERATION only. A read verb sitting in an
+  //      arbitrary MCP server name proves nothing and never reaches here.
+  const identityEvidence = composioSlugEffectEvidence(action);
+  const operationEvidence = effectToken
+    ? composioSlugEffectEvidence(effectToken)
+    : identityEvidence;
+  if (identityEvidence === 'read' && composioSlugHasCuratedReadRule(action)) {
+    return { mutating: false, classificationKnown: true };
+  }
+  if (
+    identityEvidence === 'write'
+    || operationEvidence === 'write'
+    // A server declaring its own tool destructive is believed immediately.
+    || declaredEffect?.destructive === true
+  ) {
+    return { mutating: true, classificationKnown: true };
+  }
+  if (operationEvidence === 'read') return { mutating: false, classificationKnown: true };
+  // DECLARED read: believed only once nothing above contradicted it. This is
+  // what makes a freshly connected third-party MCP server usable for reads on
+  // a blank install instead of parking every read for approval.
+  if (declaredEffect?.readOnly === true) return { mutating: false, classificationKnown: true };
   // A connected operation with no documented semantics and no recognized verb
   // stays a conservative mutation, but remains explicitly UNKNOWN so approval
   // and workspace consumers can fail closed.
   return { mutating: true, classificationKnown: false };
 }
 
-function canonicalExternalActionIsWrite(action: string | undefined): boolean {
-  return canonicalExternalActionWriteClassification(action).mutating;
+function canonicalExternalActionIsWrite(
+  action: string | undefined,
+  effectToken?: string,
+  declaredEffect?: DeclaredMcpToolEffect,
+): boolean {
+  return canonicalExternalActionWriteClassification(action, effectToken, declaredEffect).mutating;
 }
 
 /** THE canonical "is this an irreversible external send" predicate — the one
@@ -308,7 +373,7 @@ export function isMutatingExternalWrite(
 
   const canonical = canonicalExternalAction(toolName, rawArgs);
   return canonical.external
-    ? canonicalExternalActionIsWrite(canonical.action)
+    ? canonicalExternalActionIsWrite(canonical.action, canonical.effectToken, canonical.declaredEffect)
     : false;
 }
 
@@ -340,14 +405,21 @@ export function classifyCanonicalExternalEffect(
       classificationKnown: true,
     };
   }
-  const write = canonicalExternalActionWriteClassification(canonical.action);
+  // CURATED lookups keep the provider-qualified identity; HEURISTIC verb
+  // inference sees the operation only (see effectToken).
+  const verbToken = canonical.effectToken ?? canonical.action;
+  const write = canonicalExternalActionWriteClassification(
+    canonical.action,
+    canonical.effectToken,
+    canonical.declaredEffect,
+  );
   const documented = canonical.action
     ? documentedComposioOperationSemantic(canonical.action)
     : null;
   const irreversible = documented
     ? documented.reversibility === 'irreversible'
-    : canonical.action
-      ? isIrreversibleSendSlug(canonical.action)
+    : verbToken
+      ? isIrreversibleSendSlug(verbToken)
       : false;
   const reversibility: CanonicalExternalEffect['reversibility'] = documented
     ? documented.reversibility

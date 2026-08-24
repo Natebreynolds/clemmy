@@ -90,6 +90,27 @@ function currentKey(): { id: string; key: Buffer } {
   throw new AuthoritySealKeyMissingError();
 }
 
+/**
+ * First-run provisioning of the host-local seal key.
+ *
+ * The key has no meaning outside this install, so there is nothing to fetch and
+ * nothing a user can supply — but it must exist BEFORE the first typed
+ * crossing, and until now only the test runner ever created one, so typed
+ * execution could not work out of the box on any install. Minting it lazily at
+ * use time would be worse: a vault that lost its key would silently mint a
+ * replacement and orphan every authority already sealed under the old one.
+ * Provisioning at boot keeps "absent at rest" a reportable state rather than a
+ * self-healing one.
+ *
+ * Returns true when a key was created. An existing key — vault or env — is
+ * never replaced; rotation is `rotateAuthoritySealKey`, which retains v1.
+ */
+export function provisionAuthoritySealKey(): boolean {
+  if (keyForId(AUTHORITY_SEAL_KEY_ID_V2)) return false;
+  writeVaultEntry(AUTHORITY_SEAL_KEY_ID_V2, randomBytes(32).toString('hex'));
+  return true;
+}
+
 export function rotateAuthoritySealKey(nextHex: string): void {
   const next = hexKey(nextHex);
   if (!next) throw new Error('authority seal key must be 32 bytes of hex');

@@ -312,3 +312,64 @@ test('modelContextLimit: Moonshot (Kimi) family — K3 is 1M, plan/coding ids ta
   assert.equal(modelContextLimit('kimi-k2.5'), 256_000, 'generic kimi prefix');
   assert.equal(modelContextLimit('moonshotai/kimi-k3'), 1_000_000, 'org-prefixed BYO id resolves on the bare name');
 });
+
+// ─── budget table ↔ wire registry coupling ────────────────────────────────
+test('no budget entry is more generous than the window the wire registry declares', async () => {
+  // These are two records of one fact and they drift. The coupling is asserted
+  // rather than the numbers, so the next divergence fails here instead of
+  // silently mis-sizing a brain.
+  //
+  // One-way on purpose. The budget table may be MORE conservative than the wire
+  // window, because it also encodes auth-mode effective ceilings the registry
+  // does not model (gpt-5.5 is 400K through Codex OAuth against 1M on an API
+  // key). It may never be more GENEROUS — that is the direction that overruns a
+  // provider mid-turn.
+  const { resolveModelCapability } = await import('./model-wire-registry.js');
+  const offenders: string[] = [];
+  for (const id of ['grok-4', 'grok-3', 'claude-sonnet-5', 'claude-opus-4-8', 'claude-fable-5', 'kimi-k3']) {
+    const wire = resolveModelCapability(id).contextWindow;
+    const budget = modelContextLimit(id);
+    if (budget > wire) offenders.push(`${id}: budget ${budget} exceeds wire window ${wire}`);
+  }
+  assert.deepEqual(offenders, []);
+});
+
+test('a grok brain is budgeted on its real window, not the unknown-model default', () => {
+  // The bug this pins: budget.ts had no grok row at all, so a grok brain fell
+  // to the 128K unknown-model default while the registry declared 256K — half
+  // its real context, compacting and parking at half the work it could carry.
+  assert.equal(modelContextLimit('grok-4'), 256_000);
+  assert.equal(modelContextLimit('grok-4-fast'), 256_000, 'variants ride the family prefix');
+  assert.notEqual(modelContextLimit('grok-4'), 128_000, 'the unknown-model default is the bug being pinned');
+});
+
+test('two known registry gaps stay visible until the registry is fixed', async () => {
+  // NOT a budget defect — the registry is under-specified, and this records it
+  // so it cannot be forgotten. Both are Pillar-2 work, deliberately not fixed
+  // here because correcting them changes routing/budget behaviour for real
+  // brains and the published windows need confirming first.
+  //
+  //  1. `zai-org/glm-5.2` resolves to its own 512K row, but the BARE id
+  //     `glm-5.2` falls to the generic 202,752 glm row, because the specific
+  //     row's regex requires the org prefix. That is the SAME org-prefix bug
+  //     budget.ts already fixed and documented above ("silently cut GLM's
+  //     usable window from 1M to 128K") — mirrored, unfixed, in the registry.
+  //  2. `MiniMax-M3` has no registry row at all and falls to the generic 128K
+  //     OpenAI-compatible default, while budget.ts carries a published 1M.
+  //
+  // When either is fixed, this test fails and should be deleted, not updated.
+  const { resolveModelCapability } = await import('./model-wire-registry.js');
+  assert.equal(resolveModelCapability('zai-org/glm-5.2').contextWindow, 512_000, 'org-prefixed id hits its own row');
+  assert.equal(resolveModelCapability('glm-5.2').contextWindow, 202_752, 'GAP 1: the bare id still misses that row');
+  assert.equal(resolveModelCapability('MiniMax-M3').contextWindow, 128_000, 'GAP 2: MiniMax-M3 has no registry row');
+
+  // GAP 3, and the one with a live consequence: the two records DISAGREE about
+  // GLM-5.2 even when the id resolves correctly. budget.ts budgets 1M; the wire
+  // registry declares 512K. Today a GLM-5.2 brain is therefore budgeted for
+  // roughly twice the context the wire layer believes it has. One of these two
+  // numbers is wrong and neither can be confirmed from inside the repo, so this
+  // records the conflict rather than silently picking a winner — moving either
+  // one blind risks overrunning the provider or halving a working brain.
+  assert.equal(modelContextLimit('zai-org/glm-5.2'), 1_000_000, 'GAP 3: budget side of the GLM-5.2 conflict');
+  assert.equal(resolveModelCapability('zai-org/glm-5.2').contextWindow, 512_000, 'GAP 3: wire side of the GLM-5.2 conflict');
+});

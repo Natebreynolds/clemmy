@@ -27,10 +27,6 @@ const {
   wrapToolForHarness,
 } = await import('./brackets.js');
 const { buildCallTool } = await import('../../tools/call-tool.js');
-const {
-  _setExternalMcpToolsForTests,
-  dispatchCodeModeTool,
-} = await import('../../tools/code-mode-tool.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -249,7 +245,7 @@ test('an all-resolved role projection has zero broad slots without disabling exa
   }));
 });
 
-test('direct, nested boundary, and code-mode alternate broad doors deny before provider I/O', async () => {
+test('direct and nested boundary broad doors deny before provider I/O', async () => {
   const roleKey = 'clause-0:unknown';
   const requirement = {
     roleKey,
@@ -293,39 +289,38 @@ test('direct, nested boundary, and code-mode alternate broad doors deny before p
   });
   assertDeniedAttemptTerminal(nestedKey);
 
-  const codeModeKey = acceptedTask('code mode carrier parity', [requirement]);
-  const codeModeContext = {
-    ...codeModeKey,
-    turn: 1,
-    counter: new ToolCallsCounter(50),
-  };
-  let codeModeInventoryReads = 0;
-  _setExternalMcpToolsForTests(async () => {
-    codeModeInventoryReads += 1;
-    return [{ name: 'vendor__read', description: 'read', inputSchema: {} }];
+});
+
+test('tool_search without a required role fails before its physical callback and never settles nominally', async () => {
+  const key = acceptedTask('broker role-required physical denial', [{
+    roleKey: 'clause-0:read',
+    clauseIndex: 0,
+    text: 'discover the unresolved source reader',
+    resolved: false,
+  }]);
+  let callbackCalls = 0;
+  const broker = wrapToolForHarness({
+    name: 'tool_search',
+    execute: async () => {
+      callbackCalls += 1;
+      return 'catalog/provider result';
+    },
   });
-  try {
-    await assert.rejects(
-      withHarnessRunContext(
-        codeModeContext,
-        () => dispatchCodeModeTool(
-          'listTools',
-          undefined,
-          codeModeKey.sessionId,
-          codeModeContext.counter,
-        ),
-      ),
-      (error: unknown) => {
-        assert.ok(error instanceof DiscoveryBudgetDeniedError);
-        assert.equal(error.reason, 'role_required');
-        return true;
-      },
-    );
-    assert.equal(codeModeInventoryReads, 0);
-  } finally {
-    _setExternalMcpToolsForTests(null);
-  }
-  assertDeniedAttemptTerminal(codeModeKey);
+
+  const output = await withHarnessRunContext(
+    { ...key, turn: 1, counter: new ToolCallsCounter(50) },
+    () => broker.execute!({ query: 'find the source reader' }),
+  );
+
+  assert.match(String(output), /role_required/);
+  assert.equal(callbackCalls, 0, 'role denial must happen before catalog/provider I/O');
+  assertDeniedAttemptTerminal(key);
+  const settlements = eventlog.listEvents(key.sessionId, {
+    types: ['tool_attempt_settled'],
+  }).filter((event) => event.data.sourceUserSeq === key.sourceUserSeq);
+  assert.equal(settlements.length, 1);
+  assert.equal(settlements[0]?.data.kind, 'policy_denial');
+  assert.notEqual(settlements[0]?.data.kind, 'succeeded');
 });
 
 test('a nested call_tool broad denial settles the refined carrier call once', async () => {
@@ -526,6 +521,11 @@ test('the candidate card exposes only unresolved opaque roles and the broker sch
     },
   } as never, { allowedNames: new Set(['workspace_roots']) });
   assert.ok(shape?.role_key, 'the one broad broker exposes role_key');
+  assert.match(
+    String((shape?.role_key as { description?: string } | undefined)?.description ?? ''),
+    /Required on the wire.*broad discovery.*exact unresolved role_key.*no unresolved role is listed, pass null.*exact tool-name schema refresh, pass null/i,
+    'the provider-facing schema explains the admission contract instead of presenting role_key as optional telemetry',
+  );
   const result = await handler?.({
     query: 'workspace roots',
     role_key: 'clause-1:write',

@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Globe, Check, X, Loader2, Download, Stethoscope, FlaskConical, ExternalLink, Chrome } from 'lucide-react';
+import { Globe, Check, X, Loader2, Download, Stethoscope, FlaskConical, ExternalLink, Chrome , ArrowUpCircle} from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
+import { browserHarnessUpdateNotice } from '@/lib/browser-harness-update';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
 import {
   getBrowserHarness, installBrowserHarness, getBrowserHarnessInstallJob,
-  browserHarnessDoctor, browserHarnessTest, browserHarnessChromeSetup,
+  browserHarnessDoctor, browserHarnessUpdate, browserHarnessTest, browserHarnessChromeSetup,
   type BrowserHarnessCommandResult,
 } from '@/lib/connect';
 
@@ -37,7 +38,15 @@ export function BrowserHarness() {
   const s = status.data;
   const prereqsMissing = (s?.prerequisites ?? []).filter((p) => !p.available);
   const tone = !s ? 'neutral' : s.installed ? (prereqsMissing.length === 0 ? 'success' : 'warning') : 'neutral';
-  const pill = !s ? '—' : s.installed ? (prereqsMissing.length === 0 ? 'Ready' : 'Needs setup') : 'Not installed';
+  // The harness prints "update available: 0.1.0 -> 0.1.8" in its own doctor and
+  // smoke output. Reading it back means "Ready" stops being shown next to an
+  // upgrade the user was told to run by hand and had no button for.
+  const updateNotice = browserHarnessUpdateNotice(result?.r?.output ?? '');
+  const pill = !s
+    ? '—'
+    : s.installed
+      ? (prereqsMissing.length > 0 ? 'Needs setup' : updateNotice ? `Update available (${updateNotice.to})` : 'Ready')
+      : 'Not installed';
 
   const install = async () => {
     setBusy('install'); setError(''); setResult(null);
@@ -99,6 +108,15 @@ export function BrowserHarness() {
                 </Button>
                 <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => run('test', browserHarnessTest)}>
                   {busy === 'test' ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <FlaskConical className="h-3.5 w-3.5" aria-hidden />} Smoke test
+                </Button>
+                <Button
+                  size="sm"
+                  variant={updateNotice ? 'primary' : 'secondary'}
+                  disabled={busy !== null}
+                  onClick={() => run('update', browserHarnessUpdate)}
+                >
+                  {busy === 'update' ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <ArrowUpCircle className="h-3.5 w-3.5" aria-hidden />}
+                  {updateNotice ? `Update to ${updateNotice.to}` : 'Update'}
                 </Button>
                 <Button size="sm" variant="ghost" disabled={busy !== null} onClick={() => run('chrome-setup', browserHarnessChromeSetup)}>
                   {busy === 'chrome-setup' ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Chrome className="h-3.5 w-3.5" aria-hidden />} Chrome setup

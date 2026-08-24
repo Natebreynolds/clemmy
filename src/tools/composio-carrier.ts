@@ -224,6 +224,12 @@ export function serializeComposioCarrier(
   canonical: CanonicalComposioInvocation,
 ): SerializedComposioCarrier {
   const hasArgs = Object.keys(canonical.args).length > 0;
+  // No replacer here, ever. A replacer ARRAY filters keys at EVERY depth, not
+  // just the top level: `{actorId, runInput:{searchStringsArray}}` shipped as
+  // `runInput:{}` because `searchStringsArray` was not a top-level key — the
+  // provider silently received gutted arguments and the settlement digest no
+  // longer matched its admission, poisoning the logical call. Insertion order
+  // is also semantic on this wire (Sheet-from-JSON uses it as column order).
   return {
     tool_slug: canonical.toolSlug,
     arguments: hasArgs ? JSON.stringify(canonical.args) : null,

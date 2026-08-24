@@ -89,3 +89,91 @@ test('the count-only example in the work_call description is a VALID proposal (t
   assert.match(source, /compute ONLY for work a tool will perform/,
     'the description must teach that model-composed content is not a compute operation');
 });
+
+test('the collect-then-construct example is a VALID once-write proposal and rides the description', async () => {
+  const {
+    WORK_CALL_COLLECT_THEN_CONSTRUCT_EXAMPLE,
+    WorkProposalSchema,
+  } = await import('./work-call.js');
+  const parsed = WorkProposalSchema.safeParse(WORK_CALL_COLLECT_THEN_CONSTRUCT_EXAMPLE);
+  assert.equal(parsed.success, true, JSON.stringify(('error' in parsed && parsed.error) || null));
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./work-call.ts', import.meta.url), 'utf-8');
+  assert.match(
+    source,
+    /JSON\.stringify\(WORK_CALL_COLLECT_THEN_CONSTRUCT_EXAMPLE\)/,
+    'the collect-then-construct example must ride the work_call description',
+  );
+  assert.equal(WORK_CALL_COLLECT_THEN_CONSTRUCT_EXAMPLE.operations[1]?.cardinality.kind, 'once');
+  assert.equal(WORK_CALL_COLLECT_THEN_CONSTRUCT_EXAMPLE.universes.length, 0);
+});
+
+test('work_call inherits the proven-resolution remap by construction (two-teeth pin)', async () => {
+  // The 2026-08-18 consumption fix lives in buildCallTool; work_call consumes
+  // it only because its dispatcher IS buildCallTool. Tooth 1: the forwarding
+  // must survive refactors — a work_call that resolves names itself would
+  // silently regress the proven-slug remap for every carrier built on it.
+  const { readFileSync } = await import('node:fs');
+  const workCallSource = readFileSync(new URL('./work-call.ts', import.meta.url), 'utf-8');
+  assert.match(
+    workCallSource,
+    /buildCallTool\(\{\s*\.\.\.dispatcherOptions/,
+    'work_call must construct its dispatcher through buildCallTool — the proven-resolution remap lives there',
+  );
+  // Tooth 2: the remap itself must still be consumed inside that dispatcher.
+  const callToolSource = readFileSync(new URL('./call-tool.ts', import.meta.url), 'utf-8');
+  assert.match(
+    callToolSource,
+    /provenComposioSlugForTurn/,
+    "the dispatcher must consume the turn's proven resolution at the decision point",
+  );
+});
+
+test('a bound collection refuses shell/curl before its callback while admitting the exact Composio carrier', async () => {
+  const { evaluateSourceStrategyWorkCarrier } = await import('./work-call.js');
+  const binding = {
+    version: 1,
+    primary: {
+      capabilityId: 'capability:composio:APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET',
+      accountIdentity: 'research@example.com',
+      schemaFingerprint: 'schema:apify:live',
+    },
+    equivalentFallbacks: [],
+    topology: 'single_aggregate_read_then_single_artifact_write',
+    topologyDigest: 'a'.repeat(64),
+    destination: { family: 'workbook', posture: 'create_new' },
+    effect: 'external_write',
+  } as const;
+  const requirement = { role: 'collection', effect: 'read' } as const;
+  let shellCallbacks = 0;
+  const shell = evaluateSourceStrategyWorkCarrier({
+    requirement,
+    binding,
+    bindingRequired: true,
+    targetName: 'run_shell_command',
+    targetArgs: { command: 'curl https://example.invalid/alternate-source' },
+  });
+  if (shell.status === 'admitted') shellCallbacks += 1;
+  assert.equal(shell.status, 'refused');
+  assert.equal(shellCallbacks, 0, 'a generic network process never starts for a bound collection');
+
+  let composioCallbacks = 0;
+  const composio = evaluateSourceStrategyWorkCarrier({
+    requirement,
+    binding,
+    bindingRequired: true,
+    targetName: 'composio_execute_tool',
+    targetArgs: {
+      tool_slug: 'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET',
+      arguments: JSON.stringify({ actorId: 'still-physically-verified-downstream' }),
+      connected_account_id: null,
+    },
+  });
+  if (composio.status === 'admitted') composioCallbacks += 1;
+  assert.deepEqual(composio, {
+    status: 'admitted',
+    capabilityId: 'capability:composio:APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET',
+    match: 'primary',
+  });
+  assert.equal(composioCallbacks, 1, 'the exact bound carrier continues to the physical account/schema gate');
+});

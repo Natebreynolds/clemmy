@@ -22,7 +22,7 @@ const guardrail = await import('../runtime/harness/tool-guardrail.js');
 const { discoveryGovernor } = await import('../runtime/harness/discovery-governor.js');
 const { buildOrchestratorAgent } = await import('./orchestrator.js');
 const { clearFocus, createFocus, listFocuses } = await import('../memory/focus.js');
-const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
+const { _setInnerDispatchToolsForTests } = await import('../tools/inner-dispatch.js');
 const { registerToolSearchTool } = await import('../tools/tool-search-tool.js');
 
 type Invokable = Tool<unknown> & {
@@ -119,17 +119,17 @@ beforeEach(() => {
   for (const focus of listFocuses({ limit: 50 })) clearFocus(focus.id, 'abandoned');
   guardrail._resetAllTrackersForTests();
   guardrail._resetGuardrailScopeSignals();
-  _setCodeModeToolsForTests(null);
+  _setInnerDispatchToolsForTests(null);
 });
 after(() => {
-  _setCodeModeToolsForTests(null);
+  _setInnerDispatchToolsForTests(null);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
 test('fresh accepted action subtracts dormant controls without opening archaeology', async () => {
   let controlDispatches = 0;
-  _setCodeModeToolsForTests(new Map([['desktop_status', {
+  _setInnerDispatchToolsForTests(new Map([['desktop_status', {
     name: 'desktop_status',
     invoke: async () => {
       controlDispatches += 1;

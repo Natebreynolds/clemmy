@@ -13,9 +13,12 @@
  */
 import { SessionStore } from '../memory/session-store.js';
 import {
+  configuredSessionRetentionDays,
   getSession as getHarnessSession,
   listEvents as listHarnessEvents,
   listSessions as listHarnessSessions,
+  openEventLog,
+  sessionHasAcceptedSourceReplayBinding,
   updateSession as updateHarnessSession,
   type EventRow as HarnessEventRow,
   type SessionRow as HarnessSessionRow,
@@ -25,6 +28,10 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { pendingActionApprovalViewFromArgs } from '../runtime/harness/pending-action-view.js';
 import { reconstructHarnessTranscript, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
 import { publicUserInputText } from '../runtime/harness/public-presentation.js';
+import {
+  archiveAuthorityPayloadsForSession,
+  permanentlyDeleteSessionAuthorityPayloads,
+} from '../runtime/harness/dispatch-ledger.js';
 import { deriveTitle, humanizeReportBackTitle } from '../memory/derive-title.js';
 import type {
   SessionRecord,
@@ -565,7 +572,14 @@ export function patchUnifiedSession(id: string, patch: SessionPatchInput): Unifi
 export function deleteUnifiedSession(
   id: string,
   hard = false,
-): { ok: boolean; mode: 'deleted' | 'archived' } | null {
+): {
+  ok: boolean;
+  mode: 'deleted' | 'archived';
+  retainedForReplay?: boolean;
+  retentionDays?: number;
+  authorityPayloadsDeleted?: boolean;
+  replayMode?: 'terminal_or_typed_no_redispatch';
+} | null {
   const parsed = parseId(id);
   if (!parsed) return null;
 
@@ -577,14 +591,47 @@ export function deleteUnifiedSession(
     return { ok: store.delete(parsed.rawId), mode: 'deleted' };
   }
 
-  // Harness: hard-delete would cascade and destroy audited events — archive instead.
   const row = getHarnessSession(parsed.rawId);
   if (!row) return null;
+  const related = relatedHarnessRowsForPatch(row);
   if (hard) {
-    // Not supported for harness sessions (would lose audit history).
-    return { ok: false, mode: 'archived' };
+    const retainedForReplay = related.some((target) =>
+      sessionHasAcceptedSourceReplayBinding(target.id));
+    for (const target of related) {
+      permanentlyDeleteSessionAuthorityPayloads(target.id);
+      if (retainedForReplay) {
+        updateHarnessSession(target.id, {
+          metadata: {
+            ...target.metadata,
+            archived: true,
+            acceptedSourceReplayTombstone: true,
+            acceptedSourceReplayTombstonedAt: new Date().toISOString(),
+          },
+        });
+      }
+    }
+    if (retainedForReplay) {
+      return {
+        ok: true,
+        mode: 'archived',
+        retainedForReplay: true,
+        retentionDays: configuredSessionRetentionDays(),
+        authorityPayloadsDeleted: true,
+        replayMode: 'terminal_or_typed_no_redispatch',
+      };
+    }
+    const db = openEventLog();
+    const deleted = db.transaction(() => {
+      let count = 0;
+      for (const target of related) {
+        count += db.prepare('DELETE FROM sessions WHERE id = ?').run(target.id).changes;
+      }
+      return count;
+    }).immediate();
+    return { ok: deleted === related.length, mode: 'deleted', authorityPayloadsDeleted: true };
   }
-  for (const target of relatedHarnessRowsForPatch(row)) {
+  for (const target of related) {
+    archiveAuthorityPayloadsForSession(target.id);
     updateHarnessSession(target.id, { metadata: { ...target.metadata, archived: true } });
   }
   return { ok: true, mode: 'archived' };

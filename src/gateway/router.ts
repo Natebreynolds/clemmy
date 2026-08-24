@@ -194,7 +194,13 @@ function isBareContinue(message: string): boolean {
 }
 
 function isContinueCompletionReason(reason: unknown): boolean {
-  return reason === 'awaiting_continue' || reason === 'limit_exceeded';
+  // Mirrors continue-directive.ts: the park-shaped reasons (2026-08-18) resume
+  // through the same door as the legacy ask-shaped ones. The auto-resume
+  // checkpoint is excluded — it re-enters itself.
+  return reason === 'awaiting_continue'
+    || reason === 'limit_exceeded'
+    || reason === 'step_budget_parked'
+    || reason === 'sdk_step_budget_parked';
 }
 
 function buildContinueInput(lastSummary: string | undefined): string {
@@ -607,8 +613,13 @@ function terminalStatusForResponse(response: AssistantResponse): GatewayTerminal
   if (response.pendingApprovalId) return 'needs_approval';
   if (response.stoppedReason === 'awaiting-input'
     || response.stoppedReason === 'pending-approval') return 'needs_input';
+  // NEVER-RESTING (2026-08-18): a ceiling is the harness's own checkpoint —
+  // blocked+resumable, host-owned re-entry. It is never a needs_input asking
+  // the user to type `continue`; gate-reason.ts stays the only needs_input
+  // author.
   if (response.stoppedReason === 'max-turns-with-grace'
-    || response.stoppedReason === 'token-budget') return 'needs_continue';
+    || response.stoppedReason === 'token-budget'
+    || response.stoppedReason === 'in-progress') return 'blocked';
   if (response.stoppedReason === 'cancelled') return 'cancelled';
   if (response.stoppedReason === 'error') return 'failed';
   // `unverified` is not a question and must not become a lane-local block.
@@ -616,6 +627,8 @@ function terminalStatusForResponse(response: AssistantResponse): GatewayTerminal
   // through the shared terminal judge and committer.
   return 'done';
 }
+
+export const _testOnly_terminalStatusForResponse = terminalStatusForResponse;
 
 // A pending "apply your last message to the parked task?" confirmation, keyed by origin
 // session. In-memory + short TTL — a transient one-question handshake, safe to lose on
@@ -849,6 +862,10 @@ function handleStopActive(request: GatewayRequest): GatewayResponse {
   // 2) Active background tasks for this user — pending, running, awaiting_approval
   try {
     const tasks = listBackgroundTasks({ userId: request.userId })
+      // A bare panic-stop is exact-session control. `userId` may be absent on
+      // webhook/mobile ingress; treating that as an unfiltered task query made
+      // unrelated runs from other conversations candidates for this stop.
+      .filter((task) => task.originSessionId === request.sessionId)
       .filter((task) => task.status === 'pending' || task.status === 'running' || task.status === 'awaiting_approval')
       .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
     for (const task of tasks) {
@@ -1287,6 +1304,17 @@ export class ClementineGateway {
           ...(route ? { route } : {}),
         };
       }
+      if (response.stoppedReason === 'in-progress') {
+        // A peer activation or restart reconciler still owns this exact source.
+        // Publishing a gateway terminal here would steal that ownership; ending
+        // the gateway attempt would make recovery look abandoned. Return only
+        // the host's nonterminal acknowledgement and leave both ledgers open.
+        return {
+          ...response,
+          runId: run.id,
+          route,
+        };
+      }
       const runCancelled = response.stoppedReason === 'cancelled';
       // Report-back honesty: a non-pending, non-throwing respond() can still be
       // a blocked / promised / errored run. This check must happen before the
@@ -1308,8 +1336,13 @@ export class ClementineGateway {
         text: response.text,
         legacyReason: response.pendingApprovalId
           ? 'awaiting_approval'
+          // Park-shaped, not ask-shaped: the legacy decoder replays these as
+          // blocked+resumable ('token-budget' with a hyphen would slip past
+          // its /token_budget/ class and read as a plain failure).
           : response.stoppedReason === 'max-turns-with-grace'
-            ? 'awaiting_continue'
+            ? 'step_budget_parked'
+            : response.stoppedReason === 'token-budget'
+              ? 'step_budget_parked'
             : response.stoppedReason === 'awaiting-input'
               ? 'awaiting_user_input'
             : response.stoppedReason ?? 'success',
@@ -1391,12 +1424,18 @@ export class ClementineGateway {
         pendingApprovalId: response.pendingApprovalId,
         ...(runFailedNotDelivered ? { error: verdict?.reason ?? 'Run did not finish cleanly.' } : {}),
       });
+      // A ceiling park is blocked+resumable but NOT a failure: the run reached
+      // the harness's own checkpoint, and re-entry is the host's job. Keep its
+      // ceiling stoppedReason outward (callers classify on it) and settle the
+      // attempt as completed work, exactly as the old needs-continue shape did.
+      const ceilingPark = committed.presentation.status === 'blocked'
+        && (response.stoppedReason === 'max-turns-with-grace' || response.stoppedReason === 'token-budget');
       try {
         settleGatewayAttempt(
           activeAttempt,
           runCancelled
             ? 'cancelled'
-            : committed.presentation.status === 'failed' || committed.presentation.status === 'blocked'
+            : !ceilingPark && (committed.presentation.status === 'failed' || committed.presentation.status === 'blocked')
               ? 'failed'
               : 'completed',
         );
@@ -1408,8 +1447,8 @@ export class ClementineGateway {
           ? committed.presentation.approvalId
           : response.pendingApprovalId,
         runId: run.id,
-        stoppedReason: committed.presentation.needs?.kind === 'continue'
-          ? 'max-turns-with-grace'
+        stoppedReason: ceilingPark || committed.presentation.needs?.kind === 'continue'
+          ? response.stoppedReason ?? 'max-turns-with-grace'
           : committed.presentation.status === 'cancelled'
             ? 'cancelled'
             : committed.presentation.status === 'failed' || committed.presentation.status === 'blocked'

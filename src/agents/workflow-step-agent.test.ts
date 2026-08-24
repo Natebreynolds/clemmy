@@ -31,7 +31,7 @@ const {
   STEP_STRUCTURAL_BASELINE_TOOLS,
 } = await import('./workflow-step-agent.js');
 const { clearStepResult, recordStepResult } = await import('../tools/step-result-tool.js');
-const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
+const { _setInnerDispatchToolsForTests } = await import('../tools/inner-dispatch.js');
 const {
   bindAgentCapabilityEnvelope,
   bindAgentCapabilityRevision,
@@ -347,7 +347,7 @@ test('unbound workflow call_tool advances its sealed revision once and refuses o
   const priorSearch = process.env.CLEMMY_CODEX_TOOL_SEARCH;
   process.env.CLEMMY_CODEX_TOOL_SEARCH = 'on';
   let dispatches = 0;
-  _setCodeModeToolsForTests(new Map([['desktop_status', {
+  _setInnerDispatchToolsForTests(new Map([['desktop_status', {
     name: 'desktop_status',
     invoke: async () => {
       dispatches += 1;
@@ -418,7 +418,7 @@ test('unbound workflow call_tool advances its sealed revision once and refuses o
     assert.deepEqual(refusal.outside, ['desktop_status']);
     assert.equal(dispatches, 2, 'refused workflow acquisition entered the inner handler');
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (priorSearch === undefined) delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
     else process.env.CLEMMY_CODEX_TOOL_SEARCH = priorSearch;
   }

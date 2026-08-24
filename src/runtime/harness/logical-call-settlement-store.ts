@@ -33,6 +33,8 @@ import {
   ResultHandleAuthorityError,
 } from './result-handle.js';
 import { recordWriteEvidenceSettlementOutcomeInTransaction } from './write-evidence-lifecycle.js';
+import { poisonAcceptedTurnCallAuthorityInTransaction } from './accepted-turn-call-authority.js';
+import { settlementCrossingAuthorityDigest } from './settlement-crossing-authority.js';
 
 export const LOGICAL_CALL_SETTLEMENT_PROTOCOL_VERSION = 1 as const;
 
@@ -98,10 +100,15 @@ export interface FrozenSettlementCrossing {
   retryOf?: string;
   toolName: string;
   argumentDigest: string;
+  /** Frozen only by crossing-authority v2 settlements. */
+  terminalState?: 'returned' | 'threw' | 'timed_out' | 'cancelled' | 'unknown';
+  /** Absence means the crossing left the process. */
+  executionSite?: 'host';
 }
 
 export interface DurableLogicalCallSettlement {
   protocolVersion: 1;
+  crossingAuthorityVersion: 1 | 2;
   identity: CommitLogicalCallSettlementInput['identity'];
   toolName: string;
   argumentDigest: string;
@@ -145,8 +152,16 @@ interface LogicalAuthorityRow {
   state: 'open' | 'settled' | 'conflict';
   settlement_event_id: string | null;
   outcome_kind: string | null;
-  resolution_state: 'open' | 'finalized' | 'legacy_ambiguous';
-  resolution_accepted_task_id: string;
+  authority_kind:
+    | 'turn_graph'
+    | 'host_v1'
+    | 'host_v1_read_only'
+    | 'workflow_v1_read_only'
+    | 'workflow_v2_paginated_read';
+  authority_state: 'open' | 'closed' | 'conflict';
+  authority_accepted_task_id: string;
+  resolution_state: 'open' | 'finalized' | 'legacy_ambiguous' | null;
+  resolution_accepted_task_id: string | null;
 }
 
 interface CrossingRow {
@@ -164,7 +179,8 @@ interface CrossingRow {
 
 type FrozenCrossingSource = Pick<
   CrossingRow,
-  'physical_dispatch_id' | 'ordinal' | 'relation' | 'retry_of' | 'tool_name' | 'argument_digest'
+  'physical_dispatch_id' | 'ordinal' | 'relation' | 'retry_of' | 'tool_name'
+  | 'argument_digest' | 'state' | 'execution_site'
 >;
 
 interface SettlementRow {
@@ -197,6 +213,7 @@ interface SettlementRow {
   credited_progress: number;
   physical_crossing_count: number;
   host_crossing_count: number | null;
+  crossing_authority_version: number;
   physical_crossings_digest: string;
   observer_lane: LogicalCallSettlementLane;
   observer_call_id: string | null;
@@ -224,7 +241,10 @@ function normalizedProviderStatus(status: number | string | undefined): string |
   return bounded || undefined;
 }
 
-function frozenCrossings(rows: FrozenCrossingSource[]): FrozenSettlementCrossing[] {
+function frozenCrossings(
+  rows: FrozenCrossingSource[],
+  version: 1 | 2 = 2,
+): FrozenSettlementCrossing[] {
   return rows.map((row) => ({
     physicalDispatchId: row.physical_dispatch_id,
     ordinal: row.ordinal,
@@ -232,18 +252,16 @@ function frozenCrossings(rows: FrozenCrossingSource[]): FrozenSettlementCrossing
     ...(row.retry_of ? { retryOf: row.retry_of } : {}),
     toolName: row.tool_name,
     argumentDigest: row.argument_digest,
+    ...(version === 2 && row.state !== 'started' ? { terminalState: row.state } : {}),
+    ...(version === 2 && row.execution_site === 'host' ? { executionSite: 'host' as const } : {}),
   }));
 }
 
-function crossingDigest(crossings: FrozenSettlementCrossing[]): string {
-  return sha256(JSON.stringify(crossings.map((crossing) => ({
-    physicalDispatchId: crossing.physicalDispatchId,
-    ordinal: crossing.ordinal,
-    relation: crossing.relation,
-    retryOf: crossing.retryOf ?? null,
-    toolName: crossing.toolName,
-    argumentDigest: crossing.argumentDigest,
-  }))));
+function crossingDigest(
+  crossings: FrozenSettlementCrossing[],
+  version: 1 | 2 = 2,
+): string {
+  return settlementCrossingAuthorityDigest(crossings, version);
 }
 
 function progressKeyDigest(acceptedTaskId: string, identity: string | undefined): string | undefined {
@@ -321,6 +339,11 @@ function poison(
        SET state = 'legacy_ambiguous', revision = revision + 1
      WHERE session_id = ? AND source_user_seq = ? AND state != 'legacy_ambiguous'
   `).run(identity.sessionId, identity.sourceUserSeq);
+  poisonAcceptedTurnCallAuthorityInTransaction(db, {
+    sessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+    reason,
+  });
 }
 
 function conflict(
@@ -368,7 +391,8 @@ function readDurableSettlement(
   ) as SettlementRow | undefined;
   if (!row) return null;
   const crossings = db.prepare(`
-    SELECT physical_dispatch_id, ordinal, relation, retry_of, tool_name, argument_digest
+    SELECT physical_dispatch_id, ordinal, relation, retry_of, tool_name,
+           argument_digest, terminal_state, execution_site
       FROM logical_call_settlement_crossings
      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
      ORDER BY ordinal
@@ -376,7 +400,17 @@ function readDurableSettlement(
     identity.sessionId,
     identity.sourceUserSeq,
     identity.logicalToolCallId,
-  ) as Array<Omit<CrossingRow, 'accepted_task_id' | 'state'>>;
+  ) as Array<{
+    physical_dispatch_id: string;
+    ordinal: number;
+    relation: FrozenSettlementCrossing['relation'];
+    retry_of: string | null;
+    tool_name: string;
+    argument_digest: string;
+    terminal_state: CrossingRow['state'] | null;
+    execution_site: string | null;
+  }>;
+  const crossingAuthorityVersion = row.crossing_authority_version === 2 ? 2 : 1;
   const directive: RecoveryDirective = {
     action: row.recovery_action,
     retrySameCandidate: row.retry_same_candidate === 1,
@@ -386,6 +420,7 @@ function readDurableSettlement(
   };
   return {
     protocolVersion: 1,
+    crossingAuthorityVersion,
     identity: {
       ...identity,
       acceptedTaskId: row.accepted_task_id,
@@ -436,7 +471,8 @@ function readDurableSettlement(
     crossings: frozenCrossings(crossings.map((crossing) => ({
       ...crossing,
       accepted_task_id: row.accepted_task_id,
-    }))),
+      state: crossing.terminal_state ?? 'started',
+    })), crossingAuthorityVersion),
     ...(row.result_handle_id !== null ? { resultHandleId: row.result_handle_id } : {}),
     settlementEventId: row.settlement_event_id,
     settledAt: row.settled_at,
@@ -529,8 +565,18 @@ export function redeemDurableLogicalCallSettlementForHost(
     if (
       settlement.crossings.length
         !== settlement.physicalCrossingCount + settlement.hostCrossingCount
-      || crossingDigest(settlement.crossings) !== settlement.physicalCrossingsDigest
+      || crossingDigest(settlement.crossings, settlement.crossingAuthorityVersion)
+        !== settlement.physicalCrossingsDigest
     ) return { status: 'corrupt', reason: 'logical settlement crossing digest does not recompute' };
+    if (settlement.crossingAuthorityVersion === 2) {
+      const liveRows = readCrossings(db, identity);
+      if (
+        liveRows.some((crossing) => crossing.state === 'started')
+        || crossingDigest(frozenCrossings(liveRows, 2), 2) !== settlement.physicalCrossingsDigest
+      ) {
+        return { status: 'corrupt', reason: 'live crossing terminal authority differs from its frozen settlement' };
+      }
+    }
 
     const mirrorRow = db.prepare(`
       SELECT session_id, role, type, data_json FROM events WHERE id = ?
@@ -553,6 +599,7 @@ export function redeemDurableLogicalCallSettlementForHost(
       && mirrorRow.role === 'system'
       && mirrorRow.type === 'tool_attempt_settled'
       && mirror?.protocolVersion === LOGICAL_CALL_SETTLEMENT_PROTOCOL_VERSION
+      && (mirror.crossingAuthorityVersion ?? 1) === settlement.crossingAuthorityVersion
       && mirror.sourceUserSeq === identity.sourceUserSeq
       && mirror.acceptedTaskId === identity.acceptedTaskId
       && mirror.logicalToolCallId === identity.logicalToolCallId
@@ -612,10 +659,15 @@ export function commitLogicalCallSettlement(
         SELECT l.accepted_task_id, l.logical_tool_call_id, l.tool_name,
                l.argument_digest, l.raw_argument_digest, l.state,
                l.settlement_event_id, l.outcome_kind,
+               a.authority_kind, a.state AS authority_state,
+               a.accepted_task_id AS authority_accepted_task_id,
                r.state AS resolution_state,
                r.accepted_task_id AS resolution_accepted_task_id
           FROM logical_tool_calls l
-          JOIN accepted_task_resolutions r
+          JOIN accepted_turn_call_authorities a
+            ON a.session_id = l.session_id
+           AND a.source_user_seq = l.source_user_seq
+          LEFT JOIN accepted_task_resolutions r
             ON r.session_id = l.session_id
            AND r.source_user_seq = l.source_user_seq
          WHERE l.session_id = ? AND l.source_user_seq = ? AND l.logical_tool_call_id = ?
@@ -660,9 +712,20 @@ export function commitLogicalCallSettlement(
       const progressDigest = progressKeyDigest(identity.acceptedTaskId, recovery.progressIdentity);
       if (
         logical.accepted_task_id !== identity.acceptedTaskId
-        || logical.resolution_accepted_task_id !== identity.acceptedTaskId
+        || logical.authority_accepted_task_id !== identity.acceptedTaskId
+        || (
+          logical.authority_kind === 'turn_graph'
+          && logical.resolution_accepted_task_id !== identity.acceptedTaskId
+        )
       ) {
         return conflict(db, identity, 'logical call belongs to a different accepted task');
+      }
+      if (
+        logical.authority_kind !== 'turn_graph'
+        && logical.authority_kind !== 'host_v1'
+        && recovery.mutating
+      ) {
+        return conflict(db, identity, 'read-only settlement cannot claim mutation');
       }
       // A refinement REWRITES argument_digest from the call's raw admission
       // args to its provider-ready ones. Both digests describe the SAME call,
@@ -700,8 +763,9 @@ export function commitLogicalCallSettlement(
       if (crossingRows.some((crossing) => crossing.state === 'started')) {
         return { status: 'closed', reason: 'a paid crossing is still in flight' };
       }
-      const crossings = frozenCrossings(crossingRows);
-      const crossingsDigest = crossingDigest(crossings);
+      const crossingAuthorityVersion = 2 as const;
+      const crossings = frozenCrossings(crossingRows, crossingAuthorityVersion);
+      const crossingsDigest = crossingDigest(crossings, crossingAuthorityVersion);
       // Every crossing is frozen and bound to this settlement, but only the
       // ones that LEFT the machine are counted as provider traffic: the
       // settlement's crossing count is what paid-work readers and this table's
@@ -744,6 +808,20 @@ export function commitLogicalCallSettlement(
         || input.outcome.kind === 'empty_result';
       const successfulProviderResult = input.execution.kind === 'provider_execution'
         && executedSuccessfully;
+      // A returned mutation whose exact effect cannot be proven is not success
+      // authority, but its provider bytes are indispensable reconciliation
+      // evidence. Persist them under the existing returned-crossing owner while
+      // deliberately leaving the settlement's success-only result_handle_id
+      // null. Thrown/timed-out crossings and result-less classifications mint
+      // nothing.
+      const forensicUncertainProviderResult = input.execution.kind === 'provider_execution'
+        && input.outcome.kind === 'uncertain_write'
+        && crossingRows.at(-1)?.state === 'returned'
+        && Boolean(
+          input.result
+          && Object.prototype.hasOwnProperty.call(input.result, 'payload')
+          && input.result.payload !== undefined,
+        );
       // A local execution that recorded its own returned crossing holds exactly
       // the same redeemable evidence — the host invoked the tool and kept the
       // bytes it returned. Without this, work the host did itself could never
@@ -755,7 +833,7 @@ export function commitLogicalCallSettlement(
         && crossingRows.at(-1)?.state === 'returned'
         && Boolean(input.result && Object.prototype.hasOwnProperty.call(input.result, 'payload'));
       let resultHandleId: string | undefined;
-      if (successfulProviderResult || successfulHostResult) {
+      if (successfulProviderResult || successfulHostResult || forensicUncertainProviderResult) {
         const lastCrossing = crossingRows.at(-1);
         if (!lastCrossing || lastCrossing.state !== 'returned') {
           return conflict(db, identity, 'successful provider result lacks a final returned crossing');
@@ -792,10 +870,15 @@ export function commitLogicalCallSettlement(
           }
           throw error;
         }
-        if (!resultHandle.success || !resultHandle.rawLocation) {
+        if (!resultHandle.rawLocation) {
+          throw new Error('returned provider result did not produce retained raw result authority');
+        }
+        if ((successfulProviderResult || successfulHostResult) && !resultHandle.success) {
           throw new Error('successful provider result did not produce redeemable result authority');
         }
-        resultHandleId = resultHandle.handle;
+        if (successfulProviderResult || successfulHostResult) {
+          resultHandleId = resultHandle.handle;
+        }
       }
       const semantic = semanticDigest({
         toolName: canonicalToolName,
@@ -824,8 +907,12 @@ export function commitLogicalCallSettlement(
           && prior.semanticDigest === semantic
           && persistedSemantic === prior.semanticDigest
           && prior.resultHandleId === resultHandleId
-          && prior.physicalCrossingsDigest === crossingsDigest
-          && crossingDigest(prior.crossings) === prior.physicalCrossingsDigest
+          && prior.physicalCrossingsDigest === crossingDigest(
+            frozenCrossings(crossingRows, prior.crossingAuthorityVersion),
+            prior.crossingAuthorityVersion,
+          )
+          && crossingDigest(prior.crossings, prior.crossingAuthorityVersion)
+            === prior.physicalCrossingsDigest
           && prior.physicalCrossingCount === crossingCount
           && prior.hostCrossingCount === hostCrossingCount
           && prior.crossings.length === crossings.length;
@@ -836,7 +923,10 @@ export function commitLogicalCallSettlement(
       if (logical.state !== 'open') {
         return conflict(db, identity, `logical call is ${logical.state} without a durable settlement`);
       }
-      if (logical.resolution_state !== 'open') {
+      if (logical.authority_state !== 'open') {
+        return { status: 'closed', reason: `accepted-turn call authority is ${logical.authority_state}` };
+      }
+      if (logical.authority_kind === 'turn_graph' && logical.resolution_state !== 'open') {
         return { status: 'closed', reason: `accepted task resolution is ${logical.resolution_state}` };
       }
 
@@ -884,6 +974,7 @@ export function commitLogicalCallSettlement(
         type: 'tool_attempt_settled',
         data: {
           protocolVersion: LOGICAL_CALL_SETTLEMENT_PROTOCOL_VERSION,
+          crossingAuthorityVersion,
           sourceUserSeq: identity.sourceUserSeq,
           acceptedTaskId: identity.acceptedTaskId,
           logicalToolCallId: identity.logicalToolCallId,
@@ -934,8 +1025,8 @@ export function commitLogicalCallSettlement(
            settlement_event_id, settled_at, governor_evidence_kind,
            governor_evidence_detail, governor_requires_progress,
            governor_outcome, opened_discovery_epoch, credited_progress,
-           result_handle_id, host_crossing_count)
-        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           result_handle_id, host_crossing_count, crossing_authority_version)
+        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         identity.sessionId,
         identity.sourceUserSeq,
@@ -971,13 +1062,14 @@ export function commitLogicalCallSettlement(
         creditedProgress ? 1 : 0,
         resultHandleId ?? null,
         hostCrossingCount,
+        crossingAuthorityVersion,
       );
       const insertCrossing = db.prepare(`
         INSERT INTO logical_call_settlement_crossings
           (session_id, source_user_seq, logical_tool_call_id,
            physical_dispatch_id, ordinal, relation, retry_of,
-           tool_name, argument_digest)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           tool_name, argument_digest, terminal_state, execution_site)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       for (const crossing of crossings) {
         insertCrossing.run(
@@ -990,6 +1082,8 @@ export function commitLogicalCallSettlement(
           crossing.retryOf ?? null,
           crossing.toolName,
           crossing.argumentDigest,
+          crossing.terminalState ?? null,
+          crossing.executionSite ?? null,
         );
       }
       recordWriteEvidenceSettlementOutcomeInTransaction(db, {
@@ -1026,11 +1120,20 @@ export function commitLogicalCallSettlement(
         && recovery.continuesRequirement !== true
         && (!progressDigest || progressClaimed)
       ) {
-        const expected = expectedTaskFor(identity.sessionId, identity.sourceUserSeq);
-        if (expected.status !== 'ok') {
+        // Call-root ownership and work-topology attribution are orthogonal.
+        // A foreground host plan keeps host_v1 as the sole call root, while an
+        // immutable expected-work binding still requires this successful call
+        // to become an observed graph operation. The resolution insertion
+        // trigger proves the exact settled plan/delivery/activation evidence
+        // before that topology row can coexist with host_v1.
+        const expected = logical.authority_kind === 'turn_graph'
+          || (logical.authority_kind === 'host_v1' && Boolean(workBinding))
+          ? expectedTaskFor(identity.sessionId, identity.sourceUserSeq)
+          : null;
+        if (expected && expected.status !== 'ok') {
           throw new Error(`successful business call has ${expected.status} task authority`);
         }
-        if (!expected.expectation.workNodeId) {
+        if (expected?.status === 'ok' && !expected.expectation.workNodeId) {
           // A conversational graph legitimately owns NO work node — and the
           // model may still make a business call on such a turn (a greeting
           // followed by an opportunistic read; a typed-conversation control
@@ -1070,7 +1173,7 @@ export function commitLogicalCallSettlement(
         const observedOperationId = operationIdExists
           ? `${baseOperationId.slice(0, 220)}:attempt:${sha256(identity.logicalToolCallId).slice(0, 16)}`
           : baseOperationId;
-        const operation = !expected.expectation.workNodeId
+        const operation = !expected || expected.status !== 'ok' || !expected.expectation.workNodeId
           ? { status: 'skipped_conversational' as const }
           : recordResolvedOperationInTransaction(db, {
           sessionId: identity.sessionId,

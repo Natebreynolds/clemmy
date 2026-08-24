@@ -10,6 +10,7 @@ export interface ApprovalRow {
   tool?: string | null;
   args?: unknown;
   status: string;
+  resolution?: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user' | 'cancelled_by_system' | null;
   requestedAt?: string;
   expiresAt?: string;
   kind?: string;
@@ -101,6 +102,40 @@ export function collapseAttentionRows(rows: NotificationRow[]): CollapsedAttenti
 
 export const listApprovals = () =>
   apiGet<{ approvals: ApprovalRow[]; count: number; urgentCount?: number }>('/api/console/approvals/list');
+
+export interface WorkspaceDestinationChoice {
+  choiceId: string;
+  kind: 'existing' | 'create_new';
+  label: string;
+  workspaceId: string;
+}
+
+export interface WorkspaceDestinationChooser {
+  version: 1;
+  chooserId: string;
+  advancementId: string;
+  chooserRevision: number;
+  chooserDigest: string;
+  createdAt: string;
+  choices: WorkspaceDestinationChoice[];
+}
+
+export const listWorkspaceDestinationChoosers = () =>
+  apiGet<{ choosers: WorkspaceDestinationChooser[]; count: number }>(
+    '/api/console/automation-pilot/workspace-choosers',
+  );
+
+export const resolveWorkspaceDestinationChooser = (
+  chooser: WorkspaceDestinationChooser,
+  choiceId: string,
+) => apiPost(
+  `/api/console/automation-pilot/workspace-choosers/${encodeURIComponent(chooser.chooserId)}/resolve`,
+  {
+    chooserRevision: chooser.chooserRevision,
+    chooserDigest: chooser.chooserDigest,
+    choiceId,
+  },
+);
 
 // Runtime approvals (chat/Discord/CLI loop) resolve via /api/approvals/:id/:decision;
 // harness approvals via /api/console/harness-approvals/:id/:decision. The list

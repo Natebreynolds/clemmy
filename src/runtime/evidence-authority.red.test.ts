@@ -674,7 +674,11 @@ test('A7: a turn missing ONE proof cannot commit a delivered done winner', async
     'the write was never read back, and commitTurnOutcome never consults terminal truth',
   );
   assert.equal(data.delivered, false, 'an unverified turn is not delivered');
-  assert.notEqual(data.reply, proposed, 'the proposed Done text must not be delivered verbatim');
+  assert.equal(
+    data.reply,
+    proposed,
+    'the hold preserves the only model-authored account instead of substituting deterministic quick-reply prose',
+  );
 });
 
 test('A7b: a fully evidenced turn DOES commit a delivered done winner', async () => {

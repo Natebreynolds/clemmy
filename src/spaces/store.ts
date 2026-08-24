@@ -31,6 +31,7 @@ import {
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { purgeWorkspaceObservationMemory } from '../memory/workspace-observation-bridge.js';
+import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
 import { deleteWorkspaceIndex, indexWorkspaceRecord, reindexWorkspaceRecords } from './workspace-db.js';
 
 export const SPACES_DIR = path.join(BASE_DIR, 'spaces');
@@ -863,6 +864,64 @@ export interface SaveSpaceInput {
   mobile?: SpaceMobilePrefs;
 }
 
+export interface CreateSpaceIfAbsentResult {
+  created: boolean;
+  record?: SpaceRecord;
+}
+
+function workspaceMutationLockPath(slug: string): string {
+  return path.join(SPACES_DIR, `.workspace-${slug}`);
+}
+
+function saveSpaceUnlocked(input: SaveSpaceInput): SpaceRecord {
+  // A prior process may have stopped after moving this slug into quarantine.
+  // Complete its DB cascade before a new generation can claim the same slug.
+  recoverWorkspaceDeletionQuarantine(input.id);
+  const dir = resolveSpaceDir(input.id);
+  const now = new Date().toISOString();
+  const existing = readManifest(input.id);
+  const missingFixes = missingManifestFixes(
+    existing?.manifestErrors,
+    input.dataSources !== undefined,
+    input.actions !== undefined,
+  );
+  if (missingFixes.length > 0) {
+    throw new Error(`existing space manifest has invalid fields; pass corrected ${missingFixes.join(' and ')} before saving`);
+  }
+  const dataSources = input.dataSources ?? existing?.dataSources ?? [];
+  const actions = input.actions ?? existing?.actions ?? [];
+  assertValidWorkspaceIdentities(dataSources, actions);
+  assertValidDeclaredRunners(input.dataSources, input.actions);
+  const record: SpaceRecord = {
+    id: input.id,
+    title: input.title.trim().slice(0, 200) || input.id,
+    status: input.status ?? existing?.status ?? 'active',
+    contract: input.contract ?? existing?.contract,
+    viewEntry: input.viewEntry ?? existing?.viewEntry ?? 'view/index.html',
+    dataSources,
+    actions,
+    reengage: input.reengage ?? existing?.reengage,
+    originSessionId: input.originSessionId ?? existing?.originSessionId,
+    focusId: input.focusId ?? existing?.focusId ?? null,
+    version: existing?.version ?? 1,
+    revisions: existing?.revisions ?? [],
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+    lastOpenedAt: existing?.lastOpenedAt,
+    lastRefreshedAt: existing?.lastRefreshedAt,
+    recipe: input.recipe ?? existing?.recipe,
+    mobile: input.mobile ?? existing?.mobile,
+  };
+  ensureDir(dir);
+  atomicWrite(manifestPath(input.id), JSON.stringify(persistableRecord(record), null, 2));
+  indexWorkspaceRecord(record, {
+    eventType: existing ? 'workspace_file_changed' : 'workspace_created',
+    actor: 'space-store',
+    payload: { mutation: existing ? 'save:update' : 'save:create' },
+  });
+  return record;
+}
+
 export class SpaceStore {
   /** List every Space by scanning each spaces/<slug>/space.json (newest first). */
   list(includeArchived = false): SpaceRecord[] {
@@ -903,52 +962,27 @@ export class SpaceStore {
     if (!isValidSpaceSlug(input.id)) {
       throw new Error(`invalid space slug "${input.id}" — use lowercase kebab-case (2-63 chars).`);
     }
-    // A prior process may have stopped after moving this slug into quarantine.
-    // Complete its DB cascade before a new generation can claim the same slug.
-    recoverWorkspaceDeletionQuarantine(input.id);
-    const dir = resolveSpaceDir(input.id);
-    const now = new Date().toISOString();
-    const existing = readManifest(input.id);
-    const missingFixes = missingManifestFixes(
-      existing?.manifestErrors,
-      input.dataSources !== undefined,
-      input.actions !== undefined,
-    );
-    if (missingFixes.length > 0) {
-      throw new Error(`existing space manifest has invalid fields; pass corrected ${missingFixes.join(' and ')} before saving`);
+    ensureDir(SPACES_DIR);
+    return withFileLockSyncStrict(workspaceMutationLockPath(input.id), () => saveSpaceUnlocked(input));
+  }
+
+  /** Create one exact Space without ever overwriting an existing directory or
+   * manifest. The same cross-process slug lock is shared with save(), so a
+   * concurrent UI/agent upsert wins visibly and this caller can refuse rather
+   * than replacing user-owned bytes. */
+  createIfAbsent(input: SaveSpaceInput): CreateSpaceIfAbsentResult {
+    if (!isValidSpaceSlug(input.id)) {
+      throw new Error(`invalid space slug "${input.id}" — use lowercase kebab-case (2-63 chars).`);
     }
-    const dataSources = input.dataSources ?? existing?.dataSources ?? [];
-    const actions = input.actions ?? existing?.actions ?? [];
-    assertValidWorkspaceIdentities(dataSources, actions);
-    assertValidDeclaredRunners(input.dataSources, input.actions);
-    const record: SpaceRecord = {
-      id: input.id,
-      title: input.title.trim().slice(0, 200) || input.id,
-      status: input.status ?? existing?.status ?? 'active',
-      contract: input.contract ?? existing?.contract,
-      viewEntry: input.viewEntry ?? existing?.viewEntry ?? 'view/index.html',
-      dataSources,
-      actions,
-      reengage: input.reengage ?? existing?.reengage,
-      originSessionId: input.originSessionId ?? existing?.originSessionId,
-      focusId: input.focusId ?? existing?.focusId ?? null,
-      version: existing?.version ?? 1,
-      revisions: existing?.revisions ?? [],
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
-      lastOpenedAt: existing?.lastOpenedAt,
-      lastRefreshedAt: existing?.lastRefreshedAt,
-      recipe: input.recipe ?? existing?.recipe,
-      mobile: input.mobile ?? existing?.mobile,
-    };
-    ensureDir(dir);
-    atomicWrite(manifestPath(input.id), JSON.stringify(persistableRecord(record), null, 2));
-    indexWorkspaceRecord(record, {
-      eventType: existing ? 'workspace_file_changed' : 'workspace_created',
-      actor: 'space-store',
-      payload: { mutation: existing ? 'save:update' : 'save:create' },
+    ensureDir(SPACES_DIR);
+    return withFileLockSyncStrict(workspaceMutationLockPath(input.id), () => {
+      recoverWorkspaceDeletionQuarantine(input.id);
+      const dir = resolveSpaceDir(input.id);
+      if (existsSync(dir)) {
+        return { created: false, record: readManifest(input.id) };
+      }
+      return { created: true, record: saveSpaceUnlocked(input) };
     });
-    return record;
   }
 
   /** Patch a subset of fields on an existing Space. */

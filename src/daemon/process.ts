@@ -198,7 +198,28 @@ const DAEMON_ARGV_RE = /--foreground\b|\bdaemon\b/i;
 
 /** Best-effort command line for `pid`, or null when it cannot be read. */
 function readProcessCommandLine(pid: number): string | null {
-  if (process.platform === 'win32') return null;
+  if (process.platform === 'win32') {
+    // Windows recycles pids aggressively and has no `ps`. Without a real
+    // command-line read, livePidLooksLikeDaemon's conservative fallback
+    // (unreadable ⇒ block) turned any recycled stale pid in daemon.pid /
+    // daemon.lock into a permanent boot brick. Get-CimInstance is present on
+    // every supported Windows; a filter on the exact pid keeps it cheap.
+    try {
+      const out = execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `(Get-CimInstance Win32_Process -Filter "ProcessId=${Math.trunc(pid)}").CommandLine`,
+        ],
+        { encoding: 'utf-8', timeout: 8_000, windowsHide: true },
+      );
+      return out.trim() || null;
+    } catch {
+      return null;
+    }
+  }
   try {
     const out = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
       encoding: 'utf-8',
@@ -455,13 +476,15 @@ export async function waitForDaemonExit(pid: number, timeoutMs = 10_000): Promis
   return true;
 }
 
-export function spawnDaemonProcess(): number {
+export function spawnDetachedDaemonEntrypoint(
+  entrypoint: string,
+  args: string[],
+): number {
   ensureLogDir();
   const logFd = openSync(DAEMON_LOG_FILE, 'a');
-  const entrypoint = process.argv[1];
   const childArgs = entrypoint.endsWith('.ts')
-    ? ['--import', 'tsx', entrypoint, 'daemon', '--foreground']
-    : [entrypoint, 'daemon', '--foreground'];
+    ? ['--import', 'tsx', entrypoint, ...args]
+    : [entrypoint, ...args];
   const child = spawn(process.execPath, childArgs, {
     detached: true,
     stdio: ['ignore', logFd, logFd],
@@ -471,6 +494,10 @@ export function spawnDaemonProcess(): number {
   const pid = child.pid;
   if (!pid) throw new Error('Failed to spawn daemon process');
   return pid;
+}
+
+export function spawnDaemonProcess(): number {
+  return spawnDetachedDaemonEntrypoint(process.argv[1], ['daemon', '--foreground']);
 }
 
 export function getDaemonStatus(): { running: boolean; pid: number | null; logFile: string } {

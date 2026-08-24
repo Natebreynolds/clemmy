@@ -19,7 +19,35 @@ import { z } from 'zod';
 import { textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalog, type RankedCatalogEntry } from '../agents/tool-catalog.js';
+import { peekConnectedToolkits } from '../integrations/composio/client.js';
+import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
+import {
+  AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+  issueAuthorizedLocalPlanningDisclosureCandidate,
+} from '../runtime/harness/local-planning-capability.js';
+
+function connectedToolkitSlugs(): Set<string> {
+  try {
+    return new Set(
+      peekConnectedToolkits()
+        .filter((toolkit) => (toolkit.status ?? '').toUpperCase() !== 'FAILED')
+        .map((toolkit) => toolkit.slug.trim().toLowerCase())
+        .filter(Boolean),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function candidateToolkitConnected(name: string, connected: Set<string>): boolean {
+  if (connected.size === 0) return false;
+  try {
+    return connected.has(registeredToolkitOfSlug(name).trim().toLowerCase());
+  } catch {
+    return false;
+  }
+}
 
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
@@ -37,7 +65,10 @@ interface ToolSearchMetadata {
 
 export type ToolSearchDispatchCarrier = 'call_tool' | 'work_call';
 
-export type ToolSearchCandidateSourceKind = 'authorized_external_mcp' | 'authorized_composio';
+export type ToolSearchCandidateSourceKind =
+  | 'authorized_external_mcp'
+  | 'authorized_composio'
+  | typeof AUTHORIZED_LOCAL_REGISTRY_PROVENANCE;
 
 /** Provider adapters stay behind the one visible broker. A candidate is
  * capability context only: its host-selected carrier still performs every
@@ -64,6 +95,16 @@ export interface ToolSearchCandidateSource {
   search(input: { query: string; limit: number }): Promise<ToolSearchBrokerCandidate[]>;
 }
 
+export interface ToolSearchPlanningDisclosureCandidate {
+  name: string;
+  carrier: ToolSearchDispatchCarrier;
+  schema?: unknown;
+  /** Exact adapter that produced this visible result. Candidate text cannot
+   * manufacture this value; the broker attaches it while flattening the
+   * configured host sources. */
+  sourceKind: ToolSearchCandidateSourceKind;
+}
+
 export type ToolSearchBrokerCoverage = 'builtins_only' | 'authorized_external_v1';
 
 /** Positive construction-time signal for the role governor. Partial provider
@@ -80,7 +121,7 @@ export function toolSearchBrokerCoverage(
 
 function dispatchHint(carrier: ToolSearchDispatchCarrier): string {
   return carrier === 'work_call'
-    ? 'Invoke the selected result as the inner name/args_json of work_call. On the first work_call, include the complete provider-neutral semantic proposal and dispatch this first requirement in that same call; later calls use proposal:null.'
+    ? 'Invoke the selected result as the inner name/args_json of work_call. If the host already froze the contract, pass proposal:null. Otherwise the first work_call includes the complete provider-neutral semantic proposal and dispatches this first requirement in that same call; later calls use proposal:null.'
     : 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional/nullable fields you do not need.';
 }
 
@@ -153,6 +194,12 @@ export function registerToolSearchTool(
     dispatchCarrierForName?: (name: string) => ToolSearchDispatchCarrier;
     /** Scope-bound provider adapters searched behind this same visible door. */
     candidateSources?: readonly ToolSearchCandidateSource[];
+    /** Fresh-host planning only. The callback may return a capabilityRef only
+     * after independently matching/materializing this metadata result against
+     * the current host catalog. Candidate prose itself grants nothing. */
+    discloseForPlanning?: (
+      candidates: readonly ToolSearchPlanningDisclosureCandidate[],
+    ) => Promise<Readonly<Record<string, string>>> | Readonly<Record<string, string>>;
   } = {},
 ): void {
   server.tool(
@@ -168,17 +215,19 @@ export function registerToolSearchTool(
         .string()
         .min(1)
         .max(128)
+        .nullable()
         .optional()
-        .describe('Opaque host-issued requirement role. Echoed for traceability; it does not affect ranking or grant authority.'),
+        .describe('Required on the wire. For broad discovery, copy one exact unresolved role_key from the current capability card; if no unresolved role is listed, pass null. For an exact tool-name schema refresh, pass null. This keys discovery admission; it does not affect ranking or grant execution authority.'),
       limit: z
         .number()
         .int()
         .min(1)
         .max(20)
+        .nullable()
         .optional()
         .describe(`How many ranked results to return (default ${TOP_RESULTS}).`),
     },
-    async ({ query, role_key, limit }: { query: string; role_key?: string; limit?: number }) => {
+    async ({ query, role_key, limit }: { query: string; role_key?: string | null; limit?: number | null }) => {
       // An exact tool name is an explicit selection, not another fuzzy search
       // term. Resolve it against the policy-filtered catalog BEFORE semantic
       // ranking so a selected name never pays a cold embedding/model detour.
@@ -204,7 +253,8 @@ export function registerToolSearchTool(
               const candidates = await source.search({ query, limit: requestedLimit });
               return candidates
                 .filter((candidate) => candidate.name.trim() && candidate.summary.trim())
-                .slice(0, requestedLimit);
+                .slice(0, requestedLimit)
+                .map((candidate) => ({ ...candidate, sourceKind: source.kind }));
             } catch {
               return [];
             }
@@ -215,17 +265,31 @@ export function registerToolSearchTool(
       const rankedBuiltins = exactNamedHit
         ? [exactNamedHit]
         : await rankCatalog(query, { allowedNames: opts.allowedNames });
+      // TIERED RANKING (live 2026-08-19: APIFY_SCHEDULE_PUT outranked her own
+      // workflow_schedule for "update workflow schedule cron interval"). Her
+      // own catalog outranks connected-app operations, which outrank
+      // everything else — she finds what SHE has before the world's noise.
+      const connectedSlugs = connectedToolkitSlugs();
       const combined = selectedExactly
         ? [selectedExactly]
         : [
             ...sourceCandidates.map((candidate, index) => ({
               ...candidate,
-              score: candidate.score ?? Math.max(0, 1 - (index / Math.max(1, sourceCandidates.length))),
+              score: (candidate.score ?? Math.max(0, 1 - (index / Math.max(1, sourceCandidates.length))))
+                + (opts.discloseForPlanning
+                  // The fresh planning broker is resolving missing executable
+                  // roles. Exact live provider candidates must survive the
+                  // bounded result card ahead of unrelated built-in controls;
+                  // otherwise a dependent source can be the ninth item and
+                  // plan_task can never cite it. This ranks disclosure only —
+                  // stage/freeze still owns authority.
+                  ? 2
+                  : candidateToolkitConnected(candidate.name, connectedSlugs) ? 0.5 : 0),
             })),
             ...rankedBuiltins.map((entry) => ({
               name: entry.name,
               summary: entry.oneLiner,
-              score: entry.score,
+              score: (entry.score ?? 0) + 1,
             })),
           ].sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
       const seen = new Set<string>();
@@ -236,6 +300,37 @@ export function registerToolSearchTool(
         return true;
       }).slice(0, requestedLimit);
       const metadataMap = await toolMetadataMap();
+      const planningCandidates: ToolSearchPlanningDisclosureCandidate[] = opts.discloseForPlanning
+        ? (await Promise.all(topN.map(async (candidate) => {
+            const sourced = sourceCandidates.find((entry) => entry.name === candidate.name);
+            if (sourced) {
+              return {
+                name: sourced.name,
+                carrier: sourced.carrier,
+                sourceKind: sourced.sourceKind,
+                ...(sourced.schema !== undefined ? { schema: sourced.schema } : {}),
+              } satisfies ToolSearchPlanningDisclosureCandidate;
+            }
+            // Local authority is issued only for an exact row on this scoped
+            // broker's configured surface. The opaque issuance validates the
+            // current deferred schema and structural registry semantics; fuzzy
+            // text and a predictable name cannot manufacture the WeakMap seal.
+            if (!opts.allowedNames) return null;
+            const carrier = opts.dispatchCarrierForName?.(candidate.name)
+              ?? opts.dispatchCarrier
+              ?? (opts.dispatchViaCallTool ? 'call_tool' : null);
+            if (!carrier) return null;
+            return issueAuthorizedLocalPlanningDisclosureCandidate({
+              name: candidate.name,
+              carrier,
+              configuredNames: opts.allowedNames,
+            });
+          }))).filter((candidate): candidate is ToolSearchPlanningDisclosureCandidate => candidate !== null)
+        : [];
+      const planningCandidateByName = new Map(planningCandidates.map((candidate) => [candidate.name, candidate]));
+      const planningRefs = opts.discloseForPlanning
+        ? await opts.discloseForPlanning(planningCandidates)
+        : {};
 
       // When the model supplied an exact tool name, it has already selected
       // the capability. Return only that schema instead of spending tokens on
@@ -246,6 +341,14 @@ export function registerToolSearchTool(
         : topN.slice(0, TOP_SCHEMAS).map((r) => r.name);
       const schemas: Record<string, unknown> = {};
       for (const name of schemaNames) {
+        const localPlanning = planningCandidateByName.get(name);
+        if (
+          localPlanning?.sourceKind === AUTHORIZED_LOCAL_REGISTRY_PROVENANCE
+          && localPlanning.schema !== undefined
+        ) {
+          schemas[name] = localPlanning.schema;
+          continue;
+        }
         const sourced = sourceCandidates.find((candidate) => candidate.name === name);
         if (sourced?.schema !== undefined) {
           schemas[name] = relaxJsonSchemaForDeferred(sourced.schema);
@@ -289,6 +392,9 @@ export function registerToolSearchTool(
           : null
       );
       const hint = (() => {
+        if (opts.discloseForPlanning && Object.keys(planningRefs).length === 0) {
+          return 'No returned candidate was materialized into an exact host capabilityRef. Do not cite these results in plan_task; refine discovery, choose another live result, or ask the user only for a genuinely missing connection/account/target choice.';
+        }
         if (exactCarrier) return dispatchHint(exactCarrier);
         if (opts.dispatchCarrierForName) {
           return 'Each result includes its required carrier. Invoke control/recovery results with call_tool(name, args_json); invoke business results as the inner name/args_json of work_call. Never send a business result through call_tool.';
@@ -306,11 +412,20 @@ export function registerToolSearchTool(
         results: topN.map((r) => ({
           name: r.name,
           summary: 'summary' in r ? r.summary : r.oneLiner,
+          ...(planningRefs[r.name] ? { capabilityRef: planningRefs[r.name] } : {}),
+          ...(planningRefs[r.name] && planningCandidateByName.get(r.name)
+            ? { planningProvenance: planningCandidateByName.get(r.name)!.sourceKind }
+            : {}),
+          ...(opts.discloseForPlanning && !planningRefs[r.name]
+            ? { planningRefStatus: 'unsupported_unmaterialized' as const }
+            : {}),
           ...('carrier' in r && r.carrier
             ? { carrier: r.carrier }
             : opts.dispatchCarrierForName
               ? { carrier: opts.dispatchCarrierForName(r.name) }
-              : {}),
+              : opts.dispatchCarrier
+                ? { carrier: opts.dispatchCarrier }
+                : {}),
           ...('invocation' in r && r.invocation ? { invocation: r.invocation } : {}),
         })),
         schemas,

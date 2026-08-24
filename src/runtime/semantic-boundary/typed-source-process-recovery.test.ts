@@ -136,7 +136,7 @@ async function recover(home: string, extraEnv: Record<string, string> = {}) {
 // history when the replay seam lands.
 // ============================================================================
 
-test('SIGKILL after reservation recovers with one write and one terminal', async () => {
+test('SIGKILL after a write reservation never redispatches and converges to one blocked terminal', async () => {
   const home = mkdtempSync(path.join(os.tmpdir(), 'clem-process-reservation-'));
   try {
     await runInit(home);
@@ -146,17 +146,13 @@ test('SIGKILL after reservation recovers with one write and one terminal', async
     await waitFor(() => child.exitCode !== null || child.killed);
     await new Promise((resolve) => setTimeout(resolve, 900));
     const recovered = await recover(home);
-    assert.ok(store(home).creates <= 1, JSON.stringify({ recovered, store: store(home) }));
+    assert.equal(store(home).creates, 0, JSON.stringify({ recovered, store: store(home) }));
     assert.equal(terminalCount(home), 1, JSON.stringify(recovered));
-    assert.ok(
-      recovered.status === 'completed' || recovered.status === 'uncertain' || recovered.status === 'failed',
-      JSON.stringify(recovered),
-    );
+    assert.equal(recovered.status, 'blocked', JSON.stringify(recovered));
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
 });
-
 
 
 

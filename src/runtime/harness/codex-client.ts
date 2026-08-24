@@ -27,7 +27,7 @@
  * both do the same thing.
  */
 import { randomUUID } from 'node:crypto';
-import { setDefaultModelProvider } from '@openai/agents';
+import { setDefaultModelProvider, type Model } from '@openai/agents';
 import {
   accessTokenExpMs,
   assertCodexAccessTokenCanCoverCall,
@@ -137,6 +137,17 @@ setDefaultModelProvider({
   },
 });
 
+/** The exact model-resolution path the boot registration uses, exposed for
+ *  host-owned single steps (codex-one-step.ts). The agents SDK registry is
+ *  write-only (`setDefaultModelProvider` has no public getter), and a host
+ *  step must bill through the SAME credential router — Codex/ChatGPT OAuth
+ *  under AUTH_MODE=codex_oauth, Claude OAuth, or the user's BYO key — never
+ *  a raw OPENAI_API_KEY. */
+export function resolveHarnessModel(modelName?: string): Promise<Model> | Model {
+  bootDefaultProvider ??= maybeWrapDebate(new RouterModelProvider());
+  return bootDefaultProvider.getModel(modelName);
+}
+
 export interface ConfigureResult {
   ok: boolean;
   reason?: string;
@@ -212,6 +223,18 @@ function applyBrainFallback(from: string, to: BrainMode): ConfigureResult {
  * doomed request.
  */
 export async function configureHarnessRuntime(): Promise<ConfigureResult> {
+  const {
+    configureTypedExecutionRuntime,
+    typedExecutionRuntimeConfigured,
+  } = await import('../semantic-boundary/configure-typed-execution-runtime.js');
+  // A configured daemon reaches this boundary for every chat message. Re-running
+  // the full catalog install/readiness sweep there makes even a zero-tool reply
+  // scan mutable capability state. Auth/model changes already call
+  // resetHarnessRuntimeConfig(), while a missing typed boundary is independently
+  // detectable, so keep the ordinary hot path a true idempotent no-op.
+  if (!configured || !typedExecutionRuntimeConfigured()) {
+    configureTypedExecutionRuntime();
+  }
   if (configured) return { ok: true };
 
   const mode = getModelRoutingMode();

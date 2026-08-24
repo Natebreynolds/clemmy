@@ -3708,9 +3708,11 @@ app.on('ready', () => {
   });
 });
 app.on('window-all-closed', () => {
-  // macOS tray-resident pattern. On Linux/Windows we still quit when
-  // all windows are gone unless the user is explicitly tray-only.
-  if (process.platform !== 'darwin') quitCleanly();
+  // Tray-resident pattern on macOS AND Windows: the app owns the daemon, so
+  // closing the last window must not kill it — the tray keeps both alive
+  // (Windows-readiness sweep 2026-08-20; before this, closing the console on
+  // win32 silently took the daemon down with it). Linux still quits.
+  if (process.platform !== 'darwin' && process.platform !== 'win32') quitCleanly();
 });
 app.on('activate', () => {
   revealMainWindow();

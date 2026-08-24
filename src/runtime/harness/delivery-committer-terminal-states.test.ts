@@ -3,9 +3,10 @@
  *
  * The committer's UNHAPPY terminals.
  *
- * `TurnOutcomeStatus` has five members. The committer's own suite exercises
- * done, needs_input and failed; `blocked` and `cancelled` had no coverage at
- * all. That is the worst place for a gap, because the failure mode of routing
+ * `TurnOutcomeStatus` has seven members. The attempt-backed publication suite
+ * exercises their shared atomic lifecycle; this focused committer suite keeps
+ * explicit public-projection coverage for `blocked` and `cancelled`. That is
+ * the worst place for a gap, because the failure mode of routing
  * every surface through one committer is SILENCE — and silence is
  * indistinguishable from "still working" until someone is standing in front of
  * a demo.

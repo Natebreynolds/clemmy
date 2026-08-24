@@ -352,6 +352,11 @@ test('public tool progress never derives identity from model-supplied carrier ar
 });
 
 test('compact decision assignments are internal protocol, not public prose', () => {
+  const leakedAwait = 'nextAction=awaiting_user_input — The research attempt completed but wasn’t durably recorded.';
+  assert.equal(
+    publicReplyText(leakedAwait, 'safe fallback'),
+    'The research attempt completed but wasn’t durably recorded.',
+  );
   const liveLeak = 'done=true  \nnextAction=completed  \nReconciliation is unnecessary.';
   assert.equal(publicReplyText(liveLeak, 'safe fallback'), 'safe fallback');
   const rawJsonEnvelope = JSON.stringify({
@@ -714,6 +719,52 @@ test('the visibility window ships bounded excerpts and glimpses, re-validated', 
   assert.equal((junk?.data as { glimpse?: unknown }).glimpse, undefined, 'a zero-count or malformed glimpse never ships');
 });
 
+test('expected work progress projects the closed plan card only', async () => {
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const projected = projectHarnessEventForPublic({
+    sessionId: 's', seq: 12, turn: 0, role: 'system', type: 'expected_work_progress',
+    data: {
+      version: 1,
+      sourceUserSeq: 4,
+      rationale: 'model prose that must not ship',
+      lines: [
+        {
+          id: 'research', effect: 'read', state: 'data_in', settled: 0, observed: 1,
+          required: 1, dependsOn: [], secret: 'internals',
+        },
+        {
+          id: 'create_sheet', effect: 'external_write', state: 'blocked_on_dependency',
+          settled: 0, observed: 0, required: 1, dependsOn: ['social_lookup'],
+        },
+        { id: 'bad id', effect: 'read', state: 'open', settled: 0, observed: 0, required: 1, dependsOn: [] },
+      ],
+    },
+  } as never);
+  assert.ok(projected, 'the host card reaches the public stream');
+  const data = projected!.data as {
+    version: number;
+    sourceUserSeq: number;
+    lines: Array<Record<string, unknown>>;
+    rationale?: unknown;
+  };
+  assert.equal(data.version, 1);
+  assert.equal(data.sourceUserSeq, 4);
+  assert.equal(data.rationale, undefined);
+  assert.equal(data.lines.length, 2);
+  assert.deepEqual(data.lines[0], {
+    id: 'research', effect: 'read', state: 'data_in', settled: 0, observed: 1,
+    required: 1, dependsOn: [],
+  });
+  assert.equal(data.lines[1]?.state, 'blocked_on_dependency');
+  const text = JSON.stringify(projected);
+  assert.doesNotMatch(text, /rationale|secret|internals|bad id/, 'control prose and junk ids stay private');
+
+  assert.equal(projectHarnessEventForPublic({
+    sessionId: 's', seq: 13, turn: 0, role: 'system', type: 'expected_work_progress',
+    data: { version: 1, sourceUserSeq: 4, lines: [] },
+  } as never), null, 'an empty card is not a public event');
+});
+
 test('the compiled turn plan projects as SHAPE only — hashes and graph body stay private', async () => {
   const { projectHarnessEventForPublic } = await import('./public-presentation.js');
   const row = projectHarnessEventForPublic({
@@ -778,4 +829,27 @@ test('call_tool progress rows show the REAL inner action, never an anonymous wra
     data: { tool: 'call_tool', callId: 'c3', effectiveTool: '/etc/passwd; rm -rf' },
   } as never);
   assert.equal((junk as { data: Record<string, unknown> }).data.innerTool, undefined);
+});
+
+test('a progress check-in heartbeat carries the host-composed plan line onto the public bus', () => {
+  // The composed line is ledger truth (composeRunProgressLine), not model
+  // prose — dropping it left every surface saying "Still working" while the
+  // plan advanced (live 2026-08-18 session-fixture-unprovisioned-catalog: 13 heartbeats, zero shown).
+  const projected = projectHarnessEventForPublic(event('heartbeat', {
+    kind: 'progress_check_in',
+    message: 'Still working — plan 1/3 steps underway (0 done) · 25-item collection · now: collecting.',
+    internalCounter: 42,
+  }));
+  assert.ok(projected);
+  assert.equal(projected!.data.kind, 'progress_check_in');
+  assert.match(String(projected!.data.message), /plan 1\/3 steps underway/);
+  assert.equal(projected!.data.internalCounter, undefined, 'only the closed payload crosses');
+
+  // Other heartbeat kinds keep the kind-only projection (no free-text lift).
+  const budget = projectHarnessEventForPublic(event('heartbeat', {
+    kind: 'budget_threshold',
+    message: 'must not cross for non-progress kinds',
+  }));
+  assert.ok(budget);
+  assert.equal(budget!.data.message, undefined);
 });

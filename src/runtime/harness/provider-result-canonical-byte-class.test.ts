@@ -101,6 +101,27 @@ function settleProviderResult(input: {
   return { task, logicalToolCallId, resultHandleId: settled.settlement.resultHandleId! };
 }
 
+function rewriteFrozenEnvelopeMetadataForFixture(
+  resultHandleId: string,
+  envelopeMetaJson: string | null,
+): void {
+  const db = eventlog.openEventLog();
+  db.exec('DROP TRIGGER trg_durable_result_identity_immutable');
+  try {
+    db.prepare(`UPDATE durable_result_handles
+      SET envelope_meta_json = ?
+      WHERE handle_id = ?`).run(envelopeMetaJson, resultHandleId);
+  } finally {
+    db.exec(`
+      CREATE TRIGGER trg_durable_result_identity_immutable
+      BEFORE UPDATE ON durable_result_handles
+      BEGIN
+        SELECT RAISE(ABORT, 'durable result handles are immutable');
+      END;
+    `);
+  }
+}
+
 test('authoritative settlement freezes canonical JSON bytes across provider SDK result families', () => {
   const fixtures = [
     {
@@ -201,6 +222,63 @@ test('authoritative settlement freezes canonical JSON bytes across provider SDK 
       `${fixture.label}: every frozen projection comes from the retained value`,
     );
   }
+});
+
+test('a legacy clean handle may lack newly-derived envelope metadata, but conflicting metadata stays corrupt', () => {
+  const clean = settleProviderResult({
+    label: 'legacy-clean-envelope',
+    tool: 'alpha_records_search',
+    args: { query: 'alpha' },
+    mutating: false,
+    payload: {
+      successful: true,
+      logId: 'legacy-clean-log',
+      error: null,
+      data: { items: [{ id: 'alpha-1', value: 'Alpha' }] },
+    },
+  });
+  rewriteFrozenEnvelopeMetadataForFixture(clean.resultHandleId, null);
+  eventlog.closeEventLog();
+  const redeemed = resultHandles.redeemSuccessfulSettlementResultForHost({
+    sessionId: clean.task.sessionId,
+    sourceUserSeq: clean.task.sourceUserSeq,
+    acceptedTaskId: clean.task.acceptedTaskId,
+    logicalToolCallId: clean.logicalToolCallId,
+  });
+  assert.equal(redeemed.status, 'ok', JSON.stringify(redeemed));
+  if (redeemed.status === 'ok') {
+    assert.deepEqual(
+      redeemed.value.handle.envelopeMeta,
+      { successful: true, logId: 'legacy-clean-log' },
+      'legacy redemption exposes metadata re-derived from the retained bytes',
+    );
+  }
+
+  const conflicting = settleProviderResult({
+    label: 'legacy-conflicting-envelope',
+    tool: 'alpha_records_search',
+    args: { query: 'alpha' },
+    mutating: false,
+    payload: {
+      successful: true,
+      logId: 'real-log',
+      data: { items: [{ id: 'alpha-1', value: 'Alpha' }] },
+    },
+  });
+  rewriteFrozenEnvelopeMetadataForFixture(
+    conflicting.resultHandleId,
+    JSON.stringify({ successful: true, logId: 'forged-log' }),
+  );
+  const refused = resultHandles.redeemSuccessfulSettlementResultForHost({
+    sessionId: conflicting.task.sessionId,
+    sourceUserSeq: conflicting.task.sourceUserSeq,
+    acceptedTaskId: conflicting.task.acceptedTaskId,
+    logicalToolCallId: conflicting.logicalToolCallId,
+  });
+  assert.deepEqual(
+    refused,
+    { status: 'corrupt', reason: 'settlement result projections disagree with raw bytes' },
+  );
 });
 
 test('provider-family projection mutation invalidates authoritative redemption', () => {

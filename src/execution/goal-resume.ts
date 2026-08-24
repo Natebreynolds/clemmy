@@ -301,8 +301,17 @@ export async function processGoalResumptions(): Promise<void> {
               import('../runtime/harness/loop.js'),
               import('../agents/orchestrator.js'),
             ]);
-            const agent = await buildOrchestratorAgent({ userInput: directive, sessionId: goal.sessionId! });
-            await runConversation({ agent, sessionId: goal.sessionId!, input: directive, judgeCompletion: true });
+            await runConversation({
+              sessionId: goal.sessionId!,
+              input: directive,
+              judgeCompletion: true,
+              buildAgent: (identity) => buildOrchestratorAgent({
+                userInput: directive,
+                sessionId: identity.sessionId,
+                sourceUserSeq: identity.sourceUserSeq,
+                acceptedRoute: identity.route,
+              }),
+            });
           } catch (err) {
             logger.warn({ err: err instanceof Error ? err.message : err, goalId: goal.id }, 'goal resume turn failed');
           }

@@ -394,3 +394,55 @@ test('assistantMessage output validates against the installed SDK protocol', asy
   // []), but an empty output_text part must still be protocol-legal — guard it.
   await t.test('an empty-string content part', () => check('empty', ''));
 });
+
+/* ── PHASE 1A — IN-BAND FAILURE BECOMES CANONICAL TERMINATION ───────────────
+ *
+ * This CLI exits ZERO and reports failure inside the result event via
+ * `is_error` + `subtype`. Recording those as bookkeeping left the shared
+ * admission boundary seeing an ordinary response with no termination metadata,
+ * so a failed run's partial text was admitted as a finished answer. The
+ * normalisation lives in this adapter; the boundary stays provider-neutral.
+ */
+
+async function runHeadlessAndAdmit(events: unknown[]) {
+  installSpawnMock(events as never, {});
+  const model = new ClaudeHeadlessModel('claude-opus-4-8');
+  const response = await model.getResponse({
+    systemInstructions: 'sys', input: 'go', modelSettings: {},
+    tools: [], outputType: 'text', handoffs: [], tracing: false,
+  } as any);
+  return response as { output?: unknown[]; providerData?: Record<string, unknown> };
+}
+
+test('an errored result never emits its partial text as a completed answer', async () => {
+  const response = await runHeadlessAndAdmit([
+    { type: 'system', subtype: 'init', session_id: 'err-1' },
+    { type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 'err-1', result: 'PARTIAL-ERROR-TEXT' },
+  ]);
+  assert.deepEqual(response.output, [], 'the partial text is not presented as an assistant message');
+  assert.equal(response.providerData?.status, 'failed', 'and the failure is projected canonically');
+  assert.equal(response.providerData?.resultSubtype, 'error_during_execution',
+    'the raw subtype is retained privately for diagnostics');
+});
+
+test('error_max_turns becomes a bounded-limit stop, not an opaque failure', async () => {
+  const response = await runHeadlessAndAdmit([
+    { type: 'system', subtype: 'init', session_id: 'err-2' },
+    { type: 'result', subtype: 'error_max_turns', is_error: true, session_id: 'err-2', result: 'ran out of turns' },
+  ]);
+  assert.deepEqual(response.output, []);
+  assert.equal(response.providerData?.finish_reason, 'max_output_tokens',
+    'running out of turns is a limit the host can explain, not an unknown failure');
+  assert.notEqual(response.providerData?.status, 'failed');
+  assert.equal(response.providerData?.resultSubtype, 'error_max_turns');
+});
+
+test('a successful result is untouched by the failure projection', async () => {
+  const response = await runHeadlessAndAdmit([
+    { type: 'system', subtype: 'init', session_id: 'ok-1' },
+    { type: 'result', subtype: 'success', session_id: 'ok-1', result: 'the answer' },
+  ]);
+  assert.equal((response.output ?? []).length, 1, 'a good answer still presents');
+  assert.equal(response.providerData?.status, undefined);
+  assert.equal(response.providerData?.finish_reason, undefined);
+});

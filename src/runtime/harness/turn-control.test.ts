@@ -27,6 +27,7 @@ const {
   composeKillAwareShouldCancel,
   evaluateTurnBoundary,
   classifyTurnPreflight,
+  classifyFreshMaterialSourcePreflight,
   closeTheLoopNudge,
   CONFIRM_BEAT_TEXT,
   confirmBeatDirective,
@@ -35,12 +36,40 @@ const {
   confirmBeatEnabled,
   setProvenStandardLineForTest,
   effectiveTurnObjective,
+  answerAffirmsTurnSourceStrategyBinding,
+  sourceStrategyBindingAffirmedByAnswer,
   recordTurnPreflightDecision,
   PREFLIGHT_ALIGNMENT_SOURCE,
 } = await import('./turn-control.js');
 const { appendEvent } = await import('./eventlog.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
+
+const SOURCE_STRATEGY_BINDING = {
+  version: 1,
+  primary: {
+    capabilityId: 'capability:aggregate-source-v1',
+    accountIdentity: 'account:primary',
+    schemaFingerprint: 'schema:aggregate-v1',
+  },
+  equivalentFallbacks: [
+    { capabilityId: 'capability:aggregate-source-compatible' },
+  ],
+  topology: 'single_aggregate_read_then_single_artifact_write',
+  topologyDigest: 'b'.repeat(64),
+  destination: { family: 'workbook', posture: 'create_new' },
+  effect: 'external_write',
+} as const satisfies import('./turn-control.js').TurnSourceStrategyBindingV1;
+
+const NAMED_SOURCE_STRATEGY_BINDING = {
+  version: 1,
+  primary: { capabilityId: 'capability:composio:APIFY_AGGREGATE_READ' },
+  equivalentFallbacks: [{ capabilityId: 'capability:mcp:sourceco__aggregate_read' }],
+  topology: 'single_aggregate_read_then_single_artifact_write',
+  topologyDigest: 'c'.repeat(64),
+  destination: { family: 'workbook', posture: 'create_new' },
+  effect: 'external_write',
+} as const satisfies import('./turn-control.js').TurnSourceStrategyBindingV1;
 
 let seq = 0;
 function freshSession(kind = 'chat'): string {
@@ -56,6 +85,7 @@ function commitStructuralAlignment(input: {
   sourceTurn: number;
   intentKey: string;
   question?: string;
+  sourceStrategyBinding?: import('./turn-control.js').TurnSourceStrategyBindingV1;
 }): void {
   const question = input.question ?? 'I have the request. Should I go ahead?';
   appendEvent({
@@ -69,6 +99,9 @@ function commitStructuralAlignment(input: {
       source: PREFLIGHT_ALIGNMENT_SOURCE,
       sourceUserSeq: input.sourceSeq,
       intentKey: input.intentKey,
+      ...(input.sourceStrategyBinding
+        ? { sourceStrategyBinding: input.sourceStrategyBinding }
+        : {}),
     },
   });
   const identity = {
@@ -218,8 +251,8 @@ test('grindGateVerdict: a fanout refuse fires only for honorFanout callers, sile
     assert.equal(fanout.interrupt, false, 'fanout steer is a soft deny the model reads');
     assert.match(fanout.message, /REFUSED|one-at-a-time|program/i);
   }
-  // A caller WITHOUT run_tool_program (worker/step) gets a silent allow — no
-  // deny and no phantom guardrail_tripped event (review wf_2ed83f94 #6).
+  // A worker/step caller gets a silent allow — no deny and no phantom
+  // guardrail_tripped event (review wf_2ed83f94 #6).
   const sess2 = freshSession();
   for (let i = 1; i <= 12; i++) {
     const v = grindGateVerdict(sess2, 'dataforseo__serp_organic_live_advanced', { keyword: `firm ${i} austin`, url: `https://tx${i}.com` });
@@ -396,8 +429,73 @@ test('confirm beat: old completions never grant permanent alignment; reads and n
   assert.equal(confirmBeatDirective({ message: 'check my email and tell me if the accountant replied about the invoice', sessionId: chat, sessionKind: 'chat' }), null, 'read-lead + bare noun → no beat');
   assert.equal(confirmBeatDirective({ message: 'look at the github repo and summarize the recent commits', sessionId: chat, sessionKind: 'chat' }), null, 'read-lead over write-ish nouns → no beat');
   assert.equal(confirmBeatDirective({ message: msg, sessionId: freshSession('execution'), sessionKind: 'execution' }), null, 'non-chat → no beat');
+  const construct = 'Find the page for example.com and scrape their last 5 facebook post and put them in a new google sheet for me.';
+  const constructDecision = classifyTurnPreflight({
+    message: construct,
+    sessionId: chat,
+    sessionKind: 'chat',
+  });
+  assert.equal(constructDecision.phase, 'align', 'a find-lead construct is still work');
+  assert.equal(constructDecision.reason, 'collect_then_construct');
+  const fieldList = 'Find the official blog for example.com, grab the last 5 blog post, and put the title, date, and link on a new workbook for me.';
+  const fieldListDecision = classifyTurnPreflight({
+    message: fieldList,
+    sessionId: chat,
+    sessionKind: 'chat',
+  });
+  assert.equal(fieldListDecision.phase, 'align');
+  assert.equal(fieldListDecision.reason, 'collect_then_construct');
+  assert.ok(
+    confirmBeatDirective({ message: construct, sessionId: chat, sessionKind: 'chat' }),
+    'the existing align beat speaks the how; it does not add a new gate',
+  );
   process.env.CLEMMY_CONFIRM_BEAT = 'off';
   assert.equal(confirmBeatDirective({ message: msg, sessionId: freshSession('chat'), sessionKind: 'chat' }), null, 'kill-switch respected');
+});
+
+test('an unspecified collect-to-artifact source stays current-turn scoped, while explicit or standing sources stay pinned', () => {
+  const message = 'Find me the top 5 restaurants in Pismo Beach CA based on Google reviews, give me the review count and phone number for each, and create a new Google Sheet.';
+  const material = classifyTurnPreflight({
+    message,
+    sessionId: freshSession('chat'),
+    sessionKind: 'chat',
+  });
+  assert.equal(material.phase, 'align');
+  assert.equal(material.reason, 'collect_then_construct');
+  assert.equal(material.sourceStrategyPosture, undefined);
+  assert.equal(material.confirmationDisposition, undefined,
+    'an ordinary fresh task does not need a historical source A/Q/B checkpoint');
+  assert.ok(material.allowedMutationEffects?.includes('external_write'));
+  assert.ok(material.allowedActionFamilies?.includes('create'));
+
+  const explicitlyPinned = classifyTurnPreflight({
+    message: `Use CollectorX to handle the source phase. ${message}`,
+    sessionId: freshSession('chat'),
+    sessionKind: 'chat',
+  });
+  assert.equal(explicitlyPinned.phase, 'align');
+  assert.equal(explicitlyPinned.sourceStrategyPosture, 'confirmed_exact');
+  assert.equal(explicitlyPinned.confirmationDisposition, undefined);
+
+  const explicitlyPinnedFromApi = classifyTurnPreflight({
+    message: `Pull the restaurant results from the CollectorX API. ${message}`,
+    sessionId: freshSession('chat'),
+    sessionKind: 'chat',
+  });
+  assert.equal(explicitlyPinnedFromApi.phase, 'align');
+  assert.equal(explicitlyPinnedFromApi.sourceStrategyPosture, 'confirmed_exact');
+  assert.equal(explicitlyPinnedFromApi.confirmationDisposition, undefined,
+    'an explicitly named source API must not trigger a redundant source-choice question');
+
+  const standing = classifyTurnPreflight({
+    message,
+    sessionId: freshSession('chat'),
+    sessionKind: 'chat',
+    sourceStrategyPosture: 'standing_exact',
+  });
+  assert.equal(standing.phase, 'align');
+  assert.equal(standing.sourceStrategyPosture, 'standing_exact');
+  assert.equal(standing.confirmationDisposition, undefined);
 });
 
 // (fold 2026-07-17) The fail-closed preflightGateVerdict tool gate was DEMOTED
@@ -427,6 +525,298 @@ test('typed preflight is durable; approval binds to the exact pending request', 
   const execute = classifyTurnPreflight({ message: 'Go ahead.', sessionId, sessionKind: 'chat' });
   assert.equal(execute.phase, 'execute');
   assert.equal(execute.confirmedIntentKey, align.intentKey, 'approval binds to the exact pending request');
+});
+
+test('a later yes preserves the exact typed source-strategy binding and cannot approve a widened pending copy', () => {
+  const sessionId = freshSession('chat');
+  const objective = 'Find the top 5 places by public ratings and create one new workbook.';
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective },
+  });
+  const align = classifyTurnPreflight({
+    message: objective,
+    sessionId,
+    sessionKind: 'chat',
+    sourceUserSeq: source.seq,
+    sourceStrategyBinding: SOURCE_STRATEGY_BINDING,
+  });
+  assert.equal(align.confirmationDisposition, 'material_source_strategy');
+  assert.equal(JSON.stringify(align.sourceStrategyBinding), JSON.stringify(SOURCE_STRATEGY_BINDING));
+  recordTurnPreflightDecision(sessionId, align, source.seq);
+  commitStructuralAlignment({
+    sessionId,
+    sourceSeq: source.seq,
+    sourceTurn: source.turn,
+    intentKey: align.intentKey!,
+    sourceStrategyBinding: SOURCE_STRATEGY_BINDING,
+  });
+  const approval = appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Yes.' },
+  });
+  const execute = classifyTurnPreflight({
+    message: 'Yes.',
+    sessionId,
+    sessionKind: 'chat',
+    sourceUserSeq: approval.seq,
+  });
+  assert.equal(execute.reason, 'continuation_approved');
+  assert.equal(
+    JSON.stringify(execute.sourceStrategyBinding),
+    JSON.stringify(SOURCE_STRATEGY_BINDING),
+    'confirmation carries the selector binding byte-for-byte',
+  );
+
+  const widenedSession = freshSession('chat');
+  const widenedSource = appendEvent({
+    sessionId: widenedSession,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective },
+  });
+  const widenedAlign = classifyTurnPreflight({
+    message: objective,
+    sessionId: widenedSession,
+    sessionKind: 'chat',
+    sourceUserSeq: widenedSource.seq,
+    sourceStrategyBinding: SOURCE_STRATEGY_BINDING,
+  });
+  recordTurnPreflightDecision(widenedSession, widenedAlign, widenedSource.seq);
+  commitStructuralAlignment({
+    sessionId: widenedSession,
+    sourceSeq: widenedSource.seq,
+    sourceTurn: widenedSource.turn,
+    intentKey: widenedAlign.intentKey!,
+    sourceStrategyBinding: {
+      ...SOURCE_STRATEGY_BINDING,
+      equivalentFallbacks: [
+        ...SOURCE_STRATEGY_BINDING.equivalentFallbacks,
+        { capabilityId: 'capability:unconfirmed-extra' },
+      ],
+    },
+  });
+  const widenedYes = appendEvent({
+    sessionId: widenedSession,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Yes.' },
+  });
+  const refused = classifyTurnPreflight({
+    message: 'Yes.',
+    sessionId: widenedSession,
+    sessionKind: 'chat',
+    sourceUserSeq: widenedYes.seq,
+  });
+  assert.equal(refused.confirmedIntentKey, undefined, 'a widened pending copy cannot inherit approval');
+  assert.equal(refused.sourceStrategyBinding, undefined);
+});
+
+test('a bound source answer accepts only bare approval or the exact primary identity', () => {
+  assert.equal(answerAffirmsTurnSourceStrategyBinding('Yes.', NAMED_SOURCE_STRATEGY_BINDING), true);
+  const exactNamedPrimary = 'Use Apify as the restaurant source.';
+  assert.equal(answerAffirmsTurnSourceStrategyBinding(exactNamedPrimary, NAMED_SOURCE_STRATEGY_BINDING), true);
+  assert.deepEqual(
+    sourceStrategyBindingAffirmedByAnswer(exactNamedPrimary, NAMED_SOURCE_STRATEGY_BINDING),
+    NAMED_SOURCE_STRATEGY_BINDING,
+    'the exact whole-answer primary selection remains supported',
+  );
+  assert.equal(
+    answerAffirmsTurnSourceStrategyBinding('Do not use Apify as the restaurant source.', NAMED_SOURCE_STRATEGY_BINDING),
+    false,
+    'negated primary wording is never affirmative selection evidence',
+  );
+  assert.equal(
+    answerAffirmsTurnSourceStrategyBinding('Use Sourceco as the restaurant source.', NAMED_SOURCE_STRATEGY_BINDING),
+    false,
+    'a named fallback must be deterministically rebased before it can approve execution',
+  );
+  assert.equal(
+    answerAffirmsTurnSourceStrategyBinding('Use DataForSEO as the restaurant source.', NAMED_SOURCE_STRATEGY_BINDING),
+    false,
+  );
+  const primaryOnly = 'Yes—use exactly the primary source action you named, with the same parameters. Do not use the fallback.';
+  assert.equal(answerAffirmsTurnSourceStrategyBinding(primaryOnly, NAMED_SOURCE_STRATEGY_BINDING), true);
+  assert.deepEqual(
+    sourceStrategyBindingAffirmedByAnswer(primaryOnly, NAMED_SOURCE_STRATEGY_BINDING),
+    { ...NAMED_SOURCE_STRATEGY_BINDING, equivalentFallbacks: [] },
+    'the provider-neutral structural answer revokes fallback authority',
+  );
+  for (const widened of [
+    'Yes—use exactly the fallback source action you named, with the same parameters. Do not use the primary.',
+    'Yes—use exactly the primary source action you named, with different parameters. Do not use the fallback.',
+    'Yes—use exactly the primary source action you named, with the same parameters. Do not use the fallback. Also email it.',
+  ]) {
+    assert.equal(answerAffirmsTurnSourceStrategyBinding(widened, NAMED_SOURCE_STRATEGY_BINDING), false, widened);
+  }
+  for (const compoundNamedPrimary of [
+    'Use Apify as the restaurant source. Do not use the fallback.',
+    'Use Apify as the restaurant source. Also email it.',
+    'Use Apify as the restaurant source, not Sourceco.',
+    'Use Apify as the fallback source.',
+    'Use Apify as the not-preferred source.',
+    'Use Apify as the backup source.',
+    'Use Apify as the alternate source.',
+    'Use Apify as the secondary source.',
+    'Use Apify as the non-primary source.',
+    'Use Apify as the failover source.',
+    'Use Apify as the contingency source.',
+    'Use Apify as the emergency source.',
+    'Use Apify as the tertiary source.',
+  ]) {
+    assert.equal(
+      sourceStrategyBindingAffirmedByAnswer(compoundNamedPrimary, NAMED_SOURCE_STRATEGY_BINDING),
+      null,
+      compoundNamedPrimary,
+    );
+  }
+});
+
+test('material-source approval is byte-bound to the exact durable non-synthetic B row', () => {
+  const answerText = 'Yes—use exactly the primary source action you named, with the same parameters. Do not use the fallback.';
+  const setup = () => {
+    const sessionId = freshSession('chat');
+    const objective = 'Find the top 5 restaurants by public ratings and create one new workbook.';
+    const source = appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: objective },
+    });
+    const align = classifyTurnPreflight({
+      message: objective,
+      sessionId,
+      sessionKind: 'chat',
+      sourceUserSeq: source.seq,
+      sourceStrategyBinding: NAMED_SOURCE_STRATEGY_BINDING,
+    });
+    assert.equal(align.confirmationDisposition, 'material_source_strategy');
+    recordTurnPreflightDecision(sessionId, align, source.seq);
+    commitStructuralAlignment({
+      sessionId,
+      sourceSeq: source.seq,
+      sourceTurn: source.turn,
+      intentKey: align.intentKey!,
+      sourceStrategyBinding: NAMED_SOURCE_STRATEGY_BINDING,
+    });
+    return sessionId;
+  };
+
+  const exactSession = setup();
+  const exact = appendEvent({
+    sessionId: exactSession,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: answerText },
+  });
+  const approved = classifyTurnPreflight({
+    message: answerText,
+    sessionId: exactSession,
+    sessionKind: 'chat',
+    sourceUserSeq: exact.seq,
+    sourceStrategyBinding: NAMED_SOURCE_STRATEGY_BINDING,
+  });
+  assert.equal(approved.reason, 'continuation_approved');
+  assert.deepEqual(approved.sourceStrategyBinding?.equivalentFallbacks, []);
+
+  const mismatchSession = setup();
+  const rejecting = appendEvent({
+    sessionId: mismatchSession,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'No. Use a different source.' },
+  });
+  const mismatchedCaller = classifyTurnPreflight({
+    message: answerText,
+    sessionId: mismatchSession,
+    sessionKind: 'chat',
+    sourceUserSeq: rejecting.seq,
+    sourceStrategyBinding: NAMED_SOURCE_STRATEGY_BINDING,
+  });
+  assert.notEqual(mismatchedCaller.reason, 'continuation_approved');
+  assert.equal(mismatchedCaller.confirmedIntentKey, undefined);
+
+  const syntheticSession = setup();
+  const synthetic = appendEvent({
+    sessionId: syntheticSession,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: answerText, synthetic: true },
+  });
+  const syntheticCaller = classifyTurnPreflight({
+    message: answerText,
+    sessionId: syntheticSession,
+    sessionKind: 'chat',
+    sourceUserSeq: synthetic.seq,
+    sourceStrategyBinding: NAMED_SOURCE_STRATEGY_BINDING,
+  });
+  assert.notEqual(syntheticCaller.reason, 'continuation_approved');
+  assert.equal(syntheticCaller.confirmedIntentKey, undefined);
+});
+
+test('a durable material-source question with no binding cannot turn bare Yes into execution authority', () => {
+  const sessionId = freshSession('chat');
+  const objective = 'Find the top 5 restaurants in Pismo Beach by public reviews and create one new workbook.';
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective },
+  });
+  const align = classifyFreshMaterialSourcePreflight({
+    message: objective,
+    sessionId,
+    sessionKind: 'chat',
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(align.confirmationDisposition, 'material_source_strategy');
+  assert.equal(align.sourceStrategyBinding, undefined);
+  recordTurnPreflightDecision(sessionId, align, source.seq);
+  commitStructuralAlignment({
+    sessionId,
+    sourceSeq: source.seq,
+    sourceTurn: source.turn,
+    intentKey: align.intentKey!,
+    question: 'Which source should I use for the restaurant data?',
+  });
+
+  const yes = appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Yes.' },
+  });
+  const refused = classifyTurnPreflight({
+    message: 'Yes.',
+    sessionId,
+    sessionKind: 'chat',
+    sourceUserSeq: yes.seq,
+  });
+  assert.notEqual(refused.reason, 'continuation_approved');
+  assert.equal(refused.confirmedIntentKey, undefined);
+  assert.equal(refused.sourceStrategyBinding, undefined);
+
+  const explicit = classifyTurnPreflight({
+    message: `Use Apify for the restaurant source. ${objective}`,
+    sessionId,
+    sessionKind: 'chat',
+  });
+  assert.equal(explicit.sourceStrategyPosture, 'confirmed_exact',
+    'naming a source is fresh explicit authority, unlike bare confirmation');
 });
 
 test('an advisory align row alone never authorizes a later bare confirmation', () => {
@@ -683,6 +1073,32 @@ test('pre-authorized work is never interrupted by a beat', () => {
   }
 });
 
+test('fresh material-source alignment cannot be bypassed by the beat kill switch or pre-authorization', () => {
+  const sessionId = freshSession();
+  process.env.CLEMMY_CONFIRM_BEAT = 'off';
+  const message = 'fully autonomously in the background: find 10 law firms and put them in a spreadsheet';
+
+  const decision = classifyFreshMaterialSourcePreflight({
+    message,
+    sessionId,
+    sessionKind: 'chat',
+    isMultiItem: true,
+    itemCount: 10,
+    sourceStrategyBinding: NAMED_SOURCE_STRATEGY_BINDING,
+  });
+  assert.equal(decision.phase, 'align');
+  assert.equal(decision.reason, 'collect_then_construct');
+  assert.equal(decision.consequential, true);
+  assert.equal(decision.objective, message);
+  assert.equal(typeof decision.intentKey, 'string');
+  assert.ok(decision.intentKey);
+  assert.equal(decision.sourceStrategyPosture, 'materially_variant');
+  assert.equal(decision.confirmationDisposition, 'material_source_strategy');
+  assert.deepEqual(decision.sourceStrategyBinding, NAMED_SOURCE_STRATEGY_BINDING);
+  assert.ok((decision.allowedMutationEffects ?? []).includes('external_write'));
+  assert.ok((decision.allowedDestinations ?? []).includes('google_sheets'));
+});
+
 test('quick reads and chit-chat stay silent', () => {
   const sess = { id: freshSession() };
   for (const message of ['whats on my calendar today', 'Hey', 'hows it going', 'can Google Docs create tables?']) {
@@ -787,6 +1203,7 @@ test('destinationInstanceUnstated: a named target is not an open question', () =
     ['append to https://docs.google.com/spreadsheets/d/abc', 'google_sheets', false],
     ['add them to the sheet called Q3 Pipeline', 'google_sheets', false],
     ['put them in the same spreadsheet as last time', 'google_sheets', false],
+    ['put all the info in a google sheet for me and give me the link here', 'google_sheets', false],
   ];
   for (const [text, destination, expected] of cases) {
     assert.equal(

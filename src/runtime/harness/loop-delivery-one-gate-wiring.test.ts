@@ -14,7 +14,8 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { after, beforeEach, test } from 'node:test';
-import { Agent, RunContext, RunState, type Runner } from '@openai/agents';
+import { Agent, type Runner } from '@openai/agents';
+import { HostInterruptState } from './host-turn-runner.js';
 import type { BoundaryJudgeRouting } from './debate-model.js';
 import type {
   TerminalDeliveryJudgePort,
@@ -76,26 +77,19 @@ function completed(items: unknown[]) {
 }
 
 function approvalRunState(
-  agent: Agent<any, any>,
+  _agent: Agent<any, any>,
   toolName: string,
 ): string {
-  const state = new RunState(new RunContext({}), 'approve this', agent, null);
-  const json = state.toJSON() as Record<string, unknown>;
-  json.currentStep = {
-    type: 'next_step_interruption',
-    data: {
-      interruptions: [{
-        rawItem: {
-          type: 'function_call',
-          name: toolName,
-          callId: `${toolName}_call`,
-          arguments: '{}',
-        },
-        toolName,
-      }],
-    },
-  };
-  return JSON.stringify(json);
+  // Runner de-ownership (2026-08-18): paused turns persist HOST interrupt
+  // state; the resume owner consumes the same duck-typed surface.
+  return new HostInterruptState(
+    [{ type: 'message', role: 'user', content: 'approve this' } as never],
+    [{
+      callId: `${toolName}_call`,
+      name: toolName,
+      rawItem: { name: toolName, arguments: '{}', callId: `${toolName}_call` },
+    }],
+  ).toString();
 }
 
 function proposal() {
@@ -126,8 +120,15 @@ function proposal() {
 /** Freeze a two-operation action contract and settle its first requirement.
  * The intentionally missing write makes presentation repair run; whether the
  * read succeeded is the earned difference between DISCLOSE and HOLD. */
-function stageIncompleteAction(sessionId: string, readOutcome: 'failed' | 'succeeded') {
-  const source = eventlog.listEvents(sessionId, { types: ['user_input_received'] }).at(-1);
+function stageIncompleteAction(
+  sessionId: string,
+  readOutcome: 'failed' | 'succeeded',
+  exactSourceUserSeq?: number,
+) {
+  const source = exactSourceUserSeq
+    ? eventlog.listEvents(sessionId, { types: ['user_input_received'] })
+      .find((event) => event.seq === exactSourceUserSeq)
+    : eventlog.listEvents(sessionId, { types: ['user_input_received'] }).at(-1);
   assert.ok(source, 'runConversation accepted the exact source before invoking the model');
   assert.equal(
     admission.actionExpectedWorkState({ sessionId, sourceUserSeq: source.seq }).status,
@@ -346,8 +347,12 @@ async function runResumedIncompleteAction(direction: 'hold' | 'disclose') {
   });
   let repairCalls = 0;
   let sourceUserSeq = 0;
+  let builtIdentity: { sessionId: string; sourceUserSeq: number; route: 'direct_reply' | 'retrieve' | 'act' } | undefined;
   const result = await runConversationFromResume({
-    agent,
+    buildAgent: async (identity) => {
+      builtIdentity = identity;
+      return agent;
+    },
     sessionId: session.id,
     approvalId: approval.approvalId,
     decision: 'approve',
@@ -356,7 +361,12 @@ async function runResumedIncompleteAction(direction: 'hold' | 'disclose') {
     makeRunner: makeRunnerStub,
     runRunner: async (runner, _agent, items) => {
       (runner as unknown as EventEmitter).emit('agent_tool_start');
-      sourceUserSeq = stageIncompleteAction(session.id, 'succeeded').sourceUserSeq;
+      assert.ok(builtIdentity, 'the resume agent must be built from exact route authority before execution');
+      sourceUserSeq = stageIncompleteAction(
+        session.id,
+        'succeeded',
+        builtIdentity.sourceUserSeq,
+      ).sourceUserSeq;
       if (direction === 'hold') {
         const source = eventlog.listEvents(session.id, { types: ['user_input_received'] }).at(-1)!;
         recordIrreversibleUncertainWrite({
@@ -378,7 +388,19 @@ async function runResumedIncompleteAction(direction: 'hold' | 'disclose') {
       async run() { throw new Error('unavailable judge must not run'); },
     },
   });
-  return { result, repairCalls, sessionId: session.id, sourceUserSeq };
+  assert.ok(builtIdentity, 'approval resume builds only after exact route admission');
+  assert.ok(
+    sourceUserSeq > 0,
+    `approval resume must execute its saved SDK state: ${JSON.stringify(result)}`,
+  );
+  return {
+    result,
+    repairCalls,
+    sessionId: session.id,
+    sourceUserSeq: builtIdentity.sourceUserSeq,
+    approvalId: approval.approvalId,
+    builtIdentity,
+  };
 }
 
 beforeEach(() => {
@@ -401,8 +423,8 @@ test('loop calls terminal repair and holds when the source has no successful bus
   assert.equal(repairCalls, 1, 'the loop must call the sealed terminal-repair port');
   assert.equal(
     result.status,
-    'awaiting_user_input',
-    'the loop-specific hold branch must run, not merely rely on the downstream committer',
+    'blocked',
+    'the compatibility status must reflect the loop-specific durable hold',
   );
   assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
@@ -536,7 +558,7 @@ test('loop takes the sole deterministic HOLD edge for an irreversible uncertain 
     assert.equal(settlementAudit.status, 'uncertain_write', JSON.stringify(settlementAudit));
     assert.equal(delivery.deliveryMustHoldForHuman(settlementAudit), true);
     assert.equal(repairCalls, 1, 'the exact loop terminal must spend the sealed repair');
-    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(result.status, 'blocked');
     assert.equal(result.publicPresentation?.status, 'blocked');
     assert.equal(result.publicPresentation?.text, hold);
     const terminal = eventlog.listEvents(session.id, { types: ['conversation_completed'] }).at(-1);
@@ -562,7 +584,7 @@ test('loop calls terminal repair and takes the disclosure edge after real work s
   assert.equal(settlementAudit.facts.successfulBusinessSettlements, 1, JSON.stringify(settlementAudit));
 
   assert.equal(repairCalls, 1, 'the loop must call the sealed terminal-repair port');
-  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.status, 'blocked');
   // The lane takes the disclose edge and asks the shared committer to publish
   // done. The accepted-task state machine still refuses to close an incomplete
   // frozen contract, so the committer correctly falls back to a hold. The
@@ -581,12 +603,13 @@ test('loop calls terminal repair and takes the disclosure edge after real work s
 });
 
 test('approval-resume loop asks the shared gate and takes HOLD for an irreversible uncertain write', async () => {
-  const { result, repairCalls, sessionId, sourceUserSeq } = await runResumedIncompleteAction('hold');
+  const { result, repairCalls, sessionId, sourceUserSeq, builtIdentity } = await runResumedIncompleteAction('hold');
+  assert.equal(builtIdentity.route, 'act', 'resume construction receives the admitted action route');
   const settlementAudit = audit.auditAcceptedSourceSettlementTruth({ sessionId, sourceUserSeq });
   assert.equal(settlementAudit.status, 'uncertain_write', JSON.stringify(settlementAudit));
   assert.equal(delivery.deliveryMustHoldForHuman(settlementAudit), true);
   assert.equal(repairCalls, 1, 'the approval-resume terminal called the sealed repair port');
-  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.status, 'blocked');
   assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
   const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
@@ -602,13 +625,14 @@ test('approval-resume loop asks the shared gate and takes HOLD for an irreversib
 });
 
 test('approval-resume loop asks the shared gate and takes DISCLOSE after real work succeeded', async () => {
-  const { result, repairCalls, sessionId, sourceUserSeq } = await runResumedIncompleteAction('disclose');
+  const { result, repairCalls, sessionId, sourceUserSeq, builtIdentity } = await runResumedIncompleteAction('disclose');
+  assert.equal(builtIdentity.route, 'act', 'resume construction receives the admitted action route');
   const settlementAudit = audit.auditAcceptedSourceSettlementTruth({ sessionId, sourceUserSeq });
   assert.equal(settlementAudit.status, 'clean', JSON.stringify(settlementAudit));
   assert.equal(settlementAudit.facts.successfulBusinessSettlements, 1, JSON.stringify(settlementAudit));
   assert.equal(delivery.deliveryMustHoldForHuman(settlementAudit), false);
   assert.equal(repairCalls, 1, 'the approval-resume terminal called the sealed repair port');
-  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.status, 'blocked');
   assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
   const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
@@ -616,6 +640,30 @@ test('approval-resume loop asks the shared gate and takes DISCLOSE after real wo
     terminal?.data.deliveryDisclosure,
     'state_machine_hold',
     'DISCLOSE reached the committer before incomplete durable authority forced its documented fallback',
+  );
+});
+
+test('an exact approval-resume retry replays its terminal without rebuilding or rerunning tools', async () => {
+  const first = await runResumedIncompleteAction('hold');
+  let rebuilds = 0;
+  const replay = await runConversationFromResume({
+    buildAgent: async () => {
+      rebuilds += 1;
+      throw new Error('terminal replay must not rebuild an agent');
+    },
+    sessionId: first.sessionId,
+    sourceUserSeq: first.sourceUserSeq,
+    approvalId: first.approvalId,
+    decision: 'approve',
+  });
+
+  assert.equal(rebuilds, 0);
+  assert.equal(replay.status, first.result.status);
+  assert.deepEqual(replay.publicPresentation, first.result.publicPresentation);
+  assert.equal(
+    eventlog.listEvents(first.sessionId, { types: ['conversation_completed'] }).length,
+    1,
+    'one accepted approval source has one public terminal across retries',
   );
 });
 
@@ -639,7 +687,7 @@ test('loop carries a different-family DELIVER verdict through the shared commit'
 
   assert.equal(judgeCalls, 1);
   assert.equal(repairCalls, 0, 'a decided terminal judge must own the words without a second repair model');
-  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.status, 'blocked');
   assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(result.publicPresentation?.text, JUDGED_REPLY);
   const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
@@ -671,7 +719,7 @@ test('a final-step RESUME verdict cannot consume the loop terminal', async () =>
 
   assert.equal(judgeCalls, 1);
   assert.equal(repairCalls, 1, 'an impossible RESUME keeps the conservative authored fallback path');
-  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.status, 'blocked');
   assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
   const terminals = eventlog.listEvents(sessionId, { types: ['conversation_completed'] });

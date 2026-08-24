@@ -304,46 +304,6 @@ test('D7: every attempt outcome maps to exactly one recovery, from structure not
   assert.equal(recoveryDirectiveFor('uncertain_write').retrySameCandidate, false);
 });
 
-// ── 8. Describing an authorized tool the cap dropped ─────────────────────────
-
-test('D8: code mode can describe an authorized tool outside the advertised cap', async () => {
-  const codeMode = await import('../tools/code-mode-tool.js');
-  const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
-
-  // The AUTHORIZED catalog holds both servers; the turn's cap advertises one.
-  codeMode._setExternalMcpToolsForTests(async () => [
-    { name: 'firecrawl__scrape', description: 'scrape' },
-    {
-      name: 'salesforce__query_records',
-      description: 'run a SOQL query',
-      inputSchema: { type: 'object', properties: { soql: { type: 'string' } }, required: ['soql'] },
-    },
-  ] as never);
-  try {
-    const described = await withHarnessRunContext(
-      {
-        sessionId: 'authority-kernel-d8',
-        counter: new ToolCallsCounter(10),
-        mcpToolScope: {
-          reason: 'web intent',
-          authority: 'catalog',
-          allowedServerSlugs: ['firecrawl'],
-          maxTools: 1,
-        },
-      } as never,
-      () => codeMode.describeCodeModeTool('salesforce__query_records'),
-    ) as { parameters?: unknown; note?: string; allowed?: boolean };
-
-    assert.equal(described.allowed, true, 'an authorized tool is allowed');
-    assert.ok(
-      described.parameters,
-      `describe must return the REAL schema, not "not found": ${JSON.stringify(described).slice(0, 200)}`,
-    );
-  } finally {
-    codeMode._setExternalMcpToolsForTests(null);
-  }
-});
-
 // ── 9. Discovery attribution belongs to the task, not the session ────────────
 
 test('D9: composio discovery attribution is keyed by accepted task, not session', async () => {

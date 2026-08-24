@@ -4,7 +4,7 @@
  * `hostDescriptorsFromResolutionProof` already lets the model CITE this
  * source's proven capabilities; without registered catalog entries those
  * citations bind nothing and the admitted graph falls back to the legacy
- * lane (live 2026-08-18 sess-mszdq1uz: route=act fastPath=fanout_action,
+ * lane (live 2026-08-18 session-fixture-proof-provisioning: route=act fastPath=fanout_action,
  * 14 nodes, zero operationIds). This module registers the same proven
  * Composio operations as REAL host capabilities — manifest, independent
  * observation, schema-grounded argument compiler, attested-transport invoke —
@@ -23,6 +23,7 @@
  *    provider schema. A slug with no cached schema is skipped (fail closed).
  */
 import { createHash } from 'node:crypto';
+import { documentedAtomicInputContentCommit } from '../../integrations/composio/operation-semantics.js';
 import {
   attachSemanticContract,
   capabilityManifestDigest,
@@ -36,10 +37,27 @@ import {
 import {
   peekCapabilityManifestStore,
   resolveCapabilityManifestStore,
+  resolveCurrentSuccessorManifest,
 } from './capability-manifest-store.js';
 import { registerIndependentCapabilityObservation } from './independent-capability-observation.js';
 import { provenCapabilityEntriesForTurn } from './capability-resolution.js';
-import { ensureToolSchema, getCachedToolSchema } from '../../tools/composio-schema-cache.js';
+import {
+  ensureToolSchema,
+  getCachedToolSchema,
+  liveComposioSchemaFingerprint,
+  liveComposioOperationVersion,
+  liveComposioOutputSchema,
+} from '../../tools/composio-schema-cache.js';
+import { digestSchema } from '../../tools/tool-contract-store.js';
+import {
+  revalidateSelectedComposioDefinitions,
+  type SelectedComposioDefinition,
+  type SelectedComposioRevalidationRefusalCode,
+} from '../../integrations/composio/selected-definition-revalidation.js';
+import {
+  COMPOSIO_PROVIDER_SURFACE_VERSION,
+  fingerprintComposioProviderDefinition,
+} from '../../integrations/composio/provider-definition-identity.js';
 import { requireAttestedTransport } from './implementation-artifacts/attested-transport.js';
 import { executeSealed, productionProviderCrossingAllowed } from './production-capability-adapters.js';
 import { refreshTypedExecutionReadiness } from '../semantic-boundary/configure-typed-execution-runtime.js';
@@ -108,6 +126,10 @@ export function advisoryRolesForProofEntry(input: {
 
 export interface ProofProvisionResult {
   registered: string[];
+  refusal?: {
+    code: 'selected_definition_not_proven' | SelectedComposioRevalidationRefusalCode;
+    identifier: string;
+  };
 }
 
 /**
@@ -119,14 +141,113 @@ export interface ProofProvisionResult {
 export async function registerProofProvisionedCapabilities(identity: {
   sessionId: string;
   sourceUserSeq: number;
-}): Promise<ProofProvisionResult> {
+}, options: {
+  /** Foreground plan_task publishes only refs selected from its exact
+   * disclosure ledger. Legacy/proof lanes omit this and retain their existing
+   * whole-proof provisioning behavior. */
+  allowedIdentifiers?: readonly string[];
+  /** Discovery-time schema digests for that selected subset. Each selected
+   * operation must match one forced exact-slug provider refresh before any
+   * catalog/manifest entry is published. */
+  expectedSchemaDigests?: readonly { identifier: string; schemaDigest: string }[];
+  /** Exact selected Composio refs from both the initial live card and later
+   * foreground disclosures. Only allowedIdentifiers are newly published, but
+   * every row here pays the same final provider proof before freeze. */
+  selectedDefinitions?: readonly SelectedComposioDefinition[];
+} = {}): Promise<ProofProvisionResult> {
   const registered: string[] = [];
   try {
-    if (!productionProviderCrossingAllowed()) return { registered };
+    if (!productionProviderCrossingAllowed()) {
+      const selected = options.selectedDefinitions?.[0]?.identifier.trim()
+        || options.allowedIdentifiers?.[0]?.trim();
+      return selected
+        ? {
+            registered,
+            refusal: { code: 'selected_connection_refresh_unavailable', identifier: selected },
+          }
+        : { registered };
+    }
+    const allowed = options.allowedIdentifiers
+      ? new Set(options.allowedIdentifiers.map((value) => value.trim().toLowerCase()).filter(Boolean))
+      : null;
+    const expectedSchemaDigests = new Map(
+      (options.expectedSchemaDigests ?? []).map((entry) => [
+        entry.identifier.trim().toLowerCase(),
+        entry.schemaDigest.trim().toLowerCase(),
+      ]),
+    );
     const entries = provenCapabilityEntriesForTurn(identity)
       .filter((entry) => entry.kind === 'composio'
-        && (entry.effectClass === 'read' || entry.effectClass === 'write'));
-    if (entries.length === 0) return { registered };
+        && (entry.effectClass === 'read' || entry.effectClass === 'write')
+        && (!allowed || allowed.has(entry.identifier.trim().toLowerCase())));
+    if (allowed) {
+      const entryByIdentifier = new Map(
+        entries.map((entry) => [entry.identifier.trim().toLowerCase(), entry]),
+      );
+      for (const selected of allowed) {
+        if (!entryByIdentifier.has(selected)) {
+          return {
+            registered,
+            refusal: { code: 'selected_definition_not_proven', identifier: selected },
+          };
+        }
+        const expectedSchemaDigest = expectedSchemaDigests.get(selected);
+        if (
+          !options.selectedDefinitions
+          && (!expectedSchemaDigest || !/^[a-f0-9]{64}$/.test(expectedSchemaDigest))
+        ) {
+          return {
+            registered,
+            refusal: { code: 'selected_definition_digest_invalid', identifier: selected },
+          };
+        }
+      }
+    }
+
+    const selectedDefinitions = options.selectedDefinitions
+      ? [...options.selectedDefinitions]
+      : allowed
+        ? entries.map((entry) => ({
+            identifier: entry.identifier.trim(),
+            schemaDigest: expectedSchemaDigests.get(entry.identifier.trim().toLowerCase()) ?? '',
+            accountIdentity: entry.accountIdentity?.trim() || 'runtime',
+          }))
+        : [];
+    if (allowed && options.selectedDefinitions) {
+      const selectedByIdentifier = new Map(selectedDefinitions.map((entry) => [
+        entry.identifier.trim().toLowerCase(),
+        entry,
+      ]));
+      for (const identifier of allowed) {
+        const selected = selectedByIdentifier.get(identifier);
+        const proof = entries.find((entry) => entry.identifier.trim().toLowerCase() === identifier);
+        if (!selected || !proof || selected.accountIdentity.trim() !== (proof.accountIdentity?.trim() || 'runtime')) {
+          return {
+            registered,
+            refusal: { code: 'selected_definition_not_proven', identifier },
+          };
+        }
+      }
+    }
+
+    // Primary-plan authority is two phase across the complete selected
+    // Composio set (initial card plus staged disclosures): verify everything,
+    // then publish only the staged/proven subset.
+    const revalidated = await revalidateSelectedComposioDefinitions(selectedDefinitions);
+    if (!revalidated.ok) {
+      return { registered, refusal: revalidated.refusal };
+    }
+    const selectedSchemas = revalidated.definitions;
+    if (entries.length === 0) {
+      const selected = allowed?.values().next().value;
+      if (selected) {
+        return {
+          registered,
+          refusal: { code: 'selected_definition_not_proven', identifier: selected },
+        };
+      }
+      return { registered };
+    }
     const writeToolkits = new Set(
       entries.filter((entry) => entry.effectClass === 'write').map((entry) => toolkitOf(entry.identifier)),
     );
@@ -135,34 +256,106 @@ export async function registerProofProvisionedCapabilities(identity: {
 
     for (const entry of entries) {
       const slug = entry.identifier.trim();
-      const capabilityId = `cap:resolved:${slug.toLowerCase()}`;
-      if (factory.get(capabilityId)) continue;
+      const baseCapabilityId = `cap:resolved:${slug.toLowerCase()}`;
       // First-touch daemon: the schema cache is empty until something lists
       // provider tools. The proof names an exact operation, so fetch its
       // frozen contract now (single attempt per slug, cached after) — live
       // 2026-08-19: a fresh session's first act ask found zero cached schemas
       // and provisioned nothing.
-      const schema = getCachedToolSchema(slug) ?? await ensureToolSchema(slug);
+      const selectedSchema = allowed
+        ? selectedSchemas.get(slug.toLowerCase())
+        : undefined;
+      const schema = allowed
+        ? selectedSchema?.schema ?? null
+        : getCachedToolSchema(slug) ?? await ensureToolSchema(slug);
       if (!isRecord(schema)) continue; // no frozen schema → no compiler → fail closed
+      const schemaDigest = selectedSchema?.schemaDigest ?? digestSchema(schema);
+      const sourceSchemaFingerprint = selectedSchema?.fingerprint
+        ?? liveComposioSchemaFingerprint(slug);
+      const operationVersion = selectedSchema?.providerOperationVersion
+        ?? liveComposioOperationVersion(slug);
+      const outputSchema = selectedSchema
+        ? selectedSchema.outputSchema
+        : liveComposioOutputSchema(slug);
+      if (!operationVersion || outputSchema === undefined) {
+        if (allowed?.has(slug.toLowerCase())) {
+          return {
+            registered,
+            refusal: {
+              code: 'selected_definition_operation_version_unavailable',
+              identifier: slug,
+            },
+          };
+        }
+        continue;
+      }
       const effect: BoundNodeCapability['effect'] = entry.effectClass === 'write' ? 'external_write' : 'read';
       const family = toolkitOf(slug);
       const write = effect === 'external_write';
+      const atomicContentCommit = documentedAtomicInputContentCommit(slug);
       const advisoryRoles = advisoryRolesForProofEntry({
         effect: write ? 'external_write' : 'read',
         schema,
         siblingWriteInToolkit: writeToolkits.has(family),
       });
-      const schemaDigest = sha256(JSON.stringify(schema));
       const accountId = entry.accountIdentity?.trim() || 'runtime';
+      const invokePortId = selectedSchema?.invokePortId
+        ?? `port:${baseCapabilityId}:${slug}`;
+      const definitionFingerprint = selectedSchema?.definitionFingerprint
+        ?? fingerprintComposioProviderDefinition({
+          operationId: slug,
+          operationVersion,
+          accountId,
+          invokePortId,
+          inputSchema: schema,
+          outputSchema,
+        });
+      if (!definitionFingerprint) continue;
+      const currentInstalled = resolveCurrentSuccessorManifest(store, baseCapabilityId);
+      const outputSchemaDigest = outputSchema ? digestSchema(outputSchema) : undefined;
+      const currentDefinition = currentInstalled?.manifest;
+      const currentMatches = Boolean(
+        currentDefinition
+        && currentDefinition.operationId === slug
+        && currentDefinition.providerVersion === COMPOSIO_PROVIDER_SURFACE_VERSION
+        && currentDefinition.operationVersion === operationVersion
+        && currentDefinition.definitionFingerprint === definitionFingerprint
+        && currentDefinition.accountId === accountId
+        && currentDefinition.invokePortId === invokePortId
+        && currentDefinition.externalDefinition?.providerInputSchemaDigest === schemaDigest
+        && currentDefinition.externalDefinition?.providerOutputSchemaObserved === true
+        && (currentDefinition.externalDefinition?.providerOutputSchemaDigest ?? null)
+          === (outputSchemaDigest ?? null)
+      );
+      const capabilityId = currentMatches
+        ? currentDefinition!.manifestId
+        : currentInstalled
+          ? `${baseCapabilityId}:definition:${definitionFingerprint.slice(0, 24)}`
+          : baseCapabilityId;
       const manifest: CapabilityManifestV1 = attachSemanticContract({
         version: 1,
         manifestId: capabilityId,
         providerKind: 'composio',
         operationId: slug,
         providerIdentity: 'composio',
-        providerVersion: 'composio-proof-v1',
-        operationVersion: '1',
-        definitionFingerprint: schemaDigest,
+        providerVersion: COMPOSIO_PROVIDER_SURFACE_VERSION,
+        operationVersion,
+        definitionFingerprint,
+        externalDefinition: {
+          version: 1,
+          providerInputSchemaDigest: schemaDigest,
+          providerOutputSchemaObserved: true,
+          ...(outputSchemaDigest
+            ? { providerOutputSchemaDigest: outputSchemaDigest }
+            : {}),
+          semanticName: slug,
+          behaviorHints: {
+            readOnly: null,
+            destructive: null,
+            idempotent: null,
+            openWorld: null,
+          },
+        },
         effect,
         ...(write ? { destination: { family, posture: 'create_new' as const } } : {}),
         accountId,
@@ -170,8 +363,10 @@ export async function registerProofProvisionedCapabilities(identity: {
         reconciliation: { supported: write, policy: write ? 'exact_artifact' : 'none' },
         outputContract: { kind: write ? 'created_resource' : 'records' },
         evidenceContract: {
-          kinds: write ? ['receipt', 'readback'] : ['payload'],
-          readbackRequired: write,
+          kinds: atomicContentCommit
+            ? [...atomicContentCommit.evidence]
+            : write ? ['receipt', 'readback'] : ['payload'],
+          readbackRequired: write && !atomicContentCommit,
         },
         provenance: {
           issuer: 'host:resolution-proof',
@@ -181,8 +376,9 @@ export async function registerProofProvisionedCapabilities(identity: {
         lifecycle: { state: 'current' },
         advisoryRoles,
         argumentCompiler: { id: 'compile:proof-schema:v1', version: '1' },
+        invokePortId,
         // The shared 'evidence' kind keeps every hop chainable (dag_kind_mismatch
-        // trap, live 2026-08-18 sess-msz8m5vg); the role-specific kinds beside it
+        // trap, live 2026-08-18 session-fixture-remap-a); the role-specific kinds beside it
         // drive the evidence-mode derivation — a collection read owes durable
         // records, a readback is a point read of the created resource, and the
         // write produces that resource. The write also carries its concrete
@@ -203,8 +399,11 @@ export async function registerProofProvisionedCapabilities(identity: {
               : ['evidence', 'records'],
         applicableDeliverableKinds: write ? ['evidence', family] : ['evidence'],
       });
-      const installed = store.install(manifest);
+      const installed = !currentInstalled || currentMatches
+        ? store.install(manifest)
+        : store.supersede(currentInstalled.manifest.manifestId, manifest);
       if (!installed.ok) continue;
+      if (capabilityId !== baseCapabilityId) factory.forget(baseCapabilityId);
       const observedAt = Date.now();
       registerIndependentCapabilityObservation({
         operationId: manifest.operationId,
@@ -228,12 +427,14 @@ export async function registerProofProvisionedCapabilities(identity: {
         capabilityId,
         toolName: slug,
         schemaVersion: manifest.operationVersion,
-        schemaDigest,
+        schemaDigest: definitionFingerprint,
         effect,
         advisoryRoles,
         manifestDigest: capabilityManifestDigest(manifest),
         providerKind: 'composio',
-        liveFingerprint: schemaDigest,
+        providerInputSchemaDigest: schemaDigest,
+        ...(sourceSchemaFingerprint ? { sourceSchemaFingerprint } : {}),
+        liveFingerprint: definitionFingerprint,
         manifest,
         account: accountId,
         ...(write ? { destination: { family, posture: 'create_new' } } : {}),
@@ -321,7 +522,12 @@ export async function registerProofProvisionedCapabilities(identity: {
             definitionFingerprint: transformManifest.definitionFingerprint,
             providerVersion: transformManifest.providerVersion,
             operationVersion: transformManifest.operationVersion,
-            observedAt: transformObservedAt,
+            // This is a deterministic shipped host-local callable, so the
+            // observer re-reads the same frozen identity at observation time.
+            // Capturing the registration instant here made the otherwise
+            // current local transform age out after the 60-second freshness
+            // window in long-lived plans.
+            observedAt: Date.now(),
           }),
         });
         factory.register({

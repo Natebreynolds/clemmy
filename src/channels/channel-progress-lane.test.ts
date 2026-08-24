@@ -121,8 +121,16 @@ test('a pause on a person settles the message without claiming success', () => {
   const terminal = __test__.channelTerminalForState(state)!;
   assert.equal(terminal.status, 'blocked', 'an approval pause was recorded as a completed run');
   assert.equal(terminal.resumable, true);
-  assert.equal(lane.settle(state, Date.now()).action, 'final',
+  const settled = lane.settle(state, Date.now());
+  assert.equal(settled.action, 'final',
     'the paused message was never replaced in place');
+  assert.equal(settled.action === 'final' && settled.text, state.summary,
+    'the pause replacement did not preserve the user-facing request');
+  assert.equal(lane.finalized, true, 'a delivered pause left the message lane open');
+  assert.equal(lane.settle(state, Date.now() + 1).action, 'none',
+    'a duplicate settle could deliver the paused message twice');
+  assert.equal(lane.milestone(state, Date.now() + 2).action, 'none',
+    'straggling progress could repaint the delivered pause');
 });
 
 test('a settled attempt takes the message away from the progress path', () => {
@@ -187,7 +195,7 @@ test('the live sender path — both flush machines — decides through the lane'
   // to narrating from its own events.
   assert.equal((source.match(/progressLane\.milestone\(/g) ?? []).length, 2,
     'a flush path edits the message without asking the shared reducer');
-  assert.equal((source.match(/progressLane\.settle\(/g) ?? []).length, 4,
+  assert.equal((source.match(/progressLane\.settle\(/g) ?? []).length, 6,
     'a delivery path completes without the reducer marking the run settled');
   assert.equal((source.match(/if \(progressLane\.finalized\) return;/g) ?? []).length, 4,
     'a flush path can still repaint a settled message');
@@ -207,8 +215,13 @@ test('a final message is only recorded as final once it has actually been delive
   // lane marked final on a throw would lock the message against every retry and
   // leave the user staring at a placeholder.
   for (const block of source.split('const finalFlush = async ()').slice(1)) {
-    const body = block.slice(0, block.indexOf('\n  };'));
-    const send = body.search(/await (handle\.edit|transport\.sendFollowup)/);
+    const body = block.slice(0, block.indexOf('\n  };'))
+      // Source-level comments explain the invariant using the same method
+      // name. They are not executable ordering and must not become the first
+      // regex hit.
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/.*$/gm, '');
+    const send = body.search(/await (handle\.edit|transport\.sendFollowup|deliverConversationApprovalExactly)/);
     const settle = body.search(/progressLane\.settle\(/);
     assert.ok(send >= 0, 'a final flush that never sends anything');
     assert.ok(settle > send,

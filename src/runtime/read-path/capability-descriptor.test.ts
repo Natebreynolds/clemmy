@@ -47,6 +47,22 @@ function choice(intent: string, identifier: string) {
   };
 }
 
+test('a mixed find-and-write ask stays unresolved so discovery keeps its search slot', async () => {
+  const resolved = await resolveTurnCapabilityCandidates({
+    userInput: 'Find the top widgets and put all the info in a workbook.',
+    choices: [
+      choice('dataforseo keywords for site', 'dataforseo__dataforseo_labs_google_keywords_for_site'),
+      choice('google sheets add tab', 'GOOGLESHEETS_ADD_SHEET'),
+      choice('slack fetch conversation history', 'SLACK_FETCH_CONVERSATION_HISTORY'),
+    ] as never,
+    semantic: false,
+  });
+  const mixed = resolved.requirements.find((requirement) => requirement.effect === 'mixed')
+    ?? resolved.requirements[0];
+  assert.ok(mixed, 'the compound ask still projects a requirement');
+  assert.equal(mixed.resolved, false, 'remembered Slack/Sheets/SEO pins must not close the retrieve');
+});
+
 test('a resolved exact capability carries live required keys into the shared brain card', async () => {
   let providerSchemaLoads = 0;
   _setToolSchemaLoaderForTests(async () => {
@@ -81,6 +97,40 @@ test('a resolved exact capability carries live required keys into the shared bra
   const card = renderCapabilityCandidateCard(resolved);
   assert.match(card, /Live schema requires: query, limit/);
   assert.doesNotMatch(card, /optional_cursor/);
+});
+
+test('an exact source binding renders its work_call carrier even when advisory candidates are empty', () => {
+  const primary = 'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET';
+  const fallback = 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS';
+  const card = renderCapabilityCandidateCard({
+    candidates: [],
+    requirements: [],
+    matches: [],
+    pinnedTools: ['composio_execute_tool'],
+    semanticApplied: false,
+    sourceStrategyBinding: {
+      version: 1,
+      primary: {
+        capabilityId: `capability:composio:${primary}`,
+        schemaFingerprint: 'a'.repeat(64),
+      },
+      equivalentFallbacks: [{
+        capabilityId: `capability:composio:${fallback}`,
+        schemaFingerprint: 'b'.repeat(64),
+      }],
+      topology: 'single_aggregate_read_then_single_artifact_write',
+      topologyDigest: 'c'.repeat(64),
+      destination: { family: 'workbook', posture: 'create_new' },
+      effect: 'external_write',
+    },
+  });
+
+  assert.match(card, /Host-bound collection source/);
+  assert.match(card, new RegExp(`Primary[\\s\\S]*${primary}`));
+  assert.match(card, /work_call/);
+  assert.match(card, /composio_execute_tool/);
+  assert.match(card, new RegExp(`Equivalent fallback 1[\\s\\S]*${fallback}`));
+  assert.match(card, /Do not rediscover it/);
 });
 
 test('every resolved requirement descriptor carries its own current contract', async () => {
@@ -178,4 +228,21 @@ test('a semantic read hit cannot rewrite or settle an unknown read/write role', 
   assert.equal(knownWrite.requirements[0]?.roleKey, 'clause-0:write');
   assert.equal(knownWrite.requirements[0]?.resolved, false);
   assert.deepEqual(knownWrite.candidates, [], 'a proven read alias is incompatible with a known write');
+});
+
+test('a wrong-effect proven pin can never close a role (live 2026-08-21 calendar lockout)', async () => {
+  // "What's on my calendar" (READ clause) lexically matched the remembered
+  // OUTLOOK_CALENDAR_CREATE_EVENT WRITE pin at high tier; the closed role
+  // then made the governor deny every tool_search (role_not_unresolved) and
+  // the turn parked with no read path. Only a positive read/write
+  // contradiction disqualifies — unknown effects stay admissible.
+  const { effectClassMayCloseRole } = await import('./capability-candidates.js');
+  assert.equal(effectClassMayCloseRole('write', 'read'), false, 'a write pin cannot close a read role');
+  assert.equal(effectClassMayCloseRole('read', 'write'), false, 'a read pin cannot close a write role');
+  assert.equal(effectClassMayCloseRole('read', 'read'), true);
+  assert.equal(effectClassMayCloseRole('write', 'write'), true);
+  assert.equal(effectClassMayCloseRole(undefined, 'read'), true, 'unknown candidate effect stays admissible');
+  assert.equal(effectClassMayCloseRole('unknown', 'read'), true);
+  assert.equal(effectClassMayCloseRole('write', 'unknown'), true, 'unknown clause effect is not a contradiction');
+  assert.equal(effectClassMayCloseRole('write', 'mixed'), true, 'mixed clauses are already handled by the mixed rule');
 });

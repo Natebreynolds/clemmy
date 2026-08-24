@@ -333,8 +333,14 @@ const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded, harnessRunContextStorage, wrapToolForHarness } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
+const { HostInterruptState } = await import('./host-turn-runner.js');
+const hostConsent = await import('./host-interactive-consent.js');
 const { getPlanScope } = await import('../../agents/plan-scope.js');
 const { rememberFact } = await import('../../memory/facts.js');
+const taskContinuity = await import('../../memory/task-continuity.js');
+const taskContinuityRuntime = await import('./task-continuity-runtime.js');
+const { commitTurnOutcome } = await import('./delivery-committer.js');
+const { turnOutcomeId } = await import('./turn-outcome.js');
 const { recordStepResult, takeStepResult, clearStepResult } = await import('../../tools/step-result-tool.js');
 const artifactLedger = await import('./artifact-ledger.js');
 const { getPendingAction, pendingActionPayloadHash, queuePendingAction } = await import('./pending-actions.js');
@@ -480,6 +486,7 @@ async function appendPublicWorkflowDispatchInChild(input: Record<string, unknown
 }
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('./public-presentation.js');
 const { buildCallTool } = await import('../../tools/call-tool.js');
+const { _setInnerDispatchToolsForTests } = await import('../../tools/inner-dispatch.js');
 const { actionBus } = await import('../action-bus.js');
 
 function seedArtifactVerification(sessionId: string, callId: string, resourceId: string): void {
@@ -548,8 +555,6 @@ function seedClaimGroundingOutput(input: {
     },
   });
 }
-const { _setCodeModeToolsForTests } = await import('../../tools/code-mode-tool.js');
-
 test.after(() => {
   try {
     if (!process.env.CLEM_TEST_KEEP_HOME) rmSync(TMP_HOME, { recursive: true, force: true });
@@ -570,6 +575,133 @@ function makeRunnerStub(): Runner {
 function makeAgentStub(): import('@openai/agents').Agent<any, any> {
   return {} as import('@openai/agents').Agent<any, any>;
 }
+
+/** Build the exact production A/Q/B authority chain used by continuation
+ * ingress: a committed clarification creates the durable packet, then the
+ * accepted answer consumes it through the runtime resolver. Tests must never
+ * mint TaskContinuationContext directly because the graph compiler verifies
+ * every private field against this durable chain. */
+async function consumeDurableClarificationFixture(input: {
+  sessionId: string;
+  parentInput: string;
+  question: string;
+  answer: string;
+}) {
+  const parentRun = await runTurn({
+    agent: makeAgentStub(),
+    sessionId: input.sessionId,
+    input: input.parentInput,
+    internalContinuation: true,
+    suppressMemoryCapture: true,
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items) => ({
+      history: [
+        ...items,
+        { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Clarification prepared.' }] },
+      ] as AgentInputItem[],
+      lastResponseId: undefined,
+      finalOutput: 'Clarification prepared.',
+    }),
+  });
+  assert.equal(parentRun.status, 'completed');
+  const parent = listEvents(input.sessionId, { types: ['user_input_received'] }).at(-1);
+  assert.ok(parent);
+  assert.equal(parent.data.text, input.parentInput);
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: parentRun.turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: input.question,
+      purpose: 'clarification',
+      sourceUserSeq: parent.seq,
+    },
+  });
+  const identity = {
+    sessionId: input.sessionId,
+    turn: parentRun.turn,
+    sourceUserSeq: parent.seq,
+  };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: input.question },
+  });
+  assert.equal(taskContinuity.peekTaskContinuityPacket({ sessionId: input.sessionId }).status, 'available');
+
+  const answer = appendEvent({
+    sessionId: input.sessionId,
+    turn: parentRun.turn + 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: input.answer },
+  });
+  const request = await taskContinuityRuntime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId: input.sessionId,
+    sourceUserSeq: answer.seq,
+    message: input.answer,
+  }, answer.seq);
+  assert.equal(request.taskContinuationResolved, true);
+  assert.ok(request.taskContinuation, 'the exact accepted answer consumes its durable clarification packet');
+  assert.equal(request.taskContinuation.parentSourceUserSeq, parent.seq);
+  assert.equal(request.taskContinuation.consumingSourceUserSeq, answer.seq);
+  return { parent, answer, request };
+}
+
+test('fresh host action seals one owner and primes graph-neutral planning before capability construction', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat', title: 'fresh host activation order' });
+  const stopAfterPlanning = new Error('stop after host planning inspection');
+  let builds = 0;
+  await assert.rejects(
+    runConversation({
+      sessionId: sess.id,
+      input: 'Find the top five restaurants in Ventura and put them in one new spreadsheet.',
+      turnEngine: 'host_v1',
+      buildAgent: async (identity) => {
+        builds += 1;
+        assert.equal(identity.route, undefined, 'host capability construction receives no fabricated semantic route');
+        assert.equal(identity.hostFreshPlanning?.authority.scope, 'primary_model_planning_catalog_v1');
+        assert.deepEqual(identity.hostFreshPlanning?.identity, {
+          sessionId: sess.id,
+          sourceUserSeq: identity.sourceUserSeq,
+        });
+        assert.match(identity.hostFreshPlanning?.digest ?? '', /^[a-f0-9]{64}$/);
+        const owner = listEvents(sess.id, { types: ['turn_engine_selected'] })
+          .filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq);
+        const graphs = listEvents(sess.id, { types: ['turn_graph_compiled'] })
+          .filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq);
+        const armed = listEvents(sess.id, { types: ['accepted_task_authority_armed'] })
+          .filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq);
+        assert.equal(owner.length, 1, 'the exact source has one host owner');
+        assert.equal(owner[0]?.data.engine, 'host_v1');
+        assert.equal(owner[0]?.data.resumed, false);
+        assert.equal(graphs.length, 0, 'only plan_task may publish the accepted work graph');
+        assert.equal(armed.length, 0, 'graph-neutral planning cannot arm work before plan_task');
+
+        const authority = openEventLog().prepare(`
+          SELECT state, expected_work_required
+            FROM accepted_task_authority
+           WHERE session_id = ? AND source_user_seq = ?
+        `).get(sess.id, identity.sourceUserSeq);
+        assert.equal(authority, undefined, 'no accepted work authority exists before the plan barrier');
+        assert.equal(fixtureExpectedWork.actionExpectedWorkState({
+          sessionId: sess.id,
+          sourceUserSeq: identity.sourceUserSeq,
+        }).status, 'missing');
+        assert.equal(listEvents(sess.id, { types: ['tool_called'] }).length, 0);
+        throw stopAfterPlanning;
+      },
+    }),
+    (error) => error === stopAfterPlanning,
+  );
+  assert.equal(builds, 1);
+});
 
 test('settled consequential turn authors one memory-aware preamble and executes in the same turn', async () => {
   resetEventLog();
@@ -624,10 +756,20 @@ test('settled consequential turn authors one memory-aware preamble and executes 
           return 'I have the prior Ventura context and the same sheet-to-email handoff in mind.';
         },
       },
-      onConversationPreamble: async (text) => {
-        painted.push(text);
+      onConversationPreamble: async (request) => {
+        painted.push(request.text);
         assert.equal(fullRunnerCalls, 0, 'the opening is painted before the execution model runs');
-        return { status: 'delivered' };
+        return {
+          status: 'delivered',
+          receipt: {
+            version: 1,
+            deliveryKey: request.deliveryKey,
+            eventId: request.eventId,
+            eventDigest: request.eventDigest,
+            surface: 'channel_message',
+            target: 'loop-test',
+          },
+        };
       },
     });
 
@@ -689,10 +831,20 @@ for (const judgeMode of ['settled', 'unavailable'] as const) {
             return 'I have the exact Salesforce org, import source, row bound, and merge key.';
           },
         },
-        onConversationPreamble: async (text) => {
-          painted.push(text);
+        onConversationPreamble: async (request) => {
+          painted.push(request.text);
           assert.equal(runnerCalls, 0, 'the preamble is visible before execution');
-          return { status: 'delivered' };
+          return {
+            status: 'delivered',
+            receipt: {
+              version: 1,
+              deliveryKey: request.deliveryKey,
+              eventId: request.eventId,
+              eventDigest: request.eventDigest,
+              surface: 'channel_message',
+              target: 'loop-test',
+            },
+          };
         },
       });
 
@@ -2014,11 +2166,12 @@ test('typed decline stays conversational while skipping parent-task recall, capa
     content: 'Send the client email through Outlook after confirming with the user.',
   });
   const sess = HarnessSession.create({ kind: 'chat' });
-  const semanticTaskInput = [
-    'Send the client email through Outlook.',
-    'Should I send it?',
-    'No.',
-  ].join('\n');
+  const continuity = await consumeDurableClarificationFixture({
+    sessionId: sess.id,
+    parentInput: 'Send the client email through Outlook.',
+    question: 'Should I send it?',
+    answer: 'No.',
+  });
   let filteredInput: AgentInputItem[] = [];
   let opennessCalls = 0;
   const { _setOpennessJudgeForTests } = await import('./turn-openness.js');
@@ -2034,20 +2187,11 @@ test('typed decline stays conversational while skipping parent-task recall, capa
       agent: makeAgentStub(),
       sessionId: sess.id,
       input: 'No.',
-      semanticTaskInput,
-      taskContinuation: {
-        packetId: 'decline-packet',
-        parentSourceUserSeq: 1,
-        consumingSourceUserSeq: 2,
-        parentInput: 'Send the client email through Outlook.',
-        question: 'Should I send it?',
-        options: ['Yes', 'No'],
-        answer: 'No.',
-        disposition: 'declined',
-        retrievalQuery: semanticTaskInput,
-        capabilities: [],
-      },
-      taskContinuationResolved: true,
+      semanticTaskInput: continuity.request.semanticTaskInput,
+      taskContinuation: continuity.request.taskContinuation,
+      taskContinuationResolved: continuity.request.taskContinuationResolved,
+      sourceUserSeq: continuity.answer.seq,
+      reuseRecordedUserInput: true,
       makeRunner: makeRunnerStub,
       runRunner: async (_runner, _agent, items, opts) => {
         const filter = opts.callModelInputFilter as
@@ -2119,26 +2263,22 @@ test('compound decline preserves the complete user message for the model but jud
   const reply = 'Absolutely—I’ll leave the email alone.\n\nFaster startup, steadier recall.\nClem keeps the thread without the churn.';
   const filteredInputs: AgentInputItem[][] = [];
   const judgedObjectives: string[] = [];
+  const continuity = await consumeDurableClarificationFixture({
+    sessionId: sess.id,
+    parentInput: 'Send the client email through Outlook.',
+    question: 'Should I send it?',
+    answer: fullMessage,
+  });
 
   const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: fullMessage,
-    semanticTaskInput: activeTaskInput,
-    taskContinuation: {
-      packetId: 'compound-decline-packet',
-      parentSourceUserSeq: 1,
-      consumingSourceUserSeq: 2,
-      parentInput: 'Send the client email through Outlook.',
-      question: 'Should I send it?',
-      options: ['Yes', 'No'],
-      answer: fullMessage,
-      disposition: 'declined_with_new_task',
-      activeTaskInput,
-      retrievalQuery: activeTaskInput,
-      capabilities: [],
-    },
-    taskContinuationResolved: true,
+    semanticTaskInput: continuity.request.semanticTaskInput,
+    taskContinuation: continuity.request.taskContinuation,
+    taskContinuationResolved: continuity.request.taskContinuationResolved,
+    sourceUserSeq: continuity.answer.seq,
+    reuseRecordedUserInput: true,
     judgeCompletion: true,
     judgeFn: async (objective) => {
       judgedObjectives.push(objective);
@@ -2196,35 +2336,15 @@ test('compound decline memory admission is fresh-clause-only and idempotent acro
   resetEventLog();
   const { openMemoryDb } = await import('../../memory/db.js');
   const sess = HarnessSession.create({ kind: 'chat' });
-  const parent = appendEvent({
-    sessionId: sess.id,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Update the local note with the retired marker PARENT-MUST-NOT-BE-LEARNED.' },
-  });
   const fullMessage = 'No—leave that note and PARENT-MUST-NOT-BE-LEARNED alone. Instead, remember this: my standard-lane marker is FRESH-CLAUSE-ONLY-42.';
   const activeTaskInput = 'remember this: my standard-lane marker is FRESH-CLAUSE-ONLY-42.';
-  const accepted = appendEvent({
+  const continuity = await consumeDurableClarificationFixture({
     sessionId: sess.id,
-    turn: 2,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: fullMessage },
-  });
-  const taskContinuation = {
-    packetId: 'compound-memory-idempotency-packet',
-    parentSourceUserSeq: parent.seq,
-    consumingSourceUserSeq: accepted.seq,
-    parentInput: String(parent.data.text),
+    parentInput: 'Update the local note with the retired marker PARENT-MUST-NOT-BE-LEARNED.',
     question: 'Should I update it?',
-    options: ['Yes', 'No'],
     answer: fullMessage,
-    disposition: 'declined_with_new_task' as const,
-    activeTaskInput,
-    retrievalQuery: activeTaskInput,
-    capabilities: [],
-  };
+  });
+  const accepted = continuity.answer;
   const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
     history: items,
     lastResponseId: undefined,
@@ -2240,9 +2360,9 @@ test('compound decline memory admission is fresh-clause-only and idempotent acro
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: fullMessage,
-    semanticTaskInput: activeTaskInput,
-    taskContinuation,
-    taskContinuationResolved: true,
+    semanticTaskInput: continuity.request.semanticTaskInput,
+    taskContinuation: continuity.request.taskContinuation,
+    taskContinuationResolved: continuity.request.taskContinuationResolved,
     sourceUserSeq: accepted.seq,
     reuseRecordedUserInput: true,
     makeRunner: makeRunnerStub,
@@ -2725,7 +2845,7 @@ test('queue-only action → request_approval interruption pins the immutable act
   assert.match(refused.resultSummary, /approval-authority|approval card|snapshot|does not pin/i);
 });
 
-test('an identical pending-action interruption reuses its linked card, but a re-hashed changed payload cannot', async () => {
+test('an identical pending-action interruption reuses its linked card and a re-hashed payload cannot rewrite it', async () => {
   resetEventLog();
   const sessionId = 'sess-loop-linked-card-replay';
   const sess = HarnessSession.create({ id: sessionId, kind: 'chat' });
@@ -2801,17 +2921,14 @@ test('an identical pending-action interruption reuses its linked card, but a re-
 
   await surfaceInterruption('The same id now points at a changed, re-hashed payload.');
   pendingCards = approvalRegistry.listPending({ sessionId, status: 'pending' });
-  assert.equal(pendingCards.length, 2, 'a changed payload must never inherit the old card');
-  const pinnedHashes = pendingCards.map((row) =>
-    (row.args?.pendingAction as { payloadHash?: unknown } | undefined)?.payloadHash);
-  assert.deepEqual(
-    new Set(pinnedHashes),
-    new Set([firstSnapshot.payloadHash, changed.payloadHash]),
-  );
+  assert.equal(pendingCards.length, 1, 'an unresolved exact card remains the sole public decision');
+  assert.equal(pendingCards[0].approvalId, firstCard.approvalId);
+  assert.notEqual(getPendingAction(record.id)?.payloadHash, firstSnapshot.payloadHash,
+    'the live queue record carries the changed, independently re-hashed payload');
   assert.deepEqual(
     approvalRegistry.get(firstCard.approvalId)?.args,
     firstArgs,
-    'minting the changed authority cannot mutate the original card snapshot',
+    'the changed queue record cannot mutate or inherit the original card snapshot',
   );
 });
 
@@ -3280,6 +3397,284 @@ test('a bare resume cannot turn multiple direct writes into a tool-wide approval
   assert.equal(executions, 0);
   assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 2);
   assert.equal(getPlanScope(sess.id), null);
+});
+
+test('two exact host consent cards resolve sequentially and no body runs until both grants reopen', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'HostExactMultiConsentTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'host exact multi consent' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send both exact approved messages.' },
+  });
+  const rawArgs = [
+    JSON.stringify({ requirement_id: 'send-a', name: 'fixture_send', args_json: '{"to":"a"}' }),
+    JSON.stringify({ requirement_id: 'send-b', name: 'fixture_send', args_json: '{"to":"b"}' }),
+  ];
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+  const subjects = rawArgs.map((raw, index): hostConsent.HostInteractiveConsentSubjectV1 => ({
+    version: 1,
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    acceptedTaskId: `task:${sess.id}#${source.seq}`,
+    logicalToolCallId: `host-send-${index}`,
+    decisionSubjectDigest: digest(`decision:${index}`),
+    callDigest: digest(`call:${index}`),
+    coverageDigest: digest(`coverage:${index}`),
+    riskDigest: digest(`risk:${index}`),
+  }));
+  const state = new HostInterruptState(
+    [],
+    rawArgs.map((argumentsJson, index) => ({
+      callId: `host-send-${index}`,
+      name: 'work_call',
+      rawItem: { name: 'work_call', arguments: argumentsJson, callId: `host-send-${index}` },
+      consentSubject: subjects[index],
+    })),
+    undefined,
+    'host_v1',
+  );
+  sess.saveInterruptState(state.toString());
+  const cards = subjects.map((subject, index) => {
+    const resumeKey = hostConsent.hostInteractiveConsentApprovalResumeKey(subject);
+    assert.ok(resumeKey);
+    return approvalRegistry.registerResumable({
+      sessionId: sess.id,
+      subject: `Approve send ${index + 1}`,
+      tool: 'work_call',
+      args: JSON.parse(rawArgs[index]!) as Record<string, unknown>,
+      resumeKey: resumeKey!,
+    }).row;
+  });
+
+  const bodies = [0, 0];
+  const approvalSets: string[][] = [];
+  const runRunner: RunRunnerFn = async (_runner, _agent, persisted, opts) => {
+    const hostState = persisted as unknown as InstanceType<typeof HostInterruptState>;
+    const ids = Array.isArray(opts.hostApprovalIds)
+      ? opts.hostApprovalIds.filter((value): value is string => typeof value === 'string').sort()
+      : [];
+    approvalSets.push(ids);
+    const remaining = hostState.getInterruptions();
+    if (remaining.length > 0) {
+      assert.deepEqual(bodies, [0, 0], 'partial approval never executes a sibling body');
+      return {
+        history: [],
+        lastResponseId: undefined,
+        finalOutput: undefined,
+        hasInterruptions: true,
+        serializedState: hostState.toString(),
+        interruptions: remaining.map((interruption) => ({
+          toolName: interruption.toolName,
+          args: JSON.parse(interruption.rawItem.arguments) as Record<string, unknown>,
+          rawArgs: interruption.rawItem.arguments,
+          ...(interruption.approvalResumeKey
+            ? { approvalResumeKey: interruption.approvalResumeKey }
+            : {}),
+        })),
+      };
+    }
+    assert.deepEqual(ids, cards.map((card) => card.approvalId).sort());
+    bodies[0] += 1;
+    bodies[1] += 1;
+    return { history: [], lastResponseId: undefined, finalOutput: 'both exact sends completed' };
+  };
+
+  const first = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    approvalId: cards[0]!.approvalId,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(first.status, 'awaiting_approval');
+  assert.deepEqual(bodies, [0, 0]);
+  assert.deepEqual(approvalSets[0], [cards[0]!.approvalId]);
+
+  const second = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    approvalId: cards[1]!.approvalId,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(second.status, 'completed');
+  assert.deepEqual(bodies, [1, 1]);
+  assert.equal(approvalRegistry.get(cards[0]!.approvalId)?.resolution, 'approved');
+  assert.equal(approvalRegistry.get(cards[1]!.approvalId)?.resolution, 'approved');
+});
+
+test('a restart reconstructs one exact host consent card after crashing before registration', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'HostConsentCrashBeforeCardTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'host consent crash before card' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the exact restart-safe message.' },
+  });
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+  const rawArguments = JSON.stringify({
+    requirement_id: 'restart-send',
+    name: 'fixture_send',
+    args_json: JSON.stringify({ to: 'restart@example.test', body: 'hello' }),
+  });
+  const subject: hostConsent.HostInteractiveConsentSubjectV1 = {
+    version: 1,
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    acceptedTaskId: `task:${sess.id}#${source.seq}`,
+    logicalToolCallId: 'restart-send-call',
+    decisionSubjectDigest: digest('restart-decision'),
+    callDigest: digest('restart-call'),
+    coverageDigest: digest('restart-coverage'),
+    riskDigest: digest('restart-risk'),
+  };
+  const state = new HostInterruptState(
+    [],
+    [{
+      callId: subject.logicalToolCallId,
+      name: 'work_call',
+      rawItem: {
+        name: 'work_call',
+        arguments: rawArguments,
+        callId: subject.logicalToolCallId,
+      },
+      consentSubject: subject,
+    }],
+    undefined,
+    'host_v1',
+  );
+  // Crash seam: the exact V3 state won, but no card/event was registered.
+  sess.saveInterruptState(state.toString());
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'any' }).length, 0);
+
+  let resumes = 0;
+  let grantedIds: string[] = [];
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    decision: 'approve',
+    resolver: 'restart-fixture',
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, persisted, opts) => {
+      resumes += 1;
+      assert.equal((persisted as InstanceType<typeof HostInterruptState>).pending[0]?.decision, 'approved');
+      grantedIds = Array.isArray(opts.hostApprovalIds)
+        ? opts.hostApprovalIds.filter((value): value is string => typeof value === 'string')
+        : [];
+      return { history: [], lastResponseId: undefined, finalOutput: 'restart send completed' };
+    },
+  });
+
+  const rows = approvalRegistry.listPending({ sessionId: sess.id, status: 'any' });
+  assert.equal(result.status, 'completed');
+  assert.equal(resumes, 1);
+  assert.equal(rows.length, 1, 'restart reconstruction mints exactly one durable card');
+  assert.equal(rows[0]?.status, 'resolved');
+  assert.equal(rows[0]?.resolution, 'approved');
+  assert.deepEqual(grantedIds, [rows[0]!.approvalId]);
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['approval_requested'] }).length,
+    1,
+    'the recovered card is surfaced exactly once',
+  );
+});
+
+test('a resolved exact host card survives a crash before runner resume without a duplicate prompt', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'HostConsentResolvedRestartTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resolved host consent restart' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Resume the already approved exact message.' },
+  });
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+  const rawArguments = JSON.stringify({
+    requirement_id: 'resolved-send',
+    name: 'fixture_send',
+    args_json: JSON.stringify({ to: 'resolved@example.test', body: 'hello' }),
+  });
+  const subject: hostConsent.HostInteractiveConsentSubjectV1 = {
+    version: 1,
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    acceptedTaskId: `task:${sess.id}#${source.seq}`,
+    logicalToolCallId: 'resolved-send-call',
+    decisionSubjectDigest: digest('resolved-decision'),
+    callDigest: digest('resolved-call'),
+    coverageDigest: digest('resolved-coverage'),
+    riskDigest: digest('resolved-risk'),
+  };
+  const resumeKey = hostConsent.hostInteractiveConsentApprovalResumeKey(subject);
+  assert.ok(resumeKey);
+  const card = approvalRegistry.registerResumable({
+    sessionId: sess.id,
+    subject: 'Approve the exact resolved message.',
+    tool: 'work_call',
+    args: JSON.parse(rawArguments) as Record<string, unknown>,
+    resumeKey: resumeKey!,
+  }).row;
+  assert.equal(approvalRegistry.resolve(card.approvalId, 'approved', 'pre-crash').ok, true);
+  sess.saveInterruptState(new HostInterruptState(
+    [],
+    [{
+      callId: subject.logicalToolCallId,
+      name: 'work_call',
+      rawItem: {
+        name: 'work_call',
+        arguments: rawArguments,
+        callId: subject.logicalToolCallId,
+      },
+      consentSubject: subject,
+    }],
+    undefined,
+    'host_v1',
+  ).toString());
+
+  let resumes = 0;
+  let grantedIds: string[] = [];
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    approvalId: card.approvalId,
+    decision: 'approve',
+    resolver: 'post-crash',
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, _persisted, opts) => {
+      resumes += 1;
+      grantedIds = Array.isArray(opts.hostApprovalIds)
+        ? opts.hostApprovalIds.filter((value): value is string => typeof value === 'string')
+        : [];
+      return { history: [], lastResponseId: undefined, finalOutput: 'resolved send completed' };
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(resumes, 1);
+  assert.deepEqual(grantedIds, [card.approvalId]);
+  assert.equal(
+    approvalRegistry.listPending({ sessionId: sess.id, status: 'any' }).length,
+    1,
+    're-registration reopens the resolved row instead of minting a pending duplicate',
+  );
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['approval_requested'] }).length,
+    0,
+    'a previously resolved card is not prompted again after restart',
+  );
 });
 
 test('resume does not open a scoped plan scope for non-external or single-call approvals', async () => {
@@ -3809,7 +4204,7 @@ test('a local call_tool carrier rejection cannot manufacture ambiguity or replac
   ].join('\n');
   let modelSteps = 0;
   let providerDispatches = 0;
-  _setCodeModeToolsForTests(new Map([['composio_execute_tool', {
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
     invoke: async () => {
       providerDispatches += 1;
@@ -3876,7 +4271,7 @@ test('a local call_tool carrier rejection cannot manufacture ambiguity or replac
     const [terminal] = listEvents(session.id, { types: ['conversation_completed'] });
     assert.equal(terminal?.data.reply, verifiedAnswer);
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
     if (previousBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = previousBrackets;
   }
@@ -4608,51 +5003,217 @@ test('non-reconciliation completion correction still replaces a rejected public 
   assert.notEqual(terminals[0]?.data.reply, rejected);
 });
 
-// F-artifact (live 2026-07-23, the owner's own acceptance run): a BOUND claim
-// — provider returned the resource, URI recorded, VALUES_UPDATE already
-// writing to it — parked the run behind an unanswerable "reply retry" loop.
-// Bound = deliverable: the run completes green; read-back verification rides
-// as an advisory, never a wall.
+// A provider-neutral, host-sealed construct proves the standard chat/action
+// path: accepted graph -> exact requirement bindings -> one physical crossing
+// per operation -> BOUND resource -> exact-ID content readback. The fixture
+// deliberately uses the typed production executor rather than manufacturing
+// an artifact claim inside the legacy model callback.
 test('standard lane completes green when the provider create is BOUND', async () => {
   resetEventLog();
   artifactLedger._resetArtifactLedgerForTests();
-  const sess = HarnessSession.create({ kind: 'chat' });
-  const sheetUri = 'https://docs.google.com/spreadsheets/d/fixture_sheet_00000001/edit';
-  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
-    const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
-    const rootScopeId = artifactLedger.resolveArtifactRunScopeId(sess.id, `${sess.id}::turn:1`, source.seq);
-    const intent = {
-      kind: 'google_sheet',
-      provider: 'Google Sheets',
-      slotKey: 'google_sheet:primary',
-      title: 'Firm Outreach Drafts — Jul 23',
-      createShape: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
-    } as const;
-    artifactLedger.claimArtifactSlot(sess.id, intent, 'create-sheet', rootScopeId);
-    artifactLedger.bindArtifactSlot(sess.id, intent.slotKey, { uri: sheetUri }, 'create-sheet', rootScopeId);
-    return {
-      history: items,
-      lastResponseId: undefined,
-      finalOutput: {
-        summary: 'Sheet created with all 20 drafts.',
-        reply: `Done — all 20 drafts are in the sheet: ${sheetUri}`,
-        done: true,
-        nextAction: 'completed',
-        reason: null,
+  const semanticRegistry = await import('../semantic-boundary/turn-semantic-port-registry.js');
+  const semanticFixture = await import('../semantic-boundary/fake-semantic-model.js');
+  const catalogFactory = await import('./host-capability-catalog-factory.js');
+  const manifestStore = await import('./capability-manifest-store.js');
+  const productionAdapter = await import('./production-capability-adapter.js');
+  const { catalogFromConstructProviders } = await import('./construct-provider-catalog.fixture.js');
+  const priorSemanticPort = semanticRegistry.peekTurnSemanticModelPort();
+  const priorCatalogFactory = catalogFactory.peekHostCapabilityCatalogFactory();
+  const priorManifestStore = manifestStore.peekCapabilityManifestStore();
+  const priorProductionAdapter = productionAdapter.peekProductionCapabilityAdapter();
+  const fixtureRecords = [
+    { title: 'alpha', date: '1', link: 'fixture://alpha' },
+    { title: 'beta', date: '2', link: 'fixture://beta' },
+    { title: 'gamma', date: '3', link: 'fixture://gamma' },
+    { title: 'delta', date: '4', link: 'fixture://delta' },
+    { title: 'epsilon', date: '5', link: 'fixture://epsilon' },
+  ];
+  const resourceId = 'fixture-resource-1';
+  const resourceUri = `https://fixture.invalid/resources/${resourceId}`;
+  const providerCalls = { source: 0, collection: 0, transform: 0, create: 0, readback: 0 };
+  let legacyRunnerCalls = 0;
+  let written: Array<Record<string, unknown>> = [];
+
+  try {
+    catalogFactory.installHostCapabilityCatalogFactory(
+      catalogFactory.createHostCapabilityCatalogFactory(),
+    );
+    manifestStore.installCapabilityManifestStore(manifestStore.createCapabilityManifestStore());
+    productionAdapter.installProductionCapabilityAdapter(null);
+    semanticRegistry.installTurnSemanticModelPort({
+      async interpret(call) {
+        return {
+          raw: semanticFixture.fakeSemanticProposal('newConstruct', call.host),
+          modelIdentity: 'fixture-semantic/provider-neutral-construct',
+          inputTokens: 1,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
       },
+      async judgeSourceEffect(call) {
+        return {
+          verdict: 'entailed',
+          effect: call.proposedEffect,
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'fixture-semantic/effect-judge',
+          inputTokens: 1,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        return semanticFixture.entailedPlanGroundingJudge(
+          call,
+          'fixture-semantic/grounding-judge',
+        );
+      },
+    });
+    catalogFromConstructProviders({
+      async sourceRead() {
+        providerCalls.source += 1;
+        return { locator: 'fixture-source-1' };
+      },
+      async collectionRead() {
+        providerCalls.collection += 1;
+        return { records: fixtureRecords };
+      },
+      async transform(records) {
+        providerCalls.transform += 1;
+        written = records;
+        return records;
+      },
+      async create(records) {
+        providerCalls.create += 1;
+        assert.deepEqual(records, fixtureRecords, 'the create consumes the exact settled lineage');
+        written = records;
+        return { id: resourceId, handle: resourceUri, receipt: 'fixture-receipt-1' };
+      },
+      async readback(id) {
+        providerCalls.readback += 1;
+        assert.equal(id, resourceId, 'readback targets the exact returned resource id');
+        return { id, handle: resourceUri, content: written };
+      },
+    });
+
+    const sess = HarnessSession.create({ kind: 'chat' });
+    assert.equal(sess.kind, 'chat');
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Find five fixture records and put them in one new workbook.',
+      runRunner: async () => {
+        legacyRunnerCalls += 1;
+        throw new Error('the typed host executor must own this accepted action');
+      },
+    });
+    assert.equal(result.status, 'completed', 'a host-sealed bound create completes green');
+    assert.equal(legacyRunnerCalls, 0, 'the accepted typed graph never falls through to a second executor');
+    assert.deepEqual(providerCalls, {
+      source: 1,
+      collection: 1,
+      transform: 1,
+      create: 1,
+      readback: 1,
+    });
+
+    const sources = listEvents(sess.id, { types: ['user_input_received'] });
+    assert.equal(sources.length, 1);
+    const source = sources[0]!;
+    const graphEvents = listEvents(sess.id, { types: ['turn_graph_compiled'] })
+      .filter((event) => event.data.sourceUserSeq === source.seq);
+    assert.equal(graphEvents.length, 1, 'one graph owns the exact accepted source');
+    const graph = graphEvents[0]!.data.graph as {
+      classification?: { route?: string };
+      nodes?: Array<{ id?: string; capabilityRole?: string; operationId?: string }>;
     };
-  };
-  const result = await runConversation(withSettledWork({
-    agent: makeAgentStub(),
-    sessionId: sess.id,
-    input: 'put 20 firm outreach drafts in a google sheet',
-    makeRunner: makeRunnerStub,
-    runRunner,
-  }));
-  assert.equal(result.status, 'completed', 'a bound create never parks the completion');
-  const asks = listEvents(sess.id, { types: ['awaiting_user_input'] })
-    .filter((e) => e.data.source === 'artifact_verification_pending');
-  assert.equal(asks.length, 0, 'no unanswerable retry check-in');
+    assert.equal(graph.classification?.route, 'act');
+    assert.deepEqual(
+      graph.nodes?.filter((node) => node.operationId).map((node) => [node.id, node.capabilityRole]),
+      [
+        ['op-source', 'source'],
+        ['op-collect', 'collection'],
+        ['op-transform', 'transform'],
+        ['op-write', 'destination'],
+        ['op-readback', 'readback'],
+      ],
+      'the accepted graph itself owns the provider-neutral read/create/readback chain',
+    );
+
+    const expectedWork = fixtureExpectedWork.actionExpectedWorkState({
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+    });
+    assert.equal(expectedWork.status, 'required');
+    assert.ok(expectedWork.status === 'required' && expectedWork.contractId);
+    const bindings = openEventLog().prepare(`
+      SELECT requirement_id, effect_kind, logical_tool_call_id
+        FROM expected_work_call_bindings
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY rowid
+    `).all(sess.id, source.seq) as Array<{
+      requirement_id: string;
+      effect_kind: string;
+      logical_tool_call_id: string;
+    }>;
+    assert.deepEqual(bindings, [
+      { requirement_id: 'op-source', effect_kind: 'read', logical_tool_call_id: 'logical:op-source' },
+      { requirement_id: 'op-collect', effect_kind: 'read', logical_tool_call_id: 'logical:op-collect' },
+      { requirement_id: 'op-transform', effect_kind: 'compute', logical_tool_call_id: 'logical:op-transform' },
+      { requirement_id: 'op-write', effect_kind: 'external_write', logical_tool_call_id: 'logical:op-write' },
+      { requirement_id: 'op-readback', effect_kind: 'read', logical_tool_call_id: 'logical:op-readback' },
+    ]);
+
+    const dispatchCounts = openEventLog().prepare(`
+      SELECT COUNT(*) AS total, COUNT(DISTINCT physical_dispatch_id) AS unique_dispatches,
+             SUM(CASE WHEN state = 'returned' THEN 1 ELSE 0 END) AS returned
+        FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(sess.id, source.seq) as {
+      total: number;
+      unique_dispatches: number;
+      returned: number;
+    };
+    assert.deepEqual(dispatchCounts, { total: 5, unique_dispatches: 5, returned: 5 });
+    const settlementAudit = fixtureSettlementAudit.auditAcceptedSourceSettlementTruth({
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      requiresBusinessEvidence: true,
+      requireEveryBusinessReadToSettle: true,
+    });
+    assert.equal(settlementAudit.status, 'clean', settlementAudit.reason);
+    assert.equal(settlementAudit.facts.successfulBusinessSettlements, 5);
+
+    const artifacts = artifactLedger.listRunArtifacts(sess.id);
+    assert.equal(artifacts.length, 1);
+    assert.equal(artifacts[0]!.kind, 'resource', 'generic creates retain the current resource kind');
+    assert.equal(artifacts[0]!.status, 'bound');
+    assert.equal(artifacts[0]!.resourceId, resourceId);
+    assert.equal(artifacts[0]!.uri, resourceUri);
+    assert.equal(artifacts[0]!.sourceCallId, 'logical:op-write');
+    const derivation = artifactLedger.verifyHostSealedArtifactDerivationForWrite({
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      createLogicalToolCallId: 'logical:op-write',
+      createdId: resourceId,
+      intendedContentDigest: artifactLedger.hostArtifactContentDigest(fixtureRecords),
+    });
+    assert.equal(derivation.status, 'verified', JSON.stringify(derivation));
+
+    const terminals = listEvents(sess.id, { types: ['conversation_completed'] })
+      .filter((event) => event.data.sourceUserSeq === source.seq);
+    assert.equal(terminals.length, 1, 'one accepted source publishes one terminal');
+    assert.equal(terminals[0]!.data.reply, resourceUri);
+    assert.equal(listEvents(sess.id, { types: ['async_work_dispatched'] }).length, 0);
+    const asks = listEvents(sess.id, { types: ['awaiting_user_input'] })
+      .filter((event) => event.data.source === 'artifact_verification_pending');
+    assert.equal(asks.length, 0, 'the exact readback leaves no unanswerable retry check-in');
+  } finally {
+    semanticRegistry.installTurnSemanticModelPort(priorSemanticPort);
+    catalogFactory.installHostCapabilityCatalogFactory(priorCatalogFactory);
+    manifestStore.installCapabilityManifestStore(priorManifestStore);
+    productionAdapter.installProductionCapabilityAdapter(priorProductionAdapter);
+  }
 });
 
 test('standard artifact pause lineage is inherited only by the immediate reply', async () => {
@@ -5037,7 +5598,11 @@ test('runConversation: a DECISION-level awaiting_approval (no SDK interrupt) SYN
     agent: makeAgentStub(), sessionId: sess.id, input: 'send the outreach batch',
     makeRunner: makeRunnerStub, runRunner,
   });
-  assert.equal(result.status, 'awaiting_approval', 'still halts for approval');
+  assert.equal(
+    result.status,
+    'awaiting_user_input',
+    'a model-reported approval with no exact approval authority is an ordinary question',
+  );
   const askEvents = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
   assert.equal(askEvents.length, 1, 'exactly one synthesized delivery event');
   assert.match((askEvents[0].data as { question: string }).question, /approve to proceed/);
@@ -6828,7 +7393,7 @@ test('objective judge: does NOT fire for a non-action (lookup) intent', async ()
 test('honest-completion: a blocked/error-stub final reply does NOT bank as completed', async () => {
   // The Done? trust-killer: a turn that ends "I can't proceed without your
   // approval" previously returned status=completed (false green). The ungated
-  // blocked-text backstop converts it to the honest awaiting_user_input.
+  // blocked-text backstop converts it to the honest typed blocked state.
   const sess = HarnessSession.create({ kind: 'workflow' }); // non-opted-in lane (judge never runs)
   const runner = scriptedRunner([
     { finalOutput: { summary: 'blocked', reply: 'I cannot complete this task — I need your approval to send.', done: true, nextAction: 'completed', reason: null } },
@@ -6837,7 +7402,7 @@ test('honest-completion: a blocked/error-stub final reply does NOT bank as compl
     agent: makeAgentStub(), sessionId: sess.id, input: 'send the campaign',
     makeRunner: makeRunnerStub, runRunner: runner,
   });
-  assert.equal(result.status, 'awaiting_user_input', 'blocked reply must not report completed');
+  assert.equal(result.status, 'blocked', 'blocked reply must not report completed');
   const completed = listEvents(sess.id, { types: ['conversation_completed'] });
   assert.equal(completed.at(-1)!.data.delivered, false, 'event marked not-delivered');
   assert.ok(completed.at(-1)!.data.blockedReason, 'blockedReason recorded');
@@ -6860,7 +7425,7 @@ test('honest-completion: a promise-shaped final reply is judged before banking c
     makeRunner: makeRunnerStub,
     runRunner: runner,
   });
-  assert.equal(result.status, 'awaiting_user_input', 'promise-shaped reply must not false-green');
+  assert.equal(result.status, 'blocked', 'promise-shaped reply must not false-green');
   assert.equal(judgeCalls.length, 1, 'promise-shaped completion used the delivery judge');
   assert.match(judgeCalls[0].objective, /prep the contacts/i);
   const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
@@ -7033,7 +7598,7 @@ test('honest-completion: the live RESUME path (runConversationFromResume) also g
     agent, sessionId: sess.id, decision: 'approve', resolver: 'unit-test',
     makeRunner: makeRunnerStub, runRunner,
   });
-  assert.equal(result.status, 'awaiting_user_input', 'resume blocked reply must not bank completed');
+  assert.equal(result.status, 'blocked', 'resume blocked reply must not bank completed');
   assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!.data.delivered, false);
 });
 
@@ -7290,7 +7855,7 @@ test('honest-completion: RESUME path judges promise-shaped final replies before 
     },
     makeRunner: makeRunnerStub, runRunner,
   });
-  assert.equal(result.status, 'awaiting_user_input', 'resume promise-shaped reply must not bank completed');
+  assert.equal(result.status, 'blocked', 'resume promise-shaped reply must not bank completed');
   assert.equal(judgeCalls.length, 1);
   assert.match(judgeCalls[0].objective, /pull the latest records/i);
   const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
@@ -7298,7 +7863,7 @@ test('honest-completion: RESUME path judges promise-shaped final replies before 
   assert.match(String(completed.data.blockedReason), /no records were returned/i);
 });
 
-test('resume budget exit emits the PAIRED conversation_completed (bare limit event hangs the chat dock / Discord)', async () => {
+test('resume budget exit emits the paired blocked conversation_completed (a bare limit event hangs the chat dock / Discord)', async () => {
   resetEventLog();
   const agent = new Agent({ name: 'ResumeBudgetTest', instructions: 'test' });
   const sess = HarnessSession.create({ kind: 'chat', title: 'resume-budget' });
@@ -7320,15 +7885,17 @@ test('resume budget exit emits the PAIRED conversation_completed (bare limit eve
     maxSteps: 3,
     makeRunner: makeRunnerStub, runRunner: recurseForever,
   });
-  assert.equal(result.status, 'limit_exceeded');
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.limitKind, 'max_steps');
+  assert.equal(result.publicPresentation?.status, 'blocked');
   // The audit event AND the paired user-facing completion must BOTH be present —
   // the clients (chat.ts isTerminalEvent, console.ts SSE, Discord) treat a bare
   // conversation_limit_exceeded as NON-terminal and wait for the pair, so a bare
   // emit on the resume path hangs the surface until its idle/safety timeout.
   assert.ok(listEventsForConv(sess.id, { types: ['conversation_limit_exceeded'] }).length >= 1, 'audit limit event present');
   const paired = listEventsForConv(sess.id, { types: ['conversation_completed'] })
-    .find((e) => (e.data as { reason?: unknown }).reason === 'awaiting_continue');
-  assert.ok(paired, 'resume budget exit MUST emit a paired conversation_completed(reason=awaiting_continue)');
+    .find((e) => (e.data as { reason?: unknown }).reason === 'step_budget_parked');
+  assert.ok(paired, 'resume budget exit MUST emit a paired conversation_completed(reason=step_budget_parked)');
 });
 
 test('runConversationFromResume: long activation ceiling survives legacy auto-continue state', async () => {
@@ -7379,7 +7946,7 @@ test('runConversationFromResume: long activation ceiling survives legacy auto-co
       makeRunner: makeRunnerStub,
       runRunner: recurseUntilBug,
     });
-    assert.equal(result.status, 'limit_exceeded');
+    assert.equal(result.status, 'blocked');
     assert.equal(result.limitKind, 'max_steps');
     assert.equal(result.steps, 3);
     assert.equal(calls, 3);
@@ -7568,7 +8135,7 @@ test('objective judge: continuation budget caps retries, then delivery verifier 
       makeRunner: makeRunnerStub,
       runRunner: runner,
     });
-    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(result.status, 'blocked');
     assert.equal(judgeCalls, 3, '2 judge-forced continuations + 1 final delivery verification');
     assert.equal(result.steps, 3, '2 judge-forced continuations + the final not-delivered boundary');
     const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
@@ -7580,8 +8147,13 @@ test('objective judge: continuation budget caps retries, then delivery verifier 
   }
 });
 
-test('runConversation: recurses through done=false steps until done=true', async () => {
-  const sess = HarnessSession.create({ kind: 'chat' });
+// Workflow/controller mechanics only: this deliberately does not claim
+// standard chat/action acceptance coverage. The typed chat dispatcher owns a
+// participated action before the legacy model loop can recurse.
+// TODO(host-runner-default-cutover): prove false,false,true standard-chat
+// continuation at the host-runner seam once typed execution exposes it.
+test('runConversation workflow-controller mechanics: recurses through done=false steps until done=true', async () => {
+  const sess = HarnessSession.create({ kind: 'workflow' });
   const runner = scriptedRunner([
     {
       finalOutput: {
@@ -7601,21 +8173,21 @@ test('runConversation: recurses through done=false steps until done=true', async
     },
     {
       finalOutput: {
-        summary: 'all three steps complete, sheet created',
-        reply: 'All three steps complete; sheet created.',
+        summary: 'all three internal orchestration steps complete',
+        reply: 'All three internal orchestration steps are complete.',
         done: true,
         nextAction: 'completed',
         reason: null,
       },
     },
   ]);
-  const result = await runConversation(withSettledWork({
+  const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
-    input: 'find 20 accounts, scrape, build a sheet',
+    input: 'The already-confirmed internal three-step orchestration is ready for its state-machine pass.',
     makeRunner: makeRunnerStub,
     runRunner: runner,
-  }));
+  });
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 3);
   assert.equal(result.lastDecision?.done, true);
@@ -7625,6 +8197,10 @@ test('runConversation: recurses through done=false steps until done=true', async
   assert.equal(stepEvents[0].data.step, 1);
   assert.equal(stepEvents[1].data.step, 2);
   assert.equal(stepEvents[2].data.step, 3);
+  assert.deepEqual(
+    stepEvents.map((event) => (event.data.decision as { done?: boolean }).done),
+    [false, false, true],
+  );
 });
 
 test('runConversation: stops with awaiting_user_input when the orchestrator asks', async () => {
@@ -7800,7 +8376,13 @@ test('runConversation: one request materializes distinct queued payloads and col
     runRunner,
   });
 
-  assert.equal(result.status, 'awaiting_approval');
+  assert.equal(
+    result.status,
+    'awaiting_user_input',
+    'multiple approval cards require an explicit user choice; no singular approval authority is invented',
+  );
+  assert.equal(result.publicPresentation?.kind, 'question');
+  assert.equal(result.publicPresentation?.approvalId, undefined);
   assert.equal(calls, 1, 'all distinct approval edges materialize without another model turn');
   assert.equal(
     listEvents(sess.id, { types: ['heartbeat'] })
@@ -8183,7 +8765,9 @@ test('runConversation: bails out at maxSteps when the orchestrator keeps recursi
     makeRunner: makeRunnerStub,
     runRunner: recurseForever,
   });
-  assert.equal(result.status, 'limit_exceeded');
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.limitKind, 'max_steps');
+  assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(result.steps, 3);
   const limitEvents = listEventsForConv(sess.id, { types: ['conversation_limit_exceeded'] });
   assert.equal(limitEvents.length, 1);
@@ -8223,8 +8807,9 @@ test('runConversation: long auto-continue preference cannot erase the configured
       makeRunner: makeRunnerStub,
       runRunner: recurseUntilBug,
     });
-    assert.equal(result.status, 'limit_exceeded');
+    assert.equal(result.status, 'blocked');
     assert.equal(result.limitKind, 'max_steps');
+    assert.equal(result.publicPresentation?.status, 'blocked');
     assert.equal(result.steps, 3);
     assert.equal(calls, 3);
   } finally {
@@ -8262,7 +8847,9 @@ test('runConversation: bails out at maxWallClockMs', async () => {
     makeRunner: makeRunnerStub,
     runRunner: slow,
   });
-  assert.equal(result.status, 'limit_exceeded');
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.limitKind, 'wall_clock');
+  assert.equal(result.publicPresentation?.status, 'blocked');
   const limitEvents = listEventsForConv(sess.id, { types: ['conversation_limit_exceeded'] });
   assert.equal(limitEvents[0].data.reason, 'wall_clock');
 });
@@ -10701,15 +11288,16 @@ test('runConversation: propagates run_failed status when a turn throws', async (
 test('runConversation: failure replay returns the persisted stable error and never duplicates the terminal', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
-  const accepted = appendEvent({
-    sessionId: sess.id,
+  const attempt = beginRunAttempt(sess.id, { runId: 'failed-terminal-replay' });
+  const accepted = recordRunAttemptUserInput(attempt, {
     turn: 7,
     role: 'user',
-    type: 'user_input_received',
     data: { text: 'Run the same accepted request.' },
-  });
+  }, { armRunInFlight: true });
   const privateDetail = 'provider-secret diagnostic 529 upstream trace';
+  let executorAttempts = 0;
   const runRunner: RunRunnerFn = async () => {
+    executorAttempts += 1;
     throw new Error(privateDetail);
   };
   const run = () => runConversation({
@@ -10718,6 +11306,7 @@ test('runConversation: failure replay returns the persisted stable error and nev
     input: 'Run the same accepted request.',
     sourceUserSeq: accepted.seq,
     reuseRecordedUserInput: true,
+    runAttemptId: attempt.attemptId,
     makeRunner: makeRunnerStub,
     runRunner,
   });
@@ -10735,13 +11324,117 @@ test('runConversation: failure replay returns the persisted stable error and nev
     turn: accepted.turn,
     sourceUserSeq: accepted.seq,
   }, 'logical terminal identity comes from the accepted event, not either physical failed turn');
+  assert.equal(executorAttempts, 1, 'the exact terminal replay never re-enters the executor');
   const failures = listEventsForConv(sess.id, { types: ['run_failed'] });
-  assert.equal(failures.length, 2, 'each executor attempt remains privately observable');
+  assert.equal(failures.length, 1, 'the sole executor attempt remains privately observable');
   assert.ok(failures.some((event) => JSON.stringify(event.data).includes(privateDetail)));
   const terminals = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1, 'the logical request has exactly one public terminal');
   assert.equal(terminals[0].turn, accepted.turn);
   assert.equal(HarnessSession.load(sess.id)?.runInFlightSince(), null, 'the persisted terminal settles restart recovery after replay');
+});
+
+test('runConversation: source-claiming legacy or corrupt terminals stop before model and tool execution', async (t) => {
+  for (const terminalKind of ['legacy', 'corrupt'] as const) {
+    await t.test(terminalKind, async () => {
+      resetEventLog();
+      const sess = HarnessSession.create({ kind: 'chat' });
+      const accepted = appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'user',
+        type: 'user_input_received',
+        data: { text: 'Run this accepted request exactly once.' },
+      });
+      const identity = {
+        sessionId: sess.id,
+        turn: accepted.turn,
+        sourceUserSeq: accepted.seq,
+      };
+      const data = terminalKind === 'legacy'
+        ? {
+            terminalKey: `turn:${accepted.seq}`,
+            sourceUserSeq: accepted.seq,
+            reply: 'A pre-upgrade terminal already exists.',
+            summary: 'A pre-upgrade terminal already exists.',
+            reason: 'success',
+            delivered: true,
+          }
+        : {
+            terminalKey: `turn:${accepted.seq}`,
+            sourceUserSeq: accepted.seq,
+            presentation: { identity },
+          };
+      openEventLog().prepare(`
+        INSERT INTO events
+          (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+        VALUES (?, ?, ?, 'system', 'conversation_completed', ?, ?, ?)
+      `).run(
+        `${sess.id}:${terminalKind}-terminal`,
+        sess.id,
+        accepted.turn,
+        accepted.id,
+        JSON.stringify(data),
+        new Date().toISOString(),
+      );
+
+      let executorAttempts = 0;
+      const result = await runConversation({
+        agent: makeAgentStub(),
+        sessionId: sess.id,
+        input: 'Run this accepted request exactly once.',
+        sourceUserSeq: accepted.seq,
+        reuseRecordedUserInput: true,
+        makeRunner: makeRunnerStub,
+        runRunner: async () => {
+          executorAttempts += 1;
+          throw new Error('must not execute');
+        },
+      });
+
+      assert.equal(result.status, 'blocked');
+      assert.equal(result.steps, 0);
+      assert.match(result.error ?? '', /terminal record.*cannot verify safely/i);
+      assert.equal(executorAttempts, 0, 'an unverifiable existing winner is never treated as absence');
+      assert.equal(
+        listEventsForConv(sess.id, { types: ['conversation_completed'] }).length,
+        1,
+        'the retry neither overwrites nor duplicates the historical winner',
+      );
+      assert.equal(
+        listEventsForConv(sess.id, { types: ['turn_graph_compiled', 'tool_called'] }).length,
+        0,
+        'the retry stops before graph admission or any tool-bearing lane',
+      );
+
+      let resumeBuilds = 0;
+      let resumeRunners = 0;
+      let resumeExecutions = 0;
+      const resumed = await runConversationFromResume({
+        sessionId: sess.id,
+        sourceUserSeq: accepted.seq,
+        decision: 'approve',
+        buildAgent: async () => {
+          resumeBuilds += 1;
+          return makeAgentStub();
+        },
+        makeRunner: () => {
+          resumeRunners += 1;
+          return makeRunnerStub();
+        },
+        runRunner: async () => {
+          resumeExecutions += 1;
+          throw new Error('resume must not execute');
+        },
+      });
+      assert.equal(resumed.status, 'blocked');
+      assert.deepEqual(
+        { resumeBuilds, resumeRunners, resumeExecutions },
+        { resumeBuilds: 0, resumeRunners: 0, resumeExecutions: 0 },
+        'approval resume uses the same exact-source replay fence before SDK construction',
+      );
+    });
+  }
 });
 
 test('isCodexAuthRevoked: a real revoke marker is terminal; a BARE model 401 is NOT (refresh-and-retry, no brick)', async () => {
@@ -11511,8 +12204,9 @@ test('runConversation: an incomplete workflow lifecycle fails closed at its boun
     runRunner,
   });
 
-  assert.equal(result.status, 'limit_exceeded');
+  assert.equal(result.status, 'blocked');
   assert.equal(result.limitKind, 'max_steps');
+  assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(runs, 2);
   assert.equal(listEventsForConv(sess.id, { types: ['async_work_dispatched'] }).length, 0);
 });
@@ -12271,7 +12965,7 @@ test('E2E memory-credit loop: a primed fact reproduced in the reply earns recall
   assert.equal(getFact(fact.id)?.utilityCount, 1, 'the credit reached the utility counter');
 });
 
-test('Stage 4 E2E: a run that exhausts its token budget parks with the paired continue prompt', async () => {
+test('Stage 4 E2E: a run that exhausts its token budget parks with the paired blocked checkpoint', async () => {
   resetEventLog();
   const prevCeiling = process.env.HARNESS_MAX_RUN_TOKENS;
   process.env.HARNESS_MAX_RUN_TOKENS = '1000';
@@ -12300,14 +12994,15 @@ test('Stage 4 E2E: a run that exhausts its token budget parks with the paired co
       makeRunner: makeRunnerStub,
       runRunner,
     });
-    assert.equal(result.status, 'limit_exceeded');
+    assert.equal(result.status, 'blocked');
     assert.equal(result.limitKind, 'token_budget');
+    assert.equal(result.publicPresentation?.status, 'blocked');
     assert.ok(calls >= 2, 'the ceiling parked the run at a boundary, not mid-first-turn');
     const limitEvents = listEventsForConv(sess.id, { types: ['conversation_limit_exceeded'] });
     assert.ok(limitEvents.some((e) => (e.data as { reason?: string }).reason === 'token_budget'));
     const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
-    const park = completed.find((e) => (e.data as { reason?: string }).reason === 'awaiting_continue');
-    assert.ok(park, 'the paired awaiting_continue completion fires (surfaces treat a bare limit event as non-terminal)');
+    const park = completed.find((e) => (e.data as { reason?: string }).reason === 'step_budget_parked');
+    assert.ok(park, 'the paired blocked completion fires (surfaces treat a bare limit event as non-terminal)');
     assert.match(String((park!.data as { reply?: string }).reply ?? ''), /token budget/i);
   } finally {
     if (prevCeiling === undefined) delete process.env.HARNESS_MAX_RUN_TOKENS;
@@ -12524,7 +13219,7 @@ test('runConversation: when even the recovery turn fails, the floor is HUMAN lan
     const asks = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
     assert.equal(asks.length, 1);
     const q = String((asks[0].data as { question?: string }).question ?? '');
-    assert.match(q, /pick it back up fresh/, 'floor is the plain-language ask');
+    assert.match(q, /Progress is saved; send another message to resume it/i, 'floor is the plain-language ask');
     for (const banned of ['unable to make progress', 'the model', 'switch approach', 'retry', 'tool']) {
       assert.ok(!q.toLowerCase().includes(banned), `floor never says "${banned}"`);
     }
@@ -12910,7 +13605,7 @@ test('stall judge: an honest "integration not connected" report is visible but p
       agent: makeAgentStub(), sessionId: sess.id, input: 'pull the 15 prospects from salesforce',
       makeRunner: makeRunnerStub, runRunner: runner,
     });
-    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(result.status, 'blocked');
     assert.equal(judgeCalls, 1, 'the tool-unavailable claim is judged, not auto-condemned');
     const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
     assert.ok(completed.some((e) => /Connections screen/.test(String((e.data as { reply?: string }).reply ?? ''))), 'the honest gap report reaches the user');

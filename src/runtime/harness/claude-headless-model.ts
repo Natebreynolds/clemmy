@@ -11,6 +11,7 @@ import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import { recordModelUsage } from '../usage-log.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
+import { assertConversationProtocolAtProviderBoundary } from './conversation-protocol-boundary.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-headless-model' });
@@ -277,6 +278,7 @@ function safeJson(value: unknown): string {
 type ClaudeHeadlessEvent = {
   type?: string;
   subtype?: string;
+  is_error?: unknown;
   session_id?: string;
   message?: {
     id?: string;
@@ -429,11 +431,41 @@ function recordClaudeHeadlessUsage(state: HeadlessRunState): void {
   } catch { /* observability must never break the response path */ }
 }
 
+/**
+ * PROJECT THIS TRANSPORT'S FAILURE VOCABULARY INTO CANONICAL TERMINATION.
+ *
+ * This CLI reports failure in-band: it exits zero and emits a result event
+ * carrying `is_error` and a `subtype`. Recording those in `providerData` as
+ * bookkeeping — which is all this used to do — left the canonical boundary
+ * seeing a response with no termination metadata and a perfectly ordinary
+ * assistant message, so a failed run's partial text was admitted as a finished
+ * answer.
+ *
+ * Normalisation belongs HERE, at the adapter edge, so the shared admission
+ * boundary stays provider-neutral and never learns this transport's spellings.
+ */
+function canonicalTerminationFromResult(
+  result: ClaudeHeadlessEvent | undefined,
+): { status?: string; finish_reason?: string } {
+  if (!result?.is_error) return {};
+  const subtype = typeof result.subtype === 'string' ? result.subtype.trim().toLowerCase() : '';
+  // Running out of turns is a BOUNDED LIMIT, not an opaque failure: the host
+  // can say what happened and a continuation is meaningful.
+  if (subtype === 'error_max_turns') return { finish_reason: 'max_output_tokens' };
+  // Every other error subtype is an explicit provider failure.
+  return { status: 'failed' };
+}
+
 function modelResponseFromState(state: HeadlessRunState, outputType: ModelRequest['outputType']): ModelResponse {
   const text = normalizeClaudeHeadlessOutputText(state.text || state.emittedText, outputType);
   recordClaudeHeadlessUsage(state);
+  const errored = Boolean(state.resultEvent?.is_error);
+  const termination = canonicalTerminationFromResult(state.resultEvent);
   return {
-    output: text ? [assistantMessage(text)] : [],
+    // An errored run's partial text is never presented as a completed
+    // assistant message. It stays available privately in `rawEvents` for
+    // diagnostics; it does not become an answer or future model context.
+    output: text && !errored ? [assistantMessage(text)] : [],
     usage: usageFromClaude(state.usage),
     responseId: state.sessionId || state.requestId || state.responseId,
     requestId: state.requestId,
@@ -442,8 +474,11 @@ function modelResponseFromState(state: HeadlessRunState, outputType: ModelReques
       sessionId: state.sessionId,
       model: state.model,
       rawEvents: state.rawEvents,
+      // Raw subtype preserved for private diagnostics, alongside the canonical
+      // projection the admission boundary actually reads.
       resultSubtype: state.resultEvent?.subtype,
       totalCostUsd: state.resultEvent?.total_cost_usd,
+      ...termination,
     },
   };
 }
@@ -527,6 +562,7 @@ async function* runClaudeHeadless(request: ModelRequest, modelId: string): Async
 async function* runClaudeHeadlessAttempt(request: ModelRequest, modelId: string, command: string, args: string[]): AsyncGenerator<{ kind: 'delta'; delta: string } | { kind: 'done'; response: ModelResponse }> {
   const env = await buildClaudeHeadlessEnv();
   const prompt = renderClaudeHeadlessPrompt(request);
+  assertConversationProtocolAtProviderBoundary(request.input, 'claude.headless');
   const state: HeadlessRunState = {
     responseId: `claude-headless-${randomUUID()}`,
     text: '',

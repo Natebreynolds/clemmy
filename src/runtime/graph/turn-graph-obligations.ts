@@ -25,6 +25,8 @@ export type EvidenceObligation =
   | 'commit_effect'
   /** The written target was read back and matched. */
   | 'verify_committed_readback'
+  /** A documented atomic-input create acknowledged this exact submitted content. */
+  | 'verify_committed_content'
   /** A durable receipt exists for an effect that cannot be read back. */
   | 'verify_committed_receipt'
   /** Destination content predating this run was reconciled, not inherited. */
@@ -56,6 +58,8 @@ export interface AttachEvidenceObligationsInput {
   /** True when the frozen contract declared resolved-operation coverage for
    * this read: the proof owed is durable observation, not source exhaustion. */
   observationSufficient?: boolean;
+  /** Exact documented atomic input-to-created-content operation. */
+  contentCommitMode?: 'documented_atomic_input';
 }
 
 function obligationsForNode(node: {
@@ -67,6 +71,7 @@ function obligationsForNode(node: {
   hasSourceRead?: boolean;
   requiresStaleReconciliation?: boolean;
   observationSufficient?: boolean;
+  contentCommitMode?: AttachEvidenceObligationsInput['contentCommitMode'];
 }): NodeObligation[] {
   const out: NodeObligation[] = [];
   const { id } = node;
@@ -107,7 +112,13 @@ function obligationsForNode(node: {
       });
 
     // The proof depends on what the effect IS.
-    if (node.reversibility === 'irreversible') {
+    if (node.contentCommitMode === 'documented_atomic_input') {
+      out.push({
+        nodeId: id,
+        obligation: 'verify_committed_content',
+        because: 'the documented atomic create must acknowledge the exact provider-ready submitted content',
+      });
+    } else if (node.reversibility === 'irreversible') {
       out.push({
         nodeId: id,
         obligation: 'verify_committed_receipt',
@@ -173,5 +184,6 @@ export function attachEvidenceObligations(
     ...(input.observationSufficient !== undefined
       ? { observationSufficient: input.observationSufficient }
       : {}),
+    ...(input.contentCommitMode ? { contentCommitMode: input.contentCommitMode } : {}),
   });
 }

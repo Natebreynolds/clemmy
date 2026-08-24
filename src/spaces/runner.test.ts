@@ -31,9 +31,18 @@ const store = await import('./store.js');
 const dataStore = await import('./data-store.js');
 const workspaceDb = await import('./workspace-db.js');
 const observationDiff = await import('./observation-diff.js');
+const runnerTrust = await import('./space-data-runner-trust.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const operationalTelemetry = await import('../runtime/operational-telemetry.js');
+
+test('importing the Workspace runner registers trust recovery without opening the event log', async () => {
+  // Registration used to enqueue an unowned setImmediate scan. Besides making
+  // imports mutate durable state, that callback could collide with a foreground
+  // v55 migration. Boot recovery now has an explicit daemon-owned phase.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(existsSync(eventlog.HARNESS_DB_PATH), false);
+});
 
 function writeRunner(slug: string, file: string, body: string, exec = false): void {
   const dir = store.resolveInSpace(slug, 'data');
@@ -263,6 +272,47 @@ test('an installed legacy data runner requests one pinned-entrypoint trust card,
   assert.equal(resolved.ok, true);
   const approved = await runner.runSpaceDataSource(slug, source);
   assert.deepEqual(approved, { ok: true, data: { version: 1 } });
+});
+
+test('daemon-owned runner-trust recovery replays an offline approval exactly once', async () => {
+  const slug = 'legacy-runner-trust-boot-recovery';
+  const source = { id: 'pull', runner: 'pull.mjs' };
+  writeRunner(
+    slug,
+    source.runner,
+    `import { writeFileSync } from 'node:fs';
+writeFileSync(new URL('./boot-recovered.txt', import.meta.url), 'yes');
+process.stdout.write('{}');`,
+  );
+  store.spaceStore.save({
+    id: slug,
+    title: 'Legacy runner trust boot recovery',
+    dataSources: [source],
+  });
+
+  const refresh = await runner.refreshSpaceData(slug, source.id);
+  const approvalId = refresh[0]?.pendingApprovalId;
+  assert.match(approvalId ?? '', /^apr-/);
+
+  // Simulate a decision committed by another process while the daemon and its
+  // live resolution listener were offline.
+  const resolvedAt = new Date().toISOString();
+  eventlog.openEventLog().prepare(`
+    UPDATE pending_approvals
+       SET status = 'resolved', resolution = 'approved', resolver = ?, resolved_at = ?
+     WHERE approval_id = ? AND status = 'pending'
+  `).run('runner-trust-offline-test', resolvedAt, approvalId);
+
+  assert.equal(runnerTrust.recoverResolvedRunnerTrustApprovals(), 1);
+  assert.equal(approvalRegistry.get(approvalId!)?.consumedAt !== null, true);
+  assert.equal(runnerTrust.recoverResolvedRunnerTrustApprovals(), 0, 'the durable resume claim is one-shot');
+
+  const recoveredPath = store.resolveInSpace(slug, 'data/boot-recovered.txt');
+  const deadline = Date.now() + 5_000;
+  while (!existsSync(recoveredPath) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(existsSync(recoveredPath), true);
 });
 
 test('frozen CLI data source: ONE approval pins the exact argv + schedule, then refreshes run unattended', async () => {

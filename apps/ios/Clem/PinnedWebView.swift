@@ -51,6 +51,11 @@ final class WebViewModel: NSObject, ObservableObject {
         // on the LAN; the shell keeps it so the next relay-origin load can
         // establish a session there. See loadHome().
         config.userContentController.add(ScriptProxy(self), name: "clemHandoff")
+        // A failed fetch does not trigger WKNavigationDelegate failure
+        // callbacks because the PWA itself is still loaded. Let the page tell
+        // us that its current origin stopped answering so the native reconnect
+        // ladder can switch from LAN to the relay while the app is open.
+        config.userContentController.add(ScriptProxy(self), name: "clemConnectionLost")
         impactLight.prepare()
         impactMedium.prepare()
         notify.prepare()
@@ -320,6 +325,12 @@ private final class ScriptProxy: NSObject, WKScriptMessageHandler {
     }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "clemConnectionLost" {
+            MainActor.assumeIsolated {
+                model?.connectionLost = true
+            }
+            return
+        }
         if message.name == "clemHandoff" {
             // Opaque single-use token + its expiry. Held only in memory: it is
             // short-lived by design and a fresh one is minted on every LAN

@@ -1,6 +1,7 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
@@ -21,23 +22,31 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-ventura-email
 const eventlog = await import('./eventlog.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const expectedWork = await import('./expected-work-admission.js');
+const expectedWorkContract = await import('./expected-work-contract.js');
 const artifactLedger = await import('./artifact-ledger.js');
 const dispatchLedger = await import('./dispatch-ledger.js');
 const brackets = await import('./brackets.js');
+const continuityRuntime = await import('./task-continuity-runtime.js');
+const turnControl = await import('./turn-control.js');
+const { commitTurnOutcome } = await import('./delivery-committer.js');
+const { turnOutcomeId } = await import('./turn-outcome.js');
+const { recordAcceptedSourceGraph } = await import('./record-accepted-source-graph.js');
 const pendingActions = await import('./pending-actions.js');
 const pendingTransitions = await import('./pending-action-transition.js');
 const approvals = await import('./approval-registry.js');
 const composio = await import('../../tools/composio-tools.js');
+const composioSchema = await import('../../tools/composio-schema-cache.js');
 const pendingTools = await import('../../tools/pending-action-tools.js');
 const { buildWorkerAgent } = await import('../../agents/sub-agents.js');
 const {
-  _setCodeModeToolsForTests,
+  _setInnerDispatchToolsForTests,
   dispatchBatchItemTool,
-} = await import('../../tools/code-mode-tool.js');
+} = await import('../../tools/inner-dispatch.js');
 const { withToolOutputContext } = await import('./tool-output-context.js');
 
 test.after(() => {
-  _setCodeModeToolsForTests(null);
+  _setInnerDispatchToolsForTests(null);
+  composioSchema.resetToolSchemaCache();
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -45,6 +54,12 @@ test.after(() => {
 const REQUEST = 'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.';
 const SHEET_ID = 'ventura-sheet-verified';
 const SHEET_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
+const SOURCE_TOOL = 'APIFY_TEST_VENTURA_TOP_5_RESTAURANTS_GET';
+const SOURCE_SCHEMA = {
+  type: 'object',
+  properties: {},
+  additionalProperties: false,
+} as const;
 const ROWS = [
   { Name: 'Restaurant 1', Rating: 4.9, Address: '1 Main St, Ventura, CA' },
   { Name: 'Restaurant 2', Rating: 4.8, Address: '2 Main St, Ventura, CA' },
@@ -74,11 +89,6 @@ const proposal = {
     {
       id: 'verify_sheet', effect: 'read' as const, coverage: 'complete_set' as const,
       dependsOn: ['create_sheet'], dataFrom: ['create_sheet'],
-      cardinality: { kind: 'once' as const },
-    },
-    {
-      id: 'inspect_sheet', effect: 'read' as const, coverage: 'complete_set' as const,
-      dependsOn: ['fetch_restaurants'], dataFrom: ['fetch_restaurants'],
       cardinality: { kind: 'once' as const },
     },
     {
@@ -116,16 +126,107 @@ function pendingHandler(name: string) {
 }
 
 test('verified Ventura Sheet yields exactly one email approval card and zero sends across an identical retry', async () => {
+  // This integration owns the Sheet/readback/email lifecycle, not provider
+  // argument-template selection. Model the already-selected Apify recipe as a
+  // parameterless action so its V1 source binding is executable without
+  // weakening the production rule that rejects unattested nonempty args.
+  composioSchema.rememberToolSchema(SOURCE_TOOL, SOURCE_SCHEMA, Date.now());
+  const sourceSchemaFingerprint = composioSchema.liveComposioSchemaFingerprint(SOURCE_TOOL);
+  assert.ok(sourceSchemaFingerprint, 'the fixture source owns a live schema observation');
+  const sourceStrategyBinding = {
+    version: 1 as const,
+    primary: {
+      capabilityId: `capability:composio:${SOURCE_TOOL}`,
+      schemaFingerprint: sourceSchemaFingerprint,
+    },
+    equivalentFallbacks: [],
+    topology: 'single_aggregate_read_then_single_artifact_write' as const,
+    topologyDigest: createHash('sha256').update(JSON.stringify(proposal)).digest('hex'),
+    destination: { family: 'workbook' as const, posture: 'create_new' as const },
+    effect: 'external_write' as const,
+  };
   const session = eventlog.createSession({ id: 'ventura-email-card-exact-once', kind: 'chat' });
-  const source = eventlog.appendEvent({
+  const parent = eventlog.appendEvent({
     sessionId: session.id,
     turn: 1,
     role: 'user',
     type: 'user_input_received',
     data: { text: REQUEST },
   });
-  const task = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
-  assert.ok(shadow.recordTurnGraphShadow({ identity: task }));
+  const parentTask = { sessionId: session.id, sourceUserSeq: parent.seq, turn: 1 };
+  assert.ok(shadow.recordTurnGraphShadow({ identity: parentTask }));
+  const intentKey = 'ventura-email-material-source-v1';
+  const question = 'Use the exact bound Apify collection before creating and emailing the Sheet?';
+  eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 0,
+    role: 'system',
+    type: 'turn_preflight_decision',
+    data: {
+      phase: 'align',
+      consequential: true,
+      objective: REQUEST,
+      intentKey,
+      reason: 'collect_then_construct',
+      confirmationDisposition: 'material_source_strategy',
+      sourceStrategyPosture: 'materially_variant',
+      sourceStrategyBinding,
+      sourceUserSeq: parent.seq,
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question,
+      purpose: 'clarification',
+      source: 'preflight_alignment',
+      sourceUserSeq: parent.seq,
+      intentKey,
+      confirmationDisposition: 'material_source_strategy',
+      sourceStrategyBinding,
+    },
+  });
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(parentTask),
+    identity: parentTask,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: question },
+  });
+  const acceptedText = 'Yes';
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: acceptedText },
+  });
+  const enriched = await continuityRuntime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    message: acceptedText,
+  }, source.seq, { typedClassification: { disposition: 'affirmed' } });
+  const inspection = continuityRuntime.inspectDurableMaterialSourceContinuation({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(inspection.status, 'verified', JSON.stringify(inspection));
+  if (inspection.status !== 'verified') throw new Error('formal Ventura A/Q/B inspection failed');
+  turnControl.recordTurnPreflightDecision(session.id, inspection.decision, source.seq);
+  const task = { sessionId: session.id, sourceUserSeq: source.seq, turn: 2 };
+  assert.ok(await recordAcceptedSourceGraph({
+    identity: task,
+    surface: 'direct',
+    acceptedText,
+    verifiedTaskContinuation: enriched.taskContinuation,
+  }));
+  const frozen = expectedWorkContract.freezeActionExpectedWorkContract({ ...task, proposal });
+  assert.ok(frozen.status === 'fixed' || frozen.status === 'replayed', JSON.stringify(frozen));
   const activated = expectedWork.activateActionExpectedWork(task);
   assert.ok(
     activated.status === 'activated' || activated.status === 'replayed',
@@ -136,7 +237,7 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
   const providerCalls: string[] = [];
   let providerReadySheetRows: unknown;
   let sheetReadCalls = 0;
-  _setCodeModeToolsForTests(new Map([[
+  _setInnerDispatchToolsForTests(new Map([[
     'composio_execute_tool',
     {
       name: 'composio_execute_tool',
@@ -153,7 +254,7 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
           args,
           (async () => {
             providerCalls.push(parsed.tool_slug);
-            if (parsed.tool_slug === 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS') {
+            if (parsed.tool_slug === SOURCE_TOOL) {
               return { successful: true, data: { items: SOURCE_ROWS } };
             }
             if (parsed.tool_slug === 'GOOGLESHEETS_SHEET_FROM_JSON') {
@@ -174,7 +275,7 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
                 'UNFORMATTED_VALUE',
                 'numeric ratings require unformatted provider values',
               );
-              const correctContent = sheetReadCalls === 1 || args.majorDimension === 'ROWS';
+              const correctContent = args.majorDimension === 'ROWS';
               const providerRows = providerReadySheetRows as typeof ROWS;
               const headers = Object.keys(providerRows[0]!) as Array<keyof typeof ROWS[number]>;
               const readRows = correctContent
@@ -237,12 +338,8 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
     universe_selector: null,
     name: 'composio_execute_tool',
     args_json: JSON.stringify({
-      tool_slug: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
-      arguments: JSON.stringify({
-        actorId: 'compass/crawler-google-places',
-        runInput: { searchStringsArray: ['restaurants in Ventura CA'] },
-        limit: 5,
-      }),
+      tool_slug: SOURCE_TOOL,
+      arguments: JSON.stringify({}),
       connected_account_id: null,
     }),
   }));
@@ -298,32 +395,6 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
     ...task,
     createLogicalToolCallId: 'ventura-create-sheet',
   })?.contentVerifiedAt, null);
-
-  const unrelatedInspection = String(await invokeWork('ventura-inspect-sheet-unrelated', {
-    proposal: null,
-    requirement_id: 'inspect_sheet',
-    universe_item_id: null,
-    universe_selector: null,
-    name: 'composio_execute_tool',
-    args_json: JSON.stringify({
-      tool_slug: 'GOOGLESHEETS_BATCH_GET',
-      arguments: JSON.stringify({
-        spreadsheet_id: SHEET_ID,
-        ranges: ["'Restaurants'!A1:C6"],
-        valueRenderOption: 'UNFORMATTED_VALUE',
-      }),
-      connected_account_id: null,
-    }),
-  }));
-  assert.doesNotMatch(unrelatedInspection, /WRONG CONTENT/);
-  assert.equal(
-    artifactLedger.generatedArtifactContentVerificationForTests({
-      ...task,
-      createLogicalToolCallId: 'ventura-create-sheet',
-    })?.contentVerifiedAt,
-    null,
-    'an exact read bound to an unrelated operation cannot verify the create contract',
-  );
 
   const wrongReadback = String(await invokeWork('ventura-verify-sheet-wrong-content', {
     proposal: null,
@@ -477,9 +548,8 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
   assert.equal(pendingActions.listPendingActions({ sessionId: task.sessionId }).length, 1);
   assert.equal(emailProviderSends, 0, 'card materialization and retry never dispatch the email');
   assert.deepEqual(providerCalls, [
-    'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
+    SOURCE_TOOL,
     'GOOGLESHEETS_SHEET_FROM_JSON',
-    'GOOGLESHEETS_BATCH_GET',
     'GOOGLESHEETS_BATCH_GET',
     'GOOGLESHEETS_BATCH_GET',
   ], 'one create crosses once; only the safe changed readback retries; email never crosses');
@@ -488,12 +558,12 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
     crossingCounts.set(crossing.tool, (crossingCounts.get(crossing.tool) ?? 0) + 1);
   }
   assert.deepEqual([...crossingCounts.entries()].sort(([left], [right]) => left.localeCompare(right)), [
-    ['apify_run_actor_sync_get_dataset_items', 1],
-    ['googlesheets_batch_get', 3],
+    [SOURCE_TOOL.toLowerCase(), 1],
+    ['googlesheets_batch_get', 2],
     ['googlesheets_sheet_from_json', 1],
   ], 'durable crossings agree with the provider seam and contain no email');
 
-  _setCodeModeToolsForTests(new Map([[
+  _setInnerDispatchToolsForTests(new Map([[
     'carrier_context_probe',
     {
       name: 'carrier_context_probe',

@@ -85,6 +85,20 @@ test('prose word/word pairs are not deliverable paths (live 2026-08-12 draft bou
   );
 });
 
+test('slash-delimited schedule shorthand is not a deliverable path (live 2026-08-20 workflow read bounce)', () => {
+  const pointers = extractDeliverablePointers(
+    'Schedule: Every weekday, 8am/12pm/4pm (cron `0 8,12,16 * * 1-5`).',
+  );
+  assert.deepEqual(pointers, [], 'clock alternatives are schedule values, never filesystem handoffs');
+
+  const realPath = extractDeliverablePointers('Saved the schedule at reports/8am/summary.md.');
+  assert.deepEqual(
+    realPath.map((pointer) => pointer.normalized),
+    ['reports/8am/summary.md'],
+    'a time-like directory inside an otherwise concrete path remains guarded',
+  );
+});
+
 test('recall reads this run are collected as grounding evidence sources', () => {
   const events = [
     { type: 'tool_called', data: { sourceUserSeq: 100, tool: 'recall_tool_result', callId: 'call_recall_1' } },

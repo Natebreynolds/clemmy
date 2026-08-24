@@ -17,6 +17,7 @@ import path from 'node:path';
 const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-autonomy-release-gaps-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.AUTH_MODE = 'api_key';
+process.env.OPENAI_AGENTS_DISABLE_TRACING = '1';
 delete process.env.OPENAI_API_KEY;
 
 const autonomy = await import('./autonomy-v2.js');
@@ -116,7 +117,13 @@ function fakeAssistantReturning(text: string, onCall?: () => void): unknown {
   };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  // The isolated runner deliberately shrinks production's multi-minute caller
+  // budget. Give ordinary fake-runtime cycles enough time to finish their
+  // newly awaited accepted-source bookkeeping before the next test resets the
+  // ledger. Timeout-specific tests opt back into the short budget below.
+  await autonomy._testOnly_waitForAutonomyLaneIdle();
+  autonomy._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs(10_000);
   resetEventLog();
   autonomy.clearAutonomyAgentCache();
   autonomy._testOnly_resetAutonomyUnavailableWarning();
@@ -125,9 +132,12 @@ beforeEach(() => {
   process.env.CLEMMY_HARNESS_CRON = 'off';
   process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   delete process.env.OPENAI_API_KEY;
+  delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
 });
 
-after(() => {
+after(async () => {
+  await autonomy._testOnly_waitForAutonomyLaneIdle();
+  autonomy._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs();
   _setBridgeImplsForTests({});
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
@@ -374,21 +384,32 @@ test('runtime cycle timeout actively cancels the underlying Claude turn', async 
   process.env.CLEMMY_HARNESS_CRON = 'on';
   delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
 
-  let capturedRequest: { shouldCancel?: () => boolean | Promise<boolean> } | undefined;
+  // This remains a real coordinator timeout, but it must not race the bridge's
+  // preflight under full-suite load before the Claude stub has even started.
+  autonomy._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs(2_000);
+
+  let capturedRequest: { sessionId?: string; shouldCancel?: () => boolean | Promise<boolean> } | undefined;
   let releaseRuntime: (() => void) | undefined;
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
-    claudeAgentBrain: (async (_surface: string, request: { shouldCancel?: () => boolean | Promise<boolean> }) => {
+    claudeAgentBrain: (async (_surface: string, request: {
+      sessionId?: string;
+      shouldCancel?: () => boolean | Promise<boolean>;
+    }) => {
       capturedRequest = request;
-      return await new Promise<never>((_resolve, reject) => {
-        releaseRuntime = () => reject(new Error('test cleanup: release timed-out Claude stub'));
+      return await new Promise((resolve) => {
+        releaseRuntime = () => resolve({
+          text: '',
+          sessionId: request.sessionId ?? `agent:${slug}`,
+          stoppedReason: 'cancelled' as const,
+        });
       });
     }) as never,
   });
 
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) =>
-    realSetTimeout(callback, (delay ?? 0) >= 60_000 ? 1 : delay, ...args)) as typeof setTimeout;
+    realSetTimeout(callback, (delay ?? 0) >= 60_000 ? 250 : delay, ...args)) as typeof setTimeout;
 
   try {
     const summary = await autonomy.processAgentAutonomyV2({
@@ -416,6 +437,7 @@ test('runtime cycle timeout actively cancels the underlying Claude turn', async 
     globalThis.setTimeout = realSetTimeout;
     releaseRuntime?.();
     await autonomy._testOnly_waitForAutonomyLaneIdle();
+    autonomy._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs(10_000);
   }
 });
 
@@ -423,22 +445,18 @@ test('a timed-out cycle remains single-flight until its underlying run actually 
   const slug = 'timeout-single-flight';
   seedAgent(slug, { proactive: true, allowedTools: [] });
   process.env.AUTONOMY_V2_AGENTS = slug;
+  autonomy._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs();
 
-  let assistantCalls = 0;
-  process.env.CLEMMY_HARNESS_CRON = 'on';
-  let releaseConversation: (() => void) | undefined;
-  _setBridgeImplsForTests({
-    configure: (async () => ({ ok: true })) as never,
-    buildAgent: (async () => ({})) as never,
-    runConversation: (async () => {
-      assistantCalls += 1;
-      return await new Promise<never>((_resolve, reject) => {
-        releaseConversation = () => reject(new Error('test cleanup: release single-flight stub'));
-      });
-    }) as never,
+  let cycleCalls = 0;
+  let releaseCycle: (() => void) | undefined;
+  autonomy._testOnly_setRuntimeCycleImpl(async () => {
+    cycleCalls += 1;
+    return await new Promise<never>((_resolve, reject) => {
+      releaseCycle = () => reject(new Error('test cleanup: release single-flight stub'));
+    });
   });
   const neverSettles = {
-    async respond() { throw new Error('legacy assistant must not serve this harness-path test'); },
+    async respond() { throw new Error('assistant must not serve this coordinator-seam test'); },
     getRuntime() {
       return {};
     },
@@ -446,7 +464,7 @@ test('a timed-out cycle remains single-flight until its underlying run actually 
 
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) =>
-    realSetTimeout(callback, (delay ?? 0) >= 60_000 ? 1 : delay, ...args)) as typeof setTimeout;
+    realSetTimeout(callback, (delay ?? 0) >= 60_000 ? 250 : delay, ...args)) as typeof setTimeout;
 
   try {
     const first = await autonomy.processAgentAutonomyV2(neverSettles as never);
@@ -454,11 +472,13 @@ test('a timed-out cycle remains single-flight until its underlying run actually 
 
     const second = await autonomy.processAgentAutonomyV2(neverSettles as never);
     assert.equal(second.skipped, 1, 'the still-running cycle owns the slug until it actually settles or is aborted');
-    assert.equal(assistantCalls, 1, 'a second model/tool loop must not overlap the timed-out first loop');
+    assert.equal(cycleCalls, 1, 'a second model/tool loop must not overlap the timed-out first loop');
   } finally {
     globalThis.setTimeout = realSetTimeout;
-    releaseConversation?.();
+    autonomy._testOnly_setRuntimeCycleImpl();
+    releaseCycle?.();
     await autonomy._testOnly_waitForAutonomyLaneIdle();
+    autonomy._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs(10_000);
   }
 });
 

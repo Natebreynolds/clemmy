@@ -12,7 +12,7 @@
  * shell listens and bounces the user back to the login screen.
  */
 import { signProof, deviceKeySupported, exportPublicJwk } from './device-key.js';
-import { connectionDoor, setConnectionDoor } from './native-bridge.js';
+import { connectionDoor, reportConnectionLost, setConnectionDoor } from './native-bridge.js';
 
 /**
  * The current session's fingerprint, which every proof is signed over.
@@ -100,6 +100,7 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
     // Reaching the daemon again is the recovery, so say so and let the shell
     // and the UI show one honest "can't reach your Mac" state.
     setConnectionDoor('offline');
+    reportConnectionLost();
     const err = makeError(0, null, "Can't reach your Mac right now");
     err.offline = true;
     throw err;
@@ -248,7 +249,7 @@ export interface ApprovalRow {
   tool: string | null;
   args: unknown;
   status: 'pending' | 'resolved' | 'expired' | 'cancelled';
-  resolution: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user' | null;
+  resolution: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user' | 'cancelled_by_system' | null;
   kind?: 'harness' | 'runtime';
   resourceFingerprint?: { warning?: string };
 }
@@ -277,6 +278,44 @@ export async function rejectApproval(id: string): Promise<unknown> {
 }
 
 // ─── plan approvals ─
+
+export interface WorkspaceDestinationChoice {
+  choiceId: string;
+  kind: 'existing' | 'create_new';
+  label: string;
+  workspaceId: string;
+}
+
+export interface WorkspaceDestinationChooser {
+  version: 1;
+  chooserId: string;
+  advancementId: string;
+  chooserRevision: number;
+  chooserDigest: string;
+  createdAt: string;
+  choices: WorkspaceDestinationChoice[];
+}
+
+export async function listWorkspaceDestinationChoosers(): Promise<{
+  choosers: WorkspaceDestinationChooser[];
+  count: number;
+}> {
+  return api('/m/api/automation-pilot/workspace-choosers');
+}
+
+export async function resolveWorkspaceDestinationChooser(
+  chooser: WorkspaceDestinationChooser,
+  choiceId: string,
+): Promise<unknown> {
+  return api(`/m/api/automation-pilot/workspace-choosers/${encodeURIComponent(chooser.chooserId)}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({
+      chooserRevision: chooser.chooserRevision,
+      chooserDigest: chooser.chooserDigest,
+      choiceId,
+    }),
+  });
+}
 
 export interface PlanProposalRow {
   id: string;
@@ -351,6 +390,56 @@ export interface RunDetail {
 
 export async function getRun(sessionId: string): Promise<RunDetail> {
   return api(`/m/api/runs/${encodeURIComponent(sessionId)}`);
+}
+
+// ─── server-owned running work ─────────────────────────────────────────────
+//
+// This is the mobile-authenticated spelling of /api/console/activity/v2. The
+// daemon owns membership, liveness, lifecycle, and all denominators; the phone
+// only renders these bounded fields and never folds raw events into task truth.
+
+export type ActivityKind = 'chat' | 'background' | 'workflow' | 'fanout';
+
+export interface ActivityEntry {
+  schemaVersion: number;
+  runKey: string;
+  attemptId: string;
+  kind: ActivityKind;
+  lifecycle: string;
+  liveness: 'live' | 'stale' | 'unknown';
+  needsAttention: boolean;
+  headline: string;
+  activity?: { phase: string; text: string; completed?: number; total?: number };
+  progress?: { completed: number; total: number };
+  children?: { running: number; completed: number; failed: number; total: number };
+  startedAt: string;
+  lastEvidenceAt: string;
+  revision: number;
+  sessionId?: string;
+  taskId?: string;
+  runId?: string;
+  planId?: string;
+}
+
+export interface ActivityResponse {
+  schemaVersion: number;
+  observedAt: string;
+  entries?: ActivityEntry[];
+  snapshots?: ActivityEntry[];
+}
+
+export function workingNowSnapshotFromResponse(
+  body: ActivityResponse,
+): { observedAt: string; entries: ActivityEntry[] } {
+  return { observedAt: body.observedAt, entries: body.entries ?? body.snapshots ?? [] };
+}
+
+export async function listWorkingNow(): Promise<{ observedAt: string; entries: ActivityEntry[] }> {
+  const body = await api<ActivityResponse>('/m/api/activity/v2?workingNow=1');
+  // The daemon already bounds this projection. Preserve that full set so the
+  // quiet foreground count cannot disagree with the rows the server returned;
+  // the sheet applies its own, separate render cap.
+  return workingNowSnapshotFromResponse(body);
 }
 
 /** One shared mobile classification so Home and Activity cannot drift. */

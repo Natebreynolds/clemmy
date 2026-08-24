@@ -17,7 +17,8 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -180,6 +181,100 @@ test('chat session own events still stream unchanged alongside the bridge', asyn
     const frames = await collectSse(res, { untilEventCount: 1, timeoutMs: 5_000 });
     const live = frames.filter((f) => f.event === 'event').map((f) => f.data as { type?: string });
     assert.ok(live.some((e) => e.type === 'tool_called'), 'own-session events still arrive');
+  } finally {
+    await h.close();
+  }
+});
+
+function writeLegacyWorkflowOrigin(runId: string, originSessionId: string): void {
+  const runKey = createHash('sha256').update(runId).digest('hex');
+  const originKey = createHash('sha256').update(originSessionId).digest('hex');
+  const dir = path.join(TMP_HOME, 'workflows', 'runs', '.run-origins', runKey);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, `${originKey}.json`), JSON.stringify({
+    version: 1,
+    runId,
+    originSessionId,
+    recordedAt: new Date().toISOString(),
+  }), 'utf-8');
+}
+
+test('origin chat stream carries live public events from a host-dispatched workflow step', async () => {
+  resetEventLog();
+  const originId = 'console:workflow-bridge-origin';
+  createSession({ id: originId, kind: 'chat', title: 'origin chat' });
+  const runId = '1786726670475-33ef31';
+  const stepSessionId = `workflow:${runId}:find_official_page`;
+  createSession({ id: stepSessionId, kind: 'workflow', title: 'facebook trends::find_official_page' });
+  writeLegacyWorkflowOrigin(runId, originId);
+
+  const strangerRunId = '1786726670475-stranger';
+  const strangerSessionId = `workflow:${strangerRunId}:notify_nate`;
+  createSession({ id: strangerSessionId, kind: 'workflow', title: 'other::notify' });
+  writeLegacyWorkflowOrigin(strangerRunId, 'console:someone-else');
+
+  appendEvent({
+    sessionId: originId,
+    turn: 1,
+    role: 'system',
+    type: 'async_work_dispatched',
+    data: { runIds: [runId], dispatchKey: 'workflow_source_group:test' },
+  });
+  appendEvent({
+    sessionId: stepSessionId,
+    turn: 1,
+    role: 'agent',
+    type: 'tool_called',
+    data: { tool: 'web_search', arguments: JSON.stringify({ query: 'scorpion facebook' }) },
+  });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/sessions/${encodeURIComponent(originId)}/events`, {
+      headers: { accept: 'text/event-stream' },
+    });
+    assert.equal(res.status, 200);
+
+    setTimeout(() => {
+      appendEvent({
+        sessionId: stepSessionId,
+        turn: 1,
+        role: 'agent',
+        type: 'tool_returned',
+        data: { tool: 'web_search', ok: true, glimpse: { count: 3, key: 'results' } },
+      });
+      appendEvent({
+        sessionId: strangerSessionId,
+        turn: 1,
+        role: 'agent',
+        type: 'tool_called',
+        data: { tool: 'memory_search', arguments: '{}' },
+      });
+      appendEvent({
+        sessionId: stepSessionId,
+        turn: 1,
+        role: 'system',
+        type: 'conversation_completed',
+        data: { reply: 'step done' },
+      });
+    }, 150);
+
+    const frames = await collectSse(res, { untilEventCount: 1, timeoutMs: 5_000 });
+    await new Promise((r) => setTimeout(r, 400));
+
+    const replay = frames.find((f) => f.event === 'replay')?.data as { events?: Array<{ type?: string; sessionId?: string; data?: Record<string, unknown> }> } | undefined;
+    const replayedTool = replay?.events?.find((e) => e.type === 'tool_called' && e.sessionId === stepSessionId);
+    assert.ok(replayedTool, 'workflow step tool_called already on disk is in the origin replay');
+
+    const live = frames.filter((f) => f.event === 'event').map((f) => f.data as { type?: string; sessionId?: string; data?: Record<string, unknown> });
+    const bridgedReturn = live.find((e) => e.type === 'tool_returned' && e.sessionId === stepSessionId);
+    assert.ok(bridgedReturn, 'tool_returned from workflow:<runId>:<step> reaches the origin chat stream');
+
+    const leaked = live.find((e) => e.type === 'tool_called' && (e.data as { tool?: string } | undefined)?.tool === 'memory_search');
+    assert.equal(leaked, undefined, 'events from an unrelated workflow run never leak into this chat stream');
+
+    const leakedTerminal = live.find((e) => e.type === 'conversation_completed');
+    assert.equal(leakedTerminal, undefined, 'workflow step turn-lifecycle is never bridged onto the origin chat');
   } finally {
     await h.close();
   }

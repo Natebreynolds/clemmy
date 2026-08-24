@@ -11,6 +11,11 @@
 import { destinationsOf, type AcceptedGoalConstruct, type AcceptedGoalV1 } from '../graph/accepted-goal.js';
 import type { ProposedTurnGraphV1 } from '../graph/turn-graph-proposal.js';
 import type { RuntimeToolEffect } from '../harness/tool-effect.js';
+import {
+  validateWorkTopology,
+  workTopologyDigest,
+  type WorkTopologyV1,
+} from '../graph/work-topology.js';
 import type {
   ContextCheckedTurnSemanticProposalV1,
   GoalRefV1,
@@ -67,6 +72,8 @@ export interface SemanticProjectionV1 {
     openSlotKeys: string[];
     candidateRefs: Array<{ kind: 'capability' | 'workflow'; id: string }>;
     operations: ProposedSemanticWorkV1['operations'];
+    topology?: WorkTopologyV1;
+    topologyHash?: string;
     deliverables: ProposedSemanticWorkV1['deliverables'];
     evidenceRequirements: string[];
   };
@@ -84,6 +91,8 @@ function goalFromWork(
   const work = proposal.work;
   const draft = proposal.goal;
   if (!work || !draft) return undefined;
+  const topology = work.topology ? validateWorkTopology(work.topology) : null;
+  if (topology && !topology.ok) return undefined;
   return {
     construct: work.construct,
     ...(work.cardinality
@@ -102,6 +111,12 @@ function goalFromWork(
     openSlotKeys: draft.openSlots.map((slot) => slot.slotKey),
     candidateRefs: [...draft.candidates],
     operations: work.operations.map((operation) => ({ ...operation, dependsOn: [...operation.dependsOn], evidence: [...operation.evidence] })),
+    ...(topology?.ok
+      ? {
+          topology: topology.topology,
+          topologyHash: work.topologyHash ?? workTopologyDigest(topology.topology),
+        }
+      : {}),
     deliverables: work.deliverables.map((deliverable) => ({ ...deliverable })),
     evidenceRequirements: [...work.evidenceRequirements],
   };

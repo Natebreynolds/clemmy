@@ -1,3 +1,8 @@
+import {
+  TOOL_REGISTRY,
+  isRegisteredActionControl,
+  isRegistryDeclaredRead,
+} from './tool-registry.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -13,6 +18,10 @@ import { registerGoalTools } from './goal-tools.js';
 import { registerAdminTools } from './admin-tools.js';
 import { registerTeamTools } from './team-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
+import { registerAutomationOpportunityTools } from './automation-opportunity-tools.js';
+import { registerAutomationOpportunityReviewTools } from './automation-opportunity-review-tools.js';
+import { registerAutomationReadPilotTools } from './automation-read-pilot-tools.js';
+import { registerAutomationRecurrenceTools } from './automation-recurrence-tools.js';
 import { registerPendingActionTools } from './pending-action-tools.js';
 import { registerAgentRunsTools } from './agent-runs-tools.js';
 import { registerAutonomyActionTools } from './autonomy-action-tools.js';
@@ -49,8 +58,10 @@ import {
   type BuiltinCapabilityAdmissionResult,
 } from './call-tool.js';
 import { registerClaudeActionWorkCall } from './work-call-mcp.js';
+import { loadBoundExpectedWorkContract } from '../runtime/harness/frozen-work-surface.js';
+import { durableSelectedLocalPlanningMutationNames } from '../runtime/harness/local-planning-capability.js';
+import { confirmedSourceStrategyBindingForSource } from '../runtime/harness/source-strategy-admission.js';
 import { registerGatedMutatingTools } from './gated-mutating-tools.js';
-import { codeModeEnabled, codeModeDescription, runCodeModeForSession } from './code-mode-tool.js';
 import { ensureToolDirectories, textResult } from './shared.js';
 import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
@@ -415,8 +426,13 @@ function installToolAllowlistFilter(
   if (allowlist.length === 0 && !onConsidered) return;
   const allowed = new Set(allowlist);
   const filtering = allowed.size > 0;
-  // Floor: a health tool that must always exist so the surface is never empty.
-  const FLOOR = new Set(['ping']);
+  // Floor: tools that must always exist regardless of the per-turn JIT set.
+  // `ping` keeps the surface non-empty. `file_query` makes a LANDED tool
+  // result queryable: it is a deterministic host READ over stored output, and
+  // filtering it off left the model paging recall_tool_result through a 322k
+  // blob and asking the user to authorize a second search (live 2026-08-18
+  // session-fixture-remap-a: "No such tool available: mcp__clementine-local__file_query").
+  const FLOOR = new Set(['ping', 'file_query']);
   const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
     if (onConsidered) {
@@ -470,6 +486,14 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   const registeredNames = new Set<string>();
   const deferredNames = new Set(resolvedDeferredTools(opts));
   const consideredDescriptors = new Map<string, SealableToolLike>();
+  const selectedLocalPlanningNames = opts.sessionId
+    && Number.isSafeInteger(opts.sourceUserSeq)
+    && (opts.sourceUserSeq ?? 0) > 0
+    ? durableSelectedLocalPlanningMutationNames({
+        sessionId: opts.sessionId,
+        sourceUserSeq: opts.sourceUserSeq as number,
+      })
+    : new Set<string>();
 
   installAmbientToolContext(server, opts);
   installToolRegistrationObserver(server, (name, descriptor) => {
@@ -500,6 +524,10 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerAdminTools(server);
   registerTeamTools(server);
   registerOrchestrationTools(server);
+  registerAutomationOpportunityTools(server);
+  registerAutomationOpportunityReviewTools(server);
+  registerAutomationReadPilotTools(server);
+  registerAutomationRecurrenceTools(server);
   registerPendingActionTools(server);
   registerAgentRunsTools(server);
   registerBackgroundTaskTools(server);
@@ -571,6 +599,15 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
     directOrchestrator: opts.directOrchestrator,
     dispatchLease: opts.dispatchLease,
     ...actionDispatcherOptions,
+    frozenContract: loadBoundExpectedWorkContract(opts.sessionId, opts.sourceUserSeq),
+    ...(opts.sessionId && Number.isSafeInteger(opts.sourceUserSeq) && (opts.sourceUserSeq ?? 0) > 0
+      ? {
+          sourceStrategyBinding: confirmedSourceStrategyBindingForSource(
+            opts.sessionId,
+            opts.sourceUserSeq as number,
+          ),
+        }
+      : {}),
   });
   if (actionExpectedWorkRequested && !actionWorkCallRegistered) {
     throw new Error(
@@ -578,39 +615,23 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
     );
   }
 
-  // Code Mode (Lane C) — expose run_tool_program on the Claude SDK lane too, so
-  // BOTH brains can run a sandboxed program. Flag-gated (CLEMMY_CODE_MODE); the
-  // in-program clem calls dispatch through the same gated path under this MCP
-  // session. No-op when off.
-  if (codeModeEnabled()) {
-    const codeModeSessionId = opts.sessionId?.trim() || process.env.CLEMENTINE_MCP_SESSION_ID?.trim() || '';
-    server.tool(
-      'run_tool_program',
-      codeModeDescription({ actionExpectedWork: actionWorkCallRegistered }),
-      { program: z.string() },
-      async (input: { program: string }) => {
-        const r = await runCodeModeForSession(
-          input.program,
-          codeModeSessionId,
-          actionWorkCallRegistered ? { workCallOptions: actionDispatcherOptions } : {},
-        );
-        return textResult(
-          r.ok
-            ? `code-mode program returned (${r.rpcCalls} tool call${r.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(r.value)}`
-            : `code-mode program failed: ${r.error}`,
-          { isError: !r.ok },
-        );
-      },
-    );
-  }
-
   // Genuine schema-on-demand for the Claude SDK lane. Deferred tools are not
   // registered here (so their schemas cannot be billed in the provider prompt),
   // but remain callable through the same generic dispatcher and inner-tool gate
   // chain the Codex lane uses.
-  if (deferredNames.size > 0 && !actionWorkCallRegistered) {
+  if (deferredNames.size > 0) {
     registerCallToolMcp(server, {
-      reachableBuiltinNames: deferredNames,
+      // On an armed action turn the dispatcher narrows to CONTROLS + registry
+      // READS — business writes stay exclusively behind work_call. Without
+      // this door, deferred control/read tools (workflow_get, space_history…)
+      // had NO direct path on the Claude lane and every read paid the
+      // work_call proposal grammar (live 2026-08-20 mobile dashboard turn) —
+      // a lane-parity gap: the Codex action lane always had this dispatcher.
+      ...(actionWorkCallRegistered ? { controlOnlyBuiltins: true } : {}),
+      reachableBuiltinNames: actionWorkCallRegistered
+        ? new Set([...deferredNames]
+            .filter((name) => !selectedLocalPlanningNames.has(name)))
+        : deferredNames,
       // This Set is intentionally live: ping/tool_search/call_tool register
       // below and become valid first-class targets without rebuilding it.
       firstClassNames: registeredNames,
@@ -654,9 +675,15 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   // actually registered. A schema-on-demand server additionally searches the
   // explicitly deferred authority set; every such result is callable through
   // call_tool in this same turn.
-  const searchableNames = deferredNames.size > 0
-    ? new Set([...registeredNames, ...deferredNames])
-    : registeredNames;
+  // THE CLEAN LOOP (live 2026-08-19 session-fixture-tool-search: 40 denied searches while
+  // workflow_schedule sat outside the session's registered subset): SEARCH
+  // sees the whole brain-lane catalog — finding is free; CALLING still
+  // transits call_tool/work_call and every gate. A found-but-ungated name
+  // fails honestly at dispatch, never invisibly at discovery.
+  const laneCatalogNames = new Set(
+    TOOL_REGISTRY.filter((tool) => tool.lanes.includes('sdk-brain')).map((tool) => tool.name),
+  );
+  const searchableNames = new Set([...registeredNames, ...deferredNames, ...laneCatalogNames]);
   const brokerScope = resolvedMcpToolScope(opts);
   const directOrchestrator = opts.directOrchestrator
     ?? (process.env.CLEMENTINE_MCP_DIRECT_ORCHESTRATOR ?? '').trim().toLowerCase() === 'on';
@@ -670,7 +697,15 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
     allowedNames: searchableNames,
     dispatchViaCallTool: deferredNames.size > 0 && !actionWorkCallRegistered,
     ...(deferredNames.size > 0 && actionWorkCallRegistered
-      ? { dispatchCarrier: 'work_call' as const }
+      ? {
+          dispatchCarrierForName: (name: string) => (
+            selectedLocalPlanningNames.has(name)
+              ? 'work_call' as const
+              : isRegisteredActionControl(name) || isRegistryDeclaredRead(name)
+              ? 'call_tool' as const
+              : 'work_call' as const
+          ),
+        }
       : {}),
     ...(candidateSources ? { candidateSources } : {}),
   });

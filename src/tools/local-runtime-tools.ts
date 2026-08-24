@@ -27,6 +27,10 @@ import { registerFocusTools } from './focus-tools.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerMcpServerTools } from './mcp-server-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
+import { registerAutomationOpportunityTools } from './automation-opportunity-tools.js';
+import { registerAutomationOpportunityReviewTools } from './automation-opportunity-review-tools.js';
+import { registerAutomationReadPilotTools } from './automation-read-pilot-tools.js';
+import { registerAutomationRecurrenceTools } from './automation-recurrence-tools.js';
 import { registerPendingActionTools } from './pending-action-tools.js';
 import { registerStepResultTool } from './step-result-tool.js';
 import { registerWorkflowStateTools } from './workflow-state-tools.js';
@@ -40,7 +44,12 @@ import { registerProfileTools } from './profile-tools.js';
 import { registerRecallTools } from './recall-tools.js';
 import { registerArtifactClaimTools } from './artifact-claim-tools.js';
 import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
-import { registerToolSearchTool, type ToolSearchCandidateSource } from './tool-search-tool.js';
+import {
+  registerToolSearchTool,
+  type ToolSearchCandidateSource,
+  type ToolSearchPlanningDisclosureCandidate,
+} from './tool-search-tool.js';
+import { markFreshPlanDisclosureSearch } from './tool-search-mode.js';
 import { registerHarnessStatusTools } from './harness-status-tools.js';
 import { registerSessionTools } from './session-tools.js';
 import { registerTeamTools } from './team-tools.js';
@@ -220,6 +229,10 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerAdminTools(server);
   registerTeamTools(server);
   registerOrchestrationTools(server);
+  registerAutomationOpportunityTools(server);
+  registerAutomationOpportunityReviewTools(server);
+  registerAutomationReadPilotTools(server);
+  registerAutomationRecurrenceTools(server);
   registerPendingActionTools(server);
   registerStepResultTool(server);
   registerWorkflowStateTools(server);
@@ -389,6 +402,9 @@ export function buildScopedLocalToolSearch(
   dispatchCarrier: 'call_tool' | 'work_call' = 'call_tool',
   dispatchCarrierForName?: (name: string) => 'call_tool' | 'work_call',
   candidateSources?: readonly ToolSearchCandidateSource[],
+  discloseForPlanning?: (
+    candidates: readonly ToolSearchPlanningDisclosureCandidate[],
+  ) => Promise<Readonly<Record<string, string>>> | Readonly<Record<string, string>>,
 ): Tool<RuntimeContextValue> {
   const captured: CapturedLocalTool[] = [];
   const fakeServer = {
@@ -407,10 +423,14 @@ export function buildScopedLocalToolSearch(
     dispatchCarrier,
     ...(dispatchCarrierForName ? { dispatchCarrierForName } : {}),
     ...(candidateSources ? { candidateSources } : {}),
+    ...(discloseForPlanning ? { discloseForPlanning } : {}),
   });
   const localTool = captured[0];
   if (!localTool) throw new Error('tool_search did not register');
-  return localToolToRuntimeTool(localTool);
+  const runtimeTool = localToolToRuntimeTool(localTool);
+  return discloseForPlanning
+    ? markFreshPlanDisclosureSearch(runtimeTool as object) as Tool<RuntimeContextValue>
+    : runtimeTool;
 }
 
 /**

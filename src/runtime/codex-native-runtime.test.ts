@@ -12,26 +12,11 @@
  * Tests the failure-resilience too — bad JSON, missing fields,
  * malformed entries should all fall through, never throw.
  */
-// Pin the MCP attach path to deterministic legacy (blocking-connect) mode for
-// the catalog-comparison tests below. With the default bounded-connect
-// (MCP_ATTACH_CONNECTED_ONLY=on), two rapid createCodexToolDefinitions() calls
-// can land in the connect WARM-UP window and return different surfaces (a stub
-// vs the real tools) — correct self-healing behavior in production, but it makes
-// "empty exclude list is a no-op" (catalog-size equality) non-deterministic
-// under parallel-test load. These tests verify exclude-list logic, not MCP
-// warm-up, so a stable catalog is the right fixture. attachConnectedOnly() is
-// read per-call, so setting it here governs every listTools in this file.
-process.env.MCP_ATTACH_CONNECTED_ONLY = 'off';
-
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createCodexToolDefinitions, expandParallelHallucination, functionCallInput, isWallClockAbort, trimNativeInputForRetry, parseCodexUsage, sanitizeCodexInputIds, type CodexFunctionCall } from './codex-native-runtime.js';
-import { invalidateConfiguredMcpServers } from './mcp-servers.js';
 import { AgentRuntimeCancelledError } from './provider.js';
-
-test.after(async () => {
-  await invalidateConfiguredMcpServers();
-});
 
 test('sanitizeCodexInputIds strips non-fc ids off function_call items (the 2026-06-24 cross-provider 400)', () => {
   const input = [
@@ -305,6 +290,13 @@ test('createCodexToolDefinitions exposes workflow_create by default', async () =
   const tools = await createCodexToolDefinitions();
   const names = new Set(tools.map((t) => t.name));
   assert.ok(names.has('workflow_create'), 'workflow_create should be in the default surface');
+});
+
+test('retired native runtime cannot enumerate or dispatch MCP outside the shared host kernel', async () => {
+  const source = readFileSync(new URL('./codex-native-runtime.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /getOrCreateConfiguredMcpServers|\.callTool\s*\(/);
+  const tools = await createCodexToolDefinitions();
+  assert.equal(tools.some((tool) => tool.name.includes('__')), false);
 });
 
 test('createCodexToolDefinitions hides excluded tool names', async () => {

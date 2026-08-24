@@ -48,6 +48,54 @@ test('requiresApproval + approvalPreview round-trip through write→read', () =>
   assert.notEqual(prep?.requiresApproval, true);
 });
 
+test('fixed-duration interval trigger round-trips without conversion to cron', () => {
+  const interval = {
+    version: 1 as const,
+    every: 2,
+    unit: 'hour' as const,
+    anchorAt: '2026-08-22T19:00:00.000Z',
+    overlapPolicy: 'queue_one' as const,
+    catchUpPolicy: 'run_once' as const,
+  };
+  writeWorkflow('interval-trigger-rt', {
+    name: 'interval-trigger-rt',
+    description: 'Exact interval trigger round trip',
+    enabled: true,
+    trigger: { interval, manual: true },
+    steps: [{ id: 'read', prompt: 'Read the current source.', sideEffect: 'read' }],
+  });
+
+  const workflow = readWorkflow('interval-trigger-rt');
+  assert.deepEqual(workflow?.data.trigger.interval, interval);
+  assert.equal(workflow?.data.trigger.schedule, undefined);
+  const persisted = readFileSync(workflow!.filePath, 'utf8');
+  assert.match(persisted, /interval:/);
+  assert.doesNotMatch(persisted, /schedule:/);
+});
+
+test('explicit empty workflow and step allowlists round-trip without widening to ambient tools', () => {
+  writeWorkflow('empty-authority-rt', {
+    name: 'empty-authority-rt',
+    description: 'Preserve explicit no-tool authority.',
+    enabled: false,
+    allowedTools: [],
+    trigger: { manual: true },
+    steps: [{
+      id: 'read',
+      prompt: 'Use only the exact invocation authority.',
+      sideEffect: 'read',
+      allowedTools: [],
+    }],
+  });
+
+  const workflow = readWorkflow('empty-authority-rt');
+  assert.deepEqual(workflow?.data.allowedTools, []);
+  assert.deepEqual(workflow?.data.steps[0]?.allowedTools, []);
+  const persisted = readFileSync(workflow!.filePath, 'utf8');
+  assert.match(persisted, /allowed_tools:\s*\[\]/);
+  assert.match(persisted, /allowedTools:\s*\[\]/);
+});
+
 test('hand-authored snake_case (requires_approval / approval_preview) is parsed', () => {
   const dir = path.join(WORKFLOWS_DIR, 'gate-snake');
   mkdirSync(dir, { recursive: true });

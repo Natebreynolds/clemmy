@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, lstatSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getSecretStore } from '../runtime/secrets/index.js';
@@ -71,10 +71,26 @@ function extraPath(): string {
   return [...additions, process.env.PATH || ''].filter(Boolean).join(path.delimiter);
 }
 
+/**
+ * Where a learned per-site playbook lives. The harness reads this directory
+ * itself when BH_DOMAIN_SKILLS is on, so a skill written here is loaded by the
+ * harness on the NEXT visit without Clementine having to recall or replay it.
+ */
+export const BROWSER_HARNESS_DOMAIN_SKILLS_DIR = path.join(
+  BROWSER_HARNESS_DIR,
+  'agent-workspace',
+  'domain-skills',
+);
+
 export function browserHarnessEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
     PATH: extraPath(),
+    // ON by default. The harness ships this off because a stranger's playbook
+    // is an unknown instruction source — but Clementine's own domain skills are
+    // written from HER verified runs, and a playbook nobody reads cannot teach
+    // anything. Without this the learn half is write-only.
+    BH_DOMAIN_SKILLS: '1',
     ...extra,
   };
 }
@@ -140,12 +156,20 @@ function runShell(command: string, options: {
 }
 
 function commandPath(command: string): string | undefined {
-  const result = spawnSync('/bin/sh', ['-lc', `command -v ${command}`], {
-    encoding: 'utf-8',
-    env: browserHarnessEnv(),
-    timeout: 1_000,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const result = process.platform === 'win32'
+    ? spawnSync('where', [command], {
+        encoding: 'utf-8',
+        env: browserHarnessEnv(),
+        timeout: 2_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
+    : spawnSync('/bin/sh', ['-lc', `command -v ${command}`], {
+        encoding: 'utf-8',
+        env: browserHarnessEnv(),
+        timeout: 1_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
   if (result.error || result.status !== 0) return undefined;
   return result.stdout.split('\n').map((line) => line.trim()).find(Boolean);
 }
@@ -188,6 +212,12 @@ export function browserHarnessInstallCommand(): string {
     'uv tool install -e .',
     'mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/browser-harness"',
     'ln -sf "$PWD/SKILL.md" "${CODEX_HOME:-$HOME/.codex}/skills/browser-harness/SKILL.md"',
+    // Clementine reads her OWN skills directory, not Codex's. Linking only the
+    // Codex copy is why the model saw a one-line helper list instead of the
+    // real API contract and its per-mechanic guides. A symlink means a later
+    // `git pull` updates the skill for free.
+    'mkdir -p "${CLEMENTINE_HOME:-$HOME/.clementine-next}/skills/browser-harness"',
+    'ln -sf "$PWD/SKILL.md" "${CLEMENTINE_HOME:-$HOME/.clementine-next}/skills/browser-harness/SKILL.md"',
     'command -v browser-harness',
     'browser-harness --version',
   ].join('\n');
@@ -360,6 +390,50 @@ export async function runBrowserHarnessDoctor(): Promise<CommandResult> {
   return runShell('browser-harness --doctor', { timeoutMs: 20_000 });
 }
 
+/**
+ * Upgrade in place using the harness's OWN updater.
+ *
+ * Deliberately not the install command's `git pull` + reinstall: `--update -y`
+ * also restarts the daemon, which is the step a manual pull leaves undone — an
+ * upgraded binary talking to a running old daemon is a worse state than being
+ * out of date. The harness prints this exact remedy in its own output when it
+ * detects a new version; running what it asked for is the whole point.
+ */
+export async function runBrowserHarnessUpdate(): Promise<CommandResult> {
+  // MACOS WILL BREAK THIS UPDATE UNLESS WE CLEAR ITS OWN LITTER FIRST.
+  // The harness refuses to update when the checkout is dirty, and upstream has
+  // no .gitignore entry for .DS_Store — which Finder creates the instant anyone
+  // opens the folder. So a file the OS wrote by itself blocks every upgrade,
+  // for every Mac user, forever (live 2026-08-14: `?? .DS_Store` was the ONLY
+  // change in the tree). Excluding it locally via .git/info/exclude leaves
+  // upstream's tracked files untouched, so this cannot conflict on a later
+  // pull; deleting the artifacts is safe because Finder regenerates them.
+  //
+  // Deliberately narrow: only known OS metadata is removed. A user's real
+  // untracked file still blocks the update, and it should — that is a genuine
+  // "you have local work here" signal, not litter.
+  await runShell(
+    [
+      `cd "${BROWSER_HARNESS_DIR}" 2>/dev/null || exit 0`,
+      'mkdir -p .git/info',
+      'touch .git/info/exclude',
+      'grep -qxF ".DS_Store" .git/info/exclude || echo ".DS_Store" >> .git/info/exclude',
+      'grep -qxF "._*" .git/info/exclude || echo "._*" >> .git/info/exclude',
+      'find . -name ".DS_Store" -maxdepth 3 -delete 2>/dev/null || true',
+    ].join('\n'),
+    { timeoutMs: 20_000 },
+  );
+  return runShell('browser-harness --update -y', { timeoutMs: 300_000 });
+}
+
+/** Parse the harness's own "update available: 0.1.0 -> 0.1.8" notice out of any
+ *  command output. The harness is the authority on its own freshness; we do not
+ *  keep a version list to go stale beside it. */
+export function browserHarnessUpdateNotice(output: string): { from: string; to: string } | null {
+  const match = /update available:\s*([0-9][\w.-]*)\s*->\s*([0-9][\w.-]*)/i.exec(output ?? '');
+  return match ? { from: match[1]!, to: match[2]! } : null;
+}
+
 export async function runBrowserHarnessScript(code: string, options: { timeoutMs?: number; buName?: string } = {}): Promise<CommandResult> {
   const store = await getSecretStore();
   const cloudKey = await store.get('browser_use_api_key');
@@ -392,4 +466,137 @@ export async function openChromeRemoteDebuggingSetup(): Promise<CommandResult> {
     stderr: 'Open chrome://inspect/#remote-debugging in Chrome and enable remote debugging for this profile.',
     output: 'Open chrome://inspect/#remote-debugging in Chrome and enable remote debugging for this profile.',
   };
+}
+
+// ─── Learned per-site playbooks ────────────────────────────────────────────
+//
+// The unlock this serves: a user teaches Clementine to do one thing on one
+// site, and she can do it again reliably. The harness already looks for
+// per-site playbooks before improvising; nothing was ever writing them, so
+// every visit re-derived the same navigation from scratch.
+//
+// These are FILES, deliberately. A playbook that survives a daemon restart, is
+// readable by the user, and is loaded by the harness itself needs no recall
+// step, no embedding, and no replay engine — the memory is the artifact.
+
+/** A site key is a directory name, so it must never escape the skills dir. */
+export function browserDomainSkillSite(raw: string): string | null {
+  const site = raw.trim().toLowerCase()
+    // Accept a URL, a host, or an already-clean slug and normalize to a host.
+    .replace(/^[a-z]+:\/\//, '')
+    .split('/')[0]!
+    .replace(/^www\./, '')
+    .replace(/[^a-z0-9.-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[.-]+|[.-]+$/g, '');
+  if (!site || site.length > 80 || site.includes('..')) return null;
+  return site;
+}
+
+/** A task name becomes the filename; same containment rule. */
+export function browserDomainSkillTask(raw: string): string | null {
+  const task = raw.trim().toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!task || task.length > 80) return null;
+  return task;
+}
+
+export interface WriteDomainSkillResult {
+  ok: boolean;
+  path?: string;
+  error?: string;
+}
+
+/**
+ * Record what worked on a site so the harness starts from it next time.
+ *
+ * Refuses to write outside the skills directory even if the caller's site or
+ * task normalizes to something unexpected: the final resolved path is checked
+ * against the root, so a containment bug in the slug rules cannot become a
+ * filesystem write.
+ */
+export function writeBrowserDomainSkill(input: {
+  site: string;
+  task: string;
+  markdown: string;
+}): WriteDomainSkillResult {
+  const site = browserDomainSkillSite(input.site);
+  if (!site) return { ok: false, error: 'A site is required (a host like "amazon.com" or a URL).' };
+  const task = browserDomainSkillTask(input.task);
+  if (!task) return { ok: false, error: 'A task name is required (e.g. "export-monthly-report").' };
+  const body = input.markdown.trim();
+  if (!body) return { ok: false, error: 'The playbook body is empty.' };
+  if (body.length > 40_000) return { ok: false, error: 'The playbook is too large (40k character limit).' };
+  if (!existsSync(BROWSER_HARNESS_DIR)) {
+    return { ok: false, error: 'Browser Harness is not installed, so there is nowhere to save this.' };
+  }
+
+  const root = path.resolve(BROWSER_HARNESS_DOMAIN_SKILLS_DIR);
+  const target = path.resolve(root, site, `${task}.md`);
+  if (target !== root && !target.startsWith(root + path.sep)) {
+    return { ok: false, error: 'Refusing to write outside the domain-skills directory.' };
+  }
+  try {
+    mkdirSync(path.dirname(target), { recursive: true });
+    // Stamp provenance. The community playbooks carry a field-tested date, and
+    // a reader deserves to know whether a step was proven or merely proposed.
+    const stamped = body.startsWith('#')
+      ? `${body}\n\n_Learned by Clementine from a verified run on ${new Date().toISOString().slice(0, 10)}._\n`
+      : `# ${site} — ${task.replace(/-/g, ' ')}\n\n${body}\n\n_Learned by Clementine from a verified run on ${new Date().toISOString().slice(0, 10)}._\n`;
+    writeFileSync(target, stamped, 'utf-8');
+    return { ok: true, path: target };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Playbooks already learned for a site, newest first. */
+export function listBrowserDomainSkills(site?: string): Array<{ site: string; task: string; path: string }> {
+  const root = BROWSER_HARNESS_DOMAIN_SKILLS_DIR;
+  if (!existsSync(root)) return [];
+  const wanted = site ? browserDomainSkillSite(site) : null;
+  const out: Array<{ site: string; task: string; path: string }> = [];
+  try {
+    for (const dir of readdirSync(root)) {
+      if (wanted && dir !== wanted) continue;
+      const siteDir = path.join(root, dir);
+      try {
+        if (!lstatSync(siteDir).isDirectory()) continue;
+        for (const file of readdirSync(siteDir)) {
+          if (!file.endsWith('.md')) continue;
+          out.push({ site: dir, task: file.replace(/\.md$/, ''), path: path.join(siteDir, file) });
+        }
+      } catch { /* an unreadable site dir is skipped, never fatal */ }
+    }
+  } catch { /* nothing learned yet */ }
+  return out;
+}
+
+/**
+ * The single next action that would make browsing work, or null when it already
+ * does.
+ *
+ * Status used to report facts and leave the model to infer a remedy, so a
+ * missing prerequisite became "tell the user to open Settings" — an errand for
+ * a machine-fixable problem. Ordered by what blocks first: you cannot run the
+ * harness without its prerequisites, cannot connect without Chrome debugging,
+ * and a stale build is a real failure mode (a 3-month-old checkout is what sent
+ * one live run hunting for a different tool entirely).
+ */
+export function browserHarnessNextAction(status: BrowserHarnessStatus): string | null {
+  const missing = status.prerequisites.filter((p) => !p.available).map((p) => p.name);
+  if (missing.length) {
+    return `Missing prerequisite${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}. `
+      + 'These must be installed on the machine first — browser_harness_setup cannot install them. '
+      + 'Tell the user exactly which one is missing and how to get it (uv: https://docs.astral.sh/uv/, git: Xcode Command Line Tools).';
+  }
+  if (!status.installed) {
+    return 'Browser Harness is not installed. Call browser_harness_setup with action=install.';
+  }
+  if (!status.repoPresent) {
+    return 'The Browser Harness checkout is missing, so it cannot be updated or repaired. Call browser_harness_setup with action=install.';
+  }
+  return null;
 }

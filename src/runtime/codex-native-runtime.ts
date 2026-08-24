@@ -13,8 +13,7 @@ import {
   getCodexAuthDead,
 } from './auth-store.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
-import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
-import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
+import { classifyTool } from '../agents/tool-taxonomy.js';
 import { beginToolEvent, recordPendingApproval, recordToolEvent } from '../agents/tool-observability.js';
 import { recordModelUsage } from './usage-log.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
@@ -205,57 +204,29 @@ async function throwIfCancelled(callbacks?: AgentRuntimeCallbacks): Promise<void
 /**
  * Tool surface presented to the Codex Responses API.
  *
- * Three sources, merged in a single flat list:
+ * Sources are merged in a single flat list:
  *   1. Local SDK tools (`getCoreTools`) — request_destructive_action,
  *      computer-use, local runtime tools, compact Composio broker.
- *   2. MCP tools via the namespace shim — `<server>__<tool>` names.
- *   3. (future) computer-use primitives via SDK `computerTool`.
+ *   2. (future) computer-use primitives via SDK `computerTool`.
  *
  * The OpenAI Agents SDK does NOT mediate Codex requests (Codex talks
  * to `chatgpt.com/backend-api/codex/responses` directly), so this
- * runtime is responsible for the same fan-in the SDK Runner does
- * elsewhere: list the MCP shim's tools, present them to the model,
- * route incoming function-calls back to the shim's `callTool`.
+ * MCP deliberately does not enter this legacy runtime. The shared host
+ * harness owns its accepted-source, call, lease, settlement, and evidence
+ * authority; exposing MCP here would create a second execution kernel.
  */
-/** Exported for unit tests — verifies excludeToolNames filters both
- *  local SDK tools and MCP-shimmed tools. Not part of the public
- *  runtime API. */
+/** Exported for unit tests — verifies excludeToolNames filters the retired
+ * legacy SDK surface. Not part of the public runtime API. */
 export async function createCodexToolDefinitions(excludeToolNames?: string[]) {
   // 1. Local tools (Composio broker + computer + local runtime + planner shims).
   const local = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   // Code-level backstop for per-call tool restriction. See
   // RunRequest.excludeToolNames — names listed here are dropped from
-  // both the local SDK tools and the MCP shim tools below so the
+  // the local SDK tools below so the
   // model never sees them.
   const exclude = excludeToolNames && excludeToolNames.length > 0
     ? new Set(excludeToolNames)
     : null;
-
-  // 2. MCP tools through the namespace shim. We tolerate the shim
-  //    being slow / partially broken — listTools() inside the shim
-  //    already swallows per-server failures, so a single dead MCP
-  //    server doesn't take the whole tool surface down.
-  let mcpDefs: Array<{ type: string; name: string; description?: string; parameters: unknown; strict?: boolean }> = [];
-  try {
-    const shim = getOrCreateConfiguredMcpServers();
-    if (typeof shim.connect === 'function') {
-      await shim.connect();
-    }
-    const mcpTools = await shim.listTools();
-    mcpDefs = mcpTools
-      .filter((t) => !exclude || !exclude.has(t.name))
-      .map((t) => ({
-        type: 'function',
-        name: t.name,
-        description: t.description ?? `MCP tool ${t.name}`,
-        // The MCP SDK gives us a JSON Schema in `inputSchema`. Codex
-        // accepts JSON Schema directly in the `parameters` field, same
-        // as OpenAI function-calling.
-        parameters: (t as { inputSchema?: unknown }).inputSchema ?? { type: 'object', additionalProperties: true },
-      }));
-  } catch (err) {
-    logger.warn({ err }, 'failed to enumerate MCP tools for Codex runtime; continuing without MCP');
-  }
 
   const localDefs = local
     .filter((tool) => tool.type === 'function')
@@ -268,7 +239,7 @@ export async function createCodexToolDefinitions(excludeToolNames?: string[]) {
       strict: tool.strict,
     }));
 
-  return [...localDefs, ...mcpDefs];
+  return localDefs;
 }
 
 async function createToolMap() {
@@ -279,45 +250,12 @@ async function createToolMap() {
 }
 
 /**
- * True if `name` is a namespace-shimmed MCP tool: `<server>__<tool>`.
- * The Codex executeToolCall path routes these to the shim instead of
- * looking them up in the local tool map (where they don't exist).
+ * True if `name` is a stale/hallucinated MCP tool: `<server>__<tool>`.
+ * The retired runtime pairs these as no-start feedback instead of looking
+ * them up locally or creating a second MCP execution owner.
  */
 function isMcpToolName(name: string): boolean {
   return name.includes('__');
-}
-
-/**
- * MCP `callTool` returns a CallToolResult — an array of content
- * objects (text / image / resource). Collapse to a single string so
- * Codex can feed it back into the next turn the same shape it does
- * for SDK function-tool outputs.
- */
-function stringifyMcpResult(result: unknown): string {
-  if (typeof result === 'string') return result;
-  if (Array.isArray(result)) {
-    return result.map(stringifyMcpResult).join('\n');
-  }
-  if (result && typeof result === 'object') {
-    const r = result as Record<string, unknown>;
-    if (Array.isArray(r.content)) {
-      const parts: string[] = [];
-      for (const item of r.content) {
-        if (item && typeof item === 'object' && typeof (item as { text?: unknown }).text === 'string') {
-          parts.push((item as { text: string }).text);
-        } else if (item && typeof item === 'object') {
-          parts.push(JSON.stringify(item));
-        }
-      }
-      if (parts.length) return parts.join('\n');
-    }
-    try {
-      return JSON.stringify(result, null, 2);
-    } catch {
-      return String(result);
-    }
-  }
-  return String(result);
 }
 
 function parseSseChunk(buffer: string): { events: CodexSseEvent[]; rest: string } {
@@ -1211,146 +1149,22 @@ export class CodexNativeRuntime implements AgentRuntime {
     }
   }
 
-  /**
-   * Dispatch a `<server>__<tool>` MCP function-call. The local tool
-   * map doesn't have it; the namespace shim does. Approval is gated
-   * by the unified taxonomy (same `decideToolApproval` as everything
-   * else), so YOLO mode auto-runs a DataForSEO query, strict pauses
-   * a Hostinger create_domain, etc.
-   */
+  /** A stale/hallucinated MCP call on the retired runtime is returned to the
+   * model as a no-start result. Only the shared host lane may execute MCP. */
   private async executeMcpToolCall(
-    request: RunRequest,
-    sessionId: string,
+    _request: RunRequest,
+    _sessionId: string,
     toolCall: CodexFunctionCall,
     callbacks?: AgentRuntimeCallbacks,
   ): Promise<{ output?: string; pendingApprovalId?: string }> {
     const name = toolCall.name!;
-    const args = parseToolArguments(toolCall);
-
     if (callbacks?.onToolActivity) {
       await callbacks.onToolActivity(toolActivityFor(toolCall));
     }
-
-    const decision = decideToolApproval({
-      sessionId,
-      toolName: name,
-      args,
-    });
-    if (decision.needsApproval) {
-      const approvalId = randomUUID();
-      const pendingApproval: PendingApproval = {
-        id: approvalId,
-        sessionId,
-        agentName: ASSISTANT_NAME,
-        toolName: name,
-        userId: request.userId,
-        channel: request.channel,
-        createdAt: new Date().toISOString(),
-        status: 'pending',
-        state: JSON.stringify({
-          request,
-          toolCall,
-        } satisfies StoredCodexApprovalState),
-      };
-      this.approvals.add(pendingApproval);
-      this.notifyApprovalPending(pendingApproval, toolCall);
-      recordPendingApproval({
-        sessionId,
-        toolName: name,
-        kind: decision.kind,
-        args,
-        approvalId,
-        mcp: true,
-      });
-      return { pendingApprovalId: approvalId };
-    }
-
-    const finishEvent = beginToolEvent({
-      sessionId,
-      toolName: name,
-      kind: decision.kind,
-      approvalReason: decision.reason,
-      args,
-      mcp: true,
-    });
-    try {
-      await throwIfCancelled(callbacks);
-      const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
-      const output = await this.invokeMcpToolByName(name, args);
-      await throwIfCancelled(callbacks);
-      finishEvent('success');
-      return {
-        output: formatRecallableToolText(output, {
-          sessionId,
-          callId,
-          toolName: name,
-        }),
-      };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      logger.warn({ err: error, tool: name }, 'MCP tool execution failed (Codex runtime)');
-      finishEvent('error', msg);
-
-      // T2.5 — if the shim threw BoundaryError(mcp.approval_blocked),
-      // route through the real PendingApproval state machine instead
-      // of just stringifying. The runtime's own decideToolApproval
-      // check above should have caught most of these, but the shim's
-      // safety net can fire for edge cases (e.g. a slug that the
-      // runtime classified as benign but the taxonomy gated). Mirror
-      // the local-tool approval path so the user gets an apr-xxxx
-      // prompt instead of a model that "saw 'approval required' as
-      // tool output and gave up."
-      if (
-        (error as { kind?: unknown })?.kind === 'mcp.approval_blocked'
-      ) {
-        const approvalId = randomUUID();
-        const pendingApproval: PendingApproval = {
-          id: approvalId,
-          sessionId,
-          agentName: ASSISTANT_NAME,
-          toolName: name,
-          userId: request.userId,
-          channel: request.channel,
-          createdAt: new Date().toISOString(),
-          status: 'pending',
-          state: JSON.stringify({
-            request,
-            toolCall,
-          } satisfies StoredCodexApprovalState),
-        };
-        this.approvals.add(pendingApproval);
-        this.notifyApprovalPending(pendingApproval, toolCall);
-        recordPendingApproval({
-          sessionId,
-          toolName: name,
-          kind: ((error as { context?: { kind?: string } })?.context?.kind ?? decision.kind) as
-            'read' | 'write' | 'execute' | 'send' | 'admin',
-          args,
-          approvalId,
-          mcp: true,
-        });
-        return { pendingApprovalId: approvalId };
-      }
-
-      // T2.4 — when the runtime catches a BoundaryError (e.g.
-      // mcp.server_unavailable from a downed server), feed the
-      // user-facing message back as the tool output so the model's
-      // next turn explains the failure honestly instead of a generic
-      // "MCP tool failed".
-      const userMessage = (error as { userMessage?: unknown })?.userMessage;
-      if (typeof userMessage === 'string' && userMessage) {
-        return { output: userMessage };
-      }
-      return { output: `MCP tool "${name}" failed: ${msg}` };
-    }
-  }
-
-  private async invokeMcpToolByName(name: string, args: Record<string, unknown>): Promise<string> {
-    const shim = getOrCreateConfiguredMcpServers();
-    // The shim itself routes by namespaced name; we don't unparse the
-    // `<server>__<tool>` prefix here.
-    const result = await shim.callTool(name, args ?? null);
-    return stringifyMcpResult(result);
+    await throwIfCancelled(callbacks);
+    return {
+      output: `Tool "${name}" was not started. Replan through Clementine's shared host tool lane.`,
+    };
   }
 
   private async executeApprovedToolCall(
@@ -1364,30 +1178,10 @@ export class CodexNativeRuntime implements AgentRuntime {
     const args = parseToolArguments(toolCall);
     const kind = classifyTool(name, { args });
 
-    // Approved MCP call — same dispatch path as the live executor.
+    // Historical legacy approvals do not mint authority in the shared host
+    // lane. Pair the old call back to the model without any tool I/O.
     if (isMcpToolName(name)) {
-      const finish = beginToolEvent({
-        sessionId,
-        toolName: name,
-        kind,
-        approvalReason: 'approved-after-prompt',
-        args,
-        mcp: true,
-      });
-      try {
-        const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
-        const out = await this.invokeMcpToolByName(name, args);
-        finish('success');
-        return formatRecallableToolText(out, {
-          sessionId,
-          callId,
-          toolName: name,
-        });
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        finish('error', msg);
-        throw error;
-      }
+      return `Tool "${name}" was not started. Its historical legacy approval cannot authorize the shared host lane; replan it there.`;
     }
 
     const tool = (await createToolMap()).get(name);

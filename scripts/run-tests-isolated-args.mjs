@@ -39,9 +39,15 @@ function hasExplicitTestTarget(forwarded) {
   return false;
 }
 
+export const TEST_ISOLATION_PRELOAD = new URL('./test-isolation-preload.mjs', import.meta.url).href;
+
 export function isolatedTestArgs(forwarded) {
+  const hasTimeout = forwarded.some((argument) => argument === '--test-timeout' || argument.startsWith('--test-timeout='));
   return [
+    '--import',
+    TEST_ISOLATION_PRELOAD,
     '--test',
+    ...(hasTimeout ? [] : ['--test-timeout', '600000']),
     ...forwarded,
     ...(hasExplicitTestTarget(forwarded) ? [] : DEFAULT_TEST_TARGETS),
   ];

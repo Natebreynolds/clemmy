@@ -234,7 +234,11 @@ after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-test('RESUME reopens the existing SDK continuation once and publishes when that closes the gap', async () => {
+test('a judge RESUME verdict cannot mint a model step — the concern holds (one-step transport)', async () => {
+  // ONE-STEP CUT: the continuation budget is structurally zero, so the judge
+  // is always shown Live continuation: UNAVAILABLE and its RESUME edge can
+  // never reopen the SDK. The gap holds instead of buying another turn — the
+  // same shape the exhausted-budget pin below has always enforced.
   const sessionId = 'claude-terminal-judge-resume-closes';
   const recoveryInstruction = 'Replace the printed closeout with a normal final answer in your own voice now.';
   const judge = judgeFixture([{
@@ -244,14 +248,10 @@ test('RESUME reopens the existing SDK continuation once and publishes when that 
     askIfRepeated: 'The final answer still did not render. Would you like me to leave the recorded work as-is?',
   }]);
   let sdkCalls = 0;
-  const sdkPrompts: string[] = [];
   setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(judge.port);
-  setClaudeAgentSdkBrainRunForTest(async (options) => {
+  setClaudeAgentSdkBrainRunForTest(async () => {
     sdkCalls += 1;
-    sdkPrompts.push(options.prompt);
-    return sdkCalls === 1
-      ? mixedSdkResult(sessionId)
-      : { text: RECOVERED_TEXT, sessionId: 'sdk-resumed', model: 'claude-test', toolUses: [] };
+    return mixedSdkResult(sessionId);
   });
 
   const response = await respondViaClaudeAgentSdkBrain('home', {
@@ -259,21 +259,18 @@ test('RESUME reopens the existing SDK continuation once and publishes when that 
     sessionId,
   });
 
-  assert.equal(sdkCalls, 2, 'one initial SDK run plus exactly one judge-authorized continuation');
-  assert.equal(judge.resolveCalls(), 1);
-  assert.equal(judge.runCalls(), 1);
-  assert.match(judge.requests()[0]?.prompt ?? '', /Live continuation: AVAILABLE/);
-  assert.match(judge.requests()[0]?.prompt ?? '', /Tools during continuation: AVAILABLE/);
-  assert.match(judge.requests()[0]?.prompt ?? '', /Read-only external-state inspection: AVAILABLE/);
-  assert.match(sdkPrompts[1] ?? '', new RegExp(recoveryInstruction.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.equal(response.stoppedReason, 'success');
-  assert.equal(response.text, RECOVERED_TEXT);
-  const { event, presentation } = terminalFor(sessionId);
-  assert.equal(presentation.status, 'done');
-  assert.equal(presentation.text, RECOVERED_TEXT);
-  assert.equal(event.data.terminalJudgeDisposition, 'resume');
-  assert.equal(event.data.terminalJudgeFamily, 'codex');
-  assert.equal(event.data.terminalJudgeResumeCount, 1);
+  assert.equal(sdkCalls, 1, 'no judge-authorized continuation exists on the one-step transport');
+  assert.equal(judge.runCalls(), 1, 'the independent judge still evaluates the terminal candidate');
+  assert.match(judge.requests()[0]?.prompt ?? '', /Live continuation: UNAVAILABLE/);
+  assert.equal(response.stoppedReason, 'unverified');
+  const { presentation } = terminalFor(sessionId);
+  assert.equal(presentation.status, 'blocked');
+  assert.equal(
+    eventlog.listEvents(sessionId, { types: ['heartbeat'] })
+      .some((row) => row.data.kind === 'terminal_delivery_resume'),
+    false,
+    'no resume control edge is emitted',
+  );
 });
 
 test('an exhausted SDK continuation budget cannot advertise or honor terminal RESUME', async () => {
@@ -325,7 +322,11 @@ test('an exhausted SDK continuation budget cannot advertise or honor terminal RE
   }
 });
 
-test('a second consecutive RESUME becomes the judge-authored ASK without a second continuation', async () => {
+test('repeated RESUME verdicts still cannot reopen the SDK — one evaluation, one hold (one-step)', async () => {
+  // ONE-STEP CUT: the first RESUME could previously reopen the SDK once, and
+  // only the SECOND converted to ASK. With the continuation edge structurally
+  // gone, even a judge that would resume forever gets one evaluation and the
+  // concern holds.
   const sessionId = 'claude-terminal-judge-second-resume-asks';
   const askIfRepeated = 'The closeout still did not execute. Should I leave the recorded work as-is?';
   const resume = {
@@ -339,7 +340,7 @@ test('a second consecutive RESUME becomes the judge-authored ASK without a secon
   setClaudeAgentSdkBrainTerminalDeliveryJudgePortForTest(judge.port);
   setClaudeAgentSdkBrainRunForTest(async () => {
     sdkCalls += 1;
-    return mixedSdkResult(sessionId, sdkCalls === 1 ? INITIAL_MIXED : `${INITIAL_MIXED}\nStill unresolved.`);
+    return mixedSdkResult(sessionId);
   });
 
   const response = await respondViaClaudeAgentSdkBrain('home', {
@@ -347,18 +348,16 @@ test('a second consecutive RESUME becomes the judge-authored ASK without a secon
     sessionId,
   });
 
-  assert.equal(sdkCalls, 2, 'the second RESUME verdict is not allowed to reopen the SDK again');
-  assert.equal(judge.runCalls(), 2);
-  assert.equal(response.stoppedReason, 'awaiting-input');
-  assert.equal(response.text, askIfRepeated);
-  const { event, presentation } = terminalFor(sessionId);
-  assert.equal(presentation.status, 'needs_input');
-  assert.equal(presentation.text, askIfRepeated);
-  assert.equal(event.data.terminalJudgeDisposition, 'ask');
-  assert.equal(event.data.terminalJudgeResumeCount, 0);
-  const awaiting = eventlog.listEvents(sessionId, { types: ['awaiting_user_input'] }).at(-1);
-  assert.equal(awaiting?.data.source, 'terminal_delivery_judge');
-  assert.equal(awaiting?.data.question, askIfRepeated);
+  assert.equal(sdkCalls, 1, 'no RESUME verdict can reopen the SDK');
+  assert.equal(judge.runCalls(), 1, 'one evaluation; the queued second verdict is never consulted');
+  assert.equal(response.stoppedReason, 'unverified');
+  const { presentation } = terminalFor(sessionId);
+  assert.equal(presentation.status, 'blocked');
+  assert.equal(
+    eventlog.listEvents(sessionId, { types: ['awaiting_user_input'] }).length,
+    0,
+    'the hold is a park, not a manufactured user question',
+  );
 });
 
 test('ASK publishes exactly the judge-authored question and does not resume the SDK', async () => {

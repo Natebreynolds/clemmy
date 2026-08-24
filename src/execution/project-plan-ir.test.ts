@@ -273,7 +273,6 @@ test('model capabilities cannot disguise a write or open-ended executor as read 
     'pending_action_execute',
     'run_batch',
     'run_shell_command',
-    'run_tool_program',
   ]) {
     assert.match(errorsOf(withTool(tool)), /open-ended executor/,
       `${tool} must not become wildcard inner authority`);

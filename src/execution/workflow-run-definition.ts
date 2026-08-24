@@ -111,6 +111,7 @@ function compiledWorkflowTriggerIsManualOnly(definition: WorkflowDefinition): bo
   const trigger = definition.trigger;
   return trigger?.manual === true
     && trigger.schedule === undefined
+    && trigger.interval === undefined
     && trigger.timezone === undefined
     && trigger.webhookPath === undefined
     && trigger.events === undefined;

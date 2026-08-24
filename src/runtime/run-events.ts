@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { BASE_DIR } from '../config.js';
 import { actionBus } from './action-bus.js';
 
-export type RunStatus = 'received' | 'running' | 'queued' | 'awaiting_approval' | 'awaiting_input' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus = 'received' | 'running' | 'queued' | 'awaiting_approval' | 'awaiting_input' | 'completed' | 'blocked' | 'failed' | 'cancelled';
 
 export type RunEventType =
   | 'received'
@@ -15,6 +15,7 @@ export type RunEventType =
   | 'input_required'
   | 'run_resumed'
   | 'completed'
+  | 'blocked'
   | 'failed'
   | 'cancelled'
   | 'status';
@@ -231,7 +232,7 @@ export function addRunEvent(
 export function finishRun(
   runId: string | undefined,
   input: {
-    status: Extract<RunStatus, 'queued' | 'awaiting_approval' | 'awaiting_input' | 'completed' | 'failed' | 'cancelled'>;
+    status: Extract<RunStatus, 'queued' | 'awaiting_approval' | 'awaiting_input' | 'completed' | 'blocked' | 'failed' | 'cancelled'>;
     message: string;
     outputPreview?: string;
     queuedTaskId?: string;
@@ -249,7 +250,7 @@ export function finishRun(
   const now = nowIso();
   run.status = input.status;
   run.updatedAt = now;
-  if (input.status === 'completed' || input.status === 'failed' || input.status === 'queued' || input.status === 'cancelled') {
+  if (input.status === 'completed' || input.status === 'blocked' || input.status === 'failed' || input.status === 'queued' || input.status === 'cancelled') {
     run.completedAt = now;
   }
   run.outputPreview = input.outputPreview ? clean(input.outputPreview, 1200) : run.outputPreview;
@@ -271,6 +272,8 @@ export function finishRun(
     id: randomUUID(),
     type: input.status === 'failed'
       ? 'failed'
+      : input.status === 'blocked'
+        ? 'blocked'
       : input.status === 'cancelled'
         ? 'cancelled'
         : input.status === 'awaiting_approval'

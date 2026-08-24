@@ -1,7 +1,7 @@
 /**
  * The one place a tool attempt is settled, for every lane.
  *
- * Claude, Codex, BYO, native MCP, Composio and code mode all end a tool call
+ * Claude, Codex, BYO, native MCP, Composio, and nested host carriers all end a tool call
  * here. Before this each lane settled its own way — one read a boolean off
  * prose, one read an envelope, one threw and lost the reason entirely — so the
  * same failure produced three different recoveries depending on who was
@@ -21,7 +21,11 @@ import {
   type AttemptSignals,
 } from './attempt-outcome.js';
 import { callableContractIdentity, normalizeCallableArguments } from './callable-contract.js';
-import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
+import {
+  currentUnboundWorkRequirementId,
+  loadExpectedWorkCallBindingState,
+  publishExpectedWorkProgress,
+} from './expected-work-admission.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { isDeterministicImplicitRetrieveContract } from './expected-work-matcher.js';
 import { toResultHandle } from './result-handle.js';
@@ -36,8 +40,17 @@ import {
   type LogicalCallSettlementResult,
 } from './logical-call-settlement-store.js';
 import { beginPhysicalDispatch, settlePhysicalDispatch } from './dispatch-ledger.js';
-import { actionTopologyRoleForRuntimeCall, classifyRuntimeToolEffect } from './tool-effect.js';
+import type { DispatchLeaseRef } from './dispatch-lease.js';
+import {
+  classifyRuntimeToolEffect,
+  runtimeEffectIsMutation,
+  runtimeExpectedWorkProjection,
+} from './tool-effect.js';
 import { TruncatedToolOutputResult } from './tool-output-format.js';
+import {
+  acceptedTurnCallAuthorityFor,
+} from './accepted-turn-call-authority.js';
+import { currentHostToolInvocationObservation } from './tool-invocation-observation-context.js';
 
 export { normalizeCallableArguments, toResultHandle };
 
@@ -97,10 +110,14 @@ export interface SettleToolAttemptInput {
    */
   args?: unknown;
   /** Provider-neutral label for the lane that dispatched. */
-  lane: 'agents_runner' | 'native_mcp' | 'claude_sdk' | 'composio' | 'code_mode' | 'byo';
+  lane: 'agents_runner' | 'native_mcp' | 'claude_sdk' | 'composio' | 'code_mode' | 'byo'; // code_mode is legacy persisted-row compatibility
   toolName: string;
   /** Stable invocation identity, so a settlement can be correlated to its call. */
   callId?: string;
+  /** Exact current generation for a host-local evidence crossing. Passing the
+   * owned reference avoids depending on a nested adapter preserving the
+   * dispatch-lease AsyncLocalStorage implementation detail. */
+  dispatchLease?: DispatchLeaseRef;
   /** The accepted task that owns this attempt. */
   acceptedTaskId?: string;
   /** The PHYSICAL attempt — one dispatch or one refusal, whatever wraps it. */
@@ -260,18 +277,24 @@ function settlementAuthorityIdentity(
   };
 }
 
-function durablePhysicalCrossingCount(identity: SettlementAuthorityIdentity): number {
+function durablePhysicalCrossingCounts(identity: SettlementAuthorityIdentity): {
+  provider: number;
+  host: number;
+  total: number;
+} {
   try {
     const row = openEventLog().prepare(`
-      SELECT COUNT(*) AS count
+      SELECT COUNT(*) AS total,
+             SUM(CASE WHEN execution_site = 'host' THEN 1 ELSE 0 END) AS host,
+             SUM(CASE WHEN execution_site IS NULL THEN 1 ELSE 0 END) AS provider
         FROM physical_dispatches
        WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
     `).get(
       identity.sessionId,
       identity.sourceUserSeq,
       identity.logicalToolCallId,
-    ) as { count: number };
-    return row.count;
+    ) as { total: number; host: number | null; provider: number | null };
+    return { total: row.total, host: row.host ?? 0, provider: row.provider ?? 0 };
   } catch (error) {
     throw new ToolAttemptSettlementAuthorityError(
       'storage_error',
@@ -529,9 +552,32 @@ function settlesDeterministicImplicitRetrieve(identity: SettlementAuthorityIdent
   }
 }
 
+/** A graphless foreground host call may record the same host crossing only
+ * when its exact accepted-turn root is still open and its live classified
+ * effect remains inside the immutable read/compute ceiling. */
+function settlesHostAuthority(
+  identity: SettlementAuthorityIdentity,
+  call: { tool: string; args?: unknown },
+): boolean {
+  try {
+    const loaded = acceptedTurnCallAuthorityFor(identity.sessionId, identity.sourceUserSeq);
+    if (
+      loaded.status !== 'ok'
+      || (loaded.authority.authorityKind !== 'host_v1_read_only'
+        && loaded.authority.authorityKind !== 'host_v1')
+      || loaded.authority.state !== 'open'
+      || loaded.authority.identity.acceptedTaskId !== identity.acceptedTaskId
+    ) return false;
+    const effect = classifyRuntimeToolEffect(call.tool, call.args).effect;
+    return loaded.authority.effectBounds.includes(effect);
+  } catch {
+    return false;
+  }
+}
+
 function recordHostExecutionCrossing(
   identity: SettlementAuthorityIdentity,
-  call: { tool: string; args?: unknown; turn?: number },
+  call: { tool: string; args?: unknown; turn?: number; dispatchLease?: DispatchLeaseRef },
 ): void {
   try {
     // ANNOTATE AUTHORITY, NEVER CREATE IT. Opening a crossing also admits its
@@ -565,6 +611,7 @@ function recordHostExecutionCrossing(
       ...(call.turn === undefined ? {} : { turn: call.turn }),
       relation: 'primary',
       executionSite: 'host',
+      ...(call.dispatchLease ? { dispatchLease: call.dispatchLease } : {}),
     });
     if (admitted.status !== 'inserted') return;
     // Settle against the name the ledger actually STORED. It records the
@@ -630,7 +677,36 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   if (input.result instanceof TruncatedToolOutputResult) {
     extracted.outputTruncated = true;
   }
-  if (input.mutating && extracted.acknowledged === undefined) {
+  if (!hasTaskIdentity(input)) {
+    throw new ToolAttemptSettlementAuthorityError(
+      'uncorrelated',
+      'session and accepted source identity are required',
+    );
+  }
+  const identity = settlementAuthorityIdentity(input);
+  if (!identity) {
+    throw new ToolAttemptSettlementAuthorityError(
+      'uncorrelated',
+      'no logical call owned by this accepted task is available',
+    );
+  }
+  const bindingState = loadExpectedWorkCallBindingState(identity);
+  if (bindingState.status === 'storage_error') {
+    throw new ToolAttemptSettlementAuthorityError('storage_error', bindingState.reason);
+  }
+  const binding = bindingState.status === 'ok' ? bindingState.binding : undefined;
+  const runtimeProjection = runtimeExpectedWorkProjection(input.toolName, input.args);
+  // The immutable expected-work row is the sole role/effect owner after
+  // admission. In particular, a registry control mutation (Workspace or
+  // workflow authoring) becomes exact business work only after it owns this
+  // binding, while the same graph-neutral control call remains control. The
+  // durable effect also outranks the wrappers' legacy external-only mutating
+  // bit, which otherwise mislabels local writes as non-mutating at settlement.
+  const settlementMutating = binding
+    ? runtimeEffectIsMutation(binding.effect)
+    : input.mutating === true;
+  if (binding) extracted.mutating = settlementMutating;
+  if (settlementMutating && extracted.acknowledged === undefined) {
     // A mutation that threw was never acknowledged — and a mutation whose
     // envelope merely says "not successful" has not proved that nothing landed
     // either. Both are uncertain until something observes the target. Treating
@@ -651,31 +727,6 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
       providerEnvelopeContradicted: true,
     });
   }
-  if (!hasTaskIdentity(input)) {
-    throw new ToolAttemptSettlementAuthorityError(
-      'uncorrelated',
-      'session and accepted source identity are required',
-    );
-  }
-  const identity = settlementAuthorityIdentity(input);
-  if (!identity) {
-    throw new ToolAttemptSettlementAuthorityError(
-      'uncorrelated',
-      'no logical call owned by this accepted task is available',
-    );
-  }
-  const bindingState = loadExpectedWorkCallBindingState(identity);
-  if (bindingState.status === 'storage_error') {
-    throw new ToolAttemptSettlementAuthorityError('storage_error', bindingState.reason);
-  }
-  const binding = bindingState.status === 'ok' ? bindingState.binding : undefined;
-  const topologyRole = actionTopologyRoleForRuntimeCall(input.toolName, input.args);
-  if (binding && topologyRole === 'control') {
-    throw new ToolAttemptSettlementAuthorityError(
-      'conflict',
-      'a control call cannot settle or discharge immutable business work',
-    );
-  }
   if (
     binding
     && input.requirementId
@@ -686,14 +737,29 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
       'lane-supplied requirement identity conflicts with the immutable work binding',
     );
   }
-  const requirementId = binding?.requirementId ?? input.requirementId;
-  const businessCall = topologyRole === 'control'
-    ? false
-    : binding ? true : input.businessCall === true;
+  // Third tier: a read/compute bypass dispatch carries the requirement the
+  // model named in scope. It reaches the settlement row only for business
+  // calls — never as discharge authority, only as visibility for the oracle.
+  const requirementId = binding?.requirementId
+    ?? input.requirementId
+    ?? (runtimeProjection.role === 'control' ? undefined : currentUnboundWorkRequirementId());
+  const businessCall = binding
+    ? true
+    : runtimeProjection.role === 'control' ? false : input.businessCall === true;
   const continuesRequirement = input.continuesRequirement === true;
 
-  const priorCrossingCount = durablePhysicalCrossingCount(identity);
-  const executionKind = priorCrossingCount > 0
+  const priorCrossings = durablePhysicalCrossingCounts(identity);
+  if (
+    currentHostToolInvocationObservation()?.terminalPhysicalDispatchRequired === true
+    && extracted.preDispatch !== true
+    && priorCrossings.provider === 0
+  ) {
+    throw new ToolAttemptSettlementAuthorityError(
+      'conflict',
+      'terminal provider adapter attempted to settle without its provider-owned physical dispatch row',
+    );
+  }
+  const executionKind = priorCrossings.provider > 0
     ? 'provider_execution' as const
     : extracted.preDispatch === true
       ? 'refused_pre_dispatch' as const
@@ -737,6 +803,7 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     // against the ledger-stored normalized name, so a wrapped carrier's outer
     // name cannot desynchronize the result handle's identity.
     && (binding !== undefined
+      || settlesHostAuthority(identity, { tool: input.toolName, args: input.args })
       || (settlesDeterministicImplicitRetrieve(identity)
         // The implicit-retrieve door carries exactly ONE READ. Only calls the
         // taxonomy sees as read/compute may mint host evidence through it — a
@@ -752,6 +819,7 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
         tool: input.toolName,
         args: input.args,
         ...(Number.isSafeInteger(input.turn) ? { turn: input.turn as number } : {}),
+        ...(input.dispatchLease ? { dispatchLease: input.dispatchLease } : {}),
       });
     }
   }
@@ -795,7 +863,7 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     outcome,
     recovery: {
       businessCall,
-      mutating: input.mutating === true,
+      mutating: settlementMutating,
       ...(requirementId ? { requirementId } : {}),
       ...(continuesRequirement ? { continuesRequirement: true } : {}),
       ...(progressIdentity ? { progressIdentity } : {}),
@@ -822,6 +890,12 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
       identity.sourceUserSeq,
       persisted.toolName,
     );
+  }
+  if (binding) {
+    publishExpectedWorkProgress({
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+    });
   }
   return {
     outcome: persisted.outcome,

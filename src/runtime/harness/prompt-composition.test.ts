@@ -82,3 +82,45 @@ test('an empty turn measures nothing rather than inventing a reading', () => {
   assert.equal(s.stableShare, 0);
   assert.deepEqual(s.buckets, []);
 });
+
+test('BYTE-STABILITY: the frozen system append is byte-identical across consecutive renders (COMPOUNDING pin)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  const { createHash } = await import('node:crypto');
+  const { renderClaudeAgentBrainSystemAppend, renderClaudeAgentBrainTurnContext } = await import('./claude-agent-brain.js');
+  const { createSession } = await import('./eventlog.js');
+  const sessionId = createSession({ id: 'byte-stability-pin', kind: 'chat', userId: 'user-1' }).id;
+  const renderOnce = (message: string, candidates?: unknown): string => renderClaudeAgentBrainSystemAppend(
+    'home',
+    { message, sessionId, ...(candidates ? { turnCandidates: candidates } : {}) } as never,
+    'full',
+  );
+  const first = renderOnce('find the top vendors and put them in a sheet');
+  const turnCandidates = {
+    candidates: [{
+      identifier: 'CALENDAR_LIST_RECORDS',
+      kind: 'fixture',
+      intent: 'calendar.list',
+      klass: 'capability_only',
+      via: 'semantic',
+      score: 0.9,
+    }],
+    matches: [],
+    pinnedTools: [],
+    requirements: [],
+    semanticApplied: true,
+  };
+  const second = renderOnce('completely different message about calendars', turnCandidates);
+  const sha = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
+  assert.equal(sha(first), sha(second),
+    'the stable prefix must not vary with the message or the per-turn candidate card — that variance re-bills the frozen memory block every turn');
+  assert.doesNotMatch(second, /matched by meaning|proven for phrasing like this/,
+    'the volatile candidate card no longer rides the stable region');
+  const turnContext = await renderClaudeAgentBrainTurnContext({
+    message: 'completely different message about calendars',
+    sessionId,
+    turnCandidates,
+  } as never);
+  assert.match(turnContext, /CALENDAR_LIST_RECORDS/,
+    'moving the volatile card out of the stable prefix must not drop it from the model turn');
+});

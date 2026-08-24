@@ -2,12 +2,64 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   classifyRuntimeToolEffect,
+  isDelegationPrimitiveRuntimeCall,
+  isUnscopedShellRuntimeCall,
   isCanonicalTopLevelToolEvent,
   pairTransportMirrorToolCalls,
   projectCanonicalTopLevelToolEvents,
   runtimeToolAccountingMetadata,
+  runtimeToolAuthorityBinding,
+  unwrapRuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
+
+test('delegation primitive classification is exact registry authority, not a name heuristic', () => {
+  assert.equal(isDelegationPrimitiveRuntimeCall('run_worker', { item: 'x' }), true);
+  assert.equal(isDelegationPrimitiveRuntimeCall('run_batch', { action: 'execute' }), true);
+  assert.equal(isDelegationPrimitiveRuntimeCall('pending_action_execute', { approval_id: 'a' }), true);
+  assert.equal(isDelegationPrimitiveRuntimeCall('local_cli_list', { command: 'git' }), true);
+  assert.equal(isDelegationPrimitiveRuntimeCall('local_cli_probe', { command: 'git' }), true);
+  assert.equal(isDelegationPrimitiveRuntimeCall('check_capability', { name: 'git' }), true);
+  for (const name of ['space_save', 'space_refresh', 'space_edit_runner', 'space_revert_runner', 'space_action_prepare']) {
+    assert.equal(isDelegationPrimitiveRuntimeCall(name, { slug: 'source-backed-space' }), true, name);
+  }
+  assert.equal(isDelegationPrimitiveRuntimeCall('space_try_runner', { slug: 'x' }), false);
+  assert.equal(isDelegationPrimitiveRuntimeCall('mcp__clementine-local__run_worker', { item: 'x' }), true);
+  assert.equal(isDelegationPrimitiveRuntimeCall('mcp__clementine-local__local_cli_probe', { command: 'git' }), true);
+  assert.equal(isDelegationPrimitiveRuntimeCall('mcp__clementine-local__check_capability', { name: 'git' }), true);
+  assert.equal(isDelegationPrimitiveRuntimeCall('mcp__foreign__run_worker', { item: 'x' }), false);
+  assert.equal(isDelegationPrimitiveRuntimeCall('mcp__foreign__local_cli_probe', { command: 'git' }), false);
+  assert.equal(isDelegationPrimitiveRuntimeCall('mcp__foreign__check_capability', { name: 'git' }), false);
+  assert.equal(isDelegationPrimitiveRuntimeCall('run_worker_like', { item: 'x' }), false);
+  assert.equal(isDelegationPrimitiveRuntimeCall('local_cli_probe_like', { command: 'git' }), false);
+  assert.equal(isDelegationPrimitiveRuntimeCall('check_capability_like', { name: 'git' }), false);
+  assert.equal(isUnscopedShellRuntimeCall('run_shell_command', { command: 'curl https://example.test' }), true);
+  assert.equal(isUnscopedShellRuntimeCall('mcp__foreign__run_shell_command', { command: 'curl https://example.test' }), false);
+});
+import {
+  durableLogicalCallContract,
+  logicalCallArgumentsAreContractible,
+} from './logical-call-contract.js';
 import { toolCallCorrelationFingerprint } from './tool-correlation.js';
+
+test('runtime authority binding is structural and future sources fail closed', () => {
+  assert.equal(runtimeToolAuthorityBinding(
+    classifyRuntimeToolEffect('list_files', {}),
+  ), 'local_envelope');
+  assert.equal(runtimeToolAuthorityBinding(
+    classifyRuntimeToolEffect('mcp__directory__list_records', {}),
+  ), 'catalog_manifest');
+  assert.equal(runtimeToolAuthorityBinding(
+    classifyRuntimeToolEffect('team_reply', {}),
+  ), 'catalog_manifest', 'consequential effects cannot inherit a local envelope');
+  for (const effect of ['read', 'external_write'] as const) {
+    assert.equal(runtimeToolAuthorityBinding({
+      effect,
+      mutating: effect === 'external_write',
+      dangerousWrite: effect === 'external_write',
+      source: 'future_adapter' as never,
+    }), 'unknown', 'an unrecognized future source is never authorized implicitly');
+  }
+});
 
 test('canonical projection excludes MCP transport mirrors without dropping native or legacy calls', () => {
   const events = [
@@ -172,6 +224,104 @@ test('Composio gateways classify the inner operation rather than the wrapper', (
   }).effect, 'external_write', 'a read-job prefix cannot hide an explicit publish');
 });
 
+test('trusted carriers preserve the exact direct-call digest and keep ordinary inner carrier-shaped fields as data', () => {
+  const slug = 'SCHEDULERCO_LIST_EVENTS';
+  const inner = {
+    timeMin: '2026-08-07',
+    nested: {
+      tool_slug: 'ordinary-business-data',
+      arguments: 'also ordinary business data',
+    },
+  };
+  const gateway = {
+    tool_slug: slug,
+    arguments: JSON.stringify(inner),
+  };
+  const nestedCarrier = {
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify(gateway),
+  };
+
+  const directIdentity = unwrapRuntimeEffectiveToolIdentity(slug, inner);
+  const gatewayIdentity = unwrapRuntimeEffectiveToolIdentity('composio_execute_tool', gateway);
+  const nestedIdentity = unwrapRuntimeEffectiveToolIdentity('call_tool', nestedCarrier);
+  assert.deepEqual(directIdentity, { toolName: slug, args: inner });
+  assert.deepEqual(gatewayIdentity, { toolName: slug, args: inner, composioCarrier: true });
+  assert.deepEqual(nestedIdentity, { toolName: slug, args: inner, composioCarrier: true });
+
+  const directContract = durableLogicalCallContract('task:carrier-parity#1', slug, inner);
+  assert.ok(directContract);
+  assert.deepEqual(
+    durableLogicalCallContract('task:carrier-parity#1', 'composio_execute_tool', gateway),
+    directContract,
+  );
+  assert.deepEqual(
+    durableLogicalCallContract('task:carrier-parity#1', 'call_tool', nestedCarrier),
+    directContract,
+  );
+});
+
+test('trusted Composio carriers fail closed when their exact inner arguments are malformed', () => {
+  for (const argumentsPayload of [undefined, 'not-json', '[]', 42, true]) {
+    const args = { tool_slug: 'SCHEDULERCO_LIST_EVENTS', arguments: argumentsPayload };
+    assert.deepEqual(
+      unwrapRuntimeEffectiveToolIdentity('composio_execute_tool', args),
+      {
+        toolName: null,
+        args: argumentsPayload === '[]' ? '[]' : argumentsPayload,
+        composioCarrier: true,
+      },
+    );
+    assert.equal(logicalCallArgumentsAreContractible('composio_execute_tool', args), false);
+    assert.equal(durableLogicalCallContract('task:malformed-carrier#1', 'composio_execute_tool', args), null);
+  }
+});
+
+test('trusted Composio explicit null is the exact zero-argument direct contract across carriers', () => {
+  const slug = 'SCHEDULERCO_LIST_EVENTS';
+  const gateway = { tool_slug: slug, arguments: null };
+  const nested = {
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify(gateway),
+  };
+  assert.deepEqual(
+    unwrapRuntimeEffectiveToolIdentity('composio_execute_tool', gateway),
+    { toolName: slug, args: {}, composioCarrier: true },
+  );
+  const direct = durableLogicalCallContract('task:null-carrier#1', slug, {});
+  assert.ok(direct);
+  assert.deepEqual(
+    durableLogicalCallContract('task:null-carrier#1', 'composio_execute_tool', gateway),
+    direct,
+  );
+  assert.deepEqual(
+    durableLogicalCallContract('task:null-carrier#1', 'call_tool', nested),
+    direct,
+  );
+});
+
+test('only the exact host unreadable-arguments sentinel owns a durable outer refusal identity', () => {
+  const tool = 'composio_execute_tool';
+  const marker = { carrier: tool, malformed: true, version: 1 };
+  assert.equal(logicalCallArgumentsAreContractible(tool, marker), true);
+  const contract = durableLogicalCallContract('task:unreadable-host-refusal#1', tool, marker);
+  assert.ok(contract);
+  assert.equal(contract.toolName, tool);
+
+  for (const nearMiss of [
+    { ...marker, carrier: 'composio_execute_tool_like' },
+    { ...marker, malformed: false },
+    { ...marker, version: 2 },
+    { ...marker, extra: true },
+  ]) {
+    assert.equal(logicalCallArgumentsAreContractible(tool, nearMiss), false);
+    assert.equal(
+      durableLogicalCallContract('task:unreadable-host-refusal#1', tool, nearMiss),
+      null,
+    );
+  }
+});
+
 test('call_tool accounting follows the inner tool and never labels a failed guessed read as a local write', () => {
   assert.equal(classifyRuntimeToolEffect('call_tool', {
     name: 'read_file',
@@ -309,9 +459,8 @@ test('accounting metadata decodes hook arguments and exposes the inner provider 
     { tool_slug: 'DATAFORSEO_CREATE_SERP_TASK_POST' },
   ), {
     effect: 'read',
-    effectiveTool: 'DATAFORSEO_CREATE_SERP_TASK_POST',
     toolSlug: 'DATAFORSEO_CREATE_SERP_TASK_POST',
-  });
+  }, 'missing inner arguments do not mint an effective execution identity');
 });
 
 test('effective lifecycle identity collapses only trusted local carriers', () => {

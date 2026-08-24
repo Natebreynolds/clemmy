@@ -103,7 +103,7 @@ const agentScopes = new WeakMap<object, McpToolScope | null>();
 
 /** Bind the exact construction-time scope to an Agent without mutating the SDK
  * object. The loop uses this to install the same authority in AsyncLocalStorage
- * for nested carriers such as run_tool_program and worker fan-out. */
+ * for nested carriers such as run_batch items and worker fan-out. */
 export function bindAgentMcpToolScope(
   agent: object,
   scope: McpToolScope | null | undefined,

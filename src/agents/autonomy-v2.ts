@@ -69,7 +69,7 @@ const logger = pino({ name: 'clementine-next.agents.v2' });
 // -------- Configuration --------
 
 const ENGINE_OPT_IN_ENV = 'AUTONOMY_V2_AGENTS';
-const PER_AGENT_TIMEOUT_MS = 60_000;
+const PER_AGENT_TIMEOUT_MS = process.env.CLEMMY_TEST_ISOLATED_HOME === '1' ? 250 : 60_000;
 const MAX_INBOX_PER_CYCLE = 6;
 
 function readOptInSlugs(): Set<string> {
@@ -1008,7 +1008,7 @@ export interface AutonomyV2RunSummary {
 // slug bound at the call site (never a process-global), reusing the exact
 // transition functions the SDK tools call. One owner, two entry points.
 
-const RUNTIME_CYCLE_TIMEOUT_MS = 180_000;
+const RUNTIME_CYCLE_TIMEOUT_MS = process.env.CLEMMY_TEST_ISOLATED_HOME === '1' ? 250 : 180_000;
 const MAX_RUNTIME_ACTIONS = 5;
 
 /**
@@ -1035,7 +1035,7 @@ interface InFlightAutonomyCycle {
   globalHoldUntilMs: number;
 }
 
-const AUTONOMY_ABORT_SETTLEMENT_GRACE_MS = 30_000;
+const AUTONOMY_ABORT_SETTLEMENT_GRACE_MS = process.env.CLEMMY_TEST_ISOLATED_HOME === '1' ? 50 : 30_000;
 export const _testOnly_autonomyAbortSettlementGraceMs = AUTONOMY_ABORT_SETTLEMENT_GRACE_MS;
 
 let autonomyCoordinatorNow = (): number => Date.now();
@@ -1043,12 +1043,47 @@ export function _testOnly_setAutonomyCoordinatorNow(now?: () => number): void {
   autonomyCoordinatorNow = now ?? (() => Date.now());
 }
 
+/** Test-only caller wait budget. Full-suite CPU/I/O contention must not turn a
+ * fast fake cycle into a coordinator timeout, while timeout-specific tests
+ * still keep the deliberately short isolated default. Production never sets
+ * this override and retains the exact configured budgets below. */
+let runtimeAutonomyCoordinatorWaitBudgetMs: number | undefined;
+export function _testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs(ms?: number): void {
+  if (ms !== undefined && (!Number.isFinite(ms) || ms <= 0)) {
+    throw new Error('autonomy coordinator test wait budget must be a positive finite number');
+  }
+  runtimeAutonomyCoordinatorWaitBudgetMs = ms;
+}
+
 const cyclesInFlight = new Map<string, InFlightAutonomyCycle>();
+const AUTONOMY_LANE_IDLE_WAIT_MS = 1_000;
 
 /** Await physical provider settlement during isolated timeout tests. Production
- *  scheduling never calls this; it observes the same map without blocking. */
+ *  scheduling never calls this; it observes the same map without blocking.
+ *  A handle-less pending cycle must not drain the event loop: abort, wait a
+ *  bounded interval, then drop the claim so later tests can continue. */
 export async function _testOnly_waitForAutonomyLaneIdle(): Promise<void> {
-  await Promise.allSettled([...cyclesInFlight.values()].map((claim) => claim.promise));
+  const claims = [...cyclesInFlight.entries()];
+  if (claims.length === 0) return;
+  let timedOut = false;
+  const timeout = new Promise<void>((resolve) => {
+    setTimeout(() => {
+      timedOut = true;
+      for (const [, claim] of claims) {
+        try { claim.abort(); } catch { /* still settle the wait */ }
+      }
+      resolve();
+    }, AUTONOMY_LANE_IDLE_WAIT_MS);
+  });
+  await Promise.race([
+    Promise.allSettled(claims.map(([, claim]) => claim.promise)).then(() => undefined),
+    timeout,
+  ]);
+  if (timedOut) {
+    for (const [slug, claim] of claims) {
+      if (cyclesInFlight.get(slug) === claim) cyclesInFlight.delete(slug);
+    }
+  }
 }
 
 function claimCycle<T>(
@@ -1559,7 +1594,8 @@ export async function processAgentAutonomyV2(assistant?: ClementineAssistant): P
     await runBoundedAutonomyPass(
       records,
       (record, signal) => (runtimeCycleImpl ?? runAgentCycleViaRuntime)(assistant, record, signal),
-      RUNTIME_CYCLE_TIMEOUT_MS + 15_000,
+      runtimeAutonomyCoordinatorWaitBudgetMs
+        ?? RUNTIME_CYCLE_TIMEOUT_MS + (process.env.CLEMMY_TEST_ISOLATED_HOME === '1' ? 50 : 15_000),
       summary,
       'autonomy runtime cycle rejected',
     );

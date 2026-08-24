@@ -44,6 +44,12 @@ export interface RecallUsageHealth {
   runs: number;
   usedRuns: number;
   conversionRate: number | null;
+  /** Honest conversion over ALL runs in the window (tombstone counters —
+   *  survivor-based `conversionRate` reads ~3x high because the reaper
+   *  deletes exactly the uncredited runs). */
+  allRuns: number;
+  allUsedRuns: number;
+  trueConversionRate: number | null;
   usedRefs: number;
   notUsefulRefs: number;
   refUtilityEvents: number;
@@ -185,6 +191,15 @@ export function recordRecallRun(input: {
     createdAt,
     expiresAt,
   };
+  try {
+    // Tombstone counters (COMPOUNDING wave): the reaper deletes uncredited
+    // runs, so only these daily totals can report conversion honestly.
+    openMemoryDb().prepare(`
+      INSERT INTO memory_recall_run_tombstones (day, runs_total, used_total)
+      VALUES (?, 1, 0)
+      ON CONFLICT(day) DO UPDATE SET runs_total = runs_total + 1
+    `).run(createdAt.slice(0, 10));
+  } catch { /* counters must never break recall recording */ }
   openMemoryDb().prepare(`
     INSERT INTO memory_recall_runs
       (id, objective, surface, answerability, candidate_refs_json, created_at, expires_at, session_id)
@@ -344,6 +359,9 @@ export function recordRecallUse(input: {
     WHERE id = ? AND active = 1
   `);
 
+  const hadPriorUsedRow = Boolean(db.prepare(`
+    SELECT 1 FROM memory_recall_uses WHERE recall_id = ? AND outcome = 'used' LIMIT 1
+  `).get(input.recallId));
   db.transaction(() => {
     const preexistingFactIds = new Set<number>();
     for (const ref of requested.values()) {
@@ -413,6 +431,23 @@ export function recordRecallUse(input: {
     }
   })();
 
+  try {
+    // used_total: once per run's FIRST credited use (idempotent — later
+    // credits on the same run must not double-count the run).
+    if ((input.outcome ?? 'used') === 'used' && !hadPriorUsedRow) {
+      const nowHasUse = db.prepare(`
+        SELECT 1 FROM memory_recall_uses WHERE recall_id = ? AND outcome = 'used' LIMIT 1
+      `).get(input.recallId);
+      if (nowHasUse) {
+        db.prepare(`
+          INSERT INTO memory_recall_run_tombstones (day, runs_total, used_total)
+          VALUES (?, 0, 1)
+          ON CONFLICT(day) DO UPDATE SET used_total = used_total + 1
+        `).run(now.slice(0, 10));
+      }
+    }
+  } catch { /* counters must never break credit recording */ }
+
   if (resurrectedFactIds.size > 0) {
     // Same reviewable trail as decay itself, so the owner can see round trips:
     // what the janitor retired AND what usage brought back.
@@ -441,6 +476,17 @@ export function readRecallUsageHealth(windowDays = 30, nowIso = new Date().toISO
     LEFT JOIN memory_recall_uses u ON u.recall_id = r.id
     WHERE r.created_at >= ?
   `).get(since) as { runs: number; used_runs: number; used_refs: number; not_useful_refs: number };
+  let allRuns = 0;
+  let allUsedRuns = 0;
+  try {
+    const totals = db.prepare(`
+      SELECT COALESCE(SUM(runs_total), 0) AS runs, COALESCE(SUM(used_total), 0) AS used
+      FROM memory_recall_run_tombstones
+      WHERE day >= ?
+    `).get(since.slice(0, 10)) as { runs: number; used: number };
+    allRuns = Number(totals.runs);
+    allUsedRuns = Number(totals.used);
+  } catch { /* pre-migration DB: honest totals unavailable */ }
   const refRows = db.prepare(`
     SELECT ref_type, ref_id, COUNT(DISTINCT recall_id) AS uses
     FROM memory_recall_uses
@@ -470,6 +516,9 @@ export function readRecallUsageHealth(windowDays = 30, nowIso = new Date().toISO
     runs: runStats.runs,
     usedRuns: runStats.used_runs,
     conversionRate: runStats.runs > 0 ? runStats.used_runs / runStats.runs : null,
+    allRuns,
+    allUsedRuns,
+    trueConversionRate: allRuns > 0 ? allUsedRuns / allRuns : null,
     usedRefs: runStats.used_refs,
     notUsefulRefs: runStats.not_useful_refs,
     refUtilityEvents,

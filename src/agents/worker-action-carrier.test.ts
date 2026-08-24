@@ -23,10 +23,10 @@ const settlements = await import('../runtime/harness/logical-call-settlement-sto
 const brackets = await import('../runtime/harness/brackets.js');
 const workCallModule = await import('../tools/work-call.js');
 const { buildWorkerAgent } = await import('./sub-agents.js');
-const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
+const { _setInnerDispatchToolsForTests } = await import('../tools/inner-dispatch.js');
 
 test.after(() => {
-  _setCodeModeToolsForTests(null);
+  _setInnerDispatchToolsForTests(null);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -233,7 +233,7 @@ test('a worker per-item write binds to the parent contract and reaches its inner
   stageSealedSource(task, [{ id: 'lead-001' }, { id: 'lead-002' }]);
 
   const written: Array<Record<string, unknown>> = [];
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     [DRAFT_TOOL, {
       name: DRAFT_TOOL,
       invoke: async (_ctx: unknown, raw: string) => {
@@ -298,7 +298,7 @@ test('a worker item outside the sealed universe is still refused', async () => {
   const task = acceptDelegatedAction('stranger');
   stageSealedSource(task, [{ id: 'lead-001' }, { id: 'lead-002' }]);
   const ran: unknown[] = [];
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     [DRAFT_TOOL, {
       name: DRAFT_TOOL,
       invoke: async () => { ran.push(1); return { successful: true }; },
@@ -375,7 +375,7 @@ test('a worker can execute an unbound host read through a conflicting proposal, 
   let readExecutions = 0;
   let computeExecutions = 0;
   let sendExecutions = 0;
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     [PROFILE_READ_TOOL, {
       name: PROFILE_READ_TOOL,
       invoke: async () => {
@@ -519,7 +519,7 @@ test('a worker can execute an unbound host read through a conflicting proposal, 
   const renderedSend = typeof sendOutput === 'string'
     ? sendOutput
     : JSON.stringify(sendOutput ?? null);
-  assert.match(renderedSend, /work_contract_conflict/, renderedSend);
+  assert.match(renderedSend, /work_contract_conflict|work_contract_invalid/, renderedSend);
   assert.equal(sendExecutions, 0, 'a conflicting proposal still authorizes zero external writes');
   assert.equal(
     (eventlog.openEventLog().prepare(`

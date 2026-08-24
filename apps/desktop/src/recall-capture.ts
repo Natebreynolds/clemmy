@@ -546,10 +546,12 @@ export class RecallDesktopCapture {
     const blocked: NonNullable<RecallCaptureStatus['blocked']> = needsPermission
       ? {
         reason: 'screen-recording-permission',
-        message:
-          'Clementine needs Screen Recording permission to record meetings. Open System Settings → '
-          + 'Privacy & Security → Screen Recording, turn on Clementine, then QUIT and reopen Clementine. '
-          + '(Microphone and Accessibility should be on too.)',
+        message: process.platform === 'win32'
+          ? 'Clementine needs screen and microphone capture permission to record meetings. Open Windows '
+            + 'Settings → Privacy & security → Microphone (and Camera), allow desktop apps, then restart Clementine.'
+          : 'Clementine needs Screen Recording permission to record meetings. Open System Settings → '
+            + 'Privacy & Security → Screen Recording, turn on Clementine, then QUIT and reopen Clementine. '
+            + '(Microphone and Accessibility should be on too.)',
       }
       : {
         reason: 'no-meeting-detected',

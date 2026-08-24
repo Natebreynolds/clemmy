@@ -859,7 +859,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       // prose, no arguments). Projecting it is what lets Discord and the
       // desktop feed say "plan 1/3 steps underway · 25-item collection"
       // instead of an unchanging "Still working" (live 2026-08-18
-      // sess-msywj8qp: 13 ledger heartbeats, zero reached a surface). Other
+      // session-fixture-unprovisioned-catalog: 13 ledger heartbeats, zero reached a surface). Other
       // heartbeat kinds keep the kind-only projection.
       const base = selected(data, ['kind']);
       if (data.kind !== 'progress_check_in') return base;

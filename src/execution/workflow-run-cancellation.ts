@@ -33,6 +33,7 @@ export interface WorkflowRunCancellationRequest {
 export type WorkflowRunTerminalStatus =
   | 'completed'
   | 'completed_with_errors'
+  | 'blocked'
   | 'error'
   | 'failed'
   | 'cancelled'
@@ -59,6 +60,7 @@ const CANCELLATION_DIR = path.join(WORKFLOW_RUNS_DIR, '.cancellations');
 const TERMINAL_STATUSES = new Set<WorkflowRunTerminalStatus>([
   'completed',
   'completed_with_errors',
+  'blocked',
   'error',
   'failed',
   'cancelled',

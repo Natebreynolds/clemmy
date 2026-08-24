@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
@@ -15,9 +15,11 @@ import {
 } from './workflow-run-report-back.js';
 import {
   readWorkflowRunRecordUnlocked,
+  scanWorkflowRunRecordSnapshot,
   withWorkflowRunRecordLock,
   writeWorkflowRunRecordDurablyUnlocked,
 } from './workflow-run-record.js';
+import { reconcileCorruptWorkflowRunRecord } from './workflow-run-corruption.js';
 
 /**
  * Workflow watchdog (north star: REPORTS BACK WITHOUT FAIL).
@@ -71,7 +73,7 @@ const DEFAULT_TERMINAL_UNNOTIFIED_MAX_MS = 12 * 60 * 60_000;
 // be backstopped — the terminal_unnotified check only looks at this set. The
 // 12h MAX window + report-back dedup keep this from alerting on the historical
 // cancel backlog or on cancels that did notify.
-const TERMINAL_STATUSES = new Set(['completed', 'completed_with_errors', 'error', 'failed', 'cancelled']);
+const TERMINAL_STATUSES = new Set(['completed', 'completed_with_errors', 'blocked', 'error', 'failed', 'cancelled']);
 
 export interface WatchdogRunView {
   id: string;
@@ -433,8 +435,13 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
     if (!file.endsWith('.json')) continue;
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
     try {
-      let parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as WatchdogRunView;
-      if (!parsed || typeof parsed.id !== 'string') continue;
+      const initial = scanWorkflowRunRecordSnapshot<WatchdogRunView>(filePath);
+      if (initial.status === 'corrupt') {
+        reconcileCorruptWorkflowRunRecord(filePath, initial.evidence, new Date(now).toISOString());
+        continue;
+      }
+      if (initial.status !== 'ok') continue;
+      let parsed = initial.record;
       // Retry the exact durable terminal report independently of the main run
       // drain. This timer continues to make progress even when a long workflow
       // occupies the drain, and idempotent duplicates count as acknowledgements.
@@ -444,15 +451,19 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
         && workflowRunReportBackRetryDue(parsed, now)
       ) {
         attemptWorkflowRunReportBack(filePath, now);
-        parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as WatchdogRunView;
+        const refreshed = scanWorkflowRunRecordSnapshot<WatchdogRunView>(filePath);
+        if (refreshed.status === 'corrupt') {
+          reconcileCorruptWorkflowRunRecord(filePath, refreshed.evidence, new Date(now).toISOString());
+          continue;
+        }
+        if (refreshed.status !== 'ok') continue;
+        parsed = refreshed.record;
       }
       parsed.reportBackPending = parsed.reportBack
         ? workflowRunReportBackNeedsRetry(parsed)
         : false;
       runs.push(parsed);
-    } catch {
-      // A malformed run file is its own (separate) problem; skip it.
-    }
+    } catch { /* quarantine/report-back stores retry on the next watchdog tick */ }
   }
 
   // Populate lastActivityAt for running/finalizing runs from the harness event log —

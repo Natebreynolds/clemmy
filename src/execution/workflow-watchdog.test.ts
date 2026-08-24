@@ -177,6 +177,15 @@ test('flags an errored run that was never notified', () => {
   assert.equal(stalled[0].reason, 'terminal_unnotified');
 });
 
+test('flags a blocked terminal that lost its report-back', () => {
+  const runs: WatchdogRunView[] = [
+    { id: 't-blocked', workflow: 'wf', status: 'blocked', finishedAt: iso(10 * 60_000) },
+  ];
+  const stalled = findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN });
+  assert.equal(stalled.length, 1);
+  assert.equal(stalled[0].reason, 'terminal_unnotified');
+});
+
 test('does NOT flag a terminal run that WAS notified', () => {
   const runs: WatchdogRunView[] = [
     { id: 't3', workflow: 'wf', status: 'completed', finishedAt: iso(10 * 60_000), notifiedAt: iso(10 * 60_000) },

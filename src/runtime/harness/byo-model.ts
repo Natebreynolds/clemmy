@@ -29,6 +29,7 @@
 import OpenAI from 'openai';
 import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
 import type { Model } from '@openai/agents-core';
+import { withTracelessStep } from './traceless-step-model.js';
 import type { ByoBackendConfig } from '../../config.js';
 import { getRuntimeEnv } from '../../config.js';
 import { repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } from './json-repair.js';
@@ -38,6 +39,7 @@ import { recordModelUsage } from '../usage-log.js';
 import { recordWindowAcceptance, recordWindowRejection } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
+import { withConversationProtocolBoundaryAssertion } from './conversation-protocol-boundary.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.byo-model' });
@@ -676,6 +678,25 @@ function clientKey(byo: ByoBackendConfig): string {
 }
 
 function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
+  // OAuth-backed providers (xAI): resolve a FRESH bearer per request. The
+  // client's static apiKey may be an already-expired access token; refreshing
+  // here keeps the brain alive across token rotations instead of 401-ing it
+  // into a false auth-dead cooldown (live 2026-08-19: grok → codex steal).
+  const refreshBearer = byo.refreshBearer;
+  const bearerRefreshingFetch: typeof fetch | undefined = refreshBearer
+    ? (async (url, init) => {
+        let headers = init?.headers;
+        try {
+          const fresh = await refreshBearer();
+          if (fresh) {
+            const merged = new Headers(headers as HeadersInit | undefined);
+            merged.set('authorization', `Bearer ${fresh}`);
+            headers = merged;
+          }
+        } catch { /* an unrefreshable grant falls through to the stored bearer */ }
+        return fetch(url as never, { ...(init ?? {}), headers });
+      }) as typeof fetch
+    : undefined;
   // When the parity resilience wrapper owns retry/backoff, disable the OpenAI
   // client's own 2 retries so they don't STACK (otherwise a persistently-down
   // backend makes ~(1+3)×(1+2) attempts with two backoff schedules). Parity off
@@ -683,6 +704,7 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   const client = new OpenAI({
     baseURL: byo.baseURL,
     apiKey: byo.apiKey,
+    ...(bearerRefreshingFetch ? { fetch: bearerRefreshingFetch } : {}),
     ...(modelParityEnabled() ? { maxRetries: 0 } : {}),
   });
   const completions = client.chat.completions;
@@ -707,7 +729,9 @@ export function getByoModel(modelId: string, byo: ByoBackendConfig): Model {
     logger.info({ baseURL: byo.baseURL, provider: byo.providerLabel || 'custom' }, 'BYO model backend initialized');
   }
 
-  let model: Model = new OpenAIChatCompletionsModel(client as unknown as ConstructorParameters<typeof OpenAIChatCompletionsModel>[0], modelId);
+  let model: Model = withTracelessStep(
+    new OpenAIChatCompletionsModel(client as unknown as ConstructorParameters<typeof OpenAIChatCompletionsModel>[0], modelId),
+  );
   // Parity layer: the same provider-agnostic resilience the Claude path gets —
   // transparent retry on transient 429/5xx/transport blips + empty-completion
   // invariant. (BYO already lifts reasoning + repairs JSON at the client layer;
@@ -715,9 +739,12 @@ export function getByoModel(modelId: string, byo: ByoBackendConfig): Model {
   if (modelParityEnabled()) {
     model = withResilience(model, { label: 'byo', capability: resolveModelCapability(modelId) });
   }
+  model = withConversationProtocolBoundaryAssertion(model, `byo.openai_compatible:${modelId}`);
   modelCache.set(mkey, model);
   return model;
 }
+
+export { _withTracelessStepForTest } from './traceless-step-model.js';
 
 /** Test/debug helper — drop cached clients/models (e.g. after a key change). */
 export function resetByoModelCache(): void {

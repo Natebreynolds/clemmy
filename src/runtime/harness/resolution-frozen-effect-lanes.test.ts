@@ -14,6 +14,7 @@ const eventlog = await import('./eventlog.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
 const admission = await import('./expected-work-admission.js');
+const contracts = await import('./expected-work-contract.js');
 const dispatch = await import('./dispatch-ledger.js');
 const attempts = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
@@ -69,9 +70,105 @@ function stageWrite(input: {
     turn: 1,
     acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq),
   };
-  assert.ok(shadow.recordTurnGraphShadow({ identity: task }));
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: {
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      turn: task.turn,
+    },
+  }));
   const activated = admission.activateActionExpectedWork(task);
   assert.ok(activated.status === 'activated' || activated.status === 'replayed');
+
+  const proposal = {
+    version: 1 as const,
+    operations: [
+      {
+        id: 'source_rows',
+        effect: 'read' as const,
+        coverage: 'single' as const,
+        dependsOn: [],
+        dataFrom: [],
+        cardinality: { kind: 'once' as const },
+      },
+      {
+        id: 'create_sheet',
+        effect: 'external_write' as const,
+        dependsOn: ['source_rows'],
+        dataFrom: ['source_rows'],
+        cardinality: { kind: 'once' as const },
+      },
+    ],
+    universes: [],
+  };
+  const sourceLogicalToolCallId = `source-rows:${input.label}`;
+  const sourceTool = 'composio_execute_tool';
+  const sourceProviderArgs = {
+    actorId: 'fixture/source-rows',
+    runInput: { ids: ['sheet-input'] },
+    limit: 1,
+  };
+  const sourceArgs = {
+    tool_slug: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
+    arguments: JSON.stringify(sourceProviderArgs),
+    connected_account_id: null,
+  };
+  assert.equal(dispatch.admitLogicalCall({
+    identity: { ...task, logicalToolCallId: sourceLogicalToolCallId },
+    tool: sourceTool,
+    args: sourceArgs,
+  }).status, 'inserted');
+  const sourceBound = admission.admitExpectedWorkInvocation({
+    ...task,
+    logicalToolCallId: sourceLogicalToolCallId,
+    requirementId: 'source_rows',
+    tool: sourceTool,
+    args: sourceArgs,
+    proposal,
+  });
+  assert.equal(sourceBound.status, 'bound', JSON.stringify(sourceBound));
+  const loadedAfterBinding = contracts.loadExpectedWorkContract(task.sessionId, task.sourceUserSeq);
+  assert.equal(loadedAfterBinding.status, 'ok', JSON.stringify(loadedAfterBinding));
+  const sourceLogical = eventlog.openEventLog().prepare(`
+    SELECT tool_name FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, sourceLogicalToolCallId) as { tool_name: string };
+  const sourcePhysicalDispatchId = `dispatch:${sourceLogicalToolCallId}`;
+  const sourceBegun = dispatch.beginPhysicalDispatch({
+    identity: {
+      ...task,
+      logicalToolCallId: sourceLogicalToolCallId,
+      physicalDispatchId: sourcePhysicalDispatchId,
+      ordinal: 0,
+    },
+    tool: sourceLogical.tool_name,
+    args: sourceProviderArgs,
+  });
+  assert.equal(sourceBegun.status, 'inserted', JSON.stringify(sourceBegun));
+  if (sourceBegun.status !== 'inserted') throw new Error(sourceBegun.reason);
+  assert.equal(dispatch.settlePhysicalDispatch({
+    identity: sourceBegun.identity,
+    tool: sourceLogical.tool_name,
+    outcome: 'returned',
+  }).status, 'inserted');
+  const sourceSettled = settlements.commitLogicalCallSettlement({
+    identity: { ...task, logicalToolCallId: sourceLogicalToolCallId },
+    contract: { toolName: sourceLogical.tool_name, args: sourceProviderArgs },
+    execution: { kind: 'provider_execution' },
+    result: {
+      payload: {
+        successful: true,
+        data: { items: SHEET_ARGS.sheet_json },
+        meta: { complete: true, count: 1, total: 1 },
+      },
+    },
+    outcome: attempts.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: false, requirementId: 'source_rows' },
+    observer: { lane: 'composio', turn: 1 },
+  });
+  assert.equal(sourceSettled.status, 'committed', JSON.stringify(sourceSettled));
+  const loadedAfterSource = contracts.loadExpectedWorkContract(task.sessionId, task.sourceUserSeq);
+  assert.equal(loadedAfterSource.status, 'ok', JSON.stringify(loadedAfterSource));
 
   const logicalToolCallId = `create-sheet:${input.label}`;
   assert.equal(dispatch.admitLogicalCall({
@@ -86,17 +183,7 @@ function stageWrite(input: {
     tool: input.carrier,
     args: SHEET_ARGS,
     inputSchema: SHEET_INPUT_SCHEMA,
-    proposal: {
-      version: 1,
-      operations: [{
-        id: 'create_sheet',
-        effect: 'external_write',
-        dependsOn: [],
-        dataFrom: [],
-        cardinality: { kind: 'once' },
-      }],
-      universes: [],
-    },
+    proposal,
   });
   assert.equal(bound.status, 'bound', JSON.stringify(bound));
 
@@ -150,7 +237,8 @@ function stageWrite(input: {
     observer: { lane: input.label.includes('claude') ? 'claude_sdk' : 'composio', turn: 1 },
   });
   assert.equal(settled.status, 'committed', JSON.stringify(settled));
-  const operation = resolution.resolvedOperationsFor(task.sessionId, task.sourceUserSeq)[0];
+  const operation = resolution.resolvedOperationsFor(task.sessionId, task.sourceUserSeq)
+    .find((candidate) => candidate.logicalToolCallId === logicalToolCallId);
   assert.ok(operation);
   return { operation: operation!, writeBindingId };
 }

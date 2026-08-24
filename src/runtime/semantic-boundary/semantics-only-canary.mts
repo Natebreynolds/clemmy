@@ -1,29 +1,35 @@
 /**
  * Semantics-only canary: competing write capabilities, zero provider dispatch.
- * Run: CLEMENTINE_HOME=<tmp> npx tsx src/runtime/semantic-boundary/semantics-only-canary.mts
+ * Run: CLEM_CANARY_DETERMINISTIC=1 npx tsx src/runtime/semantic-boundary/semantics-only-canary.mts
+ * For an authenticated canary, export credentials in the process environment or
+ * provide an explicit CLEM_CANARY_ENV_FILE. The canary never reads the live
+ * Clementine home implicitly.
  */
 import { mkdtempSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
-const liveEnv = '/Users/nathan.reynolds/.clementine-next/.env';
-try {
-  for (const line of readFileSync(liveEnv, 'utf8').split('\n')) {
-    if (!line || line.startsWith('#') || !line.includes('=')) continue;
-    const eq = line.indexOf('=');
-    const key = line.slice(0, eq).trim();
-    const value = line.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '');
-    if (!process.env[key] && /^(OPENAI|ANTHROPIC|XAI|AZURE|BYO_|CLEMMY_|MODEL_)/.test(key)) {
-      process.env[key] = value;
-    }
-  }
-} catch {
-  // Isolated canary still runs; configured brain may fail closed.
-}
-
 const isolated = mkdtempSync(path.join(os.tmpdir(), 'clem-semantics-canary-'));
 process.env.CLEMENTINE_HOME = isolated;
+
+const explicitEnvFile = process.env.CLEM_CANARY_ENV_FILE?.trim();
+if (explicitEnvFile) {
+  try {
+    for (const line of readFileSync(path.resolve(explicitEnvFile), 'utf8').split('\n')) {
+      if (!line || line.startsWith('#') || !line.includes('=')) continue;
+      const eq = line.indexOf('=');
+      const key = line.slice(0, eq).trim();
+      const value = line.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '');
+      if (!process.env[key] && /^(OPENAI|ANTHROPIC|XAI|AZURE|BYO_|CLEMMY_|MODEL_)/.test(key)) {
+        process.env[key] = value;
+      }
+    }
+  } catch {
+    // An explicit but unreadable credential file still fails closed in the
+    // configured-brain path; deterministic mode does not require credentials.
+  }
+}
 
 const { createSession, resetEventLog } = await import('../harness/eventlog.js');
 const { interpretAcceptedSource } = await import('./interpret-accepted-source.js');

@@ -10,6 +10,29 @@ test('a point lookup does not inherit collection exhaustion', () => {
   });
 });
 
+test('a locator-producing read is a point observation, not a collection', () => {
+  assert.deepEqual(operationEvidenceContract({
+    resolvedTool: 'TAVILY_TAVILY_SEARCH',
+    effectKind: 'read',
+    reversibility: 'read_only',
+    producedOutputKinds: ['locator'],
+  }), {
+    mode: 'point_read', requiresExhaustion: false, requiresStaleReconciliation: false,
+  });
+});
+
+test('a finite records-producing read does not require source exhaustion', () => {
+  assert.deepEqual(operationEvidenceContract({
+    resolvedTool: 'TAVILY_TAVILY_EXTRACT',
+    effectKind: 'read',
+    reversibility: 'read_only',
+    producedOutputKinds: ['records'],
+    finiteBound: true,
+  }), {
+    mode: 'finite_read', requiresExhaustion: false, requiresStaleReconciliation: false,
+  });
+});
+
 test('an unfamiliar read fails closed to collection semantics', () => {
   assert.equal(operationEvidenceContract({
     resolvedTool: 'provider__records', effectKind: 'read', reversibility: 'read_only',

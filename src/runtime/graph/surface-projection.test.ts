@@ -12,9 +12,11 @@ import assert from 'node:assert/strict';
 
 import {
   applyRunDelta,
+  isFinalTerminalStatus,
   isRunningLifecycle,
   isTerminalLifecycle,
   projectRunSnapshot,
+  renderActivityLabel,
   type ProjectRunInput,
   type SurfaceRunSnapshot,
 } from './surface-projection.js';
@@ -90,9 +92,32 @@ test('a typed terminal forces the terminal lifecycle; a phase cannot contradict 
 
 test('a failed terminal is never painted green by omission', () => {
   const snapshot = projectRunSnapshot(input({
-    typedTerminal: { status: 'blocked', kind: 'needs_auth', text: 'reconnect Salesforce', resumable: true },
+    typedTerminal: { status: 'failed', kind: 'error', text: 'reconnect Salesforce', resumable: true },
   }));
-  assert.equal(snapshot.lifecycle, 'blocked');
+  assert.equal(snapshot.lifecycle, 'failed');
+  assert.equal(isTerminalLifecycle(snapshot.lifecycle), true);
+});
+
+test('blocked is a parked host-owned hold, not a final terminal', () => {
+  assert.equal(isTerminalLifecycle('blocked'), false);
+  assert.equal(isFinalTerminalStatus('blocked'), false);
+  assert.equal(isTerminalLifecycle('completed'), true);
+  assert.equal(isTerminalLifecycle('cancelled'), true);
+
+  const parked = projectRunSnapshot(input({
+    lifecycle: 'reasoning',
+    typedTerminal: { status: 'blocked', kind: 'provider_unavailable', text: 'waiting on the provider', resumable: true },
+  }));
+  assert.equal(parked.lifecycle, 'blocked');
+  assert.equal(parked.terminal, undefined, 'a hold must not freeze the run as a final');
+
+  const resumed = applyRunDelta(parked, {
+    runKey: 'run-1',
+    revision: 2,
+    patch: { terminal: { status: 'completed', kind: 'answer', text: 'resumed and finished', resumable: false } },
+  });
+  assert.equal(resumed.lifecycle, 'completed');
+  assert.equal(resumed.terminal?.status, 'completed');
 });
 
 // ── children and progress ────────────────────────────────────────────────────
@@ -167,4 +192,29 @@ test('the projection reaches nothing — time enters as data', async () => {
   for (const forbidden of ['Date.now', 'new Date', 'process.env', 'Math.random', 'fetch(']) {
     assert.equal(source.includes(forbidden), false, `projection references ${forbidden}`);
   }
+});
+
+// The loop dispatches independent calls as a bounded PARALLEL wave, but every
+// surface flattened that into one sequence — two calls running together read
+// exactly like two calls running back to back. `calling` is the phase that says
+// how many are actually in flight, and it is deliberately distinct from
+// `working_items` (durable fan-out items across a plan, not calls in one turn).
+test('the calling phase names concurrency instead of hiding it', () => {
+  assert.equal(
+    renderActivityLabel({ phase: 'calling', completed: 0, total: 3 }),
+    'Running 3 calls in parallel',
+  );
+  assert.equal(
+    renderActivityLabel({ phase: 'calling', completed: 1, total: 3 }),
+    'Running 3 calls in parallel · 1 settled',
+  );
+  // One call is not a wave; do not say "in parallel" about it.
+  assert.equal(renderActivityLabel({ phase: 'calling', completed: 0, total: 1 }), 'Running 1 call');
+  // No denominator is still honest rather than inventing one.
+  assert.equal(renderActivityLabel({ phase: 'calling' }), 'Calling a tool');
+  // `working_items` keeps its own meaning — this must not collapse into it.
+  assert.equal(
+    renderActivityLabel({ phase: 'working_items', completed: 1, total: 3 }),
+    'Working on 1 of 3',
+  );
 });

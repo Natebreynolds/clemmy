@@ -57,7 +57,7 @@ test('pending registry row + approve → resolves the row then resumes the parke
   }]);
   assert.equal(result.status, 'approved');
   assert.equal(result.text, 'sent it');
-  assert.equal(result.nextApprovalId, undefined);
+  assert.equal(result.status === 'approved' ? result.nextApprovalId : undefined, undefined);
 });
 
 test('pending registry row + reject → resolves rejected and never resumes', async () => {
@@ -95,7 +95,7 @@ test('resume pausing on a follow-up approval surfaces nextApprovalId', async () 
     legacyResolve: async () => { throw new Error('legacy must not run'); },
     resumeForTest: async () => ({ status: 'awaiting_approval' }),
   });
-  assert.equal(result.nextApprovalId, 'apr-next');
+  assert.equal(result.status === 'approved' ? result.nextApprovalId : undefined, 'apr-next');
 });
 
 test('resume failure propagates as a throw (drain marks the task failed)', async () => {
@@ -131,5 +131,80 @@ test('a resume ending awaiting_user_input surfaces the question instead of a bar
     }),
   });
   assert.equal(result.status, 'approved');
-  assert.match(result.awaitingInputQuestion ?? '', /unresolved/);
+  assert.equal(result.status === 'approved' && result.awaitingInputQuestion?.includes('unresolved'), true);
+});
+
+test('a blocked resume remains blocked and cannot be reported as approved', async () => {
+  const result = await resolveDrainApproval({
+    approvalId: 'apr-blocked-1',
+    approved: true,
+    legacyResolve: async () => { throw new Error('legacy must not run'); },
+    registryForTest: {
+      get: () => ({ sessionId: 'sess-blocked', status: 'resolved', resolution: 'approved' }),
+      resolve: () => ({ ok: true }),
+      listPending: () => [],
+    },
+    resumeForTest: async () => ({
+      status: 'blocked',
+      error: 'Exact destination binding is unavailable.',
+    }),
+  });
+  assert.deepEqual(result, {
+    approvalId: 'apr-blocked-1',
+    status: 'blocked',
+    text: '',
+    sessionId: 'sess-blocked',
+    reason: 'Exact destination binding is unavailable.',
+  });
+  assert.notEqual(result.status, 'approved');
+});
+
+test('a peer-held resume remains explicitly host-owned and in progress', async () => {
+  const result = await resolveDrainApproval({
+    approvalId: 'apr-held-1',
+    approved: true,
+    legacyResolve: async () => { throw new Error('legacy must not run'); },
+    registryForTest: {
+      get: () => ({ sessionId: 'sess-held', status: 'resolved', resolution: 'approved' }),
+      resolve: () => ({ ok: true }),
+      listPending: () => [],
+    },
+    resumeForTest: async () => ({
+      status: 'held',
+      hold: { owner: 'host', wake: 'peer', reason: 'peer_in_progress' },
+    }),
+  });
+  assert.deepEqual(result, {
+    approvalId: 'apr-held-1',
+    status: 'in_progress',
+    text: '',
+    sessionId: 'sess-held',
+    execution: {
+      kind: 'held',
+      hold: { owner: 'host', wake: 'peer', reason: 'peer_in_progress' },
+      recoveredContract: false,
+    },
+  });
+});
+
+test('dispatch, limit, and kill resumes retain their distinct lifecycle dispositions', async () => {
+  const expected = [
+    ['dispatched', 'in_progress'],
+    ['limit_exceeded', 'awaiting_continue'],
+    ['killed', 'cancelled'],
+  ] as const;
+  for (const [status, expectedStatus] of expected) {
+    const result = await resolveDrainApproval({
+      approvalId: `apr-${status}`,
+      approved: true,
+      legacyResolve: async () => { throw new Error('legacy must not run'); },
+      registryForTest: {
+        get: () => ({ sessionId: `sess-${status}`, status: 'resolved', resolution: 'approved' }),
+        resolve: () => ({ ok: true }),
+        listPending: () => [],
+      },
+      resumeForTest: async () => ({ status }),
+    });
+    assert.equal(result.status, expectedStatus);
+  }
 });

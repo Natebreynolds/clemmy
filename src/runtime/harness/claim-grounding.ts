@@ -66,6 +66,15 @@ export function extractDeliverablePointers(text: string): DeliverablePointer[] {
     const documentish = /\.(html?|pdf|docx?|pptx?|xlsx?|csv|png|jpe?g|zip|pages|key)$/.test(normalized);
     if (!hasSlash && !documentish) continue;
     const segments = normalized.split('/').filter(Boolean);
+    // Slash-delimited clock shorthand is a schedule, not a filesystem path
+    // (live 2026-08-20: `8am/12pm/4pm` in a workflow schedule was treated as
+    // three path segments and caused a false verification bounce after a
+    // successful `workflow_get`). Keep this structural: every segment must be
+    // a standalone clock token, so real paths that merely contain a time-like
+    // directory remain eligible.
+    const clockSequence = segments.length >= 2
+      && segments.every((segment) => /^(?:(?:[01]?\d|2[0-3])(?::[0-5]\d)?(?:am|pm)?|noon|midnight)$/i.test(segment));
+    if (clockSequence) continue;
     // A slashed pair of short plain words is prose, not a path: "call/task
     // records", "a yes/no decision", "24/7", "and/or" (live 2026-08-12: two
     // such pairs inside a quoted draft were judged as undelivered file paths

@@ -304,16 +304,16 @@ test('progress narration says what the turn is doing, not how many tools it used
 
 test('narration skips dispatcher wrappers and never ships a dangling verb', () => {
   // The exact live 2026-08-09 tail that produced "Still working — running."
-  // `run_tool_program` is a dispatcher; the Slack lookup one frame behind it is
+  // `call_tool` is a dispatcher; the Slack lookup one frame behind it is
   // the work the user was waiting on.
   const liveTail = [
-    'run_tool_program', 'composio_execute_tool', 'run_shell_command',
-    'run_tool_program', 'SLACK_FIND_USER_BY_EMAIL_ADDRESS',
-    'run_tool_program', 'composio_execute_tool',
+    'call_tool', 'composio_execute_tool', 'run_shell_command',
+    'call_tool', 'SLACK_FIND_USER_BY_EMAIL_ADDRESS',
+    'call_tool', 'composio_execute_tool',
   ];
   assert.equal(progressNarration(liveTail), 'Still working — reading Slack.');
 
   // A verb with no subject is a fragment; say less instead.
-  assert.equal(progressNarration(['run_tool_program']), 'Still working.');
+  assert.equal(progressNarration(['call_tool']), 'Still working.');
   assert.equal(progressNarration(['composio_execute_tool', 'call_tool']), 'Still working.');
 })

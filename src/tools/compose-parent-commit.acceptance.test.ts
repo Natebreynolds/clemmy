@@ -30,7 +30,7 @@ const {
 const { createClementineMcpServer } = await import('./mcp-server.js');
 const { registerBatchTools } = await import('./batch-tools.js');
 const { getComposioRuntimeTools, dispatchComposioTool } = await import('./composio-tools.js');
-const { _setCodeModeToolsForTests } = await import('./code-mode-tool.js');
+const { _setInnerDispatchToolsForTests } = await import('./inner-dispatch.js');
 const {
   _setCertifyJudgeForTests,
   readBatchLedger,
@@ -217,7 +217,7 @@ function acceptUserTurn(sessionId: string, turn: number, text: string): { seq: n
 
 after(() => {
   _setCertifyJudgeForTests(null);
-  _setCodeModeToolsForTests(null);
+  _setInnerDispatchToolsForTests(null);
   composioClientTest.setConnectedAccountsLoader(null);
   resetComposioClient();
   resetToolSchemaCache();
@@ -326,7 +326,7 @@ test('five workers compose, one parent batch commits, and stable mailbox routing
   // production composio_execute_tool; only the surrounding provider is fake.
   const composioExecute = getComposioRuntimeTools().find((tool) => tool.name === 'composio_execute_tool');
   assert.ok(composioExecute?.invoke, 'production composio_execute_tool is invokable');
-  _setCodeModeToolsForTests(new Map([['composio_execute_tool', composioExecute as never]]));
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', composioExecute as never]]));
   _setCertifyJudgeForTests(async () => ({
     allow: true,
     reason: 'all five draft payloads match the exact reviewed fixtures',

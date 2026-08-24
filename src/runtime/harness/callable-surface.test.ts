@@ -30,7 +30,7 @@ test.beforeEach(() => {
 });
 
 test('FAIL-CLOSED: no registration and no contract → silence, never a phantom mandate', () => {
-  const entry = resolveCallable('run_tool_program');
+  const entry = resolveCallable('fixture_unregistered_tool');
   assert.equal(entry.schemaSource, 'none');
   assert.equal(entry.reachable, false, 'bare local name without registration is not provably dispatchable');
   assert.equal(isMandatable(entry), false);
@@ -38,12 +38,12 @@ test('FAIL-CLOSED: no registration and no contract → silence, never a phantom 
 
 test('registered local schema → direct carrier, mandatable, required fields surfaced', () => {
   registerLocalSchemaProvider(() => new Map([
-    ['run_tool_program', { type: 'object', required: ['program'], properties: { program: { type: 'string' } } }],
+    ['fixture_local_tool', { type: 'object', required: ['input'], properties: { input: { type: 'string' } } }],
   ]));
-  const entry = resolveCallable('run_tool_program');
+  const entry = resolveCallable('fixture_local_tool');
   assert.equal(entry.schemaSource, 'local_registry');
   assert.equal(entry.carrier, 'direct');
-  assert.deepEqual(entry.requiredFields, ['program']);
+  assert.deepEqual(entry.requiredFields, ['input']);
   assert.equal(isMandatable(entry), true);
 });
 

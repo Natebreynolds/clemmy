@@ -12,6 +12,8 @@ import {
 } from './admit-turn-semantics.js';
 import {
   compileDurableAcceptedTurnGraph,
+  compilePrimaryModelAcceptedTurnGraph,
+  type AdmittedClampedSemanticsV1,
   type CompileDurableAcceptedTurnGraphInput,
 } from '../graph/admitted-turn-semantics.js';
 import { audienceHashOf, buildTurnSemanticHostViewV1 } from './build-semantic-host-view.js';
@@ -30,11 +32,17 @@ import {
 } from '../harness/destination-binding.js';
 import {
   freezeCatalogSnapshotForSource,
+  peekHostCapabilityCatalogFactory,
   type RegisteredHostCapability,
 } from '../harness/host-capability-catalog-factory.js';
-import type { HostCapabilityDescriptorV1 } from './turn-semantic-proposal.js';
+import {
+  type HostCapabilityDescriptorV1,
+  type TurnSemanticProposalV1,
+} from './turn-semantic-proposal.js';
 import { selectRelevantCapabilityDescriptors } from './capability-candidate-retrieval.js';
 import { registerProofProvisionedCapabilities } from '../harness/proof-provisioned-catalog.js';
+import { createProductionMcpReadCarrier } from '../harness/production-mcp-read-carrier.js';
+import { parseNamespacedTool } from '../mcp-namespace-shim.js';
 import {
   hostDescriptorsFromCapabilityIndex,
   registerIndexedCapabilitiesForTurn,
@@ -51,12 +59,19 @@ import {
   resolveTurnCapabilities,
 } from '../harness/capability-resolution.js';
 import { recordConnectedGoalCatalog } from '../harness/connected-goal-catalog.js';
+import { digestSchema } from '../../tools/tool-contract-store.js';
+import {
+  AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+  inspectAuthorizedLocalPlanningDisclosureCandidate,
+  revalidateLocalPlanningDefinition,
+  type AuthorizedLocalPlanningDefinitionV1,
+} from '../harness/local-planning-capability.js';
 
 import { snapshotTurnGraphPolicy, validateTurnGraph } from '../graph/turn-graph-compiler.js';
 import type { CompileTurnGraphResult, TurnGraphSurface } from '../graph/turn-graph-ir.js';
 import type { TurnIdentity } from '../harness/turn-outcome.js';
 import type { TaskContinuationContext } from '../../types.js';
-import { getSession, getTurnGraphEventForSource, listEvents, type EventRow } from '../harness/eventlog.js';
+import { appendEvent, getSession, getTurnGraphEventForSource, listEvents, type EventRow } from '../harness/eventlog.js';
 import { pullRecentTurnsForHarnessHistory } from '../harness/session-transcript.js';
 
 function sha256(value: string): string {
@@ -110,8 +125,29 @@ function conversationShortCircuit(
   }
 }
 
+/** Surface-only optimization for the fresh host loop. A positive answer may
+ * remove every action/discovery schema, but grants no route, graph, terminal,
+ * or tool authority. Any uncertainty returns false and keeps the full loop. */
+export function freshHostConversationSurfaceOnly(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  try {
+    const accepted = listEvents(input.sessionId, {
+      sinceSeq: input.sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    }).find((event) => event.seq === input.sourceUserSeq);
+    const display = typeof accepted?.data.displayText === 'string' ? accepted.data.displayText.trim() : '';
+    const text = display || (typeof accepted?.data.text === 'string' ? accepted.data.text.trim() : '');
+    return Boolean(text) && conversationShortCircuit(input, text);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * PROVISION FROM PROOF (live 2026-08-18 sess-msywj8qp): when the typed
+ * PROVISION FROM PROOF (live 2026-08-18 session-fixture-unprovisioned-catalog): when the typed
  * catalog is unprovisioned — production packs refuse on this home — semantic
  * admission received zero capabilities and recorded "No host capabilities
  * were supplied, so no operations could be bound". The host had ALREADY
@@ -141,7 +177,7 @@ export function hostDescriptorsFromResolutionProof(
       // validator requires predecessor.producedOutputKinds to intersect
       // successor.acceptedInputKinds; the first cut of this bridge declared
       // accepted=[] and produced=[slug], an algebra that can never chain —
-      // live 2026-08-18 sess-msz8m5vg seqs 58261/58274: the model proposed a
+      // live 2026-08-18 session-fixture-remap-a seqs 58261/58274: the model proposed a
       // full operation DAG citing these refs and validation refused BOTH
       // turns with dag_kind_mismatch, killing bound nodes, fan-out, and the
       // second declared effect in one stroke.
@@ -211,6 +247,624 @@ export type AdmitAndCompileAcceptedSourceResult =
   | { ok: true; event: EventRow; compiled: CompileTurnGraphResult }
   | { ok: false; reason: string };
 
+const PRIMARY_MODEL_PLANNING_CATALOG_SCOPE = 'primary_model_planning_catalog_v1' as const;
+interface StagedPrimaryModelPlanningCapabilityV1 {
+  descriptor: HostCapabilityDescriptorV1;
+  identifier: string;
+  schemaDigest: string;
+  providerKind: string;
+  accountIdentity: string;
+  /** Local rows have no provider manifest. Their exact configured surface and
+   * registry semantics are carried here and revalidated at plan freeze. */
+  localDefinition?: AuthorizedLocalPlanningDefinitionV1;
+}
+
+const primaryModelPlanningCatalogs = new WeakMap<object, {
+  sessionId: string;
+  sourceUserSeq: number;
+  /** The exact bounded refs the foreground model may currently cite. */
+  capabilities: HostCapabilityDescriptorV1[];
+  /** Every exact currently materialized manifest observed by this planning frame. */
+  liveCapabilities: readonly HostCapabilityDescriptorV1[];
+  disclosureByName: ReadonlyMap<string, {
+    descriptor: HostCapabilityDescriptorV1;
+    identifier: string;
+    schemaDigest: string;
+    providerKind: string;
+  }>;
+  /** Exact foreground-search disclosures that are not executable yet. The
+   * selected subset is published and revalidated only inside plan_task. */
+  stagedById: Map<string, StagedPrimaryModelPlanningCapabilityV1>;
+  digest: string;
+}>();
+
+export interface PrimaryModelPlanningCatalogAuthorityV1 {
+  readonly scope: typeof PRIMARY_MODEL_PLANNING_CATALOG_SCOPE;
+}
+
+export interface HostFreshPlanningContextV1 {
+  authority: PrimaryModelPlanningCatalogAuthorityV1;
+  identity: { sessionId: string; sourceUserSeq: number };
+  capabilities: readonly HostCapabilityDescriptorV1[];
+  digest: string;
+}
+
+function planningWords(value: string): Set<string> {
+  return new Set(value.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length >= 3));
+}
+
+const FRESH_PLANNING_CARD_LIMIT = 8;
+const FRESH_PLANNING_CARD_BYTES = 8_192;
+
+function boundedFreshPlanningCard(
+  descriptors: readonly HostCapabilityDescriptorV1[],
+): HostCapabilityDescriptorV1[] {
+  const out: HostCapabilityDescriptorV1[] = [];
+  let bytes = 2;
+  for (const descriptor of descriptors.slice(0, FRESH_PLANNING_CARD_LIMIT)) {
+    const encodedBytes = Buffer.byteLength(JSON.stringify(descriptor), 'utf8');
+    const next = bytes + encodedBytes + (out.length > 0 ? 1 : 0);
+    if (next > FRESH_PLANNING_CARD_BYTES) break;
+    out.push(descriptor);
+    bytes = next;
+  }
+  return out;
+}
+
+function replayedPlanningDescriptor(value: unknown): HostCapabilityDescriptorV1 | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const effect = row.effect;
+  const destinationPosture = row.destinationPosture;
+  const stringArrays = [
+    'acceptedInputKinds',
+    'producedOutputKinds',
+    'applicableDeliverableKinds',
+    'evidenceKinds',
+  ] as const;
+  if (
+    typeof row.id !== 'string'
+    || !['none', 'read', 'compute', 'host_only', 'unknown', 'local_write', 'external_write', 'admin'].includes(String(effect))
+    || typeof row.purpose !== 'string'
+    || typeof row.inputShape !== 'string'
+    || typeof row.outputShape !== 'string'
+    || typeof row.outputKind !== 'string'
+    || typeof row.deliverableKind !== 'string'
+    || (destinationPosture !== null && destinationPosture !== 'create_new' && destinationPosture !== 'named_existing')
+    || typeof row.handleRequired !== 'boolean'
+    || typeof row.readbackRequired !== 'boolean'
+    || typeof row.accountScope !== 'string'
+    || typeof row.manifestDigest !== 'string'
+    || !/^[a-f0-9]{64}$/i.test(row.manifestDigest)
+    || stringArrays.some((key) => !Array.isArray(row[key]) || !(row[key] as unknown[]).every((entry) => typeof entry === 'string'))
+    || (row.advisoryRoles !== undefined
+      && (!Array.isArray(row.advisoryRoles) || !row.advisoryRoles.every((entry) => typeof entry === 'string')))
+  ) return null;
+  return {
+    id: row.id,
+    effect: effect as HostCapabilityDescriptorV1['effect'],
+    purpose: row.purpose,
+    acceptedInputKinds: [...row.acceptedInputKinds as string[]],
+    producedOutputKinds: [...row.producedOutputKinds as string[]],
+    applicableDeliverableKinds: [...row.applicableDeliverableKinds as string[]],
+    inputShape: row.inputShape,
+    outputShape: row.outputShape,
+    outputKind: row.outputKind,
+    deliverableKind: row.deliverableKind,
+    destinationPosture: destinationPosture as HostCapabilityDescriptorV1['destinationPosture'],
+    evidenceKinds: [...row.evidenceKinds as string[]],
+    handleRequired: row.handleRequired,
+    readbackRequired: row.readbackRequired,
+    accountScope: row.accountScope,
+    manifestDigest: row.manifestDigest,
+    ...(Array.isArray(row.advisoryRoles) ? { advisoryRoles: [...row.advisoryRoles as string[]] } : {}),
+  };
+}
+
+/** Advisory proof/index rows may rank a live descriptor, but never enter the
+ * authority set unless that exact id is also present in the frozen catalog. */
+function rankedLivePlanningDescriptors(input: {
+  objective: string;
+  live: readonly HostCapabilityDescriptorV1[];
+  advisory: readonly HostCapabilityDescriptorV1[];
+}): HostCapabilityDescriptorV1[] {
+  const objectiveWords = planningWords(input.objective);
+  const advisoryRank = new Map(input.advisory.map((descriptor, index) => [descriptor.id, index]));
+  const scored = input.live.map((descriptor) => {
+    const descriptorWords = planningWords([
+      descriptor.id,
+      descriptor.purpose,
+      descriptor.deliverableKind,
+      ...(descriptor.advisoryRoles ?? []),
+    ].join(' '));
+    let lexical = 0;
+    for (const word of objectiveWords) {
+      if ([...descriptorWords].some((candidate) => candidate.includes(word) || word.includes(candidate))) {
+        lexical += 1;
+      }
+    }
+    const ranked = advisoryRank.get(descriptor.id);
+    return { descriptor, score: lexical * 100 + (ranked === undefined ? 0 : Math.max(1, 50 - ranked)) };
+  });
+  scored.sort((left, right) => right.score - left.score || left.descriptor.id.localeCompare(right.descriptor.id));
+  return boundedFreshPlanningCard(scored.map((entry) => entry.descriptor));
+}
+
+function replayedLocalPlanningDefinition(value: unknown): AuthorizedLocalPlanningDefinitionV1 | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const descriptor = replayedPlanningDescriptor(row.descriptor);
+  const safeMode = row.safeMode;
+  if (
+    row.version !== 1
+    || row.provenance !== AUTHORIZED_LOCAL_REGISTRY_PROVENANCE
+    || typeof row.name !== 'string'
+    || (row.carrier !== 'call_tool' && row.carrier !== 'work_call')
+    || typeof row.capabilityRef !== 'string'
+    || typeof row.schemaFingerprint !== 'string'
+    || typeof row.registrySemanticsFingerprint !== 'string'
+    || typeof row.envelopeFingerprint !== 'string'
+    || !/^[a-f0-9]{64}$/i.test(row.schemaFingerprint)
+    || !/^[a-f0-9]{64}$/i.test(row.registrySemanticsFingerprint)
+    || !/^[a-f0-9]{64}$/i.test(row.envelopeFingerprint)
+    || !['local_artifact', 'workspace_definition', 'workflow_definition', 'runtime_configuration'].includes(String(row.consequence))
+    || !['reversible', 'create_only'].includes(String(row.reversibility))
+    || row.destructive !== false
+    || row.accountIdentity !== 'local_registry:host'
+    || !descriptor
+    || (safeMode !== null && (typeof safeMode !== 'object' || Array.isArray(safeMode)))
+  ) return null;
+  return {
+    version: 1,
+    provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+    name: row.name,
+    carrier: row.carrier,
+    capabilityRef: row.capabilityRef,
+    schemaFingerprint: row.schemaFingerprint,
+    registrySemanticsFingerprint: row.registrySemanticsFingerprint,
+    envelopeFingerprint: row.envelopeFingerprint,
+    consequence: row.consequence as AuthorizedLocalPlanningDefinitionV1['consequence'],
+    reversibility: row.reversibility as AuthorizedLocalPlanningDefinitionV1['reversibility'],
+    destructive: false,
+    accountIdentity: 'local_registry:host',
+    safeMode: safeMode as AuthorizedLocalPlanningDefinitionV1['safeMode'],
+    descriptor,
+  };
+}
+
+async function durablePlanningDisclosures(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  byName: ReadonlyMap<string, { descriptor: HostCapabilityDescriptorV1; schemaDigest: string }>;
+}): Promise<{
+  descriptors: HostCapabilityDescriptorV1[];
+  stagedById: Map<string, StagedPrimaryModelPlanningCapabilityV1>;
+}> {
+  const out = new Map<string, HostCapabilityDescriptorV1>();
+  const stagedById = new Map<string, StagedPrimaryModelPlanningCapabilityV1>();
+  const proven = new Set<string>();
+  for (const event of listEvents(input.sessionId, { types: ['capability_resolution'] })) {
+    if (event.data.sourceUserSeq !== input.sourceUserSeq || event.data.authoritativeForTask === false) continue;
+    const entries = Array.isArray(event.data.entries) ? event.data.entries : [];
+    for (const raw of entries) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const entry = raw as Record<string, unknown>;
+      if (
+        entry.kind !== 'composio'
+        || entry.status !== 'proven'
+        || entry.connection === 'missing'
+        || typeof entry.identifier !== 'string'
+        || (entry.effectClass !== 'read' && entry.effectClass !== 'write')
+      ) continue;
+      proven.add(JSON.stringify({
+        identifier: entry.identifier.trim().toLowerCase(),
+        effectClass: entry.effectClass,
+        accountIdentity: typeof entry.accountIdentity === 'string' ? entry.accountIdentity.trim() : 'runtime',
+      }));
+    }
+  }
+  for (const event of listEvents(input.sessionId, { types: ['capability_discovered'] })) {
+    if (event.data.sourceUserSeq !== input.sourceUserSeq) continue;
+    const rows = Array.isArray(event.data.capabilities) ? event.data.capabilities : [];
+    for (const raw of rows) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const row = raw as Record<string, unknown>;
+      const identifier = typeof row.identifier === 'string' ? row.identifier.trim().toLowerCase() : '';
+      if (row.providerKind === AUTHORIZED_LOCAL_REGISTRY_PROVENANCE) {
+        const prior = replayedLocalPlanningDefinition(row.localAuthority);
+        if (
+          !prior
+          || identifier !== prior.name.toLowerCase()
+          || row.capabilityRef !== prior.capabilityRef
+          || row.manifestDigest !== prior.descriptor.manifestDigest
+          || row.schemaFingerprint !== prior.schemaFingerprint
+        ) continue;
+        const revalidated = await revalidateLocalPlanningDefinition(prior);
+        if (!revalidated.ok) continue;
+        const staged: StagedPrimaryModelPlanningCapabilityV1 = {
+          descriptor: revalidated.definition.descriptor,
+          identifier: revalidated.definition.name,
+          schemaDigest: revalidated.definition.schemaFingerprint,
+          providerKind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+          accountIdentity: revalidated.definition.accountIdentity,
+          localDefinition: revalidated.definition,
+        };
+        stagedById.set(staged.descriptor.id, staged);
+        out.set(staged.descriptor.id, staged.descriptor);
+        continue;
+      }
+      const match = input.byName.get(identifier);
+      if (match) {
+        if (
+          row.capabilityRef !== match.descriptor.id
+          || row.manifestDigest !== match.descriptor.manifestDigest
+          || row.schemaFingerprint !== match.schemaDigest
+        ) continue;
+        out.set(match.descriptor.id, match.descriptor);
+        continue;
+      }
+      const descriptor = replayedPlanningDescriptor(row.descriptor);
+      const schemaDigest = typeof row.schemaFingerprint === 'string' ? row.schemaFingerprint : '';
+      const accountIdentity = typeof row.accountIdentity === 'string' && row.accountIdentity.trim()
+        ? row.accountIdentity.trim()
+        : 'runtime';
+      const effectClass = descriptor?.effect === 'read'
+        ? 'read'
+        : descriptor?.effect === 'external_write'
+          ? 'write'
+          : null;
+      if (
+        row.providerKind !== 'composio'
+        || !descriptor
+        || !identifier
+        || row.capabilityRef !== descriptor.id
+        || row.manifestDigest !== descriptor.manifestDigest
+        || descriptor.id !== `cap:resolved:${identifier}`
+        || descriptor.accountScope !== accountIdentity
+        || !/^[a-f0-9]{64}$/i.test(schemaDigest)
+        || !effectClass
+        || !proven.has(JSON.stringify({ identifier, effectClass, accountIdentity }))
+      ) continue;
+      const staged = {
+        descriptor,
+        identifier: typeof row.identifier === 'string' ? row.identifier.trim() : identifier,
+        schemaDigest,
+        providerKind: 'composio',
+        accountIdentity,
+      };
+      stagedById.set(descriptor.id, staged);
+      out.set(descriptor.id, descriptor);
+    }
+  }
+  return { descriptors: [...out.values()], stagedById };
+}
+
+/** Zero-model catalog preparation for the initial foreground model surface.
+ * This is enumeration/ranking only: the accepted-source snapshot is frozen by
+ * plan_task after any foreground tool_search disclosure, never before it. */
+export async function primePrimaryModelPlanningCatalog(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): Promise<{ ok: true; planning: HostFreshPlanningContextV1 } | { ok: false; reason: string }> {
+  const accepted = listEvents(input.sessionId, {
+    sinceSeq: input.sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === input.sourceUserSeq);
+  const display = typeof accepted?.data.displayText === 'string' ? accepted.data.displayText.trim() : '';
+  const eventText = typeof accepted?.data.text === 'string' ? accepted.data.text.trim() : '';
+  const objective = display || eventText;
+  if (!objective) return { ok: false, reason: 'durable accepted source is missing' };
+  let indexedDescriptors: HostCapabilityDescriptorV1[] = [];
+  try {
+    indexedDescriptors = (await registerIndexedCapabilitiesForTurn({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      objective,
+    })).descriptors;
+  } catch {
+    indexedDescriptors = hostDescriptorsFromCapabilityIndex(objective);
+  }
+  const catalogEntries = peekHostCapabilityCatalogFactory()?.snapshot() ?? [];
+  const catalogDescriptors = catalogEntries
+    .map(hostDescriptorFromRegistered)
+    .filter((entry): entry is HostCapabilityDescriptorV1 => entry !== null);
+  // Existing proof/index facts rank only exact live ids. They are never copied
+  // into the citable set by this seam.
+  const proofDescriptors = hostDescriptorsFromResolutionProof(input.sessionId, input.sourceUserSeq);
+  const disclosureByName = new Map<string, {
+    descriptor: HostCapabilityDescriptorV1;
+    identifier: string;
+    schemaDigest: string;
+    providerKind: string;
+  }>();
+  for (const entry of catalogEntries) {
+    const descriptor = hostDescriptorFromRegistered(entry);
+    if (!descriptor) continue;
+    const identifier = entry.manifest?.operationId?.trim() || entry.toolName.trim();
+    const disclosure = {
+      descriptor,
+      identifier,
+      schemaDigest: entry.schemaDigest,
+      providerKind: entry.providerKind ?? entry.manifest?.providerKind ?? 'host',
+    };
+    for (const name of [identifier, entry.toolName, descriptor.id]) {
+      if (name.trim()) disclosureByName.set(name.trim().toLowerCase(), disclosure);
+    }
+  }
+  const initial = rankedLivePlanningDescriptors({
+    objective,
+    live: catalogDescriptors,
+    advisory: [...proofDescriptors, ...indexedDescriptors],
+  });
+  const replayed = await durablePlanningDisclosures({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    byName: disclosureByName,
+  });
+  const allowedById = new Map<string, HostCapabilityDescriptorV1>();
+  for (const descriptor of [...initial, ...replayed.descriptors]) allowedById.set(descriptor.id, descriptor);
+  const capabilities = [...allowedById.values()].map((descriptor) => Object.freeze({ ...descriptor }));
+  const digest = sha256(JSON.stringify(capabilities));
+  const authority = Object.freeze({ scope: PRIMARY_MODEL_PLANNING_CATALOG_SCOPE });
+  primaryModelPlanningCatalogs.set(authority, {
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    capabilities,
+    liveCapabilities: catalogDescriptors.map((descriptor) => Object.freeze({ ...descriptor })),
+    disclosureByName,
+    stagedById: replayed.stagedById,
+    digest,
+  });
+  return {
+    ok: true,
+    planning: {
+      authority,
+      identity: { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
+      capabilities: Object.freeze([...capabilities]),
+      digest,
+    },
+  };
+}
+
+/** Monotonically disclose only exact operations returned by this source's
+ * visible foreground tool_search. Existing live entries remain executable;
+ * novel provider entries are staged and cannot cross a business boundary
+ * until plan_task publishes and revalidates the selected subset. */
+export async function disclosePrimaryModelPlanningCapabilities(input: {
+  authority: PrimaryModelPlanningCatalogAuthorityV1;
+  candidates: readonly {
+    name: string;
+    carrier: 'call_tool' | 'work_call';
+    schema?: unknown;
+    sourceKind: 'authorized_external_mcp' | 'authorized_composio' | typeof AUTHORIZED_LOCAL_REGISTRY_PROVENANCE;
+  }[];
+}): Promise<Readonly<Record<string, string>>> {
+  const catalog = primaryModelPlanningCatalogs.get(input.authority as object);
+  if (!catalog || input.authority.scope !== PRIMARY_MODEL_PLANNING_CATALOG_SCOPE) return Object.freeze({});
+  if (getTurnGraphEventForSource(catalog.sessionId, catalog.sourceUserSeq)) return Object.freeze({});
+  const refs: Record<string, string> = {};
+  const newlyDisclosed: Array<{
+    kind: string;
+    identifier: string;
+    effectClass: 'read' | 'write' | 'unknown';
+    schemaFingerprint: string;
+    capabilityRef: string;
+    manifestDigest: string;
+    accountIdentity?: string;
+    providerKind?: string;
+    descriptor?: HostCapabilityDescriptorV1;
+    localAuthority?: AuthorizedLocalPlanningDefinitionV1;
+  }> = [];
+  const allowed = new Map(catalog.capabilities.map((descriptor) => [descriptor.id, descriptor]));
+  const proofById = new Map(
+    hostDescriptorsFromResolutionProof(catalog.sessionId, catalog.sourceUserSeq)
+      .map((descriptor) => [descriptor.id, descriptor]),
+  );
+  const proofEntries = provenCapabilityEntriesForTurn({
+    sessionId: catalog.sessionId,
+    sourceUserSeq: catalog.sourceUserSeq,
+  });
+  for (const candidate of input.candidates.slice(0, 20)) {
+    const name = candidate.name.trim();
+    if (!name) continue;
+    if (candidate.sourceKind === AUTHORIZED_LOCAL_REGISTRY_PROVENANCE) {
+      const issued = inspectAuthorizedLocalPlanningDisclosureCandidate(candidate as object);
+      if (
+        !issued
+        || issued.name !== name
+        || issued.carrier !== candidate.carrier
+        || !candidate.schema
+        || typeof candidate.schema !== 'object'
+        || Array.isArray(candidate.schema)
+        || digestSchema(candidate.schema) !== issued.schemaFingerprint
+      ) continue;
+      const revalidated = await revalidateLocalPlanningDefinition(issued);
+      if (!revalidated.ok) continue;
+      const current = revalidated.definition;
+      const prior = catalog.stagedById.get(current.capabilityRef);
+      if (prior && (
+        prior.providerKind !== AUTHORIZED_LOCAL_REGISTRY_PROVENANCE
+        || prior.identifier !== current.name
+        || prior.schemaDigest !== current.schemaFingerprint
+        || prior.accountIdentity !== current.accountIdentity
+        || prior.localDefinition?.envelopeFingerprint !== current.envelopeFingerprint
+        || JSON.stringify(prior.descriptor) !== JSON.stringify(current.descriptor)
+      )) continue;
+      const staged: StagedPrimaryModelPlanningCapabilityV1 = prior ?? {
+        descriptor: current.descriptor,
+        identifier: current.name,
+        schemaDigest: current.schemaFingerprint,
+        providerKind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+        accountIdentity: current.accountIdentity,
+        localDefinition: current,
+      };
+      catalog.stagedById.set(current.capabilityRef, staged);
+      refs[name] = current.capabilityRef;
+      if (allowed.has(current.capabilityRef)) continue;
+      allowed.set(current.capabilityRef, current.descriptor);
+      newlyDisclosed.push({
+        kind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+        identifier: current.name,
+        effectClass: 'write',
+        schemaFingerprint: current.schemaFingerprint,
+        capabilityRef: current.capabilityRef,
+        manifestDigest: current.descriptor.manifestDigest,
+        accountIdentity: current.accountIdentity,
+        providerKind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+        descriptor: current.descriptor,
+        localAuthority: current,
+      });
+      continue;
+    }
+    const exact = catalog.disclosureByName.get(name.toLowerCase());
+    if (exact) {
+      refs[name] = exact.descriptor.id;
+      if (allowed.has(exact.descriptor.id)) continue;
+      allowed.set(exact.descriptor.id, exact.descriptor);
+      newlyDisclosed.push({
+        kind: exact.providerKind,
+        identifier: exact.identifier,
+        effectClass: exact.descriptor.effect === 'read'
+          ? 'read'
+          : exact.descriptor.effect === 'external_write' || exact.descriptor.effect === 'local_write'
+            ? 'write'
+            : 'unknown',
+        schemaFingerprint: exact.schemaDigest,
+        capabilityRef: exact.descriptor.id,
+        manifestDigest: exact.descriptor.manifestDigest,
+      });
+      continue;
+    }
+    if (
+      candidate.sourceKind === 'authorized_external_mcp'
+      && candidate.carrier === 'work_call'
+      && candidate.schema
+      && typeof candidate.schema === 'object'
+      && !Array.isArray(candidate.schema)
+    ) {
+      const parsed = parseNamespacedTool(name);
+      if (!parsed) continue;
+      const materialized = await createProductionMcpReadCarrier({
+        serverName: parsed.serverSlug,
+      }).materializeExact({
+        operationId: name,
+        inputSchema: candidate.schema,
+      });
+      if (materialized.status !== 'installed') continue;
+      const entry = peekHostCapabilityCatalogFactory()?.get(materialized.manifest.manifestId);
+      const descriptor = entry ? hostDescriptorFromRegistered(entry) : null;
+      if (!entry || !descriptor || !entry.providerInputSchemaDigest) continue;
+      const prior = catalog.stagedById.get(descriptor.id);
+      const staged: StagedPrimaryModelPlanningCapabilityV1 = {
+        descriptor: Object.freeze({ ...descriptor }),
+        identifier: materialized.manifest.operationId,
+        // The provider-input digest is carried independently on the exact
+        // catalog binding. This field preserves the complete manifest
+        // definition identity used by the plan-freeze comparison below.
+        schemaDigest: entry.schemaDigest,
+        providerKind: 'native_mcp',
+        accountIdentity: materialized.manifest.accountId,
+      };
+      if (prior && (
+        prior.identifier !== staged.identifier
+        || prior.schemaDigest !== staged.schemaDigest
+        || prior.providerKind !== staged.providerKind
+        || prior.accountIdentity !== staged.accountIdentity
+        || JSON.stringify(prior.descriptor) !== JSON.stringify(staged.descriptor)
+      )) continue;
+      catalog.stagedById.set(descriptor.id, prior ?? staged);
+      refs[name] = descriptor.id;
+      if (allowed.has(descriptor.id)) continue;
+      allowed.set(descriptor.id, descriptor);
+      newlyDisclosed.push({
+        kind: 'native_mcp',
+        identifier: materialized.manifest.operationId,
+        effectClass: descriptor.effect === 'read' ? 'read' : 'write',
+        schemaFingerprint: entry.schemaDigest,
+        capabilityRef: descriptor.id,
+        manifestDigest: descriptor.manifestDigest,
+        accountIdentity: materialized.manifest.accountId,
+        providerKind: 'native_mcp',
+        descriptor,
+      });
+      continue;
+    }
+    // Candidate prose, MCP metadata, memory, and provider-wide fuzzy hits do
+    // not mint execution refs. The Composio adapter deposited an exact current
+    // connection + schema proof for these returned bytes immediately before
+    // this opaque callback; every other candidate source remains typed
+    // unsupported until it implements the same materialize→disclose contract.
+    if (
+      candidate.sourceKind !== 'authorized_composio'
+      || candidate.carrier !== 'work_call'
+      || !candidate.schema
+      || typeof candidate.schema !== 'object'
+      || Array.isArray(candidate.schema)
+    ) continue;
+    const capabilityRef = `cap:resolved:${name.toLowerCase()}`;
+    const descriptor = proofById.get(capabilityRef);
+    const proof = proofEntries.find((entry) => (
+      entry.kind === 'composio'
+      && entry.status === 'proven'
+      && entry.connection !== 'missing'
+      && entry.identifier.trim().toLowerCase() === name.toLowerCase()
+      && (entry.effectClass === 'read' || entry.effectClass === 'write')
+    ));
+    if (!descriptor || !proof) continue;
+    const schemaDigest = digestSchema(candidate.schema);
+    const accountIdentity = proof.accountIdentity?.trim() || 'runtime';
+    if (descriptor.accountScope !== accountIdentity) continue;
+    const prior = catalog.stagedById.get(capabilityRef);
+    if (prior && (
+      prior.identifier.toLowerCase() !== name.toLowerCase()
+      || prior.schemaDigest !== schemaDigest
+      || prior.accountIdentity !== accountIdentity
+      || JSON.stringify(prior.descriptor) !== JSON.stringify(descriptor)
+    )) continue;
+    const staged: StagedPrimaryModelPlanningCapabilityV1 = prior ?? {
+      descriptor: Object.freeze({ ...descriptor }),
+      identifier: name,
+      schemaDigest,
+      providerKind: 'composio',
+      accountIdentity,
+    };
+    catalog.stagedById.set(capabilityRef, staged);
+    refs[name] = capabilityRef;
+    if (allowed.has(capabilityRef)) continue;
+    allowed.set(capabilityRef, staged.descriptor);
+    newlyDisclosed.push({
+      kind: 'composio',
+      identifier: name,
+      effectClass: descriptor.effect === 'read' ? 'read' : 'write',
+      schemaFingerprint: schemaDigest,
+      capabilityRef,
+      manifestDigest: descriptor.manifestDigest,
+      accountIdentity,
+      providerKind: 'composio',
+      descriptor: staged.descriptor,
+    });
+  }
+  if (newlyDisclosed.length > 0) {
+    const source = listEvents(catalog.sessionId, {
+      sinceSeq: catalog.sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    }).find((event) => event.seq === catalog.sourceUserSeq);
+    if (!source) return Object.freeze({});
+    appendEvent({
+      sessionId: catalog.sessionId,
+      turn: source.turn,
+      role: 'system',
+      type: 'capability_discovered',
+      data: { sourceUserSeq: catalog.sourceUserSeq, capabilities: newlyDisclosed },
+    });
+    catalog.capabilities = [...allowed.values()];
+    catalog.digest = sha256(JSON.stringify(catalog.capabilities));
+  }
+  return Object.freeze({ ...refs });
+}
+
 export type PrepareDurableAcceptedTurnCompileResult =
   | {
       ok: true;
@@ -228,10 +882,50 @@ export type PrepareDurableAcceptedTurnCompileResult =
     }
   | { ok: false; reason: string };
 
+function carryExactDestinationBinding(input: {
+  clamped: AdmittedClampedSemanticsV1;
+  binding: CanonicalDestinationBindingV1;
+}): { ok: true; clamped: AdmittedClampedSemanticsV1 } | { ok: false; reason: string } {
+  const destination = input.clamped.destination;
+  const destinations = input.clamped.destinations;
+  if (!destination) {
+    return { ok: false, reason: 'destination binding has no admitted destination' };
+  }
+  if (destination.posture !== input.binding.posture) {
+    return { ok: false, reason: 'destination binding posture does not match admitted destination' };
+  }
+  if (destinations && destinations.length !== 1) {
+    return { ok: false, reason: 'one destination binding cannot authorize multiple admitted destinations' };
+  }
+  const canonical = destinations?.[0] ?? destination;
+  if (
+    canonical.posture !== destination.posture
+    || canonical.family !== destination.family
+    || canonical.handleRequired !== destination.handleRequired
+  ) {
+    return { ok: false, reason: 'admitted destination projections disagree before binding' };
+  }
+  const existing = canonical.binding ?? destination.binding;
+  if (existing && JSON.stringify(existing) !== JSON.stringify(input.binding)) {
+    return { ok: false, reason: 'admitted destination already carries a conflicting binding' };
+  }
+  const boundDestination = { ...canonical, binding: { ...input.binding } };
+  return {
+    ok: true,
+    clamped: {
+      ...input.clamped,
+      destinations: [{ ...boundDestination }],
+      destination: { ...boundDestination },
+    },
+  };
+}
+
 /** Internal half of the durable compiler seam. It deliberately returns no
  * executable envelope; only admitted data that the private sealer can mint. */
 export async function prepareDurableAcceptedTurnCompile(
   input: CompileDurableAcceptedTurnGraphInput,
+  primaryModelProposal?: TurnSemanticProposalV1,
+  primaryModelCatalogAuthority?: PrimaryModelPlanningCatalogAuthorityV1,
 ): Promise<PrepareDurableAcceptedTurnCompileResult> {
   const accepted = listEvents(input.identity.sessionId, {
     sinceSeq: input.identity.sourceUserSeq - 1,
@@ -278,30 +972,86 @@ export async function prepareDurableAcceptedTurnCompile(
   const audienceKey = userId;
   const conversationKey = session.id;
 
-  // Adapter-owned live facts first: connected registry × frozen contracts.
-  // Proof provision then registers attested catalog entries for THIS source.
-  // The advisory index is citation-only and must run after that, never as
-  // bind authority. Freeze last so first-use connected tools are in the snapshot.
-  try {
-    await recordConnectedGoalCatalog({
-      sessionId: input.identity.sessionId,
-      sourceUserSeq: input.identity.sourceUserSeq,
-      objective: durableText,
-    });
-  } catch { /* catalog priming is additive */ }
-  try {
-    await registerProofProvisionedCapabilities(input.identity);
-  } catch { /* proof provision is additive; bind still fail-closes */ }
+  // Legacy admission retains its connected-goal selector/proof provisioning.
+  // Foreground plan_task never runs that hidden selector: tool_search discloses
+  // and materializes exact candidates first, then this seam freezes/revalidates
+  // only the refs the primary model actually saw.
   let indexDescriptors: HostCapabilityDescriptorV1[] = [];
-  try {
-    const indexed = await registerIndexedCapabilitiesForTurn({
-      sessionId: input.identity.sessionId,
-      sourceUserSeq: input.identity.sourceUserSeq,
-      objective: durableText,
+  let primaryPlanningCatalog: (typeof primaryModelPlanningCatalogs extends WeakMap<object, infer V> ? V : never) | undefined;
+  let selectedPrimaryCapabilityRefs = new Set<string>();
+  if (!primaryModelProposal) {
+    try {
+      await recordConnectedGoalCatalog({
+        sessionId: input.identity.sessionId,
+        sourceUserSeq: input.identity.sourceUserSeq,
+        objective: durableText,
+      });
+    } catch { /* catalog priming is additive */ }
+    try {
+      await registerProofProvisionedCapabilities(input.identity);
+    } catch { /* proof provision is additive; bind still fail-closes */ }
+    try {
+      const indexed = await registerIndexedCapabilitiesForTurn({
+        sessionId: input.identity.sessionId,
+        sourceUserSeq: input.identity.sourceUserSeq,
+        objective: durableText,
+      });
+      indexDescriptors = indexed.descriptors;
+    } catch {
+      indexDescriptors = hostDescriptorsFromCapabilityIndex(durableText);
+    }
+  } else {
+    primaryPlanningCatalog = primaryModelCatalogAuthority
+      ? primaryModelPlanningCatalogs.get(primaryModelCatalogAuthority as object)
+      : undefined;
+    if (
+      !primaryPlanningCatalog
+      || primaryModelCatalogAuthority?.scope !== PRIMARY_MODEL_PLANNING_CATALOG_SCOPE
+      || primaryPlanningCatalog.sessionId !== input.identity.sessionId
+      || primaryPlanningCatalog.sourceUserSeq !== input.identity.sourceUserSeq
+      || primaryPlanningCatalog.digest !== sha256(JSON.stringify(primaryPlanningCatalog.capabilities))
+    ) return { ok: false, reason: 'primary model planning catalog authority is missing or changed' };
+    selectedPrimaryCapabilityRefs = new Set(
+      (primaryModelProposal.work?.operations ?? []).map((operation) => operation.capabilityRef),
+    );
+    const disclosed = new Set(primaryPlanningCatalog.capabilities.map((descriptor) => descriptor.id));
+    if ([...selectedPrimaryCapabilityRefs].some((ref) => !disclosed.has(ref))) {
+      return { ok: false, reason: 'primary model proposal cites a capability that was not disclosed to this source' };
+    }
+    const selectedStaged = [...selectedPrimaryCapabilityRefs]
+      .map((ref) => primaryPlanningCatalog!.stagedById.get(ref))
+      .filter((entry): entry is StagedPrimaryModelPlanningCapabilityV1 => Boolean(entry));
+    const selectedComposioDefinitions = [...selectedPrimaryCapabilityRefs].flatMap((ref) => {
+      const staged = primaryPlanningCatalog!.stagedById.get(ref);
+      if (staged?.providerKind.toLowerCase() === 'composio') {
+        return [{
+          identifier: staged.identifier,
+          schemaDigest: staged.schemaDigest,
+          accountIdentity: staged.accountIdentity,
+        }];
+      }
+      const initial = primaryPlanningCatalog!.disclosureByName.get(ref.trim().toLowerCase());
+      if (initial?.providerKind.toLowerCase() !== 'composio') return [];
+      return [{
+        identifier: initial.identifier,
+        schemaDigest: initial.schemaDigest,
+        accountIdentity: initial.descriptor.accountScope,
+      }];
     });
-    indexDescriptors = indexed.descriptors;
-  } catch {
-    indexDescriptors = hostDescriptorsFromCapabilityIndex(durableText);
+    if (selectedComposioDefinitions.length > 0) {
+      const provisioned = await registerProofProvisionedCapabilities(input.identity, {
+        allowedIdentifiers: selectedStaged
+          .filter((entry) => entry.providerKind.toLowerCase() === 'composio')
+          .map((entry) => entry.identifier),
+        selectedDefinitions: selectedComposioDefinitions,
+      });
+      if (provisioned.refusal) {
+        return {
+          ok: false,
+          reason: `selected_definition_revalidation_refused:${provisioned.refusal.code}:${provisioned.refusal.identifier}`,
+        };
+      }
+    }
   }
 
   const frozen = freezeCatalogSnapshotForSource({
@@ -312,15 +1062,69 @@ export async function prepareDurableAcceptedTurnCompile(
   const catalogDescriptors = catalogEntries
     .map((entry) => hostDescriptorFromRegistered(entry))
     .filter((entry): entry is HostCapabilityDescriptorV1 => entry !== null);
-  const proofDescriptors = hostDescriptorsFromResolutionProof(
-    input.identity.sessionId,
-    input.identity.sourceUserSeq,
-  );
+  const proofDescriptors = primaryModelProposal
+    ? []
+    : hostDescriptorsFromResolutionProof(
+        input.identity.sessionId,
+        input.identity.sourceUserSeq,
+      );
   const byId = new Map<string, HostCapabilityDescriptorV1>();
   for (const descriptor of [...catalogDescriptors, ...proofDescriptors, ...indexDescriptors]) {
     if (!byId.has(descriptor.id)) byId.set(descriptor.id, descriptor);
   }
-  const capabilities = selectRelevantCapabilityDescriptors([...byId.values()]);
+  let capabilities = selectRelevantCapabilityDescriptors([...byId.values()]);
+  if (primaryModelProposal) {
+    const catalog = primaryPlanningCatalog!;
+    const currentById = new Map(catalogDescriptors.map((descriptor) => [descriptor.id, descriptor]));
+    const currentEntriesById = new Map(catalogEntries.map((entry) => [entry.capabilityId, entry]));
+    const canonicalCapabilities: HostCapabilityDescriptorV1[] = [];
+    for (const descriptor of catalog.capabilities) {
+      const staged = catalog.stagedById.get(descriptor.id);
+      if (staged && !selectedPrimaryCapabilityRefs.has(descriptor.id)) continue;
+      if (staged?.providerKind === AUTHORIZED_LOCAL_REGISTRY_PROVENANCE) {
+        if (!staged.localDefinition) {
+          return { ok: false, reason: 'selected local capability lost its sealed planning definition' };
+        }
+        const revalidated = await revalidateLocalPlanningDefinition(staged.localDefinition);
+        if (
+          !revalidated.ok
+          || revalidated.definition.capabilityRef !== descriptor.id
+          || revalidated.definition.schemaFingerprint !== staged.schemaDigest
+          || revalidated.definition.accountIdentity !== staged.accountIdentity
+          || JSON.stringify(revalidated.definition.descriptor) !== JSON.stringify(descriptor)
+        ) return { ok: false, reason: 'disclosed local capability changed before plan freeze' };
+        canonicalCapabilities.push(revalidated.definition.descriptor);
+        continue;
+      }
+      const current = currentById.get(descriptor.id);
+      if (!current) return { ok: false, reason: 'primary model planning catalog no longer matches the frozen host catalog' };
+      if (!staged) {
+        if (JSON.stringify(current) !== JSON.stringify(descriptor)) {
+          return { ok: false, reason: 'primary model planning catalog no longer matches the frozen host catalog' };
+        }
+        canonicalCapabilities.push(current);
+        continue;
+      }
+      const entry = currentEntriesById.get(descriptor.id);
+      const operationId = entry?.manifest?.operationId?.trim() || entry?.toolName.trim() || '';
+      if (
+        !entry
+        || operationId.toLowerCase() !== staged.identifier.toLowerCase()
+        || entry.schemaDigest !== staged.schemaDigest
+        || (entry.providerKind ?? entry.manifest?.providerKind ?? '') !== staged.providerKind
+        || (entry.account ?? entry.manifest?.accountId ?? 'runtime') !== staged.accountIdentity
+        || current.effect !== staged.descriptor.effect
+      ) return { ok: false, reason: 'disclosed provider capability changed before plan freeze' };
+      canonicalCapabilities.push(current);
+    }
+    if ([...selectedPrimaryCapabilityRefs].some((ref) => !canonicalCapabilities.some((entry) => entry.id === ref))) {
+      return { ok: false, reason: 'selected capability was not current at plan freeze' };
+    }
+    catalog.capabilities = canonicalCapabilities;
+    catalog.liveCapabilities = catalogDescriptors;
+    catalog.digest = sha256(JSON.stringify(canonicalCapabilities));
+    capabilities = [...canonicalCapabilities];
+  }
 
   const continuity = peekTaskContinuityPacket({ sessionId: input.identity.sessionId });
   const packet = continuity.status === 'available'
@@ -374,40 +1178,62 @@ export async function prepareDurableAcceptedTurnCompile(
     allowedEffects: ['none', 'read', 'compute', 'host_only', 'unknown', 'local_write', 'external_write'],
   };
 
-  const port = peekTurnSemanticModelPort();
-  if (!port) {
-    recordSemanticDispositionOutcome(input.identity.sessionId, input.identity.sourceUserSeq, 'unavailable');
-    return { ok: false, reason: 'semantic port is unavailable' };
-  }
+  let admitted: Extract<ReturnType<typeof admitTurnSemantics>, { ok: true }>;
+  if (primaryModelProposal) {
+    // This proposal came from the already-running business model. Revalidate
+    // it against the exact durable host view; never call the hidden semantic
+    // proposer/effect judge/grounding judge from this in-loop control.
+    const direct = admitTurnSemantics(primaryModelProposal, host, authority);
+    if (!direct.ok) {
+      return {
+        ok: false,
+        reason: direct.issues.map((issue) => `${issue.code}:${issue.path}`).join('; ') || 'primary model proposal was not admitted',
+      };
+    }
+    admitted = direct;
+  } else {
+    const port = peekTurnSemanticModelPort();
+    if (!port) {
+      recordSemanticDispositionOutcome(input.identity.sessionId, input.identity.sourceUserSeq, 'unavailable');
+      return { ok: false, reason: 'semantic port is unavailable' };
+    }
 
-  // A port exists and is about to take this turn: from here on the semantic
-  // lane owns the outcome, so a refusal below is durable and must not
-  // downgrade to the untyped lane.
-  recordSemanticParticipation(
-    input.identity.sessionId,
-    input.identity.sourceUserSeq,
-    'participated',
-  );
-
-  const interpreted = await interpretAcceptedSource({
-    snapshot,
-    authority,
-    port,
-    turn: input.identity.turn,
-  });
-  if (interpreted.status !== 'admitted') {
-    recordSemanticDispositionOutcome(
+    // A port exists and is about to take this turn: from here on the semantic
+    // lane owns the outcome, so a refusal below is durable and must not
+    // downgrade to the untyped lane.
+    recordSemanticParticipation(
       input.identity.sessionId,
       input.identity.sourceUserSeq,
-      'blocked',
+      'participated',
     );
-    return { ok: false, reason: interpreted.reason };
+
+    const interpreted = await interpretAcceptedSource({
+      snapshot,
+      authority,
+      port,
+      turn: input.identity.turn,
+    });
+    if (interpreted.status !== 'admitted') {
+      recordSemanticDispositionOutcome(
+        input.identity.sessionId,
+        input.identity.sourceUserSeq,
+        'blocked',
+      );
+      return { ok: false, reason: interpreted.reason };
+    }
+    recordSemanticDispositionOutcome(input.identity.sessionId, input.identity.sourceUserSeq, 'admitted');
+    admitted = {
+      ok: true,
+      source: interpreted.source,
+      policyRevision: interpreted.record.policyRevision,
+      clamped: interpreted.clamped,
+      payloadHash: interpreted.payloadHash,
+      contextHash: interpreted.contextHash,
+    };
   }
 
-  recordSemanticDispositionOutcome(input.identity.sessionId, input.identity.sourceUserSeq, 'admitted');
-
   let destinationBinding: CanonicalDestinationBindingV1 | undefined;
-  let clamped = interpreted.clamped;
+  let clamped = admitted.clamped;
   const writeCeiling = clamped.effectCeiling === 'external_write'
     || clamped.effectCeiling === 'local_write'
     || clamped.effectCeiling === 'admin';
@@ -424,8 +1250,11 @@ export async function prepareDurableAcceptedTurnCompile(
     });
     if (bound.ok) {
       destinationBinding = bound.binding;
+      const carried = carryExactDestinationBinding({ clamped, binding: destinationBinding });
+      if (!carried.ok) return carried;
+      clamped = carried.clamped;
       const floor = unionEvidenceFloor(bound.floor, {
-        handleRequired: clamped.destination.handleRequired,
+        handleRequired: carried.clamped.destination!.handleRequired,
         evidenceRequirements: clamped.evidenceRequirements ?? [],
       });
       if (floor.handleRequired || floor.evidenceRequirements.length > 0) {
@@ -441,18 +1270,18 @@ export async function prepareDurableAcceptedTurnCompile(
   }
 
   const semanticProvenanceDigest = sha256(JSON.stringify({
-    payloadHash: interpreted.payloadHash,
-    contextHash: interpreted.contextHash,
-    source: interpreted.source,
+    payloadHash: admitted.payloadHash,
+    contextHash: admitted.contextHash,
+    source: admitted.source,
   }));
 
   return {
     ok: true,
-    source: interpreted.source,
-    policyRevision: interpreted.record.policyRevision,
+    source: admitted.source,
+    policyRevision: admitted.policyRevision,
     clamped,
-    payloadHash: interpreted.payloadHash,
-    contextHash: interpreted.contextHash,
+    payloadHash: admitted.payloadHash,
+    contextHash: admitted.contextHash,
     semanticProvenanceDigest,
     ...(destinationBinding ? { destinationBinding } : {}),
     authority,
@@ -529,5 +1358,48 @@ export async function admitAndCompileAcceptedSource(input: {
       graph: durableGraph,
       validation,
     },
+  };
+}
+
+/** Persist one graph authored by the foreground model through plan_task.
+ * Unlike the legacy compiler, a refused proposal never falls back to an
+ * identity-only graph: the primary model receives the typed refusal and may
+ * repair its proposal inside the same bounded loop. */
+export async function admitAndCompilePrimaryModelProposal(input: {
+  identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>;
+  surface: TurnGraphSurface;
+  proposal: TurnSemanticProposalV1;
+  planningCatalogAuthority: PrimaryModelPlanningCatalogAuthorityV1;
+  allowedToolNames?: readonly string[];
+  excludedToolNames?: readonly string[];
+  verifiedTaskContinuation?: TaskContinuationContext;
+}): Promise<AdmitAndCompileAcceptedSourceResult> {
+  const compiled = await compilePrimaryModelAcceptedTurnGraph(
+    input,
+    input.proposal,
+    input.planningCatalogAuthority,
+  );
+  if (!compiled.ok) return compiled;
+  if (compiled.compiled.graph.classification.route !== 'act') {
+    return { ok: false, reason: 'plan_task may persist only an admitted action graph' };
+  }
+  const event = recordTurnGraphShadow({
+    identity: input.identity,
+    surface: input.surface,
+    allowedToolNames: input.allowedToolNames,
+    excludedToolNames: input.excludedToolNames,
+    verifiedTaskContinuation: input.verifiedTaskContinuation,
+    graph: compiled.compiled.graph,
+    persistenceTicket: compiled.persistenceTicket,
+  });
+  if (!event) return { ok: false, reason: 'admitted graph persist failed' };
+  const durableGraph = turnGraphFromShadowEvent(event);
+  if (!durableGraph) return { ok: false, reason: 'admitted graph replay failed durable validation' };
+  const validation = validateTurnGraph(durableGraph);
+  if (!validation.ok) return { ok: false, reason: 'admitted graph replay failed graph validation' };
+  return {
+    ok: true,
+    event,
+    compiled: { graph: durableGraph, validation },
   };
 }

@@ -14,27 +14,47 @@ import express from 'express';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-active-skill-catalogs-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.NODE_ENV = 'test';
-process.env.CLEMMY_HARNESS_DASHBOARD = 'off';
-process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+process.env.CLEMMY_HARNESS_DASHBOARD = 'on';
+process.env.CLEMMY_TURN_ENGINE = 'host_v1';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
+const { _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
 const {
   SKILLS_DIR,
   reconcileDistilledSkillDuplicates,
   writeDistilledSkill,
 } = await import('../memory/skill-store.js');
 
-test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
+test.after(() => {
+  _setBridgeImplsForTests({});
+  rmSync(TMP_HOME, { recursive: true, force: true });
+});
 
 async function boot(onArchitectPrompt: (prompt: string) => void) {
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (options: { input: string; sessionId: string }) => {
+      onArchitectPrompt(options.input);
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          reply: 'No draft changes.',
+          summary: 'No changes proposed.',
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
   const app = express();
   app.use(express.json());
   const assistant = {
-    respond: async (request: { message: string }) => {
-      onArchitectPrompt(request.message);
-      return { text: 'No draft changes.' };
-    },
+    respond: async () => { throw new Error('legacy assistant must remain unreachable'); },
   };
   registerConsoleRoutes(app, () => true, assistant as never, { serveLegacyAtRoot: false });
   const server: Server = await new Promise((resolve) => {

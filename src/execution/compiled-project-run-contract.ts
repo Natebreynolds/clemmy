@@ -95,7 +95,7 @@ export interface CompiledProjectRootTerminalDigestInput {
   sessionId: string;
   sourceUserSeq: number;
   rootWorkflowReceiptId: string;
-  status: 'completed' | 'completed_with_errors' | 'error' | 'failed' | 'cancelled';
+  status: 'completed' | 'completed_with_errors' | 'blocked' | 'error' | 'failed' | 'cancelled';
   terminalOutcome: WorkflowTerminalOutcome;
   finishedAt: string;
   snapshotDefinitionHash: string;

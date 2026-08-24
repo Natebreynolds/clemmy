@@ -14,11 +14,13 @@ import {
   listChatSessions,
   listPlanProposals,
   listRecentRuns,
+  listWorkspaceDestinationChoosers,
   type ApprovalRow,
   type ChatSession,
   type PlanProposalRow,
   type ReminderItem,
   type RunSummary,
+  type WorkspaceDestinationChooser,
   isActiveRunStatus,
 } from '../lib/api';
 import { greetingName, timeGreeting } from '../lib/greeting';
@@ -40,6 +42,7 @@ interface Props {
 interface HomeData {
   approvals: ApprovalRow[];
   plans: PlanProposalRow[];
+  workspaceChoosers: WorkspaceDestinationChooser[];
   reminders: ReminderItem[];
   runs: RunSummary[];
   sessions: ChatSession[];
@@ -50,20 +53,22 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
   // Every section degrades on its own: one failing endpoint must not blank
   // the whole home screen, and a section that failed THIS round keeps its
   // last good rows. Only when everything fails does the screen say so.
-  const lastGood = useRef<HomeData>({ approvals: [], plans: [], reminders: [], runs: [], sessions: [] });
+  const lastGood = useRef<HomeData>({ approvals: [], plans: [], workspaceChoosers: [], reminders: [], runs: [], sessions: [] });
   const loadHome = useCallback(async (): Promise<HomeData> => {
-    const [a, p, r, runsResult, chats] = await Promise.all([
+    const [a, p, w, r, runsResult, chats] = await Promise.all([
       listApprovals().then((v) => ({ v }), (e) => ({ e })),
       listPlanProposals().then((v) => ({ v }), (e) => ({ e })),
+      listWorkspaceDestinationChoosers().then((v) => ({ v }), (e) => ({ e })),
       getReminders().then((v) => ({ v }), (e) => ({ e })),
       listRecentRuns(8).then((v) => ({ v }), (e) => ({ e })),
       listChatSessions().then((v) => ({ v }), (e) => ({ e })),
     ]);
-    const allFailed = [a, p, r, runsResult, chats].every((res) => 'e' in res);
+    const allFailed = [a, p, w, r, runsResult, chats].every((res) => 'e' in res);
     if (allFailed) throw (a as { e: unknown }).e;
     const merged: HomeData = {
       approvals: 'v' in a ? a.v.approvals.filter((row) => row.status === 'pending') : lastGood.current.approvals,
       plans: 'v' in p ? p.v.proposals.filter((row) => row.status === 'pending') : lastGood.current.plans,
+      workspaceChoosers: 'v' in w ? w.v.choosers : lastGood.current.workspaceChoosers,
       reminders: 'v' in r ? r.v.items : lastGood.current.reminders,
       runs: 'v' in runsResult ? runsResult.v.runs : lastGood.current.runs,
       sessions: 'v' in chats ? chats.v.sessions : lastGood.current.sessions,
@@ -72,9 +77,9 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
     return merged;
   }, []);
   const { data, loading, error, offline, refresh } = useScreenData(loadHome, { intervalMs: POLL_MS });
-  const { approvals, plans, reminders, runs, sessions } = data ?? lastGood.current;
+  const { approvals, plans, workspaceChoosers, reminders, runs, sessions } = data ?? lastGood.current;
 
-  const decisionCount = approvals.length + plans.length;
+  const decisionCount = approvals.length + plans.length + workspaceChoosers.length;
   useEffect(() => { onDecisionCount(decisionCount); }, [decisionCount, onDecisionCount]);
 
   const working = runs.filter((run) => isActiveRunStatus(run.status));
@@ -128,7 +133,7 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
             Needs you
             <span class="section-count">{decisionCount}</span>
           </h2>
-          <Decisions approvals={approvals} plans={plans} onResolved={refresh} />
+          <Decisions approvals={approvals} plans={plans} workspaceChoosers={workspaceChoosers} onResolved={refresh} />
         </section>
       ) : null}
 

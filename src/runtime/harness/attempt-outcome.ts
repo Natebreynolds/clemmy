@@ -186,6 +186,9 @@ export interface AttemptOutcome {
 export interface AttemptSignals {
   /** The call never left the process. */
   preDispatch?: boolean;
+  /** Caller/kill cancellation is distinct from a deadline: it never grants a
+   * retry simply because an AbortError happened to be used as transport. */
+  cancelled?: boolean;
   /** Transport status, when the lane sees one. */
   httpStatus?: number;
   /** A typed error class name the lane trusts (nominal). */
@@ -260,6 +263,11 @@ function outcome(
  */
 export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome {
   // Nominal — the lane told us directly what happened.
+  if (signals.cancelled) {
+    return signals.mutating && signals.preDispatch !== true
+      ? outcome('uncertain_write', 'nominal', 'cancelled_after_dispatch')
+      : outcome('unknown', 'nominal', 'cancelled');
+  }
   if (signals.policyRefused) return outcome('policy_denial', 'nominal', 'policy');
   if (signals.needsUserInput) return outcome('input_required', 'nominal', 'input');
   if (signals.connectionMissing) return outcome('auth_failure', 'nominal', 'connection');

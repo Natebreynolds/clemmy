@@ -1851,6 +1851,173 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
       })();
     },
   },
+  {
+    // COMPOUNDING wave (2026-08-19): the fact store finally gets a real text
+    // index. The lexical recall leg was `LOWER(content) LIKE '%tok%'` with no
+    // ORDER BY — measured live: 134 candidates ranked per turn, 4.6 shown,
+    // relevant facts routinely evicted by common-token matches. Same shape as
+    // the shipped vault_chunks_fts (porter unicode61, external-content,
+    // trigger-maintained), plus a full backfill of existing rows.
+    version: 33,
+    sql: `
+      CREATE VIRTUAL TABLE IF NOT EXISTS consolidated_facts_fts USING fts5(
+        content,
+        content='consolidated_facts',
+        content_rowid='id',
+        tokenize='porter unicode61'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS consolidated_facts_ai AFTER INSERT ON consolidated_facts BEGIN
+        INSERT INTO consolidated_facts_fts(rowid, content) VALUES (new.id, new.content);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS consolidated_facts_ad AFTER DELETE ON consolidated_facts BEGIN
+        INSERT INTO consolidated_facts_fts(consolidated_facts_fts, rowid, content)
+        VALUES ('delete', old.id, old.content);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS consolidated_facts_au AFTER UPDATE ON consolidated_facts BEGIN
+        INSERT INTO consolidated_facts_fts(consolidated_facts_fts, rowid, content)
+        VALUES ('delete', old.id, old.content);
+        INSERT INTO consolidated_facts_fts(rowid, content) VALUES (new.id, new.content);
+      END;
+
+      INSERT INTO consolidated_facts_fts(rowid, content)
+        SELECT id, content FROM consolidated_facts;
+    `,
+  },
+  {
+    // COMPOUNDING wave: honest recall conversion. The reaper deletes exactly
+    // the uncredited runs, so any survivor-based rate reads ~3x too high
+    // (measured live: 53.6% shown vs ~17% true). Daily tombstone counters
+    // survive the reap; health reports conversion over ALL runs.
+    version: 34,
+    sql: `
+      CREATE TABLE IF NOT EXISTS memory_recall_run_tombstones (
+        day        TEXT PRIMARY KEY,
+        runs_total INTEGER NOT NULL DEFAULT 0,
+        used_total INTEGER NOT NULL DEFAULT 0
+      );
+    `,
+  },
+  {
+    // Terminal-batched semantic learning. Execution truth remains exclusively
+    // in harness.db (accepted task, logical settlement and durable result
+    // handles); these rows are a restart-safe MEMORY projection of that exact
+    // source. The scanner cursor makes terminal discovery bounded without an
+    // in-process queue, immutable members are the intake/disposition receipts,
+    // and shard leases make extraction retryable without per-tool fan-out.
+    version: 35,
+    sql: `
+      CREATE TABLE IF NOT EXISTS memory_learning_scan_state (
+        id                   INTEGER PRIMARY KEY CHECK (id = 1),
+        terminal_event_rowid INTEGER NOT NULL DEFAULT 0 CHECK (terminal_event_rowid >= 0),
+        updated_at           TEXT NOT NULL
+      );
+      INSERT OR IGNORE INTO memory_learning_scan_state
+        (id, terminal_event_rowid, updated_at)
+      VALUES (1, 0, '1970-01-01T00:00:00.000Z');
+
+      CREATE TABLE IF NOT EXISTS memory_learning_batches (
+        batch_id             TEXT PRIMARY KEY,
+        session_id           TEXT NOT NULL,
+        source_user_seq      INTEGER NOT NULL CHECK (source_user_seq > 0),
+        accepted_task_id     TEXT NOT NULL,
+        terminal_event_id    TEXT NOT NULL,
+        terminal_event_rowid INTEGER NOT NULL CHECK (terminal_event_rowid > 0),
+        terminal_digest      TEXT NOT NULL CHECK (length(terminal_digest) = 64),
+        member_manifest_hash TEXT NOT NULL CHECK (length(member_manifest_hash) = 64),
+        member_count         INTEGER NOT NULL CHECK (member_count >= 0),
+        shard_count          INTEGER NOT NULL CHECK (shard_count >= 0),
+        status               TEXT NOT NULL
+          CHECK (status IN ('pending','completed','dead_letter')),
+        created_at           TEXT NOT NULL,
+        updated_at           TEXT NOT NULL,
+        completed_at         TEXT,
+        last_error           TEXT,
+        UNIQUE (session_id, source_user_seq, accepted_task_id, terminal_event_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_learning_batches_status
+        ON memory_learning_batches(status, terminal_event_rowid);
+
+      CREATE TABLE IF NOT EXISTS memory_learning_members (
+        member_id             TEXT PRIMARY KEY,
+        batch_id              TEXT NOT NULL REFERENCES memory_learning_batches(batch_id) ON DELETE CASCADE,
+        ordinal               INTEGER NOT NULL CHECK (ordinal >= 0),
+        logical_tool_call_id  TEXT NOT NULL,
+        result_handle_id      TEXT,
+        result_digest         TEXT CHECK (result_digest IS NULL OR length(result_digest) = 64),
+        tool_name             TEXT NOT NULL,
+        resolved_tool         TEXT,
+        outcome_kind          TEXT NOT NULL,
+        effect_kind           TEXT,
+        disposition           TEXT NOT NULL CHECK (disposition IN (
+          'structured_task_evidence','resource_pointer','unstructured',
+          'control','failed','write_ack','empty','unavailable'
+        )),
+        source_text_digest    TEXT CHECK (source_text_digest IS NULL OR length(source_text_digest) = 64),
+        source_text_chars     INTEGER CHECK (source_text_chars IS NULL OR source_text_chars >= 0),
+        selection_digest      TEXT CHECK (selection_digest IS NULL OR length(selection_digest) = 64),
+        selection_chars       INTEGER CHECK (selection_chars IS NULL OR selection_chars >= 0),
+        resource_ref          TEXT,
+        created_at            TEXT NOT NULL,
+        UNIQUE (batch_id, ordinal),
+        UNIQUE (batch_id, logical_tool_call_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_learning_members_disposition
+        ON memory_learning_members(batch_id, disposition, ordinal);
+
+      CREATE TABLE IF NOT EXISTS memory_learning_shards (
+        shard_id           TEXT PRIMARY KEY,
+        batch_id           TEXT NOT NULL REFERENCES memory_learning_batches(batch_id) ON DELETE CASCADE,
+        ordinal            INTEGER NOT NULL CHECK (ordinal >= 0),
+        manifest_json      TEXT NOT NULL,
+        manifest_hash      TEXT NOT NULL CHECK (length(manifest_hash) = 64),
+        reflection_call_id TEXT NOT NULL UNIQUE,
+        status             TEXT NOT NULL
+          CHECK (status IN ('pending','processing','completed','dead_letter')),
+        attempts           INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 4),
+        lease_token        TEXT,
+        lease_expires_at   TEXT,
+        next_attempt_at    TEXT NOT NULL,
+        last_error         TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        completed_at       TEXT,
+        UNIQUE (batch_id, ordinal),
+        CHECK (
+          (status = 'processing' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+          OR
+          (status != 'processing' AND lease_token IS NULL AND lease_expires_at IS NULL)
+        )
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_learning_shards_drain
+        ON memory_learning_shards(status, next_attempt_at, lease_expires_at, created_at);
+
+      CREATE TRIGGER IF NOT EXISTS memory_learning_batch_identity_immutable
+      BEFORE UPDATE OF batch_id, session_id, source_user_seq, accepted_task_id,
+                       terminal_event_id, terminal_event_rowid, terminal_digest,
+                       member_manifest_hash, member_count, shard_count
+      ON memory_learning_batches
+      BEGIN
+        SELECT RAISE(ABORT, 'memory learning batch identity is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS memory_learning_member_immutable
+      BEFORE UPDATE ON memory_learning_members
+      BEGIN
+        SELECT RAISE(ABORT, 'memory learning member receipt is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS memory_learning_shard_identity_immutable
+      BEFORE UPDATE OF shard_id, batch_id, ordinal, manifest_json,
+                       manifest_hash, reflection_call_id, created_at
+      ON memory_learning_shards
+      BEGIN
+        SELECT RAISE(ABORT, 'memory learning shard identity is immutable');
+      END;
+    `,
+  },
 ];
 
 /**

@@ -133,13 +133,21 @@ const GOLDEN = {
   // the exact subject. Mandatory recall/history/skill/discovery rituals were
   // removed after the live Ventura run spent 12 model turns reconfirming data
   // the runtime had already supplied.
-  instructions: { len: 35002, sha16: '79ff1719fe173c4d' },
-  native: { len: 34105, sha16: 'ddb1765ce9d273e9' },
-  claudeBrain: { len: 8666, sha16: 'edab8f740b3064a6' },
-  // 2026-08-13 accepted-work authority: an admitted work_call carries the exact
-  // host-frozen execution binding. The model no longer opens a competing
-  // execution owner or searches global executions before a normal write.
-  lean: { len: 12079, sha16: '6f8e86f84c98fd1a' },
+  // 2026-08-22 provider-neutral harness cut: removed application-shaped
+  // carrier precedence, workflow authoring recipes, recurring-destination
+  // recipes, worker payload examples, and compacted-result examples. Durable
+  // promotion is review-only and exact live bindings remain code-owned.
+  // 2026-08-22: exact approved opportunity → host-issued one-read pilot-card
+  // transition; consent, queueing, execution, and recurrence remain separate.
+  // 2026-08-22: exact proposal CAS → formal human review card; the staging
+  // tool owns no decision, pilot, workflow, schedule, or execution authority.
+  // 2026-08-22: a clean pilot can stage only a disabled recurrence preview and
+  // separate formal recurrence-consent card; neither configuration nor the
+  // staging tool is activation or execution authority.
+  instructions: { len: 31717, sha16: '65e2d7dd7db7d72e' },
+  native: { len: 30820, sha16: 'def13e1425bf7da4' },
+  claudeBrain: { len: 8269, sha16: 'a659203342decd00' },
+  lean: { len: 10279, sha16: '0a7eb6e3732295bd' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -170,8 +178,8 @@ test('characterization: ORCHESTRATOR_INSTRUCTIONS_LEAN is byte-stable (reviewabl
   snapshotGuard('lean', ORCHESTRATOR_INSTRUCTIONS_LEAN, GOLDEN.lean);
 });
 
-test('lean variant: registered behind the variant switch, materially leaner, keeps load-bearing rules', () => {
-  // Wired into the A/B substrate (opt in via CLEMMY_RUBRIC_VARIANT=lean)…
+test('lean variant: production default with a legacy rollback, materially leaner, keeps load-bearing rules', () => {
+  // Wired into the attributable variant substrate.
   assert.equal(RUBRIC_INSTRUCTIONS_BY_VARIANT.lean, ORCHESTRATOR_INSTRUCTIONS_LEAN, 'lean must be registered in the variant map');
   // The legacy body stays intact as a one-flag rollback.
   assert.equal(RUBRIC_INSTRUCTIONS_BY_VARIANT.legacy, renderClemRubric('codex'), 'legacy rollback stays canonical');
@@ -189,6 +197,59 @@ test('lean variant: registered behind the variant switch, materially leaner, kee
   assert.ok(/CONVERSE FIRST/i.test(ORCHESTRATOR_INSTRUCTIONS_LEAN), 'lean must keep converse-first');
 });
 
+test('durable opportunity guidance is provider-neutral and never promotes on tool count', () => {
+  for (const [lane, rubric] of [
+    ['lean-codex', ORCHESTRATOR_INSTRUCTIONS_LEAN],
+    ['claude', CLAUDE_BRAIN_RUBRIC],
+  ] as const) {
+    assert.match(rubric, /DURABLE OPPORTUNITIES/i, lane);
+    assert.match(rubric, /ordinary work stays in this loop regardless of tool count/i, lane);
+    assert.match(rubric, /automation_opportunity_propose/i, lane);
+    assert.match(rubric, /automation_opportunity_review_request/i, lane);
+    assert.match(rubric, /formal human decision card only; the model cannot decide it/i, lane);
+    assert.match(rubric, /creates no workflow, pilot, schedule, Space, or execution authority/i, lane);
+    assert.doesNotMatch(
+      rubric,
+      /50 CRM tasks|30 drafts|25 URL scrapes|composioSlug|SERP\/keyword/i,
+      lane,
+    );
+  }
+});
+
+test('approved opportunity guidance requests pilot and recurrence cards without collapsing consent boundaries', () => {
+  for (const [lane, rubric] of [
+    ['codex', ORCHESTRATOR_INSTRUCTIONS],
+    ['native', ORCHESTRATOR_BEHAVIOR_NATIVE],
+  ] as const) {
+    assert.match(rubric, /automation_read_pilot_acquisition_list/i, lane);
+    assert.match(rubric, /automation_read_pilot_request/i, lane);
+    assert.match(rubric, /automation_opportunity_review_request/i, lane);
+    assert.match(rubric, /exact revision and digest/i, lane);
+    assert.match(rubric, /exact proposal CAS, typed result mapping, exact Workspace revision\/digest when applicable, and chosen host-issued opaque reference/i, lane);
+    assert.match(rubric, /creates only a formal pilot approval card/i, lane);
+    assert.match(rubric, /cannot approve, queue, run, schedule, or infer recurrence/i, lane);
+    assert.match(rubric, /automation_recurrence_request/i, lane);
+    assert.match(rubric, /disabled preview and a separate formal recurrence-consent card/i, lane);
+    assert.match(rubric, /workflow configuration never means active consent/i, lane);
+    assert.match(rubric, /cannot approve, activate, queue, run, write externally, or send/i, lane);
+  }
+});
+
+test('runtime rubrics contain framework contracts, never customer-shaped provider recipes', () => {
+  const forbidden =
+    /restaurant|attorney|lawyer|salesforce|outlook|slack|gmail|asana|apify|dataforseo|google.?sheets?|netlify|airtable|supabase|browsermcp|serp|GOOGLESHEETS_|composioSlug|sf data|sf cli|50 CRM tasks|25 URL scrapes/i;
+  for (const [lane, rubric] of [
+    ['codex', ORCHESTRATOR_INSTRUCTIONS],
+    ['native', ORCHESTRATOR_BEHAVIOR_NATIVE],
+    ['lean-codex', ORCHESTRATOR_INSTRUCTIONS_LEAN],
+    ['claude', CLAUDE_BRAIN_RUBRIC],
+  ] as const) {
+    assert.doesNotMatch(rubric, forbidden, lane);
+    assert.match(rubric, /exact (?:persisted invocation plan|host-frozen binding|current capability contracts|capability and schema)/i, lane);
+    assert.match(rubric, /account.*resource identity|resource identity.*account/i, lane);
+  }
+});
+
 // --- Phase 3: ONE shared rubric source feeds every lane ---------------------
 test('shared source: renderClemRubric feeds all three lanes from clem-rubric', () => {
   // The Phase-3 invariant: both flagship lanes (and the lean chat brain) draw from
@@ -197,7 +258,7 @@ test('shared source: renderClemRubric feeds all three lanes from clem-rubric', (
   assert.equal(renderClemRubric('native'), ORCHESTRATOR_BEHAVIOR_NATIVE, 'native lane = the re-exported native rubric');
   assert.equal(renderClemRubric('claude_brain'), CLAUDE_BRAIN_RUBRIC, 'claude chat brain = the lean rubric');
   // and the lean brain rubric is genuinely lean vs the 34KB Codex one.
-  assert.ok(CLAUDE_BRAIN_RUBRIC.length * 4 < ORCHESTRATOR_INSTRUCTIONS.length, 'claude brain rubric must stay far leaner than the Codex rubric');
+  assert.ok(CLAUDE_BRAIN_RUBRIC.length * 3 < ORCHESTRATOR_INSTRUCTIONS.length, 'claude brain rubric must stay far leaner than the Codex rubric');
 });
 
 test('provider parity: focus context is injected, never a mandatory per-turn tool ritual', () => {
@@ -227,6 +288,15 @@ test('provider parity: resolved capabilities execute directly and discovery is o
       lane,
     );
   }
+  assert.match(
+    CLAUDE_BRAIN_RUBRIC,
+    /verified success is remembered automatically/i,
+    'lean/claude learning is a write path, not a model ritual',
+  );
+  assert.doesNotMatch(
+    CLAUDE_BRAIN_RUBRIC,
+    /On the first successful previously unknown path, call `tool_choice_remember`/i,
+  );
 });
 
 test('provider parity: accepted work_call authority never manufactures a second execution owner', () => {
@@ -269,16 +339,16 @@ test('background execution contract: the graph chooses the lane without a routin
   }
 });
 
-test('workflow execution contract: an exact imperative is authority; only ambiguous thematic matches clarify', () => {
+test('workflow execution contract: exact existing-workflow authority is distinct from authoring and effect approval', () => {
   for (const [lane, rubric] of [
     ['codex', ORCHESTRATOR_INSTRUCTIONS],
     ['native', ORCHESTRATOR_BEHAVIOR_NATIVE],
   ] as const) {
-    assert.match(rubric, /imperative with the exact workflow name/i, lane);
-    assert.match(rubric, /sufficient execution authority.*call workflow_run immediately in the same turn/is, lane);
-    assert.match(rubric, /no separate confirmation turn is required/i, lane);
-    assert.match(rubric, /merely similar topic is not authority/i, lane);
-    assert.match(rubric, /could mean multiple workflows.*ask one concise identifying clarification/is, lane);
+    assert.match(rubric, /already-authorized workflow.*exact imperative is sufficient.*workflow_run.*same turn/is, lane);
+    assert.match(rubric, /workflow's own effect approvals remain authoritative/i, lane);
+    assert.match(rubric, /merely similar topic is not (?:execution )?authority/i, lane);
+    assert.match(rubric, /ambiguous reference gets one identifying question/i, lane);
+    assert.match(rubric, /automation_opportunity_propose.*review artifact/i, lane);
     assert.doesNotMatch(rubric, /Run it now\?/i, lane);
   }
 });
@@ -358,10 +428,10 @@ test('two-lane invariant: the decision-JSON contract NEVER leaks into the native
 });
 
 // --- Token-budget guard ----------------------------------------------------
-// Catches accidental bloat. Phase-0 baseline: instructions ≈ 8,730 tok. A drift
+// Catches accidental bloat. 2026-08-22 provider-neutral baseline: ≈ 7,594 tok. A drift
 // of >5% in either direction is a prompt-size regression worth a look.
 test('budget guard: rubric token estimate stays within 5% of the Phase-0 baseline', () => {
-  const BASELINE_TOK = 8730;
+  const BASELINE_TOK = 7594;
   const actual = TOK(ORCHESTRATOR_INSTRUCTIONS.length);
   const drift = Math.abs(actual - BASELINE_TOK) / BASELINE_TOK;
   assert.ok(

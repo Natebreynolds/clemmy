@@ -269,7 +269,10 @@ test('J3: dead data source → empty-result advisory → data-quality checkpoint
     const checkpointText = String(checkpoint);
     assert.match(checkpointText, /DATA-QUALITY CHECKPOINT/);
     assert.match(checkpointText, /4\/4 reads returned empty/);
-    assert.match(checkpointText, /ask_user_question/, 'the check-in fork is offered');
+    assert.match(checkpointText, /do NOT ask the user to authorize a retry or choose for you/i,
+      'the checkpoint keeps source repair with the model instead of punting it to the user');
+    assert.match(checkpointText, /Fix the source:[\s\S]*Write honestly:/,
+      'the model receives both bounded autonomous recovery paths');
     assert.equal(writeDispatches, 0, 'the typed checkpoint proves no provider write started');
 
     // A deliberate second attempt proceeds — autonomy redirected, never dead-ended.

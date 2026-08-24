@@ -18,6 +18,7 @@ import { TOOL_REGISTRY } from '../tools/tool-registry.js';
 import { queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
 import { getHotSet } from './tool-hotset.js';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
+import { uniqueEnabledWorkflowMatch } from '../tools/named-workflow-match.js';
 
 export interface CatalogEntry {
   name: string;
@@ -56,8 +57,38 @@ export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
   'ask_user_question',
   'memory_recall_all',
   'recall_tool_result',
+  // Query a big stored result / document instead of paging it. Same recall
+  // class as recall_tool_result / tool_output_query — a landed result must be
+  // usable without a discovery round (live 2026-08-18: file_query missing from
+  // the surface turned one 322k search result into 37 recall pages and an ask
+  // for a second search).
+  'file_query',
   'tool_output_query',
   'tool_search',
+]);
+
+/**
+ * Alternate discovery / memory-admin doors. They stay callable this turn
+ * through `tool_search` → `call_tool` / `work_call`, but they must not become
+ * first-class just because recall or the session LRU touched them. Otherwise
+ * the model sees seven search products and spends the turn choosing a door
+ * instead of doing the work. The one advertised broker is `tool_search`.
+ * An explicit name in the user's message still promotes the named door.
+ */
+export const DISCOVERY_SIBLING_DOORS: ReadonlySet<string> = new Set([
+  'composio_search_tools',
+  'composio_list_tools',
+  'mcp_list_tools',
+  'local_cli_list',
+  'local_cli_probe',
+  'tool_choice_recall',
+  'tool_choice_remember',
+  'tool_choice_invalidate',
+  'tool_choice_forget',
+  'skill_list',
+  'execution_list',
+  'session_history',
+  'focus_get',
 ]);
 
 /** At most the last few tools ACTUALLY dispatched stay schema-loaded. */
@@ -72,6 +103,17 @@ export function allRegistryNames(): Set<string> {
 
 function passesPolicy(name: string, allowedNames?: ReadonlySet<string>): boolean {
   return allowedNames ? allowedNames.has(name) : true;
+}
+
+/** A matched workflow is a resource identity, not permission to execute it.
+ * Promote the immediate run control only from affirmative execution text;
+ * explicit prohibitions are constraints and must never become positive intent. */
+function requestsWorkflowExecution(input: string): boolean {
+  const positive = input.replace(
+    /\b(?:do\s+not|don'?t|dont|never|without)\b[^.!?;\n]{0,180}/gi,
+    ' prohibited_workflow_action ',
+  );
+  return /\b(?:run|start|execute|launch|trigger|kick\s+off)\b/i.test(positive);
 }
 
 /**
@@ -121,6 +163,8 @@ export function buildCompactToolCatalog(
  * behind tool_search. Union of
  *   - TOOL_SEARCH_ALWAYS_LOADED (the tiny acquisition/recovery kernel),
  *   - exact tool names present in the user's request,
+ *   - workflow_get when the accepted text uniquely names an enabled workflow,
+ *     plus workflow_run only for affirmative execution text,
  *   - tool_choice_recall pins for this input (memory says these worked before), and
  *   - a bounded session LRU (tools this session actually dispatched),
  * intersected with policy-allowed (defaults to the whole registry). Only names that
@@ -135,16 +179,33 @@ export function resolveHotSet(
   const allowed = opts.allowedNames;
   const keep = (name: string) => universe.has(name) && passesPolicy(name, allowed);
 
+  const query = userInput ?? '';
+  const named = (name: string) => queryExplicitlyNamesTool(query, name);
+  // Sibling discovery doors stay deferred unless the user named that exact
+  // tool. Recall/LRU promotion of a search product is how a Salesforce read
+  // grew three catalog searches.
+  const keepFirstClass = (name: string) =>
+    keep(name) && (!DISCOVERY_SIBLING_DOORS.has(name) || named(name));
+
   const out = new Set<string>();
   for (const name of TOOL_SEARCH_ALWAYS_LOADED) if (keep(name)) out.add(name);
   for (const name of universe) {
-    if (keep(name) && queryExplicitlyNamesTool(userInput ?? '', name)) out.add(name);
+    if (keep(name) && named(name)) out.add(name);
+  }
+  // A uniquely named existing workflow is a bounded, host-proven resource
+  // match. Keep its reader first-class so an inspect/frontmatter turn does not
+  // have to discover the workflow control it already identified. Resource
+  // identity alone is not execution authority: promote the immediate run
+  // control only when the positive (non-prohibited) request asks to execute.
+  if (uniqueEnabledWorkflowMatch(query)) {
+    if (keep('workflow_get')) out.add('workflow_get');
+    if (keep('workflow_run') && requestsWorkflowExecution(query)) out.add('workflow_run');
   }
   for (const name of recallPinnedBuiltinTools(userInput).slice(0, MAX_RECALL_PROMOTIONS)) {
-    if (keep(name)) out.add(name);
+    if (keepFirstClass(name)) out.add(name);
   }
   for (const name of getHotSet(sessionId).slice(0, MAX_SESSION_PROMOTIONS)) {
-    if (keep(name)) out.add(name);
+    if (keepFirstClass(name)) out.add(name);
   }
   return out;
 }

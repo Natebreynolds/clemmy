@@ -28,7 +28,9 @@ const actionAdmission = await import('./expected-work-admission.js');
 const guardrail = await import('./tool-guardrail.js');
 const settlement = await import('./attempt-settlement.js');
 const terminalRepair = await import('./terminal-presentation-repair.js');
-const { _setCodeModeToolsForTests } = await import('../../tools/code-mode-tool.js');
+const { _setInnerDispatchToolsForTests } = await import('../../tools/inner-dispatch.js');
+const { writeWorkflow } = await import('../../memory/workflow-store.js');
+const { WORKFLOWS_DIR } = await import('../../memory/vault.js');
 
 type Invokable = Tool<unknown> & {
   invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
@@ -112,11 +114,11 @@ beforeEach(() => {
   guardrail._resetAllTrackersForTests();
   guardrail._resetGuardrailScopeSignals();
   settlement._resetAttemptSettlementStateForTests();
-  _setCodeModeToolsForTests(null);
+  _setInnerDispatchToolsForTests(null);
 });
 
 after(() => {
-  _setCodeModeToolsForTests(null);
+  _setInnerDispatchToolsForTests(null);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -125,7 +127,6 @@ test('standard spine activates exact action authority before building its sole b
   const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'action activation' });
   let buildCount = 0;
   let capturedNames: string[] = [];
-  let codeModeDescription = '';
   const result = await runConversation({
     sessionId: session.id,
     input: 'Read my profile and workspace roots, then write a local report.',
@@ -140,11 +141,10 @@ test('standard spine activates exact action authority before building its sole b
         sessionId: identity.sessionId,
         sourceUserSeq: identity.sourceUserSeq,
         acceptedRoute: identity.route,
-        allowedToolNames: ['tool_search', 'run_tool_program', 'user_profile_read', 'workspace_roots', 'write_file'],
+        allowedToolNames: ['tool_search', 'user_profile_read', 'workspace_roots', 'write_file'],
         allowToolJit: true,
       });
       capturedNames = namesOf(agent);
-      codeModeDescription = String(invokable(agent, 'run_tool_program').description ?? '');
       return agent;
     },
     makeRunner: makeRunnerStub,
@@ -154,22 +154,21 @@ test('standard spine activates exact action authority before building its sole b
 
   assert.equal(buildCount, 1);
   assert.ok(capturedNames.includes('work_call'));
-  assert.equal(capturedNames.includes('call_tool'), false, 'action exposes no competing generic carrier');
+  assert.ok(capturedNames.includes('call_tool'), 'action preserves its read/control carrier through the explicit allowlist');
   assert.equal(capturedNames.includes('user_profile_read'), false, 'business tools stay behind work_call');
   assert.equal(capturedNames.includes('workspace_roots'), false, 'business tools stay behind work_call');
   assert.ok(capturedNames.includes('tool_search'), 'control discovery remains directly callable');
-  assert.match(codeModeDescription, /clem\.work/);
-  assert.match(codeModeDescription, /proposal must be null/);
   assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(result.publicPresentation?.kind, 'blocked', 'a zero-call action done claim must fail closed');
   const source = eventlog.listEvents(session.id, { types: ['user_input_received'] })[0]!;
-  assert.equal(expectedWork.loadExpectedWorkContract(session.id, source.seq).status, 'missing');
+  assert.equal(expectedWork.loadExpectedWorkContract(session.id, source.seq).status, 'conflict',
+    'the admitted action cannot be relabeled as missing after its zero-call completion claim fails closed');
   const db = eventlog.openEventLog();
   assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?`)
     .get(session.id, source.seq) as { n: number }).n, 0);
 });
 
-test('standard direct and retrieve routes retain the legacy carrier surface', async () => {
+test('standard direct and retrieve routes: direct is conversation-only, retrieve keeps the deferred dispatcher', async () => {
   let repairCalls = 0;
   for (const [input, expectedRoute] of [
     ['Hello', 'direct_reply'],
@@ -178,8 +177,7 @@ test('standard direct and retrieve routes retain the legacy carrier surface', as
     const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: expectedRoute });
     let builtRoute = '';
     let surface: string[] = [];
-    let codeModeDescription = '';
-    const result = await runConversation({
+      const result = await runConversation({
       sessionId: session.id,
       input,
       maxSteps: 1,
@@ -194,8 +192,6 @@ test('standard direct and retrieve routes retain the legacy carrier surface', as
           allowToolJit: true,
         });
         surface = namesOf(agent);
-        const codeMode = (agent.tools ?? []).find((toolRef) => toolRef.name === 'run_tool_program');
-        codeModeDescription = String(codeMode?.description ?? '');
         return agent;
       },
       makeRunner: makeRunnerStub,
@@ -209,82 +205,67 @@ test('standard direct and retrieve routes retain the legacy carrier surface', as
     });
     assert.equal(builtRoute, expectedRoute);
     assert.equal(surface.includes('work_call'), false, `${expectedRoute} must not pay the action schema cost`);
-    assert.ok(surface.includes('call_tool'), `${expectedRoute} keeps its pre-existing deferred dispatcher`);
-    assert.doesNotMatch(codeModeDescription, /ACTION WORK.*clem\.work/);
     if (expectedRoute === 'direct_reply') {
+      // THE CLEAN LOOP: a compiled direct_reply without an explicit allowlist
+      // is conversation-only — compose_reply still runs the model with ZERO
+      // tool authority (factorySkipForCompiledRoute).
+      assert.deepEqual(surface, [], 'direct_reply assembles no tool surface');
       assert.equal(result.publicPresentation?.text, 'Legacy direct_reply answer.');
+    } else {
+      assert.ok(surface.includes('call_tool'), `${expectedRoute} keeps its deferred dispatcher`);
     }
   }
   assert.equal(repairCalls, 0, 'direct/retrieve presentation is byte-preserved without a repair model call');
 });
 
-test('shared Codex/BYO action run_tool_program carries scoped work_call through the real sandbox', async () => {
-  const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'action code work' });
-  let sourceUserSeq = 0;
-  let innerExecutions = 0;
-  _setCodeModeToolsForTests(new Map([['user_profile_read', {
-    name: 'user_profile_read',
-    invoke: async () => {
-      innerExecutions += 1;
-      return { successful: true, data: { name: 'Clem' } };
-    },
-  }]]));
+test('shared action surface makes an exact saved-workflow reader first-class without discovery', async () => {
+  const workflowSlug = 'shared-harness-workflow-read-proof';
+  writeWorkflow(workflowSlug, {
+    name: 'Shared Harness Workflow Read Proof',
+    description: 'Fixture proving the unified host surface can inspect a named workflow directly.',
+    enabled: true,
+    trigger: { schedule: '0 8 * * 1-5', timezone: 'America/Los_Angeles' },
+    steps: [{ id: 'main', prompt: 'Return the fixture value.' }],
+  });
   try {
+    const input = `Read only the frontmatter for workflow ${workflowSlug}. Do not run or update it, and return only its schedule and timezone.`;
+    const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'shared workflow read' });
+    let capturedNames: string[] = [];
     await runConversation({
       sessionId: session.id,
-      input: 'Read my profile and workspace roots, then write a local report.',
+      input,
       maxSteps: 1,
       judgeCompletion: false,
       buildAgent: async (identity) => {
-        sourceUserSeq = identity.sourceUserSeq;
-        return buildOrchestratorAgent({
-          userInput: 'Read my profile and workspace roots, then write a local report.',
+        assert.equal(identity.route, 'act', 'the live canary-shaped request stays on the shared action surface');
+        const agent = await buildOrchestratorAgent({
+          userInput: input,
           sessionId: identity.sessionId,
           sourceUserSeq: identity.sourceUserSeq,
           acceptedRoute: identity.route,
-          allowedToolNames: ['run_tool_program', 'user_profile_read', 'workspace_roots', 'write_file'],
           allowToolJit: true,
         });
+        capturedNames = namesOf(agent);
+        return agent;
       },
       makeRunner: makeRunnerStub,
-      runRunner: async (_runner, agent, items) => {
-        const program = invokable(agent, 'run_tool_program');
-        const firstWork = workInput({
-          proposal: actionProposal(),
-          requirementId: 'read-profile',
-          name: 'user_profile_read',
-        });
-        const output = await program.invoke(
-          { context: { sessionId: session.id, sourceUserSeq, turn: 1 } },
-          JSON.stringify({ program: `return await clem.work(${firstWork});` }),
-          { toolCall: { callId: 'outer-action-code-program' } },
-        );
-        assert.match(String(output), /successful/);
-        return done(items, 'The profile read is complete; the remaining accepted work is still open.');
-      },
+      runRunner: async (_runner, _agent, items) => done(items),
       terminalDeliveryJudgePort: unavailableTerminalDeliveryJudge(),
     });
-  } finally {
-    _setCodeModeToolsForTests(null);
-  }
 
-  assert.equal(innerExecutions, 1);
-  const db = eventlog.openEventLog();
-  const binding = db.prepare(`
-    SELECT requirement_id, tool_name FROM expected_work_call_bindings
-     WHERE session_id = ? AND source_user_seq = ?
-  `).get(session.id, sourceUserSeq) as { requirement_id: string; tool_name: string } | undefined;
-  assert.deepEqual(binding, { requirement_id: 'read-profile', tool_name: 'user_profile_read' });
-  assert.equal((db.prepare(`
-    SELECT COUNT(*) AS n FROM logical_tool_calls
-     WHERE session_id = ? AND source_user_seq = ? AND state = 'OPEN'
-  `).get(session.id, sourceUserSeq) as { n: number }).n, 0);
+    assert.ok(capturedNames.includes('workflow_get'), 'the exact named-workflow reader is directly callable');
+    assert.equal(capturedNames.includes('workflow_run'), false, 'the explicit no-run constraint removes the immediate queue control');
+    assert.ok(capturedNames.includes('call_tool'), 'the deferred read/control carrier remains available');
+    assert.ok(capturedNames.includes('tool_search'), 'unrelated unresolved capabilities retain the governed broker');
+  } finally {
+    rmSync(path.join(WORKFLOWS_DIR, workflowSlug), { recursive: true, force: true });
+  }
 });
 
 test('standard action keeps control discovery before freeze, fuses proposal with call one, and binds later calls', async () => {
   const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'fused work calls' });
   const calls: string[] = [];
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['user_profile_read', {
       name: 'user_profile_read',
       invoke: async () => { calls.push('user_profile_read'); return { successful: true, data: { name: 'Clem' } }; },

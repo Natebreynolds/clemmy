@@ -24,10 +24,36 @@ import { parkDependencyRequest } from '../harness/dependency-request.js';
 import { describeGoalCatalogGap, selectGoalCatalog } from '../harness/connected-goal-catalog.js';
 import { disposeGate } from '../gate-reason.js';
 import { commitTurnOutcome } from '../harness/delivery-committer.js';
-import { turnOutcomeId } from '../harness/turn-outcome.js';
+import {
+  presentationEventFromCompletionData,
+  turnOutcomeId,
+  type PresentationEvent,
+  type TurnOutcome,
+} from '../harness/turn-outcome.js';
 import { assessControlComplexity, generalSchedulerForbidden } from '../harness/control-complexity.js';
 import { runDirectNodeInvocation } from '../harness/direct-invocation.js';
 import { createHash } from 'node:crypto';
+import { scheduleCliInventoryExpansion } from '../local-capability-enumeration.js';
+import { PUBLIC_RUN_FAILURE_TEXT } from '../harness/public-presentation.js';
+import { renderTypedControlState } from '../harness/typed-control-state.js';
+
+/** The accepted source's own words, as the user wrote them. */
+function objectiveForSource(
+  identity: Pick<TurnIdentity, 'sessionId' | 'sourceUserSeq'>,
+): string {
+  try {
+    const source = listEvents(identity.sessionId, {
+      sinceSeq: identity.sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    }).find((event) => event.seq === identity.sourceUserSeq);
+    const display = source?.data.displayText;
+    if (typeof display === 'string' && display.trim()) return display;
+    return typeof source?.data.text === 'string' ? source.data.text : '';
+  } catch {
+    return '';
+  }
+}
 
 function graphPromisesWrite(graph: { effectCeiling?: string }): boolean {
   const ceiling = graph.effectCeiling;
@@ -94,6 +120,20 @@ function stopUnboundParticipated(
   identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>,
   graph: { effectCeiling?: string } | null,
 ): Extract<TypedSourceDispatch, { kind: 'blocked' | 'needs_input' }> {
+  // This is the one place a participated turn is KNOWN to have failed to bind,
+  // and it is therefore where we learn the catalog may have been incomplete.
+  // Some carriers are a control plane rather than a capability list — a local
+  // program is indexed as one row while its subcommands are the capabilities —
+  // so a selection over that catalog can only refuse. Refusing is right;
+  // guessing would be worse. But never ASKING makes the refusal permanent, and
+  // it reads as principled while being false.
+  //
+  // Deliberately here and not inside the binder: that is a pure selector, run
+  // more than once per turn and called directly by tests, and giving it a side
+  // effect would fire this repeatedly for one ask. Detached because this turn
+  // has already failed — probing costs seconds and cannot save it, but the
+  // answer is durable, so it buys every later ask.
+  try { scheduleCliInventoryExpansion(objectiveForSource(identity)); } catch { /* best effort */ }
   if (graph && (graphPromisesWrite(graph) || graphPromisesUnknown(graph))) {
     return unboundConstructConnectionPark(identity) ?? stopUnboundWork(identity, graph);
   }
@@ -158,11 +198,176 @@ function unboundConstructConnectionPark(
   }
 }
 
+export type TypedExecutionHold = NonNullable<ConstructRunResult['hold']>;
+
 export type TypedSourceDispatch =
-  | { kind: 'conversation' }
+  | { kind: 'conversation'; capabilityRoute: 'direct_reply' | 'retrieve' | 'act' }
   | { kind: 'typed'; result: ConstructRunResult }
   | { kind: 'blocked'; text: string }
-  | { kind: 'needs_input'; text: string };
+  | { kind: 'needs_input'; text: string }
+  | {
+      kind: 'held';
+      hold: TypedExecutionHold;
+    };
+
+function parkClarifyingOpenSlot(
+  identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>,
+  clarifying: string,
+): Extract<TypedSourceDispatch, { kind: 'needs_input' }> {
+  parkDependencyRequest({
+    sessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+    turn: identity.turn,
+    kind: 'user_input',
+    text: clarifying,
+  });
+  appendEvent({
+    sessionId: identity.sessionId,
+    turn: identity.turn,
+    role: 'system',
+    type: 'awaiting_user_input',
+    data: { question: clarifying, sourceUserSeq: identity.sourceUserSeq },
+  });
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity: {
+      sessionId: identity.sessionId,
+      turn: identity.turn,
+      sourceUserSeq: identity.sourceUserSeq,
+    },
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: clarifying },
+  });
+  return { kind: 'needs_input', text: clarifying };
+}
+
+function exactPersistedPresentation(
+  identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>,
+): PresentationEvent | null {
+  const event = listEvents(identity.sessionId, {
+    sinceSeq: identity.sourceUserSeq,
+    types: ['conversation_completed'],
+  }).find((candidate) => (
+    candidate.turn === identity.turn
+    && candidate.data.sourceUserSeq === identity.sourceUserSeq
+  ));
+  if (!event) return null;
+  const presentation = presentationEventFromCompletionData(event.data);
+  if (
+    !presentation
+    || presentation.identity.sessionId !== identity.sessionId
+    || presentation.identity.turn !== identity.turn
+    || presentation.identity.sourceUserSeq !== identity.sourceUserSeq
+  ) return null;
+  return presentation;
+}
+
+function safeFallbackOutcome(
+  identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>,
+  status: Extract<ConstructRunResult['status'], 'blocked' | 'failed' | 'uncertain'>,
+): TurnOutcome {
+  const owned = {
+    sessionId: identity.sessionId,
+    turn: identity.turn,
+    sourceUserSeq: identity.sourceUserSeq,
+  };
+  if (status === 'failed') {
+    return {
+      version: 2,
+      id: turnOutcomeId(owned),
+      identity: owned,
+      status: 'failed',
+      resumable: false,
+      presentation: { kind: 'error', text: PUBLIC_RUN_FAILURE_TEXT },
+    };
+  }
+  if (status === 'uncertain') {
+    return {
+      version: 2,
+      id: turnOutcomeId(owned),
+      identity: owned,
+      status: 'uncertain',
+      resumable: true,
+      presentation: {
+        kind: 'blocked',
+        text: renderTypedControlState({ status: 'uncertain' }),
+      },
+    };
+  }
+  return {
+    version: 2,
+    id: turnOutcomeId(owned),
+    identity: owned,
+    status: 'blocked',
+    resumable: false,
+    presentation: {
+      kind: 'blocked',
+      text: 'I could not safely complete and verify every required step, so I stopped without reporting the task as done. The technical details are available in the activity log.',
+    },
+  };
+}
+
+function dispatchPersistedRunResult(
+  identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>,
+  result: ConstructRunResult,
+): TypedSourceDispatch {
+  let presentation = result.terminal ?? exactPersistedPresentation(identity);
+  if (result.status === 'held') {
+    // A terminal winner, if one raced this activation, supersedes its local
+    // recovery hold. Otherwise there is deliberately no public response yet.
+    if (!presentation) {
+      return {
+        kind: 'held',
+        hold: result.hold ?? {
+          owner: 'host',
+          wake: 'recovery',
+          reason: 'recovery_pending',
+        },
+      };
+    }
+  } else if (!presentation) {
+    // Defense in depth for direct runners and future ordinary stop branches:
+    // an admitted non-success cannot escape without an exact public winner.
+    if (result.status === 'success') {
+      return {
+        kind: 'held',
+        hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+      };
+    }
+    presentation = commitTurnOutcome(safeFallbackOutcome(identity, result.status)).presentation;
+  }
+
+  if (!presentation) {
+    return {
+      kind: 'held',
+      hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+    };
+  }
+  if (presentation.status === 'done' && presentation.kind === 'answer') {
+    const {
+      error: _privateError,
+      hold: _privateHold,
+      ...safeResult
+    } = result;
+    return {
+      kind: 'typed',
+      result: {
+        ...safeResult,
+        status: 'success',
+        artifactHandle: presentation.text,
+        published: true,
+        terminal: presentation,
+      },
+    };
+  }
+  if (presentation.status === 'needs_input') {
+    return { kind: 'needs_input', text: presentation.text };
+  }
+  return { kind: 'blocked', text: presentation.text };
+}
 
 const SUPPORTED_CONSTRUCTS = new Set([
   'collect_then_construct',
@@ -186,53 +391,28 @@ export async function dispatchAdmittedSource(
   identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>,
 ): Promise<TypedSourceDispatch> {
   const disposition = readSemanticDisposition(identity.sessionId, identity.sourceUserSeq);
-  if (!disposition || disposition.participation !== 'participated') {
-    return { kind: 'conversation' };
-  }
   const event = getTurnGraphEventForSource(identity.sessionId, identity.sourceUserSeq);
   const graph = turnGraphFromShadowEvent(event);
+  if (!disposition || disposition.participation !== 'participated') {
+    const route = graph?.classification.route;
+    return {
+      kind: 'conversation',
+      capabilityRoute: route === 'act' || route === 'retrieve' ? route : 'direct_reply',
+    };
+  }
   const clarifying = clarifyingOpenSlotQuestionForSource(identity.sessionId, identity.sourceUserSeq);
-  if (clarifying) {
-    parkDependencyRequest({
-      sessionId: identity.sessionId,
-      sourceUserSeq: identity.sourceUserSeq,
-      turn: identity.turn,
-      kind: 'user_input',
-      text: clarifying,
-    });
-    appendEvent({
-      sessionId: identity.sessionId,
-      turn: identity.turn,
-      role: 'system',
-      type: 'awaiting_user_input',
-      data: { question: clarifying, sourceUserSeq: identity.sourceUserSeq },
-    });
-    commitTurnOutcome({
-      version: 2,
-      id: turnOutcomeId(identity),
-      identity: {
-        sessionId: identity.sessionId,
-        turn: identity.turn,
-        sourceUserSeq: identity.sourceUserSeq,
-      },
-      status: 'needs_input',
-      resumable: true,
-      needs: { kind: 'input' },
-      presentation: { kind: 'question', text: clarifying },
-    });
-    return { kind: 'needs_input', text: clarifying };
-  }
-  const conversationMode = graph?.classification.route === 'direct_reply'
-    || hostOnlySketchForSource(identity.sessionId, identity.sourceUserSeq);
-  if (disposition.outcome === 'blocked' || disposition.outcome === 'unavailable') {
-    if (conversationMode) return { kind: 'conversation' };
-    return stopUnboundParticipated(identity, graph);
-  }
+  if (clarifying) return parkClarifyingOpenSlot(identity, clarifying);
   if (!graph) {
     return stopUnboundParticipated(identity, null);
   }
-  if (conversationMode) {
-    return { kind: 'conversation' };
+  if (disposition.outcome === 'blocked' || disposition.outcome === 'unavailable') {
+    return stopUnboundParticipated(identity, graph);
+  }
+  if (graph.classification.route === 'direct_reply') {
+    return { kind: 'conversation', capabilityRoute: 'direct_reply' };
+  }
+  if (hostOnlySketchForSource(identity.sessionId, identity.sourceUserSeq)) {
+    return { kind: 'conversation', capabilityRoute: 'direct_reply' };
   }
   if (!typedGraphHasExecutableOperations(graph)) {
     return stopUnboundParticipated(identity, graph);
@@ -315,5 +495,5 @@ export async function dispatchAdmittedSource(
   if (result.status === 'blocked' && result.error === 'unsupported_typed_topology') {
     return { kind: 'blocked', text: commitUnsupportedTypedExecutionTurn(identity).text };
   }
-  return { kind: 'typed', result };
+  return dispatchPersistedRunResult(identity, result);
 }

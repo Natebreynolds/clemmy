@@ -2,8 +2,8 @@
  * CHECKPOINT A — the cross-lane defects, pinned red.
  *
  * Every test here is derived from one of two preserved accepted turns:
- *   Codex  sess-msngvt2l-94f6eeb1  seq 40502  — 121s, 13 calls, 392k prompt tokens
- *   Claude sess-msnihcuo-34dfca96  seq 40654  — 440s, 56 calls, 3.11M prompt tokens
+ *   Codex  session-fixture-codex-trace  seq 40502  — 121s, 13 calls, 392k prompt tokens
+ *   Claude session-fixture-claude-trace seq 40654  — 440s, 56 calls, 3.11M prompt tokens
  *
  * They are written to FAIL against the current runtime. Fixtures are the
  * provider-neutral AlphaSource/AlphaSink pair; nothing below names a real

@@ -13,6 +13,7 @@ process.env.CLEMENTINE_HOME = testHome;
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { createWorkflowRunDefinitionSnapshot } = await import('../execution/workflow-run-definition.js');
 
 test.after(() => {
   try { rmSync(testHome, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -39,18 +40,24 @@ test('capability resume route re-admits the same run and is idempotent across a 
   const slug = 'resume-capability-flow';
   const workflowName = 'Resume capability flow';
   const runId = 'capability-route-run';
-  writeWorkflow(slug, {
+  const definition = {
     name: workflowName,
     description: 'Resume after reconnecting.',
     enabled: true,
     trigger: { manual: true },
-    steps: [{ id: 'read', prompt: 'Read connected data.', sideEffect: 'read' }],
-  });
+    steps: [{ id: 'read', prompt: 'Read connected data.', sideEffect: 'read' as const }],
+  };
+  writeWorkflow(slug, definition);
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   const runPath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
   writeFileSync(runPath, JSON.stringify({
     id: runId,
     workflow: workflowName,
+    workflowDefinitionSnapshot: createWorkflowRunDefinitionSnapshot(
+      slug,
+      definition,
+      new Date().toISOString(),
+    ),
     status: 'blocked_capability',
     createdAt: new Date().toISOString(),
     capabilityBlock: {

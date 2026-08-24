@@ -682,10 +682,10 @@ export function registerSpaceTools(server: McpServer): void {
   server.tool(
     'space_action_prepare',
     [
-      'Prepare ONE action already declared in a Workspace for the user to approve.',
-      'This tool never dispatches the action. It only creates/reuses the same exact approval card used by the Workspace button; execution remains owned by the existing Workspace approval + receipt path.',
+      'Prepare ONE action already declared in a Workspace for the user to approve, or execute it when exact standing approval already covers this invocation.',
+      'With no standing approval, this tool only creates/reuses the same exact approval card used by the Workspace button and does not dispatch. With standing approval, it executes only the exact declared action, caller arguments, and current runner bytes covered by that authority through the existing Workspace receipt path.',
       'The approval is bound to the exact Workspace, declared action manifest, runner digest when applicable, and caller arguments. You cannot supply or override a Composio slug, runner, or wildcard authority here.',
-      'Use only after Workspace evidence supports the proposed action and the user asked you to take or prepare it. Report it as waiting for approval — never as executed.',
+      'Use only after Workspace evidence supports the proposed action and the user asked you to take or prepare it. Report exactly the returned status: waiting when an approval was staged, or executed only when the result says standing authority ran it.',
     ].join('\n'),
     {
       slug: z.string().min(2).max(63).describe('Exact existing Workspace slug.'),
@@ -1081,7 +1081,7 @@ export function registerSpaceTools(server: McpServer): void {
     'space_get_runner',
     [
       "Read the SOURCE of a Workspace data/action RUNNER (the .mjs/.py/.sh script under data/ that pulls or computes the data), line-numbered — the EXACT text to craft a space_edit_runner find string. Use this BEFORE editing a runner, and to SEE where it actually pulls data from.",
-      'space_get shows the manifest + dataset (NOT runner source); space_try_runner EXECUTES a runner but does not show its code. This is the sanctioned way to READ a runner — never read_file/grep/ls it from the shell.',
+      'space_get shows the manifest + dataset (NOT runner source); space_try_runner performs static safety/provenance inspection without executing the runner and does not show its code. This is the sanctioned way to READ a runner — never read_file/grep/ls it from the shell.',
       'Omit runner_path to LIST every runner the workspace declares, each with its data source / action and a one-line data-source provenance. Pass grep to target a region of a large runner.',
     ].join('\n'),
     {

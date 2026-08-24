@@ -21,6 +21,7 @@ import {
   type ModelRoutingMode,
 } from '../../config.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
+import { getStoredXaiOAuthTokens } from '../xai-auth-bridge.js';
 import { claudeAvailable } from './judge-family.js';
 import pino from 'pino';
 
@@ -51,6 +52,11 @@ function cleanId(raw: unknown): string {
  * UI. Each provider's key lives in the vault/env (getByoProviderApiKey), never
  * in the JSON.
  */
+/** The xAI provider slug. Its credential may arrive by SUBSCRIPTION OAUTH
+ *  rather than a typed key, so it is the one provider whose secret has two
+ *  legitimate sources. */
+export const XAI_PROVIDER_ID = 'xai';
+
 export function getByoProviders(): ByoProvider[] {
   const providers: ByoProvider[] = [];
 
@@ -94,6 +100,18 @@ export function getByoProviders(): ByoProvider[] {
     }
   }
 
+  // A subscription grant with no registry row still needs a handle: Settings
+  // Browse/Refresh and the role dropdowns read this list. Empty modelIds are
+  // honest — Refresh fills them. Never invent a Grok id here.
+  if (getStoredXaiOAuthTokens() && !providers.some((p) => p.id === XAI_PROVIDER_ID)) {
+    providers.push({
+      id: XAI_PROVIDER_ID,
+      label: 'xAI (Grok)',
+      baseURL: 'https://api.x.ai/v1',
+      modelIds: [],
+    });
+  }
+
   return providers;
 }
 
@@ -105,8 +123,34 @@ export function getByoProviders(): ByoProvider[] {
  *  MUST be the provider's real model (e.g. glm-5.2), never the gpt-* id that was
  *  requested — otherwise a gpt-* id gets sent verbatim to the BYO endpoint. The
  *  model actually sent on the wire is passed to getByoModel separately. */
+
+/**
+ * The credential for a provider.
+ *
+ * An explicitly typed key always wins: a user who pasted one is telling us
+ * which credential to bill, and silently preferring a subscription grant over
+ * that would spend the wrong account. Only when no key was typed does a
+ * connected xAI OAuth grant supply the bearer.
+ *
+ * Sync by design, matching the caller. Refresh is the auth store's job — this
+ * returns whatever is currently stored, and an expired token surfaces as a
+ * provider 401 rather than being silently papered over here.
+ */
+function providerCredential(providerId: string): string {
+  const typed = getByoProviderApiKey(providerId);
+  if (typed) return typed;
+  if (providerId !== XAI_PROVIDER_ID) return '';
+  return getStoredXaiOAuthTokens()?.accessToken ?? '';
+}
+
 export function providerToBackendConfig(p: ByoProvider): ByoBackendConfig {
-  const apiKey = getByoProviderApiKey(p.id);
+  const apiKey = providerCredential(p.id);
+  // xAI on the OAuth grant (no typed key): access tokens are short-lived, so
+  // the wire client must resolve a FRESH bearer per request — otherwise the
+  // first post-expiry call 401s and the brain is falsely marked auth-dead.
+  const oauthBacked = p.id === XAI_PROVIDER_ID
+    && !getByoProviderApiKey(p.id)
+    && Boolean(getStoredXaiOAuthTokens());
   return {
     configured: Boolean(p.baseURL && apiKey),
     baseURL: p.baseURL,
@@ -114,6 +158,15 @@ export function providerToBackendConfig(p: ByoProvider): ByoBackendConfig {
     primaryId: p.modelIds[0] || '',
     judgeId: p.modelIds[0] || '',
     providerLabel: p.label,
+    ...(oauthBacked
+      ? {
+          refreshBearer: async () => {
+            const { refreshNativeXaiTokens } = await import('../xai-native-oauth.js');
+            const { getFreshXaiAccessToken } = await import('../auth-store.js');
+            return getFreshXaiAccessToken(refreshNativeXaiTokens);
+          },
+        }
+      : {}),
   };
 }
 
@@ -484,7 +537,7 @@ export async function warmByoProviderCatalogs(timeoutMs = 8_000): Promise<number
     const providers = getByoProviders().filter((p) => providerToBackendConfig(p).configured);
     await Promise.all(providers.map(async (p) => {
       try {
-        const apiKey = getByoProviderApiKey(p.id) ?? '';
+        const apiKey = providerToBackendConfig(p).apiKey;
         const result = await discoverProviderModels({ baseURL: p.baseURL, apiKey }, fetch, timeoutMs);
         if (result.status === 200 && 'models' in result.body) {
           recorded += result.body.models.filter((m) => m.contextLength !== undefined).length;

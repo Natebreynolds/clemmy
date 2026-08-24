@@ -24,10 +24,6 @@ const {
   withHarnessRunContext,
   wrapToolForHarness,
 } = await import('./brackets.js');
-const {
-  _setExternalMcpToolsForTests,
-  dispatchCodeModeTool,
-} = await import('../../tools/code-mode-tool.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -67,7 +63,7 @@ test('classifies broad discovery across provider and MCP transport spellings', (
     ['mcp__clementine-local__composio_list_tools', { toolkit_slug: 'outlook' }, 'composio_list_tools'],
     ['mcp_list_tools', { server: 'dataforseo', query: 'keyword volume' }, 'mcp_list_tools'],
     ['local_cli_list', { filter: 'gh' }, 'local_cli_list'],
-    ['clem.listTools', undefined, 'code_mode_list_tools'],
+    ['clem.listTools', undefined, 'catalog_list_tools'],
   ] as const) {
     assert.deepEqual(classifyDiscoveryCall(name, input), {
       category: 'broad_discovery',
@@ -87,7 +83,7 @@ test('classifies exact schema refreshes without charging ordinary status or carr
     ['local_cli_probe', { command: 'gh' }, 'local_cli_probe', 'gh'],
     ['composio_execute_tool', { tool_slug: 'SALESFORCE_DESCRIBE_SOBJECT', arguments: '{}' }, 'provider_describe_slug', 'salesforce_describe_sobject'],
     ['mcp__clementine-local__cx_airtable_get_base_schema', { base_id: 'x' }, 'provider_describe_slug', 'airtable_get_base_schema'],
-    ['clem.describe', 'read_file', 'code_mode_describe', 'read_file'],
+    ['clem.describe', 'read_file', 'catalog_describe', 'read_file'],
   ] as const) {
     assert.deepEqual(classifyDiscoveryCall(name, input), {
       category: 'exact_schema_refresh',
@@ -307,86 +303,4 @@ test('wrapped discovery timeout settles the durable claim as timed_out', async (
   );
   // Transient, so the slot stays where it is and the same call can be retried.
   assert.equal(state?.policy.epoch, 0);
-});
-
-test('code-mode describe local validation does not consume the corrected schema-refresh call', async () => {
-  const key = acceptedTask('code-mode-invalid-describe');
-  let inventoryReads = 0;
-  _setExternalMcpToolsForTests(async () => {
-    inventoryReads += 1;
-    return [{
-      name: 'dataforseo__serp',
-      description: 'search',
-      inputSchema: { type: 'object', properties: { query: { type: 'string' } } },
-    }];
-  });
-  const ctx = { ...key, counter: new ToolCallsCounter(10) };
-  try {
-    const invalid = await withHarnessRunContext(
-      ctx,
-      () => dispatchCodeModeTool('describe', undefined, key.sessionId, ctx.counter),
-    ) as { error?: string };
-    assert.match(invalid.error ?? '', /pass a tool name string/i);
-    assert.equal(inventoryReads, 0);
-    assert.equal(discoveryGovernor.getTaskState(key)?.claims.exact_schema_refresh, undefined);
-
-    const described = await withHarnessRunContext(
-      ctx,
-      () => dispatchCodeModeTool('describe', 'dataforseo__serp', key.sessionId, ctx.counter),
-    ) as { parameters?: unknown };
-    assert.ok(described.parameters);
-    assert.equal(inventoryReads, 1);
-    assert.equal(
-      discoveryGovernor.getTaskState(key)?.claims.exact_schema_refresh?.outcome,
-      'succeeded',
-    );
-  } finally {
-    _setExternalMcpToolsForTests(null);
-  }
-});
-
-test('code-mode listTools and describe share the same broad/exact task slots', async () => {
-  const key = acceptedTask('code-mode-helpers');
-  let inventoryReads = 0;
-  _setExternalMcpToolsForTests(async () => {
-    inventoryReads += 1;
-    return [{
-      name: 'dataforseo__serp',
-      description: 'search',
-      inputSchema: { type: 'object', properties: { query: { type: 'string' } } },
-    }];
-  });
-  const ctx = { ...key, counter: new ToolCallsCounter(10) };
-  try {
-    const listed = await withHarnessRunContext(
-      ctx,
-      () => dispatchCodeModeTool('listTools', undefined, key.sessionId, ctx.counter),
-    ) as { mcp: unknown[] };
-    assert.equal(listed.mcp.length, 1);
-
-    const described = await withHarnessRunContext(
-      ctx,
-      () => dispatchCodeModeTool('describe', 'dataforseo__serp', key.sessionId, ctx.counter),
-    ) as { parameters?: unknown };
-    assert.ok(described.parameters);
-    assert.equal(inventoryReads, 2);
-
-    await assert.rejects(
-      withHarnessRunContext(
-        ctx,
-        () => dispatchCodeModeTool('listTools', undefined, key.sessionId, ctx.counter),
-      ),
-      DiscoveryBudgetDeniedError,
-    );
-    await assert.rejects(
-      withHarnessRunContext(
-        ctx,
-        () => dispatchCodeModeTool('describe', 'dataforseo__serp', key.sessionId, ctx.counter),
-      ),
-      DiscoveryBudgetDeniedError,
-    );
-    assert.equal(inventoryReads, 2, 'denied helper calls never touch provider inventory');
-  } finally {
-    _setExternalMcpToolsForTests(null);
-  }
 });

@@ -252,6 +252,27 @@ export const codexDeviceBegin = () =>
   apiPost<CodexDeviceBegin>('/api/console/auth/codex-device/begin');
 export const codexDevicePoll = (loginId: string) =>
   apiPost<{ status?: 'complete' | 'pending' | 'expired'; message?: string; error?: string }>('/api/console/auth/codex-device/poll', { loginId });
+// ─── xAI (Grok) subscription sign-in — RFC 8628 device code ──────────────────
+// One flow for every surface: no redirect URI, no loopback listener, so the
+// SAME path works on desktop, over the tunnel, and from a phone.
+export interface XaiDeviceBegin {
+  loginId?: string;
+  userCode?: string;
+  verificationUri?: string;
+  verificationUriComplete?: string;
+  intervalSeconds?: number;
+  expiresAt?: string;
+  error?: string;
+}
+export const xaiDeviceBegin = () =>
+  apiPost<XaiDeviceBegin>('/api/console/auth/xai-device/begin');
+export const xaiDevicePoll = (loginId: string) =>
+  apiPost<{ status?: 'complete' | 'pending' | 'slow_down' | 'denied' | 'expired' | 'error'; intervalSeconds?: number; message?: string; error?: string }>('/api/console/auth/xai-device/poll', { loginId });
+export const xaiAuthStatus = () =>
+  apiGet<{ connected: boolean; expiresAt?: string; lastRefresh?: string; expiresSoon?: boolean }>('/api/console/auth/xai/status');
+export const xaiDisconnect = () =>
+  apiPost<{ ok?: boolean; connected?: boolean; error?: string }>('/api/console/auth/xai/disconnect');
+
 export const setDiscordOwner = (ownerId: string) =>
   apiPost<{ ok: boolean; discordAllowedUsers?: string; appliesOnRestart?: boolean }>('/api/console/credentials/discord-owner', { ownerId });
 export const setSlackOwner = (ownerId: string) =>
@@ -371,6 +392,7 @@ export const installBrowserHarness = () => apiPost<{ job: InstallJob }>('/api/co
 export const getBrowserHarnessInstallJob = (id: string) =>
   apiGet<{ job: InstallJob }>(`/api/console/browser-harness/install/${encodeURIComponent(id)}`);
 export const browserHarnessDoctor = () => apiPost<BrowserHarnessCommandResult>('/api/console/browser-harness/doctor', {});
+export const browserHarnessUpdate = () => apiPost<BrowserHarnessCommandResult>('/api/console/browser-harness/update', {});
 export const browserHarnessTest = () => apiPost<BrowserHarnessCommandResult>('/api/console/browser-harness/test', {});
 export const browserHarnessChromeSetup = () => apiPost<BrowserHarnessCommandResult>('/api/console/browser-harness/open-chrome-setup', {});
 

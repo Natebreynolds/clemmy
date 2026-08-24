@@ -154,19 +154,19 @@ test('MCP shim never appends fan-out prose without a keyed accepted task', async
   assert.ok(!/FAN-OUT NOW/.test(last), 'one call per accepted task never keys a fan-out bucket');
 });
 
-test('MCP shim leaves structured results untouched inside a code-mode batch', async () => {
+test('MCP shim leaves structured results untouched inside a nested-dispatch batch', async () => {
   const slug = 'dataforseo';
   const tool = 'serp_organic_live_advanced';
   const shim = createMcpNamespaceShim({ servers: [makeFakeServer(slug, tool)] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
 
-  const seq = anchorAcceptedTask('workflow:run-code-mode:seo', 'Run the seo research program.');
-  await withHarnessRunContext({ ...ctx('workflow:run-code-mode:seo', seq), codeMode: true }, async () => {
+  const seq = anchorAcceptedTask('workflow:run-nested-dispatch:seo', 'Run the seo research program.');
+  await withHarnessRunContext({ ...ctx('workflow:run-nested-dispatch:seo', seq), nestedDispatch: true }, async () => {
     await shim.listTools();
     for (let i = 1; i <= 6; i += 1) {
       const result = await shim.callTool(namespaced, { target: `firm-${i}.example` });
       const serialized = JSON.stringify(result);
-      assert.ok(!/FAN-OUT NOW|forEach|run_worker/.test(serialized), `call ${i}: no prose appended in code mode`);
+      assert.ok(!/FAN-OUT NOW|forEach|run_worker/.test(serialized), `call ${i}: no prose appended during nested dispatch`);
       assert.match(serialized, /serp rank 4/, `call ${i}: native result is preserved`);
     }
   });
@@ -177,7 +177,7 @@ test('MCP shim leaves structured results untouched inside a code-mode batch', as
 // lives HERE too. These integration tests drive the REAL shim -> guardrail
 // path: a genuine serial batch (6+ distinct entities) is refused with the
 // standing-turn-rule recovery message and the server is NOT contacted; the
-// entity gate, code-mode/certified-batch exemptions, and the default-off
+// entity gate, nested-dispatch/certified-batch exemptions, and the default-off
 // kill-switch each keep legitimate shapes untouched.
 
 /** Fake server that counts dispatches, so a refusal is provably pre-dispatch. */
@@ -201,7 +201,7 @@ function makeCountingServer(name: string, toolName: string): { server: MCPServer
   return { server, calls: () => n };
 }
 
-test('shim block: 6 distinct-entity serial reads → 6th REFUSED pre-dispatch with the program recovery', async () => {
+test('shim block: 6 distinct-entity serial reads → 6th REFUSED pre-dispatch with parallel-call recovery', async () => {
   _resetAllTrackersForTests();
   process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
   try {
@@ -218,7 +218,7 @@ test('shim block: 6 distinct-entity serial reads → 6th REFUSED pre-dispatch wi
       assert.equal(calls(), 5, 'first five reads reached the server');
       const r6 = JSON.stringify(await shim.callTool(namespaced, { target: 'firm-6-group-z.example' }));
       assert.ok(/REFUSED/.test(r6), '6th distinct entity → refused');
-      assert.ok(/run_tool_program/.test(r6), 'refusal carries the program recovery skeleton');
+      assert.ok(/PARALLEL tool calls/.test(r6), 'refusal carries the parallel-calls recovery');
       assert.equal(calls(), 5, 'the refused read NEVER reached the server');
     });
   } finally {
@@ -247,11 +247,11 @@ test('shim block entity gate: re-reading ONE entity 8 ways (pagination/refinemen
   }
 });
 
-test('shim block exemptions: code-mode program reads and certified-batch items are never refused', async () => {
+test('shim block exemptions: nested-dispatch child reads and certified-batch items are never refused', async () => {
   process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
   try {
     for (const [label, extra] of [
-      ['codeMode', { codeMode: true }],
+      ['nestedDispatch', { nestedDispatch: true }],
       ['certifiedBatch', { certifiedBatch: { batchId: 'b1', payloadHash: 'h1' } }],
     ] as const) {
       _resetAllTrackersForTests();
@@ -273,17 +273,17 @@ test('shim block exemptions: code-mode program reads and certified-batch items a
   }
 });
 
-test('shim block A: exempt program reads do NOT poison the orchestrator scope — the next DIRECT read is not refused', async () => {
+test('shim block A: exempt nested reads do NOT poison the orchestrator scope — the next DIRECT read is not refused', async () => {
   _resetAllTrackersForTests();
   process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
   try {
     const { server, calls } = makeCountingServer('dataforseo', 'serp_organic_live_advanced');
     const shim = createMcpNamespaceShim({ servers: [server] });
     const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
-    // Phase 1: a code-mode PROGRAM reads 6 distinct entities (exempt — the sanctioned
-    // batched execution). Under the fix these register in the program's OWN window.
+    // Phase 1: a nested carrier reads 6 distinct entities. Under the fix these
+    // register in the carrier's OWN window.
     const seq = anchorAcceptedTask('sess-poison', 'Run the program reads then one follow-up.');
-    await withHarnessRunContext({ ...ctx('sess-poison', seq), codeMode: true }, async () => {
+    await withHarnessRunContext({ ...ctx('sess-poison', seq), nestedDispatch: true }, async () => {
       await shim.listTools();
       for (let i = 1; i <= 6; i += 1)
         await shim.callTool(namespaced, { target: `firm-${i}-group-a.example` });

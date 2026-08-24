@@ -476,13 +476,13 @@ function readDelegationById(id: string): DelegationRecord | null {
   return null;
 }
 
-function loadWorkflowRunStatus(runId: string): 'queued' | 'running' | 'completed' | 'error' {
+function loadWorkflowRunStatus(runId: string): 'queued' | 'running' | 'completed' | 'blocked' | 'error' {
   const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
   if (!existsSync(filePath)) return 'error';
   try {
     const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as { status?: string };
     if (parsed.status === 'finalizing') return 'running';
-    return parsed.status === 'running' || parsed.status === 'completed' || parsed.status === 'error' ? parsed.status : 'queued';
+    return parsed.status === 'running' || parsed.status === 'completed' || parsed.status === 'blocked' || parsed.status === 'error' ? parsed.status : 'queued';
   } catch {
     return 'error';
   }
@@ -679,6 +679,16 @@ function syncWorkflowBindings(store: ExecutionStore, execution: ExecutionRecord)
             500,
           ),
           metadata: { runId: binding.runId, workflow: binding.workflow, status },
+        });
+      } else if (status === 'blocked') {
+        activity.push({
+          key: `workflow:${binding.runId}:blocked`,
+          type: 'workflow_blocked',
+          message: clean(
+            `Workflow "${binding.workflow}" was blocked.${typeof runRecord?.error === 'string' ? ` ${String(runRecord.error)}` : ''}`,
+            500,
+          ),
+          metadata: { runId: binding.runId, workflow: binding.workflow, status, outcome: 'blocked', error: runRecord?.error },
         });
       } else if (status === 'error') {
         activity.push({

@@ -1,5 +1,6 @@
 import type { AgentInputItem } from '@openai/agents';
 import { Agent, Runner } from '@openai/agents';
+import { createHash } from 'node:crypto';
 import { MODELS } from '../../config.js';
 import {
   appendEvent,
@@ -98,6 +99,7 @@ const DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS = 3;
 const DEFAULT_IN_FLIGHT_MAX_RETAIN_PAIRS = 8;
 const COMPACTION_SYSTEM_SUMMARY_PREFIXES = [
   '[summary of older completed tool activity]',
+  '[summary of byte-identical completed tool activity]',
   '[summary of earlier conversation]',
 ] as const;
 
@@ -327,6 +329,184 @@ interface CompletedToolPair {
   name: string;
   args: string;
   resultText: string;
+  storedResultText: string | null;
+}
+
+function completedToolPairs(
+  items: AgentInputItem[],
+  sessionId?: string,
+  requireRecallable = true,
+): CompletedToolPair[] {
+  const calls = new Map<string, { index: number; item: Record<string, unknown> }>();
+  const results = new Map<string, { index: number; item: Record<string, unknown> }>();
+  const resultOrder: string[] = [];
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index] as Record<string, unknown>;
+    const callId = typeof item.callId === 'string' ? item.callId : null;
+    if (!callId) continue;
+    if (item.type === 'function_call' && !calls.has(callId)) {
+      calls.set(callId, { index, item });
+    } else if (item.type === 'function_call_result' && !results.has(callId)) {
+      results.set(callId, { index, item });
+      resultOrder.push(callId);
+    }
+  }
+
+  const pairs: CompletedToolPair[] = [];
+  for (const callId of resultOrder) {
+    const call = calls.get(callId);
+    const result = results.get(callId);
+    if (!call || !result || call.index > result.index) continue;
+    if (requireRecallable && !recallableToolOutputExists(sessionId, callId)) continue;
+    let storedResultText: string | null = null;
+    if (sessionId) {
+      try {
+        storedResultText = getToolOutput(sessionId, callId)?.output ?? null;
+      } catch {
+        storedResultText = null;
+      }
+    }
+    pairs.push({
+      callId,
+      callIndex: call.index,
+      resultIndex: result.index,
+      name: typeof call.item.name === 'string' ? call.item.name : 'tool',
+      args: typeof call.item.arguments === 'string' ? call.item.arguments : '',
+      resultText: outputTextOf(result.item),
+      storedResultText,
+    });
+  }
+  return pairs;
+}
+
+function sha256Text(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+interface DuplicateToolPairGroup {
+  canonical: CompletedToolPair;
+  duplicates: CompletedToolPair[];
+  sha256: string;
+}
+
+/**
+ * Place a collapse summary without splitting an open call/result pair.
+ *
+ * Both collapse passes want the summary where the first collapsed item stood.
+ * In a SEQUENTIAL frame (call, result, call, result) that position is always a
+ * closed boundary. In a PARALLEL frame (call, call, result, result) it is not:
+ * dropping the second pair leaves `call A | summary | result A`, and the
+ * provider protocol boundary rejects that as `conversation_advanced_with_open_call`
+ * (live 2026-08-24: two concurrent tool_search calls returned identical bytes,
+ * dedup fired, and the next model step failed the assertion even though every
+ * call had settled cleanly).
+ *
+ * So advance the insertion point to the first index at or after the desired one
+ * where no function_call is still awaiting its result. Ordering of surviving
+ * items is never changed.
+ */
+function insertAtClosedCallBoundary(
+  items: AgentInputItem[],
+  desiredIndex: number,
+  summary: AgentInputItem,
+): AgentInputItem[] {
+  const open = new Set<string>();
+  let index = 0;
+  for (; index < items.length; index += 1) {
+    if (index >= desiredIndex && open.size === 0) break;
+    const any = items[index] as Record<string, unknown>;
+    const callId = typeof any.callId === 'string' ? any.callId : null;
+    if (!callId) continue;
+    if (any.type === 'function_call') open.add(callId);
+    else if (any.type === 'function_call_result') open.delete(callId);
+  }
+  return [...items.slice(0, index), summary, ...items.slice(index)];
+}
+
+function buildDuplicateToolPairsSummary(groups: DuplicateToolPairGroup[]): AgentInputItem {
+  const duplicateCount = groups.reduce((sum, group) => sum + group.duplicates.length, 0);
+  const lines = [
+    '[summary of byte-identical completed tool activity]',
+    `${duplicateCount} completed calls returned bytes already visible in ${groups.length} canonical result${groups.length === 1 ? '' : 's'}. The duplicate calls remain independently recallable; no durable output was discarded.`,
+  ];
+  for (const group of groups) {
+    for (const pair of group.duplicates) {
+      const args = pair.args ? oneLine(pair.args, 120) : '{}';
+      lines.push(
+        `- ${pair.name} [${pair.callId}] args: ${args}; output is byte-identical to [${group.canonical.callId}] sha256=${group.sha256}; ${toolCallHint('recall_tool_result', { call_id: pair.callId })} returns its exact stored bytes.`,
+      );
+    }
+  }
+  return { role: 'system', content: lines.join('\n') } as unknown as AgentInputItem;
+}
+
+/**
+ * Collapse byte-identical completed results before pressure-based compaction.
+ * The first pair stays verbatim; later pairs become a compact, call-id-complete
+ * recall ledger. Raw outputs remain independently parked under every original
+ * call id.
+ */
+export function collapseDuplicateCompletedToolPairs(
+  items: AgentInputItem[],
+  sessionId?: string,
+): { nextItems: AgentInputItem[]; collapsed: number; callIds: string[] } {
+  if (items.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
+
+  const byDigest = new Map<string, DuplicateToolPairGroup[]>();
+  for (const pair of completedToolPairs(items, sessionId)) {
+    // Deduplication claims byte identity, so prove it from the durable raw
+    // store and require the canonical visible value to be those same bytes.
+    // Two equal clipping/digest stubs must never collapse distinct raw output.
+    if (!pair.storedResultText || pair.resultText !== pair.storedResultText) continue;
+    const digest = sha256Text(pair.storedResultText);
+    const bucket = byDigest.get(digest) ?? [];
+    const exact = bucket.find((group) => group.canonical.storedResultText === pair.storedResultText);
+    if (exact) {
+      exact.duplicates.push(pair);
+    } else {
+      bucket.push({ canonical: pair, duplicates: [], sha256: digest });
+      byDigest.set(digest, bucket);
+    }
+  }
+
+  const groups: DuplicateToolPairGroup[] = [];
+  for (const bucket of byDigest.values()) {
+    for (const group of bucket) {
+      if (group.duplicates.length === 0) continue;
+      const ledgerChars = group.duplicates.reduce((sum, pair) =>
+        sum + pair.callId.length + pair.name.length + Math.min(pair.args.length, 120) + 180, 0);
+      const removedChars = group.duplicates.reduce((sum, pair) =>
+        sum + pair.resultText.length + pair.args.length + pair.callId.length + pair.name.length + 120, 0);
+      if (ledgerChars < removedChars) groups.push(group);
+    }
+  }
+  if (groups.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
+
+  const duplicates = groups.flatMap((group) => group.duplicates);
+  const collapseIds = new Set(duplicates.map((pair) => pair.callId));
+  const summary = buildDuplicateToolPairsSummary(groups);
+  const nextItems: AgentInputItem[] = [];
+  let desiredIndex = -1;
+  for (const item of items) {
+    const any = item as Record<string, unknown>;
+    const callId = typeof any.callId === 'string' ? any.callId : null;
+    const shouldCollapse = callId != null
+      && collapseIds.has(callId)
+      && (any.type === 'function_call' || any.type === 'function_call_result');
+    if (shouldCollapse) {
+      if (desiredIndex < 0) desiredIndex = nextItems.length;
+      continue;
+    }
+    nextItems.push(item);
+  }
+  return {
+    nextItems: desiredIndex < 0
+      ? nextItems
+      : insertAtClosedCallBoundary(nextItems, desiredIndex, summary),
+    collapsed: duplicates.length,
+    callIds: duplicates.map((pair) => pair.callId),
+  };
 }
 
 function collapsedPairLine(pair: CompletedToolPair): string {
@@ -341,9 +521,11 @@ function collapsedPairLine(pair: CompletedToolPair): string {
 }
 
 function buildCollapsedToolPairsSummary(pairs: CompletedToolPair[]): AgentInputItem {
+  const completeCallIdIndex = `[complete collapsed call-id index JSON] ${JSON.stringify(pairs.map((pair) => pair.callId))}`;
   const lines: string[] = [
     '[summary of older completed tool activity]',
     `${pairs.length} older completed tool call/result pairs were collapsed to keep the active model context small. Recent tool calls remain verbatim. Exact older outputs remain available with ${toolCallHint('recall_tool_result', { call_id: '<call id>' })}.`,
+    completeCallIdIndex,
   ];
 
   let chars = lines.join('\n').length;
@@ -391,45 +573,18 @@ export function collapseOldCompletedToolPairs(
   if (items.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
 
   const normalizedRetain = Math.max(0, Math.floor(retainPairs));
-  const calls = new Map<string, { index: number; item: Record<string, unknown> }>();
-  const results = new Map<string, { index: number; item: Record<string, unknown> }>();
-  const resultOrder: string[] = [];
-
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i] as Record<string, unknown>;
-    const callId = typeof item.callId === 'string' ? item.callId : null;
-    if (!callId) continue;
-    if (item.type === 'function_call' && !calls.has(callId)) {
-      calls.set(callId, { index: i, item });
-    } else if (item.type === 'function_call_result' && !results.has(callId)) {
-      results.set(callId, { index: i, item });
-      resultOrder.push(callId);
-    }
-  }
-
-  const completedIds = resultOrder.filter((callId) => calls.has(callId));
+  const completed = completedToolPairs(items, sessionId, false);
+  const completedIds = completed.map((pair) => pair.callId);
   if (completedIds.length <= normalizedRetain) {
     return { nextItems: items, collapsed: 0, callIds: [] };
   }
 
   const keepIds = new Set(completedIds.slice(-normalizedRetain));
   const pairs: CompletedToolPair[] = [];
-  for (const callId of completedIds) {
-    if (keepIds.has(callId)) continue;
-    const call = calls.get(callId);
-    const result = results.get(callId);
-    if (!call || !result) continue;
-    if (call.index > result.index) continue;
-    if (!recallableToolOutputExists(sessionId, callId)) continue;
-
-    pairs.push({
-      callId,
-      callIndex: call.index,
-      resultIndex: result.index,
-      name: typeof call.item.name === 'string' ? call.item.name : 'tool',
-      args: typeof call.item.arguments === 'string' ? call.item.arguments : '',
-      resultText: outputTextOf(result.item),
-    });
+  for (const pair of completed) {
+    if (keepIds.has(pair.callId)) continue;
+    if (!recallableToolOutputExists(sessionId, pair.callId)) continue;
+    pairs.push(pair);
   }
 
   if (pairs.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
@@ -437,7 +592,7 @@ export function collapseOldCompletedToolPairs(
   const collapseIds = new Set(pairs.map((pair) => pair.callId));
   const summary = buildCollapsedToolPairsSummary(pairs);
   const nextItems: AgentInputItem[] = [];
-  let inserted = false;
+  let desiredIndex = -1;
 
   for (const item of items) {
     const any = item as Record<string, unknown>;
@@ -447,17 +602,16 @@ export function collapseOldCompletedToolPairs(
       && (any.type === 'function_call' || any.type === 'function_call_result');
 
     if (shouldCollapse) {
-      if (!inserted) {
-        nextItems.push(summary);
-        inserted = true;
-      }
+      if (desiredIndex < 0) desiredIndex = nextItems.length;
       continue;
     }
     nextItems.push(item);
   }
 
   return {
-    nextItems,
+    nextItems: desiredIndex < 0
+      ? nextItems
+      : insertAtClosedCallBoundary(nextItems, desiredIndex, summary),
     collapsed: pairs.length,
     callIds: pairs.map((pair) => pair.callId),
   };
@@ -518,36 +672,54 @@ export function compactInFlightToolContext(
   ));
   const beforeTokens = estimateInputTokens(items);
 
-  const callIds = new Set<string>();
-  for (const item of items) {
-    const any = item as Record<string, unknown>;
-    if (any.type === 'function_call' && typeof any.callId === 'string') {
-      callIds.add(any.callId);
+  const completedResultTokens = (sourceItems: AgentInputItem[]) => {
+    const callIds = new Set<string>();
+    for (const item of sourceItems) {
+      const any = item as Record<string, unknown>;
+      if (any.type === 'function_call' && typeof any.callId === 'string') callIds.add(any.callId);
     }
-  }
+    const results: Array<{ callId: string; tokens: number }> = [];
+    for (const item of sourceItems) {
+      const any = item as Record<string, unknown>;
+      const callId = typeof any.callId === 'string' ? any.callId : '';
+      if (any.type !== 'function_call_result' || !callId || !callIds.has(callId)) continue;
+      results.push({ callId, tokens: estimateInputTokens([item]) });
+    }
+    return results;
+  };
 
-  const completedResults: Array<{ callId: string; tokens: number }> = [];
-  for (const item of items) {
-    const any = item as Record<string, unknown>;
-    const callId = typeof any.callId === 'string' ? any.callId : '';
-    if (any.type !== 'function_call_result' || !callId || !callIds.has(callId)) continue;
-    completedResults.push({ callId, tokens: estimateInputTokens([item]) });
-  }
-  const resultTokensBefore = completedResults.reduce((sum, pair) => sum + pair.tokens, 0);
+  const originalCompletedResults = completedResultTokens(items);
+  const resultTokensBefore = originalCompletedResults.reduce((sum, pair) => sum + pair.tokens, 0);
   const unchanged = (): InFlightToolContextResult => ({
     nextItems: items,
     applied: false,
     collapsed: 0,
     callIds: [],
-    retainedPairs: completedResults.length,
+    retainedPairs: originalCompletedResults.length,
     resultTokensBefore,
     beforeTokens,
     afterTokens: beforeTokens,
     triggerTokens,
   });
 
-  if (resultTokensBefore <= triggerTokens || completedResults.length <= minRetain) {
-    return unchanged();
+  const deduplicated = collapseDuplicateCompletedToolPairs(items, sessionId);
+  const workingItems = deduplicated.nextItems;
+  const completedResults = completedResultTokens(workingItems);
+  const workingResultTokens = completedResults.reduce((sum, pair) => sum + pair.tokens, 0);
+  const deduplicatedOnly = (): InFlightToolContextResult => ({
+    nextItems: workingItems,
+    applied: true,
+    collapsed: deduplicated.collapsed,
+    callIds: deduplicated.callIds,
+    retainedPairs: completedResults.length,
+    resultTokensBefore,
+    beforeTokens,
+    afterTokens: estimateInputTokens(workingItems),
+    triggerTokens,
+  });
+
+  if (workingResultTokens <= triggerTokens || completedResults.length <= minRetain) {
+    return deduplicated.collapsed > 0 ? deduplicatedOnly() : unchanged();
   }
 
   let retainedPairs = 0;
@@ -564,13 +736,13 @@ export function compactInFlightToolContext(
     retainedTokens += nextTokens;
   }
 
-  const collapsed = collapseOldCompletedToolPairs(items, retainedPairs, sessionId);
-  if (collapsed.collapsed === 0) return unchanged();
+  const collapsed = collapseOldCompletedToolPairs(workingItems, retainedPairs, sessionId);
+  if (collapsed.collapsed === 0) return deduplicated.collapsed > 0 ? deduplicatedOnly() : unchanged();
   return {
     nextItems: collapsed.nextItems,
     applied: true,
-    collapsed: collapsed.collapsed,
-    callIds: collapsed.callIds,
+    collapsed: deduplicated.collapsed + collapsed.collapsed,
+    callIds: [...deduplicated.callIds, ...collapsed.callIds],
     retainedPairs,
     resultTokensBefore,
     beforeTokens,

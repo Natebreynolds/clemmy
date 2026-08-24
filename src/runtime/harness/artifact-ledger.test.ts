@@ -177,7 +177,10 @@ test('an artifact slot is claimed once and remains reusable after binding', () =
   const retry = ledger.claimArtifactSlot(sid, { ...intent, title: 'Renamed retry' }, 'call-2');
   assert.equal(retry.acquired, false, 'a changed title cannot mint a second primary document');
   assert.equal(retry.artifact.resourceId, 'doc_1234567890');
-  assert.match(ledger.artifactReuseMessage(retry.artifact), /Reuse or update/);
+  const reuse = ledger.artifactReuseMessage(retry.artifact);
+  assert.match(reuse, /Reconcile this create claim to existing document doc_1234567890/i);
+  assert.match(reuse, /Update it only under a separately declared authorized operation or turn/i);
+  assert.doesNotMatch(reuse, /reuse or update/i);
 });
 
 test('claim settlement is owned by the provider call id, not just the slot', () => {
@@ -533,7 +536,11 @@ test('Google Docs binding verifies only when request and successful response ide
   assert.equal(verified?.verificationShape, 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT');
   assert.match(verified?.verificationFingerprint ?? '', /^[a-f0-9]{16}$/);
   assert.deepEqual(ledger.listUnverifiedRunArtifacts(sid, runScope), []);
-  assert.match(ledger.artifactReuseMessage(verified!), /provider-verified/i);
+  const reuse = ledger.artifactReuseMessage(verified!);
+  assert.match(reuse, /provider-verified/i);
+  assert.match(reuse, /Use that existing resource; do not create another/i);
+  assert.match(reuse, /Update it only under a separately declared authorized operation or turn/i);
+  assert.doesNotMatch(reuse, /reuse or update/i);
 });
 
 test('provider verification survives expiry of the raw tool result', () => {
@@ -886,8 +893,12 @@ test('extracts Netlify CLI Project ID and gives a repairable reuse instruction',
   const sid = session();
   ledger.claimArtifactSlot(sid, intent, 'site-1', 'run:one');
   const bound = ledger.bindArtifactSlot(sid, intent.slotKey, resource!, 'site-1', 'run:one');
-  assert.match(ledger.artifactReuseMessage(bound), /--site 00000000-0000-4000-8000-000000000001/);
-  assert.match(ledger.artifactReuseMessage(bound), /do not run sites:create again/i);
+  const reuse = ledger.artifactReuseMessage(bound);
+  assert.match(reuse, /getSite.*00000000-0000-4000-8000-000000000001/);
+  assert.match(reuse, /reconcile this create claim to that existing site/i);
+  assert.match(reuse, /do not run sites:create again/i);
+  assert.match(reuse, /Update it only under a separately declared authorized operation or turn/i);
+  assert.doesNotMatch(reuse, /reuse or update|--site/i);
 });
 
 test('extracts the current colorized Netlify CLI Project ID', () => {

@@ -98,13 +98,18 @@ function runJob(spec: RunJobSpec): ManagedCliJob {
   };
   jobs.set(id, job);
 
-  const child = spawn('/bin/zsh', spec.args, {
+  // win32 has no zsh; spec.args is ['-lc', <script>] — translate to cmd /d /s /c.
+  const win32 = process.platform === 'win32';
+  const shell = win32 ? (process.env.ComSpec || 'cmd.exe') : '/bin/zsh';
+  const shellArgs = win32
+    ? ['/d', '/s', '/c', spec.args[spec.args.length - 1] ?? '']
+    : spec.args;
+  const child = spawn(shell, shellArgs, {
     cwd: os.homedir(),
     env: {
       ...process.env,
       PATH: [
-        '/opt/homebrew/bin',
-        '/usr/local/bin',
+        ...(win32 ? [] : ['/opt/homebrew/bin', '/usr/local/bin']),
         path.join(os.homedir(), '.composio'),
         path.join(os.homedir(), '.composio', 'bin'),
         process.env.PATH ?? '',

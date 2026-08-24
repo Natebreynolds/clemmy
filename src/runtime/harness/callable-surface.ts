@@ -4,7 +4,7 @@
  * different wrong proxies: "can this turn call tool X, and does it know how?"
  *
  * The live failure class this ends (Aug 2026 ledger): a guardrail mandated
- * run_tool_program while the discovery governor refused the tool_search that
+ * a batching tool while the discovery governor refused the tool_search that
  * would supply its schema, so the model brute-forced parameter names; denied
  * schema lookups drove empty-arg probes at MUTATING tools (one created a blank
  * spreadsheet in the user's Drive); the fan-out nudge recommended run_worker
@@ -16,8 +16,8 @@
  *     Never a provider call, never a governor charge.
  *   - Local built-in schemas arrive via REGISTRATION, not import: importing
  *     local-runtime-tools from here would drag the whole tool surface into
- *     every guardrail consumer (the exact cycle that forced the inlined
- *     `codeModeRecoveryAvailable()` env-flag proxy this replaces).
+ *     every guardrail consumer (the exact cycle that once forced an inlined
+ *     environment-flag reachability proxy).
  *   - Fail-closed toward SILENCE: a missing registration or unknown name
  *     yields `schemaSource: 'none'` and `isMandatable() === false`. Degrading
  *     means a guardrail mandates nothing — never that it mandates a phantom.

@@ -19,6 +19,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 const { HarnessSession } = await import('./session.js');
 const {
+  acceptUserInputForRun,
   beginRunAttempt,
   finishRunAttempt,
   getLatestRunAttempt,
@@ -75,6 +76,112 @@ test('terminal marker clear refuses to steal ownership from a foreign active att
   assert.equal(clearRunInFlightAfterTerminal(chat.id, active.attemptId), true);
   assert.equal(HarnessSession.load(chat.id)?.runInFlightSince(), null);
   finishRunAttempt(active, 'completed');
+});
+
+test('late attempt A cannot clear newer attempt B structured recovery ownership', () => {
+  const chat = HarnessSession.create({ kind: 'chat', title: 'exact marker race' });
+  const attemptA = beginRunAttempt(chat.id, { runId: 'marker-race-A' });
+  const sourceA = recordRunAttemptUserInput(attemptA, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'first request' },
+  }, { armRunInFlight: true });
+  const attemptB = beginRunAttempt(chat.id, { runId: 'marker-race-B' });
+  const sourceB = recordRunAttemptUserInput(attemptB, {
+    turn: 2,
+    role: 'user',
+    data: { text: 'newer request' },
+  }, { armRunInFlight: true });
+
+  const before = HarnessSession.load(chat.id)?.sessionRow.metadata;
+  assert.deepEqual(before?.__run_in_flight_owner, {
+    attemptId: attemptB.attemptId,
+    sourceUserSeq: sourceB.seq,
+    armedAt: (before?.__run_in_flight_owner as { armedAt?: string } | undefined)?.armedAt,
+  });
+  assert.equal(
+    clearRunInFlightAfterTerminal(chat.id, attemptA.attemptId, sourceA.seq),
+    false,
+    'late A loses the owner CAS',
+  );
+  assert.deepEqual(
+    HarnessSession.load(chat.id)?.sessionRow.metadata.__run_in_flight_owner,
+    before?.__run_in_flight_owner,
+    'B keeps both its marker and exact owner',
+  );
+
+  assert.equal(clearRunInFlightAfterTerminal(chat.id, attemptB.attemptId, sourceB.seq), true);
+  const after = HarnessSession.load(chat.id)?.sessionRow.metadata ?? {};
+  assert.equal(after.__run_in_flight, undefined);
+  assert.equal(after.__run_in_flight_owner, undefined);
+  finishRunAttempt(attemptB, 'completed');
+});
+
+test('source re-entry preserves the stronger outer attempt owner', () => {
+  const chat = HarnessSession.create({ kind: 'chat', title: 'attempt owner re-entry' });
+  const attempt = beginRunAttempt(chat.id, { runId: 'attempt-owner-reentry' });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'accepted by the outer bridge' },
+  }, { armRunInFlight: true });
+  const before = HarnessSession.load(chat.id)?.sessionRow.metadata.__run_in_flight_owner;
+
+  const reused = acceptUserInputForRun({
+    sessionId: chat.id,
+    turn: source.turn,
+    role: source.role,
+    data: source.data,
+  }, { existingEventSeq: source.seq });
+
+  assert.equal(reused.seq, source.seq);
+  assert.deepEqual(
+    HarnessSession.load(chat.id)?.sessionRow.metadata.__run_in_flight_owner,
+    before,
+    'source-only loop acceptance cannot erase attempt identity',
+  );
+  assert.equal(clearRunInFlightAfterTerminal(chat.id, attempt.attemptId, source.seq), true);
+  finishRunAttempt(attempt, 'completed');
+});
+
+test('late source-only turn A cannot clear newer source-only turn B recovery ownership', () => {
+  const chat = HarnessSession.create({ kind: 'chat', title: 'source marker race' });
+  const sourceA = acceptUserInputForRun({
+    sessionId: chat.id,
+    turn: 1,
+    role: 'user',
+    data: { text: 'first direct request' },
+  });
+  const sourceB = acceptUserInputForRun({
+    sessionId: chat.id,
+    turn: 2,
+    role: 'user',
+    data: { text: 'newer direct request' },
+  });
+
+  const before = HarnessSession.load(chat.id)?.sessionRow.metadata;
+  const sourceOnlyOwner = before?.__run_in_flight_owner as {
+    sourceUserSeq?: number;
+    armedAt?: string;
+  } | undefined;
+  assert.equal(
+    sourceOnlyOwner?.sourceUserSeq,
+    sourceB.seq,
+  );
+  assert.equal(before?.__run_in_flight, sourceOnlyOwner?.armedAt, 'fresh B owns a fresh boot-cutoff timestamp');
+  assert.equal(
+    clearRunInFlightAfterTerminal(chat.id, undefined, sourceA.seq),
+    false,
+    'late A loses the source owner CAS',
+  );
+  assert.deepEqual(
+    HarnessSession.load(chat.id)?.sessionRow.metadata.__run_in_flight_owner,
+    before?.__run_in_flight_owner,
+  );
+  assert.equal(clearRunInFlightAfterTerminal(chat.id, undefined, sourceB.seq), true);
+  const after = HarnessSession.load(chat.id)?.sessionRow.metadata ?? {};
+  assert.equal(after.__run_in_flight, undefined);
+  assert.equal(after.__run_in_flight_owner, undefined);
 });
 
 test.after(() => {
@@ -226,7 +333,7 @@ test('commit then crash before marker clear reconciles the exact terminal withou
 
   const summary = recoverInterruptedChatRuns(
     () => nowMs,
-    async (sessionId) => { dispatched.push(sessionId); },
+    async (restart) => { dispatched.push(restart.sessionId); },
   );
   await new Promise((resolve) => setTimeout(resolve, 20));
 
@@ -293,7 +400,12 @@ test('a terminal from another source with the same run id cannot settle the inte
 
   const summary = recoverInterruptedChatRuns(
     () => nowMs,
-    async (sessionId, _directive, sourceUserSeq) => { dispatched.push({ sessionId, sourceUserSeq }); },
+    async (restart) => {
+      dispatched.push({
+        sessionId: restart.sessionId,
+        sourceUserSeq: restart.sourceUserSeq,
+      });
+    },
   );
   await new Promise((resolve) => setTimeout(resolve, 20));
 
@@ -330,7 +442,12 @@ test('boot cutoff recovers only markers owned by the previous daemon process', a
 
   const summary = recoverInterruptedChatRuns(
     () => scanNowMs,
-    async (sessionId, _directive, sourceUserSeq) => { dispatched.push({ sessionId, sourceUserSeq }); },
+    async (restart) => {
+      dispatched.push({
+        sessionId: restart.sessionId,
+        sourceUserSeq: restart.sourceUserSeq,
+      });
+    },
     { bootCutoffMs },
   );
   await new Promise((resolve) => setTimeout(resolve, 20));

@@ -56,6 +56,16 @@ export interface ToolContract {
   providerObservedAt?: string;
   /** Fingerprint observed at providerObservedAt; binds the lease to one schema. */
   providerObservedFingerprint?: string;
+  /** Exact provider operation version returned by the same metadata
+   * observation. It is executable only while the schema lease above is live. */
+  providerOperationVersion?: string;
+  /** Exact provider result-payload schema observed in the same definition row.
+   * This is optional because some providers/CLI definitions expose inputs
+   * only; absence never authorizes output-file hydration. */
+  providerOutputSchemaObserved?: true;
+  providerOutputSchema?: Record<string, unknown>;
+  providerOutputSchemaDigest?: string;
+  providerOutputSchemaFingerprint?: string;
   /**
    * Two different schemas observed at the same provider timestamp are
    * unordered. Keep that timestamp as a monotonic watermark, but revoke
@@ -89,8 +99,15 @@ export function contractFileName(identifier: string): string {
   return `${safe}.${digest}.json`;
 }
 
+/** Full canonical provider-input-schema identity. Authority boundaries use the
+ * complete digest; the historical cache/selector identity below intentionally
+ * retains its 128-bit wire shape. Both are derived by this one encoder. */
+export function digestSchema(schema: unknown): string {
+  return createHash('sha256').update(stableStringify(schema)).digest('hex');
+}
+
 export function fingerprintSchema(schema: unknown): string {
-  return createHash('sha256').update(stableStringify(schema)).digest('hex').slice(0, 32);
+  return digestSchema(schema).slice(0, 32);
 }
 
 /** Key order must not change the fingerprint — otherwise a re-serialised but
@@ -139,6 +156,11 @@ export function saveToolContract(input: {
   exampleArgs?: unknown;
   /** Set only by a real provider-metadata observation. */
   providerObservedAt?: string;
+  /** Exact operation version from that same provider observation. */
+  providerOperationVersion?: string;
+  /** Exact provider result-payload schema from that same observation. `null`
+   * records an authoritative absence; omitted keeps legacy callers input-only. */
+  providerOutputSchema?: unknown | null;
   /** Set only when two real observations at the same timestamp disagree. */
   providerAuthorityConflictAt?: string;
 }): ToolContract | null {
@@ -150,6 +172,25 @@ export function saveToolContract(input: {
     const existing = validateToolContractRecord(readContractFile(file), identifier);
     const fingerprint = fingerprintSchema(schema);
     const explicitProviderObservedAt = normalizeProviderObservedAt(input.providerObservedAt);
+    const explicitProviderOperationVersion = normalizeProviderOperationVersion(
+      input.providerOperationVersion,
+    );
+    const outputSchemaWasObserved = Object.prototype.hasOwnProperty.call(input, 'providerOutputSchema');
+    const explicitProviderOutputSchema = input.providerOutputSchema === null
+      ? null
+      : input.providerOutputSchema && typeof input.providerOutputSchema === 'object'
+          && !Array.isArray(input.providerOutputSchema)
+        ? structuredClone(input.providerOutputSchema as Record<string, unknown>)
+        : undefined;
+    if (outputSchemaWasObserved && input.providerOutputSchema !== null && !explicitProviderOutputSchema) {
+      return null;
+    }
+    const explicitProviderOutputSchemaDigest = explicitProviderOutputSchema
+      ? digestSchema(explicitProviderOutputSchema)
+      : undefined;
+    const explicitProviderOutputSchemaFingerprint = explicitProviderOutputSchema
+      ? fingerprintSchema(explicitProviderOutputSchema)
+      : undefined;
     const explicitConflictAt = normalizeProviderObservedAt(input.providerAuthorityConflictAt);
     const existingObservation = providerObservation(existing);
     const existingConflictAt = normalizeProviderObservedAt(existing?.providerAuthorityConflictAt);
@@ -198,7 +239,13 @@ export function saveToolContract(input: {
     if (existing && explicitProviderObservedAt
       && explicitObservedMs === existingWatermarkMs
       && !(existingObservation?.observedMs === explicitObservedMs
-        && existing.fingerprint === fingerprint)) {
+        && existing.fingerprint === fingerprint
+        && (!explicitProviderOperationVersion
+          || !existing.providerOperationVersion
+          || explicitProviderOperationVersion === existing.providerOperationVersion)
+        && (!outputSchemaWasObserved
+          || (existing.providerOutputSchemaDigest ?? null)
+            === (explicitProviderOutputSchemaDigest ?? null)))) {
       const record: ToolContract = {
         identifier,
         schema: existing.schema,
@@ -233,12 +280,51 @@ export function saveToolContract(input: {
       && existing?.fingerprint === fingerprint
       ? existingConflictAt
       : undefined;
+    const providerOperationVersion = acceptExplicitObservation
+      ? explicitProviderOperationVersion
+      : existing?.fingerprint === fingerprint && providerObservedAt
+        ? normalizeProviderOperationVersion(existing.providerOperationVersion)
+        : undefined;
+    const preserveExistingOutput = !outputSchemaWasObserved
+      && existing?.fingerprint === fingerprint
+      && Boolean(providerObservedAt)
+      && existing?.providerOutputSchemaObserved === true;
+    const acceptExplicitOutputObservation = outputSchemaWasObserved
+      && acceptExplicitObservation;
+    const providerOutputSchemaObserved = acceptExplicitOutputObservation
+      || preserveExistingOutput;
+    const providerOutputSchema = acceptExplicitOutputObservation
+      ? explicitProviderOutputSchema ?? undefined
+      : preserveExistingOutput
+        ? existing!.providerOutputSchema === undefined
+          ? undefined
+          : structuredClone(existing!.providerOutputSchema)
+        : undefined;
+    const providerOutputSchemaDigest = acceptExplicitOutputObservation
+      ? explicitProviderOutputSchemaDigest
+      : preserveExistingOutput
+        ? existing!.providerOutputSchemaDigest
+        : undefined;
+    const providerOutputSchemaFingerprint = acceptExplicitOutputObservation
+      ? explicitProviderOutputSchemaFingerprint
+      : preserveExistingOutput
+        ? existing!.providerOutputSchemaFingerprint
+        : undefined;
     const record: ToolContract = {
       identifier,
       schema: schema as Record<string, unknown>,
       fingerprint,
       ...(providerObservedAt
         ? { providerObservedAt, providerObservedFingerprint: fingerprint }
+        : {}),
+      ...(providerOperationVersion ? { providerOperationVersion } : {}),
+      ...(providerOutputSchemaObserved ? { providerOutputSchemaObserved: true as const } : {}),
+      ...(providerOutputSchema && providerOutputSchemaDigest && providerOutputSchemaFingerprint
+        ? {
+            providerOutputSchema,
+            providerOutputSchemaDigest,
+            providerOutputSchemaFingerprint,
+          }
         : {}),
       ...(providerAuthorityConflictAt ? { providerAuthorityConflictAt } : {}),
       // A previously-learned working example survives a schema refresh unless a
@@ -284,6 +370,14 @@ function normalizeProviderObservedAt(value: unknown): string | undefined {
   return new Date(observedAt).toISOString();
 }
 
+function normalizeProviderOperationVersion(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized && normalized.length <= 160 && /^[A-Za-z0-9_.:-]+$/.test(normalized)
+    ? normalized
+    : undefined;
+}
+
 function providerObservation(record: ToolContract | null): {
   observedAt: string;
   observedMs: number;
@@ -311,6 +405,27 @@ function validateToolContractRecord(
   if (!Number.isFinite(age) || age < 0 || age > CONTRACT_TTL_MS) return null;
   if (!record.schema || typeof record.schema !== 'object' || Array.isArray(record.schema)) return null;
   if (fingerprintSchema(record.schema) !== record.fingerprint) return null;
+  const outputFields = [
+    record.providerOutputSchema,
+    record.providerOutputSchemaDigest,
+    record.providerOutputSchemaFingerprint,
+  ];
+  const hasAnyOutputField = outputFields.some((value) => value !== undefined);
+  const hasAllOutputFields = outputFields.every((value) => value !== undefined);
+  if (record.providerOutputSchemaObserved !== undefined
+    && record.providerOutputSchemaObserved !== true) return null;
+  if (hasAnyOutputField && (!hasAllOutputFields || record.providerOutputSchemaObserved !== true)) {
+    return null;
+  }
+  if (hasAllOutputFields) {
+    if (
+      !record.providerOutputSchema
+      || typeof record.providerOutputSchema !== 'object'
+      || Array.isArray(record.providerOutputSchema)
+      || digestSchema(record.providerOutputSchema) !== record.providerOutputSchemaDigest
+      || fingerprintSchema(record.providerOutputSchema) !== record.providerOutputSchemaFingerprint
+    ) return null;
+  }
   return record;
 }
 

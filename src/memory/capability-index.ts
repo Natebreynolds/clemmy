@@ -57,6 +57,14 @@ export interface CapabilityOperationRow {
   effectProvenance: CapabilityEffectProvenance;
   /** Account/tenant this operation is bound to, when the carrier is account-scoped. */
   accountIdentity?: string;
+  /**
+   * The operation that REACHES this capability, when the capability is not a
+   * verb of its own — the program for a subcommand, the control-plane call for
+   * a unit. Absent for an ordinary top-level operation.
+   */
+  parentIdentifier?: string;
+  /** The token that selects this capability within its parent's inventory. */
+  selector?: string;
 }
 
 export interface CapabilityOperationHit extends CapabilityOperationRow {
@@ -65,6 +73,92 @@ export interface CapabilityOperationHit extends CapabilityOperationRow {
 }
 
 const MAX_TEXT = 600;
+
+/**
+ * Shape version for this store. BUMP whenever a column is added or its meaning
+ * changes.
+ *
+ * THE HAZARD THIS CLOSES: the schema below is `CREATE TABLE IF NOT EXISTS`,
+ * which is a silent no-op against a table that already exists. Without a
+ * version marker, a column added here is simply ABSENT on every install that
+ * already has the file, and every read of it returns `undefined` — a defect
+ * that never raises and shows up only as a capability that mysteriously never
+ * binds.
+ *
+ * Changes are applied ADDITIVELY (nullable columns, existing rows keep NULL)
+ * rather than by rebuild. A rebuild would be tempting — this store is
+ * per-machine, authority-free and provisioning-derived — but it is NOT
+ * uniformly reconstructible: connected apps re-enumerate on the next
+ * connection publication and CLIs on the next scan, while MCP servers
+ * re-enumerate ONLY when their config is written. Dropping the table would
+ * lose every MCP row until a user happened to edit their config.
+ */
+const CAPABILITY_INDEX_SCHEMA = 2;
+
+/** Columns introduced after v1, applied to an existing table by ALTER. */
+const ADDITIVE_COLUMNS: ReadonlyArray<{ name: string; ddl: string }> = [
+  // The operation that REACHES this capability, when the capability is not a
+  // verb of its own. NULL for an ordinary top-level operation.
+  { name: 'parent_identifier', ddl: 'TEXT' },
+  // The identifier that selects this capability within its parent's inventory
+  // — the unit name, subcommand, or downstream tool. NULL when top-level.
+  { name: 'selector', ddl: 'TEXT' },
+  // Expansion state of a top-level operation that addresses an inventory:
+  // NULL = never asked, 'expanded' = its inventory is indexed, 'none' = asked
+  // and it has no inventory. Recording 'none' is what stops us asking twice.
+  { name: 'inventory_state', ddl: 'TEXT' },
+];
+
+function ensureAdditiveColumns(database: Database.Database): void {
+  const present = new Set(
+    (database.pragma('table_info(capability_operations)') as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  for (const column of ADDITIVE_COLUMNS) {
+    if (present.has(column.name)) continue;
+    // Nullable, no default: existing rows are top-level by construction, and
+    // NULL is the honest value for "this was indexed before we asked".
+    database.exec(`ALTER TABLE capability_operations ADD COLUMN ${column.name} ${column.ddl}`);
+  }
+}
+
+/**
+ * Rebuild the search index when it has drifted from the table it indexes.
+ *
+ * The FTS table is external-content and stays current through triggers, so it
+ * is correct as long as every write goes through them. When something breaks
+ * that — a file whose FTS creation failed, an older shape, a row written
+ * outside this module — the failure is SILENT and asymmetric: the rows are
+ * still in `capability_operations`, `capabilityIndexStats` still counts them,
+ * and only retrieval comes back empty. A capability that exists but cannot be
+ * found is indistinguishable from one the install never had, which is exactly
+ * the confident-false-refusal this index is supposed to prevent.
+ *
+ * Cheap to check (two counts) and cheap to repair, so it happens on open
+ * rather than waiting for someone to notice a capability going missing.
+ */
+function repairSearchIndex(database: Database.Database): void {
+  try {
+    // Count the SHADOW table, not the FTS table. `SELECT COUNT(*)` on an
+    // external-content FTS5 table reads through to the content table, so it
+    // matches by construction even when the inverted index holds nothing —
+    // measured: docsize 0 / fts 1 / zero MATCH hits on an unindexed row.
+    // `_docsize` is the real number of indexed documents.
+    const indexed = (database.prepare(
+      'SELECT COUNT(*) AS n FROM capability_operations_fts_docsize',
+    ).get() as { n: number }).n;
+    const stored = (database.prepare(
+      'SELECT COUNT(*) AS n FROM capability_operations',
+    ).get() as { n: number }).n;
+    if (indexed === stored) return;
+    database.exec(
+      "INSERT INTO capability_operations_fts (capability_operations_fts) VALUES ('rebuild')",
+    );
+  } catch {
+    // A damaged FTS table must not stop the store from opening: the rows are
+    // the durable fact and lexical retrieval already degrades to [].
+  }
+}
 
 let handle: Database.Database | null = null;
 let handlePath = '';
@@ -97,6 +191,14 @@ function db(): Database.Database {
       first_seen_at     TEXT NOT NULL,
       last_seen_at      TEXT NOT NULL,
       active            INTEGER NOT NULL DEFAULT 1,
+      -- Second-level addressing. A capability is not always a verb of its own:
+      -- for a carrier whose API is a control plane ("run a unit", "call
+      -- downstream", a binary with subcommands) the capability lives one level
+      -- below the operation. These stay NULL for an ordinary top-level row.
+      -- See ADDITIVE_COLUMNS — existing installs get these by ALTER.
+      parent_identifier TEXT,
+      selector          TEXT,
+      inventory_state   TEXT,
       PRIMARY KEY (identifier, account_identity)
     );
     CREATE INDEX IF NOT EXISTS idx_capability_operations_carrier
@@ -140,6 +242,15 @@ function db(): Database.Database {
       PRIMARY KEY (identifier, account_identity)
     );
   `);
+  // A file created before a column existed keeps its old shape forever —
+  // CREATE TABLE IF NOT EXISTS above did nothing for it. Bring it forward
+  // additively, then record the shape so the work happens once.
+  const onDisk = Number(database.pragma('user_version', { simple: true }) ?? 0);
+  if (onDisk < CAPABILITY_INDEX_SCHEMA) {
+    ensureAdditiveColumns(database);
+    database.pragma(`user_version = ${CAPABILITY_INDEX_SCHEMA}`);
+  }
+  repairSearchIndex(database);
   handle = database;
   handlePath = file;
   return database;
@@ -174,8 +285,9 @@ export function recordCapabilityOperations(rows: readonly CapabilityOperationRow
   const upsert = database.prepare(`
     INSERT INTO capability_operations (
       identifier, account_identity, carrier_kind, carrier, display_name, description,
-      effect_class, effect_provenance, first_seen_at, last_seen_at, active
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+      effect_class, effect_provenance, first_seen_at, last_seen_at, active,
+      parent_identifier, selector
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
     ON CONFLICT (identifier, account_identity) DO UPDATE SET
       carrier_kind = excluded.carrier_kind,
       carrier = excluded.carrier,
@@ -184,7 +296,9 @@ export function recordCapabilityOperations(rows: readonly CapabilityOperationRow
       effect_class = excluded.effect_class,
       effect_provenance = excluded.effect_provenance,
       last_seen_at = excluded.last_seen_at,
-      active = 1
+      active = 1,
+      parent_identifier = excluded.parent_identifier,
+      selector = excluded.selector
   `);
   const write = database.transaction((batch: readonly CapabilityOperationRow[]) => {
     for (const row of batch) {
@@ -199,11 +313,50 @@ export function recordCapabilityOperations(rows: readonly CapabilityOperationRow
         row.effectProvenance,
         now,
         now,
+        row.parentIdentifier?.trim() || null,
+        row.selector?.trim() || null,
       );
     }
   });
   write(usable);
   return usable.length;
+}
+
+/** Whether a top-level operation's inventory has been asked for yet. */
+export type CapabilityInventoryState = 'expanded' | 'none';
+
+/**
+ * Record that we asked a top-level operation what it can address.
+ *
+ * Recording `'none'` matters as much as `'expanded'`: without it, a carrier
+ * that genuinely has no inventory would be asked again on every future miss,
+ * turning a one-off cost into a permanent one. "Asked and there was nothing"
+ * is a real answer and deserves to be durable.
+ */
+export function markCapabilityInventory(
+  identifier: string,
+  state: CapabilityInventoryState,
+): void {
+  const id = identifier.trim();
+  if (!id) return;
+  try {
+    db().prepare(
+      'UPDATE capability_operations SET inventory_state = ? WHERE identifier = ?',
+    ).run(state, id);
+  } catch { /* the index is advisory; a failed note must not break a turn */ }
+}
+
+/** `null` means never asked — which is the only state that justifies asking. */
+export function capabilityInventoryState(identifier: string): CapabilityInventoryState | null {
+  try {
+    const row = db().prepare(
+      'SELECT inventory_state AS state FROM capability_operations WHERE identifier = ? LIMIT 1',
+    ).get(identifier.trim()) as { state: string | null } | undefined;
+    const state = row?.state;
+    return state === 'expanded' || state === 'none' ? state : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -235,6 +388,11 @@ function rowToOperation(row: Record<string, unknown>): CapabilityOperationRow {
     effectClass: String(row.effect_class ?? 'unknown') as CapabilityEffectClass,
     effectProvenance: String(row.effect_provenance ?? 'none') as CapabilityEffectProvenance,
     ...(account ? { accountIdentity: account } : {}),
+    // Second-level addressing. Absent on an ordinary top-level row, and absent
+    // on every row written before these columns existed — so read them as
+    // optional, never as a guarantee.
+    ...(row.parent_identifier ? { parentIdentifier: String(row.parent_identifier) } : {}),
+    ...(row.selector ? { selector: String(row.selector) } : {}),
   };
 }
 

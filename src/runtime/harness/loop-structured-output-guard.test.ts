@@ -1,6 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isStructuredOutputError, assistantItemText, __defaultRunRunner } from './loop.js';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// `loop.js` reaches stores whose boot work can settle after these deliberately
+// tiny assertions finish. Node runs test files concurrently, so inheriting the
+// runner's one shared disposable home lets two child processes migrate the
+// same fresh schema at once. Bind this file before the dynamic import; cleanup
+// at process exit, after delayed import-time work has settled.
+const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-loop-structured-output-'));
+process.env.CLEMENTINE_HOME = TEST_HOME;
+mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
+process.once('exit', () => {
+  rmSync(TEST_HOME, { recursive: true, force: true });
+});
+
+const { isStructuredOutputError, assistantItemText, __defaultRunRunner } = await import('./loop.js');
 
 // --- pure classifiers ------------------------------------------------------
 

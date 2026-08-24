@@ -21,6 +21,7 @@ import { getMachineId } from '../runtime/machine-id.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { eventLogReceiptResolver } from '../runtime/read-path/event-log-read-receipts.js';
 import {
+  composioToolOperationVersion,
   composioToolSchemaObservedAt,
   getComposioToolBySlug,
 } from '../integrations/composio/client.js';
@@ -80,6 +81,7 @@ async function acquireLiveContract(identifier: string): Promise<string | undefin
         identifier,
         match.inputParameters,
         composioToolSchemaObservedAt(match) ?? Number.NaN,
+        composioToolOperationVersion(match),
       );
     }
   } catch { /* declined below; the pending row retries */ }

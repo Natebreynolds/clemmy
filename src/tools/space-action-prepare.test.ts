@@ -2,9 +2,9 @@
  * Run: npx tsx --test src/tools/space-action-prepare.test.ts
  *
  * A chat/model turn may prepare one action already declared by a Workspace,
- * but it must not gain a second execution path. The tool below is expected to
- * reuse the Workspace button's exact approval authority and dispatch nothing
- * until that approval is resolved.
+ * but it must not gain a second execution path. The tool below reuses the
+ * Workspace button's exact approval authority: it stages when authority is
+ * absent and may run only an exact invocation covered by standing approval.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,11 +24,13 @@ const spaceRunner = await import('../spaces/runner.js');
 
 type Handler = (input: Record<string, unknown>) => Promise<unknown> | unknown;
 
+const descriptions: Record<string, string> = {};
 function captureTools(): Record<string, Handler> {
   const handlers: Record<string, Handler> = {};
   const server = {
-    tool(name: string, _description: string, _schema: unknown, handler: Handler) {
+    tool(name: string, description: string, _schema: unknown, handler: Handler) {
       handlers[name] = handler;
+      descriptions[name] = description;
     },
   };
   registerSpaceTools(server as never);
@@ -40,6 +42,23 @@ function resultText(result: unknown): string {
 }
 
 const tools = captureTools();
+
+test('space_action_prepare model contract truthfully distinguishes staging from exact standing-authority execution', () => {
+  const description = descriptions.space_action_prepare ?? '';
+  assert.match(description, /standing approval/i);
+  assert.match(description, /does not dispatch/i);
+  assert.match(description, /executes only the exact declared action/i);
+  assert.doesNotMatch(description, /never dispatches/i);
+});
+
+test('Workspace runner catalog copy truthfully describes space_try_runner as static-only', () => {
+  const inspection = descriptions.space_try_runner ?? '';
+  const sourceRead = descriptions.space_get_runner ?? '';
+  assert.match(inspection, /statically inspect/i);
+  assert.match(inspection, /without executing/i);
+  assert.match(sourceRead, /static safety\/provenance inspection without executing/i);
+  assert.doesNotMatch(sourceRead, /space_try_runner executes|see the json/i);
+});
 
 test('space_action_prepare refuses an unknown declared action without minting authority', async () => {
   const slug = 'prepare-unknown-action';

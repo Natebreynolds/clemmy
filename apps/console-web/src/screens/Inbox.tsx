@@ -13,12 +13,14 @@ import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
 import {
   listApprovals, decideApproval, cancelStaleApprovals,
+  listWorkspaceDestinationChoosers, resolveWorkspaceDestinationChooser,
   listNotifications, markNotificationRead, retryNotification,
   listTrustProposals, decideTrustProposal,
   relativeTime,
   approvalDecisionSuccessText, collapseAttentionRows, notifTone, notifFailed,
   summarizeApprovalDecisionBatch,
   type ApprovalRow, type NotificationRow, type TrustProposalRow,
+  type WorkspaceDestinationChooser,
 } from '@/lib/inbox';
 
 /** Client mirror of the backend's needs-attention rule (runtime/notifications.ts)
@@ -58,6 +60,7 @@ export function Inbox() {
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [decisionStates, setDecisionStates] = useState<Record<string, RowDecisionState>>({});
+  const [chooserBusy, setChooserBusy] = useState<string | null>(null);
   const [decisionNotice, setDecisionNotice] = useState<DecisionNotice | null>(null);
   // Re-apply when the deep link changes while the screen stays mounted
   // (e.g. Home card → Inbox already open in the router tree).
@@ -70,10 +73,16 @@ export function Inbox() {
   }, [searchParams]);
 
   const approvals = usePoll(['approvals'], listApprovals, 6000);
+  const workspaceChoosers = usePoll(
+    ['workspace-choosers'],
+    listWorkspaceDestinationChoosers,
+    6000,
+  );
   const notifications = usePoll(['notifications'], listNotifications, 8000);
   const trustProposals = usePoll(['trust-proposals'], listTrustProposals, 8000);
 
   const approvalRows = approvals.data?.approvals ?? [];
+  const workspaceChooserRows = workspaceChoosers.data?.choosers ?? [];
   // Server sorts urgent-first; aged cards (48h+ unanswered, nothing parked on
   // them) render below a divider and stop counting toward "needs you".
   const urgentApprovalRows = approvalRows.filter((a) => !a.stale);
@@ -88,13 +97,13 @@ export function Inbox() {
   // A burst of blocked runs from one workflow is ONE decision, not ten rows —
   // collapse duplicates to the newest and badge the earlier ones.
   const collapsedAttention = collapseAttentionRows(attentionRows);
-  const needsCount = urgentApprovalRows.length + collapsedAttention.length + trustRows.length;
-  const anyDecisionRows = approvalRows.length + collapsedAttention.length + trustRows.length;
+  const needsCount = workspaceChooserRows.length + urgentApprovalRows.length + collapsedAttention.length + trustRows.length;
+  const anyDecisionRows = workspaceChooserRows.length + approvalRows.length + collapsedAttention.length + trustRows.length;
   // Count only checked IDs that still exist in the live list — resolved cards
   // drop out on the next poll and must not keep inflating the bulk-action count.
   const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
   const queryUnavailable = tab === 'needs'
-    ? approvals.isError || notifications.isError || trustProposals.isError
+    ? approvals.isError || workspaceChoosers.isError || notifications.isError || trustProposals.isError
     : notifications.isError;
   const hasRows = !queryUnavailable && (tab === 'needs' ? needsCount : plainNotifRows.length) > 0;
   const unread = plainNotifRows.filter((n) => !n.read).length;
@@ -201,6 +210,26 @@ export function Inbox() {
       invalidate('approvals', 'approvals-count');
     }
   };
+  const onChooseWorkspace = async (chooser: WorkspaceDestinationChooser, choiceId: string) => {
+    if (chooserBusy) return;
+    setChooserBusy(chooser.chooserId);
+    setDecisionNotice(null);
+    try {
+      await resolveWorkspaceDestinationChooser(chooser, choiceId);
+      setDecisionNotice({
+        tone: 'success',
+        text: 'Workspace destination recorded. Clem is continuing the pilot automatically.',
+      });
+    } catch (error) {
+      setDecisionNotice({
+        tone: 'error',
+        text: actionError(error, 'Could not record that Workspace destination.'),
+      });
+    } finally {
+      setChooserBusy(null);
+      invalidate('workspace-choosers', 'approvals', 'approvals-count', 'command-center');
+    }
+  };
   const onDecideTrust = async (id: string, decision: 'approve' | 'decline') => {
     setDecisionNotice(null);
     try {
@@ -245,11 +274,12 @@ export function Inbox() {
   const selNotif = notifRows.find((n) => n.id === selected);
 
   const loading =
-    (tab === 'needs' && (approvals.isLoading || notifications.isLoading || trustProposals.isLoading)) ||
+    (tab === 'needs' && (approvals.isLoading || workspaceChoosers.isLoading || notifications.isLoading || trustProposals.isLoading)) ||
     (tab === 'notifications' && notifications.isLoading);
   const retryCurrentTab = () => {
     if (tab === 'needs') {
       void approvals.refetch();
+      void workspaceChoosers.refetch();
       void trustProposals.refetch();
     }
     void notifications.refetch();
@@ -324,6 +354,14 @@ export function Inbox() {
             ? <EmptyState title="You're all caught up" description="Nothing needs a decision from you right now." />
             : (
               <>
+                {workspaceChooserRows.map((chooser) => (
+                  <WorkspaceChooserCard
+                    key={chooser.chooserId}
+                    chooser={chooser}
+                    busy={chooserBusy === chooser.chooserId}
+                    onChoose={(choiceId) => onChooseWorkspace(chooser, choiceId)}
+                  />
+                ))}
                 {approvalRows.length > 1 && (
                   <div className="flex items-center gap-3 rounded-md border border-border bg-subtle px-3.5 py-2">
                     <input type="checkbox" aria-label="Select all approvals"
@@ -435,6 +473,42 @@ function ListRow({ title, meta, tone, selected, onSelect, dim }: {
       <span className="min-w-0 flex-1 truncate text-body text-fg">{title}</span>
       {meta && <span className="shrink-0 text-caption text-faint">{meta}</span>}
     </button>
+  );
+}
+
+function WorkspaceChooserCard({ chooser, busy, onChoose }: {
+  chooser: WorkspaceDestinationChooser;
+  busy: boolean;
+  onChoose: (choiceId: string) => void;
+}) {
+  return (
+    <div className="rounded-md border border-primary/40 bg-primary-tint/40 px-3.5 py-3">
+      <div className="flex w-full items-start gap-3">
+        <StatusPill tone="live">Workspace</StatusPill>
+        <div className="min-w-0 flex-1">
+          <div className="text-body font-medium text-fg">Where should these records live?</div>
+          <div className="mt-1 text-caption text-muted">
+            Choose an exact existing Workspace, or have Clem stage a separate new-Workspace approval.
+          </div>
+        </div>
+        <span className="shrink-0 text-caption text-faint">{relativeTime(chooser.createdAt)}</span>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {chooser.choices.map((choice) => (
+          <Button
+            key={choice.choiceId}
+            size="sm"
+            {...(choice.kind === 'create_new' ? { variant: 'secondary' as const } : {})}
+            disabled={busy}
+            onClick={() => onChoose(choice.choiceId)}
+          >
+            {busy
+              ? 'Saving…'
+              : choice.kind === 'existing' ? `${choice.label} (${choice.workspaceId})` : choice.label}
+          </Button>
+        ))}
+      </div>
+    </div>
   );
 }
 

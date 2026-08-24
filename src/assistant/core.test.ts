@@ -176,7 +176,10 @@ test('legacy assistant keeps a labeled local-recording fallback when unified rec
     sessionId: 'assistant-core-degraded-meeting',
     userId: 'core-user',
     channel: 'desktop',
-    message: 'What was the in-person Orchid meeting about?',
+    // Keep the fixture explicitly in the user's hosted world. Closed-world
+    // questions intentionally skip archival recall; this test owns the
+    // degraded-primer behavior, not intent classification.
+    message: 'What was my in-person Orchid meeting about?',
   });
 
   assert.ok(runtime.request);

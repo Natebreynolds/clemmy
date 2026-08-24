@@ -55,9 +55,29 @@ test('resolve: ambiguous when several workflows share the named token', () => {
   }
 });
 
+test('resolve: live "run my team activity slack update early" uniquely matches', () => {
+  const slack = E('Team Activity Slack Updates', 'team-activity-slack-updates');
+  const facebook = E('Scorpion Facebook Trends', 'scorpion-facebook-trends');
+  const r = resolveWorkflowName(
+    'run my team activity slack update early and skip the 9am one',
+    [slack, facebook],
+  );
+  assert.equal(r.kind, 'fuzzy');
+  if (r.kind === 'fuzzy') assert.equal(r.name, 'Team Activity Slack Updates');
+});
+
 test('resolve: none for an unrelated ad-hoc request (2026-05-31 incident)', () => {
   const r = resolveWorkflowName('scrape their top keywords into a google sheet', [PROSPECT, SEO]);
   assert.equal(r.kind, 'none');
+});
+
+test('resolve: a leftover cadence token is not a unique workflow name', () => {
+  const digest = E('nightly-digest', 'nightly-digest');
+  const shared = resolveWorkflowName('please digest these notes into a new sheet', [digest, PROSPECT]);
+  assert.equal(shared.kind, 'none');
+  const named = resolveWorkflowName('run my nightly digest', [digest, PROSPECT]);
+  assert.equal(named.kind, 'fuzzy');
+  if (named.kind === 'fuzzy') assert.equal(named.name, 'nightly-digest');
 });
 
 test('resolve: none for empty input', () => {

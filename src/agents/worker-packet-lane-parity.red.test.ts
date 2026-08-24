@@ -5,7 +5,7 @@
  *
  * The same contracted fan-out item can be dispatched to a worker from three
  * production entry points: the SDK-brain run_worker MCP tool (worker-tools),
- * the orchestrator's inline run_worker, and code-mode's clem.run_worker. The
+ * and the orchestrator's inline run_worker. The
  * packet a worker receives is its ONLY authority: under a frozen work
  * contract a worker with no expectedWork binding sees no first-class business
  * tool and quits with zero calls (live 2026-08-11: five workers, twice each).
@@ -14,7 +14,7 @@
  * SAME contracted binding (expectedWork.requirementId/universeId) and the
  * same authority envelope — the binding must never depend on which brain
  * happened to fan out. Today only the worker-tools lane derives expectedWork;
- * the orchestrator and code-mode lanes forward the packet blind, so those two
+ * the orchestrator lane forwards the packet blind, so those
  * lane tests fail until packet assembly is shared.
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -44,13 +44,11 @@ const { registerWorkerTools } = await import('../tools/worker-tools.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
 const { buildOrchestratorAgent } = await import('./orchestrator.js');
-const { dispatchCodeModeTool, _setCodeModeWorkerRunnerForTests } = await import('../tools/code-mode-tool.js');
 const { workerPacketKey } = await import('./worker-job-packet.js');
 const { activateDispatchLease } = await import('../runtime/harness/dispatch-lease.js');
 
 test.after(() => {
   setClaudeAgentSdkWorkerRunForTest(null);
-  _setCodeModeWorkerRunnerForTests(null);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -266,25 +264,6 @@ async function dispatchViaOrchestrator(task: ArmedTask): Promise<CapturedDispatc
   }
 }
 
-async function dispatchViaCodeMode(task: ArmedTask): Promise<WorkerToolInput> {
-  const captured: WorkerToolInput[] = [];
-  _setCodeModeWorkerRunnerForTests(async (input) => {
-    captured.push(input);
-    return { text: 'DRAFTED lead-001 | drafts/lead-001.md', model: 'test' };
-  });
-  try {
-    const out = await withHarnessRunContext(
-      { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, counter: new ToolCallsCounter(50) },
-      () => dispatchCodeModeTool('run_worker', packetFor(), task.sessionId, new ToolCallsCounter(50)),
-    ) as { ok: boolean; error?: string };
-    assert.equal(out.ok, true, `code-mode lane dispatched one worker: ${JSON.stringify(out)}`);
-    assert.equal(captured.length, 1);
-    return captured[0];
-  } finally {
-    _setCodeModeWorkerRunnerForTests(null);
-  }
-}
-
 test('the worker-tools lane hands its worker the contracted binding (the reference lane)', async () => {
   const task = armContractedTask('sdk-brain');
   const dispatched = await dispatchViaWorkerTools(task);
@@ -302,17 +281,6 @@ test('the orchestrator inline lane hands its worker the same contracted binding'
     dispatched.packet.expectedWork,
     EXPECTED_BINDING,
     'a contracted fan-out from the orchestrator lane must carry the same expectedWork binding '
-      + 'the worker-tools lane derives — a worker dispatched blind sees no business surface and quits',
-  );
-});
-
-test('the code-mode lane hands its worker the same contracted binding', async () => {
-  const task = armContractedTask('code-mode');
-  const packet = await dispatchViaCodeMode(task);
-  assert.deepEqual(
-    packet.expectedWork,
-    EXPECTED_BINDING,
-    'a contracted fan-out from clem.run_worker must carry the same expectedWork binding '
       + 'the worker-tools lane derives — a worker dispatched blind sees no business surface and quits',
   );
 });

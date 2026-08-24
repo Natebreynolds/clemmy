@@ -4,6 +4,7 @@ import {
   validateArgsAgainstSchema,
   normalizeComposioBatchItemArgs,
   formatBatchValidationError,
+  repairUnambiguousFieldRename,
 } from './composio-batch-validator.js';
 
 // Test batch validation detects empty items
@@ -490,4 +491,25 @@ console.log('composio-batch-validator tests passed');
   if (!/google-maps-scraper/.test(String(payload.arguments.actorId))) {
     throw new Error('the field description must travel with the gap');
   }
+}
+
+// An unambiguous wrong field name repairs in place instead of refusing.
+// Live 2026-08-18 session-fixture-unprovisioned-catalog: FIRECRAWL_SEARCH called with
+// arguments.query while the schema requires `q` — one pre-dispatch refusal
+// and a paid tuition round-trip. One missing required + one unknown provided
+// = deterministic rename, value untouched, surfaced as a note.
+{
+  const schema = { required: ['q'], properties: { q: { type: 'string' }, limit: { type: 'number' } } };
+  const repaired = repairUnambiguousFieldRename('FIRECRAWL_SEARCH', { query: 'fort worth firms', limit: 10 }, schema);
+  if (!repaired) throw new Error('unambiguous rename must repair');
+  if (repaired.args.q !== 'fort worth firms') throw new Error('value must move to the required key');
+  if ('query' in repaired.args) throw new Error('the wrong key must be removed');
+  if (repaired.args.limit !== 10) throw new Error('other args untouched');
+  if (repairUnambiguousFieldRename('FIRECRAWL_SEARCH', { query: 'x', qq: 'y' }, schema) !== null) {
+    throw new Error('two unknown fields is ambiguous — no repair');
+  }
+  if (repairUnambiguousFieldRename('FIRECRAWL_SEARCH', { q: 'x', extra: 'y' }, schema) !== null) {
+    throw new Error('nothing missing — no repair');
+  }
+  console.log('✓ unambiguous field rename repairs query→q (session-fixture-unprovisioned-catalog)');
 }

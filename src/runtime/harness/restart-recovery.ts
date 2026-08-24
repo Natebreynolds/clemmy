@@ -24,6 +24,7 @@ import {
   clearKill,
   finishRunAttempt,
   getLatestRunAttempt,
+  getRunAttemptBySourceUserSeq,
   getRunAttemptSourceUserEvent,
   isKillRequested,
   listEvents,
@@ -73,14 +74,32 @@ function autoResumeEnabled(): boolean {
   return (process.env.CLEMMY_CHAT_AUTO_RESUME ?? 'on').toLowerCase() !== 'off';
 }
 
-/** A dispatcher the daemon supplies at boot: run one continuation turn on the
- *  session through the normal harness spine. Injected (not imported) so this
- *  module stays free of the respond-bridge dependency. */
-export type ResumeDispatcher = (
-  sessionId: string,
-  directive: string,
-  sourceUserSeq: number,
-) => Promise<void>;
+/** Interactive surface reconstructed from the durable session. This local
+ * union deliberately keeps restart recovery free of the respond-bridge
+ * dependency while preventing a chat source from being reopened as a
+ * background/execution session. */
+export type RestartChatSurface =
+  | 'webhook'
+  | 'cli'
+  | 'dashboard'
+  | 'home'
+  | 'discord'
+  | 'slack';
+
+/** Internal-only boot dispatch. `acceptedInput` is the exact text already
+ * owned by `sourceUserSeq`, never a synthetic continuation instruction. */
+export interface RestartResumeDispatch {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedInput: string;
+  surface: RestartChatSurface;
+  channel?: string;
+}
+
+/** A dispatcher the daemon supplies at boot: reopen one exact accepted source
+ * through the ordinary interactive harness spine. Injected (not imported) so
+ * this module stays free of the respond-bridge dependency. */
+export type ResumeDispatcher = (dispatch: RestartResumeDispatch) => Promise<void>;
 
 /** Distinguish an ordinary resume failure from the narrow crash window where
  * the resumed turn durably transferred this exact source to an activated
@@ -122,13 +141,6 @@ async function transferredWorkflowDispatchForSource(
     runIds: [...receipts[0].runIds],
   };
 }
-
-export const AUTO_RESUME_DIRECTIVE = [
-  'The previous run in this session was interrupted by a daemon restart and has been automatically resumed.',
-  'First inspect the replayed tool outputs and audit events from the interrupted run. Successful tool results are durable: never repeat a completed mutation, including space_save, and never restart the task from scratch.',
-  'Treat an earlier question as resolved when a later user_input_received event answers it; do not reopen that question.',
-  'A successful space_save can be the final action or an intermediate checkpoint. If the durable results already satisfy the request, use at most read-only verification and report the result now. Otherwise continue only work that the objective and event trail show is clearly unfinished, starting from the last durable boundary.',
-].join('\n');
 
 function externalWriteRiskIdentity(event: {
   seq: number;
@@ -194,22 +206,26 @@ export function markRunInFlight(sessionId: string, on: boolean): void {
     const sess = HarnessSession.load(sessionId);
     if (!sess || sess.kind !== 'chat') return;
     if (on) sess.setRunInFlight();
-    else sess.clearRunInFlight();
+    else clearRunInFlightAfterTerminal(sessionId);
   } catch {
     /* best-effort — the recovery marker must never break a run */
   }
 }
 
 /**
- * Clear a terminal run's coarse chat marker without stealing recovery
- * ownership from a different durable attempt that is still active. The SQL
- * predicate and metadata update run as one statement, so a concurrently
- * accepted attempt either blocks this clear or re-arms itself after it.
+ * Compare-and-swap the exact chat recovery owner. Modern accepted turns arm a
+ * pair: the coarse timestamp used by boot scanning plus a structured owner
+ * `{ attemptId, sourceUserSeq }`. Both keys are removed together or neither is.
+ * The SQL predicate and metadata update are one statement, so late attempt A
+ * cannot erase a marker that newer attempt B has already armed.
  *
- * A matching owner attempt is allowed because most surface wrappers settle
- * their run_attempt row immediately after the inner graph commits its public
- * terminal. Direct callers without an attempt id may clear only when no
- * attempt-backed run is active for the session.
+ * Attempt-only calls support wrappers that have not carried source identity to
+ * their outermost finally, but still require the marker's durable attempt id.
+ * Direct callers without a physical run attempt own the marker by exact
+ * accepted source. Ownerless calls are legacy-only: they may clear an
+ * ownerless marker only when no attempt-backed run is active. An old ownerless
+ * marker paired with one explicitly named attempt is retained as a narrow
+ * migration path.
  */
 export function clearRunInFlightAfterTerminal(
   sessionId: string,
@@ -228,26 +244,161 @@ export function clearRunInFlightAfterTerminal(
     })) {
       return false;
     }
-    const owner = ownerAttemptId?.trim() || null;
-    const result = openEventLog().prepare(
+    return clearExactRunInFlightOwner(sessionId, ownerAttemptId, sourceUserSeq);
+  } catch {
+    return false;
+  }
+}
+
+/** Release the foreground chat owner only after the exact accepted source has
+ * durably transferred to an activated workflow group. This is deliberately not
+ * a terminal clear: the workflow reducer still owes the eventual public
+ * terminal, while the synchronous chat attempt no longer owns execution. */
+export function releaseRunInFlightAfterWorkflowTransfer(
+  sessionId: string,
+  ownerAttemptId: string | undefined,
+  sourceUserSeq: number,
+): boolean {
+  if (!enabled()) return false;
+  try {
+    if (readPendingWorkflowChatDispatchOwnership({ sessionId, sourceUserSeq })) return false;
+    const sourceGroupId = workflowOriginSourceGroupId({ sessionId, sourceUserSeq });
+    const active = readActiveWorkflowOriginGroup(sourceGroupId);
+    if (!active || active.sealed.sourceGroupId !== sourceGroupId) return false;
+    return clearExactRunInFlightOwner(sessionId, ownerAttemptId, sourceUserSeq);
+  } catch {
+    return false;
+  }
+}
+
+function clearExactRunInFlightOwner(
+  sessionId: string,
+  ownerAttemptId?: string,
+  sourceUserSeq?: number,
+): boolean {
+  const owner = ownerAttemptId?.trim() || '';
+  const source = Number.isSafeInteger(sourceUserSeq) && Number(sourceUserSeq) > 0
+    ? Number(sourceUserSeq)
+    : null;
+  const db = openEventLog();
+  const now = new Date().toISOString();
+  const removeOwnerAndMarker = `json_remove(
+    metadata_json,
+    '$.__run_in_flight',
+    '$.__run_in_flight_owner'
+  )`;
+
+  if (owner && source !== null) {
+    const result = db.prepare(
       `UPDATE sessions
-          SET metadata_json = json_remove(metadata_json, '$.__run_in_flight'),
+          SET metadata_json = ${removeOwnerAndMarker},
               updated_at = ?
         WHERE id = ?
           AND kind = 'chat'
           AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
+          AND (
+            (
+              json_extract(metadata_json, '$.__run_in_flight_owner.attemptId') = ?
+              AND json_extract(metadata_json, '$.__run_in_flight_owner.sourceUserSeq') = ?
+            )
+            OR json_type(metadata_json, '$.__run_in_flight_owner') IS NULL
+          )
+          AND EXISTS (
+            SELECT 1
+              FROM run_attempts AS owner
+             WHERE owner.session_id = sessions.id
+               AND owner.attempt_id = ?
+               AND owner.source_user_seq = ?
+          )
           AND NOT EXISTS (
             SELECT 1
               FROM run_attempts AS active
              WHERE active.session_id = sessions.id
                AND active.finished_at IS NULL
-               AND (? IS NULL OR active.attempt_id != ?)
+               AND active.attempt_id != ?
           )`,
-    ).run(new Date().toISOString(), sessionId, owner, owner);
+    ).run(now, sessionId, owner, source, owner, source, owner);
     return result.changes === 1;
-  } catch {
-    return false;
   }
+
+  if (owner) {
+    const result = db.prepare(
+      `UPDATE sessions
+          SET metadata_json = ${removeOwnerAndMarker},
+              updated_at = ?
+        WHERE id = ?
+          AND kind = 'chat'
+          AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+              FROM run_attempts AS owner
+             WHERE owner.session_id = sessions.id
+               AND owner.attempt_id = ?
+          )
+          AND (
+            json_extract(metadata_json, '$.__run_in_flight_owner.attemptId') = ?
+            OR (
+              json_type(metadata_json, '$.__run_in_flight_owner') IS NULL
+              AND EXISTS (
+                SELECT 1
+                  FROM run_attempts AS legacy_owner
+                 WHERE legacy_owner.session_id = sessions.id
+                   AND legacy_owner.attempt_id = ?
+                   AND legacy_owner.finished_at IS NULL
+              )
+            )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM run_attempts AS active
+             WHERE active.session_id = sessions.id
+               AND active.finished_at IS NULL
+               AND active.attempt_id != ?
+          )`,
+    ).run(now, sessionId, owner, owner, owner, owner);
+    return result.changes === 1;
+  }
+
+  if (source !== null) {
+    const result = db.prepare(
+      `UPDATE sessions
+          SET metadata_json = ${removeOwnerAndMarker},
+              updated_at = ?
+        WHERE id = ?
+          AND kind = 'chat'
+          AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
+          AND (
+            (
+              json_type(metadata_json, '$.__run_in_flight_owner.attemptId') IS NULL
+              AND json_extract(metadata_json, '$.__run_in_flight_owner.sourceUserSeq') = ?
+            )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM run_attempts AS active
+             WHERE active.session_id = sessions.id
+               AND active.finished_at IS NULL
+          )`,
+    ).run(now, sessionId, source);
+    return result.changes === 1;
+  }
+
+  const result = db.prepare(
+    `UPDATE sessions
+        SET metadata_json = ${removeOwnerAndMarker},
+            updated_at = ?
+      WHERE id = ?
+        AND kind = 'chat'
+        AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
+        AND json_type(metadata_json, '$.__run_in_flight_owner') IS NULL
+        AND NOT EXISTS (
+          SELECT 1
+            FROM run_attempts AS active
+           WHERE active.session_id = sessions.id
+             AND active.finished_at IS NULL
+        )`,
+  ).run(now, sessionId);
+  return result.changes === 1;
 }
 
 const INTERRUPTED_REPLY =
@@ -287,7 +438,15 @@ export interface RestartRecoveryRecord {
   preparedDispatchPhase?: PendingWorkflowChatDispatchOwnership['phase'];
   preparedDispatchRunIds: string[];
   /** Why auto-resume did NOT run (for the boot log / forensics). */
-  autoResumeSkipped?: 'disabled' | 'no_dispatcher' | 'external_write' | 'too_old' | 'boot_cap' | 'user_stopped' | 'identity_missing';
+  autoResumeSkipped?:
+    | 'disabled'
+    | 'no_dispatcher'
+    | 'external_write'
+    | 'too_old'
+    | 'boot_cap'
+    | 'user_stopped'
+    | 'identity_missing'
+    | 'batch_unproven';
   errors: string[];
 }
 
@@ -356,6 +515,40 @@ function recoveryTurnIdentity(
     : null;
 }
 
+/** Read the exact already-accepted user bytes. A restart may reuse this event,
+ * but it may not substitute an internal recovery prompt or infer missing text
+ * from a title, snapshot, or later chat turn. */
+function recoveryAcceptedInput(identity: TurnIdentity | null): string | null {
+  if (!identity) return null;
+  const source = listEvents(identity.sessionId, {
+    sinceSeq: identity.sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === identity.sourceUserSeq);
+  const text = source?.data.text;
+  return source?.turn === identity.turn
+    && source.role === 'user'
+    && typeof text === 'string'
+    && text.trim().length > 0
+    ? text
+    : null;
+}
+
+/** Session channels are transport metadata rather than execution authority.
+ * Preserve exact interactive channels where the bridge has a matching lane;
+ * desktop/mobile/unknown chat clients share the canonical home chat lane. */
+function restartSurfaceForSession(row: SessionRow): RestartChatSurface {
+  switch (row.channel) {
+    case 'discord': return 'discord';
+    case 'slack': return 'slack';
+    case 'webhook': return 'webhook';
+    case 'cli': return 'cli';
+    case 'dashboard': return 'dashboard';
+    case 'home': return 'home';
+    default: return 'home';
+  }
+}
+
 function nonEmptyString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
@@ -418,6 +611,44 @@ function exactCommittedTerminal(
     if (terminal.turn === identity.turn) return terminal;
   }
   return null;
+}
+
+/** Resolve the newest physical owner of an exact accepted source. A resumed
+ * attempt can supersede the boot-scan attempt while keeping the same logical
+ * source, so cleanup must prefer this lookup over the scan's stale snapshot. */
+function recoveryAttemptForIdentity(
+  sessionId: string,
+  identity: TurnIdentity | null,
+  fallback: RunAttemptRecord | null,
+): RunAttemptRecord | null {
+  if (!identity) return fallback;
+  try {
+    return getRunAttemptBySourceUserSeq(sessionId, identity.sourceUserSeq) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Clear only the exact owner captured by recovery, then report whether the
+ * session is actually marker-free. A terminal append may already have removed
+ * the owner atomically; conversely a newer turn may have armed its own marker
+ * between the boot scan and this cleanup. */
+function reconcileRecoveryMarker(
+  sessionId: string,
+  identity: TurnIdentity | null,
+  fallback: RunAttemptRecord | null,
+): boolean {
+  const owner = recoveryAttemptForIdentity(sessionId, identity, fallback);
+  if (owner) {
+    clearRunInFlightAfterTerminal(
+      sessionId,
+      owner.attemptId,
+      identity?.sourceUserSeq,
+    );
+  } else {
+    clearRunInFlightAfterTerminal(sessionId);
+  }
+  return HarnessSession.load(sessionId)?.runInFlightSince() === null;
 }
 
 function runAttemptStatusForTerminal(
@@ -542,6 +773,14 @@ export function recoverInterruptedChatRuns(
       // external-write/age checks still decide whether resume is safe.
     }
     const recoveryIdentity = recoveryTurnIdentity(row.id, interruptedAttempt);
+    let acceptedInput: string | null = null;
+    if (recoveryIdentity) {
+      try {
+        acceptedInput = recoveryAcceptedInput(recoveryIdentity);
+      } catch {
+        acceptedInput = null;
+      }
+    }
     let pendingDispatchOwnership: PendingWorkflowChatDispatchOwnership | null = null;
     if (recoveryIdentity) {
       try {
@@ -605,8 +844,11 @@ export function recoverInterruptedChatRuns(
         record.errors.push(`attempt_reconcile: ${err instanceof Error ? err.message : String(err)}`);
       }
       try {
-        sess.clearRunInFlight();
-        record.markerCleared = true;
+        record.markerCleared = reconcileRecoveryMarker(
+          row.id,
+          recoveryIdentity,
+          interruptedAttempt,
+        );
       } catch {
         record.errors.push('marker_clear: failed');
       }
@@ -639,7 +881,7 @@ export function recoverInterruptedChatRuns(
     // recovery state is published or a manual terminal is committed.
     const ageMs = now() - Date.parse(since);
     const externalWritesSinceInterrupt = countExternalWritesSince(row.id, since);
-    if (!recoveryIdentity) record.autoResumeSkipped = 'identity_missing';
+    if (!recoveryIdentity || acceptedInput === null) record.autoResumeSkipped = 'identity_missing';
     else if (userStopped) record.autoResumeSkipped = 'user_stopped';
     else if (!autoResumeEnabled()) record.autoResumeSkipped = 'disabled';
     else if (!dispatchResume) record.autoResumeSkipped = 'no_dispatcher';
@@ -812,8 +1054,11 @@ export function recoverInterruptedChatRuns(
 
     if (!willAutoResume && !pendingDispatchOwnership) {
       try {
-        sess.clearRunInFlight();
-        record.markerCleared = true;
+        record.markerCleared = reconcileRecoveryMarker(
+          row.id,
+          recoveryIdentity,
+          interruptedAttempt,
+        );
       } catch {
         record.errors.push('marker_clear: failed');
       }
@@ -834,15 +1079,17 @@ export function recoverInterruptedChatRuns(
     // Fire-and-forget: boot must not block on model turns. A dispatch failure
     // commits the manual continue terminal only when no unactivated workflow
     // admission still owns this exact source.
-    if (willAutoResume && dispatchResume && recoveryIdentity) {
+    if (willAutoResume && dispatchResume && recoveryIdentity && acceptedInput !== null) {
       autoResumes += 1;
       record.autoResumed = true;
       const sessionId = row.id;
-      void dispatchResume(
+      void dispatchResume({
         sessionId,
-        AUTO_RESUME_DIRECTIVE,
-        recoveryIdentity.sourceUserSeq,
-      ).catch(async (error: unknown) => {
+        sourceUserSeq: recoveryIdentity.sourceUserSeq,
+        acceptedInput,
+        surface: restartSurfaceForSession(row),
+        ...(row.channel ? { channel: row.channel } : {}),
+      }).catch(async (error: unknown) => {
         try {
           // Raw dispatch diagnostics remain private; the user-facing terminal
           // is stable constant copy committed through the typed boundary.
@@ -887,8 +1134,8 @@ export function recoverInterruptedChatRuns(
           } else if (transferredDispatch) {
             // The dispatcher Promise failed after the immutable background edge
             // won. That is successful ownership transfer, not permission to
-            // publish a competing foreground terminal or clear its restart
-            // marker. The workflow's real terminal will report back normally.
+            // publish a competing foreground terminal. Release only the exact
+            // foreground owner; the workflow's real terminal will report back.
             appendEvent({
               sessionId,
               turn: recoveryIdentity.turn,
@@ -903,6 +1150,18 @@ export function recoverInterruptedChatRuns(
                 resumable: true,
               },
             });
+            const transferOwner = recoveryAttemptForIdentity(
+              sessionId,
+              recoveryIdentity,
+              interruptedAttempt,
+            );
+            if (transferOwner) {
+              releaseRunInFlightAfterWorkflowTransfer(
+                sessionId,
+                transferOwner.attemptId,
+                recoveryIdentity.sourceUserSeq,
+              );
+            }
           } else {
             commitRestartRecoveryTerminal(
               recoveryIdentity,
@@ -910,8 +1169,7 @@ export function recoverInterruptedChatRuns(
               failedReply,
               'interrupted_by_restart',
             );
-            const failedSession = HarnessSession.load(sessionId);
-            failedSession?.clearRunInFlight();
+            reconcileRecoveryMarker(sessionId, recoveryIdentity, interruptedAttempt);
           }
           if (!transferredDispatch) {
             addNotification({

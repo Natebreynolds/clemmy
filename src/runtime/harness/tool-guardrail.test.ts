@@ -377,7 +377,7 @@ test('fanoutBlock: ON → a serialized READ is blocked past the threshold (nudge
     for (let i = 1; i <= 5; i += 1) assert.equal(call(i).fanoutBlock, undefined, `read #${i} (< block threshold 6) not blocked`);
     const d6 = call(6);
     assert.ok(d6.fanoutBlock, '6th distinct read → blocked');
-    assert.match(d6.fanoutBlock!, /run_tool_program/, 'the refusal steers to a program');
+    assert.match(d6.fanoutBlock!, /PARALLEL tool calls/, 'the refusal steers to parallel calls');
     assert.match(d6.fanoutBlock!, /REFUSED/);
   } finally {
     delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
@@ -472,20 +472,20 @@ test('strand-hunt B: re-hammering a fanout-refused read keeps the program recove
       last = applyMode(evaluateToolCall('sess-sh-B', 'dataforseo__serp_organic_live_advanced', { keyword: 'k9' }));
     assert.equal(last?.rule, 'exact_args_repeat', 'the exact-repeat branch is what returns at this count');
     assert.ok(last?.fanoutBlock, 'but it STILL carries the fanout recovery (does not degrade to generic loop advice)');
-    assert.match(last!.fanoutBlock!, /run_tool_program/);
+    assert.match(last!.fanoutBlock!, /PARALLEL tool calls/);
   } finally { delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK; }
 });
 
-test('strand-hunt D: with code mode OFF the block falls back to advisory — never refuses toward a tool that is not registered', () => {
+test('strand-hunt D: the recovery door is the model\'s own parallel calls — available on every lane, so the block never strands', () => {
   _resetAllTrackersForTests();
   process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
-  process.env.CLEMMY_CODE_MODE = 'off';
   try {
     let last;
-    for (let i = 1; i <= 8; i += 1)
+    for (let i = 1; i <= 9; i += 1)
       last = applyMode(evaluateToolCall('sess-sh-D', 'dataforseo__serp_organic_live_advanced', { keyword: `k${i}` }));
-    assert.equal(last?.fanoutBlock, undefined, 'no hard refusal when run_tool_program is unavailable (would strand)');
-  } finally { delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK; delete process.env.CLEMMY_CODE_MODE; }
+    assert.ok(last?.fanoutBlock, 'the block fires without needing any tool mandate');
+    assert.match(last!.fanoutBlock!, /PARALLEL tool calls/, 'and its steer is a door every lane has');
+  } finally { delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK; }
 });
 
 test('strand-hunt E: the block DECAYS with the window — a tripped slug frees up after the window rotates past it', () => {
@@ -547,29 +547,26 @@ test('fanoutBlock safety envelope: fires only on serial external reads, silent o
   }
 });
 
-// REGRESSION GUARD (2026-07-11): the original recovery skeleton emitted
-// clem["<lowercased slug>"] for composio slugs — NOT a dispatchable code-mode
-// method (composio dispatches via clem.composio_execute_tool), so every forced
-// recovery was UNRUNNABLE and the model fell back to raw serial reads. Pin the
-// dispatch shapes so that bug can never silently return.
-test('buildFanoutRecoveryMessage: composio dispatches via composio_execute_tool, MCP by name', () => {
+// REGRESSION GUARD (2026-07-11 heritage, retargeted 2026-08-20): the recovery
+// must be RUNNABLE — it carries the exact arg shape the model was varying and
+// steers to parallel calls, never to a door that does not exist.
+test('buildFanoutRecoveryMessage: the parallel recovery carries the literal arg shape and never a dead door', () => {
   const composio = buildFanoutRecoveryMessage({
     toolName: 'composio_execute_tool', slug: 'OUTLOOK_GET_MAIL_FOLDER',
     args: { tool_slug: 'OUTLOOK_GET_MAIL_FOLDER', arguments: JSON.stringify({ folder_id: 'inbox' }) },
     distinct: 6, fanoutBlockAt: 6,
-    mandate: { name: 'run_tool_program', schema: null, requiredFields: [], source: 'legacy_env' },
+    mandate: null,
   });
-  assert.match(composio, /clem\.composio_execute_tool\(\{ tool_slug: "OUTLOOK_GET_MAIL_FOLDER"/, 'composio → composio_execute_tool');
-  assert.doesNotMatch(composio, /clem\["outlook_get_mail_folder"\]/, 'the broken lowercased-slug dispatch must never return');
-  assert.match(composio, /distilled value/i, 'carries the distill directive (fixes savedBytes=0)');
+  assert.match(composio, /PARALLEL tool calls/, 'the recovery is parallel direct calls');
   assert.match(composio, /folder_id/, 'carries the literal arg shape the model was varying');
-  assert.match(composio, /run_tool_program/);
+  assert.doesNotMatch(composio, /run_tool_program/, 'the subtracted door is never prescribed');
 
   const mcp = buildFanoutRecoveryMessage({
     toolName: 'dataforseo__serp', args: { keyword: 'x' }, distinct: 6, fanoutBlockAt: 6,
-    mandate: { name: 'run_tool_program', schema: null, requiredFields: [], source: 'legacy_env' },
+    mandate: null,
   });
-  assert.match(mcp, /clem\["dataforseo__serp"\]\(a\)/, 'native MCP dispatched by its namespaced name');
+  assert.match(mcp, /PARALLEL tool calls/);
+  assert.match(mcp, /keyword/, 'MCP recovery carries its arg shape too');
 });
 
 test('buildFanoutRecoveryMessage: escalation prefix appears only at refusals >= 2', () => {
@@ -1151,10 +1148,10 @@ test('a block may not outlive the alternative it prescribes', () => {
   const scope = 'sess-redirect';
   const big = JSON.stringify({ data: 'x'.repeat(20_000) });
   assert.ok(serialLookups(scope, 8, big)?.fanoutBlock, 'setup: the block should be active');
-  // The prescribed program fails the way it failed live.
-  noteGuardrailObservedCost(scope, 'run_tool_program',
-    'code-mode program failed: discovery budget denied (category_budget_exhausted) on code_mode_describe');
-  noteGuardrailObservedCost(scope, 'run_tool_program',
+  // The prescribed batching alternative fails the way it failed live.
+  noteGuardrailObservedCost(scope, 'run_worker',
+    'run_worker failed: discovery budget denied (category_budget_exhausted)');
+  noteGuardrailObservedCost(scope, 'run_worker',
     'An error occurred while running the tool. Error: InvalidToolInputError: Invalid JSON input for tool');
   const after = evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: SLACK, arguments: { email: 'last@scorpion.co' } });
   assert.equal(after.fanoutBlock, undefined,
@@ -1170,10 +1167,10 @@ test('a repeated refusal releases the working path instead of ending the turn', 
   // Refusing a fanout-keyed READ must never kill the turn (pinned invariant).
   const again = evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: SLACK, arguments: { email: 'a@scorpion.co' } });
   assert.notEqual(again.action, 'escalate', 'a fanout-refused read must never end the turn');
-  // Recovery is RELEASE: once the prescribed program fails twice, the working
-  // path resumes and the remaining items can finish.
-  noteGuardrailObservedCost(scope, 'run_tool_program', 'code-mode program failed: discovery budget denied');
-  noteGuardrailObservedCost(scope, 'run_tool_program', 'Error: InvalidToolInputError: Invalid JSON input for tool');
+  // Recovery is RELEASE: once the prescribed alternative fails twice, the
+  // working path resumes and the remaining items can finish.
+  noteGuardrailObservedCost(scope, 'run_worker', 'run_worker failed: discovery budget denied');
+  noteGuardrailObservedCost(scope, 'run_worker', 'Error: InvalidToolInputError: Invalid JSON input for tool');
   const released = evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: SLACK, arguments: { email: 'b@scorpion.co' } });
   assert.equal(released.fanoutBlock, undefined, 'the turn stayed deadlocked instead of releasing');
 });

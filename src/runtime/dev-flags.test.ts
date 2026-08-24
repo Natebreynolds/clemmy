@@ -16,6 +16,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { DEFAULT_RUBRIC_VARIANT } from '../agents/rubric-variant.js';
 
 const {
   buildDevFlagsSnapshot, setDevFlag, clearDevFlag, isSafeDevFlagKey,
@@ -26,11 +27,11 @@ const TOUCHED = ['CLEMMY_DEV_FLAG_TEST_XYZ', 'CLEMMY_DEBATE_MODE', 'CLEMMY_DEV_M
 afterEach(() => { for (const k of TOUCHED) delete process.env[k]; });
 
 test('isSafeDevFlagKey: CLEMMY_* only, never dev-mode or secrets, case-sensitive', () => {
-  assert.ok(isSafeDevFlagKey('CLEMMY_CODE_MODE'));
+  assert.ok(isSafeDevFlagKey('CLEMMY_TOOL_JIT'));
   assert.ok(!isSafeDevFlagKey('CLEMMY_DEV_MODE'), 'dev-mode has its own setter');
   assert.ok(!isSafeDevFlagKey('OPENAI_API_KEY'), 'never a secret/auth key');
   assert.ok(!isSafeDevFlagKey('WEBHOOK_PORT'));
-  assert.ok(!isSafeDevFlagKey('clemmy_code_mode'), 'case-sensitive');
+  assert.ok(!isSafeDevFlagKey('clemmy_tool_jit'), 'case-sensitive');
 });
 
 test('set then clear a curated flag is live (process.env) + reflected in the snapshot', () => {
@@ -76,4 +77,11 @@ test('registry is well-formed: unique CLEMMY_* keys, boolean defaults are on/off
   for (const d of DEV_FLAG_REGISTRY) {
     if (d.type === 'boolean') assert.ok(d.default === 'on' || d.default === 'off', `${d.key} default must be on/off`);
   }
+});
+
+test('the developer surface reports the same rubric default the orchestrator uses', () => {
+  const rubric = DEV_FLAG_REGISTRY.find((def) => def.key === 'CLEMMY_RUBRIC_VARIANT');
+  assert.ok(rubric);
+  assert.equal(rubric.default, DEFAULT_RUBRIC_VARIANT);
+  assert.equal(buildDevFlagsSnapshot().flags.find((def) => def.key === rubric.key)?.value, DEFAULT_RUBRIC_VARIANT);
 });

@@ -1,6 +1,6 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/semantic-boundary/fast-lane-collect-construct.test.ts
  *
- * THE FAST LANE (plan: "The 3-Minute Graph"). Live 2026-08-19 sess-mt0c3kkc
+ * THE FAST LANE (plan: "The 3-Minute Graph"). Live 2026-08-19 session-fixture-fast-lane
  * paid 97s and six model calls at admission for a plan the host could prove.
  * These pins run the same live ask through the host deterministic compile:
  *

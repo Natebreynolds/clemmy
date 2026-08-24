@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import {
   activityTerminalOutcomeForMessageStatus,
   activityTerminalOutcomeFromHarnessEvents,
+  humanizeRequirementId,
   settleTerminalActivity,
+  workPlanActivityItem,
 } from './activity-presentation.js';
 import type { ActivityItem } from './useChat.js';
 
@@ -18,6 +20,30 @@ test('terminal activity never turns an unresolved row green after failure or int
   assert.equal(settleTerminalActivity([runningTool], 'failed')[0]?.status, 'failed');
   assert.equal(settleTerminalActivity([runningTool], 'interrupted')[0]?.status, 'interrupted');
   assert.equal(settleTerminalActivity([runningTool], 'completed')[0]?.status, 'done');
+});
+
+test('host work-plan rows keep their own truth when the turn ends', () => {
+  assert.equal(humanizeRequirementId('social_lookup'), 'Social lookup');
+  assert.equal(humanizeRequirementId('n5:retrieve'), 'Retrieve');
+  const complete = workPlanActivityItem({ id: 'n5:retrieve', effect: 'read', state: 'data_in' });
+  assert.ok(complete);
+  assert.equal(complete.label, 'Looked this up');
+  assert.equal(
+    workPlanActivityItem({
+      id: 'n6:execute',
+      effect: 'external_write',
+      state: 'blocked_on_dependency',
+      dependsOn: ['n5:retrieve'],
+    }),
+    null,
+    'a later write waiting on the read is not a user-facing block',
+  );
+  const open = workPlanActivityItem({ id: 'n5:retrieve', effect: 'read', state: 'open' });
+  assert.ok(open);
+  assert.equal(open.label, 'Looking this up');
+  const settled = settleTerminalActivity([complete, open], 'completed');
+  assert.equal(settled[0]?.status, 'done', 'data in stays complete');
+  assert.equal(settled[1]?.status, 'interrupted', 'an open requirement is not painted done');
 });
 
 test('live activity remains untouched and preserves its array identity', () => {
@@ -117,6 +143,50 @@ test('board feed uses durable terminal events and fails closed without one', () 
     assert.equal(narrateActivity(items, { verbose: true }).length, 2, 'diagnostics mode is lossless');
   }
 
+  // Live: discovery is one human stand-in so the strip is not a blank pause.
+  {
+    const items = [
+      row({ label: 'tool_search', status: 'running', startedAt: 1 }),
+      row({ label: 'composio_search_tools', status: 'running', startedAt: 2 }),
+    ];
+    const narrated = narrateActivity(items, { live: true });
+    assert.equal(narrated.length, 1, 'many lookups are one live row');
+    assert.equal(narrated[0]!.label, 'Finding the right tool…');
+    assert.equal(narrated[0]!.status, 'running');
+    assert.equal(narrated[0]!.tone, 'live');
+  }
+
+  // Live: once real work exists, the stand-in yields to it.
+  {
+    const narrated = narrateActivity([
+      row({ label: 'tool_search', status: 'done' }),
+      row({ label: 'outlook create draft', status: 'running' }),
+    ], { live: true });
+    assert.equal(narrated.length, 1);
+    assert.equal(narrated[0]!.label, 'outlook create draft');
+  }
+
+  // Finished turn: discovery stays hidden even if it was the only row.
+  {
+    assert.equal(
+      narrateActivity([row({ label: 'tool_search', status: 'done' })], { live: false }).length,
+      0,
+    );
+  }
+
+  // Compiler IR and leftover inventory are not work, even if an older
+  // client already reduced them onto the bubble.
+  {
+    const narrated = narrateActivity([
+      { id: 'ew-n5:retrieve', kind: 'event', variant: 'lifecycle', label: 'N5 retrieve', status: 'running', tone: 'live' },
+      { id: 'ew-n6:execute', kind: 'event', variant: 'lifecycle', label: 'N6 execute — blocked', status: 'interrupted', tone: 'warning', detail: 'waiting on N5 retrieve' },
+      { id: 'cap-0', kind: 'event', variant: 'lifecycle', label: "Grounded in what's proven: 3 proven tools, 1 needs a re-check", status: 'done', tone: 'warning', detail: 'outlook calendar list events ✓' },
+    ], { live: true });
+    assert.equal(narrated.length, 1);
+    assert.equal(narrated[0]!.label, 'Looking this up');
+    assert.doesNotMatch(narrated.map((row) => row.label).join(' '), /blocked|Grounded|N5|N6|outlook/i);
+  }
+
   // Unrecognised rows stay visible — a missed hide is noise, a wrong hide is a lie.
   assert.equal(isDiscoveryRow({ kind: 'tool', label: 'draft the email' }), false);
   assert.equal(isDiscoveryRow({ kind: 'event', label: 'tool_search' }), false, 'only TOOL rows can be discovery');
@@ -133,7 +203,7 @@ test('board feed uses durable terminal events and fails closed without one', () 
   const { readFileSync } = await import('node:fs');
   for (const file of ['../components/chat/TurnActivity.tsx', '../components/chat/ActivityFeed.tsx']) {
     const source = readFileSync(new URL(file, import.meta.url), 'utf8');
-    assert.match(source, /narrateActivity\(/, `${file} must narrate, not render raw call rows`);
+    assert.match(source, /narrateActivity\([^)]*live/, `${file} must narrate (and pass live so discovery can stand in)`);
   }
   console.log('activity narration wiring pinned');
 }

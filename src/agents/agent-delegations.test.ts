@@ -36,6 +36,7 @@ let renderOpenDelegations: Mod['renderOpenDelegations'];
 let DELEGATION_CLAIM_LEASE_MS: Mod['DELEGATION_CLAIM_LEASE_MS'];
 let setBridgeImplsForTests: typeof import('../runtime/harness/respond-bridge.js')['_setBridgeImplsForTests'];
 let resetEventLog: typeof import('../runtime/harness/eventlog.js')['resetEventLog'];
+let autonomyRuntime: typeof import('./autonomy-v2.js');
 
 const DELEGATIONS = () => path.join(process.env.CLEMENTINE_HOME!, 'delegations');
 
@@ -78,9 +79,15 @@ before(async () => {
   ({ _setBridgeImplsForTests: setBridgeImplsForTests } =
     await import('../runtime/harness/respond-bridge.js'));
   ({ resetEventLog } = await import('../runtime/harness/eventlog.js'));
+  autonomyRuntime = await import('./autonomy-v2.js');
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  // Do not let the isolated runner's deliberately tiny coordinator timeout
+  // abort a valid fake cycle halfway through accepted-source persistence and
+  // then race that still-running cycle against the next ledger reset.
+  await autonomyRuntime._testOnly_waitForAutonomyLaneIdle();
+  autonomyRuntime._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs(10_000);
   rmSync(DELEGATIONS(), { recursive: true, force: true });
   resetEventLog();
   setBridgeImplsForTests({});
@@ -90,7 +97,9 @@ beforeEach(() => {
   delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
 });
 
-after(() => {
+after(async () => {
+  await autonomyRuntime._testOnly_waitForAutonomyLaneIdle();
+  autonomyRuntime._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs();
   setBridgeImplsForTests({});
   rmSync(tmpHome, { recursive: true, force: true });
 });
@@ -572,6 +581,8 @@ test('HONESTY: a parked/blocked turn is never a successful cycle and consumes no
 
 test('HONESTY: an error turn is not a successful cycle', async () => {
   const mod = await import('./autonomy-v2.js');
+  await mod._testOnly_waitForAutonomyLaneIdle();
+  mod._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs(10_000);
   seedTeamAgent('rt-err');
   seed('rt-err', 're1');
   const harness = fakeHarnessAssistant([{
@@ -588,6 +599,7 @@ test('HONESTY: an error turn is not a successful cycle', async () => {
     assert.equal(harness.legacyCalls(), 0);
     assert.deepEqual(harness.authority, [[]]);
   } finally {
+    mod._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs();
     if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
     else process.env.AUTONOMY_V2_AGENTS = prevAgents;
   }
@@ -604,6 +616,8 @@ test('PROVENANCE: a completed delegation says its result is model prose', async 
 
 test('WAKE: open delegated work wakes the agent, paced by backoff', async () => {
   const mod = await import('./autonomy-v2.js');
+  await mod._testOnly_waitForAutonomyLaneIdle();
+  mod._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs(10_000);
   seedTeamAgent('rt-wake');
   seed('rt-wake', 'w9');
 
@@ -630,6 +644,7 @@ test('WAKE: open delegated work wakes the agent, paced by backoff', async () => 
     assert.equal(harness.legacyCalls(), 0);
     assert.deepEqual(harness.authority, [[]]);
   } finally {
+    mod._testOnly_setRuntimeAutonomyCoordinatorWaitBudgetMs();
     if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
     else process.env.AUTONOMY_V2_AGENTS = prevAgents;
   }

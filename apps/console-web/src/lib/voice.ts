@@ -210,7 +210,11 @@ export class RealtimeVoice {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ message, sessionId: 'console:voice' }),
+      body: JSON.stringify({
+        message,
+        sessionId: 'console:voice',
+        clientRequestId: `voice-${crypto.randomUUID()}`,
+      }),
     });
     if (!res.ok || !res.body) {
       const e = await res.json().catch(() => ({}));

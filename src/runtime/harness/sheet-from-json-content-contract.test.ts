@@ -4,6 +4,8 @@ import {
   authorizeGoogleSheetsSheetFromJsonReadbackRequest,
   compileGoogleSheetsSheetFromJsonContract,
   extractGoogleSheetsSheetFromJsonTarget,
+  googleSheetsSheetFromJsonMatchesSourceRecords,
+  parseGoogleSheetsSheetFromJsonContract,
   verifyGoogleSheetsSheetFromJsonReadback,
   type GoogleSheetsSheetFromJsonContract,
   type GoogleSheetsSheetTarget,
@@ -54,14 +56,24 @@ function exactValues(): Array<Array<string | number>> {
 }
 
 test('compiles the exact provider-ready Sheet JSON into an ordered Ventura matrix', () => {
-  assert.deepEqual(contract(), {
+  const compiled = contract();
+  assert.match(compiled.submittedContentDigest, /^[a-f0-9]{64}$/);
+  assert.deepEqual({ ...compiled, submittedContentDigest: undefined }, {
     kind: 'googlesheets_sheet_from_json_content_v1',
     createShape: 'GOOGLESHEETS_SHEET_FROM_JSON',
     sheetName: 'Top 5 Restaurants',
     headers: ['Name', 'Rating', 'Address'],
     expectedValues: exactValues(),
     expectedRange: "'Top 5 Restaurants'!A1:C6",
+    submittedContentDigest: undefined,
   });
+  assert.deepEqual(parseGoogleSheetsSheetFromJsonContract(compiled), compiled);
+  assert.equal(googleSheetsSheetFromJsonMatchesSourceRecords(compiled, rows), true);
+  assert.equal(googleSheetsSheetFromJsonMatchesSourceRecords(compiled, rows.slice(0, -1)), false);
+  assert.equal(googleSheetsSheetFromJsonMatchesSourceRecords(compiled, [
+    ...rows.slice(0, -1),
+    { ...rows.at(-1)!, Rating: 1 },
+  ]), false);
 
   const direct = compileGoogleSheetsSheetFromJsonContract(
     'mcp__googlesheets__sheet_from_json',
@@ -127,7 +139,7 @@ test('extracts the exact created spreadsheet and never borrows an ambient generi
     successful: true,
     data: {
       spreadsheetId,
-      spreadsheetUrl: 'https://docs.google.com/spreadsheets/d/a_different_sheet/edit',
+      spreadsheetUrl: 'https://docs.google.com/spreadsheets/d/fixture-different-sheet/edit',
     },
   }), null, 'conflicting exact Sheet fields fail closed');
 });

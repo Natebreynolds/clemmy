@@ -2,12 +2,15 @@
  * Production attested transport. Lazy-loads the provider SDK from the
  * installed package root — never from a path relative to this artifact.
  */
-import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SHIPPED_TRANSPORT_SUPPORT_MARK } from './transport-support.js';
+import {
+  COMPOSIO_PROVIDER_SURFACE_VERSION,
+  fingerprintComposioProviderDefinition,
+} from '../../../integrations/composio/provider-definition-identity.js';
 import type {
   AttestedTransport,
   AttestedTransportCall,
@@ -18,24 +21,34 @@ import type {
 
 void SHIPPED_TRANSPORT_SUPPORT_MARK;
 
-/** Identity of the provider surface this transport speaks, not a build number. */
-const PROVIDER_VERSION = 'composio-tool-router-v1';
-
 type ComposioToolSchema = {
   slug: string;
   inputParameters?: unknown;
+  outputParameters?: unknown;
+  version?: string;
 };
 
 type ComposioClientSurface = {
   isComposioEnabled: () => boolean;
   peekConnectedToolkits: () => unknown[];
-  executeComposioTool: (
-    operationId: string,
-    args: Record<string, unknown>,
-    accountId: string,
-  ) => Promise<unknown>;
-  getComposioToolBySlug: (slug: string) => Promise<ComposioToolSchema | null>;
+  prepareComposioOneShotDispatch: (input: {
+    toolSlug: string;
+    args: Record<string, unknown>;
+    connectedAccountId: string;
+    providerOperationVersion: string;
+  }) => unknown;
+  executePreparedComposioTool: (prepared: unknown) => Promise<unknown>;
+  getExactComposioToolBySlug: (slug: string) => Promise<ComposioToolSchema | null>;
   composioToolSchemaObservedAt: (tool: ComposioToolSchema) => number | undefined;
+  composioToolOperationVersion: (tool: ComposioToolSchema) => string | undefined;
+};
+
+type NativeMcpCarrierSurface = {
+  executeProductionMcpRead: (call: AttestedTransportCall) => Promise<unknown>;
+  refreshProductionMcpReadObservation: (input: {
+    operationId: string;
+    accountId: string;
+  }) => Promise<AttestedTransportObservation | null>;
 };
 
 function here(): string {
@@ -75,6 +88,16 @@ function loadComposioClient(): ComposioClientSurface {
   throw new Error('attested transport could not resolve the packaged provider client');
 }
 
+function loadNativeMcpCarrier(): NativeMcpCarrierSurface {
+  const root = findPackageRoot(here());
+  const req = createRequire(path.join(root, 'package.json'));
+  const distCarrier = path.join(root, 'dist', 'runtime', 'harness', 'production-mcp-read-carrier.js');
+  if (existsSync(distCarrier)) {
+    return req(distCarrier) as NativeMcpCarrierSurface;
+  }
+  throw new Error('attested transport could not resolve the packaged native MCP carrier');
+}
+
 function loopbackOutboundDenied(): boolean {
   for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy']) {
     const value = process.env[key] ?? '';
@@ -90,11 +113,24 @@ export async function executeAttestedTransport(call: AttestedTransportCall): Pro
   if (call.accountId.startsWith('host:')) {
     throw new Error('consequential call requires a sealed provider account');
   }
+  if (call.expected?.providerKind === 'native_mcp') {
+    return loadNativeMcpCarrier().executeProductionMcpRead(call);
+  }
   const client = loadComposioClient();
   if (!client.isComposioEnabled()) {
     throw new Error(`${call.operationId} transport unavailable`);
   }
-  return client.executeComposioTool(call.operationId, call.args, call.accountId);
+  const providerOperationVersion = call.expected?.operationVersion;
+  if (!providerOperationVersion) {
+    throw new Error(`${call.operationId} transport lacks an exact provider operation version`);
+  }
+  const prepared = client.prepareComposioOneShotDispatch({
+    toolSlug: call.operationId,
+    args: call.args,
+    connectedAccountId: call.accountId,
+    providerOperationVersion,
+  });
+  return client.executePreparedComposioTool(prepared);
 }
 
 /** Observations this transport actually made, keyed by operation and account. */
@@ -152,23 +188,46 @@ export async function refreshAttestedTransportObservation(input: {
   observed.delete(observationKey(input.operationId, input.accountId));
   if (loopbackOutboundDenied()) return null;
   try {
+    if (input.accountId.startsWith('native_mcp:')) {
+      const observation = await loadNativeMcpCarrier().refreshProductionMcpReadObservation(input);
+      if (!observation) return null;
+      observed.set(observationKey(input.operationId, input.accountId), observation);
+      return observation;
+    }
     const client = loadComposioClient();
     if (!client.isComposioEnabled()) return null;
     const accountId = resolveConnectedAccount(client, input);
     if (!accountId) return null;
-    const tool = await client.getComposioToolBySlug(input.operationId);
+    const tool = await client.getExactComposioToolBySlug(input.operationId);
     if (!tool || tool.slug !== input.operationId || tool.inputParameters === undefined) return null;
     const observedAt = client.composioToolSchemaObservedAt(tool);
+    const providerOperationVersion = client.composioToolOperationVersion(tool);
     if (typeof observedAt !== 'number' || !Number.isFinite(observedAt) || observedAt <= 0) return null;
-    const definitionFingerprint = createHash('sha256')
-      .update(JSON.stringify({ slug: tool.slug, inputParameters: tool.inputParameters }), 'utf8')
-      .digest('hex');
+    if (!providerOperationVersion) return null;
+    if (!Object.prototype.hasOwnProperty.call(tool, 'outputParameters')
+      || tool.outputParameters === undefined) return null;
+    const outputSchema = tool.outputParameters === null
+      ? null
+      : tool.outputParameters && typeof tool.outputParameters === 'object'
+          && !Array.isArray(tool.outputParameters)
+        ? tool.outputParameters as Record<string, unknown>
+        : undefined;
+    if (outputSchema === undefined) return null;
+    const definitionFingerprint = fingerprintComposioProviderDefinition({
+      operationId: input.operationId,
+      operationVersion: providerOperationVersion,
+      accountId,
+      invokePortId: `port:cap:resolved:${input.operationId.toLowerCase()}:${input.operationId}`,
+      inputSchema: tool.inputParameters as Record<string, unknown>,
+      outputSchema,
+    });
+    if (!definitionFingerprint) return null;
     const observation: AttestedTransportObservation = {
       operationId: input.operationId,
       accountId,
       definitionFingerprint,
-      providerVersion: PROVIDER_VERSION,
-      operationVersion: definitionFingerprint.slice(0, 16),
+      providerVersion: COMPOSIO_PROVIDER_SURFACE_VERSION,
+      operationVersion: providerOperationVersion,
       observedAt,
     };
     observed.set(observationKey(input.operationId, accountId), observation);

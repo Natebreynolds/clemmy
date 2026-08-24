@@ -8,7 +8,7 @@
  *     once each on first crossing
  *   - withTimeout rejects when work exceeds the deadline and resolves
  *     when work completes in time
- *   - timeoutForTool picks shell/MCP/code-mode/default budgets correctly
+ *   - timeoutForTool picks shell/MCP/dispatcher/default budgets correctly
  */
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
@@ -140,6 +140,52 @@ function anchorAcceptedTask(
   anchorExistingSource(sessionId, source);
   return { sourceUserSeq: source.seq, turn: source.turn };
 }
+
+test('carrier-owned returned failures never settle as successful local work', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = anchorAcceptedTask(
+    session.id,
+    'Read the restaurant source through the accepted aggregate carrier.',
+  );
+  const returnedFailures = [
+    '{"error":"not_reachable","detail":"selected capability is outside the callable surface"}',
+    'An error occurred while running the tool. Please try again. Error: external MCP tool is not authorized.',
+  ];
+
+  for (const [index, returned] of returnedFailures.entries()) {
+    for (const lane of ['invoke', 'execute'] as const) {
+      const callId = `carrier-returned-failure-${lane}-${index}`;
+      const toolName = `fixture_nested_source_${lane}_${index}`;
+      const wrapped = wrapToolForHarness(lane === 'invoke'
+        ? { name: toolName, invoke: async () => returned }
+        : { name: toolName, execute: async () => returned });
+      const counter = new ToolCallsCounter(10);
+      const outward = await withHarnessRunContext({
+        sessionId: session.id,
+        sourceUserSeq: source.sourceUserSeq,
+        turn: source.turn,
+        behaviorScopeId: `carrier-returned-failure:${lane}:${index}`,
+        nestedDispatch: true,
+        counter,
+      }, () => lane === 'invoke'
+        ? (wrapped as unknown as {
+            invoke: (runContext: unknown, input: unknown, details: unknown) => Promise<unknown>;
+          }).invoke(null, '{}', { toolCall: { callId } })
+        : (wrapped as unknown as {
+            execute: (input: unknown, runContext: unknown) => Promise<unknown>;
+          }).execute({}, null));
+      assert.equal(outward, returned, 'model-facing corrective bytes are preserved');
+
+      const settled = listEvents(session.id, { types: ['tool_attempt_settled'] })
+        .find((event) => event.data.tool === toolName);
+      assert.ok(settled, `logical call for ${toolName} settled`);
+      assert.notEqual(settled.data.kind, 'succeeded', 'a carrier failure cannot become host success');
+      assert.equal(settled.data.creditedProgress, false, 'a carrier failure earns no work progress');
+      assert.equal(settled.data.physicalDispatchCount, 0, 'no provider crossing is invented');
+    }
+  }
+});
 
 test('parallelPreWriteGatesEnabled: DEFAULT-ON with =off kill-switch', () => {
   const prev = process.env.CLEMMY_PARALLEL_PREWRITE_GATES;
@@ -1240,14 +1286,6 @@ test('wrapToolForHarness: kill switch is checked mid-turn (per-tool)', async () 
   }
 });
 
-test('timeoutForTool: run_tool_program outer budget exceeds the code-mode sandbox ceiling', () => {
-  assert.equal(timeoutForTool('run_tool_program'), DEFAULT_TIMEOUTS_MS.externalApi);
-  assert.ok(
-    timeoutForTool('run_tool_program') > 180_000,
-    'outer harness must not kill code mode before its default 180s sandbox ceiling can return partial results',
-  );
-});
-
 test('wrapToolForHarness: applies per-tool timeout via withTimeout', async () => {
   const prev = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
@@ -1338,7 +1376,7 @@ async function runTscTimeout(opts: {
 test('timeout self-correct: composio READ timeout → async start+poll corrective, no throw', async () => {
   const { result, error } = await runTscTimeout({
     name: 'composio_execute_tool',
-    input: { tool_slug: 'APIFY_GET_DATASET_ITEMS' },
+    input: { tool_slug: 'APIFY_GET_DATASET_ITEMS', arguments: null },
   });
   assert.equal(error, undefined, 'run continues — no ToolTimeout thrown');
   assert.equal(typeof result, 'string');
@@ -1350,7 +1388,7 @@ test('timeout self-correct: composio READ timeout → async start+poll correctiv
 test('timeout self-correct: composio WRITE timeout → verify-before-retry corrective', async () => {
   const { result, error } = await runTscTimeout({
     name: 'composio_execute_tool',
-    input: { tool_slug: 'AIRTABLE_CREATE_RECORD' },
+    input: { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: null },
   });
   assert.equal(error, undefined);
   assert.match(result as string, /WRITE TIMED OUT/);
@@ -3665,7 +3703,7 @@ async function runCertifiedSendProbe(opts: { certifiedBatch?: { batchId: string;
   try {
     const sess = createSession({ kind: 'chat' }).id;
     // A goal (re-derived from the user's ask) so the goal-fidelity judge WOULD fire.
-    const source = appendEvent({ sessionId: sess, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Send 10 personalized intro emails to the prospect list I approved.' } });
+    const source = appendEvent({ sessionId: sess, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Send 10 personalized intro emails to the prospect list I approved.' } });
     anchorExistingSource(sess, source);
     let invoked = 0;
     const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', invoke: async () => { invoked += 1; return 'OK sent'; } }, {});
@@ -3740,7 +3778,7 @@ async function runJudgeFailSendProbe(opts: {
     appendEvent({ sessionId: sess, turn: 0, role: 'orchestrator', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: cid, arguments: JSON.stringify({ tool_slug: slug, arguments: JSON.stringify({ to_email: toEmail, subject: 's', body: OPENING }) }) } });
   try {
     const sess = createSession({ kind: 'chat' }).id;
-    const source = appendEvent({ sessionId: sess, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Send the 10 approved intro emails to the prospect list.' } });
+    const source = appendEvent({ sessionId: sess, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Send the 10 approved intro emails to the prospect list.' } });
     anchorExistingSource(sess, source);
     if (opts.judge === 'timeout') {
       // Two prior byte-identical sends to DISTINCT targets → a burst is in flight,

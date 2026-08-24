@@ -1,4 +1,5 @@
 import {
+  digestSchema,
   fingerprintSchema,
   loadToolContract,
   saveToolContract,
@@ -45,12 +46,28 @@ interface CachedSchema {
   providerObservedAt?: number;
   /** Exact schema fingerprint bound to that provider observation. */
   providerObservedFingerprint?: string;
+  /** Exact provider operation version from the same observation. */
+  providerOperationVersion?: string;
+  /** Whether the same provider row authoritatively described output. `true`
+   * with no schema means that row declared no result-payload schema. */
+  providerOutputSchemaObserved?: true;
+  providerOutputSchema?: Record<string, unknown>;
+  providerOutputSchemaDigest?: string;
+  providerOutputSchemaFingerprint?: string;
 }
 
 const cache = new Map<string, CachedSchema>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function normalizeOperationVersion(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized && normalized.length <= 160 && /^[A-Za-z0-9_.:-]+$/.test(normalized)
+    ? normalized
+    : undefined;
 }
 
 function cachedProviderObservation(entry: CachedSchema | undefined): number | undefined {
@@ -81,6 +98,8 @@ export function rememberToolSchema(
   toolSlug: string,
   inputParameters: unknown,
   providerObservedAt?: number,
+  providerOperationVersion?: string,
+  providerOutputParameters?: unknown | null,
 ): void {
   if (!toolSlug || !isRecord(inputParameters)) return;
   let schema: Record<string, unknown>;
@@ -97,6 +116,24 @@ export function rememberToolSchema(
     && observedAt! >= 0
     && observedAt! <= now;
   const observedFingerprint = fingerprintSchema(schema);
+  const observedOperationVersion = normalizeOperationVersion(providerOperationVersion);
+  const outputSchemaWasObserved = arguments.length >= 5
+    && providerOutputParameters !== undefined;
+  let observedOutputSchema: Record<string, unknown> | null | undefined;
+  if (outputSchemaWasObserved) {
+    if (providerOutputParameters === null) observedOutputSchema = null;
+    else if (!isRecord(providerOutputParameters)) return;
+    else {
+      try { observedOutputSchema = structuredClone(providerOutputParameters); }
+      catch { return; }
+    }
+  }
+  const observedOutputDigest = observedOutputSchema
+    ? digestSchema(observedOutputSchema)
+    : undefined;
+  const observedOutputFingerprint = observedOutputSchema
+    ? fingerprintSchema(observedOutputSchema)
+    : undefined;
   const currentEntry = cache.get(toolSlug);
   const currentObservation = cachedProviderObservation(currentEntry);
   let equalTimeConflict = false;
@@ -106,7 +143,24 @@ export function rememberToolSchema(
       let currentFingerprint: string | undefined;
       try { currentFingerprint = fingerprintSchema(currentEntry?.schema); } catch { /* conflict below */ }
       if (currentFingerprint !== observedFingerprint) equalTimeConflict = true;
-      else return;
+      else if (
+        observedOperationVersion
+        && currentEntry?.providerOperationVersion
+        && observedOperationVersion !== currentEntry.providerOperationVersion
+      ) equalTimeConflict = true;
+      else if (
+        outputSchemaWasObserved
+        && currentEntry?.providerOutputSchemaObserved === true
+        && (currentEntry.providerOutputSchemaDigest ?? null) !== (observedOutputDigest ?? null)
+      ) equalTimeConflict = true;
+      else {
+        const enrichesOperationVersion = Boolean(
+          observedOperationVersion && !currentEntry?.providerOperationVersion,
+        );
+        const enrichesOutputDefinition = outputSchemaWasObserved
+          && currentEntry?.providerOutputSchemaObserved !== true;
+        if (!enrichesOperationVersion && !enrichesOutputDefinition) return;
+      }
     } else {
       // Never let an older catalog replay or an unproven validation hint roll
       // back a newer provider observation.
@@ -121,7 +175,15 @@ export function rememberToolSchema(
     ...(equalTimeConflict
       ? { providerAuthorityConflictAt: new Date(observedAt!).toISOString() }
       : validProviderObservation
-      ? { providerObservedAt: new Date(observedAt!).toISOString() }
+      ? {
+          providerObservedAt: new Date(observedAt!).toISOString(),
+          ...(observedOperationVersion
+            ? { providerOperationVersion: observedOperationVersion }
+            : {}),
+          ...(outputSchemaWasObserved
+            ? { providerOutputSchema: observedOutputSchema ?? null }
+            : {}),
+        }
       : {}),
   });
 
@@ -132,12 +194,41 @@ export function rememberToolSchema(
   let acceptedObservedFingerprint = validProviderObservation && !equalTimeConflict
     ? observedFingerprint
     : undefined;
+  let acceptedOperationVersion = validProviderObservation && !equalTimeConflict
+    ? observedOperationVersion
+    : undefined;
+  let acceptedOutputSchemaObserved = validProviderObservation
+    && !equalTimeConflict
+    && outputSchemaWasObserved;
+  let acceptedOutputSchema = acceptedOutputSchemaObserved
+    ? observedOutputSchema ?? undefined
+    : undefined;
+  let acceptedOutputSchemaDigest = acceptedOutputSchemaObserved
+    ? observedOutputDigest
+    : undefined;
+  let acceptedOutputSchemaFingerprint = acceptedOutputSchemaObserved
+    ? observedOutputFingerprint
+    : undefined;
   if (accepted) {
     acceptedSchema = structuredClone(accepted.schema);
     const durableObservedAt = durableProviderObservation(accepted);
     acceptedObservedAt = durableObservedAt;
     acceptedObservedFingerprint = durableObservedAt !== undefined
       ? accepted.providerObservedFingerprint
+      : undefined;
+    acceptedOperationVersion = durableObservedAt !== undefined
+      ? normalizeOperationVersion(accepted.providerOperationVersion)
+      : undefined;
+    acceptedOutputSchemaObserved = durableObservedAt !== undefined
+      && accepted.providerOutputSchemaObserved === true;
+    acceptedOutputSchema = acceptedOutputSchemaObserved
+      ? accepted.providerOutputSchema
+      : undefined;
+    acceptedOutputSchemaDigest = acceptedOutputSchemaObserved
+      ? accepted.providerOutputSchemaDigest
+      : undefined;
+    acceptedOutputSchemaFingerprint = acceptedOutputSchemaObserved
+      ? accepted.providerOutputSchemaFingerprint
       : undefined;
   }
 
@@ -150,6 +241,23 @@ export function rememberToolSchema(
       ? {
         providerObservedAt: acceptedObservedAt,
         providerObservedFingerprint: acceptedObservedFingerprint,
+        ...(acceptedOperationVersion
+          ? { providerOperationVersion: acceptedOperationVersion }
+          : {}),
+        ...(acceptedOutputSchemaObserved
+          ? {
+              providerOutputSchemaObserved: true as const,
+              ...(acceptedOutputSchema
+                && acceptedOutputSchemaDigest
+                && acceptedOutputSchemaFingerprint
+                ? {
+                    providerOutputSchema: structuredClone(acceptedOutputSchema),
+                    providerOutputSchemaDigest: acceptedOutputSchemaDigest,
+                    providerOutputSchemaFingerprint: acceptedOutputSchemaFingerprint,
+                  }
+                : {}),
+            }
+          : {}),
       }
       : {}),
   });
@@ -162,10 +270,22 @@ export function rememberToolSchema(
 
 /** Convenience: deposit a batch of {slug, inputParameters} items. */
 export function rememberToolSchemas(
-  items: Array<{ slug?: string; inputParameters?: unknown; providerObservedAt?: number }>,
+  items: Array<{
+    slug?: string;
+    inputParameters?: unknown;
+    providerObservedAt?: number;
+    providerOperationVersion?: string;
+    outputParameters?: unknown | null;
+  }>,
 ): void {
   for (const item of items) {
-    if (item?.slug) rememberToolSchema(item.slug, item.inputParameters, item.providerObservedAt);
+    if (item?.slug) rememberToolSchema(
+      item.slug,
+      item.inputParameters,
+      item.providerObservedAt,
+      item.providerOperationVersion,
+      item.outputParameters,
+    );
   }
 }
 
@@ -198,11 +318,34 @@ export function getCachedToolSchema(toolSlug: string): Record<string, unknown> |
   const providerObservedFingerprint = providerObservedAt !== undefined
     ? durable.providerObservedFingerprint
     : undefined;
+  const providerOperationVersion = providerObservedAt !== undefined
+    ? normalizeOperationVersion(durable.providerOperationVersion)
+    : undefined;
+  const providerOutputSchemaObserved = providerObservedAt !== undefined
+    && durable.providerOutputSchemaObserved === true;
   cache.set(toolSlug, {
     schema: durable.schema,
     cachedAt: Date.now(),
     ...(Number.isFinite(providerObservedAt) && providerObservedFingerprint
-      ? { providerObservedAt, providerObservedFingerprint }
+      ? {
+          providerObservedAt,
+          providerObservedFingerprint,
+          ...(providerOperationVersion ? { providerOperationVersion } : {}),
+          ...(providerOutputSchemaObserved
+            ? {
+                providerOutputSchemaObserved: true as const,
+                ...(durable.providerOutputSchema
+                  && durable.providerOutputSchemaDigest
+                  && durable.providerOutputSchemaFingerprint
+                  ? {
+                      providerOutputSchema: structuredClone(durable.providerOutputSchema),
+                      providerOutputSchemaDigest: durable.providerOutputSchemaDigest,
+                      providerOutputSchemaFingerprint: durable.providerOutputSchemaFingerprint,
+                    }
+                  : {}),
+              }
+            : {}),
+        }
       : {}),
   });
   return durable.schema;
@@ -225,45 +368,72 @@ export interface LiveSchemaProviderRefresh {
 export type LiveSchemaProviderRefreshObserver = (refresh: LiveSchemaProviderRefresh) => void;
 
 interface ProviderSchemaLoad {
-  promise: Promise<LiveSchemaProviderRefresh>;
+  promise: Promise<ProviderSchemaRefresh>;
   /** First warm-session observer wins; one physical request emits one event. */
   observer?: LiveSchemaProviderRefreshObserver;
+}
+
+interface ProviderSchemaRefresh extends LiveSchemaProviderRefresh {
+  /** Exact bytes returned by this request, never a pre-existing cache hit. */
+  schema?: Record<string, unknown>;
+  outputSchema?: Record<string, unknown> | null;
+  outputSchemaDigest?: string;
+  outputSchemaFingerprint?: string;
+  providerOperationVersion?: string;
 }
 
 const providerSchemaLoads = new Map<string, ProviderSchemaLoad>();
 
 interface LoadedSchema {
   inputParameters?: unknown;
+  outputParameters?: unknown | null;
   providerObservedAt?: number;
+  providerOperationVersion?: string;
 }
 type SchemaLoader = (slug: string) => Promise<LoadedSchema | null>;
 let schemaLoader: SchemaLoader | null = null;
 
-async function loadSchemaFromProvider(toolSlug: string): Promise<LoadedSchema | null> {
+async function loadSchemaFromProvider(
+  toolSlug: string,
+  exactOnly = false,
+): Promise<LoadedSchema | null> {
   const load = schemaLoader ?? (async (slug: string) => {
     const client = await import('../integrations/composio/client.js');
-    // This is one exact-slug metadata lookup. The client uses the SDK's direct
-    // filter when available and otherwise one toolkit-constrained CLI search
-    // that accepts only the exact primary slug plus a schema-backed result.
-    // It never executes the business tool or performs broad discovery.
-    const tool = await client.getComposioToolBySlug(slug);
+    // Selection authority uses the strict SDK/CLI exact-slug path with no
+    // toolkit-list fallback. Compatibility validation retains the older
+    // getter, but can never satisfy an exact selection refresh through its
+    // cache/list result. Neither path executes the business tool.
+    const tool = exactOnly
+      ? await client.getExactComposioToolBySlug(slug)
+      : await client.getComposioToolBySlug(slug);
     return tool
       ? {
         inputParameters: tool.inputParameters,
         providerObservedAt: client.composioToolSchemaObservedAt(tool),
+        providerOperationVersion: client.composioToolOperationVersion(tool),
+        ...(Object.prototype.hasOwnProperty.call(tool, 'outputParameters')
+          && tool.outputParameters !== undefined
+          ? {
+              outputParameters: isRecord(tool.outputParameters)
+                ? tool.outputParameters
+                : null,
+            }
+          : {}),
       }
       : null;
   });
   return load(toolSlug);
 }
 
-/** One exact-slug metadata lookup per process at a time. Validation and warm
- * authority callers share it, so concurrent accepted turns cannot fan out. */
+/** One metadata lookup per mode+slug at a time. Exact selection refreshes may
+ * coalesce with each other, but never inherit a compatibility/cache refresh. */
 function refreshSchemaFromProvider(
   toolSlug: string,
   observer?: LiveSchemaProviderRefreshObserver,
-): Promise<LiveSchemaProviderRefresh> {
-  const existing = providerSchemaLoads.get(toolSlug);
+  exactOnly = false,
+): Promise<ProviderSchemaRefresh> {
+  const loadKey = `${exactOnly ? 'exact' : 'compatible'}:${toolSlug}`;
+  const existing = providerSchemaLoads.get(loadKey);
   if (existing) {
     // A validation lookup can start first with no session observer. Let the
     // first warm joiner attach the one accounting event to that physical I/O.
@@ -274,32 +444,76 @@ function refreshSchemaFromProvider(
   entry.observer = observer;
   const refresh = (async () => {
     const startedAt = Date.now();
-    let result: LiveSchemaProviderRefresh;
+    let result: ProviderSchemaRefresh;
     try {
-      const tool = await loadSchemaFromProvider(toolSlug);
-      if (!tool?.inputParameters) {
+      const tool = await loadSchemaFromProvider(toolSlug, exactOnly);
+      if (!isRecord(tool?.inputParameters)) {
         result = { outcome: 'unavailable', durationMs: Date.now() - startedAt };
       } else {
+        const observedSchema = structuredClone(tool.inputParameters);
+        const outputSchemaWasObserved = Object.prototype.hasOwnProperty.call(tool, 'outputParameters')
+          && tool.outputParameters !== undefined;
+        let observedOutputSchema: Record<string, unknown> | null | undefined;
+        if (!outputSchemaWasObserved) {
+          observedOutputSchema = undefined;
+        } else if (tool.outputParameters === null) {
+          observedOutputSchema = null;
+        } else if (isRecord(tool.outputParameters)) {
+          observedOutputSchema = structuredClone(tool.outputParameters);
+        } else {
+          result = { outcome: 'unavailable', durationMs: Date.now() - startedAt };
+          return result;
+        }
+        const observedFingerprint = fingerprintSchema(observedSchema);
         rememberToolSchema(
           toolSlug,
-          tool.inputParameters,
+          observedSchema,
           tool.providerObservedAt ?? Number.NaN,
+          tool.providerOperationVersion,
+          ...(outputSchemaWasObserved ? [observedOutputSchema] : []),
         );
-        const fingerprint = liveComposioSchemaFingerprint(toolSlug);
-        result = fingerprint
-          ? { outcome: 'refreshed', durationMs: Date.now() - startedAt, fingerprint }
+        const liveFingerprint = liveComposioSchemaFingerprint(toolSlug);
+        const liveOutput = cache.get(toolSlug);
+        const outputAccepted = !outputSchemaWasObserved
+          ? liveOutput?.providerOutputSchemaObserved !== true
+          : liveOutput?.providerOutputSchemaObserved === true
+            && (liveOutput.providerOutputSchemaDigest ?? null)
+              === (observedOutputSchema ? digestSchema(observedOutputSchema) : null);
+        result = liveFingerprint === observedFingerprint && outputAccepted
+          ? {
+              outcome: 'refreshed',
+              durationMs: Date.now() - startedAt,
+              fingerprint: observedFingerprint,
+              schema: observedSchema,
+              ...(outputSchemaWasObserved ? { outputSchema: observedOutputSchema ?? null } : {}),
+              ...(observedOutputSchema
+                ? {
+                    outputSchemaDigest: digestSchema(observedOutputSchema),
+                    outputSchemaFingerprint: fingerprintSchema(observedOutputSchema),
+                  }
+                : {}),
+              ...(liveComposioOperationVersion(toolSlug)
+                ? { providerOperationVersion: liveComposioOperationVersion(toolSlug) }
+                : {}),
+            }
           : { outcome: 'unavailable', durationMs: Date.now() - startedAt };
       }
     } catch {
       result = { outcome: 'failed', durationMs: Date.now() - startedAt };
     }
-    try { entry.observer?.(result); } catch { /* telemetry never changes authority */ }
+    try {
+      entry.observer?.({
+        outcome: result.outcome,
+        durationMs: result.durationMs,
+        ...(result.fingerprint ? { fingerprint: result.fingerprint } : {}),
+      });
+    } catch { /* telemetry never changes authority */ }
     return result;
   })();
   entry.promise = refresh;
-  providerSchemaLoads.set(toolSlug, entry);
+  providerSchemaLoads.set(loadKey, entry);
   void refresh.finally(() => {
-    if (providerSchemaLoads.get(toolSlug) === entry) providerSchemaLoads.delete(toolSlug);
+    if (providerSchemaLoads.get(loadKey) === entry) providerSchemaLoads.delete(loadKey);
   });
   return refresh;
 }
@@ -330,6 +544,56 @@ export async function ensureToolSchema(toolSlug: string): Promise<Record<string,
   schemaLoadAttempted.add(toolSlug);
   await refreshSchemaFromProvider(toolSlug);
   return getCachedToolSchema(toolSlug);
+}
+
+export interface ExactComposioSchemaRefresh {
+  schema: Record<string, unknown>;
+  fingerprint: string;
+  providerOperationVersion?: string;
+  /** Exact operation-payload schema from the same provider definition. `null`
+   * is an authoritative absence and never enables download hydration. */
+  outputSchema?: Record<string, unknown> | null;
+  outputSchemaDigest?: string;
+  outputSchemaFingerprint?: string;
+}
+
+/**
+ * Force one exact-slug provider metadata read even when discovery or durable
+ * memory already holds a recent schema. This is intentionally stronger than
+ * ensureToolSchema(): the latter is the cheap validation path, while primary
+ * plan publication needs a last-edge observation of only the model-selected
+ * operations. Concurrent refreshes for the same slug still coalesce into one
+ * physical request.
+ */
+export async function refreshExactComposioSchemaFromProvider(
+  toolSlug: string,
+): Promise<ExactComposioSchemaRefresh | null> {
+  if (!toolSlug) return null;
+  const refreshed = await refreshSchemaFromProvider(toolSlug, undefined, true);
+  const schema = refreshed.schema;
+  const fingerprint = refreshed.fingerprint;
+  if (refreshed.outcome !== 'refreshed') return null;
+  if (!schema || !fingerprint) return null;
+  return {
+    schema: structuredClone(schema),
+    fingerprint,
+    ...(Object.prototype.hasOwnProperty.call(refreshed, 'outputSchema')
+      ? {
+          outputSchema: refreshed.outputSchema
+            ? structuredClone(refreshed.outputSchema)
+            : null,
+        }
+      : {}),
+    ...(refreshed.providerOperationVersion
+      ? { providerOperationVersion: refreshed.providerOperationVersion }
+      : {}),
+    ...(refreshed.outputSchemaDigest && refreshed.outputSchemaFingerprint
+      ? {
+          outputSchemaDigest: refreshed.outputSchemaDigest,
+          outputSchemaFingerprint: refreshed.outputSchemaFingerprint,
+        }
+      : {}),
+  };
 }
 
 /** Test hook: how many entries the PROCESS cache currently holds — the size
@@ -366,6 +630,34 @@ export function liveComposioSchemaFingerprint(toolSlug: string): string | undefi
   } catch { return undefined; }
 }
 
+/** Provider operation version bound to the same current schema observation. */
+export function liveComposioOperationVersion(toolSlug: string): string | undefined {
+  if (!liveComposioSchemaFingerprint(toolSlug)) return undefined;
+  return normalizeOperationVersion(cache.get(toolSlug)?.providerOperationVersion);
+}
+
+/** Exact result-payload schema from the same live provider observation. `null`
+ * means the provider row explicitly exposed no output schema; `undefined`
+ * means output identity was never observed and cannot authorize downloads. */
+export function liveComposioOutputSchema(
+  toolSlug: string,
+): Record<string, unknown> | null | undefined {
+  if (!liveComposioSchemaFingerprint(toolSlug)) return undefined;
+  const entry = cache.get(toolSlug);
+  if (entry?.providerOutputSchemaObserved !== true) return undefined;
+  return entry.providerOutputSchema
+    ? structuredClone(entry.providerOutputSchema)
+    : null;
+}
+
+export function liveComposioOutputSchemaDigest(toolSlug: string): string | undefined {
+  const output = liveComposioOutputSchema(toolSlug);
+  if (!output) return undefined;
+  const entry = cache.get(toolSlug);
+  const digest = digestSchema(output);
+  return entry?.providerOutputSchemaDigest === digest ? digest : undefined;
+}
+
 /** Restore only the unused part of a real provider-observation lease. */
 function hydrateRecentProviderAuthority(toolSlug: string): string | undefined {
   if (!toolSlug) return undefined;
@@ -384,6 +676,23 @@ function hydrateRecentProviderAuthority(toolSlug: string): string | undefined {
     cachedAt: Date.now(),
     providerObservedAt: observedAt,
     providerObservedFingerprint: durable.providerObservedFingerprint,
+    ...(normalizeOperationVersion(durable.providerOperationVersion)
+      ? { providerOperationVersion: normalizeOperationVersion(durable.providerOperationVersion) }
+      : {}),
+    ...(durable.providerOutputSchemaObserved === true
+      ? {
+          providerOutputSchemaObserved: true as const,
+          ...(durable.providerOutputSchema
+            && durable.providerOutputSchemaDigest
+            && durable.providerOutputSchemaFingerprint
+            ? {
+                providerOutputSchema: structuredClone(durable.providerOutputSchema),
+                providerOutputSchemaDigest: durable.providerOutputSchemaDigest,
+                providerOutputSchemaFingerprint: durable.providerOutputSchemaFingerprint,
+              }
+            : {}),
+        }
+      : {}),
   });
   return liveComposioSchemaFingerprint(toolSlug);
 }
@@ -403,7 +712,7 @@ export async function ensureLiveComposioSchemaFingerprint(
     ?? hydrateRecentProviderAuthority(toolSlug);
   if (current) return current;
   if (!toolSlug) return undefined;
-  const inFlight = providerSchemaLoads.get(toolSlug);
+  const inFlight = providerSchemaLoads.get(`compatible:${toolSlug}`);
   if (inFlight) {
     if (!inFlight.observer && observer) inFlight.observer = observer;
     await inFlight.promise;

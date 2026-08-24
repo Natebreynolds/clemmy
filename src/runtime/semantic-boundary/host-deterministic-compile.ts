@@ -2,7 +2,7 @@
  * HOST DETERMINISTIC COMPILE — the fast lane that kills the admission
  * ceremony for asks the host can prove end-to-end.
  *
- * Live 2026-08-19 sess-mt0c3kkc: "top 5 restaurants → Google sheet" paid 97
+ * Live 2026-08-19 session-fixture-fast-lane: "top 5 restaurants → Google sheet" paid 97
  * seconds and six brain/judge calls to author a plan the host could already
  * derive: the connected goal catalog proves search + row-create + readback
  * from frozen schemas, host-bind synthesizes the exact 5-op chain, and every

@@ -897,8 +897,39 @@ export function searchFactsByText(query: string, limit = 5): ConsolidatedFact[] 
     .filter((t) => t.length >= 3 && !FACT_QUERY_STOPWORDS.has(t))
     .slice(0, 12);
   if (tokens.length === 0) return [];
+  const db = openMemoryDb();
+  // FTS5 + BM25 (COMPOUNDING wave, 2026-08-19): porter-stemmed relevance
+  // ranking replaces the un-ordered LIKE scan — the measured live cost of the
+  // old leg was relevant facts evicted by common-token matches before scoring.
   try {
-    const db = openMemoryDb();
+    const match = tokens.map((token) => `"${token.replace(/"/g, '')}"`).join(' OR ');
+    const rows = db.prepare(`
+      SELECT f.*, bm25(consolidated_facts_fts) AS fts_rank
+        FROM consolidated_facts_fts
+        JOIN consolidated_facts f ON f.id = consolidated_facts_fts.rowid
+       WHERE consolidated_facts_fts MATCH ?
+         AND f.active = 1
+       ORDER BY fts_rank
+       LIMIT ?
+    `).all(match, Math.max(1, limit) * 4) as (ConsolidatedFactRow & { fts_rank: number })[];
+    if (rows.length > 0) {
+      // Preserve the historical tie-break shape: exact-token hit count first
+      // (bm25 already ordered candidates; hit count keeps multi-term queries
+      // preferring facts that cover more of the query), then recency.
+      const scored = rows.map((row) => {
+        const lc = row.content.toLowerCase();
+        const hits = tokens.reduce((sum, t) => sum + (lc.includes(t) ? 1 : 0), 0);
+        return { row, hits };
+      });
+      scored.sort((a, b) => b.hits - a.hits || a.row.fts_rank - b.row.fts_rank
+        || (b.row.updated_at || '').localeCompare(a.row.updated_at || ''));
+      return scored.slice(0, Math.max(1, limit)).map((s) => rowToFact(s.row));
+    }
+  } catch {
+    // FTS unavailable (pre-migration DB, fts5-less build) → the LIKE fallback
+    // below keeps recall alive; never let index absence blank the leg.
+  }
+  try {
     const matches = db.prepare(`
       SELECT * FROM consolidated_facts
       WHERE active = 1
@@ -1626,6 +1657,30 @@ export function listConstraints(limit?: number): ConsolidatedFact[] {
 const POLICY_RUNAWAY_CAP = 256;
 const CORE_PROFILE_BUDGET = 1400;
 const STANDING_PREFERENCE_BUDGET = 1000;
+
+/** Candidate refs for the STABLE Persistent-Facts block (COMPOUNDING wave):
+ * the same selection primitives the renderer uses (pinned policies + the
+ * Stanford-ranked top-N), exposed as refs so the stable block can join the
+ * recall-credit loop. Over-inclusion is harmless — credit requires content
+ * evidence; an unused candidate simply earns nothing. */
+export function stableFactCandidateRefs(
+  limit = 10,
+  objective?: string,
+): Array<{ type: 'fact'; id: string; snippet: string }> {
+  const refs = new Map<number, string>();
+  try {
+    for (const policy of listMemoryPolicies().slice(0, POLICY_RUNAWAY_CAP)) {
+      const fact = getFact(policy.fact_id);
+      if (fact) refs.set(fact.id, fact.content);
+    }
+  } catch { /* pinned unavailable → scored-only refs */ }
+  try {
+    for (const fact of listActiveFacts({ limit, ranking: 'stanford', objective })) {
+      refs.set(fact.id, fact.content);
+    }
+  } catch { /* scored unavailable → pinned-only refs */ }
+  return [...refs.entries()].map(([id, snippet]) => ({ type: 'fact' as const, id: String(id), snippet }));
+}
 
 export function renderFactsForInstructions(
   limit = 10,

@@ -167,6 +167,7 @@ type ReadCoverage = 'complete_set' | 'single';
 
 function runReadDependency(input: {
   label: string;
+  taskText?: string;
   logicalTool: string;
   physicalTool?: string;
   args: unknown;
@@ -177,7 +178,10 @@ function runReadDependency(input: {
   settlementResultHandleId: string | undefined;
   redeemed: ReturnType<typeof resultHandles.redeemSuccessfulSettlementResultForHost>;
 } {
-  const task = createTask(input.label, `Read ${input.label}, then create one Sheet from it.`);
+  const task = createTask(
+    input.label,
+    input.taskText ?? `Read ${input.label}, then create one Sheet from it.`,
+  );
   const turnIdentity = {
     sessionId: task.sessionId,
     sourceUserSeq: task.sourceUserSeq,
@@ -430,6 +434,7 @@ test('expected-work discharge follows evidence semantics across read carriers an
   const fixtures = [
     {
       label: 'apify-bounded-complete-set',
+      taskText: 'Find the top 5 restaurants in Ventura, then create one Sheet from them.',
       logicalTool: 'cx_apify_act_run_sync_get_dataset_items_get',
       physicalTool: 'apify_act_run_sync_get_dataset_items_get',
       args: apifyArgs,
@@ -507,6 +512,48 @@ test('expected-work discharge follows evidence semantics across read carriers an
       expectedDownstream: 'refused',
     },
     {
+      label: 'generic-returned-exceeds-total',
+      taskText: 'Find the top 2 accounts, then create one Sheet from them.',
+      logicalTool: 'cx_salesforce_query',
+      physicalTool: 'salesforce_query',
+      args: { query: 'SELECT Id FROM Account LIMIT 2' },
+      payload: {
+        successful: true,
+        data: { records: [{ Id: '001-a' }, { Id: '001-b' }] },
+        meta: { total: 1, returned: 2, offset: 0 },
+      },
+      coverage: 'complete_set' as const,
+      expectedDownstream: 'refused',
+    },
+    {
+      label: 'generic-offset-exceeds-total',
+      taskText: 'Find the top 1 account, then create one Sheet from it.',
+      logicalTool: 'cx_salesforce_query',
+      physicalTool: 'salesforce_query',
+      args: { query: 'SELECT Id FROM Account LIMIT 1 OFFSET 3' },
+      payload: {
+        successful: true,
+        data: { records: [{ Id: '001-a' }] },
+        meta: { total: 2, returned: 1, offset: 3 },
+      },
+      coverage: 'complete_set' as const,
+      expectedDownstream: 'refused',
+    },
+    {
+      label: 'generic-page-exceeds-page-count',
+      taskText: 'Find the top 1 account, then create one Sheet from it.',
+      logicalTool: 'cx_salesforce_query',
+      physicalTool: 'salesforce_query',
+      args: { query: 'SELECT Id FROM Account LIMIT 1' },
+      payload: {
+        successful: true,
+        data: { records: [{ Id: '001-a' }] },
+        meta: { page: 3, page_count: 2 },
+      },
+      coverage: 'complete_set' as const,
+      expectedDownstream: 'refused',
+    },
+    {
       label: 'salesforce-large-terminal-page',
       logicalTool: 'cx_salesforce_query',
       physicalTool: 'salesforce_query',
@@ -524,6 +571,34 @@ test('expected-work discharge follows evidence semantics across read carriers an
       payload: { successful: true, data: { records: [{ id: 'rec-1' }] } },
       coverage: 'complete_set' as const,
       expectedDownstream: 'refused',
+    },
+    {
+      label: 'airtable-opaque-offset-is-a-continuation',
+      taskText: 'Find the top 3 accounts, then create one Sheet from them.',
+      logicalTool: 'cx_airtable_list_records',
+      physicalTool: 'airtable_list_records',
+      args: { base_id: 'app-1', table_id: 'tbl-1' },
+      payload: {
+        successful: true,
+        records: [{ id: 'rec-1' }, { id: 'rec-2' }, { id: 'rec-3' }],
+        offset: 'itrNextPageToken/opaque+=',
+      },
+      coverage: 'complete_set' as const,
+      expectedDownstream: 'refused',
+    },
+    {
+      label: 'nested-business-total-is-not-pagination',
+      taskText: 'Find the top 3 accounts, then create one Sheet from them.',
+      logicalTool: 'cx_account_search',
+      physicalTool: 'account_search',
+      args: { query: 'top accounts', limit: 3 },
+      payload: {
+        successful: true,
+        data: { records: [{ id: 'acct-1' }, { id: 'acct-2' }, { id: 'acct-3' }] },
+        billing: { total: 'USD 25' },
+      },
+      coverage: 'complete_set' as const,
+      expectedDownstream: 'bound',
     },
     {
       label: 'airtable-point-observation',

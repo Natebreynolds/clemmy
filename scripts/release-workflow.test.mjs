@@ -387,9 +387,12 @@ test('production desktop publishing is gated on exact-main preflight', () => {
   const preflight = workflow.jobs?.preflight;
   const scripts = runScripts(preflight);
   assert.match(scripts, /npm test/);
+  assert.match(scripts, /npm run test:measurement/);
+  assert.match(scripts, /npm run proof:selftest/);
   assert.match(scripts, /npm run check:public-hygiene/);
   assert.match(scripts, /npm run test:public-hygiene/);
   assert.match(scripts, /npm run test:release-assets/);
+  assert.match(scripts, /npm run test:release-closure/);
   assert.match(scripts, /npm run typecheck/);
   assert.match(scripts, /npm run bench:gates/);
   assert.match(scripts, /npm run eval:memory/);
@@ -403,6 +406,20 @@ test('production desktop publishing is gated on exact-main preflight', () => {
   assert.equal(workflow.jobs?.['release-mac']?.needs, 'preflight');
   assert.equal(workflow.jobs?.['release-windows']?.needs, 'preflight');
   assert.equal(workflow.concurrency?.['cancel-in-progress'], false);
+});
+
+test('main CI installs the isolated runner before hygiene self-tests and closes release-only coverage', () => {
+  const job = testWorkflow.jobs?.test;
+  const steps = job?.steps ?? [];
+  const checkout = steps.find((step) => String(step?.uses ?? '').startsWith('actions/checkout@'));
+  const installIndex = steps.findIndex((step) => step?.name === 'Install dependencies');
+  const hygieneSelfTestIndex = steps.findIndex((step) => step?.name === 'Test public repository hygiene gate');
+  assert.equal(checkout?.with?.['fetch-depth'], 0, 'the pinned v3.14 rehearsal needs full history');
+  assert.ok(installIndex >= 0 && hygieneSelfTestIndex > installIndex);
+  assert.match(runScripts(job), /npm run test:measurement/);
+  assert.match(runScripts(job), /npm run proof:selftest/);
+  assert.match(runScripts(job), /npm run test:release-closure/);
+  assert.match(runScripts(job), /sqlite3 --version/);
 });
 
 test('one tag-only publisher owns GitHub Release mutation', () => {

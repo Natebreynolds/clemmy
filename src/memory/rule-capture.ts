@@ -13,7 +13,8 @@
  * and phrasing, zero permanent rubric weight.
  */
 
-const RULE_MARKER_RE = /\b(?:only|never|always|exclusively)\b/i;
+const STRONG_RULE_MARKER_RE = /\b(?:never|always|exclusively)\b/i;
+const SUBJECT_SCOPED_ONLY_RE = /\b(?:i|we|you|clem(?:entine)?|my team|our team)\b[^.!?]{0,80}\bonly\b/i;
 const OPERATIONAL_RE = /\b(?:use|uses|used|using|access|send|post|create|deploy|publish|write|read|connect|query|via|through|route)\b/i;
 const STANDING_PHRASE_RE = /\b(?:from now on|going forward|permanently|as a (?:standing )?rule|standing rule|hard rule)\b/i;
 
@@ -31,7 +32,7 @@ export function standingRuleCaptureDirective(input: string): string | null {
   if (QUESTION_START_RE.test(text) || NEVER_MIND_RE.test(text)) return null;
 
   const standingPhrase = STANDING_PHRASE_RE.test(text);
-  const ruleShaped = RULE_MARKER_RE.test(text)
+  const ruleShaped = (STRONG_RULE_MARKER_RE.test(text) || SUBJECT_SCOPED_ONLY_RE.test(text))
     && OPERATIONAL_RE.test(text)
     && !CONDITIONAL_ONLY_RE.test(text);
   if (!standingPhrase && !ruleShaped) return null;
@@ -41,6 +42,6 @@ export function standingRuleCaptureDirective(input: string): string | null {
     `Standing-rule signal: this message states a durable operating rule ("${excerpt}"). `
     + "If it is genuinely standing — not situational to this one task — persist it NOW with remember(kind='constraint', content=<the rule, stated precisely and generally>) "
     + 'so it auto-pins into every future turn and gates matching tool dispatch, then confirm in one natural line what you will always/never do. '
-    + 'If the same store holds guidance that CONTRADICTS this rule, forget or supersede it in the same breath. If the statement is situational, ignore this signal.'
+    + 'If the same store holds guidance that CONTRADICTS this rule, forget or supersede it in the same breath. If the statement is situational, silently ignore this signal and do not mention it to the user.'
   );
 }

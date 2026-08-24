@@ -13,6 +13,7 @@ import type { CommandCenter, CommandCenterItem } from '@/lib/types';
 import { DogMark } from '@/components/DogMark';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
+import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { cn } from '@/lib/cn';
@@ -91,6 +92,7 @@ export function Chat() {
   const chat = useChat({ rememberAsLastSession: true });
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   // Whether the view is "stuck" to the bottom. True by default so the initial
   // load lands at the newest message; flips false the moment the user scrolls up
   // (so streaming tokens don't yank them back down mid-read).
@@ -185,7 +187,8 @@ export function Chat() {
 
         <CollaborativeWorkstate snapshot={cc.data?.focus} compact className="mb-5" />
 
-        <Composer busy={chat.busy} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
+        <RunningTasksDrawer className="mb-2" composerRef={composerRef} />
+        <Composer inputRef={composerRef} busy={chat.busy} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
 
         <div className="mt-4 flex flex-wrap justify-center gap-2">
           {SUGGESTIONS.map((s) => (
@@ -227,7 +230,8 @@ export function Chat() {
       </div>
       <div className={cn('border-t border-border bg-canvas/80 backdrop-blur')}>
         <div className="mx-auto w-full max-w-3xl px-8 py-4">
-          <Composer busy={chat.busy} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
+          <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
+          <Composer inputRef={composerRef} busy={chat.busy} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
         </div>
       </div>
     </div>

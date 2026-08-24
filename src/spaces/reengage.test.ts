@@ -59,6 +59,8 @@ test('wake guidance uses workspace runner tools, not stale write_file-first repa
   const text = turns.find((turn) => typeof turn.text === 'string' && turn.text.includes(`[workspace ${slug}:threshold-data changed`))?.text ?? '';
   assert.match(text, /space_get_runner\('rg-runner-guidance'\)/);
   assert.match(text, /space_edit_runner\('rg-runner-guidance'/);
+  assert.match(text, /space_try_runner\('rg-runner-guidance'.*without executing it/i);
+  assert.doesNotMatch(text, /SEE the JSON \(nothing persisted\)/i);
   assert.doesNotMatch(text, /edit the data runner with write_file/i);
 });
 

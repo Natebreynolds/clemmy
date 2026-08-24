@@ -16,11 +16,12 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 mkdirSync(path.join(HOME, 'state'), { recursive: true });
 writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-generic-shapes\n', 'utf8');
 
-const { appendEvent, createSession, closeEventLog, listEvents } = await import('../harness/eventlog.js');
+const { appendEvent, createSession, closeEventLog, listEvents, openEventLog } = await import('../harness/eventlog.js');
 const { commitTurnOutcome } = await import('../harness/delivery-committer.js');
 const { turnOutcomeId } = await import('../harness/turn-outcome.js');
 const {
   createHostCapabilityCatalogFactory,
+  freezeCatalogSnapshotForSource,
   installHostCapabilityCatalogFactory,
   peekHostCapabilityCatalogFactory,
 } = await import('../harness/host-capability-catalog-factory.js');
@@ -54,6 +55,7 @@ const { clearProductionCapabilityPorts } = await import('../harness/production-c
 const { physicalCrossingsFor } = await import('../harness/dispatch-ledger.js');
 const { issueCollectionReceipt } = await import('../harness/evidence-receipts.js');
 const { setAdmittedGraphRunFault } = await import('../harness/admitted-construct-run.js');
+const { freezeActionExpectedWorkContract } = await import('../harness/expected-work-contract.js');
 const { readCanonicalGraphNodeLease } = await import('../harness/canonical-graph-node-lease.js');
 import type { RegisteredHostCapability } from '../harness/host-capability-catalog-factory.js';
 import type { ManifestEffect } from '../harness/capability-manifest.js';
@@ -946,6 +948,46 @@ async function admitConstructTurn(creates: { count: number }) {
   return { identity, admitted };
 }
 
+test('exact destination binding survives the semantic seal and durable graph replay byte-for-byte', async () => {
+  const { identity, admitted } = await admitConstructTurn({ count: 0 });
+  assert.equal(admitted.ok, true, JSON.stringify(admitted).slice(0, 400));
+  if (!admitted.ok) return;
+  const frozen = freezeCatalogSnapshotForSource({
+    sessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+  });
+  assert.equal(frozen.ok, true);
+  if (!frozen.ok) return;
+  const create = frozen.entries.find((entry) => (
+    entry.effect === 'external_write'
+    && entry.destination?.posture === 'create_new'
+  ));
+  assert.ok(create?.manifest && create.manifestDigest);
+  const expected = {
+    manifestId: create!.manifest!.manifestId,
+    manifestDigest: create!.manifestDigest!,
+    accountId: create!.manifest!.accountId,
+    operationId: create!.manifest!.operationId,
+    schemaVersion: create!.manifest!.operationVersion,
+    definitionFingerprint: create!.manifest!.definitionFingerprint,
+    effect: create!.manifest!.effect,
+    posture: 'create_new',
+  };
+  const compiledGoal = admitted.compiled.graph.classification.goalConstraints;
+  assert.equal(compiledGoal?.destinations?.length, 1);
+  assert.equal(JSON.stringify(compiledGoal?.destination?.binding), JSON.stringify(expected));
+  assert.equal(JSON.stringify(compiledGoal?.destinations?.[0]?.binding), JSON.stringify(expected));
+
+  const replayed = turnGraphFromShadowEvent(
+    getTurnGraphEventForSource(identity.sessionId, identity.sourceUserSeq),
+  );
+  assert.ok(replayed);
+  assert.equal(JSON.stringify(replayed?.classification.goalConstraints?.destination?.binding),
+    JSON.stringify(expected));
+  assert.equal(JSON.stringify(replayed?.classification.goalConstraints?.destinations?.[0]?.binding),
+    JSON.stringify(expected));
+});
+
 test('collect → analyze → construct → readback finishes typed done with one create', async () => {
   const creates = { count: 0 };
   const { identity, admitted } = await admitConstructTurn(creates);
@@ -979,6 +1021,66 @@ test('collect → analyze → construct → readback finishes typed done with on
   }
 });
 
+test('a corrupt frozen catalog closes once with persisted safe copy before provider work', async () => {
+  const creates = { count: 0 };
+  const { identity, admitted } = await admitConstructTurn(creates);
+  assert.equal(admitted.ok, true, JSON.stringify(admitted).slice(0, 300));
+  if (!admitted.ok) return;
+  const frozen = freezeCatalogSnapshotForSource({
+    sessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+  });
+  assert.equal(frozen.ok, true);
+  openEventLog().prepare(
+    `UPDATE accepted_source_catalog_snapshots
+        SET snapshot_digest = ?
+      WHERE session_id = ? AND source_user_seq = ?`,
+  ).run('0'.repeat(64), identity.sessionId, identity.sourceUserSeq);
+
+  const dispatched = await dispatchAdmittedSource(identity);
+  assert.equal(dispatched.kind, 'blocked', JSON.stringify(dispatched).slice(0, 400));
+  if (dispatched.kind !== 'blocked') return;
+  assert.doesNotMatch(dispatched.text, /catalog_snapshot|corrupt_snapshot|[a-f0-9]{64}/i);
+  assert.equal(creates.count, 0);
+  const terminals = listEvents(identity.sessionId, { types: ['conversation_completed'] })
+    .filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq);
+  assert.equal(terminals.length, 1);
+  assert.equal((terminals[0]?.data.presentation as { text?: string } | undefined)?.text, dispatched.text);
+});
+
+test('an expected-work authority conflict stays recovery-held without a false terminal', async () => {
+  const creates = { count: 0 };
+  const { identity, admitted } = await admitConstructTurn(creates);
+  assert.equal(admitted.ok, true, JSON.stringify(admitted).slice(0, 300));
+  if (!admitted.ok) return;
+  const seeded = freezeActionExpectedWorkContract({
+    sessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+    proposal: {
+      version: 1,
+      operations: [{
+        id: 'alternate-once-write',
+        effect: 'external_write',
+        dependsOn: [],
+        dataFrom: [],
+        cardinality: { kind: 'once' },
+      }],
+      universes: [],
+    },
+  });
+  assert.equal(seeded.status, 'fixed', JSON.stringify(seeded));
+
+  const dispatched = await dispatchAdmittedSource(identity);
+  assert.deepEqual(dispatched, {
+    kind: 'held',
+    hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+  });
+  assert.equal(creates.count, 0);
+  const terminals = listEvents(identity.sessionId, { types: ['conversation_completed'] })
+    .filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq);
+  assert.equal(terminals.length, 0, 'corrupt work authority cannot own a fabricated public stop');
+});
+
 test('a crashed construct does not recreate the first write on resume', async () => {
   const creates = { count: 0 };
   const { identity, admitted } = await admitConstructTurn(creates);
@@ -987,7 +1089,16 @@ test('a crashed construct does not recreate the first write on resume', async ()
   setAdmittedGraphRunFault('before_publication');
   const crashed = await dispatchAdmittedSource(identity);
   setAdmittedGraphRunFault(null);
-  assert.notEqual(crashed.kind === 'typed' && crashed.result.status === 'success', true);
+  assert.deepEqual(crashed, {
+    kind: 'held',
+    hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+  });
+  assert.equal(
+    listEvents(identity.sessionId, { types: ['conversation_completed'] })
+      .filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq).length,
+    0,
+    'restart-owned execution must not be falsely terminalized',
+  );
   const firstCreates = creates.count;
   assert.ok(firstCreates >= 1, 'the first write committed before the crash');
   const finish = await dispatchAdmittedSource(identity);

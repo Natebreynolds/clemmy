@@ -7,6 +7,11 @@ import type { AuthStatus } from '../types.js';
 import { loginWithNativeCodexOAuth, refreshNativeCodexTokens, startCodexDeviceAuth, pollCodexDeviceAuth } from './codex-native-oauth.js';
 import type { NativeCodexTokenSet } from './codex-native-oauth.js';
 import { claudeVaultFallbackReady, hasClaudeCodeCredentialFile } from './claude-oauth.js';
+import {
+  startXaiDeviceAuth,
+  pollXaiDeviceAuth,
+  revokeNativeXaiToken,
+} from './xai-native-oauth.js';
 
 const AUTH_STATE_FILE = path.join(BASE_DIR, 'state', 'auth.json');
 const CODEX_ACCESS_ONLY_FILE = path.join(BASE_DIR, 'state', 'codex-access-only.json');
@@ -262,6 +267,17 @@ interface LocalAuthState {
     accountId?: string;
     lastRefresh?: string;
   };
+  /** xAI (Grok) subscription grant. A SEPARATE section rather than a second
+   * file: auth.json is written whole, so two writers would clobber each other's
+   * provider. Connecting one provider must never sign the user out of another. */
+  xaiOauth?: {
+    accessToken?: string;
+    refreshToken?: string;
+    idToken?: string;
+    /** Absolute expiry, ISO-8601, so a stale token is detectable without a call. */
+    expiresAt?: string;
+    lastRefresh?: string;
+  };
 }
 
 export interface StoredCodexOAuthTokens {
@@ -467,7 +483,12 @@ export async function loginWithNativeOAuth(_sourceFile = getCodexAuthSourceFile(
     // that file lets a separate `codex` invocation rotate/consume our refresh
     // token and trip reuse-detection (token_revoked). See the notes near
     // REFRESH_LOCK_FILE; this is the "Clem holds her own auth token" decouple.
+    //
+    // MERGE, never replace: this file also holds sibling grants (xaiOauth, …).
+    // Writing a fresh object here silently signed those providers out — live
+    // 2026-08-18: a Codex login at 04:41Z dropped the connected xAI grant.
     saveLocalAuthState({
+      ...loadLocalAuthState(),
       importedAt: new Date().toISOString(),
       source: 'native',
       codexOauth: {
@@ -509,7 +530,9 @@ function sweepPendingDeviceLogins(): void {
 
 function persistDeviceTokens(tokens: NativeCodexTokenSet): void {
   // OWN vault only (source 'native') — clears the DEAD latch via saveLocalAuthState.
+  // Merge with the current state so sibling provider grants (xaiOauth, …) survive.
   saveLocalAuthState({
+    ...loadLocalAuthState(),
     importedAt: new Date().toISOString(),
     source: 'native',
     codexOauth: {
@@ -688,7 +711,11 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
     // pushing our rotating RT there lets a separate `codex` invocation consume
     // it and trip reuse-detection. Clementine owns its grant; the codex CLI owns
     // its own. (Initial login/import still seeds the CLI file — see those paths.)
+    // Re-load at write time (not the pre-refresh snapshot): the provider
+    // round-trip above is slow, and a sibling grant (xaiOauth, …) connected
+    // meanwhile must survive this rotation.
     saveLocalAuthState({
+      ...loadLocalAuthState(),
       importedAt: new Date().toISOString(),
       source: local.source ?? 'native',
       codexOauth: {
@@ -758,7 +785,10 @@ export function importCodexCliAuth(sourceFile = getCodexAuthSourceFile()): { ok:
     };
   }
 
+  // Merge with the current state so sibling provider grants (xaiOauth, …)
+  // survive the import.
   saveLocalAuthState({
+    ...loadLocalAuthState(),
     importedAt: new Date().toISOString(),
     source: 'codex_cli',
     codexOauth: {
@@ -895,4 +925,189 @@ export function formatAuthStatus(status = getAuthStatus()): string {
     status.codexImportPath ? `codex_import_path: ${status.codexImportPath}` : '',
     `message: ${status.message}`,
   ].filter(Boolean).join('\n');
+}
+
+// ─── xAI (Grok) subscription grant ─────────────────────────────────────────
+//
+// Peer to the Codex section above. Kept deliberately small: this file already
+// carries a large Codex-specific surface, and xAI needs only store / read /
+// refresh / clear. Everything provider-specific about the FLOW lives in
+// xai-native-oauth.ts; this is persistence and freshness only.
+
+export interface StoredXaiOAuthTokens {
+  accessToken: string;
+  refreshToken: string;
+  idToken?: string;
+  expiresAt?: string;
+  lastRefresh?: string;
+}
+
+/** Persist a fresh xAI grant. Merges into the existing state so connecting xAI
+ *  cannot sign the user out of Codex — auth.json is written whole. */
+export function saveXaiOAuthTokens(tokens: StoredXaiOAuthTokens): void {
+  const current = loadLocalAuthState();
+  saveLocalAuthState({
+    ...current,
+    xaiOauth: {
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      ...(tokens.idToken ? { idToken: tokens.idToken } : {}),
+      ...(tokens.expiresAt ? { expiresAt: tokens.expiresAt } : {}),
+      lastRefresh: tokens.lastRefresh ?? new Date().toISOString(),
+    },
+  });
+}
+
+export function getStoredXaiOAuthTokens(): StoredXaiOAuthTokens | null {
+  const stored = loadLocalAuthState().xaiOauth;
+  if (!stored?.accessToken || !stored.refreshToken) return null;
+  return {
+    accessToken: stored.accessToken,
+    refreshToken: stored.refreshToken,
+    ...(stored.idToken ? { idToken: stored.idToken } : {}),
+    ...(stored.expiresAt ? { expiresAt: stored.expiresAt } : {}),
+    ...(stored.lastRefresh ? { lastRefresh: stored.lastRefresh } : {}),
+  };
+}
+
+/** Disconnect xAI without disturbing any other provider's grant. */
+export function clearXaiOAuthTokens(): void {
+  const current = loadLocalAuthState();
+  const { xaiOauth: _dropped, ...rest } = current;
+  saveLocalAuthState(rest);
+}
+
+/** True when the stored access token is expired or within `skewMs` of it.
+ *  A grant with no recorded expiry is treated as fresh: the token endpoint is
+ *  the authority, and refusing to use an unexpired-but-undated token would
+ *  break a grant that is actually fine. */
+export function xaiAccessTokenExpiresSoon(skewMs = 60_000): boolean {
+  const stored = getStoredXaiOAuthTokens();
+  if (!stored) return false;
+  if (!stored.expiresAt) return false;
+  const expiry = Date.parse(stored.expiresAt);
+  if (!Number.isFinite(expiry)) return false;
+  return expiry - skewMs <= Date.now();
+}
+
+/**
+ * Return a usable xAI access token, refreshing first when it is at or near
+ * expiry. Returns null when xAI is not connected.
+ *
+ * A failed refresh does NOT clear the grant: a network blip or a provider
+ * outage is not the user revoking access, and discarding a valid refresh token
+ * on a transient error would silently sign them out. The caller surfaces the
+ * error; only an explicit disconnect clears.
+ */
+export async function getFreshXaiAccessToken(
+  refresh: (refreshToken: string) => Promise<StoredXaiOAuthTokens>,
+): Promise<string | null> {
+  const stored = getStoredXaiOAuthTokens();
+  if (!stored) return null;
+  if (!xaiAccessTokenExpiresSoon()) return stored.accessToken;
+  const refreshed = await refresh(stored.refreshToken);
+  saveXaiOAuthTokens(refreshed);
+  return refreshed.accessToken;
+}
+
+export function xaiOAuthConnected(): boolean {
+  return getStoredXaiOAuthTokens() !== null;
+}
+
+/** In-flight xAI device sign-ins, keyed by an opaque loginId so the raw
+ *  device_code (bearer of the pending grant) never leaves the daemon. */
+const pendingXaiDeviceLogins = new Map<string, {
+  deviceCode: string;
+  intervalSeconds: number;
+  createdAt: number;
+  expiresAt: number;
+}>();
+
+function sweepPendingXaiDeviceLogins(): void {
+  const now = Date.now();
+  for (const [id, p] of pendingXaiDeviceLogins) {
+    if (now > p.expiresAt) pendingXaiDeviceLogins.delete(id);
+  }
+}
+
+export interface XaiDeviceLoginStart {
+  loginId: string;
+  userCode: string;
+  verificationUri: string;
+  /** Same page with the code pre-filled — prefer for a clickable link or QR. */
+  verificationUriComplete?: string;
+  intervalSeconds: number;
+  expiresAt: string;
+}
+
+export type XaiDeviceLoginPoll =
+  | { status: 'pending' }
+  | { status: 'slow_down'; intervalSeconds: number }
+  | { status: 'complete' }
+  | { status: 'denied' }
+  | { status: 'expired' }
+  | { status: 'error'; message: string };
+
+/** Begin an xAI (Grok) device-code sign-in. Peer to beginCodexDeviceLogin. */
+export async function beginXaiDeviceLogin(): Promise<XaiDeviceLoginStart> {
+  sweepPendingXaiDeviceLogins();
+  const start = await startXaiDeviceAuth();
+  const loginId = randomUUID();
+  pendingXaiDeviceLogins.set(loginId, {
+    deviceCode: start.deviceCode,
+    intervalSeconds: start.intervalSeconds,
+    createdAt: Date.now(),
+    // Trust the SERVER's expiry, not a local constant: the grant dies when xAI
+    // says it does, and polling past that only produces confusing errors.
+    expiresAt: Date.parse(start.expiresAt) || (Date.now() + 1_800_000),
+  });
+  return {
+    loginId,
+    userCode: start.userCode,
+    verificationUri: start.verificationUri,
+    ...(start.verificationUriComplete ? { verificationUriComplete: start.verificationUriComplete } : {}),
+    intervalSeconds: start.intervalSeconds,
+    expiresAt: start.expiresAt,
+  };
+}
+
+/** Poll an xAI device sign-in once. On `complete` the grant is persisted.
+ *  Safe to call repeatedly every `intervalSeconds`. */
+export async function pollXaiDeviceLogin(loginId: string): Promise<XaiDeviceLoginPoll> {
+  const pending = pendingXaiDeviceLogins.get(loginId);
+  if (!pending) return { status: 'expired' };
+  if (Date.now() > pending.expiresAt) {
+    pendingXaiDeviceLogins.delete(loginId);
+    return { status: 'expired' };
+  }
+  try {
+    const result = await pollXaiDeviceAuth(pending.deviceCode);
+    if (result.status === 'pending') return { status: 'pending' };
+    if (result.status === 'slow_down') {
+      pending.intervalSeconds = result.intervalSeconds;
+      return { status: 'slow_down', intervalSeconds: result.intervalSeconds };
+    }
+    if (result.status === 'denied' || result.status === 'expired') {
+      pendingXaiDeviceLogins.delete(loginId);
+      return { status: result.status };
+    }
+    pendingXaiDeviceLogins.delete(loginId);
+    saveXaiOAuthTokens({
+      accessToken: result.tokens.accessToken,
+      refreshToken: result.tokens.refreshToken,
+      ...(result.tokens.idToken ? { idToken: result.tokens.idToken } : {}),
+      ...(result.tokens.expiresAt ? { expiresAt: result.tokens.expiresAt } : {}),
+      lastRefresh: result.tokens.lastRefresh,
+    });
+    return { status: 'complete' };
+  } catch (error) {
+    return { status: 'error', message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** Disconnect xAI: revoke upstream (best-effort) then drop the local grant. */
+export async function disconnectXaiOAuth(): Promise<void> {
+  const stored = getStoredXaiOAuthTokens();
+  clearXaiOAuthTokens();
+  if (stored?.refreshToken) await revokeNativeXaiToken(stored.refreshToken);
 }

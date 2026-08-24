@@ -195,7 +195,7 @@ export function deriveStepDataSources(step: WorkflowStepInput): string[] {
   for (const m of prompt.matchAll(/\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b/g)) {
     if (!NON_CONNECTOR_TOKENS.has(m[0])) refs.add(m[0]);
   }
-  for (const m of prompt.matchAll(/\b(?:composio_execute_tool|run_tool_program|write_file|run_shell_command|web_fetch|web_search)\b/g)) {
+  for (const m of prompt.matchAll(/\b(?:composio_execute_tool|write_file|run_shell_command|web_fetch|web_search)\b/g)) {
     refs.add(m[0]);
   }
   if (refs.size > 0) out.push(`refs in prompt: ${[...refs].slice(0, 12).join(', ')}`);

@@ -86,7 +86,11 @@ function stageManifested() {
   return { ...task, manifest: compiled.manifest };
 }
 
-function stageManifestedRead(options: { satisfy?: boolean } = {}) {
+function stageManifestedRead(options: {
+  satisfy?: boolean;
+  payload?: unknown;
+  executionSite?: 'provider' | 'host';
+} = {}) {
   const task = stageContract('Find every current alpha record.');
   const logicalToolCallId = `logical:terminal-read:${serial}`;
   const tool = 'alpha_records_search';
@@ -102,6 +106,7 @@ function stageManifestedRead(options: { satisfy?: boolean } = {}) {
     },
     tool,
     args,
+    ...(options.executionSite === 'host' ? { executionSite: 'host' as const } : {}),
   });
   assert.equal(begun.status, 'inserted');
   if (begun.status !== 'inserted') throw new Error(begun.reason);
@@ -113,9 +118,9 @@ function stageManifestedRead(options: { satisfy?: boolean } = {}) {
   const settled = settlements.commitLogicalCallSettlement({
     identity: { ...task, acceptedTaskId, logicalToolCallId },
     contract: { toolName: tool, args },
-    execution: { kind: 'provider_execution' },
+    execution: { kind: options.executionSite === 'host' ? 'local_execution' : 'provider_execution' },
     result: {
-      payload: {
+      payload: options.payload ?? {
         successful: true,
         data: { records: [{ id: 'r1' }, { id: 'r2' }] },
         meta: { complete: true },
@@ -123,7 +128,7 @@ function stageManifestedRead(options: { satisfy?: boolean } = {}) {
     },
     outcome: attempts.classifyAttemptOutcome({ envelopeSuccessful: true }),
     recovery: { businessCall: true, mutating: false },
-    observer: { lane: 'composio', turn: task.turn },
+    observer: { lane: options.executionSite === 'host' ? 'byo' : 'composio', turn: task.turn },
   });
   assert.equal(settled.status, 'committed');
   if (settled.status !== 'committed') throw new Error(JSON.stringify(settled));
@@ -178,32 +183,58 @@ function outcomeFor(
     id: outcomes.turnOutcomeId(identity),
     identity,
   };
-  if (status === 'done') {
-    return {
-      ...common,
-      status,
-      resumable: false,
-      presentation: { kind: 'answer', text },
-    };
+  switch (status) {
+    case 'done':
+      return {
+        ...common,
+        status,
+        resumable: false,
+        presentation: { kind: 'answer', text },
+      };
+    case 'needs_input':
+      return {
+        ...common,
+        status,
+        resumable: true,
+        needs: { kind: 'input' },
+        presentation: { kind: 'question', text },
+      };
+    case 'blocked':
+      return {
+        ...common,
+        status,
+        resumable: true,
+        presentation: { kind: 'blocked', text },
+      };
+    case 'failed':
+      return {
+        ...common,
+        status,
+        resumable: false,
+        presentation: { kind: 'error', text },
+      };
+    case 'cancelled':
+      return {
+        ...common,
+        status,
+        resumable: false,
+        presentation: { kind: 'stopped', text },
+      };
+    case 'transferred':
+      return {
+        ...common,
+        status,
+        resumable: false,
+        presentation: { kind: 'transferred', text },
+      };
+    case 'uncertain':
+      return {
+        ...common,
+        status,
+        resumable: true,
+        presentation: { kind: 'blocked', text },
+      };
   }
-  if (status === 'needs_input') {
-    return {
-      ...common,
-      status,
-      resumable: true,
-      needs: { kind: 'input' },
-      presentation: { kind: 'question', text },
-    };
-  }
-  if (status === 'blocked') {
-    return {
-      ...common,
-      status,
-      resumable: true,
-      presentation: { kind: 'blocked', text },
-    };
-  }
-  throw new Error(`unsupported fixture status: ${status}`);
 }
 
 function appendOutcome(task: ReturnType<typeof accept>, status: TurnOutcomeStatus) {
@@ -221,6 +252,34 @@ function readAuthority(task: ReturnType<typeof accept>) {
   assert.equal(loaded.status, 'ok');
   if (loaded.status !== 'ok') throw new Error('fixture authority is missing');
   return loaded.authority;
+}
+
+function bindAttempt(
+  task: Pick<ReturnType<typeof accept>, 'sessionId' | 'sourceUserSeq' | 'turn'>,
+  label = 'owner',
+) {
+  const attempt = eventlog.beginRunAttempt(task.sessionId, {
+    attemptId: `attempt:terminal-publication:${label}:${task.sourceUserSeq}`,
+    runId: `run:terminal-publication:${label}:${task.sourceUserSeq}`,
+  });
+  const source = eventlog.recordRunAttemptUserInput(attempt, {
+    turn: task.turn,
+    role: 'user',
+    data: { text: `${label} source` },
+  }, {
+    existingEventSeq: task.sourceUserSeq,
+    armRunInFlight: true,
+  });
+  assert.equal(source.seq, task.sourceUserSeq);
+  return attempt;
+}
+
+function sessionMetadata(sessionId: string): Record<string, unknown> {
+  const row = eventlog.openEventLog().prepare(
+    'SELECT metadata_json FROM sessions WHERE id = ?',
+  ).get(sessionId) as { metadata_json: string } | undefined;
+  assert.ok(row);
+  return JSON.parse(row.metadata_json) as Record<string, unknown>;
 }
 
 function recreatePhysicalDispatchImmutableTrigger(): void {
@@ -254,6 +313,33 @@ function recreateDurableResultImmutableTrigger(): void {
   `);
 }
 
+function recreateLogicalSettlementCrossingImmutableTrigger(): void {
+  eventlog.openEventLog().exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_logical_settlement_crossing_update_immutable
+    BEFORE UPDATE ON logical_call_settlement_crossings
+    BEGIN
+      SELECT RAISE(ABORT, 'logical settlement crossings are immutable');
+    END;
+  `);
+}
+
+function rewriteFrozenEnvelopeMetadataForFixture(
+  resultHandleId: string,
+  envelopeMetaJson: string | null,
+): void {
+  const db = eventlog.openEventLog();
+  db.exec('DROP TRIGGER IF EXISTS trg_durable_result_identity_immutable');
+  try {
+    db.prepare(`
+      UPDATE durable_result_handles
+         SET envelope_meta_json = ?
+       WHERE handle_id = ?
+    `).run(envelopeMetaJson, resultHandleId);
+  } finally {
+    recreateDurableResultImmutableTrigger();
+  }
+}
+
 test('staged done atomically publishes one event and advances exact authority to that event', () => {
   const task = stageManifested();
   const terminal = appendOutcome(task, 'done');
@@ -266,6 +352,36 @@ test('staged done atomically publishes one event and advances exact authority to
   const read = eventlog.readAcceptedTaskTerminalPublication(task.sessionId, task.sourceUserSeq);
   assert.equal(read.status, 'published');
   assert.equal(read.status === 'published' && read.event.id, terminal.event.id);
+});
+
+test('a source-owned direct terminal clears restart ownership in the publication transaction', () => {
+  const session = eventlog.createSession({
+    id: `terminal-source-owner-${process.pid}-${++serial}`,
+    kind: 'chat',
+  });
+  const source = eventlog.acceptUserInputForRun({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    data: { text: 'Stop this direct turn safely.' },
+  });
+  const task = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  assert.ok(shadow.recordTurnGraphShadow({ identity: task }));
+  assert.equal(resolution.expectedTaskFor(task.sessionId, task.sourceUserSeq).status, 'ok');
+  assert.equal(
+    (sessionMetadata(task.sessionId).__run_in_flight_owner as { sourceUserSeq?: number }).sourceUserSeq,
+    task.sourceUserSeq,
+  );
+
+  const terminal = appendOutcome(task, 'blocked');
+
+  assert.equal(terminal.inserted, true);
+  assert.equal(sessionMetadata(task.sessionId).__run_in_flight, undefined);
+  assert.equal(sessionMetadata(task.sessionId).__run_in_flight_owner, undefined);
+  assert.equal(
+    eventlog.listEvents(task.sessionId, { types: ['conversation_completed'] })[0]?.id,
+    terminal.event.id,
+  );
 });
 
 test('a manifested read cannot publish done until its declared receipt is exactly transitioned', () => {
@@ -286,18 +402,82 @@ test('a manifested read cannot publish done until its declared receipt is exactl
   assert.equal(readAuthority(unsatisfied).state, 'manifested_verifying');
 
   const satisfied = stageManifestedRead({ satisfy: true });
+  assert.deepEqual(eventlog.openEventLog().prepare(`
+    SELECT physical_crossing_count, host_crossing_count, crossing_authority_version
+      FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(satisfied.sessionId, satisfied.sourceUserSeq, satisfied.logicalToolCallId), {
+    physical_crossing_count: 1,
+    host_crossing_count: 0,
+    crossing_authority_version: 2,
+  });
   const terminal = appendOutcome(satisfied, 'done');
   assert.equal(terminal.inserted, true);
   assert.equal(readAuthority(satisfied).terminalEventId, terminal.event.id);
 });
 
+test('terminal proof accepts an exact v2 host crossing and its bound result', () => {
+  const task = stageManifestedRead({ satisfy: true, executionSite: 'host' });
+  assert.deepEqual(eventlog.openEventLog().prepare(`
+    SELECT physical_crossing_count, host_crossing_count, crossing_authority_version
+      FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, task.logicalToolCallId), {
+    physical_crossing_count: 0,
+    host_crossing_count: 1,
+    crossing_authority_version: 2,
+  });
+  const terminal = appendOutcome(task, 'done');
+  assert.equal(terminal.inserted, true);
+  assert.equal(readAuthority(task).terminalEventId, terminal.event.id);
+});
+
+test('terminal proof accepts narrow missing legacy envelope metadata but rejects stored conflicts', () => {
+  const payload = {
+    successful: true,
+    logId: 'terminal-publication-legacy-log',
+    data: {
+      records: [{ id: 'r1' }, { id: 'r2' }],
+      totalSize: 2,
+      done: true,
+    },
+  };
+  const legacy = stageManifestedRead({ satisfy: true, payload });
+  rewriteFrozenEnvelopeMetadataForFixture(legacy.receipt.resultHandleId, null);
+  const terminal = appendOutcome(legacy, 'done');
+  assert.equal(terminal.inserted, true);
+  assert.equal(readAuthority(legacy).terminalEventId, terminal.event.id);
+
+  const conflicting = stageManifestedRead({ satisfy: true, payload });
+  rewriteFrozenEnvelopeMetadataForFixture(
+    conflicting.receipt.resultHandleId,
+    JSON.stringify({ successful: true, logId: 'forged-log' }),
+  );
+  assert.throws(
+    () => appendOutcome(conflicting, 'done'),
+    (error: unknown) => {
+      assert.ok(error instanceof eventlog.AcceptedTaskTerminalPublicationError);
+      assert.equal(error.status, 'conflict');
+      assert.match(error.reason, /raw payload|projection/i);
+      return true;
+    },
+  );
+  assert.equal(readAuthority(conflicting).state, 'manifested_verifying');
+});
+
 test('terminal proof recomputes the frozen crossing digest instead of trusting its count', () => {
   const task = stageManifestedRead({ satisfy: true });
-  eventlog.openEventLog().prepare(`
-    UPDATE logical_call_settlement_crossings
-       SET tool_name = tool_name || '_forged'
-     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
-  `).run(task.sessionId, task.sourceUserSeq, task.logicalToolCallId);
+  const db = eventlog.openEventLog();
+  db.exec('DROP TRIGGER IF EXISTS trg_logical_settlement_crossing_update_immutable');
+  try {
+    db.prepare(`
+      UPDATE logical_call_settlement_crossings
+         SET tool_name = tool_name || '_forged'
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).run(task.sessionId, task.sourceUserSeq, task.logicalToolCallId);
+  } finally {
+    recreateLogicalSettlementCrossingImmutableTrigger();
+  }
   assert.throws(
     () => appendOutcome(task, 'done'),
     (error: unknown) => {
@@ -520,17 +700,118 @@ test('a dangling staged work-contract binding cannot publish done', () => {
   );
 });
 
-test('blocked and needs-input terminals never advance manifested authority', () => {
-  for (const status of ['blocked', 'needs_input'] as const) {
+test('all typed terminal statuses atomically close manifested authority and exact run ownership', () => {
+  const cases = [
+    { status: 'done', presentationKind: 'answer', attemptStatus: 'completed' },
+    { status: 'needs_input', presentationKind: 'question', attemptStatus: 'interrupted' },
+    { status: 'blocked', presentationKind: 'blocked', attemptStatus: 'failed' },
+    { status: 'failed', presentationKind: 'error', attemptStatus: 'failed' },
+    { status: 'cancelled', presentationKind: 'stopped', attemptStatus: 'cancelled' },
+    { status: 'transferred', presentationKind: 'transferred', attemptStatus: 'completed' },
+    { status: 'uncertain', presentationKind: 'blocked', attemptStatus: 'failed' },
+  ] as const satisfies readonly Array<{
+    status: TurnOutcomeStatus;
+    presentationKind: TurnOutcome['presentation']['kind'];
+    attemptStatus: Exclude<ReturnType<typeof eventlog.getRunAttemptBySourceUserSeq>, null>['status'];
+  }>;
+  type MissingTerminalStatus = Exclude<TurnOutcomeStatus, typeof cases[number]['status']>;
+  const everyTerminalStatusIsCovered: MissingTerminalStatus extends never ? true : false = true;
+  type HeldIsNotATurnOutcome = Extract<TurnOutcomeStatus, 'held'>;
+  const heldStaysOutsideTerminalPublication: HeldIsNotATurnOutcome extends never ? true : false = true;
+  assert.equal(everyTerminalStatusIsCovered, true);
+  assert.equal(heldStaysOutsideTerminalPublication, true);
+
+  for (const { status, presentationKind, attemptStatus } of cases) {
     const task = stageManifested();
+    const attempt = bindAttempt(task, status);
+    eventlog.requestKill(task.sessionId, `${status} fixture`, attempt);
+    assert.equal(eventlog.isKillRequested(task.sessionId, attempt), true);
+    const active = eventlog.getRunAttemptBySourceUserSeq(task.sessionId, task.sourceUserSeq);
+    assert.equal(active?.attemptId, attempt.attemptId);
+    assert.equal(active?.runId, attempt.runId);
+    assert.equal(active?.status, 'active');
+    assert.equal(active?.finishedAt, null);
+    const activeMetadata = sessionMetadata(task.sessionId);
+    assert.ok(activeMetadata.__run_in_flight);
+    assert.equal(
+      (activeMetadata.__run_in_flight_owner as { attemptId?: string }).attemptId,
+      attempt.attemptId,
+    );
+    assert.equal(
+      (activeMetadata.__run_in_flight_owner as { sourceUserSeq?: number }).sourceUserSeq,
+      task.sourceUserSeq,
+    );
+
+    const expectedPresentation = outcomes.presentationEventForOutcome(outcomeFor(task, status));
     const terminal = appendOutcome(task, status);
     assert.equal(terminal.inserted, true);
-    const pending = readAuthority(task);
-    assert.equal(pending.state, 'manifested_verifying');
-    assert.equal(pending.terminalEventId, undefined);
+    const presentation = terminal.event.data.presentation as {
+      status?: string;
+      kind?: string;
+      text?: string;
+    };
+    assert.equal(presentation.status, status);
+    assert.equal(presentation.kind, presentationKind);
+    assert.equal(presentation.text, `${status} response`);
+    assert.deepEqual(terminal.event.data.presentation, expectedPresentation);
+    assert.equal(
+      (terminal.event.data.turnOutcome as { status?: string }).status,
+      status,
+    );
+    const terminals = eventlog.listEvents(task.sessionId, { types: ['conversation_completed'] });
+    assert.equal(terminals.length, 1);
+    assert.equal(terminals[0]?.id, terminal.event.id);
+
+    const closed = readAuthority(task);
+    assert.equal(closed.state, 'terminal');
+    assert.equal(closed.terminalEventId, terminal.event.id);
     const read = eventlog.readAcceptedTaskTerminalPublication(task.sessionId, task.sourceUserSeq);
-    assert.equal(read.status, 'pending');
+    assert.equal(read.status, 'published');
+    const settled = eventlog.getRunAttemptBySourceUserSeq(task.sessionId, task.sourceUserSeq);
+    assert.equal(settled?.attemptId, attempt.attemptId);
+    assert.equal(settled?.runId, attempt.runId);
+    assert.equal(settled?.status, attemptStatus);
+    assert.ok(settled?.finishedAt);
+    assert.equal(eventlog.isKillRequested(task.sessionId, attempt), false);
+    assert.equal(sessionMetadata(task.sessionId).__run_in_flight, undefined);
+    assert.equal(sessionMetadata(task.sessionId).__run_in_flight_owner, undefined);
+
+    const finishedAt = settled?.finishedAt;
+    const replay = appendOutcome(task, status);
+    assert.equal(replay.inserted, false);
+    assert.equal(replay.event.id, terminal.event.id);
+    assert.deepEqual(replay.event.data.presentation, terminal.event.data.presentation);
+    assert.equal(eventlog.listEvents(task.sessionId, { types: ['conversation_completed'] }).length, 1);
+    assert.equal(readAuthority(task).terminalEventId, terminal.event.id);
+    const replayedAttempt = eventlog.getRunAttemptBySourceUserSeq(task.sessionId, task.sourceUserSeq);
+    assert.equal(replayedAttempt?.attemptId, attempt.attemptId);
+    assert.equal(replayedAttempt?.status, attemptStatus);
+    assert.equal(replayedAttempt?.finishedAt, finishedAt);
+    assert.equal(eventlog.isKillRequested(task.sessionId, attempt), false);
+    assert.equal(sessionMetadata(task.sessionId).__run_in_flight, undefined);
+    assert.equal(sessionMetadata(task.sessionId).__run_in_flight_owner, undefined);
   }
+});
+
+test('a non-done terminal closes armed authority as an exact conflict winner', () => {
+  const task = stageContract();
+  assert.equal(readAuthority(task).state, 'armed');
+  const attempt = bindAttempt(task, 'armed');
+  const terminal = appendOutcome(task, 'blocked');
+  assert.equal(terminal.inserted, true);
+  const closed = readAuthority(task);
+  assert.equal(closed.state, 'conflict');
+  assert.equal(closed.terminalEventId, terminal.event.id);
+  assert.equal(
+    eventlog.getRunAttemptBySourceUserSeq(task.sessionId, task.sourceUserSeq)?.status,
+    'failed',
+  );
+  assert.equal(sessionMetadata(task.sessionId).__run_in_flight, undefined);
+
+  const replay = appendOutcome(task, 'blocked');
+  assert.equal(replay.inserted, false);
+  assert.equal(replay.event.id, terminal.event.id);
+  assert.equal(eventlog.isKillRequested(task.sessionId, attempt), false);
 });
 
 test('legacy and unbound action-deferred sources retain their existing publication behavior', () => {
@@ -607,6 +888,144 @@ test('terminal authority update failure rolls back the event and an exact retry 
   const retry = appendOutcome(task, 'done');
   assert.equal(retry.inserted, true);
   assert.equal(readAuthority(task).terminalEventId, retry.event.id);
+});
+
+test('non-done terminal cleanup failure rolls back event, authority, attempt, kill, and marker', () => {
+  const task = stageManifested();
+  const attempt = bindAttempt(task, 'rollback');
+  eventlog.requestKill(task.sessionId, 'rollback fixture', attempt);
+  const db = eventlog.openEventLog();
+  db.exec(`
+    CREATE TRIGGER force_terminal_cleanup_failure
+    BEFORE UPDATE OF metadata_json ON sessions
+    WHEN OLD.id = '${task.sessionId}'
+      AND json_type(OLD.metadata_json, '$.__run_in_flight') IS NOT NULL
+      AND json_type(NEW.metadata_json, '$.__run_in_flight') IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'forced terminal cleanup failure');
+    END;
+  `);
+  try {
+    assert.throws(
+      () => appendOutcome(task, 'blocked'),
+      (error: unknown) => {
+        assert.ok(error instanceof eventlog.AcceptedTaskTerminalPublicationError);
+        assert.equal(error.status, 'storage_error');
+        assert.match(error.message, /forced terminal cleanup failure/);
+        return true;
+      },
+    );
+  } finally {
+    db.exec('DROP TRIGGER force_terminal_cleanup_failure');
+  }
+
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['conversation_completed'] }).length, 0);
+  assert.equal(readAuthority(task).state, 'manifested_verifying');
+  assert.equal(readAuthority(task).terminalEventId, undefined);
+  const rolledBackAttempt = eventlog.getRunAttemptBySourceUserSeq(task.sessionId, task.sourceUserSeq);
+  assert.equal(rolledBackAttempt?.status, 'active');
+  assert.equal(rolledBackAttempt?.finishedAt, null);
+  assert.equal(eventlog.isKillRequested(task.sessionId, attempt), true);
+  assert.ok(sessionMetadata(task.sessionId).__run_in_flight);
+
+  const retry = appendOutcome(task, 'blocked');
+  assert.equal(retry.inserted, true);
+  assert.equal(readAuthority(task).terminalEventId, retry.event.id);
+  assert.equal(
+    eventlog.getRunAttemptBySourceUserSeq(task.sessionId, task.sourceUserSeq)?.status,
+    'failed',
+  );
+  assert.equal(eventlog.isKillRequested(task.sessionId, attempt), false);
+  assert.equal(sessionMetadata(task.sessionId).__run_in_flight, undefined);
+});
+
+test('a late terminal cannot clear a foreign active attempt marker or kill state', () => {
+  const first = stageManifested();
+  const firstAttempt = bindAttempt(first, 'first');
+  eventlog.requestKill(first.sessionId, 'first stop', firstAttempt);
+
+  const secondSource = eventlog.appendEvent({
+    sessionId: first.sessionId,
+    turn: first.turn + 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'A newer accepted turn.' },
+  });
+  const second = {
+    sessionId: first.sessionId,
+    sourceUserSeq: secondSource.seq,
+    turn: secondSource.turn,
+  };
+  const secondAttempt = bindAttempt(second, 'second');
+  eventlog.requestKill(first.sessionId, 'second stop', secondAttempt);
+  const ownerBefore = sessionMetadata(first.sessionId).__run_in_flight_owner as {
+    attemptId?: string;
+    sourceUserSeq?: number;
+  };
+  assert.equal(ownerBefore.attemptId, secondAttempt.attemptId);
+  assert.equal(ownerBefore.sourceUserSeq, second.sourceUserSeq);
+
+  const terminal = appendOutcome(first, 'blocked');
+  assert.equal(terminal.inserted, true);
+  assert.equal(readAuthority(first).terminalEventId, terminal.event.id);
+  assert.equal(eventlog.isKillRequested(first.sessionId, firstAttempt), false);
+  assert.equal(eventlog.isKillRequested(first.sessionId, secondAttempt), true);
+  assert.equal(
+    eventlog.getRunAttemptBySourceUserSeq(first.sessionId, first.sourceUserSeq)?.status,
+    'superseded',
+  );
+  assert.equal(
+    eventlog.getRunAttemptBySourceUserSeq(first.sessionId, second.sourceUserSeq)?.status,
+    'active',
+  );
+  const metadataAfter = sessionMetadata(first.sessionId);
+  assert.ok(metadataAfter.__run_in_flight);
+  assert.deepEqual(metadataAfter.__run_in_flight_owner, ownerBefore);
+
+  eventlog.clearKill(first.sessionId, secondAttempt);
+  eventlog.finishRunAttempt(secondAttempt, 'cancelled');
+});
+
+test('a terminal cannot claim an explicit run owner from another accepted source', () => {
+  const first = stageManifested();
+  const secondSource = eventlog.appendEvent({
+    sessionId: first.sessionId,
+    turn: first.turn + 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'A different accepted turn owns this attempt.' },
+  });
+  const second = {
+    sessionId: first.sessionId,
+    sourceUserSeq: secondSource.seq,
+    turn: secondSource.turn,
+  };
+  const foreignAttempt = bindAttempt(second, 'foreign-terminal-owner');
+  const outcome = outcomeFor(first, 'blocked');
+
+  assert.throws(
+    () => eventlog.appendTerminalEventOnce({
+      sessionId: first.sessionId,
+      turn: first.turn,
+      role: 'system',
+      data: {
+        ...delivery.completionDataForTurnOutcome(outcome),
+        attemptId: foreignAttempt.attemptId,
+        runId: foreignAttempt.runId,
+      },
+    }, outcome.id),
+    (error: unknown) => error instanceof eventlog.AcceptedTaskTerminalPublicationError
+      && error.status === 'conflict'
+      && /different accepted source/i.test(error.message),
+  );
+  assert.equal(eventlog.listEvents(first.sessionId, { types: ['conversation_completed'] }).length, 0);
+  assert.equal(readAuthority(first).state, 'manifested_verifying');
+  assert.equal(eventlog.getRunAttemptBySourceUserSeq(
+    first.sessionId,
+    second.sourceUserSeq,
+  )?.status, 'active');
+
+  eventlog.finishRunAttempt(foreignAttempt, 'cancelled');
 });
 
 test('an exact replay returns the one authority-linked winner', () => {

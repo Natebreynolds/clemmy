@@ -41,10 +41,12 @@ import {
   currentLogicalCall,
 } from '../runtime/harness/attempt-identity.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
-import { dispatchBatchItemTool, isMcpNamespacedTool } from './code-mode-tool.js';
-import { deriveOrchestratorDiscoveryNames, isRegisteredActionControl } from './tool-registry.js';
+import { isTrustedComposioGateway } from '../runtime/harness/runtime-tool-identity.js';
+import { dispatchBatchItemTool, isMcpNamespacedTool } from './inner-dispatch.js';
+import { deriveOrchestratorDiscoveryNames, isRegisteredActionControl, isRegistryDeclaredRead } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
+import { provenComposioSlugForTurn } from '../runtime/harness/capability-resolution.js';
 import { isHarnessRefusalText, textResult } from './shared.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
@@ -69,6 +71,10 @@ import {
   jsonSchemaAllowsNull,
   materializeStrictNullableFields,
 } from '../runtime/schema-normalizer.js';
+import {
+  validatedTurnSourceStrategyBinding,
+  type TurnSourceStrategyBindingV1,
+} from '../runtime/harness/turn-control.js';
 
 export { materializeStrictNullableFields } from '../runtime/schema-normalizer.js';
 
@@ -81,8 +87,8 @@ const DESCRIPTION = [
 ].join(' ');
 
 const CONTROL_ONLY_DESCRIPTION = [
-  'Invoke one deferred built-in control or recovery tool returned by tool_search. Pass its exact `name` and `args_json` JSON object string.',
-  'This carrier cannot invoke business/provider work or external MCP tools; business results belong inside `work_call`.',
+  'Invoke one deferred built-in control, recovery, or READ tool returned by tool_search. Pass its exact `name` and `args_json` JSON object string.',
+  'This carrier cannot invoke business/provider WRITES or external MCP tools; those belong inside `work_call`. Local reads are always direct here — no proposal needed.',
   'The selected control keeps its own schema, approval classification, capability admission, and settlement behavior exactly as if it were first-class.',
   'If arguments fail validation, no inner dispatch occurs; use the exact schema returned by tool_search and retry once.',
 ].join(' ');
@@ -184,6 +190,26 @@ async function nullableRequiredKeys(): Promise<Map<string, ReadonlySet<string>>>
 function jsonResult(value: unknown): string {
   if (value instanceof ExternalWritePreDispatchResult) return value.output;
   return typeof value === 'string' ? value : JSON.stringify(value ?? null);
+}
+
+/**
+ * Opaque return used only by work_call's host preparation pass.  It tells this
+ * resolver that the exact inner call was deliberately stopped after semantic
+ * admission and before dispatch.  Keeping the marker in a WeakSet means model
+ * bytes and provider output cannot manufacture it.
+ */
+const resolvedDispatchPreparations = new WeakSet<object>();
+
+export function resolvedDispatchPreparedWithoutExecution(): object {
+  const marker = Object.freeze({});
+  resolvedDispatchPreparations.add(marker);
+  return marker;
+}
+
+export function isResolvedDispatchPreparedWithoutExecution(
+  value: unknown,
+): value is object {
+  return Boolean(value && typeof value === 'object' && resolvedDispatchPreparations.has(value));
 }
 
 interface CarrierValidationError {
@@ -311,6 +337,11 @@ export interface BuildCallToolOptions {
    * to the active HarnessRunContext (and then legacy behavior); `null` is an
    * explicit no-external-tools boundary. */
   mcpToolScope?: McpToolScope | null;
+  /** Exact selector-authored collection-source binding carried by this
+   * accepted turn. It may route only an exact bound capability name onto its
+   * existing provider carrier; physical account/schema admission remains the
+   * durable authority boundary. */
+  sourceStrategyBinding?: TurnSourceStrategyBindingV1;
   /** Fail-closed admission gate for a validated built-in acquisition. When
    * supplied, the inner tool cannot dispatch unless this callback proves the
    * name belongs to a sealed capability universe and appends/reuses its active
@@ -375,6 +406,29 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
   const reachableBuiltinNames = options.reachableBuiltinNames ?? new Set(defaultSurface.firstClass);
   const firstClassNames = options.firstClassNames ?? new Set<string>();
   const deniedNames = options.deniedNames ?? new Set<string>();
+  const sourceStrategyBinding = validatedTurnSourceStrategyBinding(options.sourceStrategyBinding);
+  const boundSourceIdentities = sourceStrategyBinding
+    ? [sourceStrategyBinding.primary, ...sourceStrategyBinding.equivalentFallbacks]
+    : [];
+  const exactBoundComposioSlug = (requestedTarget: string): string | null => {
+    const wanted = requestedTarget.trim().toUpperCase();
+    for (const identity of boundSourceIdentities) {
+      const match = identity.capabilityId.match(/^capability:composio:(.+)$/i);
+      const slug = match?.[1]?.trim();
+      if (slug && slug.toUpperCase() === wanted) return slug;
+    }
+    return null;
+  };
+  const boundSourceCorrection = (requestedTarget: string): string => {
+    const wantedFamily = requestedTarget.trim().toUpperCase().split(/[_:]/)[0];
+    if (!wantedFamily) return '';
+    const exactNames = boundSourceIdentities
+      .map((identity) => identity.capabilityId.match(/^capability:[^:]+:(.+)$/i)?.[1]?.trim() ?? '')
+      .filter((name) => name && name.toUpperCase().split(/[_:]/)[0] === wantedFamily);
+    return exactNames.length > 0
+      ? ` The confirmed source name was approximated. Retry through work_call with exactly one bound inner name: ${exactNames.map((name) => `"${name}"`).join(', ')}; do not rediscover or switch provider families.`
+      : '';
+  };
   return tool({
     name: 'call_tool',
     description: options.controlOnlyBuiltins ? CONTROL_ONLY_DESCRIPTION : DESCRIPTION,
@@ -461,6 +515,43 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           resolvedArgs = alias.targetArgs;
         }
       }
+      // CONSUME THE TURN'S PROVEN RESOLUTION. The host proves capabilities
+      // before the model speaks; when the model names that exact proven
+      // Composio identifier, refusing it as "not reachable" charges the model
+      // failed calls to rediscover what the harness already knew (live
+      // 2026-08-18: three refusals of tuition on a proven, connected calendar
+      // read). Map the identifier onto the carrier — authority is unchanged,
+      // because the carrier's full gate chain still owns the dispatch.
+      if (
+        !reachableBuiltinNames.has(target)
+        && !firstClassNames.has(target)
+        && !isMcpNamespacedTool(target)
+        && (reachableBuiltinNames.has('composio_execute_tool') || firstClassNames.has('composio_execute_tool'))
+      ) {
+        const ambient = harnessRunContextStorage.getStore();
+        if (ambient?.sessionId) {
+          // A selector-authored, user-confirmed source binding is stronger
+          // routing evidence than generic capability memory. It still grants
+          // no provider crossing: the Composio gateway resolves the live
+          // account/schema and the physical source gate exact-matches those
+          // facts against the durable current-source decision.
+          const boundSlug = exactBoundComposioSlug(target);
+          const proven = boundSlug
+            ? { slug: boundSlug }
+            : provenComposioSlugForTurn({
+                sessionId: ambient.sessionId,
+                sourceUserSeq: ambient.sourceUserSeq,
+                requestedTarget: target,
+              });
+          if (proven) {
+            resolvedArgs = {
+              tool_slug: proven.slug,
+              arguments: JSON.stringify(resolvedArgs && typeof resolvedArgs === 'object' ? resolvedArgs : {}),
+            };
+            target = 'composio_execute_tool';
+          }
+        }
+      }
 
       if (deniedNames.has(requestedTarget) || deniedNames.has(target)) {
         return refuse({
@@ -469,16 +560,19 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         });
       }
 
+      // Registry-declared READS pass alongside controls: a read duplicates
+      // nothing, so the frozen contract has nothing to protect on it (the
+      // admission wall's own doctrine). Business WRITES stay behind work_call.
       if (
         options.controlOnlyBuiltins
         && (
           isMcpNamespacedTool(target)
-          || !isRegisteredActionControl(target)
+          || !(isRegisteredActionControl(target) || isRegistryDeclaredRead(target))
         )
       ) {
         return refuse({
           error: 'not_reachable',
-          detail: `"${requestedTarget}" is not a registry-declared control on this turn. Invoke business/provider work through work_call.`,
+          detail: `"${requestedTarget}" is not a registry-declared control or read on this turn. Invoke business/provider WRITES through work_call.`,
         });
       }
 
@@ -487,7 +581,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // DOWNSTREAM: dispatchBatchItemTool resolves them against the session's
       // connected MCP scope (unknown/unconnected servers error honestly) and
       // routes approval through decideToolApproval on the inner name — the
-      // same contract as run_batch/run_tool_program. Refusing them here was a
+      // same contract as run_batch. Refusing them here was a
       // live Phase-1 gap (2026-07-08): the model fell back to hand-rolling the
       // provider's REST API through shell calls, slower and less gated.
       const activeMcpScope = options.mcpToolScope !== undefined
@@ -505,7 +599,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         if (!reachableBuiltinNames.has(target) && !firstClassNames.has(target)) {
           return refuse({
             error: 'not_reachable',
-            detail: `"${requestedTarget}" is not a deferred callable tool on this turn's surface. Call a first-class tool directly, use tool_search for an available deferred tool, or use a connected external MCP tool as <server>__<tool>.`,
+            detail: `"${requestedTarget}" is not a deferred callable tool on this turn's surface. Call a first-class tool directly, use tool_search for an available deferred tool, or use a connected external MCP tool as <server>__<tool>.${boundSourceCorrection(requestedTarget)}`,
           });
         }
       }
@@ -617,13 +711,22 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         && Number.isSafeInteger(activeRunContext.sourceUserSeq)
         && (activeRunContext.sourceUserSeq ?? 0) > 0
       ) {
-        authorizeResolvedLogicalCallContract({
-          sessionId,
-          sourceUserSeq: activeRunContext.sourceUserSeq as number,
-          turn: activeRunContext.turn,
-          tool: target,
-          effectiveArgs: dispatchArgs,
-        });
+        // ONE REFINEMENT OWNER: the logical call's effective contract is frozen
+        // by the LAST trusted resolver before the paid crossing. For the
+        // Composio carrier that resolver is the gateway itself — it still
+        // applies schema repairs (e.g. renaming `query` to a required `q`)
+        // AFTER this wrapper, so freezing the pre-repair bytes here made the
+        // gateway's own refinement a poisoning conflict and killed the step
+        // (live 2026-08-18: FIRECRAWL_SEARCH first attempt of the turn).
+        if (!isTrustedComposioGateway(target)) {
+          authorizeResolvedLogicalCallContract({
+            sessionId,
+            sourceUserSeq: activeRunContext.sourceUserSeq as number,
+            turn: activeRunContext.turn,
+            tool: target,
+            effectiveArgs: dispatchArgs,
+          });
+        }
         resolvedRefusalTarget = {
           sessionId,
           sourceUserSeq: activeRunContext.sourceUserSeq,
@@ -711,6 +814,13 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         throw error;
       }
 
+      // A host preparation pass intentionally stops at the exact resolved
+      // admission edge. It is not a tool result and must not mutate the
+      // session hot-set or serialize a synthetic value back toward a model.
+      if (isResolvedDispatchPreparedWithoutExecution(out)) {
+        return out as unknown as string;
+      }
+
       // 5. Promote the reached tool into the session hot-set.
       recordToolHit(sessionId, target);
       return jsonResult(out);
@@ -742,7 +852,7 @@ export function registerCallToolMcp(
   };
   server.tool(
     'call_tool',
-    DESCRIPTION,
+    options.controlOnlyBuiltins ? CONTROL_ONLY_DESCRIPTION : DESCRIPTION,
     {
       name: z.string().min(1).describe('Exact built-in tool name returned by tool_search.'),
       args_json: z.string().describe('JSON object string matching that tool\'s returned schema. Use "{}" for no args.'),

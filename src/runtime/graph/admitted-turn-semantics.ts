@@ -13,6 +13,9 @@ import type {
 import type { RuntimeToolEffect } from '../harness/tool-effect.js';
 import type { TurnIdentity } from '../harness/turn-outcome.js';
 import type { TaskContinuationContext } from '../../types.js';
+import type { TurnSemanticProposalV1 } from '../semantic-boundary/turn-semantic-proposal.js';
+import type { PrimaryModelPlanningCatalogAuthorityV1 } from '../semantic-boundary/admit-and-compile-accepted-source.js';
+import type { WorkTopologyV1 } from './work-topology.js';
 
 const ADMITTED_SCOPE = 'admitted_turn_semantics_v1' as const;
 const ADMITTED_TURN_SEMANTICS: unique symbol = Symbol('admitted-turn-semantics');
@@ -87,6 +90,10 @@ export interface AdmittedClampedSemanticsV1 {
     dependsOn: readonly string[];
     evidence: readonly string[];
   }>;
+  /** Exact normalized topology accepted with the semantic payload. Capability
+   * annotations above bind its ids but do not own a second DAG. */
+  workTopology?: WorkTopologyV1;
+  workTopologyHash?: string;
   evidenceRequirements?: readonly string[];
 }
 
@@ -153,19 +160,12 @@ export type CompileDurableAcceptedTurnGraphResult =
     }
   | { ok: false; reason: string };
 
-/**
- * The sole executable-authority minting seam. The caller supplies only a
- * durable source identity and presentation constraints. Source text,
- * audience, policy, model judgment, and admitted semantics are loaded and
- * checked inside the atomic semantic boundary; no callback or seal escapes.
- */
-export async function compileDurableAcceptedTurnGraph(
+async function compilePreparedAcceptedTurnGraph(
   input: CompileDurableAcceptedTurnGraphInput,
+  prepared: Awaited<ReturnType<
+    typeof import('../semantic-boundary/admit-and-compile-accepted-source.js')['prepareDurableAcceptedTurnCompile']
+  >>,
 ): Promise<CompileDurableAcceptedTurnGraphResult> {
-  const { prepareDurableAcceptedTurnCompile } = await import(
-    '../semantic-boundary/admit-and-compile-accepted-source.js'
-  );
-  const prepared = await prepareDurableAcceptedTurnCompile(input);
   if (!prepared.ok) return prepared;
 
   if (prepared.source.sessionId !== input.identity.sessionId) {
@@ -194,15 +194,15 @@ export async function compileDurableAcceptedTurnGraph(
   });
   const { compileTurnGraph } = await import('./turn-graph-compiler.js');
   const compiled = compileTurnGraph({
-      identity: input.identity,
-      input: prepared.acceptedText,
-      sessionKind: prepared.sessionKind,
-      surface: input.surface,
-      policy: prepared.policy,
-      admitted,
-      allowedToolNames: input.allowedToolNames,
-      excludedToolNames: input.excludedToolNames,
-    });
+    identity: input.identity,
+    input: prepared.acceptedText,
+    sessionKind: prepared.sessionKind,
+    surface: input.surface,
+    policy: prepared.policy,
+    admitted,
+    allowedToolNames: input.allowedToolNames,
+    excludedToolNames: input.excludedToolNames,
+  });
   return {
     ok: true,
     compiled,
@@ -211,4 +211,42 @@ export async function compileDurableAcceptedTurnGraph(
       semanticProvenanceDigest: prepared.semanticProvenanceDigest,
     }),
   };
+}
+
+/**
+ * The sole executable-authority minting seam. The caller supplies only a
+ * durable source identity and presentation constraints. Source text,
+ * audience, policy, model judgment, and admitted semantics are loaded and
+ * checked inside the atomic semantic boundary; no callback or seal escapes.
+ */
+export async function compileDurableAcceptedTurnGraph(
+  input: CompileDurableAcceptedTurnGraphInput,
+): Promise<CompileDurableAcceptedTurnGraphResult> {
+  const { prepareDurableAcceptedTurnCompile } = await import(
+    '../semantic-boundary/admit-and-compile-accepted-source.js'
+  );
+  const prepared = await prepareDurableAcceptedTurnCompile(input);
+  return compilePreparedAcceptedTurnGraph(input, prepared);
+}
+
+/**
+ * Primary-model planning seam. The proposal is authored inside the foreground
+ * model loop, but it acquires no authority until this boundary reloads the
+ * accepted source/catalog/policy and admits it through the same opaque sealer.
+ * No semantic model port or judge is called here.
+ */
+export async function compilePrimaryModelAcceptedTurnGraph(
+  input: CompileDurableAcceptedTurnGraphInput,
+  proposal: TurnSemanticProposalV1,
+  planningCatalogAuthority: PrimaryModelPlanningCatalogAuthorityV1,
+): Promise<CompileDurableAcceptedTurnGraphResult> {
+  const { prepareDurableAcceptedTurnCompile } = await import(
+    '../semantic-boundary/admit-and-compile-accepted-source.js'
+  );
+  const prepared = await prepareDurableAcceptedTurnCompile(
+    input,
+    proposal,
+    planningCatalogAuthority,
+  );
+  return compilePreparedAcceptedTurnGraph(input, prepared);
 }

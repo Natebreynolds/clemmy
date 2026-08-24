@@ -55,9 +55,15 @@ test('exact source 50404 keeps the read, Sheet, and delivery request on an exter
   assert.equal(result.graph.classification.externalEffectRequested, true);
   assert.deepEqual(result.graph.classification.externalEffectKinds, ['communication']);
   assert.equal(result.graph.effectCeiling, 'external_write');
-  assert.equal(result.graph.nodes.some((node) => node.kind === 'retrieve'), false,
-    'the compound ask must not freeze as one deterministic read');
-  assert.ok(result.graph.nodes.some((node) => node.kind === 'execute' || node.kind === 'fanout'));
+  assert.equal(
+    result.graph.nodes.filter((node) => node.kind === 'retrieve').length,
+    1,
+    'the compound ask keeps one aggregate source-read phase',
+  );
+  assert.ok(
+    result.graph.nodes.some((node) => node.kind === 'execute' || node.kind === 'fanout'),
+    'the downstream construct cannot be erased by the leading read verb',
+  );
   assert.equal(compileDeterministicExpectedWorkProposal(result.graph), null,
     'an action must wait for its explicit nonzero operation contract');
 });
@@ -76,8 +82,8 @@ test('provider-neutral read plus artifact/delivery compounds retain action autho
     },
     {
       input: 'Find the current records and put them in a new spreadsheet.',
-      external: false,
-      ceiling: 'unknown',
+      external: true,
+      ceiling: 'external_write',
     },
     {
       input: 'Research the market and write a brief with sources.',

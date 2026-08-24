@@ -130,6 +130,7 @@ function gapKind(value: string): TerminalPresentationGapKind {
     case 'derivation_from_current_source': return 'derivation_not_verified';
     case 'commit_effect': return 'effect_not_confirmed';
     case 'verify_committed_readback': return 'readback_not_verified';
+    case 'verify_committed_content': return 'effect_not_confirmed';
     case 'verify_committed_receipt': return 'receipt_not_verified';
     case 'stale_destination_reconciled': return 'destination_not_reconciled';
     case 'execution_terminal': return 'execution_not_closed';

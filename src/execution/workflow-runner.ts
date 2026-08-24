@@ -37,6 +37,11 @@ import {
 } from '../runtime/harness/accepted-source-settlement-audit.js';
 import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
 import {
+  loadPriorSuccessfulStepOutputs,
+  resolveCertifiedStepOutput,
+  workflowStepPinIntent,
+} from '../memory/workflow-certified-binding.js';
+import {
   evaluateLearningCandidate,
   recordLearningDecision,
 } from '../memory/learning-receipt.js';
@@ -119,6 +124,10 @@ import {
   runConversationFromResume,
   type RunConversationResult,
 } from '../runtime/harness/loop.js';
+import {
+  runConversationDisposition,
+  type RunConversationHold,
+} from '../runtime/harness/run-conversation-disposition.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { normalizeRouteDiagnostics, routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
@@ -228,6 +237,28 @@ import {
   type WorkflowTerminalOutcome,
 } from './workflow-terminal-outcome.js';
 import {
+  finalizeCanonicalEntityWorkflowCompletion,
+  type FinalizeCanonicalEntityWorkflowCompletionResultV1,
+} from '../spaces/canonical-entity-workflow-finalizer.js';
+import { parseWorkflowNodeInvocationPlan } from '../memory/workflow-node-invocation-plan.js';
+import { executeWorkflowNodeRead } from './workflow-node-invocation-executor.js';
+import {
+  produceCanonicalEntityWorkflowLineage,
+  type CanonicalEntityWorkflowResultRootV1,
+} from './canonical-entity-workflow-lineage-producer.js';
+import { canonicalEntityJson } from './canonical-entity-resolution.js';
+import {
+  resolveWorkflowReadPilotAdmission,
+  workflowReadPilotTriggerReceiptId,
+  type WorkflowReadPilotAdmissionV1,
+} from './workflow-read-pilot-admission.js';
+import {
+  resolveWorkflowRecurringReadAdmission,
+  workflowRecurringReadInputsDigest,
+  type WorkflowRecurringReadAdmissionV1,
+} from './workflow-recurring-read-admission.js';
+import { resolveCurrentAutomationRecurrenceAuthoritySnapshot } from './automation-recurrence-live-authority.js';
+import {
   settleCompiledProjectRootFromRun,
   stampCompiledProjectRootSettlement,
 } from './project-root-lifecycle.js';
@@ -235,18 +266,26 @@ import {
   isCatalogWorkflowRunDefinitionSnapshot,
   isCompiledWorkflowRunDefinitionSnapshot,
   resolveWorkflowRunDefinitionSnapshot,
+  workflowDefinitionHash,
   workflowCodeRevisionMatchesSnapshot,
   workflowDefinitionMatchesSnapshotIgnoringEnabled,
   type AnyWorkflowRunDefinitionSnapshot,
+  type WorkflowRunDefinitionSnapshot,
 } from './workflow-run-definition.js';
+import { workflowIntervalRevisionIdentityFromRun } from './workflow-interval-run-identity.js';
 import { ExecutionStore } from './store.js';
 import {
   readWorkflowRunRecord,
   readWorkflowRunRecordSnapshot,
   readWorkflowRunRecordUnlocked,
+  scanWorkflowRunRecordSnapshot,
   withWorkflowRunRecordLock,
   writeWorkflowRunRecordDurablyUnlocked,
 } from './workflow-run-record.js';
+import {
+  reconcileCorruptWorkflowRunRecord,
+  reconcileCorruptWorkflowRunRecords,
+} from './workflow-run-corruption.js';
 import type { WorkflowAwaitingInputState } from './workflow-awaiting-input.js';
 import { reconcileAwaitingInputWorkflowRunProjections } from './workflow-awaiting-input-projection.js';
 import {
@@ -794,6 +833,25 @@ export interface QueuedRunRecord {
    * the user can see what it does in isolation.
    */
   targetStepId?: string;
+  /** Host-dispatched unique catalog match. One-shot; does not enable cron. */
+  acceptDisabled?: boolean;
+  /** Exact disabled one-node read pilot lineage, bound to this run id and immutable
+   * definition snapshot before queue admission. Presence alone grants nothing;
+   * resolution rechecks the canonical approval row before execution. */
+  workflowReadPilotAdmission?: unknown;
+  /** Exact standing-consent occurrence lineage. Presence alone grants nothing;
+   * definition, activation receipt, and current live authority are re-resolved. */
+  workflowRecurringReadAdmission?: unknown;
+  /**
+   * Runner-owned pointer to an exact durable canonical-entity lineage receipt.
+   * It grants no authority by presence and is never reconstructed from step
+   * output. The terminal finalizer revalidates its digest, run/workflow/Space
+   * identity, current binding revision, and clean completion receipt.
+   */
+  canonicalEntityWorkspaceProjectionClaim?: unknown;
+  /** Exact closed read-authority root captured before step completion. This is
+   * the restart bridge to the producer; it contains no provider/result body. */
+  canonicalEntityWorkflowResultRoot?: CanonicalEntityWorkflowResultRootV1;
   /**
    * Self-heal: a run can "complete" with steps that cleanly blocked. These
    * mark it as needing attention and link the proposed fix (if diagnosed).
@@ -878,6 +936,10 @@ export interface QueuedRunRecord {
   mutationBlock?: WorkflowMutationAmbiguityBlockState;
   /** Exact conversational dependency owned by one workflow step. */
   awaitingInput?: WorkflowAwaitingInputState;
+  /** A losing consumer observed the exact source still owned by a peer or the
+   * restart reconciler. The run remains `running`; this marker is diagnostic
+   * ownership truth, never permission to retry or publish completion. */
+  heldExecution?: WorkflowHeldExecutionState;
   /**
    * Report-back backstop (north star: REPORTS BACK WITHOUT FAIL). Set
    * once the terminal (completed/error) user notification has been
@@ -982,10 +1044,50 @@ function readRunRecord(filePath: string): QueuedRunRecord | null {
   catch { return null; }
 }
 
+type CanonicalEntityResultRootPersistence =
+  | 'persisted'
+  | 'replayed'
+  | 'run_unavailable'
+  | 'root_conflict';
+
+/**
+ * Bridge a closed read authority to terminal-time canonical ingestion without
+ * retaining its result body in the run record. The root is written before the
+ * step-completed event, so a restart that skips the already-completed step can
+ * still redeem the exact immutable result handles. Same-byte replay is a no-op;
+ * no later attempt may replace the first root for this run.
+ */
+function persistCanonicalEntityWorkflowResultRoot(
+  runId: string,
+  root: CanonicalEntityWorkflowResultRootV1,
+): CanonicalEntityResultRootPersistence {
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  return withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    if (!current || isTerminalRunRecord(current) || current.id !== runId) return 'run_unavailable';
+    if (current.canonicalEntityWorkflowResultRoot) {
+      return canonicalEntityJson(current.canonicalEntityWorkflowResultRoot) === canonicalEntityJson(root)
+        ? 'replayed'
+        : 'root_conflict';
+    }
+    writeWorkflowRunRecordDurablyUnlocked(filePath, {
+      ...current,
+      canonicalEntityWorkflowResultRoot: root,
+    });
+    return 'persisted';
+  });
+}
+
 /** Broad timer/boot scans retry on their next tick instead of synchronously
  * starving every channel behind a contended or ambiguous record lock. */
 function readRunRecordForScan(filePath: string): QueuedRunRecord | null {
-  return readWorkflowRunRecordSnapshot<QueuedRunRecord>(filePath);
+  const scan = scanWorkflowRunRecordSnapshot<QueuedRunRecord>(filePath);
+  if (scan.status === 'ok') return scan.record;
+  if (scan.status === 'corrupt') {
+    try { reconcileCorruptWorkflowRunRecord(filePath, scan.evidence); }
+    catch { /* the next boot/tick retries durable quarantine + presentation */ }
+  }
+  return null;
 }
 
 /** A run fired by the TIME-BASED scheduler (no human present to approve). The
@@ -1149,7 +1251,7 @@ function exactScheduledSendCommittedReplayStepIds(
   return eligible;
 }
 
-const TERMINAL_RUN_RECORD_STATUSES = new Set(['completed', 'completed_with_errors', 'error', 'failed', 'cancelled']);
+const TERMINAL_RUN_RECORD_STATUSES = new Set(['completed', 'completed_with_errors', 'blocked', 'error', 'failed', 'cancelled']);
 
 function isTerminalRunRecord(record: Pick<QueuedRunRecord, 'status' | 'finishedAt'>): boolean {
   return TERMINAL_RUN_RECORD_STATUSES.has(record.status ?? '')
@@ -1169,6 +1271,7 @@ function waitAfterTerminalPublishForTest(): void {
 
 function terminalReportMatchesStatus(record: QueuedRunRecord, report: TerminalReportInput): boolean {
   if (record.status === 'cancelled') return report.outcome === 'failed';
+  if (record.status === 'blocked') return report.outcome === 'blocked';
   if (record.status === 'error' || record.status === 'failed') return report.outcome !== 'done';
   if (
     record.status === 'completed'
@@ -1312,6 +1415,68 @@ function bestEffortSettleCompiledProjectRoot(filePath: string, record: QueuedRun
   }
 }
 
+function finalizeCanonicalEntityWorkspaceProjection(
+  record: QueuedRunRecord,
+  finalize: typeof finalizeCanonicalEntityWorkflowCompletion = finalizeCanonicalEntityWorkflowCompletion,
+): FinalizeCanonicalEntityWorkflowCompletionResultV1 {
+  return finalize({
+    version: 1,
+    runId: record.id,
+    workflowId: typeof record.workflowSlug === 'string' ? record.workflowSlug : record.workflow,
+    status: record.status,
+    terminalOutcome: record.terminalOutcome,
+    finishedAt: record.finishedAt,
+    needsAttention: record.needsAttention,
+    ...(Object.hasOwn(record, 'canonicalEntityWorkspaceProjectionClaim')
+      ? { claim: record.canonicalEntityWorkspaceProjectionClaim }
+      : {}),
+  });
+}
+
+/**
+ * Complete the reference-only Space projection after the workflow terminal
+ * record is durable. Failure never changes or disguises workflow truth: boot
+ * reconciliation can retry the same exact lineage claim, and the canonical
+ * projector's CAS turns a post-commit crash into an idempotent replay.
+ */
+function bestEffortFinalizeCanonicalEntityWorkspaceProjection(record: QueuedRunRecord): void {
+  try {
+    const result = finalizeCanonicalEntityWorkspaceProjection(record);
+    if (result.status === 'projected' || result.status === 'replayed') {
+      logger.info(
+        {
+          runId: result.runId,
+          workflowId: result.workflowId,
+          bindingId: result.bindingId,
+          projectionStatus: result.status,
+          coverage: result.coverage.status,
+        },
+        'Canonical entity Workspace projection finalized from exact workflow lineage',
+      );
+      return;
+    }
+    if (result.status === 'blocked' && (
+      Object.hasOwn(record, 'canonicalEntityWorkspaceProjectionClaim')
+      || result.code === 'canonical_entity_lineage_unrepresented'
+    )) {
+      logger.warn(
+        {
+          runId: result.runId,
+          workflowId: result.workflowId,
+          bindingId: result.bindingId,
+          reason: result.code,
+        },
+        'Workflow terminal truth is durable but canonical entity Workspace projection remains fail-closed',
+      );
+    }
+  } catch (error) {
+    logger.warn(
+      { runId: record.id, error: error instanceof Error ? error.message : String(error) },
+      'Workflow terminal truth is durable but canonical entity Workspace projection finalization failed closed',
+    );
+  }
+}
+
 function writeRunRecord(
   filePath: string,
   record: QueuedRunRecord,
@@ -1367,6 +1532,9 @@ function writeRunRecord(
     // never expose that stale question as the run's current dependency.
     if (nextRecord.status !== 'running' && nextRecord.status !== 'awaiting_input') {
       delete nextRecord.awaitingInput;
+    }
+    if (isTerminalRunRecord(nextRecord) || nextRecord.status !== 'running') {
+      delete nextRecord.heldExecution;
     }
     // Capability retry authority is a monotonic per-retry checkpoint. A
     // terminal projection is commonly assembled from the run snapshot that
@@ -1481,8 +1649,30 @@ function writeRunRecord(
   });
   if (isTerminalRunRecord(written.record)) {
     bestEffortSettleCompiledProjectRoot(filePath, written.record);
+    if (written.publishedTerminal) {
+      bestEffortFinalizeCanonicalEntityWorkspaceProjection(written.record);
+    }
   }
   return written;
+}
+
+/** Merge only the nonterminal ownership observation. A losing consumer must
+ * never replay its stale run snapshot over progress written by the peer. */
+function persistWorkflowHarnessHold(
+  filePath: string,
+  state: WorkflowHeldExecutionState,
+): QueuedRunRecord | null {
+  return withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    if (!current || isTerminalRunRecord(current) || current.status === 'cancelled') return current;
+    const held: QueuedRunRecord = {
+      ...current,
+      status: 'running',
+      heldExecution: state,
+    };
+    writeWorkflowRunRecordDurablyUnlocked(filePath, held);
+    return held;
+  });
 }
 
 /** Crash-injection seam proving terminal projection + exact report envelope are
@@ -1575,6 +1765,41 @@ export class WorkflowAwaitingInputSignal extends Error {
     super(state.question);
     this.name = 'WorkflowAwaitingInputSignal';
     this.state = state;
+  }
+}
+
+export interface WorkflowHeldExecutionState {
+  stepId: string;
+  sessionId: string;
+  observedAt: string;
+  sourceStatus: 'held' | 'dispatched';
+  hold: RunConversationHold;
+  recoveredContract: boolean;
+}
+
+/** Typed nonterminal unwind for a duplicate/async workflow-step consumer. */
+export class WorkflowHarnessHeldSignal extends Error {
+  readonly state: WorkflowHeldExecutionState;
+
+  constructor(state: WorkflowHeldExecutionState) {
+    super(`Workflow step "${state.stepId}" remains ${state.hold.wake}-owned (${state.hold.reason}).`);
+    this.name = 'WorkflowHarnessHeldSignal';
+    this.state = state;
+  }
+}
+
+/** A harness refusal is an explained blocked terminal, not a runtime crash. */
+export class WorkflowHarnessBlockedSignal extends Error {
+  readonly stepId: string;
+  readonly sessionId: string;
+  readonly reason: string;
+
+  constructor(input: { stepId: string; sessionId: string; reason: string }) {
+    super(input.reason);
+    this.name = 'WorkflowHarnessBlockedSignal';
+    this.stepId = input.stepId;
+    this.sessionId = input.sessionId;
+    this.reason = input.reason;
   }
 }
 
@@ -2901,6 +3126,11 @@ interface StepExecutionContext {
   admittedCodeRevision?: string;
   /** Answer captured while this exact run was parked on a step question. */
   awaitingInput?: WorkflowAwaitingInputState;
+  /** Canonically resolved one-shot read-pilot authority for this exact run.
+   * Ordinary workflow contexts leave this absent, so invocationPlan remains a
+   * hard blocker rather than becoming a new prompt/name-based route. */
+  workflowReadPilotAdmission?: WorkflowReadPilotAdmissionV1;
+  workflowRecurringReadAdmission?: WorkflowRecurringReadAdmissionV1;
   /** Probe-based loopUntil attempts validate their external exit condition
    * before publishing completion. The plain-step finalizer captures the exact
    * output/meta here; the loop publishes it only after the probe passes. */
@@ -3417,7 +3647,7 @@ function workflowHarnessRoute(step: WorkflowStepInput, stepModel: string | undef
     requestedModel: step.model ?? stepModel,
     effectiveModel,
     provider: resolveEffectiveProviderForModel(effectiveModel),
-    transport: 'openai_agents_harness',
+    transport: 'host_harness',
   };
 }
 
@@ -3531,6 +3761,7 @@ export const workflowRunnerInternalsForTest = {
   formatStepOutputs,
   renderStepContextBlock,
   renderWorkflowOriginLineageBlock,
+  renderWorkflowToolPin,
   hasCompletedUpstreamMutation: (steps: WorkflowStepInput[], blockedStepId: string, completedStepIds: Set<string>) =>
     hasCompletedUpstreamMutation(steps, blockedStepId, completedStepIds),
   hasUngatedIrreversibleAction,
@@ -3556,6 +3787,7 @@ export const workflowRunnerInternalsForTest = {
   renderStepContextForInvocation,
   authenticatedWorkflowExecutionRole,
   uniqueCompiledProjectTerminalSink,
+  persistWorkflowHarnessHold,
 };
 
 interface InvocationArtifactReference {
@@ -3763,7 +3995,10 @@ async function runStepViaHarness(
     // rendered from the same object the reduce gate verifies — the authored
     // prose can no longer drift from what the gate demands.
     const contractSpec = activeOutputContract ? `\n\n${renderOutputContractSpec(activeOutputContract)}` : '';
-    // Fold 3: the step's learned tool pin (if healthy) rides in with the contract.
+    // A learned pin is advisory memory only. Looking it up/rendering it cannot
+    // open provider, logical-call, physical-dispatch, settlement, or lease
+    // authority; the ordinary harness invocation below remains the sole owner
+    // of any eventual call.
     const pinSpec = !isItemInvocation ? renderWorkflowToolPin(workflowName, step.id) : '';
     const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}${pinSpec}`;
     // Typed-contract delivery (P1): when the step declared inputs and the
@@ -4129,7 +4364,11 @@ async function runStepViaHarness(
       // approve. Mirror the same channel-side logic from
       // tryHandleHarnessApprovalReply.
       const resolved = approvalRegistry.listPending({ sessionId: realSessionId, status: 'any' });
-      const anyRejected = resolved.some((r) => r.resolution === 'rejected' || r.resolution === 'cancelled_by_user');
+      const anyRejected = resolved.some((r) => (
+        r.resolution === 'rejected'
+        || r.resolution === 'cancelled_by_user'
+        || r.resolution === 'cancelled_by_system'
+      ));
       const anyExpired = resolved.some((r) => r.resolution === 'expired');
       const decision: 'approve' | 'reject' = (anyRejected || anyExpired) ? 'reject' : 'approve';
 
@@ -4146,12 +4385,52 @@ async function runStepViaHarness(
       clearWorkflowRunPausedForApproval(workflowRunId);
     }
 
-    // `killed` has one meaning on this child: a user/control-plane stop. Never
-    // let a previously captured partial result turn that stop into permission
-    // for downstream workflow steps to continue.
-    if (result.status === 'killed') {
-      stepAttemptStatus = 'cancelled';
-      throw new WorkflowRunCancelledError();
+    const disposition = runConversationDisposition(result);
+    switch (disposition.kind) {
+      case 'held':
+        throw new WorkflowHarnessHeldSignal({
+          stepId: step.id,
+          sessionId: realSessionId,
+          observedAt: new Date().toISOString(),
+          sourceStatus: 'held',
+          hold: disposition.hold,
+          recoveredContract: disposition.recoveredContract,
+        });
+      case 'dispatched':
+        // An async dispatch receipt is not the workflow step's deliverable.
+        // Recovery owns the exact source until it publishes a durable terminal.
+        throw new WorkflowHarnessHeldSignal({
+          stepId: step.id,
+          sessionId: realSessionId,
+          observedAt: new Date().toISOString(),
+          sourceStatus: 'dispatched',
+          hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+          recoveredContract: false,
+        });
+      case 'blocked':
+        throw new WorkflowHarnessBlockedSignal({
+          stepId: step.id,
+          sessionId: realSessionId,
+          reason: result.error?.trim()
+            || result.lastDecision?.reply?.trim()
+            || result.lastDecision?.summary?.trim()
+            || `Workflow step "${step.id}" was blocked by the execution harness.`,
+        });
+      case 'killed':
+        // A user/control-plane stop can never consume a previously captured
+        // partial as permission for downstream workflow steps to continue.
+        stepAttemptStatus = 'cancelled';
+        throw new WorkflowRunCancelledError();
+      case 'awaiting_approval':
+        // The loop above owns every approval continuation. Reaching this branch
+        // means its invariant was broken, so fail closed instead of consuming a
+        // process-local result.
+        throw new Error(`workflow step "${step.id}" left the approval loop while still awaiting approval`);
+      case 'completed':
+      case 'awaiting_user_input':
+      case 'limit_exceeded':
+      case 'failed':
+        break;
     }
 
     // Pull the user-visible output from the most recent
@@ -4289,6 +4568,7 @@ async function runStepViaHarness(
       err instanceof ParkRunSignal
       || err instanceof WorkflowAwaitingInputSignal
       || err instanceof WorkflowCapabilityBlockedError
+      || err instanceof WorkflowHarnessHeldSignal
     ) {
       stepAttemptStatus = 'interrupted';
     } else if (
@@ -4763,12 +5043,9 @@ function workflowBrainFalloverEnabled(): boolean {
  *  zero new storage. A successful step's last proven composio call is
  *  remembered with provenance; future runs get it INJECTED into the step
  *  prompt ("try this first"), like auto-brief's author-time pinning without
- *  the hand-authoring. Never mutates the user's SKILL.md. */
-function workflowStepPinIntent(workflowName: string, stepId: string): string {
-  return `workflow:${workflowName}:${stepId}`;
-}
-
-/** Render the learned pin for prompt injection, or '' when none/unhealthy. */
+ *  the hand-authoring. Never mutates the user's SKILL.md. This is a discovery
+ *  and tool-choice hint only: memory never dispatches or supplies an
+ *  authoritative result. */
 function renderWorkflowToolPin(workflowName: string, stepId: string): string {
   try {
     // EXACT lookup only (review: the fuzzy fallback matched unrelated generic
@@ -5638,10 +5915,245 @@ export function tightenWorkflowContractsFromCleanRun(
   return applicable.map((t) => t.stepId);
 }
 
+async function executeAdmittedWorkflowRead(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+  admission: WorkflowReadPilotAdmissionV1 | WorkflowRecurringReadAdmissionV1,
+): Promise<unknown> {
+  const definitionHash = workflowDefinitionHash(ctx.workflow);
+  const snapshot: WorkflowRunDefinitionSnapshot = {
+    version: 1,
+    workflowSlug: ctx.workflowSlug,
+    definitionHash,
+    admittedAt: '1970-01-01T00:00:00.000Z',
+    definition: ctx.workflow,
+  };
+  const oneShot = 'oneShotActivationAuthorization' in admission;
+  const resolved = oneShot
+    ? resolveWorkflowReadPilotAdmission({
+        value: admission,
+        runId: ctx.runId,
+        snapshot,
+        approval: approvalRegistry.get(
+          admission.oneShotActivationAuthorization.approvalId,
+        ),
+        // A restart after v51 atomically consumed the grant must be allowed to
+        // reach v51's exact existing activation and redeem its durable result.
+        // A grant consumed by any foreign activation still conflicts in v51 and
+        // cannot cross a second time.
+        allowConsumedApproval: true,
+      })
+    : (() => {
+        const live = resolveCurrentAutomationRecurrenceAuthoritySnapshot(
+          admission.activationAuthority.activationId,
+        );
+        return live.ok
+          ? resolveWorkflowRecurringReadAdmission({
+              value: admission,
+              runId: ctx.runId,
+              snapshot,
+              currentAuthoritySnapshot: live.snapshot,
+            })
+          : { ok: false as const, reason: live.reason };
+      })();
+  if (!resolved.ok || resolved.admission.nodeId !== step.id) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: admission.workflowSessionId,
+      reason: `workflow_activation_lineage_invalid: ${resolved.ok
+        ? 'the admitted pilot names a different workflow node'
+        : resolved.reason}`,
+    });
+  }
+  const workflowSession = getHarnessSession(resolved.admission.workflowSessionId);
+  if (!workflowSession || workflowSession.kind !== 'workflow') {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: resolved.admission.workflowSessionId,
+      reason: 'workflow_activation_session_invalid: the exact workflow authority session is missing or has a foreign kind.',
+    });
+  }
+
+  throwIfWorkflowRunCancelled(ctx.runId);
+  const parsedPlan = parseWorkflowNodeInvocationPlan(step.invocationPlan);
+  const executionMode = parsedPlan.ok && parsedPlan.plan.continuation.kind === 'cursor'
+    ? 'manifest_bound_paginated_read'
+    : 'manifest_bound_read';
+  appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+    kind: 'step_started',
+    stepId: step.id,
+    meta: {
+      mode: executionMode,
+      invocationPlanDigest: resolved.admission.invocationPlanDigest,
+      runOccurrenceId: resolved.admission.runOccurrenceId,
+      nodeAttempt: resolved.admission.nodeAttempt,
+    },
+  });
+  const result = await executeWorkflowNodeRead({
+    plan: step.invocationPlan,
+    identity: {
+      workflowId: resolved.admission.workflowId,
+      workflowRevision: resolved.admission.workflowRevision,
+      workflowDigest: resolved.admission.workflowDigest,
+      runId: resolved.admission.runId,
+      runOccurrenceId: resolved.admission.runOccurrenceId,
+      nodeId: resolved.admission.nodeId,
+      nodeAttempt: resolved.admission.nodeAttempt,
+      invocationPlanDigest: resolved.admission.invocationPlanDigest,
+      bindingSnapshotDigest: resolved.admission.bindingSnapshotDigest,
+      controlDigest: resolved.admission.controlDigest,
+    },
+    arguments: {
+      workflowInputs: ctx.inputs,
+      stepOutputs: ctx.stepOutputs,
+    },
+    sessionId: resolved.admission.workflowSessionId,
+    ...('oneShotActivationAuthorization' in resolved.admission
+      ? { oneShotActivationAuthorization: resolved.admission.oneShotActivationAuthorization }
+      : {}),
+  });
+  if (!result.ok) {
+    if (result.block.message === 'prior_crossing_unknown_no_redispatch') {
+      throw new WorkflowHarnessHeldSignal({
+        stepId: step.id,
+        sessionId: resolved.admission.workflowSessionId,
+        observedAt: new Date().toISOString(),
+        sourceStatus: 'held',
+        hold: { owner: 'host', wake: 'peer', reason: 'peer_in_progress' },
+        recoveredContract: false,
+      });
+    }
+    if ('aggregate' in result && result.aggregate) {
+      const aggregate = result.aggregate;
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_blocked',
+        stepId: step.id,
+        error: `${result.block.code}: ${result.block.message}`,
+        meta: {
+          reason: result.block.code,
+          mode: 'manifest_bound_paginated_read',
+          collectionStatus: result.status,
+          ...('activationId' in result ? { activationId: result.activationId } : {}),
+          aggregateReceiptId: aggregate.aggregateReceiptId,
+          aggregateReceiptDigest: aggregate.aggregateReceiptDigest,
+          coverageState: aggregate.coverageState,
+          outcome: aggregate.outcome,
+          pageCount: aggregate.pageCount,
+          finalExhaustedTruth: aggregate.finalExhaustedTruth,
+        },
+      });
+    }
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: resolved.admission.workflowSessionId,
+      reason: `${result.block.code}: ${result.block.message}`,
+    });
+  }
+  throwIfWorkflowRunCancelled(ctx.runId);
+  if (parsedPlan.ok && parsedPlan.plan.resultProjection) {
+    const resultRoot: CanonicalEntityWorkflowResultRootV1 = {
+      version: 1,
+      executionKind: result.executionKind,
+      activationId: result.activationId,
+      lineage: {
+        workflowId: resolved.admission.workflowId,
+        workflowRevision: resolved.admission.workflowRevision,
+        workflowDigest: resolved.admission.workflowDigest,
+        runId: resolved.admission.runId,
+        runOccurrenceId: resolved.admission.runOccurrenceId,
+        nodeId: resolved.admission.nodeId,
+        nodeAttempt: resolved.admission.nodeAttempt,
+        invocationPlanDigest: resolved.admission.invocationPlanDigest,
+        bindingSnapshotDigest: resolved.admission.bindingSnapshotDigest,
+        controlDigest: resolved.admission.controlDigest,
+      },
+      ...(resolved.admission.workspaceBinding
+        ? { workspaceBinding: structuredClone(resolved.admission.workspaceBinding) }
+        : {}),
+    };
+    const persisted = persistCanonicalEntityWorkflowResultRoot(ctx.runId, resultRoot);
+    if (persisted !== 'persisted' && persisted !== 'replayed') {
+      throw new WorkflowHarnessBlockedSignal({
+        stepId: step.id,
+        sessionId: resolved.admission.workflowSessionId,
+        reason: `canonical_entity_result_root_${persisted}: the exact closed read authority could not be retained before step completion`,
+      });
+    }
+  }
+  if (result.executionKind === 'paginated_read') {
+    return finalizeOrDeferStepOutput(ctx, step, result.aggregate, {
+      mode: 'manifest_bound_paginated_read',
+      callStatus: result.status,
+      activationId: result.activationId,
+      authorityRootId: result.authorityRootId,
+      aggregateReceiptId: result.aggregate.aggregateReceiptId,
+      aggregateReceiptDigest: result.aggregate.aggregateReceiptDigest,
+      coverageState: result.aggregate.coverageState,
+      outcome: result.aggregate.outcome,
+      pageCount: result.aggregate.pageCount,
+      finalExhaustedTruth: result.aggregate.finalExhaustedTruth,
+      pageResultHandleIds: [...result.aggregate.pageResultHandleIds],
+    });
+  }
+  if (parsedPlan.ok && parsedPlan.plan.resultProjection) {
+    return finalizeOrDeferStepOutput(ctx, step, {
+      version: 1,
+      kind: 'retained_canonical_entity_read',
+      activationId: result.activationId,
+      authorityRootId: result.authorityRootId,
+      logicalCallId: result.logicalCallId,
+      ...(result.resultHandleId ? { resultHandleId: result.resultHandleId } : {}),
+    }, {
+      mode: 'manifest_bound_read',
+      callStatus: result.status,
+      activationId: result.activationId,
+      authorityRootId: result.authorityRootId,
+      logicalCallId: result.logicalCallId,
+      ...(result.physicalDispatchId ? { physicalDispatchId: result.physicalDispatchId } : {}),
+      ...(result.resultHandleId ? { resultHandleId: result.resultHandleId } : {}),
+      canonicalEntityResultBody: 'retained_out_of_band',
+    });
+  }
+  return finalizeOrDeferStepOutput(ctx, step, result.result, {
+    mode: 'manifest_bound_read',
+    callStatus: result.status,
+    activationId: result.activationId,
+    authorityRootId: result.authorityRootId,
+    logicalCallId: result.logicalCallId,
+    ...(result.physicalDispatchId ? { physicalDispatchId: result.physicalDispatchId } : {}),
+    ...(result.resultHandleId ? { resultHandleId: result.resultHandleId } : {}),
+  });
+}
+
 export async function executeStep(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {
+  if (step.invocationPlan) {
+    if (ctx.workflowReadPilotAdmission && ctx.workflowRecurringReadAdmission) {
+      throw new WorkflowHarnessBlockedSignal({
+        stepId: step.id,
+        sessionId: `workflow:${ctx.runId}:${step.id}`,
+        reason: 'workflow_activation_lineage_ambiguous: one run cannot carry both one-shot pilot and standing recurrence authority.',
+      });
+    }
+    const readAdmission = ctx.workflowReadPilotAdmission ?? ctx.workflowRecurringReadAdmission;
+    if (readAdmission) {
+      return executeAdmittedWorkflowRead(
+        step,
+        ctx,
+        readAdmission,
+      );
+    }
+    // A persisted exact plan is not a prompt hint. Ordinary workflow contexts
+    // have no admitted workflow revision, binding/control digests, occurrence,
+    // node attempt, or one-shot pilot grant, so they remain fail-closed.
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: `workflow:${ctx.runId}:${step.id}`,
+      reason: 'workflow_activation_lineage_unrepresented: this run did not admit the exact workflow revision, occurrence, node attempt, binding/control digests, and pilot grant required by a shared workflow read root.',
+    });
+  }
   // 0. Opt-in approval gate (autonomous-by-default model). When a step
   //    declares requiresApproval, the RUNNER surfaces ONE batch approval
   //    and holds the run here until the user resolves it — then the rest
@@ -6177,6 +6689,34 @@ export async function executeStep(
     kind: 'step_started',
     stepId: step.id,
   });
+  const certified = resolveCertifiedStepOutput({
+    sideEffectClass: stepSideEffectClass(step),
+    outputContract: step.output,
+    forEach: step.forEach,
+    deterministic: Boolean(step.deterministic),
+    hasCallNode: Boolean(step.call?.tool),
+    priorSuccessfulOutputs: loadPriorSuccessfulStepOutputs({
+      workflowSlug: ctx.workflowSlug,
+      workflowName: ctx.workflow.name,
+      stepId: step.id,
+      currentRunId: ctx.runId,
+    }),
+  });
+  if (certified) {
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_advisory',
+      stepId: step.id,
+      meta: {
+        reason: 'certified_prior_output',
+        sourceCount: certified.sourceCount,
+        identityKeys: Object.keys(certified.identity),
+      },
+    });
+    return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, certified.output, {
+      mode: 'certified_prior_output',
+      sourceCount: certified.sourceCount,
+    });
+  }
   const prompt = applyWatcherSteerToPrompt(
     ctx,
     applyGoalFeedbackToPrompt(
@@ -6218,10 +6758,26 @@ export async function executeStep(
       // failure means 'parked', not 'crashed'"). Tag WHY so the UI can render
       // it as "waiting for your approval" instead of a red FAILED row.
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-        kind: 'step_failed',
+        kind: err instanceof WorkflowHarnessHeldSignal
+          ? 'step_paused'
+          : err instanceof WorkflowHarnessBlockedSignal
+            ? 'step_blocked'
+            : 'step_failed',
         stepId: step.id,
         error: err instanceof Error ? err.message : String(err),
-        ...(err instanceof ParkRunSignal
+        ...(err instanceof WorkflowHarnessHeldSignal
+          ? {
+            meta: {
+              reason: 'exact_source_held',
+              owner: err.state.hold.owner,
+              wake: err.state.hold.wake,
+              holdReason: err.state.hold.reason,
+              sourceStatus: err.state.sourceStatus,
+            },
+          }
+          : err instanceof WorkflowHarnessBlockedSignal
+            ? { meta: { reason: 'harness_blocked', sessionId: err.sessionId } }
+          : err instanceof ParkRunSignal
           ? { meta: { reason: 'parked_on_approval' } }
           : err instanceof WorkflowAwaitingInputSignal
             ? { meta: { reason: 'parked_on_input', questionId: err.state.questionId } }
@@ -6981,21 +7537,27 @@ export function settlementGuardedStepOutput(input: {
       tool.length > 0
       && !PHANTOM_GUARD_INERT_TOOLS.has(tool)
       && actionTopologyRoleForRuntimeCall(tool, {}) !== 'control');
+  const sideEffect = stepSideEffectClass(input.step);
+  const declaredContract = input.step.output;
+  const outputSatisfiesDeclaredContract = Boolean(
+    declaredContract
+    && verifyStepOutput(declaredContract, input.output).ok,
+  );
   const audit = auditAcceptedSourceSettlementTruth({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
     // A write/send step necessarily owes business evidence. A read/synthesis
     // step owes it once the runtime observed a real tool invocation; SDK
     // summaries alone never satisfy the audit.
-    requiresBusinessEvidence: stepSideEffectClass(input.step) !== 'read' || businessTools.length > 0,
+    requiresBusinessEvidence: sideEffect !== 'read' || businessTools.length > 0,
     // A model-driven workflow step is a declared unit, not exploratory chat.
-    // If it issued multiple business reads, every one must settle successfully
-    // before its aggregate output can feed a downstream write/send. This stays
-    // strict even when the step also performs a local write (for example, a
-    // morning baseline): that local persistence does not make failed source
-    // reads optional. Deterministic and structured-call steps do not enter this
-    // model-output guard and retain their existing execution semantics.
-    requireEveryBusinessReadToSettle: true,
+    // Write/send steps, and reads with no verifying contract, still require
+    // every business read to settle — one successful sibling must not launder
+    // a failed required query. A read whose submitted output already satisfies
+    // its declared contract has the evidence the graph asked for; later
+    // successful business work may recover a differently-shaped first read
+    // the same way default chat audit already does.
+    requireEveryBusinessReadToSettle: sideEffect !== 'read' || !outputSatisfiesDeclaredContract,
   });
   if (audit.status === 'clean') return input.output;
   return {
@@ -7203,6 +7765,21 @@ function workflowStepHasPhysicalDispatch(runId: string, stepId: string): boolean
 
 export function stepSendAlreadyFired(runId: string, stepId: string): boolean {
   return stepExternalWriteAlreadyClaimed(runId, stepId);
+}
+
+/** A send that already crossed cannot be reported as a failed/blocked step
+ *  just because the model then rejected Slack's normalized echo. The
+ *  external_write receipt is completion authority. */
+export function omitBlocksForAlreadyFiredSends(
+  blocked: BlockedStep[],
+  steps: WorkflowStepInput[],
+  runId: string,
+): BlockedStep[] {
+  return blocked.filter((block) => {
+    const step = steps.find((candidate) => candidate.id === block.stepId);
+    if (!step || stepSideEffectClass(step) !== 'send') return true;
+    return !stepSendAlreadyFired(runId, block.stepId);
+  });
 }
 
 function downstreamOfStep(steps: WorkflowStepInput[], rootStepId: string): Set<string> {
@@ -7591,6 +8168,9 @@ function graphAddedNodeSafetyErrors(node: WorkflowGraphNode): string[] {
   if (node.deterministic) {
     errors.push(`Graph-added node "${node.id}" requests script execution, which is outside the release-v3 graph contract.`);
   }
+  if (node.invocationPlan) {
+    errors.push(`Graph-added node "${node.id}" requests invocation authority; only an authored, snapshotted plan may carry it.`);
+  }
   if (node.forEach) {
     errors.push(`Graph-added node "${node.id}" requests fan-out, which is outside the release-v3 graph contract.`);
   }
@@ -7956,6 +8536,8 @@ async function executeWorkflow(
   capabilityResume?: WorkflowCapabilityBlockState,
   admittedCodeRevision?: string,
   awaitingInput?: WorkflowAwaitingInputState,
+  workflowReadPilotAdmission?: WorkflowReadPilotAdmissionV1,
+  workflowRecurringReadAdmission?: WorkflowRecurringReadAdmissionV1,
 ): Promise<{
   finalOutput: string;
   publicTerminalStepId: string | null;
@@ -8206,7 +8788,7 @@ async function executeWorkflow(
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
       const output = await executeStepVerified(step, {
-        workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision, awaitingInput,
+        workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision, awaitingInput, workflowReadPilotAdmission, workflowRecurringReadAdmission,
       });
       throwIfWorkflowRunCancelled(runId);
       stepOutputs[step.id] = output;
@@ -8415,7 +8997,7 @@ async function executeWorkflow(
                 ? (epoch.steerWave = context.wave, epoch.steer)
                 : undefined;
               const output = await executeStepVerified(step, {
-                workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision, awaitingInput,
+                workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision, awaitingInput, workflowReadPilotAdmission, workflowRecurringReadAdmission,
                 ...(steerForStep ? { watcherSteer: steerForStep } : {}),
               });
               stepOutputs[step.id] = output;
@@ -8789,6 +9371,18 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
   if (workflowDrainInFlight) return;
   workflowDrainInFlight = true;
   try {
+    const corruptRunRecords = reconcileCorruptWorkflowRunRecords();
+    if (corruptRunRecords.failed > 0) {
+      logger.warn(
+        { corruptRunRecords },
+        'Corrupt workflow run records remain execution-blocked; quarantine presentation will retry',
+      );
+    } else if (corruptRunRecords.corrupt > 0) {
+      logger.debug(
+        { corruptRunRecords },
+        'Corrupt workflow run records remain quarantined and execution-blocked',
+      );
+    }
     // `awaiting_input` records are intentionally non-drainable. Their canonical
     // record doubles as a durable presentation outbox, so repair its cards,
     // shared activity state, and exact-origin question before considering any
@@ -9164,7 +9758,9 @@ export function reapResolvedParkedRuns(): void {
         ? 'declined by the user'
         : stopped.resolution === 'expired'
           ? 'not approved before it expired'
-          : 'cancelled by the user';
+          : stopped.resolution === 'cancelled_by_system'
+            ? 'closed by Clementine because its owning session ended'
+            : 'cancelled by the user';
       const reason = `Workflow occurrence stopped because its approval was ${decision}. The protected action was not performed; steps completed before the approval stand, and any remaining steps were skipped.`;
 
       // Approval rejection is a cancellation producer too. Publish through
@@ -9251,6 +9847,13 @@ const inFlightRunIds = new Set<string>();
 // again. Keep this separate from inFlightRunIds so ordinary runs may consume
 // the remaining bounded-pool capacity.
 const inFlightCatchupRunIds = new Set<string>();
+// Exact interval identities need the same cross-pass protection as run ids.
+// Once run A enters the pool it is removed from a later scan by inFlightRunIds;
+// without this separate identity lease, queued successor B would look like the
+// only candidate for its identity and could enter concurrently. The lease is
+// acquired synchronously at the pool boundary and released only after A leaves
+// processOneRunFile, so B remains a durable queued record until a later drain.
+const inFlightWorkflowIntervalIdentities = new Set<string>();
 
 type WorkflowDrainCandidate = { file: string; filePath: string; run: QueuedRunRecord };
 
@@ -9258,6 +9861,76 @@ function catchupAdmissionAge(run: QueuedRunRecord): number {
   if (Number.isFinite(run.catchupOccurrenceAtMs)) return run.catchupOccurrenceAtMs!;
   const createdAtMs = Date.parse(run.createdAt ?? '');
   return Number.isFinite(createdAtMs) ? createdAtMs : 0;
+}
+
+/**
+ * Exact interval concurrency identity. Display names and current catalog text
+ * are deliberately absent: the immutable admitted definition revision and the
+ * canonical fixed-duration contract own this lane. A forged/malformed receipt
+ * or stale snapshot grants no serialization authority.
+ */
+function workflowIntervalConcurrencyIdentity(run: QueuedRunRecord): string | null {
+  return workflowIntervalRevisionIdentityFromRun(run);
+}
+
+function workflowIntervalAdmissionOrder(run: QueuedRunRecord): [number, number, string] {
+  const resumeFirst = run.status === 'running' || run.status === 'finalizing' ? 0 : 1;
+  const createdAtMs = Date.parse(run.createdAt ?? '');
+  return [resumeFirst, Number.isFinite(createdAtMs) ? createdAtMs : 0, run.id];
+}
+
+function compareWorkflowIntervalAdmission(left: QueuedRunRecord, right: QueuedRunRecord): number {
+  const a = workflowIntervalAdmissionOrder(left);
+  const b = workflowIntervalAdmissionOrder(right);
+  return a[0] - b[0] || a[1] - b[1] || a[2].localeCompare(b[2]);
+}
+
+/** At most one run for one exact workflow-revision + interval-contract can
+ * enter a drain pass. Other workflows, revised contracts, manual runs, and cron
+ * runs retain ordinary bounded-pool parallelism. */
+function selectExactIntervalDrainCandidates<T extends { run: QueuedRunRecord }>(candidates: T[]): T[] {
+  const winnerByIdentity = new Map<string, T>();
+  for (const candidate of candidates) {
+    const identity = workflowIntervalConcurrencyIdentity(candidate.run);
+    if (!identity) continue;
+    if (inFlightWorkflowIntervalIdentities.has(identity)) continue;
+    const current = winnerByIdentity.get(identity);
+    if (!current || compareWorkflowIntervalAdmission(candidate.run, current.run) < 0) {
+      winnerByIdentity.set(identity, candidate);
+    }
+  }
+  if (winnerByIdentity.size === 0) return candidates;
+  return candidates.filter((candidate) => {
+    const identity = workflowIntervalConcurrencyIdentity(candidate.run);
+    return !identity || (
+      !inFlightWorkflowIntervalIdentities.has(identity)
+      && winnerByIdentity.get(identity) === candidate
+    );
+  });
+}
+
+interface WorkflowDrainOwnership {
+  runId: string;
+  intervalIdentity: string | null;
+}
+
+/** Atomically claim both the physical run and its exact interval concurrency
+ * scope before any execution can begin. JavaScript runs this synchronous
+ * section without an await boundary, so overlapping drains cannot both win. */
+function acquireWorkflowDrainOwnership(run: QueuedRunRecord): WorkflowDrainOwnership | null {
+  if (inFlightRunIds.has(run.id)) return null;
+  const intervalIdentity = workflowIntervalConcurrencyIdentity(run);
+  if (intervalIdentity && inFlightWorkflowIntervalIdentities.has(intervalIdentity)) return null;
+  inFlightRunIds.add(run.id);
+  if (intervalIdentity) inFlightWorkflowIntervalIdentities.add(intervalIdentity);
+  return { runId: run.id, intervalIdentity };
+}
+
+function releaseWorkflowDrainOwnership(ownership: WorkflowDrainOwnership): void {
+  if (ownership.intervalIdentity) {
+    inFlightWorkflowIntervalIdentities.delete(ownership.intervalIdentity);
+  }
+  inFlightRunIds.delete(ownership.runId);
 }
 
 interface LegacyScheduledCatchupIdentity {
@@ -9475,15 +10148,19 @@ function selectWorkflowDrainCandidates<T extends { run: QueuedRunRecord }>(
   const executable = eligible.filter((item) =>
     item.run.status !== 'awaiting_catchup_decision'
     && item.run.catchupDisposition !== 'held');
-  if (catchupSlotOccupied) return executable.filter((item) => item.run.catchupFire !== true);
+  if (catchupSlotOccupied) {
+    return selectExactIntervalDrainCandidates(
+      executable.filter((item) => item.run.catchupFire !== true),
+    );
+  }
   const oldestCatchup = executable
     .filter((item) => item.run.catchupFire === true)
     .sort((a, b) =>
       catchupAdmissionAge(a.run) - catchupAdmissionAge(b.run)
       || a.run.id.localeCompare(b.run.id))[0];
-  if (!oldestCatchup) return executable;
-  return executable.filter((item) =>
-    item.run.catchupFire !== true || item.run.id === oldestCatchup.run.id);
+  if (!oldestCatchup) return selectExactIntervalDrainCandidates(executable);
+  return selectExactIntervalDrainCandidates(executable.filter((item) =>
+    item.run.catchupFire !== true || item.run.id === oldestCatchup.run.id));
 }
 
 /** Direct deterministic proof seam; the production drain uses the same
@@ -9819,18 +10496,43 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
     admitted,
     resolveWorkflowRunConcurrency(),
     async (item) => {
-      if (inFlightRunIds.has(item.run.id)) return;
-      inFlightRunIds.add(item.run.id);
+      const ownership = acquireWorkflowDrainOwnership(item.run);
+      if (!ownership) return;
       if (item.run.catchupFire === true) inFlightCatchupRunIds.add(item.run.id);
       try {
         await processOneRunFile(item.file, item.filePath, item.run, workflows, assistant);
       } finally {
         inFlightCatchupRunIds.delete(item.run.id);
-        inFlightRunIds.delete(item.run.id);
+        releaseWorkflowDrainOwnership(ownership);
       }
     },
     (err, item) => logger.error({ err, file: item.file }, 'Workflow run drain task crashed'),
   );
+}
+
+/** Test-only production admission seam. It deliberately composes the real
+ * selector with the real cross-pass identity lease so tests can overlap two
+ * passes without executing workflow steps or mutating durable run records. */
+export async function _testOnly_runWorkflowDrainAdmissionPass(
+  runs: QueuedRunRecord[],
+  onAdmitted: (run: QueuedRunRecord) => Promise<void>,
+): Promise<string[]> {
+  const admittedIds: string[] = [];
+  const selected = selectWorkflowDrainCandidates(
+    runs.map((run) => ({ run })),
+    false,
+  );
+  await Promise.all(selected.map(async ({ run }) => {
+    const ownership = acquireWorkflowDrainOwnership(run);
+    if (!ownership) return;
+    admittedIds.push(run.id);
+    try {
+      await onAdmitted(run);
+    } finally {
+      releaseWorkflowDrainOwnership(ownership);
+    }
+  }));
+  return admittedIds;
 }
 
 // ── Bounded autonomous self-heal ────────────────────────────────────
@@ -10410,6 +11112,8 @@ interface WorkflowDefinitionForRunResolution {
   currentWorkflow?: WorkflowCatalogEntry;
   definitionSource: 'snapshot' | 'compiled_snapshot' | 'legacy_current';
   snapshot?: AnyWorkflowRunDefinitionSnapshot;
+  workflowReadPilotAdmission?: WorkflowReadPilotAdmissionV1;
+  workflowRecurringReadAdmission?: WorkflowRecurringReadAdmissionV1;
   error?: string;
 }
 
@@ -10438,6 +11142,9 @@ export function resolveWorkflowDefinitionForRun(
     | 'projectExecutionSettlement'
     | 'mutationReceiptProtocolVersion'
     | 'targetStepId'
+    | 'acceptDisabled'
+    | 'workflowReadPilotAdmission'
+    | 'workflowRecurringReadAdmission'
     | 'catchupFire'
     | 'catchupDisposition'
     | 'catchupOccurrenceAtMs'
@@ -10447,6 +11154,8 @@ export function resolveWorkflowDefinitionForRun(
     | 'goalAttempt'
   >,
   workflows: WorkflowCatalogEntry[],
+  resolveRecurringAuthority: typeof resolveCurrentAutomationRecurrenceAuthoritySnapshot =
+    resolveCurrentAutomationRecurrenceAuthoritySnapshot,
 ): WorkflowDefinitionForRunResolution {
   // Use the same presence-only ownership predicate as queue, lifecycle,
   // scheduler, and dashboard boundaries. Empty/null/corrupt reserved markers
@@ -10540,6 +11249,8 @@ export function resolveWorkflowDefinitionForRun(
       || run.retryFailedItemsFromRunId
       || (run.selfHealAttempt ?? 0) > 0
       || (run.goalAttempt ?? 0) > 0
+      || run.workflowReadPilotAdmission !== undefined
+      || run.workflowRecurringReadAdmission !== undefined
     );
     const catalogCollision = workflows.find((entry) =>
       entry.name === snapshot.workflowSlug
@@ -10637,6 +11348,113 @@ export function resolveWorkflowDefinitionForRun(
         'No workflow step was executed; start a fresh run to admit the new code revision.',
     };
   }
+  let workflowReadPilotAdmission: WorkflowReadPilotAdmissionV1 | undefined;
+  let workflowRecurringReadAdmission: WorkflowRecurringReadAdmissionV1 | undefined;
+  if (
+    run.workflowReadPilotAdmission !== undefined
+    && run.workflowRecurringReadAdmission !== undefined
+  ) {
+    return {
+      ok: false,
+      currentWorkflow,
+      definitionSource: 'snapshot',
+      snapshot,
+      error: 'A workflow run cannot carry both one-shot pilot and standing recurrence authority. No workflow step was executed.',
+    };
+  }
+  if (run.workflowReadPilotAdmission !== undefined) {
+    const candidate = run.workflowReadPilotAdmission as {
+      oneShotActivationAuthorization?: { approvalId?: unknown };
+    };
+    const approvalId = candidate?.oneShotActivationAuthorization?.approvalId;
+    const forbiddenPilotLineage = run.source !== 'automation_pilot'
+      || run.acceptDisabled !== true
+      || Boolean(run.catchupFire)
+      || run.catchupDisposition !== undefined
+      || run.catchupOccurrenceAtMs !== undefined
+      || run.requeuedFromRunId !== undefined
+      || run.retryFailedItemsFromRunId !== undefined
+      || (run.selfHealAttempt ?? 0) > 0
+      || (run.goalAttempt ?? 0) > 0;
+    const resolvedPilot = typeof approvalId === 'string'
+      ? resolveWorkflowReadPilotAdmission({
+          value: run.workflowReadPilotAdmission,
+          runId: run.id,
+          snapshot,
+          approval: approvalRegistry.get(approvalId),
+          allowConsumedApproval: true,
+        })
+      : { ok: false as const, reason: 'pilot approval identity is missing' };
+    if (
+      forbiddenPilotLineage
+      || !resolvedPilot.ok
+      || run.targetStepId !== (resolvedPilot.ok ? resolvedPilot.admission.nodeId : undefined)
+      || run.workflowSlug !== snapshot.workflowSlug
+      || run.triggerReceiptId !== (resolvedPilot.ok
+        ? workflowReadPilotTriggerReceiptId(resolvedPilot.admission)
+        : undefined)
+    ) {
+      return {
+        ok: false,
+        currentWorkflow,
+        definitionSource: 'snapshot',
+        snapshot,
+        error: `Exact read-pilot run admission is invalid: ${resolvedPilot.ok
+          ? 'the queue source, target, receipt, or recovery controls do not match the one-shot pilot'
+          : resolvedPilot.reason}. No workflow step was executed.`,
+      };
+    }
+    workflowReadPilotAdmission = resolvedPilot.admission;
+  }
+  if (run.workflowRecurringReadAdmission !== undefined) {
+    const candidate = run.workflowRecurringReadAdmission as {
+      activationAuthority?: { activationId?: unknown };
+    };
+    const activationId = candidate?.activationAuthority?.activationId;
+    const currentAuthority = typeof activationId === 'string'
+      ? resolveRecurringAuthority(activationId)
+      : { ok: false as const, reason: 'standing recurrence activation identity is missing' };
+    const resolvedRecurring = currentAuthority.ok
+      ? resolveWorkflowRecurringReadAdmission({
+          value: run.workflowRecurringReadAdmission,
+          runId: run.id,
+          snapshot,
+          currentAuthoritySnapshot: currentAuthority.snapshot,
+        })
+      : { ok: false as const, reason: currentAuthority.reason };
+    const forbiddenRecurringLineage = run.source !== 'schedule'
+      || run.acceptDisabled === true
+      || run.targetStepId !== undefined
+      || Boolean(run.catchupFire)
+      || run.catchupDisposition !== undefined
+      || run.catchupOccurrenceAtMs !== undefined
+      || run.requeuedFromRunId !== undefined
+      || run.retryFailedItemsFromRunId !== undefined
+      || (run.selfHealAttempt ?? 0) > 0
+      || (run.goalAttempt ?? 0) > 0;
+    if (
+      forbiddenRecurringLineage
+      || !resolvedRecurring.ok
+      || run.workflowSlug !== snapshot.workflowSlug
+      || run.triggerReceiptId !== (resolvedRecurring.ok
+        ? resolvedRecurring.admission.runOccurrenceId
+        : undefined)
+      || (resolvedRecurring.ok
+        && resolvedRecurring.admission.workflowInputsDigest
+          !== workflowRecurringReadInputsDigest(normalizeWorkflowRunInputs(run.inputs)))
+    ) {
+      return {
+        ok: false,
+        currentWorkflow,
+        definitionSource: 'snapshot',
+        snapshot,
+        error: `Exact recurring-read run admission is invalid: ${resolvedRecurring.ok
+          ? 'the queue source, inputs, receipt, or recovery controls do not match standing consent'
+          : resolvedRecurring.reason}. No workflow step was executed.`,
+      };
+    }
+    workflowRecurringReadAdmission = resolvedRecurring.admission;
+  }
   return {
     ok: true,
     workflow: {
@@ -10647,6 +11465,8 @@ export function resolveWorkflowDefinitionForRun(
     currentWorkflow,
     definitionSource: 'snapshot',
     snapshot,
+    ...(workflowReadPilotAdmission ? { workflowReadPilotAdmission } : {}),
+    ...(workflowRecurringReadAdmission ? { workflowRecurringReadAdmission } : {}),
   };
 }
 
@@ -11088,10 +11908,12 @@ async function processOneRunFile(
       return;
     }
     // TRY (single-step) runs bypass the workflow enabled gate — they're
-    // explicit dashboard actions on a draft. Full runs still require
-    // the workflow to be approved.
+    // explicit dashboard actions on a draft. A uniquely named chat act
+    // that the host dispatched is the same kind of one-shot approval:
+    // cron still requires enabled, this run does not.
     if (
       !run.targetStepId
+      && run.acceptDisabled !== true
       && definitionResolution.definitionSource !== 'compiled_snapshot'
       && !currentWorkflow?.data.enabled
     ) {
@@ -11302,6 +12124,7 @@ async function processOneRunFile(
       ...run,
       status: 'running',
       startedAt: run.startedAt ?? new Date().toISOString(),
+      heldExecution: undefined,
     }, undefined, buildWorkflowMutationContractSnapshot(workflow.data.steps)).record;
     if (isTerminalRunRecord(runningRecord)) {
       const cancelledRecord = readRunRecord(filePath);
@@ -11438,6 +12261,8 @@ async function processOneRunFile(
         capabilityResumeAuthority,
         definitionResolution.snapshot?.codeRevision,
         runningRecord.awaitingInput,
+        definitionResolution.workflowReadPilotAdmission,
+        definitionResolution.workflowRecurringReadAdmission,
       );
       if (beforeWorkflowGraphFinalizationForTests) {
         await beforeWorkflowGraphFinalizationForTests({
@@ -11526,9 +12351,13 @@ async function processOneRunFile(
       // could not finish its job. Today that still marks "completed" and
       // dumps raw JSON. Detect it, diagnose the root cause, and offer a
       // fix — instead of silently reporting a misleading success.
-      const blockedSteps = detectBlockedSteps(
-        publicStepOutputs,
-        publicExecutionSteps.map((step) => step.id),
+      const blockedSteps = omitBlocksForAlreadyFiredSends(
+        detectBlockedSteps(
+          publicStepOutputs,
+          publicExecutionSteps.map((step) => step.id),
+        ),
+        publicExecutionSteps,
+        run.id,
       );
       for (const evidenceProblem of exactSendRedemptionProblems) {
         blockedSteps.push({
@@ -12022,12 +12851,61 @@ async function processOneRunFile(
         : '';
 
       throwIfWorkflowRunCancelled(run.id);
+      let terminalFinishedAt = new Date().toISOString();
+      let canonicalEntityWorkspaceProjectionClaim: unknown;
+      const readProjectionAdmission = definitionResolution.workflowReadPilotAdmission
+        ?? definitionResolution.workflowRecurringReadAdmission;
+      const reviewedResultProjection = readProjectionAdmission?.resultProjection;
+      if (!needsAttention && !goalRepursuing && reviewedResultProjection) {
+        const projectionStep = executionSteps.find(
+          (candidate) => candidate.id === readProjectionAdmission.nodeId,
+        );
+        const parsedProjectionPlan = parseWorkflowNodeInvocationPlan(projectionStep?.invocationPlan);
+        const retainedRun = readRunRecord(filePath);
+        if (
+          !projectionStep
+          || !parsedProjectionPlan.ok
+          || !parsedProjectionPlan.plan.resultProjection
+          || !retainedRun?.canonicalEntityWorkflowResultRoot
+          || typeof retainedRun.startedAt !== 'string'
+        ) {
+          throw new WorkflowHarnessBlockedSignal({
+            stepId: readProjectionAdmission.nodeId,
+            sessionId: readProjectionAdmission.workflowSessionId,
+            reason: 'canonical_entity_result_lineage_unavailable: the successful read cannot publish without its exact reviewed plan, retained authority root, and run start receipt',
+          });
+        }
+        const produced = produceCanonicalEntityWorkflowLineage({
+          version: 1,
+          root: retainedRun.canonicalEntityWorkflowResultRoot,
+          invocationPlan: projectionStep.invocationPlan,
+          startedAt: retainedRun.startedAt,
+          proposedFinishedAt: terminalFinishedAt,
+        });
+        if (produced.status === 'blocked' || produced.status === 'not_applicable') {
+          throw new WorkflowHarnessBlockedSignal({
+            stepId: readProjectionAdmission.nodeId,
+            sessionId: readProjectionAdmission.workflowSessionId,
+            reason: produced.status === 'blocked'
+              ? `canonical_entity_result_projection_blocked:${produced.code}: ${produced.reason}`
+              : 'canonical_entity_result_projection_unrepresented: the reviewed dataset plan did not produce an exact projection contract',
+          });
+        }
+        // On a post-receipt restart the retained completed receipt owns the
+        // timestamp, so the terminal projection is byte-stable and cannot
+        // conflict with its own lineage claim.
+        terminalFinishedAt = produced.finishedAt;
+        canonicalEntityWorkspaceProjectionClaim = produced.claim;
+      }
       const terminalProjection: QueuedRunRecord = {
         ...run,
         status: hasForEachFailures ? 'completed_with_errors' : 'completed',
-        finishedAt: new Date().toISOString(),
+        finishedAt: terminalFinishedAt,
         stepOutputs: runRecordStepOutputs,
         output: finalOutput,
+        ...(canonicalEntityWorkspaceProjectionClaim
+          ? { canonicalEntityWorkspaceProjectionClaim }
+          : {}),
         ...(needsAttention
           ? { needsAttention: true, blockedSteps, proposedFixId: proposedFix?.id ?? null }
           : {}),
@@ -12327,6 +13205,94 @@ async function processOneRunFile(
       // lane. A routine no-op never wakes the chat.
       logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: publicForEachFailures.length, blockedSteps: blockedSteps.length, advisories: publicQualityAdvisories.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
+      // Another exact-source owner (or restart recovery) is still executing
+      // this step. Persist only the ownership observation, release this
+      // consumer, and leave both workflow/activity lifecycles in progress.
+      if (error instanceof WorkflowHarnessHeldSignal) {
+        const heldRecord = persistWorkflowHarnessHold(filePath, error.state);
+        if (!heldRecord || heldRecord.status === 'cancelled' || isTerminalRunRecord(heldRecord)) return;
+        appendWorkflowEvent(workflow.name, run.id, {
+          kind: 'run_paused',
+          meta: {
+            reason: 'exact_source_held',
+            stepId: error.state.stepId,
+            sessionId: error.state.sessionId,
+            owner: error.state.hold.owner,
+            wake: error.state.hold.wake,
+            holdReason: error.state.hold.reason,
+            sourceStatus: error.state.sourceStatus,
+            recoveredContract: error.state.recoveredContract,
+          },
+        });
+        addRunEvent(run.id, {
+          type: 'status',
+          status: 'running',
+          message: `Workflow step ${error.state.stepId} remains ${error.state.hold.wake}-owned; waiting for its exact source owner.`,
+          data: {
+            workflow: workflow.data.name,
+            stepId: error.state.stepId,
+            heldExecution: error.state,
+          },
+        });
+        logger.info(
+          { workflow: workflow.data.name, runId: run.id, heldExecution: error.state },
+          'Workflow consumer released while exact source remains host-owned',
+        );
+        return;
+      }
+      // A canonical harness refusal is terminal BLOCKED truth. It reports back
+      // on the blocked lane and never enters generic failure/self-heal logic.
+      if (error instanceof WorkflowHarnessBlockedSignal) {
+        const finishedAt = new Date().toISOString();
+        const detail = `Workflow "${workflow.data.name}" was blocked at step "${error.stepId}": ${error.reason}`;
+        const report = {
+          workflowName: workflow.data.name,
+          outcome: 'blocked' as const,
+          detail,
+        };
+        const terminalRecord = writeRunRecord(filePath, {
+          ...run,
+          status: 'blocked',
+          finishedAt,
+          error: error.reason,
+          needsAttention: true,
+          blockedSteps: [{ stepId: error.stepId, reason: error.reason }],
+        }, report);
+        if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
+        appendWorkflowEvent(workflow.name, run.id, {
+          kind: 'run_blocked',
+          error: error.reason,
+          meta: { stepId: error.stepId, sessionId: error.sessionId },
+        });
+        attemptWorkflowRunReportBack(filePath);
+        addNotification({
+          id: `workflow-${run.id}-blocked`,
+          kind: 'workflow',
+          title: `Workflow blocked: ${workflow.data.name}`,
+          body: detail,
+          createdAt: finishedAt,
+          read: false,
+          metadata: {
+            workflow: workflow.data.name,
+            runId: run.id,
+            status: 'blocked',
+            stepId: error.stepId,
+            needsAttention: true,
+          },
+        });
+        markRunNotified(filePath);
+        finishRun(run.id, {
+          status: 'blocked',
+          message: detail,
+          outputPreview: detail,
+          needsAttention: true,
+        });
+        logger.warn(
+          { workflow: workflow.data.name, runId: run.id, stepId: error.stepId, reason: error.reason },
+          'Workflow run ended blocked by the harness',
+        );
+        return;
+      }
       // A provider mutation crossed the durable STARTED boundary but no
       // success/failure receipt settled it. This is neither a terminal failure
       // nor a safe retry: preserve completed steps, release the worker, and
@@ -12750,7 +13716,78 @@ async function processOneRunFile(
  * mid-run, etc.) — those get marked as 'interrupted' rather than
  * left dangling.
  */
+export interface CanonicalEntityWorkspaceProjectionReconcileResult {
+  eligible: number;
+  projected: number;
+  replayed: number;
+  blocked: number;
+  failed: number;
+}
+
+/**
+ * Recover the crash cut after terminal publication but before Space
+ * projection finalization. Selection is presence-only on the exact typed
+ * top-level claim; terminal prose and step/provider output are never scanned.
+ * No separate completion marker is needed: a retry after projection commit is
+ * reduced to `replayed` by the canonical projector's durable head CAS.
+ */
+export function reconcileCanonicalEntityWorkspaceProjectionClaims(options: {
+  runsDirectory?: string;
+  finalize?: typeof finalizeCanonicalEntityWorkflowCompletion;
+} = {}): CanonicalEntityWorkspaceProjectionReconcileResult {
+  const result: CanonicalEntityWorkspaceProjectionReconcileResult = {
+    eligible: 0,
+    projected: 0,
+    replayed: 0,
+    blocked: 0,
+    failed: 0,
+  };
+  const runsDirectory = options.runsDirectory ?? WORKFLOW_RUNS_DIR;
+  if (!existsSync(runsDirectory)) return result;
+  for (const file of readdirSync(runsDirectory).filter((entry) => entry.endsWith('.json')).sort()) {
+    const record = readRunRecordForScan(path.join(runsDirectory, file));
+    if (!record
+      || !isTerminalRunRecord(record)
+      || !Object.hasOwn(record, 'canonicalEntityWorkspaceProjectionClaim')) continue;
+    result.eligible += 1;
+    try {
+      const finalized = finalizeCanonicalEntityWorkspaceProjection(
+        record,
+        options.finalize ?? finalizeCanonicalEntityWorkflowCompletion,
+      );
+      if (finalized.status === 'projected') result.projected += 1;
+      else if (finalized.status === 'replayed') result.replayed += 1;
+      else if (finalized.status === 'blocked') result.blocked += 1;
+    } catch {
+      result.failed += 1;
+    }
+  }
+  return result;
+}
+
 export function reconcilePendingWorkflowRuns(): void {
+  const corruptRunRecords = reconcileCorruptWorkflowRunRecords();
+  if (corruptRunRecords.corrupt > 0) {
+    logger.warn(
+      { corruptRunRecords },
+      corruptRunRecords.failed > 0
+        ? 'Boot found corrupt workflow run records; quarantine presentation remains pending'
+        : 'Boot quarantined corrupt workflow run records before workflow recovery',
+    );
+  }
+  const canonicalEntityProjection = reconcileCanonicalEntityWorkspaceProjectionClaims();
+  if (canonicalEntityProjection.projected > 0 || canonicalEntityProjection.replayed > 0) {
+    logger.info(
+      { canonicalEntityProjection },
+      'Recovered canonical entity Workspace projection finalization from terminal workflow truth',
+    );
+  }
+  if (canonicalEntityProjection.blocked > 0 || canonicalEntityProjection.failed > 0) {
+    logger.warn(
+      { canonicalEntityProjection },
+      'Canonical entity Workspace projection recovery remains fail-closed',
+    );
+  }
   const inputProjection = reconcileAwaitingInputWorkflowRunProjections();
   if (inputProjection.failed.length > 0) {
     logger.warn(

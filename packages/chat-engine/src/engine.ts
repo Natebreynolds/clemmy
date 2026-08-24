@@ -114,9 +114,12 @@ export class ChatEngine {
       this.busy = true;
       this.ensureActiveAssistant();
       this.attachStream(inFlightSince);
-    } else {
+    } else if (events.length > 0 || latestSeq > 0) {
       this.attachStream(latestSeq);
     }
+    // A session with no history may not exist server-side yet (stable
+    // workspace thread ids are minted lazily on first message) — attaching a
+    // stream would just 404-loop. send() attaches after the accepted claim.
     this.emit();
   }
 
@@ -171,8 +174,11 @@ export class ChatEngine {
         this.messages = this.messages.map((m) => (m.id === userMessage.id
           ? { ...m, pending: undefined, pendingError: undefined }
           : m));
-        if (!this.sessionId) {
+        if (result.sessionId !== this.sessionId) {
+          this.stream?.stop();
+          this.stream = null;
           this.sessionId = result.sessionId;
+          this.cursor = 0;
         }
         // (Re)attach the stream from the current cursor so the accepted
         // turn's events land here.

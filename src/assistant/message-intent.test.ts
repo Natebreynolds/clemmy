@@ -10,8 +10,10 @@ import assert from 'node:assert/strict';
 
 import {
   classifyMessageIntent,
+  hasDiscourseReferent,
   isCasualCheckIn,
   memoryBudgetFor,
+  refersToUserOrHostedWorld,
 } from './message-intent.js';
 
 // ─── casual ────────────────────────────────────────────────────
@@ -25,6 +27,77 @@ test('casual: short greetings', () => {
 test('casual: short acknowledgements', () => {
   for (const msg of ['thanks', 'thanks!', 'ok', 'cool', 'got it', 'sounds good', 'sweet', 'perfect']) {
     assert.equal(classifyMessageIntent(msg).intent, 'casual', `"${msg}" should be casual`);
+  }
+});
+
+test('conversation: closed-world questions do not become lookups', () => {
+  for (const msg of [
+    "what's 2x2",
+    'What’s 2x3',
+    'what is 2+2',
+    'What is 12 * 11?',
+    'what is 5 times 7',
+    'what is 15% of 80',
+    'what is 2^8',
+    'what is sqrt(144)',
+    "what's 12 divided by 4 then times 3",
+    'what is the capital of France',
+  ]) {
+    assert.equal(
+      classifyMessageIntent(msg).intent,
+      'conversation',
+      `"${msg}" should stay closed-world`,
+    );
+  }
+});
+
+test('a hosted-world follow-up via they/those continues retrieve; 2x3 does not', () => {
+  for (const msg of ['what are they slack IDs', 'what are their slack IDs', 'what are those']) {
+    assert.equal(
+      classifyMessageIntent(msg).intent,
+      'conversation',
+      `"${msg}" alone is still closed-world`,
+    );
+    assert.equal(hasDiscourseReferent(msg), true, `"${msg}" points at prior discourse`);
+    assert.equal(
+      classifyMessageIntent(msg, { continueHostedWorld: true }).intent,
+      'lookup',
+      `"${msg}" continues a hosted turn`,
+    );
+  }
+  assert.equal(
+    classifyMessageIntent("what's 2x3", { continueHostedWorld: true }).intent,
+    'conversation',
+    'a self-contained closed-world question stays a reply even after a retrieve',
+  );
+  assert.equal(classifyMessageIntent('thanks', { continueHostedWorld: true }).intent, 'casual');
+});
+
+test('lookup: a user or hosted-world referent still retrieves', () => {
+  for (const msg of [
+    "what's 2x2 for the team",
+    'what is 2+2 in salesforce',
+    'what is the weather in Seattle',
+    'what is the net MRR we sold as a team this week',
+    "who's on my sales team",
+  ]) {
+    assert.equal(classifyMessageIntent(msg).intent, 'lookup', `"${msg}" should stay a lookup`);
+    assert.equal(refersToUserOrHostedWorld(msg), true, `"${msg}" refers to user/hosted world`);
+  }
+});
+
+test('lookup: current clock questions retrieve instead of becoming closed-world replies', () => {
+  for (const msg of [
+    'what time is it?',
+    "what's the local time?",
+    "what's today's date?",
+  ]) {
+    assert.equal(classifyMessageIntent(msg).intent, 'lookup', `"${msg}" should stay a lookup`);
+    assert.equal(
+      refersToUserOrHostedWorld(msg),
+      true,
+      `"${msg}" points at the current runtime environment`,
+    );
   }
 });
 

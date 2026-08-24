@@ -1,9 +1,26 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { isKillRequested, appendEvent, getSession, listEvents, resolveToolOutputForAuthority, type KillRequestTarget } from './eventlog.js';
+import type { ConversationPreambleDeliveryCallback } from '../../types.js';
 import { effectiveTurnObjective } from './turn-control.js';
+import {
+  copyHostWorkCallPreparer,
+  isHostPlanRequiredWorkCall,
+} from '../../tools/work-call-mode.js';
+import { isFreshPlanDisclosureSearch } from '../../tools/tool-search-mode.js';
 import { runWithToolAbortSignal } from '../tool-abort-context.js';
+import {
+  noteHostToolInvocationObservation,
+  requireHostToolInvocationTerminalPhysicalDispatch,
+  reserveHostToolInvocationPhysicalDispatch,
+  settleHostToolInvocationPhysicalDispatch,
+} from './tool-invocation-observation-context.js';
+import {
+  copyTerminalPhysicalDispatchOwnership,
+  isTerminalPhysicalDispatchOwner,
+} from './terminal-physical-dispatch-owner.js';
 import { getToolOutputContext, withToolOutputContext } from './tool-output-context.js';
+import { formatRecallableToolText } from './tool-output-format.js';
 import { steerBlockForToolBoundary } from './steer-notes.js';
 import { exactToolOutputForInvocation } from './tool-output-format.js';
 import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
@@ -43,6 +60,7 @@ import {
   toolOutputProvesExternalWriteAcknowledgement,
 } from './tool-evidence.js';
 import {
+  actionTopologyRoleForRuntimeCall,
   classifyRuntimeToolEffect,
   projectCanonicalTopLevelToolEvents,
 } from './tool-effect.js';
@@ -158,7 +176,10 @@ import {
   settleToolAttempt,
   ToolAttemptSettlementAuthorityError,
 } from './attempt-settlement.js';
-import { currentExpectedWorkBinding } from './expected-work-admission.js';
+import {
+  actionExpectedWorkRequired,
+  currentExpectedWorkBinding,
+} from './expected-work-admission.js';
 import {
   authorizeResolvedLogicalCallContract,
   currentLogicalCall,
@@ -173,7 +194,7 @@ import {
 } from './runtime-tool-identity.js';
 
 /** One host invocation owns one output nonce even when it crosses a nested
- * carrier (code mode/call_tool) and then the ordinary bracket. A nonce is
+ * carrier (call_tool/work_call/batch) and then the ordinary bracket. A nonce is
  * reusable only when session, call id, and tool identity all match exactly. */
 function settlementNonceForInvocation(
   sessionId: string | undefined,
@@ -525,7 +546,31 @@ function isNestedDispatchCarrier(toolName: string): boolean {
     || isPlainOrClementineLocalTool(toolName, 'work_call');
 }
 
-function nestedDispatchCarrierInputIsStructurallyValid(toolName: string, input: unknown): boolean {
+function freshPlanCatalogDisclosureAdmission(
+  configuredTool: unknown,
+  context: HarnessRunContext | undefined,
+): boolean {
+  if (
+    !isFreshPlanDisclosureSearch(configuredTool)
+    || !context?.sessionId
+    || !Number.isSafeInteger(context.sourceUserSeq)
+    || (context.sourceUserSeq ?? 0) <= 0
+  ) return false;
+  try {
+    return !actionExpectedWorkRequired({
+      sessionId: context.sessionId,
+      sourceUserSeq: context.sourceUserSeq as number,
+    });
+  } catch {
+    return false;
+  }
+}
+
+function nestedDispatchCarrierInputIsStructurallyValid(
+  toolName: string,
+  input: unknown,
+  configuredTool?: unknown,
+): boolean {
   const carrier = input && typeof input === 'object' && !Array.isArray(input)
     ? input as Record<string, unknown>
     : null;
@@ -539,7 +584,10 @@ function nestedDispatchCarrierInputIsStructurallyValid(toolName: string, input: 
       || (
         typeof carrier.requirement_id === 'string'
         && carrier.requirement_id.length > 0
-        && Object.prototype.hasOwnProperty.call(carrier, 'proposal')
+        && (
+          Object.prototype.hasOwnProperty.call(carrier, 'proposal')
+          || isHostPlanRequiredWorkCall(configuredTool)
+        )
       )
     ),
   );
@@ -588,14 +636,6 @@ export function timeoutForTool(toolName: string): number {
   // worst case well below it.
   if (toolName === 'run_batch') {
     return DEFAULT_TIMEOUTS_MS.shell;
-  }
-  // run_tool_program has its OWN activity-aware sandbox ceiling
-  // (CLEMMY_CODEMODE_MAX_MS, default 180s) and partial-result salvage. The
-  // outer harness must be wider than that inner deadline; otherwise the generic
-  // 60s wrapper kills code mode first and the model gets an ask/retry timeout
-  // instead of the sandbox's "partial results salvaged" corrective.
-  if (toolName === 'run_tool_program') {
-    return DEFAULT_TIMEOUTS_MS.externalApi;
   }
   // MCP namespace shim separator is "__" (src/runtime/mcp-namespace-shim.ts).
   if (toolName.includes('__')) {
@@ -1106,6 +1146,16 @@ export interface HarnessRunContext {
   /** Exact physical harness turn owning canonical tool and auxiliary evidence. */
   turn?: number;
   counter: ToolCallsCounter;
+  /** The host stepper charged this model-emitted execution intent before
+   * invoking any carrier. Wrapped built-ins and nested inner tools must not
+   * charge the same intent again. Undefined/false preserves legacy SDK-runner
+   * accounting at the individual wrapper boundary. */
+  hostOwnsToolAccounting?: boolean;
+  /** The host invocation coordinator owns the one deadline, abort signal,
+   * physical terminalization and logical settlement for this exact call.
+   * Nested wrappers must consume that signal and must not create a second
+   * timer or settlement owner. */
+  hostOwnsToolDeadlineAndSettlement?: boolean;
   /** Exact physical provider/Runner generation allowed to dispatch tools.
    * Transport cancellation is best-effort; this durable lease is checked at
    * tool entry and again immediately before provider/local execution. */
@@ -1121,6 +1171,9 @@ export interface HarnessRunContext {
   /** Exact accepted user event for this attempt. Deterministic preflight gates
    * must not consult whichever session input happens to be newest. */
   sourceUserSeq?: number;
+  /** Fresh host plan_task publishes its model-authored conversational preamble
+   * through the same awaited transport edge as structural preflight. */
+  onConversationPreamble?: ConversationPreambleDeliveryCallback;
   /** Exact execution lane explicitly opened/advanced by this turn. External
    * write receipts use this to stay attached to one durable objective even
    * when a chat later contains unrelated work. */
@@ -1198,11 +1251,11 @@ export interface HarnessRunContext {
    *  admission's scope side effects tripped the execution gate on uncertified
    *  plans (2026-07-22). */
   batchItem?: boolean;
-  /** This tool call originates INSIDE a code-mode program (clem.<tool> dispatch).
-   *  The deterministic read-fanout block must never fire here — a program's
-   *  batched reads ARE the sanctioned execution the block steers the model toward;
-   *  refusing them would break the very recovery the block demands. */
-  codeMode?: boolean;
+  /** This tool call is the child of a host-owned carrier (`call_tool`,
+   *  `work_call`, `run_batch`, or pending-action execution). The direct-read
+   *  fanout rail must account for the child rather than double-counting the
+   *  carrier and child as separate model decisions. */
+  nestedDispatch?: boolean;
   /** Recall runs recorded by tool handlers during this turn (memory_recall_all,
    *  memory_search_facts). The post-turn auto-credit hook reads these so every
    *  lane that records a run gets credit matching — the code-level replacement
@@ -1221,22 +1274,22 @@ export interface HarnessRunContext {
   resolvedToolkitAccounts?: Map<string, Map<string, { identity?: string; explicit: boolean }>>;
 }
 
-/** The tracker scope a call registers under. EXEMPT lanes (code-mode programs,
+/** The tracker scope a call registers under. EXEMPT lanes (nested-dispatch calls,
  *  certified-batch items, workers) get their OWN window so their reads never
  *  inflate the ORCHESTRATOR's direct-read fanout counts — otherwise a batch/
- *  program of 6+ reads poisoned the shared session tracker and the orchestrator's
+ *  carrier with 6+ reads poisoned the shared session tracker and the orchestrator's
  *  very NEXT direct read of that tool was refused with a nonsensical "batch this
  *  single read" message (2026-07-12 strand-hunt finding). Workers already isolate
- *  via guardrailScopeId; this extends the same isolation to code-mode/batch.
+ *  via guardrailScopeId; this extends the same isolation to nested dispatch/batch.
  *  Direct orchestrator calls fall through to behaviorScopeId ?? sessionId — the
  *  ENFORCED scope — exactly as before (byte-identical for the non-exempt path). */
 export function guardrailScopeKey(
-  ctx: Pick<HarnessRunContext, 'sessionId' | 'guardrailScopeId' | 'behaviorScopeId' | 'codeMode' | 'certifiedBatch'>,
+  ctx: Pick<HarnessRunContext, 'sessionId' | 'guardrailScopeId' | 'behaviorScopeId' | 'nestedDispatch' | 'certifiedBatch'>,
 ): string {
   if (ctx.guardrailScopeId) return ctx.guardrailScopeId; // worker: already isolated
   const base = ctx.behaviorScopeId ?? ctx.sessionId;
   if (ctx.certifiedBatch) return `${base}::batch:${ctx.certifiedBatch.batchId}`;
-  if (ctx.codeMode) return `${base}::codeMode`;
+  if (ctx.nestedDispatch) return `${base}::nestedDispatch`;
   return base;
 }
 
@@ -1310,6 +1363,52 @@ export interface WrapToolOptions {
   /** Test injection — when set, use this clock instead of Date.now()
    *  for timeout testing. */
   now?: () => number;
+}
+
+type HarnessBoundToolAttestation = Readonly<{
+  version: 1;
+  name: string;
+  invoke?: Function;
+  execute?: Function;
+}>;
+
+/**
+ * Module-private proof that a concrete tool object crossed Clem's harness
+ * wrapper boundary.  This deliberately is not a symbol/property on the tool:
+ * enumerable or reflective proof can be copied onto a raw tool, while a
+ * WeakMap entry can only be minted in this module for the exact returned
+ * object.  Pinning the wrapped method identity also makes post-wrap mutation
+ * fail closed.
+ */
+const harnessBoundToolAttestations = new WeakMap<object, HarnessBoundToolAttestation>();
+
+function attestHarnessBoundTool<T extends object>(tool: T): T {
+  const candidate = tool as {
+    name?: unknown;
+    invoke?: unknown;
+    execute?: unknown;
+  };
+  harnessBoundToolAttestations.set(tool, Object.freeze({
+    version: 1,
+    name: typeof candidate.name === 'string' ? candidate.name : '',
+    ...(typeof candidate.invoke === 'function' ? { invoke: candidate.invoke } : {}),
+    ...(typeof candidate.execute === 'function' ? { execute: candidate.execute } : {}),
+  }));
+  return tool;
+}
+
+/**
+ * True only for the exact SDK-style function-tool object returned by
+ * wrapToolForHarness while brackets were enabled and whose executable identity
+ * has not changed since wrapping.  Callers can verify this proof but cannot
+ * mint it.
+ */
+export function isHarnessBoundFunctionTool(tool: unknown): boolean {
+  if (!tool || typeof tool !== 'object') return false;
+  const attestation = harnessBoundToolAttestations.get(tool);
+  if (!attestation || typeof attestation.invoke !== 'function') return false;
+  const candidate = tool as { name?: unknown; invoke?: unknown };
+  return candidate.name === attestation.name && candidate.invoke === attestation.invoke;
 }
 
 // Tool reliability brackets — per-tool wall-clock timeout + identical-args
@@ -1972,7 +2071,7 @@ export function pendingActionApprovalRequiredError(
  * Sibling of pendingActionApprovalRequiredError for a NON-send local tool that
  * the tool's OWN needsApproval hook flags (a danger-classified run_shell_command,
  * a sensitive-path read/write) when it is reached through a nested dispatcher — a
- * code-mode program or call_tool — which cannot open its own approval card. The
+ * nested-dispatch carrier — which cannot open its own approval card. The
  * direct wrapped.invoke() path skips the SDK's per-tool needsApproval hook, so
  * without this the call would run card-free. Same class ⇒ provenNoDispatch: the
  * call is refused BEFORE it runs, never a retryable failure.
@@ -1988,7 +2087,7 @@ export function pendingNestedToolApprovalRequiredError(
   } catch { /* omit an unserializable payload */ }
   return new ExternalWritePreDispatchError(
     `PENDING_ACTION_APPROVAL_REQUIRED: "${toolName}" needs your approval and was reached through a nested dispatcher `
-    + '(a code-mode program or call_tool), which cannot open its own approval card. Do not retry it inside the program. '
+    + '(a nested-dispatch carrier), which cannot open its own approval card. Do not retry it through the same carrier. '
     + `Run "${toolName}" as a direct tool call so the normal approval card can surface — or, if this is part of an approved plan, ensure the plan scope authorizes it.`
     + payloadLabel,
   );
@@ -2298,6 +2397,7 @@ export function _setAfterSharedWriteReservationForTests(
  * and reads only the ambient task-owned logical row.
  */
 function wrapperMustSettleLogicalCall(ctx: HarnessRunContext | undefined): boolean {
+  if (ctx?.hostOwnsToolDeadlineAndSettlement) return false;
   if (!ctx?.sessionId || !Number.isSafeInteger(ctx.sourceUserSeq) || (ctx.sourceUserSeq ?? 0) <= 0) {
     return true;
   }
@@ -2364,6 +2464,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const hasInvoke = typeof tt.invoke === 'function';
   const hasExecute = typeof tool.execute === 'function';
   if (!hasInvoke && !hasExecute) return tool; // pure declaration; nothing to wrap
+  const ownsTerminalPhysicalDispatch = isTerminalPhysicalDispatchOwner(tool);
 
   type ArtifactDispatch = {
     sessionId: string;
@@ -2432,10 +2533,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // ceiling without applying any outer effect/write gate. A valid envelope is
     // charged exactly once by either its validated inner call or execute.refuse.
     if (isNestedDispatchCarrier(tool.name)) {
-      const structurallyValid = nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput);
+      const structurallyValid = nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput, tool);
       if (!structurallyValid) {
-        if (ctx.counter.willExceed()) throw new ToolCallsLimitExceeded(ctx.counter.limit);
-        ctx.counter.increment();
+        if (!ctx.hostOwnsToolAccounting) {
+          if (ctx.counter.willExceed()) throw new ToolCallsLimitExceeded(ctx.counter.limit);
+          ctx.counter.increment();
+        }
         return { carrierMalformed: true };
       }
       return undefined;
@@ -2457,7 +2560,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // bill every deferred action twice, halving the effective budget on the
     // schema-on-demand lane. The inner charge is the real one; loop
     // detection below still evaluates the outer call.
-    if (!isNestedDispatchCarrier(tool.name)) {
+    if (!ctx.hostOwnsToolAccounting && !isNestedDispatchCarrier(tool.name)) {
       if (ctx.counter.willExceed()) {
         throw new ToolCallsLimitExceeded(ctx.counter.limit);
       }
@@ -2483,11 +2586,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // Fan-out nudge: only steer the ORCHESTRATOR's own context toward
       // run_worker — inside a worker scope (guardrailScopeId set) the nudge
       // is wrong advice (workers can't spawn workers), so suppress it. Also
-      // suppress for CODE MODE and CERTIFIED batch items: both are sanctioned
-      // aggregation primitives. Appending prose to a code-mode tool's JSON
+      // suppress for NESTED DISPATCH and CERTIFIED batch items: both are sanctioned
+      // aggregation primitives. Appending prose to a nested-dispatch tool's JSON
       // also corrupts its machine-readable result (successful provider data
       // becomes a string), so the exemption is a response-shape invariant.
-      if (decision.fanoutNudge && !ctx.codeMode && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
+      if (decision.fanoutNudge && !ctx.nestedDispatch && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
         fanoutNudge = decision.fanoutNudge;
         try {
           appendEvent({
@@ -2507,17 +2610,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // DETERMINISTIC read-fanout BLOCK (kill-switch CLEMMY_GUARDRAIL_FANOUT_BLOCK,
       // default off). The advisory nudge above is provably ignored; when enabled,
       // a model that keeps serializing the SAME read past the block threshold is
-      // REFUSED so it must batch the remainder in one run_tool_program. Enforced
-      // ONLY for the model's DIRECT calls — a call from a code-mode program
-      // (ctx.codeMode), a worker (guardrailScopeId), or a certified batch is the
-      // batched execution we're steering toward and must NEVER be blocked (that
-      // would refuse the very program the block demands). Reads are idempotent, so
-      // refusing one loses nothing.
+      // REFUSED so it must issue the remainder as PARALLEL calls. Enforced
+      // ONLY for the model's DIRECT serial calls — a nested dispatch
+      // (ctx.nestedDispatch), a worker (guardrailScopeId), or a certified batch is the
+      // batched execution we're steering toward and must NEVER be blocked.
+      // Reads are idempotent, so refusing one loses nothing.
       // A fan-out-keyed READ is never hard-killed, even after its refusal has
       // released: the shield is about the CALL's nature, the block is about
       // whether we are refusing right now. Conflating them meant releasing the
       // refusal handed the read to the exact-repeat turn-kill.
-      if (decision.fanoutBlock && !ctx.codeMode && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
+      if (decision.fanoutBlock && !ctx.nestedDispatch && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
         try {
           appendEvent({
             sessionId: ctx.sessionId,
@@ -2535,7 +2637,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // worker scope they diverge, so suppress. Also suppress when the prior
       // output was error-shaped: a retry after a transient failure must NOT be
       // discouraged. Nudge points at recall_tool_result; never serves a payload.
-      if (decision.cachedCallId && !ctx.codeMode && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
+      if (decision.cachedCallId && !ctx.nestedDispatch && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
         let priorOutput: string | null = null;
         try {
           const authority = resolveToolOutputForAuthority(ctx.sessionId, decision.cachedCallId);
@@ -2566,7 +2668,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         }
       }
       if (decision.action !== 'allow') {
-        // Advisory dedupe (live 2026-07-24): a code-mode rebuild emitted 15
+        // Advisory dedupe (live 2026-07-24): a nested-dispatch rebuild emitted 15
         // identical "run_shell_command called 2×" WARN rows into the visible
         // feed. A warn logs once per (rule, tool) per run context; blocks and
         // escalations always log. The guardrail DECISION itself is unchanged.
@@ -2618,7 +2720,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     if (
       settledReadRepeatEnabled()
       && ctx.directOrchestrator !== false
-      && !ctx.codeMode
+      && !ctx.nestedDispatch
       && !ctx.guardrailScopeId
       && !ctx.certifiedBatch
       && !ctx.batchItem
@@ -3544,11 +3646,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
           toolName: tool.name,
           input: parsedInput,
           callId: callId ?? `harness-${randomUUID()}`,
+          freshPlanCatalogDisclosure: freshPlanCatalogDisclosureAdmission(tool, ctx),
         });
-    // Code-mode callers must always receive the native result unchanged.
+    // Nested-dispatch callers must always receive the native result unchanged.
     // Keep this final invariant even if a future advisory is added above and
-    // forgets its local codeMode exemption.
-    if (ctx.codeMode) return reservation || discovery
+    // forgets its local nestedDispatch exemption.
+    if (ctx.nestedDispatch) return reservation || discovery
       ? { reservation, discovery: discovery ?? undefined }
       : undefined;
     // All nudges ride the same advisory rail (appended to the tool result by the
@@ -3733,7 +3836,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       !settledReadRepeatEnabled()
       || !ctx
       || ctx.directOrchestrator === false
-      || ctx.codeMode
+      || ctx.nestedDispatch
       || ctx.guardrailScopeId
       || ctx.certifiedBatch
       || ctx.batchItem
@@ -3781,7 +3884,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // invalid-arguments error and letting the model retype the call.
       const logicalContractArgs = !logicalCallArgumentsAreContractible(tool.name, parsedInput)
         || (isNestedDispatchCarrier(tool.name)
-          && !nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput))
+          && !nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput, tool))
         ? { carrier: tool.name, malformed: true, version: 1 }
         : parsedInput;
       const ctx = harnessRunContextStorage.getStore();
@@ -3838,6 +3941,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       let artifact: ArtifactAdmission = {};
       let bracketOutcome: BracketOutcome | undefined;
       let deferredDiscoveryAdmissionError: unknown;
+      let hostPhysicalReserved = false;
       try {
         bracketOutcome = await runBrackets(
           ctx?.sessionId ?? '',
@@ -3932,8 +4036,17 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // finish in the background costs nothing extra (the work is already
         // paid for) and lets the tool's OWN receipt detection park the job with
         // the watcher, which then delivers the real result to this session.
+        const hostOwnedSignal = ctx?.hostOwnsToolDeadlineAndSettlement
+          ? (details as { signal?: AbortSignal } | undefined)?.signal
+          : undefined;
+        if (ctx?.hostOwnsToolDeadlineAndSettlement && !hostOwnedSignal) {
+          throw new ToolAttemptSettlementAuthorityError(
+            'conflict',
+            'host-owned invocation did not provide its exact abort signal',
+          );
+        }
         const mayStartProviderJob = toolCallMayStartProviderJob(tool.name, parsedInput);
-        const ac = new AbortController();
+        const ac = hostOwnedSignal ? undefined : new AbortController();
         const invokeDetails = withSdkParsedInputCallback(details, (validatedInput) => {
           try {
             const lease = admitDiscoveryBoundary({
@@ -3944,8 +4057,21 @@ export function wrapToolForHarness<T extends WrappableTool>(
               toolName: tool.name,
               input: validatedInput,
               callId: invokeCallId,
+              freshPlanCatalogDisclosure: freshPlanCatalogDisclosureAdmission(tool, ctx),
             });
             if (lease) bracketOutcome = { ...bracketOutcome, discovery: lease };
+            // Structural carriers still have gates and routing ahead of them;
+            // their terminal inner tool owns this edge. For every actual SDK
+            // body, this callback is the one point after schema parsing and all
+            // harness admission but before execute begins.
+            if (ownsTerminalPhysicalDispatch) {
+              requireHostToolInvocationTerminalPhysicalDispatch();
+            } else if (!isNestedDispatchCarrier(tool.name)) {
+              hostPhysicalReserved = reserveHostToolInvocationPhysicalDispatch({
+                toolName: tool.name,
+                args: validatedInput,
+              });
+            }
           } catch (error) {
             deferredDiscoveryAdmissionError = error;
             throw error;
@@ -3959,7 +4085,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
           toolName: tool.name,
           settlementNonce,
         }, () => originalInvoke.call(tt, runContext, input, invokeDetails)));
-        const work = runWithToolAbortSignal(ac.signal, start);
+        const work = runWithToolAbortSignal(hostOwnedSignal ?? ac!.signal, start);
+        if (hostOwnedSignal) return work;
         if (mayStartProviderJob) {
           // The harness stops WAITING on it; the promise keeps living so its
           // late completion can self-park. Swallow its settlement so a late
@@ -3974,7 +4101,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             isPaused: isPausedFactory(ctx?.sessionId),
             onTimeout: () => {
               if (mayStartProviderJob) return;
-              ac.abort(new ToolTimeout(tool.name, timeoutMs));
+              ac!.abort(new ToolTimeout(tool.name, timeoutMs));
             },
           },
         );
@@ -3998,6 +4125,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
         throw err;
       }
       invokePromise = invokePromise.then((result) => {
+        if (ctx?.hostOwnsToolDeadlineAndSettlement) {
+          // The host may already have durably stopped this generation. Do not
+          // let a late local return park output, publish progress or settle a
+          // write after that boundary.
+          assertDispatchLeaseCurrent(ctx.dispatchLease);
+        }
         // The SDK's default error function converts a parser-callback throw to
         // a string result. Restore the harness's specific recoverable denial,
         // while preserving the decisive fact that execute/provider code never
@@ -4007,10 +4140,22 @@ export function wrapToolForHarness<T extends WrappableTool>(
           if (soft !== null) return soft;
           throw deferredDiscoveryAdmissionError;
         }
+        if (hostPhysicalReserved) {
+          settleHostToolInvocationPhysicalDispatch('returned');
+        }
+        const returnedToolSucceeded = toolOutputLooksSuccessful(result);
+        // A carrier/nested dispatcher owns the interpretation of its transport
+        // envelope. When that boundary has already classified a returned value
+        // as failure, preserve the nominal verdict in settlement instead of
+        // reclassifying the serialized error as successful local work. Direct
+        // tools stay byte-oriented: a read_file payload beginning with "ERROR"
+        // is still data unless its own lane supplies a typed failure.
+        const carrierReturnedFailure = !returnedToolSucceeded
+          && (tool.name === 'call_tool' || tool.name === 'work_call' || ctx?.nestedDispatch === true);
         settleDiscoveryBoundary(
           bracketOutcome?.discovery,
-          toolOutputLooksSuccessful(result) ? 'succeeded' : 'failed',
-          toolOutputLooksSuccessful(result) ? undefined : 'provider_returned_failure',
+          returnedToolSucceeded ? 'succeeded' : 'failed',
+          returnedToolSucceeded ? undefined : 'provider_returned_failure',
         );
         const shellOutcome = tool.name === 'run_shell_command'
           ? takeShellExecutionOutcome(invokeCallId)
@@ -4022,6 +4167,27 @@ export function wrapToolForHarness<T extends WrappableTool>(
           compactResult: result,
           settlementNonce,
         });
+        const hostSignals = {
+          ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
+          ...(carrierReturnedFailure ? { executionFailed: true } : {}),
+          ...(bracketOutcome?.carrierMalformed
+            ? {
+                preDispatch: true,
+                argumentValidationFailed: true,
+                schemaAvailable: true,
+              }
+            : {}),
+        };
+        if (ctx?.hostOwnsToolDeadlineAndSettlement) {
+          noteHostToolInvocationObservation({
+            result: exactEvidenceResult,
+            resultPresent: true,
+            signals: hostSignals,
+            mutating: isMutatingExternalWrite(tool.name, parsedInput),
+            businessCall: bracketOutcome?.discovery == null
+              && actionTopologyRoleForRuntimeCall(tool.name, parsedInput) === 'business',
+          });
+        }
         // Every lane ends here or in its own equivalent; this is the shared one.
         // A business call that returned is where the task's next requirement
         // becomes new, and where a candidate that eliminated itself gives the
@@ -4034,25 +4200,18 @@ export function wrapToolForHarness<T extends WrappableTool>(
             lane: 'agents_runner',
             toolName: tool.name,
             callId: invokeCallId,
+            ...(ctx?.dispatchLease ? { dispatchLease: ctx.dispatchLease } : {}),
             args: logicalContractArgs,
             mutating: isMutatingExternalWrite(tool.name, parsedInput),
-            businessCall: bracketOutcome?.discovery == null,
+            businessCall: bracketOutcome?.discovery == null
+              && actionTopologyRoleForRuntimeCall(tool.name, parsedInput) === 'business',
             // Settlement consumes the exact nonce-scoped bytes, not the
             // model-facing digest. If the durable cap was crossed this value
             // is a typed TruncatedToolOutputResult, never a successful prefix.
             result: exactEvidenceResult,
-            ...((shellOutcome || bracketOutcome?.carrierMalformed)
+            ...((shellOutcome || bracketOutcome?.carrierMalformed || carrierReturnedFailure)
               ? {
-                  signals: {
-                    ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
-                    ...(bracketOutcome?.carrierMalformed
-                      ? {
-                          preDispatch: true,
-                          argumentValidationFailed: true,
-                          schemaAvailable: true,
-                        }
-                      : {}),
-                  },
+                  signals: hostSignals,
                 }
               : {}),
           });
@@ -4109,6 +4268,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
         }
         return outwardResult;
       }, (err) => {
+        if (ctx?.hostOwnsToolDeadlineAndSettlement) {
+          assertDispatchLeaseCurrent(ctx.dispatchLease);
+        }
+        if (hostPhysicalReserved) {
+          settleHostToolInvocationPhysicalDispatch('threw');
+        }
         settleDiscoveryBoundary(
           bracketOutcome?.discovery,
           err instanceof ToolTimeout ? 'timed_out' : 'failed',
@@ -4117,6 +4282,26 @@ export function wrapToolForHarness<T extends WrappableTool>(
         const shellOutcome = tool.name === 'run_shell_command'
           ? takeShellExecutionOutcome(invokeCallId)
           : undefined;
+        const hostSignals = {
+          ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
+          ...(bracketOutcome?.carrierMalformed
+            ? {
+                preDispatch: true,
+                argumentValidationFailed: true,
+                schemaAvailable: true,
+              }
+            : err instanceof ToolTimeout ? { errorName: 'TimeoutError' } : {}),
+        };
+        if (ctx?.hostOwnsToolDeadlineAndSettlement) {
+          noteHostToolInvocationObservation({
+            thrown: err,
+            thrownPresent: true,
+            signals: hostSignals,
+            mutating: isMutatingExternalWrite(tool.name, parsedInput),
+            businessCall: bracketOutcome?.discovery == null
+              && actionTopologyRoleForRuntimeCall(tool.name, parsedInput) === 'business',
+          });
+        }
         // The rejection path settles too. Only the RETURN path did, so a tool
         // that threw left the task holding a spent budget and no reason.
         if (wrapperMustSettleLogicalCall(ctx)) {
@@ -4127,22 +4312,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
             lane: 'agents_runner',
             toolName: tool.name,
             callId: invokeCallId,
+            ...(ctx?.dispatchLease ? { dispatchLease: ctx.dispatchLease } : {}),
             args: logicalContractArgs,
             mutating: isMutatingExternalWrite(tool.name, parsedInput),
-            businessCall: bracketOutcome?.discovery == null,
+            businessCall: bracketOutcome?.discovery == null
+              && actionTopologyRoleForRuntimeCall(tool.name, parsedInput) === 'business',
             thrown: err,
             ...((shellOutcome || bracketOutcome?.carrierMalformed || err instanceof ToolTimeout)
               ? {
-                  signals: {
-                    ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
-                    ...(bracketOutcome?.carrierMalformed
-                      ? {
-                          preDispatch: true,
-                          argumentValidationFailed: true,
-                          schemaAvailable: true,
-                        }
-                      : err instanceof ToolTimeout ? { errorName: 'TimeoutError' } : {}),
-                  },
+                  signals: hostSignals,
                 }
               : {}),
           });
@@ -4231,11 +4409,18 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // Deliver the fan-out nudge INTO the model's view: append it to a
       // string result. (Non-string results skip the nudge rather than risk
       // corrupting a structured payload — the next serial call will re-fire.)
+      // SPILL TAIL (COMPOUNDING wave, Move 4.3): any wrapped tool that did
+      // not self-format gets the same recallable clip every local tool gets —
+      // exact bytes parked with a locator, head/tail digest in context. A
+      // tool that already ran formatRecallableToolText passes through
+      // untouched (under-cap text is byte-identical by contract).
+      const spillClip = (value: unknown): unknown =>
+        typeof value === 'string' ? formatRecallableToolText(value) : value;
       if (fanoutNudge) {
         const result = await invokePromise;
-        return typeof result === 'string' ? `${result}\n\n${fanoutNudge}` : result;
+        return typeof result === 'string' ? `${spillClip(result)}\n\n${fanoutNudge}` : result;
       }
-      return invokePromise;
+      return invokePromise.then(spillClip);
       };
       if (ctx?.sessionId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0) {
         return withLogicalToolCall(
@@ -4251,7 +4436,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
       }
       return invokeBody();
     };
-    return { ...tool, invoke: wrappedInvoke } as T;
+    const wrapped = { ...tool, invoke: wrappedInvoke } as T;
+    copyHostWorkCallPreparer(tool, wrapped);
+    copyTerminalPhysicalDispatchOwnership(tool, wrapped);
+    return attestHarnessBoundTool(wrapped) as T;
   }
 
   // LEGACY PATH — plain-object tool with execute only (tests, fixtures).
@@ -4363,7 +4551,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
       throw err;
     }
     let result: unknown;
+    let hostPhysicalReserved = false;
     try {
+      if (ownsTerminalPhysicalDispatch) {
+        requireHostToolInvocationTerminalPhysicalDispatch();
+      } else if (!isNestedDispatchCarrier(tool.name)) {
+        hostPhysicalReserved = reserveHostToolInvocationPhysicalDispatch({
+          toolName: tool.name,
+          args: input,
+        });
+      }
       // S3 abort-on-timeout (legacy execute twin — mirrors the invoke path above).
       const ac = new AbortController();
       const start = () => Promise.resolve(withToolOutputContext({
@@ -4385,6 +4582,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
         },
       );
     } catch (err) {
+      if (hostPhysicalReserved) {
+        settleHostToolInvocationPhysicalDispatch('threw');
+      }
       settleDiscoveryBoundary(
         bracketOutcome?.discovery,
         err instanceof ToolTimeout ? 'timed_out' : 'failed',
@@ -4401,9 +4601,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
           lane: 'agents_runner',
           toolName: tool.name,
           callId: executeCallId,
+          ...(ctx?.dispatchLease ? { dispatchLease: ctx.dispatchLease } : {}),
           args: input,
           mutating: isMutatingExternalWrite(tool.name, input),
-          businessCall: bracketOutcome?.discovery == null,
+          businessCall: bracketOutcome?.discovery == null
+            && actionTopologyRoleForRuntimeCall(tool.name, input) === 'business',
           thrown: err,
           ...((shellOutcome || bracketOutcome?.carrierMalformed || err instanceof ToolTimeout)
             ? {
@@ -4447,10 +4649,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (soft !== null) return soft;
       throw err;
     }
+    if (hostPhysicalReserved) {
+      settleHostToolInvocationPhysicalDispatch('returned');
+    }
+    const returnedToolSucceeded = toolOutputLooksSuccessful(result);
+    const carrierReturnedFailure = !returnedToolSucceeded
+      && (tool.name === 'call_tool' || tool.name === 'work_call' || ctx?.nestedDispatch === true);
     settleDiscoveryBoundary(
       bracketOutcome?.discovery,
-      toolOutputLooksSuccessful(result) ? 'succeeded' : 'failed',
-      toolOutputLooksSuccessful(result) ? undefined : 'provider_returned_failure',
+      returnedToolSucceeded ? 'succeeded' : 'failed',
+      returnedToolSucceeded ? undefined : 'provider_returned_failure',
     );
     const shellOutcome = tool.name === 'run_shell_command'
       ? takeShellExecutionOutcome(executeCallId)
@@ -4470,16 +4678,19 @@ export function wrapToolForHarness<T extends WrappableTool>(
         lane: 'agents_runner',
         toolName: tool.name,
         callId: executeCallId,
+        ...(ctx?.dispatchLease ? { dispatchLease: ctx.dispatchLease } : {}),
         args: input,
         mutating: isMutatingExternalWrite(tool.name, input),
-        businessCall: bracketOutcome?.discovery == null,
+        businessCall: bracketOutcome?.discovery == null
+          && actionTopologyRoleForRuntimeCall(tool.name, input) === 'business',
         // Execute-path twin of the invoke seam above: durable evidence is the
         // exact invocation result (or typed truncation), never presentation.
         result: exactEvidenceResult,
-        ...((shellOutcome || bracketOutcome?.carrierMalformed)
+        ...((shellOutcome || bracketOutcome?.carrierMalformed || carrierReturnedFailure)
           ? {
               signals: {
                 ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
+                ...(carrierReturnedFailure ? { executionFailed: true } : {}),
                 ...(bracketOutcome?.carrierMalformed
                   ? {
                       preDispatch: true,
@@ -4547,7 +4758,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
     }
     return executeBody();
   };
-  return { ...tool, execute: wrappedExecute };
+  const wrapped = { ...tool, execute: wrappedExecute } as T;
+  copyTerminalPhysicalDispatchOwnership(tool, wrapped);
+  return attestHarnessBoundTool(wrapped) as T;
 }
 
 /** A recoverable gate throw → the recovery string surfaced to the model as the

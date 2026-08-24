@@ -12,6 +12,7 @@ import {
   type ChatSession,
 } from './lib/api';
 import { CONNECTION_EVENT, connectionDoor, haptic, parkOriginHandoff, type ConnectionDoor } from './lib/native-bridge';
+import { authBootstrapMode } from './lib/auth-bootstrap';
 import { Login } from './screens/Login';
 import { Home } from './screens/Home';
 import { Activity } from './screens/Activity';
@@ -51,7 +52,11 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    refreshAuth();
+    // A pairing/adoption request replaces the session cookie and installs its
+    // matching in-memory fingerprint. Do not race it with a status request
+    // carrying the previous cookie: a late old response makes the next device
+    // proof fail even though the credential ceremony itself succeeded.
+    if (authBootstrapMode(window.location.search) === 'status') void refreshAuth();
     const handler = () => setAuthStatus((s) => s ? { ...s, authenticated: false } : s);
     window.addEventListener('clem:needs-login', handler);
     return () => window.removeEventListener('clem:needs-login', handler);
@@ -75,6 +80,7 @@ export function App() {
   // `?adopt=`; spending it mints the same device's session at this origin.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    if (authBootstrapMode(window.location.search) !== 'adopt') return;
     const token = params.get('adopt');
     if (!token) return;
     let cancelled = false;
@@ -119,6 +125,7 @@ export function App() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    if (authBootstrapMode(window.location.search) !== 'pair') return;
     const token = params.get('pair');
     if (!token) return;
     let cancelled = false;

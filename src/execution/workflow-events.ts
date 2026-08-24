@@ -20,6 +20,7 @@ import type {
   StepOutputArtifactReference,
 } from './workflow-run-workspace.js';
 import { isOperationalEventType, recordOperationalEvent, type OperationalEventSeverity, type OperationalEventSource, type OperationalEventType } from '../runtime/operational-telemetry.js';
+import { scanWorkflowRunRecordSnapshot } from './workflow-run-record.js';
 
 /**
  * Append-only event log per workflow run — the durability layer.
@@ -55,6 +56,7 @@ import { isOperationalEventType, recordOperationalEvent, type OperationalEventSe
 export type WorkflowEventKind =
   | 'run_started'         // workflow run kicked off
   | 'run_completed'       // workflow finished successfully
+  | 'run_blocked'         // workflow reached an explained blocked terminal
   | 'run_failed'          // workflow halted with an error
   | 'run_cancelled'       // workflow was abandoned by the user/operator
   | 'run_paused'          // explicit pause (approval gate, user pause)
@@ -62,6 +64,8 @@ export type WorkflowEventKind =
   | 'run_summary'         // structured "succeeded because X + artifacts (files/URLs/counts)" at completion
   | 'step_started'        // single-shot or container step started
   | 'step_completed'      // step finished — output is the final result
+  | 'step_blocked'        // step reached an explained blocked terminal
+  | 'step_paused'         // exact source remains owned by peer/recovery
   | 'step_failed'         // step errored
   | 'step_retry'          // step failed transiently; retrying after backoff
   | 'step_loop_retry'     // loopUntil: output contract failed; re-running with evidence
@@ -518,7 +522,7 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
 
   for (const ev of events) {
     lastEventAt = ev.t;
-    if (ev.kind === 'run_completed' || ev.kind === 'run_failed' || ev.kind === 'run_cancelled') {
+    if (ev.kind === 'run_completed' || ev.kind === 'run_blocked' || ev.kind === 'run_failed' || ev.kind === 'run_cancelled') {
       terminal = true;
     }
     if (ev.kind === 'step_started' && ev.stepId) {
@@ -532,7 +536,7 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
       // mid-flight), not a park — so it must NOT be exempted from the guard.
       failedSteps.delete(ev.stepId);
     }
-    if (ev.kind === 'step_failed' && ev.stepId) {
+    if ((ev.kind === 'step_failed' || ev.kind === 'step_blocked') && ev.stepId) {
       failedSteps.add(ev.stepId);
     }
     if ((ev.kind === 'step_completed' || ev.kind === 'step_skipped') && ev.stepId) {
@@ -712,17 +716,14 @@ export interface PendingRun {
   runStatus?: string;
 }
 
-const TERMINAL_RUN_RECORD_STATUSES = new Set(['completed', 'error', 'cancelled', 'dry_run']);
+const TERMINAL_RUN_RECORD_STATUSES = new Set(['completed', 'completed_with_errors', 'blocked', 'error', 'failed', 'cancelled', 'dry_run']);
 
 function readRunRecordStatus(runId: string): string | undefined {
   const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
-  if (!existsSync(file)) return undefined;
-  try {
-    const raw = JSON.parse(readFileSync(file, 'utf-8')) as { status?: unknown };
-    return typeof raw.status === 'string' ? raw.status : undefined;
-  } catch {
-    return undefined;
-  }
+  const scan = scanWorkflowRunRecordSnapshot<{ status?: unknown }>(file);
+  return scan.status === 'ok' && typeof scan.record.status === 'string'
+    ? scan.record.status
+    : undefined;
 }
 
 function terminalRunRecordStatus(runId: string): boolean {
@@ -732,21 +733,21 @@ function terminalRunRecordStatus(runId: string): boolean {
   // missing as terminal so a reaped run with a lingering events.jsonl doesn't
   // get "resumed" as a phantom on every boot (the May-29 trio symptom). Was
   // `return false`, which made every reaped run look permanently pending.
-  if (!existsSync(file)) return true;
-  try {
-    const raw = JSON.parse(readFileSync(file, 'utf-8')) as { status?: unknown; finishedAt?: unknown };
-    if (typeof raw.status !== 'string') return false;
-    if (TERMINAL_RUN_RECORD_STATUSES.has(raw.status)) return true;
-    // A creation_test (workflow-shape validation) is a one-shot check, not a
-    // resumable run. Once it has FINISHED it must not resurface as pending/in-flight
-    // on the board or in the boot "Resuming N in-flight" loop — the 2026-06-19
-    // clem-smoke-flow zombies (9 finished creation_tests painted QUEUED / RUNNING=0,
-    // re-"resumed" every boot, never reaped because they aren't a terminal status).
-    if (raw.status === 'creation_test' && typeof raw.finishedAt === 'string') return true;
-    return false;
-  } catch {
-    return false;
-  }
+  const scan = scanWorkflowRunRecordSnapshot<{ status?: unknown; finishedAt?: unknown }>(file);
+  // Missing was already terminal here. Busy and corrupt are equally
+  // non-resumable for this inventory tick; the canonical recovery sweep owns
+  // their retry/quarantine instead of painting a phantom live run.
+  if (scan.status !== 'ok') return true;
+  const raw = scan.record;
+  if (typeof raw.status !== 'string') return false;
+  if (TERMINAL_RUN_RECORD_STATUSES.has(raw.status)) return true;
+  // A creation_test (workflow-shape validation) is a one-shot check, not a
+  // resumable run. Once it has FINISHED it must not resurface as pending/in-flight
+  // on the board or in the boot "Resuming N in-flight" loop — the 2026-06-19
+  // clem-smoke-flow zombies (9 finished creation_tests painted QUEUED / RUNNING=0,
+  // re-"resumed" every boot, never reaped because they aren't a terminal status).
+  if (raw.status === 'creation_test' && typeof raw.finishedAt === 'string') return true;
+  return false;
 }
 
 /** Authored catalog workflow slugs that have a runs/ directory — the set the

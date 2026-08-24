@@ -19,7 +19,10 @@ export function isTerminalEvent(type: string): boolean {
     type === 'conversation_completed' ||
     type === 'run_failed' ||
     type === 'awaiting_user_input' ||
-    type === 'approval_requested'
+    type === 'approval_requested' ||
+    // Host-owned workflow dispatch: the foreground turn is the ACK. The
+    // workflow's later conversation_completed arrives on the late watch.
+    type === 'async_work_dispatched'
   );
 }
 
@@ -434,12 +437,20 @@ export function subscribeDelegatedActivity(
   const connect = () => {
     if (closed) return;
     es = new EventSource(withToken(`/api/sessions/${encodeURIComponent(sessionId)}/events`));
+    const handleForeign = (ev: HarnessEvent) => {
+      if (!ev || typeof ev.type !== 'string') return;
+      if (!ev.sessionId || ev.sessionId === sessionId) return; // own-turn frames belong to the turn stream
+      onEvent(ev);
+    };
+    es.addEventListener('replay', (e) => {
+      try {
+        const payload = JSON.parse((e as MessageEvent).data) as { events?: HarnessEvent[] };
+        for (const ev of payload.events ?? []) handleForeign(ev);
+      } catch { /* malformed frame — skip */ }
+    });
     es.addEventListener('event', (e) => {
       try {
-        const ev = JSON.parse((e as MessageEvent).data) as HarnessEvent;
-        if (!ev || typeof ev.type !== 'string') return;
-        if (!ev.sessionId || ev.sessionId === sessionId) return; // own-turn frames belong to the turn stream
-        onEvent(ev);
+        handleForeign(JSON.parse((e as MessageEvent).data) as HarnessEvent);
       } catch { /* malformed frame — skip */ }
     });
     es.onerror = () => {

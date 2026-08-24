@@ -1,7 +1,7 @@
 /**
  * THIS-TURN CATALOG from CONNECTED reality.
  *
- * Live 2026-08-19 sess-mt05r35h: the admitted collect_then_construct starved
+ * Live 2026-08-19 session-fixture-catalog-starvation: the admitted collect_then_construct starved
  * twice on the same input defect. The admission-time prover was
  * `resolveTurnCapabilities` — a RECALL matcher — so a fresh session offered
  * cross-goal recency (Slack cron, DataForSEO keywords-for-site, ADD_SHEET)

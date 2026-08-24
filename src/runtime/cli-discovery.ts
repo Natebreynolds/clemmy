@@ -143,8 +143,7 @@ export function scanPath(): { command: string; path: string }[] {
       try {
         const st = statSync(full);
         if (!st.isFile()) continue;
-        // Executable bit set for anyone.
-        if (!(st.mode & 0o111)) continue;
+        if (!statLooksExecutable(st, full)) continue;
         seen.set(entry, full);
       } catch {
         continue;
@@ -191,7 +190,7 @@ export async function scanPathAsync(): Promise<{ command: string; path: string }
         const full = path.join(dir, entry);
         try {
           const details = await stat(full);
-          return details.isFile() && Boolean(details.mode & 0o111)
+          return details.isFile() && statLooksExecutable(details, full)
             ? { command: entry, path: full }
             : null;
         } catch {
@@ -412,6 +411,40 @@ const DEVELOPER_TOOL_BACKING_DIRS = [
   '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin',
 ];
 
+
+/** Windows has no execute bit: executability is extension membership in
+ *  PATHEXT (.EXE/.CMD/.BAT/...). On POSIX it is `mode & 0o111`. One predicate
+ *  so every scanner and resolver agrees — without it, all four PATH walkers
+ *  returned ZERO executables on win32 and the whole CLI surface looked empty. */
+const WINDOWS_PATHEXT: ReadonlySet<string> = new Set(
+  (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD;.PS1')
+    .split(';')
+    .map((ext) => ext.trim().toUpperCase())
+    .filter((ext) => ext.startsWith('.')),
+);
+
+function statLooksExecutable(st: { mode: number }, filePath: string): boolean {
+  if (process.platform === 'win32') {
+    return WINDOWS_PATHEXT.has(path.extname(filePath).toUpperCase());
+  }
+  return Boolean(st.mode & 0o111);
+}
+
+/** Candidate spellings for `command` in one PATH dir: the bare name on POSIX;
+ *  on win32 the bare name (when it already carries a PATHEXT extension) plus
+ *  each PATHEXT expansion, in PATHEXT order — matching cmd.exe resolution. */
+function commandCandidatesInDir(dir: string, command: string): string[] {
+  if (process.platform !== 'win32') return [path.join(dir, command)];
+  const candidates: string[] = [];
+  if (WINDOWS_PATHEXT.has(path.extname(command).toUpperCase())) {
+    candidates.push(path.join(dir, command));
+  }
+  for (const ext of WINDOWS_PATHEXT) {
+    candidates.push(path.join(dir, command + ext.toLowerCase()));
+  }
+  return candidates;
+}
+
 export type SafeCliProbe =
   | { skipped: false; command: string; path: string }
   | { skipped: true; command: string; path: string; reason: string };
@@ -419,7 +452,7 @@ export type SafeCliProbe =
 function executableFile(candidate: string): boolean {
   try {
     const st = statSync(candidate);
-    return st.isFile() && Boolean(st.mode & 0o111);
+    return st.isFile() && statLooksExecutable(st, candidate);
   } catch {
     return false;
   }
@@ -615,12 +648,13 @@ function whichOnPath(command: string): string | undefined {
   // shell-exec seam can actually run on a packaged .app.
   const PATH = augmentPath(process.env.PATH);
   for (const dir of PATH.split(path.delimiter).filter(Boolean)) {
-    const candidate = path.join(dir, command);
-    try {
-      const st = statSync(candidate);
-      if (st.isFile() && (st.mode & 0o111)) return candidate;
-    } catch {
-      continue;
+    for (const candidate of commandCandidatesInDir(dir, command)) {
+      try {
+        const st = statSync(candidate);
+        if (st.isFile() && statLooksExecutable(st, candidate)) return candidate;
+      } catch {
+        continue;
+      }
     }
   }
   return undefined;
@@ -658,6 +692,14 @@ async function performFullScan(opts: { concurrency?: number } = {}): Promise<Cli
     scannedAt: new Date().toISOString(),
   };
   await writeCachedScan(result);
+  // CONNECT-TIME INDEXING. Every path that refreshes the inventory (boot warm,
+  // the console scan button, post-install invalidation) lands here, so this is
+  // the one place a newly installed CLI becomes a retrievable capability — and
+  // where one that left $PATH stops being one.
+  try {
+    const { indexDiscoveredClis, scheduleLocalCapabilityIndex } = await import('./local-capability-enumeration.js');
+    scheduleLocalCapabilityIndex(async () => { indexDiscoveredClis(result.clis); });
+  } catch { /* indexing never blocks discovery */ }
   return result;
 }
 

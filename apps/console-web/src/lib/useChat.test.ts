@@ -3,16 +3,20 @@ import assert from 'node:assert/strict';
 import {
   ChatPostCancelledError,
   appendLiveApprovalCard,
+  applyBridgedWorkflowActivity,
   chatApprovalReply,
   createInboxOutcomeCursor,
   createInboxOutcomeDeliveryState,
   inboxOutcomeCursorForSession,
   mergePendingActionHydration,
   postPendingChatWithRetry,
+  progressLabel,
   reduceActivity,
   retainPendingChatPost,
   terminalCompletionPresentation,
+  workflowStepLabelFromSession,
   type ActivityItem,
+  type ChatMessage,
 } from './useChat';
 import {
   cancelPendingChatRequest,
@@ -391,6 +395,140 @@ test('stop during retry backoff prevents another POST attempt', async () => {
 
   await assert.rejects(post, (error: Error) => error.name === 'AbortError');
   assert.equal(calls, 1);
+});
+
+test('reduceActivity upserts the host work-plan as the work happening, not a blocked queue', () => {
+  let activity = reduceActivity([], ev('expected_work_progress', {
+    version: 1,
+    sourceUserSeq: 4,
+    lines: [
+      { id: 'n5:retrieve', effect: 'read', state: 'open', settled: 0, observed: 0, required: 1, dependsOn: [] },
+      { id: 'n6:execute', effect: 'external_write', state: 'blocked_on_dependency', settled: 0, observed: 0, required: 1, dependsOn: ['n5:retrieve'] },
+    ],
+  }));
+  assert.equal(activity.length, 1);
+  assert.equal(activity[0]?.label, 'Looking this up');
+
+  activity = reduceActivity(activity, ev('expected_work_progress', {
+    version: 1,
+    sourceUserSeq: 4,
+    lines: [
+      { id: 'n5:retrieve', effect: 'read', state: 'data_in', settled: 0, observed: 1, required: 1, dependsOn: [] },
+      { id: 'n6:execute', effect: 'external_write', state: 'open', settled: 0, observed: 0, required: 1, dependsOn: ['n5:retrieve'] },
+    ],
+  }));
+  assert.equal(activity.length, 2, 'the card updates in place, it does not append a second board');
+  assert.equal(activity[0]?.label, 'Looked this up');
+  assert.equal(activity[0]?.tone, 'success');
+  assert.equal(activity[1]?.label, 'Writing');
+});
+
+test('reduceActivity paints a host-dispatched workflow as live background work', () => {
+  const next = reduceActivity([], ev('async_work_dispatched', {
+    dispatchKey: 'workflow_source_group:abc:def',
+    runIds: ['1786721689090-4af5e4'],
+    text: 'Started — I’ll post the result here when it’s ready.',
+  }));
+  assert.equal(next.length, 1);
+  assert.equal(next[0]?.kind, 'event');
+  assert.equal(next[0]?.status, 'running');
+  assert.match(next[0]?.label ?? '', /started the workflow/i);
+});
+
+test('applyBridgedWorkflowActivity paints step tools onto the dispatched ACK bubble', () => {
+  assert.equal(workflowStepLabelFromSession('workflow:1786726670475-33ef31:find_official_page'), 'find official page');
+  const seeded = reduceActivity([], ev('async_work_dispatched', {
+    dispatchKey: 'workflow_source_group:abc:def',
+    runIds: ['1786726670475-33ef31'],
+  }));
+  const messages: ChatMessage[] = [{
+    id: 'ack-1',
+    role: 'assistant',
+    text: 'Started — I’ll post the result here when it’s ready.',
+    status: 'complete',
+    activity: seeded,
+  }];
+  const next = applyBridgedWorkflowActivity(messages, {
+    seq: 10,
+    turn: 1,
+    role: 'agent',
+    type: 'tool_called',
+    sessionId: 'workflow:1786726670475-33ef31:find_official_page',
+    data: { tool: 'web_search', callId: 'c1' },
+  });
+  assert.notEqual(next, messages);
+  assert.equal(next[0]?.status, 'complete', 'ACK stays complete — the strip goes live instead');
+  assert.equal(next[0]?.workflowLive, true);
+  assert.ok(next[0]?.activity?.some((row) => row.id.startsWith('wf-step-')));
+  assert.ok(next[0]?.activity?.some((row) => row.kind === 'tool' && row.status === 'running'));
+  assert.match(next[0]?.progress ?? '', /web search|find official page/i);
+});
+
+test('reduceActivity never pins a compiled-graph plan row', () => {
+  const prev: ActivityItem[] = [];
+  const next = reduceActivity(prev, ev('turn_graph_compiled', {
+    route: 'retrieve',
+    fastPath: 'single_retrieval',
+    nodeCount: 10,
+  }));
+  assert.equal(next, prev, 'same array — nothing to render');
+  assert.equal(next.length, 0);
+});
+
+test('progressLabel names the live work, not the compiled topology', () => {
+  assert.equal(
+    progressLabel(ev('turn_graph_compiled', { route: 'retrieve', fastPath: 'single_retrieval', nodeCount: 10 })),
+    'Looking this up…',
+  );
+  assert.equal(
+    progressLabel(ev('turn_graph_compiled', { route: 'direct_reply', fastPath: 'direct_reply', nodeCount: 6 })),
+    null,
+    'a reply stays on Thinking… — no fake plan beat',
+  );
+  assert.equal(
+    progressLabel(ev('turn_graph_compiled', { route: 'act', fastPath: 'fanout_action', nodeCount: 11 })),
+    'Working on several things…',
+  );
+  assert.equal(
+    progressLabel(ev('turn_graph_compiled', { route: 'act', fastPath: 'single_action', nodeCount: 8 })),
+    'Getting started…',
+  );
+  assert.equal(
+    progressLabel(ev('async_work_dispatched', {
+      text: 'Started — I’ll post the result here when it’s ready.',
+      runIds: ['1786721689090-4af5e4'],
+    })),
+    'Started the workflow — I’ll post the result here.',
+  );
+  assert.equal(
+    progressLabel(ev('expected_work_progress', {
+      lines: [
+        { id: 'n5:retrieve', effect: 'read', state: 'open' },
+        { id: 'n6:execute', effect: 'external_write', state: 'blocked_on_dependency' },
+      ],
+    })),
+    'Looking this up…',
+  );
+  assert.equal(progressLabel(ev('tool_called', { tool: 'tool_search' })), 'Finding the right tool…');
+  assert.equal(
+    progressLabel(ev('tool_called', { tool: 'composio_execute_tool', publicSlug: 'OUTLOOK_LIST_MESSAGES' })),
+    'Using outlook list messages…',
+  );
+  assert.equal(
+    progressLabel(ev('tool_called', {
+      tool: 'composio_execute_tool',
+      publicSlug: 'OUTLOOK_SEND_EMAIL',
+      args: JSON.stringify({ to: 'sam@pine.example' }),
+    })),
+    'Using outlook send email · sam@pine.example',
+  );
+  assert.equal(
+    progressLabel(ev('tool_returned', {
+      tool: 'sf',
+      glimpse: { count: 12, key: 'records' },
+    })),
+    'Got 12 records',
+  );
 });
 
 test('reduceActivity pairs overlapping same-name tool calls by callId when present', () => {

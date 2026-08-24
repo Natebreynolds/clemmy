@@ -241,7 +241,7 @@ test('the same unverified-but-complete shape delivers identically through both b
     events: eventlog.listEvents(standard.id).map((event) => ({ type: event.type, data: event.data })),
   }));
   assert.equal(claudeRepairCalls, 1);
-  assert.equal(standardResult.status, 'awaiting_user_input', 'standard result follows the durable fallback hold');
+  assert.equal(standardResult.status, 'blocked', 'standard result follows the durable fallback hold');
   assert.equal(claudeResult.stoppedReason, 'unverified', 'Claude result follows the durable fallback hold');
 
   const standardPresentation = committedPresentation(standard.id);

@@ -226,7 +226,7 @@ test('completed-work recovery candidate proposes done with a delivery concern; a
     message: 'Try the fixture without any completed work.',
     sessionId: 'respond-one-gate-no-work-candidate',
   });
-  assert.equal(noWork.stoppedReason, 'error');
+  assert.equal(noWork.stoppedReason, 'blocked');
   assert.equal(proposals[1]?.status, 'blocked');
   assert.equal(proposals[1]?.deliveryConcern, undefined);
   assert.equal(terminalStatus(onlyTerminal(noWork.sessionId)), 'blocked');
@@ -260,7 +260,7 @@ test('a recovery candidate with no successful work still proposes done, and the 
     sessionId: 'respond-one-gate-no-success',
   });
 
-  assert.equal(response.stoppedReason, 'error');
+  assert.equal(response.stoppedReason, 'blocked');
   assert.equal(proposals[0]?.status, 'done', 'the carrier proposes completion instead of owning a second veto');
   assert.equal(proposals[0]?.deliveryConcern, 'sub_agent_stalled');
   assert.equal(terminalStatus(onlyTerminal(response.sessionId)), 'blocked');
@@ -313,7 +313,7 @@ test('parse recovery after a confirmed external write never reruns and lets the 
   assert.equal(terminalStatus(terminal), 'done');
 });
 
-test('whole-turn crash recovery after a confirmed external write discloses once and transport replay cannot re-drive the brain', async () => {
+test('legacy standalone Claude reducer: a post-write crash discloses once and replay cannot re-drive the brain', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
   process.env.CLEMMY_BRAIN_FALLOVER = 'on';
@@ -324,6 +324,7 @@ test('whole-turn crash recovery after a confirmed external write discloses once 
   let harnessCalls = 0;
   let sourceUserSeq = 0;
   bridge._setBridgeImplsForTests({
+    allowStandaloneClaudeInteractiveBrainForTests: true,
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
     commitTurnOutcome: recordingCommit(proposals),
@@ -383,7 +384,7 @@ test('whole-turn crash recovery after a confirmed external write discloses once 
   assert.equal(eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
 });
 
-test('narration give-up after completed work also asks the shared rule instead of pre-converting to blocked', async () => {
+test('legacy standalone Claude reducer: narration give-up asks the shared rule instead of pre-converting to blocked', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
   process.env.CLEMMY_BRAIN_FALLOVER = 'off';
@@ -391,6 +392,7 @@ test('narration give-up after completed work also asks the shared rule instead o
   const sessionId = 'respond-one-gate-narration-work';
   let harnessCalls = 0;
   bridge._setBridgeImplsForTests({
+    allowStandaloneClaudeInteractiveBrainForTests: true,
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
     commitTurnOutcome: recordingCommit(proposals),

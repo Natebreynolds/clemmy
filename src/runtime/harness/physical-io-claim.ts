@@ -15,6 +15,8 @@ import {
   parseCanonicalOwnerFence,
 } from './canonical-graph-node-lease.js';
 import type { ResolvedCallAuthorityV1 } from './resolved-call-authority.js';
+import { workflowReadOnlyPhysicalClaimAttestationMatches } from './accepted-turn-call-authority.js';
+import { workflowReadPagePhysicalClaimAttestationMatches } from './workflow-paginated-read-authority.js';
 
 export interface PhysicalIoClaimIdentity {
   sessionId: string;
@@ -156,4 +158,228 @@ export function claimPhysicalIo(input: {
     return changes === 1 ? { claimed: true } : { claimed: false, reason: 'already_claimed' };
   }).immediate();
   return outcome;
+}
+
+/**
+ * Workflow read-only I/O claim.
+ *
+ * This deliberately does not pretend a workflow activation owns a graph lease.
+ * The exact immutable activation/root plus its unforgeable ALS proof is the
+ * owner; the same physical row CAS remains the one provider-I/O linearization
+ * point. Graph claim bytes and lease behavior above remain untouched.
+ */
+export function claimWorkflowPhysicalIo(input: {
+  identity: PhysicalIoClaimIdentity & {
+    authorityRootId: string;
+    logicalCallId: string;
+  };
+  activationId: string;
+  activationDigest: string;
+  authorityDigest: string;
+  authorityRevision: number;
+  toolName: string;
+}): PhysicalIoClaimResult {
+  const { identity } = input;
+  if (!workflowReadOnlyPhysicalClaimAttestationMatches({
+    sessionId: identity.sessionId,
+    sourceEventSeq: identity.sourceUserSeq,
+    authorityRootId: identity.authorityRootId,
+    activationId: input.activationId,
+    activationDigest: input.activationDigest,
+    authorityDigest: input.authorityDigest,
+    authorityRevision: input.authorityRevision,
+    logicalCallId: identity.logicalCallId,
+    physicalToolName: input.toolName,
+  })) return { claimed: false, reason: 'authority_mismatch' };
+
+  const db = openEventLog();
+  const claimedAt = new Date().toISOString();
+  return db.transaction((): PhysicalIoClaimResult => {
+    const row = db.prepare(`
+      SELECT p.accepted_task_id, p.logical_tool_call_id, p.tool_name,
+             p.state AS physical_state, p.io_claimed_at,
+             a.authority_kind, a.authority_digest, a.revision,
+             a.state AS authority_state, a.workflow_activation_id,
+             a.workflow_activation_digest, a.workflow_logical_call_id,
+             a.workflow_node_attempt,
+             w.authority_root_id, w.logical_call_id AS activation_logical_call_id
+        FROM physical_dispatches p
+        JOIN accepted_turn_call_authorities a
+          ON a.session_id = p.session_id
+         AND a.source_user_seq = p.source_user_seq
+        JOIN workflow_node_invocation_activations w
+          ON w.activation_id = a.workflow_activation_id
+       WHERE p.session_id = ? AND p.source_user_seq = ?
+         AND p.physical_dispatch_id = ?
+    `).get(
+      identity.sessionId,
+      identity.sourceUserSeq,
+      identity.physicalDispatchId,
+    ) as {
+      accepted_task_id: string;
+      logical_tool_call_id: string;
+      tool_name: string;
+      physical_state: string;
+      io_claimed_at: string | null;
+      authority_kind: string;
+      authority_digest: string;
+      revision: number;
+      authority_state: string;
+      workflow_activation_id: string | null;
+      workflow_activation_digest: string | null;
+      workflow_logical_call_id: string | null;
+      workflow_node_attempt: number | null;
+      authority_root_id: string;
+      activation_logical_call_id: string;
+    } | undefined;
+    if (!row) return { claimed: false, reason: 'no_reservation' };
+    if (row.io_claimed_at) return { claimed: false, reason: 'already_claimed' };
+    if (
+      row.physical_state !== 'started'
+      || row.authority_kind !== 'workflow_v1_read_only'
+      || row.authority_state !== 'open'
+      || row.accepted_task_id !== identity.authorityRootId
+      || row.authority_root_id !== identity.authorityRootId
+      || row.logical_tool_call_id !== identity.logicalCallId
+      || row.activation_logical_call_id !== identity.logicalCallId
+      || row.workflow_logical_call_id !== identity.logicalCallId
+      || row.tool_name !== input.toolName
+      || row.workflow_activation_id !== input.activationId
+      || row.workflow_activation_digest !== input.activationDigest
+      || row.authority_digest !== input.authorityDigest
+      || row.revision !== input.authorityRevision
+      || !Number.isSafeInteger(row.workflow_node_attempt)
+      || (row.workflow_node_attempt ?? 0) <= 0
+    ) return { claimed: false, reason: 'authority_mismatch' };
+
+    const changes = db.prepare(`
+      UPDATE physical_dispatches
+         SET io_claimed_at = ?, io_owner = ?, io_fence = ?, io_revision = ?
+       WHERE session_id = ? AND source_user_seq = ? AND physical_dispatch_id = ?
+         AND state = 'started' AND io_claimed_at IS NULL
+    `).run(
+      claimedAt,
+      input.activationId,
+      row.workflow_node_attempt,
+      row.revision,
+      identity.sessionId,
+      identity.sourceUserSeq,
+      identity.physicalDispatchId,
+    ).changes;
+    return changes === 1 ? { claimed: true } : { claimed: false, reason: 'already_claimed' };
+  }).immediate();
+}
+
+/** Sequential page child of one workflow_v2_paginated_read activation. The
+ * page reservation and opaque ALS proof replace graph lease identity; the same
+ * physical row CAS remains the only provider-I/O linearization point. */
+export function claimWorkflowPaginatedPhysicalIo(input: {
+  identity: PhysicalIoClaimIdentity & {
+    authorityRootId: string;
+    logicalCallId: string;
+  };
+  activationId: string;
+  activationDigest: string;
+  authorityDigest: string;
+  authorityRevision: number;
+  pageOrdinal: number;
+  toolName: string;
+}): PhysicalIoClaimResult {
+  const { identity } = input;
+  if (!workflowReadPagePhysicalClaimAttestationMatches({
+    sessionId: identity.sessionId,
+    sourceEventSeq: identity.sourceUserSeq,
+    authorityRootId: identity.authorityRootId,
+    activationId: input.activationId,
+    activationDigest: input.activationDigest,
+    authorityDigest: input.authorityDigest,
+    authorityRevision: input.authorityRevision,
+    pageOrdinal: input.pageOrdinal,
+    logicalCallId: identity.logicalCallId,
+    physicalDispatchId: identity.physicalDispatchId,
+    toolName: input.toolName,
+  })) return { claimed: false, reason: 'authority_mismatch' };
+
+  const db = openEventLog();
+  const claimedAt = new Date().toISOString();
+  return db.transaction((): PhysicalIoClaimResult => {
+    const row = db.prepare(`
+      SELECT p.accepted_task_id, p.logical_tool_call_id, p.tool_name,
+             p.state AS physical_state, p.io_claimed_at,
+             a.authority_kind, a.authority_digest, a.revision,
+             a.state AS authority_state, a.workflow_activation_digest,
+             w.authority_root_id, w.activation_digest, w.node_attempt,
+             w.aggregate_state, pg.state AS page_state,
+             pg.logical_call_id AS page_logical_call_id,
+             pg.physical_dispatch_id AS page_physical_dispatch_id
+        FROM physical_dispatches p
+        JOIN accepted_turn_call_authorities a
+          ON a.session_id = p.session_id AND a.source_user_seq = p.source_user_seq
+        JOIN workflow_paginated_read_activations w
+          ON w.authority_root_id = a.accepted_task_id
+        JOIN workflow_paginated_read_pages pg
+          ON pg.activation_id = w.activation_id
+         AND pg.page_ordinal = ?
+       WHERE p.session_id = ? AND p.source_user_seq = ?
+         AND p.physical_dispatch_id = ?
+    `).get(
+      input.pageOrdinal,
+      identity.sessionId,
+      identity.sourceUserSeq,
+      identity.physicalDispatchId,
+    ) as {
+      accepted_task_id: string;
+      logical_tool_call_id: string;
+      tool_name: string;
+      physical_state: string;
+      io_claimed_at: string | null;
+      authority_kind: string;
+      authority_digest: string;
+      revision: number;
+      authority_state: string;
+      workflow_activation_digest: string | null;
+      authority_root_id: string;
+      activation_digest: string;
+      node_attempt: number;
+      aggregate_state: string;
+      page_state: string;
+      page_logical_call_id: string;
+      page_physical_dispatch_id: string;
+    } | undefined;
+    if (!row) return { claimed: false, reason: 'no_reservation' };
+    if (row.io_claimed_at) return { claimed: false, reason: 'already_claimed' };
+    if (
+      row.physical_state !== 'started'
+      || row.authority_kind !== 'workflow_v2_paginated_read'
+      || row.authority_state !== 'open'
+      || row.aggregate_state !== 'open'
+      || row.page_state !== 'reserved'
+      || row.accepted_task_id !== identity.authorityRootId
+      || row.authority_root_id !== identity.authorityRootId
+      || row.logical_tool_call_id !== identity.logicalCallId
+      || row.page_logical_call_id !== identity.logicalCallId
+      || row.page_physical_dispatch_id !== identity.physicalDispatchId
+      || row.tool_name !== input.toolName
+      || row.workflow_activation_digest !== input.activationDigest
+      || row.activation_digest !== input.activationDigest
+      || row.authority_digest !== input.authorityDigest
+      || row.revision !== input.authorityRevision
+      || !Number.isSafeInteger(row.node_attempt) || row.node_attempt <= 0
+    ) return { claimed: false, reason: 'authority_mismatch' };
+    const changes = db.prepare(`
+      UPDATE physical_dispatches
+         SET io_claimed_at = ?, io_owner = ?, io_fence = ?, io_revision = ?
+       WHERE session_id = ? AND source_user_seq = ? AND physical_dispatch_id = ?
+         AND state = 'started' AND io_claimed_at IS NULL
+    `).run(
+      claimedAt,
+      `${input.activationId}:page:${input.pageOrdinal}`,
+      row.node_attempt,
+      row.revision,
+      identity.sessionId,
+      identity.sourceUserSeq,
+      identity.physicalDispatchId,
+    ).changes;
+    return changes === 1 ? { claimed: true } : { claimed: false, reason: 'already_claimed' };
+  }).immediate();
 }

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -16,6 +16,7 @@ const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
 const dispatch = await import('./dispatch-ledger.js');
 const results = await import('./result-handle.js');
+const payloadStorage = await import('./result-payload-storage.js');
 const providerEvidence = await import('./provider-read-evidence.js');
 
 test.after(() => {
@@ -254,7 +255,7 @@ test('one logical pagination call cannot silently change its base arguments', ()
   );
 });
 
-test('projection is UTF-8-byte bounded and malformed or oversized payloads never claim completeness', () => {
+test('projection stays bounded, malformed payloads fail closed, and oversized payloads spill losslessly', () => {
   const projection = results.toResultHandle({
     successful: true,
     data: {
@@ -293,19 +294,147 @@ test('projection is UTF-8-byte bounded and malformed or oversized payloads never
     physicalDispatchId: 'physical-oversized',
     args: { query: 'oversized' },
   });
-  const oversized = results.toResultHandle({
+  const rawTail = 'RAW_TAIL_MUST_NEVER_APPEAR_IN_THE_MODEL_HANDLE';
+  const oversizedPayload = {
     successful: true,
-    data: { records: [{ id: 'large', blob: 'x'.repeat(results.RESULT_RAW_MAX_BYTES + 1) }] },
+    data: { records: [{ id: 'large', blob: `${'x'.repeat(results.RESULT_RAW_MAX_BYTES + 1)}${rawTail}` }] },
     meta: { complete: true },
-  }, { authority: oversizedAuthority });
-  assert.equal(oversized.completeness, 'unknown');
-  assert.equal(oversized.rawLocation, null);
-  const rejected = eventlog.openEventLog().prepare(`
-    SELECT rejection_reason, raw_payload_json
+  };
+  const rawJson = JSON.stringify(oversizedPayload);
+  const rawDigest = createHash('sha256').update(rawJson).digest('hex');
+  const oversized = results.toResultHandle(oversizedPayload, { authority: oversizedAuthority });
+  assert.equal(oversized.completeness, 'complete');
+  assert.ok(oversized.rawLocation);
+  assert.equal(JSON.stringify(oversized).includes(rawTail), false);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(oversized), 'utf8')
+      <= results.RESULT_PROJECTION_MAX_BYTES + 10_000,
+    'the model-visible handle remains bounded instead of carrying the raw spill',
+  );
+  const stored = eventlog.openEventLog().prepare(`
+    SELECT raw_location, rejection_reason, raw_payload_json,
+           raw_payload_sha256, raw_byte_count
       FROM durable_result_handles WHERE handle_id = ?
-  `).get(oversized.handle) as { rejection_reason: string; raw_payload_json: string | null };
-  assert.equal(rejected.rejection_reason, 'oversized');
-  assert.equal(rejected.raw_payload_json, null, 'an oversized result is not half-stored');
+  `).get(oversized.handle) as {
+    raw_location: string;
+    rejection_reason: string | null;
+    raw_payload_json: string;
+    raw_payload_sha256: string;
+    raw_byte_count: number;
+  };
+  assert.deepEqual(stored, {
+    raw_location: oversized.rawLocation,
+    rejection_reason: null,
+    raw_payload_json: payloadStorage.RESULT_PAYLOAD_SPILL_SENTINEL,
+    raw_payload_sha256: rawDigest,
+    raw_byte_count: Buffer.byteLength(rawJson, 'utf8'),
+  });
+
+  const beforeLogicalSettlement = results.redeemAuthoritativeResultPayload({
+    kind: 'returned_handle',
+    rawLocation: oversized.rawLocation!,
+    authority: oversizedAuthority,
+  });
+  assert.equal(beforeLogicalSettlement.status, 'ok', JSON.stringify(beforeLogicalSettlement));
+  if (beforeLogicalSettlement.status === 'ok') {
+    assert.equal(beforeLogicalSettlement.value.rawPayloadJson, rawJson);
+    assert.equal(beforeLogicalSettlement.value.rawPayloadSha256, rawDigest);
+    assert.equal(beforeLogicalSettlement.value.rawByteCount, Buffer.byteLength(rawJson, 'utf8'));
+    assert.deepEqual(beforeLogicalSettlement.value.rawPayload, oversizedPayload);
+  }
+  assert.equal(results.redeemAuthoritativeResultPayload({
+    kind: 'successful_settlement',
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    logicalToolCallId: oversizedAuthority.logicalToolCallId,
+  }).status, 'missing', 'returned-handle recovery must not manufacture a logical settlement');
+
+  const spillPath = payloadStorage.resultPayloadFilePath(rawDigest);
+  assert.equal(lstatSync(spillPath).mode & 0o777, 0o600);
+  const secondTask = accept('oversized-dedupe');
+  const secondAuthority = returnedCall({
+    task: secondTask,
+    logicalToolCallId: 'logical-oversized-dedupe',
+    physicalDispatchId: 'physical-oversized-dedupe',
+    args: { query: 'oversized-dedupe' },
+  });
+  const second = results.toResultHandle(oversizedPayload, { authority: secondAuthority });
+  assert.notEqual(second.handle, oversized.handle, 'call authority still gives each handle its own identity');
+  assert.equal(
+    readdirSync(payloadStorage.RESULT_PAYLOAD_SPILL_DIRECTORY)
+      .filter((name) => name === `${rawDigest}.json`).length,
+    1,
+    'identical authoritative bytes share one verified content-addressed file',
+  );
+
+  eventlog.closeEventLog();
+  assert.deepEqual(
+    results.redeemRawResult(oversized.rawLocation!, oversizedAuthority),
+    { status: 'ok', value: oversizedPayload },
+    'off-row authoritative bytes redeem exactly after the eventlog is reopened',
+  );
+
+  rmSync(spillPath);
+  assert.equal(
+    results.redeemAuthoritativeResultPayload({
+      kind: 'returned_handle',
+      rawLocation: oversized.rawLocation!,
+      authority: oversizedAuthority,
+    }).status,
+    'missing',
+    'a durable row cannot make a missing spill look successful',
+  );
+  writeFileSync(spillPath, '{"wrong":"payload"}', { mode: 0o600 });
+  assert.equal(
+    results.redeemAuthoritativeResultPayload({
+      kind: 'returned_handle',
+      rawLocation: oversized.rawLocation!,
+      authority: oversizedAuthority,
+    }).status,
+    'corrupt',
+    'parseable replacement bytes cannot inherit the authoritative digest',
+  );
+});
+
+test('a payload exactly at the 8MB cap retains the historical inline representation', () => {
+  const exactInline = 'i'.repeat(results.RESULT_RAW_MAX_BYTES - 2);
+  const canonical = JSON.stringify(exactInline);
+  assert.equal(Buffer.byteLength(canonical, 'utf8'), results.RESULT_RAW_MAX_BYTES);
+  const handle = results.toResultHandle(exactInline, {
+    acceptedTaskId: 'inline-boundary-task',
+    physicalAttemptId: 'inline-boundary-attempt',
+  });
+  const row = eventlog.openEventLog().prepare(`
+    SELECT raw_payload_json, raw_payload_sha256, raw_byte_count, rejection_reason
+      FROM durable_result_handles WHERE handle_id = ?
+  `).get(handle.handle) as {
+    raw_payload_json: string;
+    raw_payload_sha256: string;
+    raw_byte_count: number;
+    rejection_reason: string | null;
+  };
+  const digest = createHash('sha256').update(canonical).digest('hex');
+  assert.equal(row.raw_payload_json, canonical);
+  assert.equal(row.raw_payload_sha256, digest);
+  assert.equal(row.raw_byte_count, results.RESULT_RAW_MAX_BYTES);
+  assert.equal(row.rejection_reason, null);
+  assert.equal(existsSync(payloadStorage.resultPayloadFilePath(digest)), false);
+  assert.deepEqual(results.redeemRawResult(handle.rawLocation!), { status: 'ok', value: exactInline });
+
+  const unscopedOversized = results.toResultHandle('u'.repeat(results.RESULT_RAW_MAX_BYTES), {
+    acceptedTaskId: 'legacy-oversized-task',
+    physicalAttemptId: 'legacy-oversized-attempt',
+  });
+  assert.equal(unscopedOversized.rawLocation, null);
+  assert.equal(unscopedOversized.completeness, 'unknown');
+  assert.deepEqual(eventlog.openEventLog().prepare(`
+    SELECT raw_payload_json, rejection_reason
+      FROM durable_result_handles WHERE handle_id = ?
+  `).get(unscopedOversized.handle), {
+    raw_payload_json: null,
+    rejection_reason: 'oversized',
+  }, 'unscoped projection callers retain their historical >8MB rejection behavior');
 });
 
 test('a handle cannot bind to a crossing owned by another accepted task', () => {

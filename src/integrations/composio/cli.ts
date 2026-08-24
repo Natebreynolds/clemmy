@@ -371,7 +371,15 @@ export function parseComposioCliJson(text: string): unknown {
 // so memoize briefly. TTL is short enough that a fresh `composio login` is picked
 // up within a minute; busted explicitly on backend save / client reset.
 const CLI_STATUS_TTL_MS = 45_000;
-let cliStatusCache: { key: string; at: number; value: Promise<ComposioCliStatus> } | null = null;
+interface ComposioCliStatusCacheEntry {
+  key: string;
+  at: number;
+  value: Promise<ComposioCliStatus>;
+  /** Present only after the status probe completed successfully. Prepared
+   * execution may inspect this synchronously; it must never join/start a probe. */
+  resolved?: ComposioCliStatus;
+}
+let cliStatusCache: ComposioCliStatusCacheEntry | null = null;
 
 export function invalidateComposioCliStatusCache(): void {
   cliStatusCache = null;
@@ -390,14 +398,34 @@ export function benchComposioCliAuth(): void {
 }
 export function _resetComposioCliBenchForTests(): void { cliAuthBenchedUntil = 0; }
 
+function benchedComposioCliStatus(): ComposioCliStatus {
+  return {
+    installed: true,
+    path: findComposioCli(),
+    version: null,
+    authenticated: false,
+    authStatus: 'error',
+    authMessage: 'Composio CLI session was proven auth-dead by a live probe — using the SDK backend until it recovers (run composio login to restore the CLI lane).',
+  };
+}
+
+/** Current completed CLI readiness, without spawning `--version`/`whoami` or
+ * awaiting a probe already in flight. `null` means preparation is absent. */
+export function peekCurrentComposioCliStatus(
+  options: ComposioCliEnvOptions = {},
+  now = Date.now(),
+): ComposioCliStatus | null {
+  if (now < cliAuthBenchedUntil) return benchedComposioCliStatus();
+  const key = JSON.stringify([options.apiKey ?? '', options.userId ?? '']);
+  if (!cliStatusCache || cliStatusCache.key !== key) return null;
+  const age = now - cliStatusCache.at;
+  if (!Number.isFinite(age) || age < 0 || age > CLI_STATUS_TTL_MS) return null;
+  return cliStatusCache.resolved ?? null;
+}
+
 export async function getComposioCliStatus(options: ComposioCliEnvOptions = {}): Promise<ComposioCliStatus> {
   if (Date.now() < cliAuthBenchedUntil) {
-    return {
-      installed: true,
-      authenticated: false,
-      authStatus: 'error',
-      authMessage: 'Composio CLI session was proven auth-dead by a live probe — using the SDK backend until it recovers (run composio login to restore the CLI lane).',
-    } as ComposioCliStatus;
+    return benchedComposioCliStatus();
   }
   const key = JSON.stringify([options.apiKey ?? '', options.userId ?? '']);
   const now = Date.now();
@@ -405,9 +433,12 @@ export async function getComposioCliStatus(options: ComposioCliEnvOptions = {}):
     return cliStatusCache.value;
   }
   const value = fetchComposioCliStatus(options);
-  cliStatusCache = { key, at: now, value };
+  const entry: ComposioCliStatusCacheEntry = { key, at: now, value };
+  cliStatusCache = entry;
   try {
-    return await value;
+    const resolved = await value;
+    if (cliStatusCache === entry) entry.resolved = resolved;
+    return resolved;
   } catch (err) {
     // Never cache a rejection.
     if (cliStatusCache?.value === value) cliStatusCache = null;

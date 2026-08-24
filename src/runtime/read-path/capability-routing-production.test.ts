@@ -27,8 +27,13 @@ writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'machine-A\n');
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import type { TurnCapabilityCandidates } from './capability-candidates.js';
 
-const { respondPreferHarness, _setBridgeImplsForTests } = await import('../harness/respond-bridge.js');
+const {
+  respondPreferHarness,
+  _setBridgeImplsForTests,
+  _setFalloverChainForTest,
+} = await import('../harness/respond-bridge.js');
 const {
   respondViaClaudeAgentSdkBrain,
   setClaudeAgentSdkBrainRunForTest,
@@ -195,6 +200,50 @@ test('an ESTABLISHED session still receives its candidates — delivery is bound
   assert.equal(probes.length, 1, 'the turn did not reach the brain-building seam');
   assert.ok(probes[0]!.pinned.includes('composio_execute_tool'),
     'the established session lost its candidates — delivery depends on a phrase-keyed side channel');
+});
+
+test('a host fallover rebuild shares the accepted capability-node resolution instead of rediscovering', async () => {
+  await teachOneVerifiedRead();
+  assert.equal(await candidates.warmCapabilityRetrieval(), true);
+
+  const priorFallover = process.env.CLEMMY_BRAIN_FALLOVER;
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  _setFalloverChainForTest(['gpt-5']);
+  const seen: TurnCapabilityCandidates[] = [];
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: (async (opts: { turnCandidates?: TurnCapabilityCandidates }) => {
+      if (opts.turnCandidates) seen.push(opts.turnCandidates);
+      return FAKE_AGENT;
+    }) as never,
+    runConversation: (async (opts: {
+      sessionId: string;
+      sourceUserSeq: number;
+      buildAgent?: (identity: { sessionId: string; sourceUserSeq: number; route: string }) => Promise<unknown>;
+      rebuildAgentForBrain?: (modelId: string) => Promise<unknown>;
+    }) => {
+      await opts.buildAgent?.({ sessionId: opts.sessionId, sourceUserSeq: opts.sourceUserSeq, route: 'act' });
+      await opts.rebuildAgentForBrain?.('gpt-5');
+      return { sessionId: opts.sessionId, steps: 1, lastTurn: 1, status: 'completed', text: 'ok' };
+    }) as never,
+  });
+
+  try {
+    await respondPreferHarness(
+      'home',
+      { message: PARAPHRASE, sessionId: 'sess-paraphrase-fallover' },
+      async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+    );
+  } finally {
+    _setFalloverChainForTest(null);
+    _setBridgeImplsForTests({});
+    if (priorFallover === undefined) delete process.env.CLEMMY_BRAIN_FALLOVER;
+    else process.env.CLEMMY_BRAIN_FALLOVER = priorFallover;
+  }
+
+  assert.equal(seen.length, 2, 'both the primary and fallover brain must receive candidates');
+  assert.strictEqual(seen[1], seen[0], 'the accepted source was resolved more than once across fallover');
+  assert.ok(seen[0]!.pinnedTools.includes('composio_execute_tool'));
 });
 
 test('the Claude lane receives the same turn-bound candidates as the Codex lane', async () => {

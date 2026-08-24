@@ -2,6 +2,7 @@ import { Card } from '@/components/ui/Card';
 import { ModelRolesCard } from './ModelRolesCard';
 import { ClaudeLoginForm } from './ClaudeLoginForm';
 import { CodexLoginForm } from './CodexLoginForm';
+import { XaiLoginForm } from './XaiLoginForm';
 import { ConnectedModelsStrip } from './ConnectedModelsStrip';
 
 /**
@@ -32,7 +33,7 @@ export function ModelsRoutingSection() {
       <div className="mt-6 border-t border-border pt-5">
         <h4 className="mb-1 text-label text-fg">Connect models</h4>
         <p className="mb-4 text-small text-muted">
-          Codex and Claude sign in with your subscription (OAuth). Everything else connects with an API key.
+          Codex, Claude, and xAI (Grok) sign in with your subscription (OAuth). Everything else connects with an API key.
           Whatever you connect here shows up in the dropdowns above.
         </p>
 
@@ -44,6 +45,9 @@ export function ModelsRoutingSection() {
             </div>
             <div className="rounded-lg border border-border bg-canvas p-4">
               <ClaudeLoginForm embedded />
+            </div>
+            <div className="rounded-lg border border-border bg-canvas p-4">
+              <XaiLoginForm embedded />
             </div>
           </div>
 

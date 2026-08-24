@@ -153,6 +153,69 @@ test('resolve is atomic — only one of two racing resolves wins', () => {
   assert.equal(second.row?.resolution, 'approved');
 });
 
+test('system cleanup has a truthful terminal resolution while historical user cancellation remains readable', () => {
+  const systemSession = createSession({ kind: 'chat' });
+  const action = pending.queuePendingAction({
+    title: 'System-owned cleanup',
+    summary: 'This action belongs to a dead session.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+    sessionId: systemSession.id,
+  });
+  const systemRow = reg.register({
+    sessionId: systemSession.id,
+    subject: 'System cleanup card',
+    args: { pendingActionId: action.id },
+  });
+  const systemResult = reg.resolve(
+    systemRow.approvalId,
+    'cancelled_by_system',
+    'reaper-dead-session',
+  );
+  assert.equal(systemResult.ok, true);
+  assert.equal(systemResult.row?.status, 'cancelled');
+  assert.equal(systemResult.row?.resolution, 'cancelled_by_system');
+  assert.equal(systemResult.row?.resolver, 'reaper-dead-session');
+  assert.equal(pending.getPendingAction(action.id)?.status, 'cancelled');
+
+  const historicalSession = createSession({ kind: 'chat' });
+  const historicalRow = reg.register({
+    sessionId: historicalSession.id,
+    subject: 'User cancelled this card',
+  });
+  const historicalResult = reg.resolve(
+    historicalRow.approvalId,
+    'cancelled_by_user',
+    'discord-user',
+  );
+  assert.equal(historicalResult.ok, true);
+  assert.equal(historicalResult.row?.status, 'resolved', 'old persisted status semantics remain readable');
+  assert.equal(historicalResult.row?.resolution, 'cancelled_by_user');
+});
+
+test('resolve atomically expires an overdue approve or reject attempt', () => {
+  for (const attempted of ['approved', 'rejected'] as const) {
+    const session = createSession({ kind: 'chat' });
+    const row = reg.register({ sessionId: session.id, subject: `late ${attempted}` });
+    openEventLog().prepare(
+      'UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ?',
+    ).run(new Date(Date.now() - 1_000).toISOString(), row.approvalId);
+
+    const result = reg.resolve(row.approvalId, attempted, 'late-human');
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'expired');
+    assert.equal(result.row?.status, 'expired');
+    assert.equal(result.row?.resolution, 'expired');
+    assert.equal(result.row?.consumedAt, null);
+
+    const replay = reg.resolve(row.approvalId, attempted, 'later-human');
+    assert.equal(replay.ok, false);
+    assert.equal(replay.reason, 'already_resolved');
+    assert.equal(replay.row?.resolution, 'expired');
+  }
+});
+
 test('resolving a superseded card cannot overwrite the pending action owned by its replacement', () => {
   const session = createSession({ kind: 'chat' });
   const action = pending.queuePendingAction({
@@ -327,6 +390,34 @@ test('resumable approval registration dedupes and an approved grant is claimed e
 
   const replay = reg.claimResumableApproval(input.resumeKey);
   assert.equal(replay.state, 'consumed', 'the exact approved payload cannot reuse the grant twice');
+});
+
+test('a persisted late-approved resumable row cannot be consumed', () => {
+  const session = createSession({ kind: 'workflow' });
+  const registered = reg.registerResumable({
+    sessionId: session.id,
+    subject: 'Late historical grant',
+    tool: 'fixture_read',
+    args: { key: 'exact' },
+    resumeKey: 'late-historical-resume',
+  });
+  const expiredAt = new Date(Date.now() - 2_000).toISOString();
+  const lateResolvedAt = new Date(Date.now() - 1_000).toISOString();
+  openEventLog().prepare(`
+    UPDATE pending_approvals
+       SET expires_at = ?, status = 'resolved', resolution = 'approved',
+           resolver = 'historical-writer', resolved_at = ?, consumed_at = NULL
+     WHERE approval_id = ?
+  `).run(expiredAt, lateResolvedAt, registered.row.approvalId);
+
+  const inspected = reg.inspectResumableApproval(registered.row.resumeKey!);
+  assert.equal(inspected.state, 'expired');
+  const claimed = reg.claimResumableApproval(
+    registered.row.resumeKey!,
+    registered.row.approvalId,
+  );
+  assert.equal(claimed.state, 'expired');
+  assert.equal(reg.get(registered.row.approvalId)?.consumedAt, null);
 });
 
 test('conversational send consent survives restart windows and grants its frozen payload exactly once', () => {

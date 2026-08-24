@@ -79,6 +79,7 @@ const {
   sendAlreadyClaimed,
   stepExternalWriteAlreadyClaimed,
   stepSendAlreadyFired,
+  omitBlocksForAlreadyFiredSends,
   seedFailedItemRetryRun,
   detectEmptyDeliverableReads,
   stepConsumesOutput,
@@ -2252,6 +2253,36 @@ test('reapResolvedParkedRuns makes a rejected approval terminal (never stuck or 
   delete process.env.WORKFLOW_APPROVAL_PARKING;
 });
 
+test('reapResolvedParkedRuns records system cleanup truthfully without attributing it to the user', () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  const runId = 'park-test-system-cancel';
+  const sessionId = `workflow-gate:${runId}:send_step`;
+  HarnessSession.create({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: runId,
+    metadata: { source: 'workflow' },
+  });
+  const row = approvalRegistry.register({
+    sessionId,
+    subject: 'Approve the send',
+    tool: 'workflow_approval_gate',
+    ttlMs: 60_000,
+  });
+  const filePath = writeParkedRun(runId, [row.approvalId]);
+  approvalRegistry.resolve(row.approvalId, 'cancelled_by_system', 'reaper-dead-session');
+
+  reapResolvedParkedRuns();
+
+  const record = JSON.parse(readFileSync(filePath, 'utf-8')) as { status?: string; error?: string };
+  assert.equal(record.status, 'cancelled');
+  assert.match(record.error ?? '', /owning session ended/);
+  assert.doesNotMatch(record.error ?? '', /cancelled by the user/);
+  rmSync(filePath, { force: true });
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
 test('reapResolvedParkedRuns is a no-op when WORKFLOW_APPROVAL_PARKING is off (kill-switch)', () => {
   // Parking now defaults ON (P1-7), so the kill-switch must be set EXPLICITLY to
   // get the legacy no-scan behavior (was: rely on the default).
@@ -3075,12 +3106,12 @@ test('normal harness route marker always names provider + transport for untagged
     'gpt-5.4',
   );
   assert.equal(codex.provider, 'codex');
-  assert.equal(codex.transport, 'openai_agents_harness');
+  assert.equal(codex.transport, 'host_harness');
   assert.equal((codex.modelRoute as { routeKind?: string }).routeKind, 'harness');
   assert.equal((codex.modelRoute as { requestedModel?: string }).requestedModel, 'gpt-5.4');
   assert.equal((codex.modelRoute as { effectiveModel?: string }).effectiveModel, 'gpt-5.4');
   assert.equal((codex.modelRoute as { provider?: string }).provider, 'codex');
-  assert.equal((codex.modelRoute as { transport?: string }).transport, 'openai_agents_harness');
+  assert.equal((codex.modelRoute as { transport?: string }).transport, 'host_harness');
 
   withEnv({
     MODEL_ROUTING_MODE: 'all_in',
@@ -3093,7 +3124,7 @@ test('normal harness route marker always names provider + transport for untagged
       'minimax-01',
     );
     assert.equal(byo.provider, 'byo');
-    assert.equal(byo.transport, 'openai_agents_harness');
+    assert.equal(byo.transport, 'host_harness');
     assert.equal((byo.modelRoute as { provider?: string }).provider, 'byo');
   });
 });
@@ -6405,6 +6436,119 @@ test('required read failures cannot be laundered into a downstream-ready dashboa
   );
 });
 
+test('a recovered scrape whose output satisfies the declared contract is complete', () => {
+  resetEventLog();
+  const sessionId = 'workflow:facebook-trends:scrape_and_analyze';
+  HarnessSession.create({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Recovered scrape',
+    metadata: { source: 'workflow' },
+  });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Scrape the official page and analyze recent posts.' },
+  });
+  assert.ok(workflowSettlementShadow.recordTurnGraphShadow({
+    identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
+    surface: 'workflow',
+  }));
+  const acceptedTaskId = workflowSettlementIdentities.acceptedTaskIdFor(sessionId, source.seq);
+
+  const settleRead = (callId: string, tool: string, ok: boolean): void => {
+    const args = { actor: callId };
+    const logicalToolCallId = `logical:${callId}`;
+    const begun = workflowSettlementDispatch.beginPhysicalDispatch({
+      identity: {
+        sessionId,
+        sourceUserSeq: source.seq,
+        turn: source.turn,
+        acceptedTaskId,
+        logicalToolCallId,
+        physicalDispatchId: `dispatch:${callId}`,
+        ordinal: 0,
+      },
+      tool,
+      args,
+    });
+    assert.equal(begun.status, 'inserted');
+    if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+    assert.equal(workflowSettlementDispatch.settlePhysicalDispatch({
+      identity: begun.identity,
+      tool,
+      outcome: 'returned',
+    }).status, 'inserted');
+    const settled = workflowSettlements.commitLogicalCallSettlement({
+      identity: {
+        sessionId,
+        sourceUserSeq: source.seq,
+        turn: source.turn,
+        acceptedTaskId,
+        logicalToolCallId,
+      },
+      contract: { toolName: tool, args },
+      execution: { kind: 'provider_execution' },
+      ...(ok ? { result: { payload: { successful: true, data: { items: [{ id: 'p1' }] } } } } : {}),
+      outcome: ok
+        ? workflowSettlementOutcomes.classifyAttemptOutcome({ envelopeSuccessful: true })
+        : workflowSettlementOutcomes.classifyAttemptOutcome({ executionFailed: true }),
+      recovery: { businessCall: true, mutating: false },
+      observer: { lane: 'agents_runner', turn: source.turn },
+    });
+    assert.equal(settled.status, 'committed');
+  };
+  settleRead('sync-timeout', 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', false);
+  settleRead('dataset-recovery', 'APIFY_GET_RUN_DATASET_ITEMS', true);
+
+  const scrapeContract = {
+    required_keys: [
+      'scraper_used',
+      'actor_id',
+      'source_page_url',
+      'posts_reviewed_count',
+      'key_trends',
+      'limitations',
+      'sources',
+      'key_findings',
+      'source_errors',
+    ],
+  };
+  const output = {
+    scraper_used: 'apify',
+    actor_id: 'zhOq6vlY7WaeCwX88',
+    source_page_url: 'https://www.facebook.com/scorpion.co',
+    posts_reviewed_count: 25,
+    key_trends: ['AI-search partner'],
+    limitations: ['sync actor timed out; recovered via dataset items'],
+    sources: ['https://www.facebook.com/scorpion.co'],
+    key_findings: ['AI-search partner announced 2026-07-23'],
+    source_errors: ['APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS timed out'],
+  };
+  const guarded = settlementGuardedStepOutput({
+    step: {
+      id: 'scrape_and_analyze',
+      prompt: 'Scrape recent posts and return the analysis contract.',
+      sideEffect: 'read',
+      output: scrapeContract,
+    },
+    sessionId,
+    sourceUserSeq: source.seq,
+    toolUses: [
+      'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
+      'APIFY_GET_RUN_DATASET_ITEMS',
+      'StructuredOutput',
+    ],
+    output,
+  });
+
+  assert.equal((guarded as { blocked?: unknown }).blocked, undefined);
+  assert.deepEqual(guarded, output);
+});
+
 test('one successful workflow read cannot launder a failed sibling required read', () => {
   resetEventLog();
   const sessionId = 'workflow:mixed-source-dashboard:pull';
@@ -6573,6 +6717,48 @@ test('a local-write source step cannot fabricate complete evidence over a failed
   );
   assert.deepEqual(skips.map((skip) => skip.stepId), ['post_summary']);
   assert.match(skips[0]?.output.reason ?? '', /required source query failed|not complete yet|unrecovered/i);
+});
+
+test('omitBlocksForAlreadyFiredSends: a successful send is not a failed run', () => {
+  resetEventLog();
+  const runId = 'run-slack-echo';
+  const stepId = 'post_slack';
+  const sessionId = `workflow:${runId}:${stepId}`;
+  HarnessSession.create({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Posted slack send',
+    metadata: { source: 'workflow' },
+  });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Post the summary.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: source.seq,
+      shapeKey: 'SLACK_SEND_MESSAGE',
+      action: 'send',
+    },
+  });
+  const blocked = omitBlocksForAlreadyFiredSends(
+    [{
+      stepId,
+      kind: 'blocked',
+      reason: 'provider echo was not byte-equal after Slack normalized markdown',
+    }],
+    [{ id: stepId, prompt: 'Send the summary.', sideEffect: 'send' }],
+    runId,
+  );
+  assert.deepEqual(blocked, []);
 });
 
 test('decideBatchSettlement: park OUTRANKS a sibling failure (T1.3 — the approval survives)', () => {
@@ -6875,4 +7061,188 @@ test('workflow worker pin: session override registers, wins at dispatch, and cle
   assert.equal(getSessionWorkerModelOverride('some-other-session'), undefined, 'override is session-scoped');
   clearSessionWorkerModelOverride('workflow:run-1:step-a');
   assert.equal(getSessionWorkerModelOverride('workflow:run-1:step-a'), undefined, 'cleared at step end');
+});
+
+test('learned workflow read pins are advisory only before the ordinary harness invocation', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  const previous = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
+    WORKFLOW_STEP_AGENT: process.env.WORKFLOW_STEP_AGENT,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
+    COMPOSIO_BACKEND: process.env.COMPOSIO_BACKEND,
+  };
+  process.env.AUTH_MODE = 'codex_oauth';
+  process.env.WORKFLOW_USE_HARNESS = 'on';
+  process.env.WORKFLOW_STEP_AGENT = 'off';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'off';
+  process.env.COMPOSIO_BACKEND = 'sdk';
+
+  const workflowName = `Pin Advisory ${Date.now()}`;
+  const workflowSlug = `pin-advisory-${Date.now()}`;
+  const runId = `pin-advisory-run-${Date.now()}`;
+  const stepId = 'read_records';
+  const sessionId = `workflow:${runId}:${stepId}`;
+  const slug = 'PROOF_LIST_RECORDS';
+  const staleSlug = 'PROOF_STALE_LIST_RECORDS';
+  const args = { scope: 'current' };
+  const toolChoices = await import('../memory/tool-choice-store.js');
+  const certifiedBindings = await import('../memory/workflow-certified-binding.js');
+  const composioClient = await import('../integrations/composio/client.js');
+  const schemaCache = await import('../tools/composio-schema-cache.js');
+  const db = (await import('../runtime/harness/eventlog.js')).openEventLog();
+  const authorityCounts = () => db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM logical_tool_calls WHERE session_id = ?) AS logical_calls,
+      (SELECT COUNT(*) FROM run_dispatch_leases WHERE session_id = ?) AS call_leases,
+      (SELECT COUNT(*) FROM physical_dispatches WHERE session_id = ?) AS physical_dispatches,
+      (SELECT COUNT(*) FROM logical_call_settlements WHERE session_id = ?) AS settlements,
+      (SELECT COUNT(*) FROM logical_call_settlements
+        WHERE session_id = ? AND result_handle_id IS NOT NULL) AS result_handles
+  `).get(sessionId, sessionId, sessionId, sessionId, sessionId) as {
+    logical_calls: number;
+    call_leases: number;
+    physical_dispatches: number;
+    settlements: number;
+    result_handles: number;
+  };
+  const zeroAuthority = {
+    logical_calls: 0,
+    call_leases: 0,
+    physical_dispatches: 0,
+    settlements: 0,
+    result_handles: 0,
+  };
+
+  toolChoices.rememberToolChoice({
+    intent: certifiedBindings.workflowStepPinIntent(workflowName, stepId),
+    description: 'Previously successful read route.',
+    choice: {
+      kind: 'composio',
+      identifier: slug,
+      invocationTemplate: JSON.stringify(args),
+      testedAt: new Date().toISOString(),
+      testEvidence: 'prior read completed successfully',
+    },
+  });
+  const staleWorkflow = `${workflowName} Stale`;
+  const staleIntent = certifiedBindings.workflowStepPinIntent(staleWorkflow, stepId);
+  toolChoices.rememberToolChoice({
+    intent: staleIntent,
+    description: 'A route whose later execution failed.',
+    choice: {
+      kind: 'composio',
+      identifier: staleSlug,
+      invocationTemplate: JSON.stringify(args),
+      testedAt: new Date().toISOString(),
+      testEvidence: 'initial read completed successfully',
+    },
+  });
+  toolChoices.updateToolChoiceOutcome(staleIntent, 'failure');
+
+  const renderPin = workflowRunnerInternalsForTest.renderWorkflowToolPin;
+  const exactHint = renderPin(workflowName, stepId);
+  assert.match(exactHint, /LEARNED TOOL PIN/);
+  assert.match(exactHint, new RegExp(slug));
+  assert.equal(renderPin(`${workflowName} Mismatch`, stepId), '', 'lookup is exact, so another workflow cannot borrow this pin');
+  assert.equal(renderPin(staleWorkflow, stepId), '', 'a net-failing pin is withheld rather than elevated to authority');
+  assert.deepEqual(authorityCounts(), zeroAuthority, 'pin lookup/render mints no execution authority');
+
+  let providerBodies = 0;
+  composioClient.__test__.setComposioApiKeyOverride('cmp_test_pin_advisory');
+  composioClient.__test__.setComposioClient({
+    tools: {
+      execute: async () => {
+        providerBodies += 1;
+        return { successful: true, data: { records: [{ id: 'provider-record' }] } };
+      },
+    },
+  });
+  composioClient.__test__.setConnectedAccountsLoader(async () => [{
+    id: 'ca_pin_advisory',
+    toolkit: { slug: 'proof' },
+    status: 'ACTIVE',
+    data: { user_info: { email: 'pin@example.test' } },
+  }]);
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object',
+    required: ['scope'],
+    properties: { scope: { type: 'string' } },
+    additionalProperties: false,
+  }, Date.now());
+
+  let observedPrompt = '';
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (options: { sessionId: string; input?: string }) => {
+      observedPrompt = options.input ?? '';
+      assert.equal(providerBodies, 0, 'the learned pin cannot cross the provider before the model chooses a tool');
+      assert.deepEqual(authorityCounts(), zeroAuthority, 'pre-model pin retrieval owns no logical/physical/lease/settlement rows');
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          summary: 'No ordinary tool call was needed in this fixture.',
+          reply: 'No ordinary tool call was needed in this fixture.',
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
+
+  try {
+    const step = {
+      id: stepId,
+      prompt: 'Read the current proof records.',
+      model: 'gpt-5.4',
+      sideEffect: 'read' as const,
+      allowedTools: ['composio_execute_tool'],
+    };
+    const ctx = {
+      workflow: {
+        name: workflowName,
+        description: 'Learned-pin authority regression.',
+        enabled: true,
+        trigger: { manual: true },
+        allowedTools: ['composio_execute_tool'],
+        steps: [step],
+      },
+      workflowSlug,
+      runId,
+      inputs: {},
+      stepOutputs: {},
+      assistant: { respond: async () => { throw new Error('legacy assistant should not run'); } },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+
+    await executeStep(step, ctx);
+    assert.match(observedPrompt, /LEARNED TOOL PIN/);
+    assert.match(observedPrompt, new RegExp(slug));
+    assert.doesNotMatch(observedPrompt, /HOST SETTLED READ|runtime already executed/i);
+    assert.equal(providerBodies, 0);
+    assert.deepEqual(authorityCounts(), zeroAuthority);
+    assert.equal(
+      readWorkflowEvents(workflowSlug, runId)
+        .some((event) => event.kind === 'step_advisory' && event.meta?.reason === 'host_dispatched_step_pin'),
+      false,
+      'pin memory cannot publish a host-dispatch claim',
+    );
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+    composioClient.__test__.setConnectedAccountsLoader(null);
+    composioClient.__test__.setComposioApiKeyOverride(null);
+    composioClient.resetComposioClient();
+    resetHarnessRuntimeConfig();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });

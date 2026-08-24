@@ -12,7 +12,7 @@
  *   - request_approval emits approval_requested
  *   - ask_user_question emits awaiting_user_input
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -48,7 +48,7 @@ const { TOOL_JIT_CORE } = await import('./tool-jit.js');
 const { RunContext, Usage } = await import('@openai/agents');
 const { setClaudeAgentSdkWorkerRunForTest } = await import('../runtime/harness/claude-agent-worker.js');
 const { summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
-const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
+const { _setInnerDispatchToolsForTests } = await import('../tools/inner-dispatch.js');
 const { boundAgentCapabilityEnvelope, boundAgentCapabilityRevision } = await import('./capability-envelope.js');
 const {
   markByoModelNotServed,
@@ -242,7 +242,7 @@ test('Orchestrator carries the harness guardrails', async () => {
 test('production call_tool admits a deferred built-in against the orchestrator sealed universe before dispatch', async () => {
   const session = createSession({ kind: 'chat', channel: 'test' });
   let dispatches = 0;
-  _setCodeModeToolsForTests(new Map([['desktop_status', {
+  _setInnerDispatchToolsForTests(new Map([['desktop_status', {
     name: 'desktop_status',
     invoke: async () => {
       dispatches += 1;
@@ -278,7 +278,7 @@ test('production call_tool admits a deferred built-in against the orchestrator s
     assert.equal(after.revision, before!.revision + 1);
     assert.deepEqual([...after.bound], [...before!.bound, 'desktop_status']);
   } finally {
-    _setCodeModeToolsForTests(null);
+    _setInnerDispatchToolsForTests(null);
   }
 });
 
@@ -470,6 +470,15 @@ test('JIT classification guard: every rubric-named built-in is consciously CORE 
   // background / app status / cache forget), so semantic retrieval surfaces them.
   const JITABLE_ALLOWED = new Set<string>([
     'workflow_create', 'workflow_run', 'workflow_run_status', 'workflow_update', 'workflow_schedule',
+    // Durable-opportunity capture is conditional on explicit schedule/reuse/
+    // recovery evidence in the request; it persists review bytes only.
+    'automation_opportunity_propose',
+    'automation_opportunity_review_request',
+    'automation_read_pilot_acquisition_list',
+    'automation_read_pilot_request',
+    'automation_read_pilot_workspace_create_request',
+    'automation_read_pilot_workspace_list',
+    'automation_recurrence_request',
     'memory_pin', 'memory_restore', 'memory_list_facts',
     'task_add', 'task_update', 'task_list',
     'background_tasks_recent', 'background_task_status', 'background_task_revise', 'dispatch_background_task',
@@ -528,6 +537,7 @@ test('run_worker requires a structured parent-planned job packet', async () => {
     'instructions',
     'expectedOutput',
     'intent',
+    'model',
     'workManifest',
     // 2026-08-11 contracted fan-out: expectedWork carries the frozen-plan
     // requirement so workers bind instead of concluding a capability is
@@ -992,7 +1002,7 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
     assert.equal(routed.length, 1);
     assert.equal((routed[0].data as { modelId?: string }).modelId, 'glm-5.2');
     assert.equal((routed[0].data as { provider?: string }).provider, 'byo');
-    assert.equal((routed[0].data as { transport?: string }).transport, 'openai_agents_harness');
+    assert.equal((routed[0].data as { transport?: string }).transport, 'host_harness');
 
     const results = listEvents(session.id, { types: ['worker_result'] });
     assert.equal(results.length, 1);
@@ -1000,6 +1010,132 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
     assert.equal((results[0].data as { model?: string }).model, 'glm-5.2');
   } finally {
     clearByoNotServedForTest();
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('a Claude brain executes a durable Codex worker binding on the host worker lane', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat', title: 'claude brain codex worker route' });
+  const authFile = path.join(TMP_HOME, 'state', 'auth.json');
+  const prev: Record<string, string | undefined> = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    CLAUDE_MODEL: process.env.CLAUDE_MODEL,
+    MODEL_ROUTING_MODE: process.env.MODEL_ROUTING_MODE,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKER: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER,
+    CLEMMY_MODEL_ROLES_REGISTRY: process.env.CLEMMY_MODEL_ROLES_REGISTRY,
+    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
+    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
+  };
+  const requestedModels: Array<string | undefined> = [];
+  try {
+    process.env.AUTH_MODE = 'claude_oauth';
+    process.env.CLAUDE_MODEL = 'claude-sonnet-5';
+    process.env.MODEL_ROUTING_MODE = 'off';
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER = 'on';
+    process.env.CLEMMY_MODEL_ROLES_REGISTRY = 'on';
+    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
+    process.env.CLEMMY_MODEL_ROLES = JSON.stringify([{
+      role: 'worker',
+      modelId: 'gpt-5.4',
+      whenIntent: 'research',
+      scope: 'durable',
+      source: 'settings',
+    }]);
+    writeFileSync(authFile, JSON.stringify({
+      source: 'native',
+      codexOauth: {
+        accessToken: 'test-codex-access',
+        refreshToken: 'test-codex-refresh',
+        accountId: 'test-codex-account',
+        lastRefresh: new Date().toISOString(),
+      },
+    }), 'utf8');
+    setClaudeAgentSdkWorkerRunForTest(async () => {
+      assert.fail('a Codex-bound worker must not enter the Claude Agent SDK lane');
+    });
+
+    const stubModel: import('@openai/agents').Model = {
+      async getResponse() {
+        return {
+          output: [{
+            type: 'message',
+            id: 'msg_codex_worker_done',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text: 'codex worker completed under claude brain', providerData: {} }],
+          }],
+          usage: new Usage(),
+          responseId: 'resp_codex_worker_done',
+        } as unknown as import('@openai/agents').ModelResponse;
+      },
+      async *getStreamedResponse() {
+        throw new Error('not used in this test');
+      },
+    };
+    const stubProvider: import('@openai/agents').ModelProvider = {
+      getModel(modelName?: string) {
+        requestedModels.push(modelName);
+        return stubModel;
+      },
+    };
+
+    const agent = await buildOrchestratorAgent();
+    const runWorker = (agent.tools ?? []).find((tool) => (tool as { name?: string }).name === 'run_worker') as {
+      invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
+    } | undefined;
+    assert.ok(runWorker, 'expected run_worker on the Claude-brain orchestrator surface');
+
+    const packet = {
+      objective: 'Research one fictional account.',
+      item: 'Cedar & Finch',
+      resolvedTools: 'none needed',
+      externalMcpToolNames: null,
+      context: 'This is an offline routing proof.',
+      instructions: 'Return one concise sentence.',
+      expectedOutput: 'One sentence or ERROR: <reason>.',
+      intent: 'research',
+      workManifest: {
+        id: 'claude-brain-codex-worker',
+        contractVersion: '1',
+        phase: 'research',
+        mode: 'declare',
+        phases: [{ id: 'research' }],
+      },
+    };
+    const input = JSON.stringify(packet);
+    const anchor = anchorAcceptedTask(session.id, 'Research one fictional account with the configured worker.');
+    const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
+      new RunContext({ sessionId: session.id }),
+      input,
+      {
+        parentRunConfig: { modelProvider: stubProvider },
+        toolCall: { name: 'run_worker', callId: 'call_claude_brain_codex_worker', arguments: input },
+      },
+    ));
+
+    assert.equal(result, 'codex worker completed under claude brain');
+    assert.deepEqual(requestedModels, ['gpt-5.4']);
+    const started = listEvents(session.id, { types: ['worker_started'] });
+    assert.equal((started[0]?.data as { model?: string }).model, 'gpt-5.4');
+    assert.equal((started[0]?.data as { provider?: string }).provider, 'codex');
+    const routed = listEvents(session.id, { types: ['worker_model_routed'] });
+    assert.equal(routed.length, 1);
+    assert.equal((routed[0].data as { modelId?: string }).modelId, 'gpt-5.4');
+    assert.equal((routed[0].data as { provider?: string }).provider, 'codex');
+    assert.equal((routed[0].data as { source?: string }).source, 'settings');
+    assert.equal((routed[0].data as { matchedIntent?: string }).matchedIntent, 'research');
+    assert.equal((routed[0].data as { transport?: string }).transport, 'host_harness');
+    const results = listEvents(session.id, { types: ['worker_result'] });
+    assert.equal(results.length, 1);
+    assert.equal((results[0].data as { ok?: boolean }).ok, true);
+    assert.equal((results[0].data as { model?: string }).model, 'gpt-5.4');
+  } finally {
+    setClaudeAgentSdkWorkerRunForTest(null);
+    rmSync(authFile, { force: true });
     for (const [key, value] of Object.entries(prev)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -1465,23 +1601,23 @@ test('request_approval execute returns an "approved" acknowledgement after resum
   assert.equal(events.length, 0);
 });
 
-test('request_approval execute opens a slug-scoped plan scope for Outlook draft batches', async () => {
+test('request_approval prose cannot mint an operation scope without an exact queued payload', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const t = buildRequestApprovalTool();
   const result = await invokeFunctionTool(
     t,
     {
-      subject: 'Create 15 personalized Outlook drafts',
-      reason: 'Write draft emails into Outlook for review, without sending.',
+      subject: 'Create 15 external draft records',
+      reason: 'Create reviewable drafts without publishing them.',
       destructive: false,
       preview: {
         count: 15,
         samples: [
           {
             label: 'Draft',
-            value: 'Acme has been the best choice for us.',
-            secondary: 'To: Pat Dunphy <pdunphy@example.com>',
+            value: 'Example bounded preview',
+            secondary: 'Destination: connected account',
           },
         ],
       },
@@ -1489,10 +1625,8 @@ test('request_approval execute opens a slug-scoped plan scope for Outlook draft 
     },
     { sessionId: sess.id, turn: 4 },
   );
-  assert.match(result, /Approved scope opened for OUTLOOK_CREATE_DRAFT/);
-  const scope = getPlanScope(sess.id);
-  assert.deepEqual(scope?.allowedTools, ['composio_execute_tool']);
-  assert.deepEqual(scope?.allowedComposioSlugs, ['OUTLOOK_CREATE_DRAFT']);
+  assert.doesNotMatch(result, /Approved scope opened for/i);
+  assert.equal(getPlanScope(sess.id), null, 'approval prose is not live operation authority');
 });
 
 test('ask_user_question preserves exact source provenance and a single typed clarification purpose', async () => {
@@ -1984,6 +2118,34 @@ test('compound decline keeps the full conversational turn while scoping tools to
       !JSON.stringify(event.data).toLowerCase().includes('outlook')),
     'private tool-policy evidence is derived from the arithmetic clause, not the visible parent decline',
   );
+});
+
+test('direct_reply accepted route skips factory, MCP, and capability hunt', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'discord' });
+  const agent = await buildOrchestratorAgent({
+    userInput: "what's 2x2",
+    sessionId: sess.id,
+    acceptedRoute: 'direct_reply',
+    allowToolJit: true,
+  });
+  const scope = boundAgentMcpToolScope(agent).scope;
+  assert.deepEqual(scope?.allowedServerSlugs ?? [], []);
+  assert.equal(scope?.maxTools ?? 0, 0);
+  assert.match(scope?.reason ?? '', /direct_reply/);
+  const policies = listEvents(sess.id, { types: ['tool_policy_resolved'] });
+  assert.ok(policies.length > 0, 'direct_reply records its explicit local tool boundary');
+  assert.ok(
+    policies.every((event) =>
+      event.data.shortCircuitReason === 'direct_reply'
+      && event.data.semanticAcquisitionSkipped === true
+      && event.data.schemaWarmSkipped === true
+      && event.data.advertisedSchemaCount === 0
+      && event.data.catalogCount === 0),
+    'direct_reply records positive proof that acquisition and schema work were bypassed',
+  );
+  assert.equal(listEvents(sess.id, { types: ['tool_search_scope'] }).length, 0);
+  assert.equal(listEvents(sess.id, { types: ['tool_jit_scope'] }).length, 0);
 });
 
 test('continuity cross-session: a NEW session inherits scope via the continuation lineage', () => {

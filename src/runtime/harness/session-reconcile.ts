@@ -24,6 +24,11 @@ const WORK_LIFECYCLE_EVENT_TYPES: EventType[] = [
 const NON_TERMINAL_COMPLETION_REASONS = new Set([
   'awaiting_user_input',
   'awaiting_continue',
+  // Budget parks (2026-08-18): blocked+resumable checkpoints awaiting host
+  // re-entry — the work has not finished.
+  'step_budget_parked',
+  'sdk_step_budget_parked',
+  'budget_checkpoint_auto_resume',
 ]);
 
 const DEFAULT_ACTIVE_WORK_STALE_MS = 12 * 60 * 60_000;

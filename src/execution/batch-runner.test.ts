@@ -30,7 +30,7 @@ process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
 process.env.CLEMMY_CONFIRM_FIRST = 'off';
 
 // eslint-disable-next-line import/first
-const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
+const { _setInnerDispatchToolsForTests } = await import('../tools/inner-dispatch.js');
 // eslint-disable-next-line import/first
 const { validateBatchPlan, prepareBatchPlanForExecution, runBatchPlan, certifyBatchPlan, parseBatchCertificationVerdict, formatBatchLedger, readBatchLedger, _setBatchSleepForTests, _setCertifyJudgeForTests, _setCertifyChainForTests } = await import('./batch-runner.js');
 // eslint-disable-next-line import/first
@@ -145,7 +145,7 @@ test('validateBatchPlan: catches the shapes that must never execute', () => {
 
 test('runBatchPlan: read batch executes every item, ledger honest, zero model involvement', async () => {
   calls.length = 0;
-  _setCodeModeToolsForTests(new Map([['read_file', fakeTool('read_file', (input) => `contents of ${String(input.path)}`)]]) as never);
+  _setInnerDispatchToolsForTests(new Map([['read_file', fakeTool('read_file', (input) => `contents of ${String(input.path)}`)]]) as never);
   const ledger = await runBatchPlanAnchored({
     tool: 'read_file',
     sideEffect: 'read',
@@ -180,7 +180,7 @@ test('runBatchPlan: bounded http_fetch aliases validate and execute through the 
     items: [{ id: 'post', args: { url: 'https://example.com/posts', method: 'POST' } }],
   }).some((error) => /GET only/.test(error)), 'mutation-shaped alias input is refused during validation');
 
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['run_shell_command', fakeTool('run_shell_command', (input) => {
       assert.match(String(input.command), /^curl /);
       assert.match(String(input.command), /CLEMENTINE_HTTP_META_V1/);
@@ -199,7 +199,7 @@ test('runBatchPlan: bounded http_fetch aliases validate and execute through the 
 test('runBatchPlan: transient failures retry once; hard failures do not; consecutive failures halt', async () => {
   calls.length = 0;
   let flaky = 0;
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['read_file', fakeTool('read_file', (input) => {
       const p = String(input.path);
       if (p.includes('flaky')) { flaky += 1; if (flaky === 1) throw new Error('fetch failed: read ECONNRESET'); return 'recovered'; }
@@ -236,7 +236,7 @@ test('runBatchPlan: transient failures retry once; hard failures do not; consecu
 
 test('runBatchPlan: a composio polite-failure result counts as a FAILED item, not success', async () => {
   calls.length = 0;
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['composio_execute_tool', fakeTool('composio_execute_tool', () => '⚠️ composio_execute_tool FAILED (slug=X): boom')],
   ]) as never);
   const ledger = await runBatchPlanAnchored({
@@ -252,7 +252,7 @@ test('runBatchPlan: a composio polite-failure result counts as a FAILED item, no
 
 test('runBatchPlan: a structured provider failure counts as FAILED and never earns an idempotency success receipt', async () => {
   calls.length = 0;
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['composio_execute_tool', fakeTool('composio_execute_tool', () => ({
       successful: false,
       error: { message: 'upstream rejected the write' },
@@ -388,7 +388,7 @@ test('runBatchPlan: a rate-limit pauses the whole batch, does NOT consume the it
   // a BATCH-level pause + fresh re-run — the item's single transient retry is never
   // spent, and rate-limits never count as consecutive failures (haltAfter=1 proves it).
   let n = 0;
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['read_file', fakeTool('read_file', () => { n += 1; if (n <= 2) throw new Error('HTTP 429 Too Many Requests'); return 'ok'; })],
   ]) as never);
   try {
@@ -415,7 +415,7 @@ test('runBatchPlan: persistent rate-limiting halts after 5 back-offs with the th
   calls.length = 0;
   const delays: number[] = [];
   _setBatchSleepForTests(async (ms) => { delays.push(ms); });
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['read_file', fakeTool('read_file', () => { throw new Error('429 rate limit exceeded'); })],
   ]) as never);
   try {
@@ -442,7 +442,7 @@ test('runBatchPlan: a re-run skips an already-succeeded item but re-executes a f
   // Run A: dedup-ok succeeds, dedup-fail hard-fails.
   calls.length = 0;
   let failToggle = 0;
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['read_file', fakeTool('read_file', (input) => {
       const p = String(input.path);
       if (p.includes('dedup-fail')) { failToggle += 1; if (failToggle === 1) throw new Error('permission denied'); return 'ok-on-retry'; }
@@ -480,7 +480,7 @@ test('runBatchPlan: a re-run skips an already-succeeded item but re-executes a f
 
 test('composio items: connected_account_id is ALWAYS present (strict nullable-required schema) and SDK error banners are FAILURES', async () => {
   calls.length = 0;
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['composio_execute_tool', fakeTool('composio_execute_tool', (input) => {
       // The real tool's parser rejects ABSENT keys before any network call —
       // mirror that contract so composition drift fails this test.
@@ -503,7 +503,7 @@ test('composio items: connected_account_id is ALWAYS present (strict nullable-re
 
   // Now the classifier: a tool that ALWAYS returns the SDK banner must be an
   // honest failure, never a fake success (the 2026-07-08 "5/5 succeeded" lie).
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['composio_execute_tool', fakeTool('composio_execute_tool', () =>
       'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid JSON input for tool')],
   ]) as never);
@@ -599,7 +599,7 @@ test('prepareBatchPlanForExecution: mismatched nested composio wrapper is reject
 
 test('a harness gate REFUSAL banner is a FAILED item — never a fake success (2026-07-08 "10 sent" lie, 8 were refused)', async () => {
   calls.length = 0;
-  _setCodeModeToolsForTests(new Map([
+  _setInnerDispatchToolsForTests(new Map([
     ['composio_execute_tool', fakeTool('composio_execute_tool', () =>
       'Tool call refused by harness: GOAL_FIDELITY_CHECK_FAILED: this irreversible composio_execute_tool was blocked')],
   ]) as never);

@@ -24,7 +24,7 @@ test('clarification text cannot accidentally trigger the non-terminal path', () 
 });
 
 test('a successful durable control receipt settles the foreground request on every lane', () => {
-  // Live 2026-08-10, sess-msmo2312-e8aad2da (Codex gpt-5.6-sol): "How's it
+  // Live 2026-08-10, session-fixture-terminal-control (Codex gpt-5.6-sol): "How's it
   // going?" → one correct status read → one good answer → the harness treated
   // the still-running CHILD task as unfinished FOREGROUND work. 58 status
   // calls, 40 conversation steps, 95 model calls, 3.36M tokens, no delivered

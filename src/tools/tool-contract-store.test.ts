@@ -22,7 +22,7 @@ import { test, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 const {
-  saveToolContract, saveToolContractExample, loadToolContract, redactExample, fingerprintSchema,
+  saveToolContract, saveToolContractExample, loadToolContract, redactExample, digestSchema, fingerprintSchema,
   contractFileName, _clearToolContractsForTests,
 } = await import('./tool-contract-store.js');
 
@@ -59,6 +59,16 @@ test('the fingerprint is key-order independent, so a re-serialised schema is not
   const two = fingerprintSchema({ b: { d: 3, c: 2 }, a: 1 });
   assert.equal(one, two, 'identical contracts must agree or we discard good contracts as drift');
   assert.notEqual(one, fingerprintSchema({ a: 1, b: { c: 2, d: 4 } }), 'a real change must move it');
+});
+
+test('the full provider-input digest shares the canonical encoder without changing the legacy fingerprint', () => {
+  const one = digestSchema({ a: 1, b: { c: 2, d: 3 } });
+  const two = digestSchema({ b: { d: 3, c: 2 }, a: 1 });
+  assert.match(one, /^[a-f0-9]{64}$/);
+  assert.equal(one, two, 'key-order permutations are one exact provider schema');
+  assert.equal(fingerprintSchema({ a: 1, b: { c: 2, d: 3 } }), one.slice(0, 32),
+    'the historical selector/cache identity keeps its exact 32-hex bytes');
+  assert.notEqual(one, digestSchema({ a: 1, b: { c: 2, d: 4 } }));
 });
 
 test('an example records SHAPE, never content — this is a cache, not a copy of the mailbox', () => {

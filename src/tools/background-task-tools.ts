@@ -199,6 +199,8 @@ export function registerBackgroundTaskTools(server: McpServer): void {
           .describe('Phase names each item passes through, in order (default: ["execute"]).'),
         missing_required_inputs: z.array(z.string()).nullable()
           .describe('Load-bearing inputs you do NOT have. Naming any pauses admission with ONE typed clarification instead of guessing unattended.'),
+        worker_model: z.string().min(1).nullable().optional()
+          .describe('Exact model id the fan-out windows should run on (for example a codex or grok id) — the master stays on its own brain while the fleet runs here. Omit/null uses the default worker routing; an unroutable id falls back, never refuses.'),
       }).nullable().describe(
         'For MANY-ITEM work (each item processed independently, then combined): the typed fan-out manifest. '
         + 'The runtime windows items across durable workers, settles each item exactly once (a restart resumes, never redoes), '
@@ -301,6 +303,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
               runnerClass: 'worker',
             })),
             reducer: { id: 'reduce', requiredPhases: phases, outputContract: 'report@1' },
+            ...(manifest.worker_model?.trim() ? { workerModel: manifest.worker_model.trim() } : {}),
           },
         }, {
           originSessionId: sessionId,

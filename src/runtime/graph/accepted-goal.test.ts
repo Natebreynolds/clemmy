@@ -127,6 +127,7 @@ test('a leading per-member field list preserves every requested source projectio
   assert.deepEqual(goal.collection, {
     count: 5,
     projection: ['name', 'review count', 'phone number'],
+    completeness: 'count',
   });
   assert.deepEqual(goal.destination, {
     posture: 'create_new',
@@ -406,6 +407,31 @@ test('projection roles come from the field list, not a vendor dictionary', () =>
     projectionRolesFromText('put the title, date, and link on a new workbook'),
     ['title', 'date', 'link'],
   );
+});
+
+test('listed fields plus a database sink compile as collect-then-construct', () => {
+  const text = [
+    'Populate a database of matching local professionals, grouped by category.',
+    'The information that I would like pulled is the following:',
+    'Name',
+    'Organization',
+    'Category',
+    'Phone',
+    'Email',
+    'Website',
+    'Address',
+  ].join('\n');
+  const goal = compileAcceptedGoal({
+    text,
+    sourceUserSeq: 91,
+    multiItem: detectMultiItemIntent(text),
+  });
+  assert.equal(goal.construct, 'collect_then_construct');
+  assert.equal(goal.route, 'act');
+  assert.equal(goal.destination?.family, 'records');
+  for (const field of ['name', 'organization', 'category', 'phone', 'email', 'website', 'address']) {
+    assert.ok(goal.collection?.projection.includes(field), field);
+  }
 });
 
 test('capability inventory omits instance-bound command payloads', async () => {

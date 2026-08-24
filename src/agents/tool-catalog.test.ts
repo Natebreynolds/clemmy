@@ -70,6 +70,25 @@ test('resolveHotSet seeds from the tiny schema kernel and includes session LRU',
   assert.ok(hot.has('workflow_schedule'), 'session LRU tool should be promoted');
 });
 
+test('resolveHotSet never promotes sibling discovery doors from recall or LRU', () => {
+  _resetHotSetForTest();
+  const sid = 'sess-sibling-doors';
+  for (const name of ['composio_search_tools', 'tool_choice_recall', 'local_cli_list', 'skill_list']) {
+    recordToolHit(sid, name);
+  }
+  const hot = resolveHotSet(sid, 'pull my open Salesforce tasks and email the list');
+  for (const name of ['composio_search_tools', 'tool_choice_recall', 'local_cli_list', 'skill_list']) {
+    assert.equal(hot.has(name), false, `${name} must stay behind tool_search unless the user named it`);
+  }
+  assert.ok(hot.has('tool_search'), 'the one broker stays first-class');
+});
+
+test('resolveHotSet still promotes a sibling door the user named', () => {
+  _resetHotSetForTest();
+  const hot = resolveHotSet('sess-named-door', 'call composio_search_tools for the Salesforce slug');
+  assert.ok(hot.has('composio_search_tools'), 'an explicit name is still a first-class request');
+});
+
 test('resolveHotSet does not inherit the broad legacy JIT core', () => {
   const hot = resolveHotSet('sess-lean-kernel', 'hello there');
   assert.deepEqual(
@@ -127,6 +146,46 @@ test('resolveHotSet respects an allowedNames policy', () => {
   const allowed = new Set(['read_file']);
   const hot = resolveHotSet(sid, 'read a file', { allowedNames: allowed });
   assert.deepEqual([...hot], ['read_file']); // mandated tools excluded by policy
+});
+
+test('resolveHotSet pins bounded workflow controls when the user uniquely names an enabled workflow', async () => {
+  _resetHotSetForTest();
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const { WORKFLOWS_DIR } = await import('../memory/vault.js');
+  const { rmSync } = await import('node:fs');
+  writeWorkflow('platform-49-slack-channel-review', {
+    name: 'Platform 49 Slack Channel Review',
+    description: 'Business-hours channel review',
+    enabled: true,
+    trigger: { schedule: '0 9 * * 1-5', timezone: 'America/Los_Angeles' },
+    steps: [{ id: 'post', prompt: 'Post the team update.' }],
+  });
+  try {
+    const runHot = resolveHotSet(
+      'sess-named-workflow',
+      'run my platform 49 slack channel review early and skip the 9am one',
+    );
+    assert.ok(runHot.has('workflow_run'), 'a uniquely named catalog workflow must advertise workflow_run');
+    assert.ok(runHot.has('workflow_get'), 'the same proven workflow match keeps its bounded reader hot');
+
+    const readHot = resolveHotSet(
+      'canary-claude-workflow-get-20260820-0148',
+      'CANARY-CLAUDE-WORKFLOW-20260820-0148: Read only the frontmatter for workflow platform-49-slack-channel-review using the workflow read capability. Do not run or update it, do not use external apps, and return only the schedule cron and timezone.',
+      { allowedNames: new Set(['workflow_get', 'workflow_run']) },
+    );
+    assert.ok(readHot.has('workflow_get'), 'an exact canary-shaped workflow read gets the reader schema first-class');
+    assert.equal(readHot.has('workflow_run'), false, 'an explicit no-run workflow read does not expose the immediate queue control');
+
+    const unrelated = resolveHotSet(
+      'sess-named-workflow-bare',
+      'hello there',
+      { allowedNames: new Set(['workflow_get', 'workflow_run']) },
+    );
+    assert.equal(unrelated.has('workflow_get'), false, 'an unrelated turn must not pin workflow_get');
+    assert.equal(unrelated.has('workflow_run'), false, 'an unrelated turn must not pin workflow_run');
+  } finally {
+    rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
+  }
 });
 
 test('resolveHotSet makes an explicitly named tool first-class without prior LRU state', () => {

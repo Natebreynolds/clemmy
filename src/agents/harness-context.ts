@@ -268,14 +268,21 @@ export function renderHarnessMemoryContext(opts?: {
   }
 
   let facts = '';
-  try {
-    // Move 1 (scoped recall): scope injected facts to the active focus's
-    // objective so an off-topic fact can't leak into a focused session.
-    // getActiveObjective() returns undefined when there's no focus or the
-    // flag is off → identical to the global ranking (no regression).
-    facts = renderFactsForInstructions(10, 2600, getActiveObjective());
-  } catch {
-    facts = '';
+  // PHANTOM IMPRESSIONS killed (COMPOUNDING wave): Persistent Facts is a
+  // STABLE-partition block; rendering it on a volatile-only pass recorded an
+  // impression per fact per turn for text the model never received — the
+  // measured live inflation behind the 1,735:1 impression:use ratio. Render
+  // (and count) only when the partition actually delivers the block.
+  if ((opts?.partition ?? 'all') !== 'volatile') {
+    try {
+      // Move 1 (scoped recall): scope injected facts to the active focus's
+      // objective so an off-topic fact can't leak into a focused session.
+      // getActiveObjective() returns undefined when there's no focus or the
+      // flag is off → identical to the global ranking (no regression).
+      facts = renderFactsForInstructions(10, 2600, getActiveObjective());
+    } catch {
+      facts = '';
+    }
   }
 
   // Learned context (Recently Learned + Remembered Tool Choices) — shared with

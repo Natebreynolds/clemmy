@@ -9,7 +9,7 @@ import { getRuntimeEnv } from '../../config.js';
  * incident that still allowed 87 real top-level calls while producing one
  * document. This state is owned by the logical brain attempt and shared by all
  * of its continuations. It counts provider call ids (not MCP mirrors or
- * code-mode children), shifts a single-deliverable turn into a bounded finish
+ * nested-dispatch children), shifts a single-deliverable turn into a bounded finish
  * phase, and leaves explicit batch/background execution on their own rails.
  */
 
@@ -189,13 +189,19 @@ function decodeJsonValue(value: unknown): unknown {
   try { return JSON.parse(trimmed) as unknown; } catch { return value; }
 }
 
+const CARRIER_TAILS = new Set(['call_tool', 'work_call']);
+
 function resolvedInvocation(toolName: string, args: unknown): { toolName: string; args: unknown } {
-  if (toolTail(toolName) !== 'call_tool') return { toolName, args };
+  // Every carrier with a {name, args_json} envelope resolves to its inner
+  // call. Classifying the carrier name instead of the carried work made the
+  // finish phase refuse the exact artifact write its own advisory demanded
+  // (live 2026-08-18: work_call carrying the requested Sheets create).
+  if (!CARRIER_TAILS.has(toolTail(toolName))) return { toolName, args };
   const decoded = decodeJsonValue(args);
   if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return { toolName, args };
   const input = decoded as Record<string, unknown>;
   const target = typeof input.name === 'string' ? input.name.trim() : '';
-  if (!target || toolTail(target) === 'call_tool') return { toolName, args };
+  if (!target || CARRIER_TAILS.has(toolTail(target))) return { toolName, args };
   return { toolName: target, args: decodeJsonValue(input.args_json ?? input.arguments ?? {}) };
 }
 
@@ -263,7 +269,7 @@ export function isFinishPhaseTool(toolName: string, args: unknown): boolean {
   const tail = toolTail(resolved.toolName);
   if (tail === 'run_worker') return false;
   if (
-    /^(?:run_tool_program|run_batch|recall_tool_result|tool_output_query|workspace_artifact_query|ask_user_question|offer_background|dispatch_background_task)$/.test(tail)
+    /^(?:run_batch|recall_tool_result|tool_output_query|workspace_artifact_query|ask_user_question|offer_background|dispatch_background_task)$/.test(tail)
   ) return true;
   if (isExactReadBack(resolved.toolName, resolved.args)) return true;
   const effect = classifyRuntimeToolEffect(toolName, args);
@@ -297,7 +303,7 @@ function isCompletionReserveTool(toolName: string, args: unknown): boolean {
 }
 
 /** One permission-boundary decision. The provider call id makes replayed SDK
- * frames/accounting callbacks free; mirrors and code-mode children never call
+ * frames/accounting callbacks free; mirrors and nested-dispatch children never call
  * this logical-run state in the first place. */
 export function evaluateToolEconomy(input: {
   state: ToolEconomyState;
@@ -363,7 +369,7 @@ export function evaluateToolEconomy(input: {
         policy: state.policy,
         message: terminal
           ? 'The finish-phase steer was ignored three times. End this foreground turn with the evidence already collected; do not make another exploratory call.'
-          : 'Finish phase: stop exploring. Synthesize from existing tool results (use tool_output_query/recall_tool_result if needed). Only the requested artifact write, one exact read-back verification, a batched run_tool_program, or a blocking/background handoff may run now.',
+          : 'Finish phase: stop exploring. Synthesize from existing tool results (use tool_output_query/recall_tool_result if needed). Only the requested artifact write, one exact read-back verification, remaining reads issued as parallel calls, or a blocking/background handoff may run now.',
       };
       cacheDecision(state, id, signature, verdict);
       return verdict;

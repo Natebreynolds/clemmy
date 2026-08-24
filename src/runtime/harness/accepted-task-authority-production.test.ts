@@ -183,25 +183,40 @@ test('a standard-lane graph persistence failure reaches zero provider calls', as
   `);
   let modelCalls = 0;
   try {
-    await assert.rejects(
-      runConversation({
-        agent: makeAgentStub(),
-        sessionId: session.id,
-        input: 'Hello',
-        judgeCompletion: false,
-        makeRunner: makeRunnerStub,
-        runRunner: standardAnswerRunner(() => { modelCalls += 1; }, 'must not run'),
-      }),
-      (error: unknown) => error instanceof BoundaryError
-        && error.kind === 'state.write_failed'
-        && error.context.authorityStatus === 'missing',
-    );
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: session.id,
+      input: 'Hello',
+      judgeCompletion: false,
+      makeRunner: makeRunnerStub,
+      runRunner: standardAnswerRunner(() => { modelCalls += 1; }, 'must not run'),
+    });
+    assert.equal(result.status, 'blocked');
+    assert.equal(result.steps, 0);
+    assert.match(result.error ?? '', /stopped before using any tools/i);
   } finally {
     db.exec('DROP TRIGGER IF EXISTS force_turn_graph_storage_failure');
   }
   assert.equal(modelCalls, 0);
   assert.equal(eventlog.listEvents(session.id, { types: ['turn_graph_compiled'] }).length, 0);
   assert.equal(eventlog.listEvents(session.id, { types: ['accepted_task_authority_armed'] }).length, 0);
+  const source = eventlog.listEvents(session.id, { types: ['user_input_received'] })[0];
+  assert.ok(source);
+  const terminal = eventlog.listEvents(session.id, { types: ['conversation_completed'] })[0];
+  const outcome = terminal?.data.turnOutcome as { status?: string; resumable?: boolean } | undefined;
+  assert.equal(outcome?.status, 'blocked');
+  assert.equal(outcome?.resumable, true);
+  const bodies = eventlog.openEventLog().prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM logical_tool_calls
+        WHERE session_id = ? AND source_user_seq = ?) AS logical_calls,
+      (SELECT COUNT(*) FROM physical_dispatches
+        WHERE session_id = ? AND source_user_seq = ?) AS physical_dispatches
+  `).get(session.id, source.seq, session.id, source.seq) as {
+    logical_calls: number;
+    physical_dispatches: number;
+  };
+  assert.deepEqual(bodies, { logical_calls: 0, physical_dispatches: 0 });
 });
 
 test('a Claude-lane authority storage failure reaches zero provider calls', async () => {

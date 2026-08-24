@@ -61,6 +61,7 @@ const {
   assessBackgroundTaskRestartSafety,
   _setBackgroundTaskSettlementCasHookForTests,
   _setBackgroundTaskApprovalDispatchCheckHookForTests,
+  _setDrainApprovalResolverForTests,
   _setBackgroundTaskReattachCasHookForTests,
   markBackgroundTaskAwaitingApproval,
   queueBackgroundTaskApprovalResolution,
@@ -518,6 +519,95 @@ test('a proven failed write is netted as no-dispatch and can resume safely', () 
   assert.equal(getBackgroundTask(task.id)?.status, 'pending');
 });
 
+test('an interrupted queued approval retains its exact decision only when the ledger proves zero physical crossing', () => {
+  const task = createBackgroundTask({ title: 'Resume exact approved action', prompt: 'run the approved action once', source: 'desktop' });
+  const approvalId = 'approval-safe-restart-exact';
+  assert.equal(markBackgroundTaskAwaitingApproval(task.id, approvalId, 'Waiting for approval.')?.status, 'awaiting_approval');
+  assert.equal(queueBackgroundTaskApprovalResolution(approvalId, true)?.status, 'pending', 'decision is durably queued before the crash');
+  assert.equal(markBackgroundTaskRunning(task.id)?.status, 'running', 'worker claimed the queued continuation');
+  // Exact no-dispatch evidence: a write reservation and its failed terminal
+  // prove the physical crossing count is zero rather than merely absent.
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'safe-restart-write', shapeKey: 'SEND_EXACT_RESULT', targets: ['target-1'] },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: { callId: 'safe-restart-write', shapeKey: 'SEND_EXACT_RESULT', targets: ['target-1'] },
+  });
+
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+  assert.deepEqual(getBackgroundTask(task.id)?.approvalResolution, {
+    approvalId,
+    approved: true,
+    queuedAt: getBackgroundTask(task.id)?.approvalResolution?.queuedAt,
+  }, 'interruption preserves the frozen decision until safety is assessed');
+  assert.deepEqual(assessBackgroundTaskRestartSafety(task), {
+    safeToAutoResume: true,
+    reason: 'safe_no_external_write',
+    externalWriteCount: 0,
+    ambiguousWriteCount: 0,
+  });
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 1);
+  const resumed = getBackgroundTask(task.id);
+  assert.equal(resumed?.status, 'pending');
+  assert.equal(resumed?.approvalResolution?.approvalId, approvalId);
+  assert.equal(resumed?.approvalResolution?.approved, true);
+  assert.equal(resumed?.restartRecovery?.externalWriteCount, 0);
+  assert.equal(resumed?.restartRecovery?.ambiguousWriteCount, 0);
+  archiveBackgroundTask(task.id);
+});
+
+test('write-crossed queued approval is verification-held, loses replay authority, and a second boot is idempotent', () => {
+  const task = createBackgroundTask({ title: 'Do not replay crossed approval', prompt: 'send once', source: 'desktop' });
+  const approvalId = 'approval-crossed-restart-held';
+  markBackgroundTaskAwaitingApproval(task.id, approvalId, 'Waiting for approval.');
+  queueBackgroundTaskApprovalResolution(approvalId, true);
+  markBackgroundTaskRunning(task.id);
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'crossed-write', shapeKey: 'SEND_EXACT_RESULT', targets: ['target-1'] },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: { callId: 'crossed-write', shapeKey: 'SEND_EXACT_RESULT', targets: ['target-1'] },
+  });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+  assert.equal(getBackgroundTask(task.id)?.approvalResolution?.approvalId, approvalId, 'decision survives only until the crossing audit');
+
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
+  const held = getBackgroundTask(task.id);
+  assert.equal(held?.status, 'interrupted');
+  assert.equal(held?.approvalResolution, undefined, 'unsafe decision cannot become blind replay authority');
+  assert.equal(held?.restartRecovery?.disposition, 'parked_for_verification');
+  assert.equal(held?.restartRecovery?.externalWriteCount, 1);
+  assert.equal(held?.restartRecovery?.ambiguousWriteCount, 0);
+  const cardsBefore = listNotifications(500).filter((item) => (
+    item.metadata?.backgroundTaskId === task.id && item.metadata?.verificationRequired === true
+  ));
+  assert.equal(cardsBefore.length, 1);
+  assert.match(cardsBefore[0]?.body ?? '', /1 confirmed physical write\(s\), 0 ambiguous write\(s\)/i);
+
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0, 'second boot remains held');
+  const cardsAfter = listNotifications(500).filter((item) => (
+    item.metadata?.backgroundTaskId === task.id && item.metadata?.verificationRequired === true
+  ));
+  assert.equal(cardsAfter.length, 1, 'second boot does not duplicate the same verification card');
+  archiveBackgroundTask(task.id);
+});
+
 test('an unresolved external-write call is ambiguous and always parks on boot', () => {
   const task = createBackgroundTask({ title: 'Ambiguous CRM update', prompt: 'update the account', source: 'desktop' });
   markBackgroundTaskRunning(task.id);
@@ -619,6 +709,148 @@ test('a clean read-only complete history auto-resumes in place as safe_no_extern
   assert.equal(resumed?.restartRecovery?.reason, 'safe_no_external_write');
   assert.equal(resumed?.continueResolution?.auto, true, 'automatic (not user-initiated) continuation');
   assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1, 'auto-resume creates no clone');
+});
+
+test('restart retry cap parks one visible same-session Resume/Cancel decision and never auto-retries', () => {
+  const task = createBackgroundTask({
+    title: 'Read-only task at restart ceiling',
+    prompt: 'finish the retained read-only analysis',
+    source: 'desktop',
+  });
+  markBackgroundTaskRunning(task.id);
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'session_history', callId: 'cap-read-1', accounting: 'top_level' },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'session_history', callId: 'cap-read-1', result: 'retained state' },
+  });
+  updateBackgroundTask(task.id, { resumeCount: 2 });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0, 'ceiling is never an automatic retry');
+  const parked = getBackgroundTask(task.id);
+  assert.equal(parked?.id, task.id);
+  assert.equal(parked?.runSessionId, task.runSessionId);
+  assert.equal(parked?.status, 'interrupted');
+  assert.equal(parked?.resumeCount, 2);
+  assert.equal(parked?.restartRecovery?.disposition, 'parked_for_verification');
+  assert.equal(parked?.restartRecovery?.reason, 'automatic_retry_limit_reached');
+  assert.equal(parked?.continueResolution, undefined, 'the retry ceiling queues no continuation');
+  assert.match(parked?.error ?? '', /Resume, or choose Cancel/i);
+
+  const cardsBefore = listNotifications(500).filter((item) => (
+    item.metadata?.backgroundTaskId === task.id
+    && item.metadata?.restartRecoveryReason === 'automatic_retry_limit_reached'
+  ));
+  assert.equal(cardsBefore.length, 1);
+  assert.match(cardsBefore[0]?.body ?? '', /choose Resume/i);
+  assert.match(cardsBefore[0]?.body ?? '', /choose Cancel/i);
+  assert.deepEqual(cardsBefore[0]?.metadata?.availableActions, ['resume', 'cancel']);
+  assert.equal(cardsBefore[0]?.metadata?.runSessionId, task.runSessionId);
+
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0, 'a second boot remains inert');
+  const cardsAfter = listNotifications(500).filter((item) => (
+    item.metadata?.backgroundTaskId === task.id
+    && item.metadata?.restartRecoveryReason === 'automatic_retry_limit_reached'
+  ));
+  assert.equal(cardsAfter.length, 1, 'stable projection id prevents a duplicate card');
+  const decisions = listEvents(task.runSessionId, { types: ['restart_recovery_decision'] })
+    .filter((event) => (event.data as { reason?: string }).reason === 'automatic_retry_limit_reached');
+  assert.equal(decisions.length, 1, 'the unchanged retry-ceiling decision is recorded once');
+
+  // Manual Resume is asserted as a state transition only; do not let a drain
+  // kick race the following restart-recovery cases in this shared test file.
+  registerBackgroundDrainKick(() => {});
+  const manuallyResumed = resumeBackgroundTask(task.id);
+  assert.equal(manuallyResumed?.id, task.id);
+  assert.equal(manuallyResumed?.runSessionId, task.runSessionId);
+  assert.equal(manuallyResumed?.status, 'pending');
+  assert.equal(manuallyResumed?.resumeCount, 3);
+  assert.ok(manuallyResumed?.continueResolution, 'only an explicit Resume queues continuation');
+  archiveBackgroundTask(task.id);
+});
+
+test('restart retry cap never preserves approved replay authority across a physical write', () => {
+  const task = createBackgroundTask({
+    title: 'Approved send at restart ceiling',
+    prompt: 'send the frozen result once',
+    source: 'desktop',
+  });
+  const approvalId = 'approval-cap-crossing-held';
+  markBackgroundTaskAwaitingApproval(task.id, approvalId, 'Waiting for approval.');
+  queueBackgroundTaskApprovalResolution(approvalId, true);
+  markBackgroundTaskRunning(task.id);
+  updateBackgroundTask(task.id, { resumeCount: 2 });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'cap-crossing-write', shapeKey: 'SEND_EXACT_RESULT', targets: ['target-1'] },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: { callId: 'cap-crossing-write', shapeKey: 'SEND_EXACT_RESULT', targets: ['target-1'] },
+  });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
+  const held = getBackgroundTask(task.id);
+  assert.equal(held?.status, 'interrupted');
+  assert.equal(held?.restartRecovery?.reason, 'automatic_retry_limit_reached');
+  assert.equal(held?.restartRecovery?.externalWriteCount, 1);
+  assert.equal(held?.approvalResolution, undefined, 'a retry ceiling cannot preserve blind redispatch authority');
+  const card = listNotifications(500).find((item) => (
+    item.metadata?.backgroundTaskId === task.id
+    && item.metadata?.restartRecoveryReason === 'automatic_retry_limit_reached'
+  ));
+  assert.match(card?.body ?? '', /1 confirmed physical write/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('restart retry cap repairs a missing visible card after the task decision persisted', () => {
+  const task = createBackgroundTask({
+    title: 'Repair retry ceiling projection',
+    prompt: 'retain this run for review',
+    source: 'desktop',
+  });
+  markBackgroundTaskRunning(task.id);
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+  updateBackgroundTask(task.id, {
+    resumeCount: 2,
+    restartRecovery: {
+      disposition: 'parked_for_verification',
+      reason: 'automatic_retry_limit_reached',
+      decidedAt: '2026-08-22T12:00:00.000Z',
+      externalWriteCount: 0,
+      ambiguousWriteCount: 0,
+    },
+  });
+  assert.equal(listNotifications(500).some((item) => (
+    item.metadata?.backgroundTaskId === task.id
+    && item.metadata?.restartRecoveryReason === 'automatic_retry_limit_reached'
+  )), false, 'simulated crash left the task authority but no presentation');
+
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
+  const cards = listNotifications(500).filter((item) => (
+    item.metadata?.backgroundTaskId === task.id
+    && item.metadata?.restartRecoveryReason === 'automatic_retry_limit_reached'
+  ));
+  assert.equal(cards.length, 1, 'boot repairs the missing projection under its stable generation id');
+  assert.deepEqual(cards[0]?.metadata?.availableActions, ['resume', 'cancel']);
+  archiveBackgroundTask(task.id);
 });
 
 test('boot recovery never clobbers a user abort that lands before reattach (finding C)', () => {
@@ -1645,7 +1877,12 @@ test('an approved continuation with no cancellation dispatches the mutation exac
                 targets: ['casey@example.com'],
               },
             });
-            return { text: 'Sent the approved follow-up to casey@example.com (message m-1).' };
+            return {
+              approvalId: id,
+              status: 'approved' as const,
+              text: 'Sent the approved follow-up to casey@example.com (message m-1).',
+              sessionId: task.runSessionId,
+            };
           },
         };
       },
@@ -1662,6 +1899,81 @@ test('an approved continuation with no cancellation dispatches the mutation exac
     assert.equal(tracked?.status, 'completed');
   } finally {
     _setBackgroundTaskApprovalDispatchCheckHookForTests(null);
+  }
+});
+
+test('a held approval continuation remains durably running under the peer owner', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const approvalId = 'approval-held-owner';
+  const task = createBackgroundTask({
+    title: 'Wait for exact-source peer',
+    prompt: 'Continue only under the existing exact-source owner.',
+  });
+  assert.equal(markBackgroundTaskAwaitingApproval(task.id, approvalId, 'Waiting for approval.')?.status, 'awaiting_approval');
+  assert.equal(queueBackgroundTaskApprovalResolution(approvalId, true)?.status, 'pending');
+  _setDrainApprovalResolverForTests((async () => ({
+    approvalId,
+    status: 'in_progress',
+    text: '',
+    sessionId: task.runSessionId,
+    execution: {
+      kind: 'held',
+      hold: { owner: 'host', wake: 'peer', reason: 'peer_in_progress' },
+      recoveredContract: false,
+    },
+  })) as never);
+
+  try {
+    assert.equal(await processBackgroundTasks({
+      getRuntime() { return {} as never; },
+      async respond() { throw new Error('held approval continuation must not start new model work'); },
+    } as any, 1), 1);
+    const durable = getBackgroundTask(task.id);
+    assert.equal(durable?.status, 'running');
+    assert.equal(durable?.completedAt, undefined);
+    assert.match(durable?.lastCheckInMessage ?? '', /peer-owned.*peer_in_progress/i);
+    const tracked = listRuns(40).find((candidate) => candidate.sessionId === task.runSessionId);
+    assert.equal(tracked?.status, 'running');
+    assert.equal(tracked?.events.some((event) => ['completed', 'blocked', 'failed', 'cancelled'].includes(event.type)), false);
+  } finally {
+    _setDrainApprovalResolverForTests(null);
+    updateBackgroundTask(task.id, { status: 'interrupted' });
+    archiveBackgroundTask(task.id);
+  }
+});
+
+test('a blocked approval continuation is blocked in both task and activity ledgers', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const approvalId = 'approval-blocked-owner';
+  const task = createBackgroundTask({
+    title: 'Preserve blocked approval truth',
+    prompt: 'Stop blocked when exact destination authority is unavailable.',
+  });
+  assert.equal(markBackgroundTaskAwaitingApproval(task.id, approvalId, 'Waiting for approval.')?.status, 'awaiting_approval');
+  assert.equal(queueBackgroundTaskApprovalResolution(approvalId, true)?.status, 'pending');
+  _setDrainApprovalResolverForTests((async () => ({
+    approvalId,
+    status: 'blocked',
+    text: '',
+    sessionId: task.runSessionId,
+    reason: 'Exact destination authority is unavailable.',
+  })) as never);
+
+  try {
+    assert.equal(await processBackgroundTasks({
+      getRuntime() { return {} as never; },
+      async respond() { throw new Error('blocked approval continuation must not start new model work'); },
+    } as any, 1), 1);
+    const durable = getBackgroundTask(task.id);
+    assert.equal(durable?.status, 'blocked');
+    assert.match(durable?.error ?? '', /destination authority/);
+    const tracked = listRuns(40).find((candidate) => candidate.sessionId === task.runSessionId);
+    assert.equal(tracked?.status, 'blocked');
+    assert.equal(tracked?.events.filter((event) => event.type === 'blocked').length, 1);
+    assert.equal(tracked?.events.some((event) => event.type === 'completed' || event.type === 'failed'), false);
+  } finally {
+    _setDrainApprovalResolverForTests(null);
+    archiveBackgroundTask(task.id);
   }
 });
 
@@ -1980,6 +2292,16 @@ test('classifyBackgroundTaskOutcome: max-turns-with-grace → blocked until cont
   );
   assert.equal(outcome.outcome, 'blocked', 'a continuation prompt is not a completed background task');
   assert.match(outcome.reason ?? '', /continue|budget/i);
+});
+
+test('classifyBackgroundTaskOutcome: exact-source in-progress is never reported done', () => {
+  const outcome = classifyBackgroundTaskOutcome(
+    { runSessionId: 'sess-exact-source-in-progress' },
+    'The existing exact attempt remains owned by recovery.',
+    'in-progress',
+  );
+  assert.equal(outcome.outcome, 'blocked', 'compatibility classification never promotes a held turn to done');
+  assert.match(outcome.reason ?? '', /exact accepted source|recovery/i);
 });
 
 test('classifyBackgroundTaskOutcome: the wall-clock error text alone (no stoppedReason) → blocked', () => {

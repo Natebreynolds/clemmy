@@ -18,7 +18,10 @@ import type {
 import type { GraphNodeInvocationEnvelopeV1 } from './graph-node-envelope.js';
 import { attachSemanticContract, type CapabilityManifestV1 } from './capability-manifest.js';
 import { isolatedTestContractActive } from './isolated-test-contract.js';
-import { requireAttestedTransport } from './implementation-artifacts/attested-transport.js';
+import {
+  requireAttestedTransport,
+  type AttestedTransportCall,
+} from './implementation-artifacts/attested-transport.js';
 
 export const SHEET_CREATE = 'GOOGLESHEETS_SHEET_FROM_JSON';
 export const SHEET_READBACK = 'GOOGLESHEETS_BATCH_GET';
@@ -295,6 +298,7 @@ export async function executeSealed(
   operationId: string,
   args: Record<string, unknown>,
   accountId: string,
+  expected?: AttestedTransportCall['expected'],
 ): Promise<unknown> {
   const attested = (() => {
     try {
@@ -304,7 +308,7 @@ export async function executeSealed(
     }
   })();
   if (attested) {
-    return attested.execute({ operationId, args, accountId });
+    return attested.execute({ operationId, args, accountId, ...(expected ? { expected } : {}) });
   }
   if (isolatedTestContractActive() && installedTransport) {
     return installedTransport({ operationId, args, accountId });
@@ -409,6 +413,11 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
   const sealed = Object.freeze({
     manifestId: manifest.manifestId,
     operationId: manifest.operationId,
+    providerKind: manifest.providerKind,
+    providerIdentity: manifest.providerIdentity,
+    providerVersion: manifest.providerVersion,
+    operationVersion: manifest.operationVersion,
+    definitionFingerprint: manifest.definitionFingerprint,
     purpose: manifest.purpose,
     effect: manifest.effect,
     accountId: manifest.accountId,
@@ -544,6 +553,24 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
         }
         throw error;
       }
+    }
+    if (sealed.purpose === 'invoke_live_read' && sealed.effect === 'read') {
+      const compiled = authority?.canonicalArgs ?? (
+        payload && typeof payload === 'object' && !Array.isArray(payload)
+          ? payload as Record<string, unknown>
+          : null
+      );
+      if (!compiled) throw new Error('live read requires canonical object arguments');
+      const result = await executeSealed(sealed.operationId, compiled, accountId, {
+        providerKind: sealed.providerKind,
+        providerIdentity: sealed.providerIdentity,
+        providerVersion: sealed.providerVersion,
+        operationVersion: sealed.operationVersion,
+        definitionFingerprint: sealed.definitionFingerprint,
+        invokePortId: sealed.invokePortId,
+        argumentCompiler: { ...sealed.argumentCompiler },
+      });
+      return { result, complete: true };
     }
     throw new Error(`no sealed invoke for exact operation ${sealed.operationId}`);
   };

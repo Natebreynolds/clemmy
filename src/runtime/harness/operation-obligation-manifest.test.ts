@@ -98,3 +98,31 @@ test('a source-backed replacement still owes derivation and stale reconciliation
     && edge.toObligation === 'derivation_from_current_source'
     && edge.fromObligation === 'source_completeness'));
 });
+
+test('only exact documented Sheet-from-JSON uses content commit instead of readback', () => {
+  const atomic = compileFor('read the source and create one Sheet from those rows', [
+    { operationId: 'read', resolvedTool: 'source_list_records' },
+    { operationId: 'write', resolvedTool: 'GOOGLESHEETS_SHEET_FROM_JSON' },
+  ]);
+  const write = atomic.nodes.find((node) => node.operationId === 'write');
+  assert.equal(write?.contentCommitMode, 'documented_atomic_input');
+  assert.ok(write?.obligations.includes('verify_committed_content'));
+  assert.equal(write?.obligations.includes('verify_committed_readback'), false);
+  assert.ok(write?.obligations.includes('derivation_from_current_source'));
+
+  for (const resolvedTool of [
+    'GOOGLESHEETS_SHEET_FROM_JSON_PREVIEW',
+    'GOOGLE_SHEETS_SHEET_FROM_JSON',
+    'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+    'GOOGLESHEETS_UPDATE_SHEET',
+    'GOOGLESHEETS_CREATE_GOOGLE_SHEET',
+  ]) {
+    const generic = compileFor(`create using ${resolvedTool}`, [
+      { operationId: 'write', resolvedTool },
+    ]);
+    const node = generic.nodes[0];
+    assert.equal(node?.contentCommitMode, undefined, resolvedTool);
+    assert.ok(node?.obligations.includes('verify_committed_readback'), resolvedTool);
+    assert.equal(node?.obligations.includes('verify_committed_content'), false, resolvedTool);
+  }
+});

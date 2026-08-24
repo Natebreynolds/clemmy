@@ -7,7 +7,7 @@ import {
   deriveOrchestratorDiscoveryNames,
   deriveSdkProfile,
   deriveJitCore,
-  deriveCodeModeSets,
+  deriveInnerDispatchSets,
   deriveWorkspaceDockNames,
   deriveWorkflowStepBlocked,
   deriveWorkerBlocked,
@@ -17,13 +17,14 @@ import {
   deriveGuardrailCacheSafeReads,
   deriveGuardrailReadMutators,
   deriveTerminalAuthoringEvidenceNames,
+  hostReadOnlyExecutionContractFor,
   isTerminalAuthoringEvidenceTool,
   terminalAuthoringResultIsProven,
   withTerminalAuthoringEvidenceReceipt,
 } from './tool-registry.js';
 
 import { LOCAL_MCP_TOOL_NAMES } from './catalog.js';
-import { READ_ONLY_TOOLS, WRITE_TOOLS } from './code-mode-tool.js';
+import { READ_ONLY_TOOLS, WRITE_TOOLS } from './inner-dispatch.js';
 import { TOOL_JIT_MANDATED } from '../agents/tool-jit.js';
 import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from '../agents/workflow-step-agent.js';
 import { WORKSPACE_DOCK_TOOLS } from '../spaces/workspace-context.js';
@@ -63,7 +64,7 @@ function assertSetEqual(actual: Set<string>, expected: Set<string>, label: strin
 }
 
 // F1 members that are NOT registered as real tools anywhere in the advertise /
-// JIT / code-mode surface. propose_plan is referenced only in prompts + the
+// JIT / inner-dispatch surface. propose_plan is referenced only in prompts + the
 // blocklist (see workflow-step-agent.ts / loop.ts) — a dead blocklist entry, not
 // a registered tool. It is a harmless no-op filter today; documented here so a
 // NEW phantom (or an eventual real registration) trips this test.
@@ -105,7 +106,7 @@ function assertReadMutatorsEqual(
 
 test('catalog surface contains its known-critical members', () => {
   const catalog = asSet(LOCAL_MCP_TOOL_NAMES);
-  for (const n of ['memory_recall', 'memory_remember', 'run_batch', 'run_tool_program', 'workflow_create', 'pending_action_queue', 'tool_search', 'composio_execute_tool', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
+  for (const n of ['memory_recall', 'memory_remember', 'run_batch', 'workflow_create', 'pending_action_queue', 'tool_search', 'composio_execute_tool', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
     assert.ok(catalog.has(n), `catalog (LOCAL_MCP_TOOL_NAMES) must include ${n}`);
   }
 });
@@ -119,7 +120,7 @@ test('orchestrator discovery surface: critical members present, non-orchestrator
   const surface = deriveOrchestratorDiscoveryNames();
   for (const n of [
     'composio_execute_tool', 'memory_forget', 'memory_pin', 'space_save', 'workflow_create',
-    'workflow_from_session', 'goal_upsert', 'run_batch', 'run_tool_program', 'recall_tool_result',
+    'workflow_from_session', 'goal_upsert', 'run_batch', 'recall_tool_result',
     'tool_output_query', 'workspace_artifact_query', 'focus_get', 'browser_harness_run', 'pending_action_queue', 'tool_search',
     // Incident 2026-07-24: GPT-5.6 Sol searched for a one-time reminder,
     // could not see set_timer on the orchestrator surface, wrote a TODO instead,
@@ -238,23 +239,24 @@ test('JIT core surface: mandated members present, JIT-able tools absent', () => 
   }
 });
 
-test('code-mode sets: INVARIANT members after the derive flip (equality is now tautological)', () => {
+test('inner-dispatch sets: INVARIANT members after the derive flip (equality is now tautological)', () => {
   // READ_ONLY_TOOLS/WRITE_TOOLS derive from the registry since the step-2
   // flip, so set-equality proves nothing. Pin the incident-critical members
   // and the safety exclusions instead (same conversion as the catalog /
   // discovery / JIT flips).
-  const { readOnly, write } = deriveCodeModeSets();
+  const { readOnly, write } = deriveInnerDispatchSets();
   assertSetEqual(readOnly, asSet(READ_ONLY_TOOLS), 'exported set mirrors the derivation');
   assertSetEqual(write, asSet(WRITE_TOOLS), 'exported set mirrors the derivation');
-  for (const n of ['memory_recall', 'read_file', 'workspace_artifact_query', 'list_files', 'recall_tool_result', 'tool_output_query', 'skill_read', 'composio_search_tools']) {
-    assert.ok(readOnly.has(n), `code-mode read surface must keep ${n}`);
+  for (const n of ['memory_recall', 'read_file', 'workspace_artifact_query', 'list_files', 'recall_tool_result', 'tool_output_query', 'skill_read']) {
+    assert.ok(readOnly.has(n), `inner-dispatch read surface must keep ${n}`);
   }
+  assert.equal(readOnly.has('composio_search_tools'), false, 'discovery is not a batch program');
   for (const n of ['composio_execute_tool', 'write_file', 'run_shell_command']) {
-    assert.ok(write.has(n), `code-mode write surface must keep ${n}`);
+    assert.ok(write.has(n), `inner-dispatch write surface must keep ${n}`);
   }
   // Safety exclusions: never reachable from a program, in either set.
-  for (const n of ['run_worker', 'run_batch', 'run_tool_program', 'add_cron_job', 'workflow_create']) {
-    assert.ok(!readOnly.has(n) && !write.has(n), `${n} must never be callable from inside a code-mode program`);
+  for (const n of ['run_worker', 'run_batch', 'add_cron_job', 'workflow_create']) {
+    assert.ok(!readOnly.has(n) && !write.has(n), `${n} must never be callable through unrestricted inner dispatch`);
   }
 });
 
@@ -323,6 +325,48 @@ test('B1 guardrail sets: INVARIANT members after the derive flip (the runaway-wr
 
 // ── invariants that guard the transcription itself ────────────────────────────
 
+test('host_v1 pure-local read execution is a small positive registry contract', () => {
+  const expected = new Set([
+    'list_files',
+    'time_slots',
+    'user_profile_read',
+    'workspace_list',
+    'workspace_roots',
+  ]);
+  const actual = new Set(
+    TOOL_REGISTRY
+      .filter((declaration) => declaration.hostReadOnlyExecution === 'pure_local')
+      .map((declaration) => declaration.name),
+  );
+  assertSetEqual(actual, expected, 'host_v1 pure-local read execution');
+  for (const name of actual) {
+    const declaration = TOOL_REGISTRY.find((entry) => entry.name === name);
+    assert.equal(declaration?.sideEffect, 'read', `${name} pure-local execution must remain read-only`);
+    assert.equal(hostReadOnlyExecutionContractFor(name), 'pure_local');
+  }
+  for (const name of [
+    'automation_opportunity_get',
+    'automation_opportunity_list',
+    'automation_opportunity_propose',
+    'automation_opportunity_review_request',
+    'automation_opportunity_revise',
+    'automation_read_pilot_acquisition_list',
+    'automation_read_pilot_request',
+    'automation_read_pilot_workspace_create_request',
+    'automation_read_pilot_workspace_list',
+    'automation_recurrence_request',
+    'call_tool',
+    'extract_structured',
+    'git_status',
+    'read_file',
+    'run_shell_command',
+    'session_history',
+    'table_ops',
+  ]) {
+    assert.equal(hostReadOnlyExecutionContractFor(name), null, `${name} must fail closed in host_v1`);
+  }
+});
+
 test('every registry name is unique', () => {
   const seen = new Set<string>();
   const dupes: string[] = [];
@@ -331,6 +375,63 @@ test('every registry name is unique', () => {
     seen.add(d.name);
   }
   assert.deepEqual(dupes, [], `duplicate registry entries: ${dupes.join(', ')}`);
+});
+
+test('delegation primitives are exactly the host-local unpropagated child and future-execution carriers', () => {
+  const expected = new Set([
+    'background_task_revise',
+    'browser_harness_run',
+    'check_capability',
+    'cli_setup',
+    'complete_delegation',
+    'create_agent',
+    'delegate_task',
+    'dispatch_background_task',
+    'execution_create',
+    'execution_reconcile_write',
+    'execution_update_step',
+    'hold_task_for_later',
+    'local_cli_list',
+    'local_cli_probe',
+    'pending_action_execute',
+    'project_run',
+    'resume_held_task',
+    'run_batch',
+    'run_worker',
+    'space_action_prepare',
+    'space_edit_runner',
+    'space_refresh',
+    'space_revert_runner',
+    'space_save',
+    'team_message',
+    'team_reply',
+    'team_request',
+    'update_agent',
+    'workflow_create',
+    'workflow_edit_step',
+    'workflow_from_session',
+    'workflow_import_framework',
+    'workflow_rerun_failed_items',
+    'workflow_reshape',
+    'workflow_run',
+    'workflow_schedule',
+    'workflow_set_enabled',
+    'workflow_update',
+  ]);
+  const actual = new Set(
+    TOOL_REGISTRY
+      .filter((declaration) => declaration.delegationPrimitive === true)
+      .map((declaration) => declaration.name),
+  );
+  assertSetEqual(actual, expected, 'host-local unpropagated delegation primitives');
+});
+
+test('space_try_runner registry copy is static inspection, never execution', () => {
+  const declaration = TOOL_REGISTRY.find((entry) => entry.name === 'space_try_runner');
+  assert.equal(
+    declaration?.description,
+    'Statically inspect a legacy Workspace runner\'s declared role and provenance without executing it; execution remains behind space_refresh or the normal Workspace action approval path.',
+  );
 });
 
 test('workflow_reshape registry copy pins the shipped additive read-only contract', () => {

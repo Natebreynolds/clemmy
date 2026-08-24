@@ -279,7 +279,8 @@ test('collect-then-construct freezes one set read and one write, and refuses per
   const writes = proposal.operations.filter((operation) => operation.effect === 'external_write');
   assert.equal(reads.length, 1, 'the counted source set is one aggregate read');
   assert.equal(writes.length, 1);
-  assert.equal(reads[0]?.coverage, 'resolved_operation');
+  assert.equal(reads[0]?.coverage, 'complete_set',
+    'the graph-derived counted aggregate read owns collection evidence');
   assert.equal(reads[0]?.cardinality.kind, 'once');
   assert.equal(writes[0]?.cardinality.kind, 'once');
   assert.ok(writes[0]?.dependsOn.includes(reads[reads.length - 1]!.id));

@@ -36,6 +36,7 @@ import assert from 'node:assert/strict';
 const { configureHarnessRuntime, loadFreshCodexAccessToken, resetHarnessRuntimeConfig, __test__ } = await import(
   './codex-client.js'
 );
+const capabilityCatalogs = await import('./host-capability-catalog-factory.js');
 
 function clearAuth(): void {
   try {
@@ -111,11 +112,27 @@ test('configureHarnessRuntime is idempotent within a process', async () => {
   const first = await configureHarnessRuntime();
   assert.equal(first.ok, true);
 
+  const factory = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  assert.ok(factory);
+  let catalogSnapshots = 0;
+  capabilityCatalogs.installHostCapabilityCatalogFactory({
+    ...factory,
+    snapshot() {
+      catalogSnapshots += 1;
+      return factory.snapshot();
+    },
+  });
+
   // Wipe auth and call again — should still report ok because the
   // module already installed the OpenAI client into the agents SDK.
-  clearAuth();
-  const second = await configureHarnessRuntime();
-  assert.equal(second.ok, true);
+  try {
+    clearAuth();
+    const second = await configureHarnessRuntime();
+    assert.equal(second.ok, true);
+    assert.equal(catalogSnapshots, 0, 'the hot configured path does not rescan the capability catalog');
+  } finally {
+    capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+  }
 });
 
 test('access-only proof token fails before a model call that could cross its expiry', async () => {

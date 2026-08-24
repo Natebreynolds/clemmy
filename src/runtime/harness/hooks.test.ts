@@ -223,10 +223,8 @@ test('tool hooks pair a start admitted before lease rotation without consuming a
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const stub = makeStub();
-  const reflected: string[] = [];
   attachEventLogHooks(stub, {
     getSessionId: extractSessionIdFromContext,
-    scheduleReflection: (input) => { reflected.push(input.output); },
   });
   const firstLease = activateDispatchLease({
     sessionId: sess.id,
@@ -303,8 +301,8 @@ test('tool hooks pair a start admitted before lease rotation without consuming a
   const authority = resolveToolOutputForAuthority(sess.id, 'same-sdk-id');
   assert.equal(authority.status, 'ambiguous',
     'without a nominal pre-dispatch marker, reused-id physical outcomes fail closed');
-  assert.deepEqual(reflected, ['{"successful":true}'],
-    'the losing physical generation remains audit-only and cannot teach memory');
+  assert.equal(listEvents(sess.id, { types: ['tool_returned'] }).length, 2,
+    'both physical generations remain audit evidence; neither result schedules live learning');
 });
 
 test('settled-read replay stays visible but never becomes fresh tool-output authority', () => {
@@ -409,7 +407,7 @@ test('settled-read replay stays visible but never becomes fresh tool-output auth
   if (freshAuthority.status === 'ok') assert.equal(freshAuthority.record.output, freshProvider);
 });
 
-test('settled-read steering is model-facing only and never enters authority or reflection', () => {
+test('settled-read steering is model-facing only and never enters authority or live learning', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const source = appendEvent({
@@ -419,11 +417,9 @@ test('settled-read steering is model-facing only and never enters authority or r
     type: 'user_input_received',
     data: { text: 'List the queue once.' },
   });
-  const reflected: Array<{ output: string }> = [];
   const stub = makeStub();
   attachEventLogHooks(stub, {
     getSessionId: extractSessionIdFromContext,
-    scheduleReflection: (input) => { reflected.push({ output: input.output }); },
   });
   const callId = 'settled-first-success';
   const details = {
@@ -452,7 +448,6 @@ test('settled-read steering is model-facing only and never enters authority or r
     },
   );
 
-  assert.deepEqual(reflected, [{ output: provider }]);
   const authority = resolveToolOutputForAuthority(sess.id, callId);
   assert.equal(authority.status, 'ok');
   if (authority.status === 'ok') assert.equal(authority.record.output, provider);

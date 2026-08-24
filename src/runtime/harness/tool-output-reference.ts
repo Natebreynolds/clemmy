@@ -1,6 +1,6 @@
 import { getRuntimeEnv } from '../../config.js';
 import { resolveToolOutputForAuthority } from './eventlog.js';
-import { parseShellToolOutput } from '../../tools/code-mode-tool.js';
+import { parseShellToolOutput } from '../../tools/inner-dispatch.js';
 import { gatherTrustedEvidence } from './trusted-evidence.js';
 import { pruneProviderRequestEchoes } from './provider-read-evidence.js';
 

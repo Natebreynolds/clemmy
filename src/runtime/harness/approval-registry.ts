@@ -67,7 +67,7 @@ function approvalChoiceIdentifier(tool: string | null, args: Record<string, unkn
 }
 
 export type PendingApprovalStatus = 'pending' | 'resolved' | 'expired' | 'cancelled';
-export type ApprovalResolution = 'approved' | 'rejected' | 'expired' | 'cancelled_by_user';
+export type ApprovalResolution = 'approved' | 'rejected' | 'expired' | 'cancelled_by_user' | 'cancelled_by_system';
 
 export interface PendingApprovalRow {
   approvalId: string;
@@ -132,6 +132,24 @@ export const DEFAULT_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
 export function isExpired(row: Pick<PendingApprovalRow, 'expiresAt'>, now: Date = new Date()): boolean {
   const expiresAt = Date.parse(row.expiresAt);
   return Number.isFinite(expiresAt) && expiresAt < now.getTime();
+}
+
+/** A persisted human decision carries authority only inside the exact lifetime
+ * of the card it resolved. This remains a consumer-side defense for historical
+ * or deliberately corrupted rows even though resolve() now refuses late
+ * approve/reject attempts at the write boundary. */
+export function approvalResolutionWithinLifetime(row: Pick<
+  PendingApprovalRow,
+  'requestedAt' | 'expiresAt' | 'resolvedAt'
+>): boolean {
+  const requestedAt = Date.parse(row.requestedAt);
+  const expiresAt = Date.parse(row.expiresAt);
+  const resolvedAt = row.resolvedAt ? Date.parse(row.resolvedAt) : Number.NaN;
+  return Number.isFinite(requestedAt)
+    && Number.isFinite(expiresAt)
+    && Number.isFinite(resolvedAt)
+    && resolvedAt >= requestedAt
+    && resolvedAt <= expiresAt;
 }
 
 /** How long an unanswered approval stays in the urgent "needs you" surfaces.
@@ -689,6 +707,7 @@ export function inspectResumableApproval(resumeKey: string): ResumableApprovalCl
   if (current.resolution === 'expired' || current.status === 'expired') return { state: 'expired', row: current };
   if (current.resolution === 'cancelled_by_user' || current.status === 'cancelled') return { state: 'cancelled', row: current };
   if (current.resolution !== 'approved') return { state: 'expired', row: current };
+  if (!approvalResolutionWithinLifetime(current)) return { state: 'expired', row: current };
   return { state: current.consumedAt ? 'consumed' : 'approved', row: current };
 }
 
@@ -740,6 +759,7 @@ export function claimResumableApproval(
       return { state: 'cancelled', row: current };
     }
     if (current.resolution !== 'approved') return { state: 'expired', row: current };
+    if (!approvalResolutionWithinLifetime(current)) return { state: 'expired', row: current };
     if (current.consumedAt) return { state: 'consumed', row: current };
 
     const consumedAt = new Date().toISOString();
@@ -779,7 +799,7 @@ export function claimApprovedUnconsumedForSession(
   const db = openEventLog();
   const placeholders = opts.tools.map(() => '?').join(',');
   const claim = db.transaction((): PendingApprovalRow | null => {
-    const row = db.prepare(`
+    const rows = db.prepare(`
       SELECT * FROM pending_approvals
        WHERE session_id = ?
          AND status = 'resolved'
@@ -787,8 +807,9 @@ export function claimApprovedUnconsumedForSession(
          AND consumed_at IS NULL
          AND tool IN (${placeholders})
        ORDER BY resolved_at DESC, rowid DESC
-       LIMIT 1
-    `).get(sessionId, ...opts.tools) as ApprovalSqlRow | undefined;
+       LIMIT 25
+    `).all(sessionId, ...opts.tools) as ApprovalSqlRow[];
+    const row = rows.find((candidate) => approvalResolutionWithinLifetime(rowToPublic(candidate)));
     if (!row) return null;
     const current = rowToPublic(row);
     const changes = db.prepare(`
@@ -1490,8 +1511,21 @@ export function resolve(
 
   // Atomic conditional update — only succeeds if status is still
   // 'pending'. Two racers can't both win.
-  const nextStatus: PendingApprovalStatus = resolution === 'expired' ? 'expired' : 'resolved';
-  const now = new Date().toISOString();
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
+  const pending = rowToPublic(existing);
+  const requestedAt = Date.parse(pending.requestedAt);
+  const expiresAt = Date.parse(pending.expiresAt);
+  const decisionWithinWindow = Number.isFinite(requestedAt)
+    && Number.isFinite(expiresAt)
+    && nowDate.getTime() >= requestedAt
+    && nowDate.getTime() <= expiresAt;
+  const lateDecision = (resolution === 'approved' || resolution === 'rejected')
+    && !decisionWithinWindow;
+  const effectiveResolution: ApprovalResolution = lateDecision ? 'expired' : resolution;
+  const nextStatus: PendingApprovalStatus = effectiveResolution === 'expired'
+    ? 'expired'
+    : effectiveResolution === 'cancelled_by_system' ? 'cancelled' : 'resolved';
   const changes = db
     .prepare(`
       UPDATE pending_approvals
@@ -1502,7 +1536,7 @@ export function resolve(
        WHERE approval_id = ?
          AND status      = 'pending'
     `)
-    .run(nextStatus, resolution, resolver, now, approvalId).changes;
+    .run(nextStatus, effectiveResolution, resolver, now, approvalId).changes;
   if (changes === 0) {
     const reread = db
       .prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
@@ -1514,7 +1548,9 @@ export function resolve(
     .get(approvalId) as ApprovalSqlRow;
   const publicRow = rowToPublic(row);
   finalizeResolvedRow(publicRow);
-  return { ok: true, row: publicRow };
+  return lateDecision
+    ? { ok: false, reason: 'expired', row: publicRow }
+    : { ok: true, row: publicRow };
 }
 
 /**

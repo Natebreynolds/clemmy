@@ -1,4 +1,32 @@
 import type { ApprovalResolutionResult } from '../types.js';
+import type { RunConversationResult } from '../runtime/harness/loop.js';
+import {
+  runConversationDisposition,
+  type RunConversationHold,
+} from '../runtime/harness/run-conversation-disposition.js';
+
+type ApprovalDrainBase = Pick<
+  ApprovalResolutionResult,
+  'approvalId' | 'text' | 'sessionId'
+>;
+
+/**
+ * The approval decision and the resumed execution disposition are different
+ * facts. `approved` means the resumed source reached a success/input/approval
+ * boundary; the remaining variants prevent an approved decision from
+ * laundering blocked or still-owned execution into completion.
+ */
+export type DrainApprovalResolutionResult =
+  | ApprovalResolutionResult
+  | (ApprovalDrainBase & {
+    status: 'in_progress';
+    execution:
+      | { kind: 'dispatched' }
+      | { kind: 'held'; hold: RunConversationHold; recoveredContract: boolean };
+  })
+  | (ApprovalDrainBase & { status: 'blocked'; reason: string })
+  | (ApprovalDrainBase & { status: 'awaiting_continue'; reason: string })
+  | (ApprovalDrainBase & { status: 'cancelled'; reason: string });
 
 /**
  * Registry-first approval resolution for the background-task drain.
@@ -33,12 +61,11 @@ export async function resolveDrainApproval(opts: {
     resolve: (id: string, resolution: string, resolver: string) => { ok: boolean; reason?: string };
     listPending: (filter: { sessionId?: string }) => Array<{ approvalId: string }>;
   };
-  resumeForTest?: (args: { sessionId: string; approvalId: string; decision: 'approve' | 'reject'; resolver?: string }) => Promise<{
-    status: string;
-    error?: string;
-    lastDecision?: { reply?: string; summary?: string };
-  }>;
-}): Promise<ApprovalResolutionResult> {
+  resumeForTest?: (args: { sessionId: string; approvalId: string; decision: 'approve' | 'reject'; resolver?: string }) => Promise<Pick<
+    RunConversationResult,
+    'status' | 'error' | 'lastDecision' | 'hold' | 'limitKind'
+  >>;
+}): Promise<DrainApprovalResolutionResult> {
   const registry = opts.registryForTest
     ?? await import('../runtime/harness/approval-registry.js');
   const row = registry.get(opts.approvalId);
@@ -65,9 +92,12 @@ export async function resolveDrainApproval(opts: {
       import('../runtime/harness/loop.js'),
       import('../agents/orchestrator.js'),
     ]);
-    const agent = await buildOrchestratorAgentForApprovalResume({ sessionId: args.sessionId });
     return runConversationFromResume({
-      agent,
+      buildAgent: (identity) => buildOrchestratorAgentForApprovalResume({
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        acceptedRoute: identity.route,
+      }),
       sessionId: args.sessionId,
       approvalId: args.approvalId,
       decision: args.decision,
@@ -81,25 +111,62 @@ export async function resolveDrainApproval(opts: {
     decision: 'approve',
     resolver,
   });
-  if (result.status === 'failed') {
-    throw new Error(result.error ?? `Approval ${opts.approvalId} resume failed.`);
-  }
-  const nextApprovalId = result.status === 'awaiting_approval'
-    ? registry.listPending({ sessionId: row.sessionId }).at(-1)?.approvalId
-    : undefined;
-  // A resume that ends AWAITING USER INPUT is neither done nor blocked — the
-  // settle must park the task on the question, never mark it done-with-empty
-  // (live 2026-07-23: the resumed 120-account run hit the artifact ask and
-  // was stamped done with an empty result 6s after resuming).
-  const awaitingInputQuestion = result.status === 'awaiting_user_input'
-    ? (result.lastDecision?.reply ?? result.lastDecision?.summary ?? 'The resumed run needs your input to continue.')
-    : undefined;
-  return {
+  const text = result.lastDecision?.reply ?? result.lastDecision?.summary ?? '';
+  const base = {
     approvalId: opts.approvalId,
-    status: 'approved',
-    text: result.lastDecision?.reply ?? result.lastDecision?.summary ?? '',
+    text,
     sessionId: row.sessionId,
-    nextApprovalId,
-    ...(awaitingInputQuestion ? { awaitingInputQuestion } : {}),
   };
+  const disposition = runConversationDisposition(result);
+  switch (disposition.kind) {
+    case 'completed':
+      return { ...base, status: 'approved' };
+    case 'awaiting_approval':
+      return {
+        ...base,
+        status: 'approved',
+        nextApprovalId: registry.listPending({ sessionId: row.sessionId }).at(-1)?.approvalId,
+      };
+    case 'awaiting_user_input':
+      // A resume that asks a question is neither done nor blocked. Preserve the
+      // existing approved-decision contract while parking the task on the ask.
+      return {
+        ...base,
+        status: 'approved',
+        awaitingInputQuestion: text || 'The resumed run needs your input to continue.',
+      };
+    case 'dispatched':
+      return {
+        ...base,
+        status: 'in_progress',
+        execution: { kind: 'dispatched' },
+      };
+    case 'held':
+      return {
+        ...base,
+        status: 'in_progress',
+        execution: {
+          kind: 'held',
+          hold: disposition.hold,
+          recoveredContract: disposition.recoveredContract,
+        },
+      };
+    case 'blocked': {
+      const reason = result.error?.trim() || text || `Approval ${opts.approvalId} resumed into a blocked execution.`;
+      return { ...base, status: 'blocked', reason };
+    }
+    case 'limit_exceeded': {
+      const reason = result.error?.trim()
+        || `The resumed run reached its ${result.limitKind === 'token_budget' ? 'token budget' : 'execution limit'} before finishing.`;
+      return { ...base, status: 'awaiting_continue', reason };
+    }
+    case 'killed': {
+      const reason = result.error?.trim() || 'The resumed run was cancelled.';
+      return { ...base, status: 'cancelled', reason };
+    }
+    case 'failed':
+      // Preserve the historical failure behavior: the background drain's
+      // outer error boundary owns a genuine runtime failure.
+      throw new Error(result.error ?? `Approval ${opts.approvalId} resume failed.`);
+  }
 }

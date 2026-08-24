@@ -29,6 +29,11 @@ import type { SessionKind } from '../harness/eventlog.js';
 import type { RuntimeToolEffect } from '../harness/tool-effect.js';
 import type { TurnIdentity } from '../harness/turn-outcome.js';
 import {
+  canonicalWorkTopologyJson,
+  validateWorkTopology,
+  workTopologyDigest,
+} from './work-topology.js';
+import {
   TURN_GRAPH_COMPILER_VERSION,
   TURN_GRAPH_IR_VERSION,
   TURN_GRAPH_POLICY_VERSION,
@@ -351,6 +356,44 @@ export function validateTurnGraph(graph: TurnGraphIR): TurnGraphValidation {
   if (!/^[a-f0-9]{64}$/.test(graph.compiler.policyHash)) errors.push('Turn graph policy hash is invalid.');
   if (!/^[a-f0-9]{64}$/.test(graph.compiler.graphHash)) errors.push('Turn graph content hash is invalid.');
   else if (!turnGraphHashMatches(graph)) errors.push('Turn graph content does not match its hash.');
+
+  if (graph.workTopology) {
+    const validatedTopology = validateWorkTopology(graph.workTopology.topology);
+    if (!validatedTopology.ok) {
+      errors.push(`Turn graph work topology is invalid: ${validatedTopology.errors.join('; ')}`);
+    } else {
+      if (
+        canonicalWorkTopologyJson(validatedTopology.topology)
+        !== canonicalWorkTopologyJson(graph.workTopology.topology)
+      ) {
+        errors.push('Turn graph work topology is not in canonical normalized form.');
+      }
+      if (workTopologyDigest(validatedTopology.topology) !== graph.workTopology.topologyHash) {
+        errors.push('Turn graph work topology does not match its hash.');
+      }
+      const graphOperationIds = graph.nodes
+        .flatMap((node) => node.operationId ? [node.operationId] : [])
+        .sort();
+      const topologyOperationIds = validatedTopology.topology.operations.map((operation) => operation.id);
+      if (
+        graphOperationIds.length !== topologyOperationIds.length
+        || graphOperationIds.some((id, index) => id !== topologyOperationIds[index])
+      ) {
+        errors.push('Turn graph operation nodes do not exactly cover the work topology.');
+      }
+      for (const operation of validatedTopology.topology.operations) {
+        const graphNode = graph.nodes.find((node) => node.operationId === operation.id);
+        if (!graphNode || graphNode.effect.kind !== operation.effect) {
+          errors.push(`Turn graph node ${operation.id} does not preserve its work topology effect.`);
+        }
+        for (const dependency of operation.dependsOn) {
+          if (!graph.edges.some((edge) => edge.source === dependency && edge.target === operation.id)) {
+            errors.push(`Turn graph is missing work topology edge ${dependency}->${operation.id}.`);
+          }
+        }
+      }
+    }
+  }
 
   const nodeIds = new Set<string>();
   for (const node of graph.nodes) {
@@ -983,6 +1026,14 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
       ...(allowedToolNames === undefined ? {} : { allowedToolNames }),
       excludedToolNames,
     },
+    ...(typed?.workTopology && typed.workTopologyHash
+      ? {
+          workTopology: {
+            topology: typed.workTopology,
+            topologyHash: typed.workTopologyHash,
+          },
+        }
+      : {}),
     classification: {
       messageIntent: intent.intent,
       confidence: Number(Math.max(0, Math.min(1, intent.confidence)).toFixed(3)),

@@ -362,8 +362,8 @@ function authorizeExternalWriteRetryUnlocked(input: {
  *   - verdict 'present' appends external_write_succeeded (reconciled_present)
  *     — completion can honestly report the work done, no re-send.
  */
-/** Child call ids recorded when a code-mode program parked this handle. */
-function codeModeParkedChildCallIds(sessionId: string, handle: string): string[] {
+/** Child call ids recorded by the retired program executor's durable event. */
+function legacyProgramParkedChildCallIds(sessionId: string, handle: string): string[] {
   try {
     const parked = listEvents(sessionId, { types: ['codemode_result_parked'], desc: true, limit: 50 })
       .find((event) => event.data.handle === handle);
@@ -441,18 +441,18 @@ function reconcileExternalWriteUnlocked(input: {
     duplicateIdentityKeys?: unknown;
     correlationFingerprint?: unknown;
   };
-  // A `codemode-result-*` handle is the parked DERIVED return of a program —
+  // A legacy `codemode-result-*` handle is the parked DERIVED return of a program —
   // recall-only, no lifecycle, and by design never evidence authority. Naming
   // the child call ids that produced it turns the refusal into the fix; the
-  // generic "run one fresh read" advice sent a model back through code mode,
+  // generic "run one fresh read" advice sent a model back through that retired lane,
   // which minted another unusable handle, for ten straight minutes (live
   // 2026-08-12, Apify reconciliation loop).
   if (/^codemode-result-/.test(input.evidenceCallId)) {
-    const childIds = codeModeParkedChildCallIds(input.execution.sessionId, input.evidenceCallId);
-    return `Reconciliation refused: ${input.evidenceCallId} is a code-mode PARKED RESULT (a derived value), never evidence authority. `
+    const childIds = legacyProgramParkedChildCallIds(input.execution.sessionId, input.evidenceCallId);
+    return `Reconciliation refused: ${input.evidenceCallId} is a legacy program PARKED RESULT (a derived value), never evidence authority. `
       + (childIds.length > 0
         ? `Pass the underlying tool call id instead: ${childIds.join(', ')}.`
-        : 'Re-run the verification read as a DIRECT tool call (not inside run_tool_program) and pass that call id.');
+        : 'Re-run the verification read as a DIRECT tool call and pass that call id.');
   }
   const evidenceResolution = resolveToolOutputForAuthority(
     input.execution.sessionId,

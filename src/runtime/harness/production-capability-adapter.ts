@@ -230,6 +230,12 @@ export function registeredCapabilityFromManifest(input: {
     advisoryRoles: input.manifest.advisoryRoles,
     manifestDigest: capabilityManifestDigest(input.manifest),
     providerKind: input.manifest.providerKind,
+    ...(input.manifest.externalDefinition
+      ? {
+          providerInputSchemaDigest:
+            input.manifest.externalDefinition.providerInputSchemaDigest,
+        }
+      : {}),
     liveFingerprint: input.observation.definitionFingerprint,
     delegatedFrom: input.manifest.delegatedFrom,
     manifest: input.manifest,

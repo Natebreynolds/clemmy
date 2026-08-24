@@ -6,6 +6,7 @@ import {
 } from '../../memory/tool-choice-store.js';
 import type { CapabilityEffect } from '../../memory/capability-effect-scope.js';
 import {
+  capabilityEffectIsCompatible,
   requestedCapabilityEffectScope,
   type RequestedCapabilityEffectScope,
 } from '../../memory/capability-effect-scope.js';
@@ -58,7 +59,14 @@ function resolvedRequirementEffect(
   matches: readonly StepToolChoiceMatch[],
 ): RequestedCapabilityEffectScope {
   if (requested !== 'unknown') return requested;
-  const proven = new Set(matches
+  // Medium advertise hits may come only from broad learned-ask context. They
+  // are useful fallback suggestions, but cannot vote on a clause's effect:
+  // doing so let a destination sibling relabel an exact source clause as
+  // unknown. Prefer exact/high receipt matches whenever any exist.
+  const effectEvidence = matches.some((match) => match.tier === 'high')
+    ? matches.filter((match) => match.tier === 'high')
+    : matches;
+  const proven = new Set(effectEvidence
     .map((match) => match.effectClass)
     .filter((effect): effect is 'read' | 'write' => effect === 'read' || effect === 'write'));
   // The parser stays open-vocabulary. When every proven candidate agrees on
@@ -93,10 +101,22 @@ function capabilityDiversityKey(value: {
   return `${value.kind}:${capabilityNamespace(value)}`;
 }
 
+/** Account provenance is part of capability identity, but not a sibling
+ * operation. Once one physical capability wins a role, retain every account
+ * under which that exact operation was proven so retrieval never chooses an
+ * account for the brain. */
+function capabilityProvenanceGroupKey(value: {
+  kind: string;
+  identifier: string;
+  roleKey?: string;
+}): string {
+  return `${value.kind}:${value.identifier.trim().toLowerCase()}::${value.roleKey ?? ''}`;
+}
+
 /**
- * Put one best candidate from every requirement and integration family ahead of sibling
- * variants, then fill the remaining bounded menu by score. This prevents four
- * near-identical destination operations from hiding the source capability.
+ * Put one best candidate from every requirement and integration family into a
+ * bounded menu. Sibling variants for an already-represented role+family stay
+ * behind later exact-schema discovery instead of flooding the capability card.
  */
 export function diversifyCapabilities<T extends {
   kind: string;
@@ -137,10 +157,12 @@ export function diversifyCapabilities<T extends {
   // A bounded menu serves requirements before offering sibling variants.
   for (const value of bestByRole.values()) select(value);
   for (const value of bestByFamily.values()) select(value);
-  const remainder = pool
-    .filter((value) => !selectedKeys.has(`${capabilityCandidateKey(value)}::${value.roleKey ?? ''}`))
-    .sort((a, b) => b.score - a.score || a.identifier.localeCompare(b.identifier));
-  return [...selected, ...remainder].slice(0, limit);
+  const selectedProvenanceGroups = new Set(selected.map(capabilityProvenanceGroupKey));
+  for (const value of pool) {
+    if (!value.accountIdentity) continue;
+    if (selectedProvenanceGroups.has(capabilityProvenanceGroupKey(value))) select(value);
+  }
+  return selected.slice(0, limit);
 }
 
 export interface LexicalCapabilityRequestOptions {
@@ -194,7 +216,11 @@ export function lexicalCapabilityProjectionForRequest(
         roleKey: capabilityRequirementRoleKey(requirement.clauseIndex, effect),
       };
       requirements.push(projected);
-      found.push(...matches.map((match) => ({
+      // Once receipt evidence resolves an open-vocabulary role, an opposite-
+      // effect fuzzy sibling cannot occupy that role's candidate budget.
+      const compatibleMatches = matches.filter((match) =>
+        capabilityEffectIsCompatible(projected.effect, match.effectClass ?? 'unknown'));
+      found.push(...compatibleMatches.map((match) => ({
         ...match,
         roleKey: projected.roleKey,
         requirementIndex: requirement.clauseIndex,

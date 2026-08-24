@@ -32,16 +32,57 @@ export function classifyBackgroundInputReply(input: {
   const question = input.question?.trim();
   if (!question) return { kind: 'fresh_turn' };
 
+  const options = (input.options ?? [])
+    .filter((option): option is string => typeof option === 'string')
+    .map((option) => option.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+
   const classification = classifyClarificationAnswer(input.message, {
     kind: 'clarification',
     question,
-    options: (input.options ?? [])
-      .filter((option): option is string => typeof option === 'string')
-      .map((option) => option.trim())
-      .filter(Boolean)
-      .slice(0, 8),
+    options,
   });
-  if (!classification) return { kind: 'fresh_turn' };
+  if (!classification) {
+    // Background ingress has a stronger fact than the generic legacy phrase
+    // classifier: the exact, durable option list that was shown to this
+    // origin. Bind only an unambiguous literal option or its 1-based ordinal.
+    // This restores "Production" / "2" without turning a generic short reply
+    // into inherited task authority.
+    const answer = input.message.replace(/\s+/g, ' ').trim();
+    if (!answer || answer.length > 280 || answer.split(/\s+/).length > 24) {
+      return { kind: 'fresh_turn' };
+    }
+    const choiceKey = (value: string): string => value.toLowerCase().replace(/[.!]+$/g, '').trim();
+    const exact = options.filter((option) => choiceKey(option) === choiceKey(answer));
+    if (exact.length === 1) {
+      return {
+        kind: 'resume',
+        classification: { disposition: 'selected', selectedOption: exact[0] },
+      };
+    }
+    const ordinalWords: Record<string, number> = {
+      first: 1,
+      second: 2,
+      third: 3,
+      fourth: 4,
+      fifth: 5,
+      sixth: 6,
+      seventh: 7,
+      eighth: 8,
+    };
+    const ordinalMatch = choiceKey(answer).match(/^(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|[1-8])(?:\s+(?:one|option|choice))?$/);
+    const ordinal = ordinalMatch
+      ? (ordinalWords[ordinalMatch[1]] ?? Number.parseInt(ordinalMatch[1], 10))
+      : 0;
+    if (ordinal >= 1 && ordinal <= options.length) {
+      return {
+        kind: 'resume',
+        classification: { disposition: 'selected', selectedOption: options[ordinal - 1] },
+      };
+    }
+    return { kind: 'fresh_turn' };
+  }
   if (classification.disposition === 'declined') {
     return { kind: 'declined', classification };
   }

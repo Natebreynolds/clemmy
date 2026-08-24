@@ -437,3 +437,33 @@ test('isDirectionSeekingQuestion: catches the batch-approval question; ignores p
   assert.equal(isDirectionSeekingQuestion(''), false);
   assert.equal(isDirectionSeekingQuestion(null), false);
 });
+
+test('isBlockingDirectionSeekingQuestion: a retrieve answer plus an offer stays delivered', async () => {
+  const { isBlockingDirectionSeekingQuestion } = await import('./objective-judge.js');
+  const roster = [
+    'Eight people on the roster:',
+    '',
+    '- Bobby Romano — bobby.romano@example.com',
+    '- Brett Lorenzini — brett.lorenzini@example.com',
+    '',
+    'Want me to pull this week\'s closed-won totals next?',
+  ].join('\n');
+  assert.equal(
+    isBlockingDirectionSeekingQuestion(roster, { route: 'retrieve' }),
+    false,
+    'an already-answered retrieve may offer a next step without parking',
+  );
+  assert.equal(
+    isBlockingDirectionSeekingQuestion('Which team should I use — east or west?', { route: 'retrieve' }),
+    true,
+    'a retrieve that is only a clarification still pauses',
+  );
+  assert.equal(
+    isBlockingDirectionSeekingQuestion(
+      'Yes — we\'re on the 60 priority-account reactivation emails.\n\nDo you want me to pick up by **sending the 55 send-ready emails now**, or review the drafts first?',
+      { route: 'act' },
+    ),
+    true,
+    'ask-first on an action turn still parks',
+  );
+});

@@ -26,6 +26,7 @@ test.after(() => {
 });
 
 const { AUTH_POLICY, classifyRoute, realmFor, EXPECTED_PUBLIC_PATTERNS } = await import('./auth-policy.js');
+const { createMobilePairingCode } = await import('../runtime/mobile-pairing.js');
 
 interface DiscoveredRoute { method: string; path: string }
 
@@ -145,6 +146,57 @@ test('a mobile session cannot self-elevate to PIN rotation or session enumeratio
   // ...while the ordinary mobile API stays session-gated, not admin-gated.
   assert.equal(realmFor('POST', '/m/api/chat/send'), 'mobile-session');
   assert.equal(realmFor('GET', '/m/api/whoami'), 'mobile-session');
+  assert.equal(realmFor('POST', '/m/auth/origin-handoff'), 'mobile-session');
+  assert.equal(realmFor('POST', '/m/auth/origin-adopt'), 'mobile-anon');
+});
+
+test('LIVE: the global gate delegates origin handoff and adoption to their mobile credentials', async () => {
+  const { createServer } = await import('node:http');
+  const server = createServer(app as never);
+  await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', () => resolve()); });
+  const port = (server.address() as { port: number }).port;
+  const base = `http://127.0.0.1:${port}`;
+  const post = (pathname: string, body: unknown, cookie?: string) => fetch(`${base}${pathname}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(cookie ? { cookie } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  try {
+    const anonymousMint = await post('/m/auth/origin-handoff', {});
+    assert.equal(anonymousMint.status, 401);
+    assert.deepEqual(
+      await anonymousMint.json(),
+      { error: 'NO_SESSION' },
+      'the request must reach requireMobileSession rather than the admin default',
+    );
+
+    const pairing = await createMobilePairingCode(
+      { targetUrl: `${base}/m/` },
+      { stateDir: path.join(TMP_ROOT, 'state') },
+    );
+    const paired = await post('/m/auth/pair', { pairToken: pairing.token, deviceLabel: 'Policy test phone' });
+    assert.equal(paired.status, 200);
+    const cookie = paired.headers.get('set-cookie')?.split(';')[0];
+    assert.ok(cookie, 'pairing must issue the mobile session used to mint the handoff');
+
+    const mint = await post('/m/auth/origin-handoff', {}, cookie);
+    assert.equal(mint.status, 200);
+    const handoff = await mint.json() as { token?: string };
+    assert.ok(handoff.token, 'the mobile-session route must mint a one-time handoff');
+
+    const adopt = await post('/m/auth/origin-adopt', { token: handoff.token });
+    assert.equal(adopt.status, 200, 'adoption must reach its token handler without admin auth');
+    assert.ok(adopt.headers.get('set-cookie'), 'adoption must establish the relay-origin session');
+
+    const replay = await post('/m/auth/origin-adopt', { token: handoff.token });
+    assert.equal(replay.status, 401);
+    assert.deepEqual(await replay.json(), { error: 'INVALID_HANDOFF' }, 'the handoff remains single use');
+  } finally {
+    await new Promise<void>((resolve) => { server.close(() => resolve()); });
+  }
 });
 
 test('an unlisted route defaults to admin rather than public', () => {

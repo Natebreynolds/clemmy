@@ -1,4 +1,5 @@
-import { matchToolChoicesForStep, type StepToolChoiceMatch } from '../memory/tool-choice-store.js';
+import { listToolChoices, matchToolChoicesForStep, type StepToolChoiceMatch } from '../memory/tool-choice-store.js';
+import { acceptedPhraseDigest } from '../memory/capability-alias-index.js';
 
 /**
  * What this turn is ALLOWED to run — deliberately not the same question as what
@@ -140,7 +141,7 @@ export interface McpAccessConstraint {
 
 /** Generic words for "an external system", with no system named. */
 const GENERIC_CONNECTOR_RE =
-  /\b(?:external\s+)?(?:connectors?|integrations?|mcp(?:\s+servers?)?|external\s+(?:tools?|services?|systems?)|third[-\s]party\s+(?:tools?|services?))\b/gi;
+  /\b(?:external\s+)?(?:apps?|applications?|connectors?|integrations?|mcp(?:\s+servers?)?|external\s+(?:tools?|services?|systems?)|third[-\s]party\s+(?:tools?|services?))\b/gi;
 /** Refusals. Order matters only for readability; all are scanned by position. */
 const NEGATIVE_MARKER_RE =
   /\b(?:do\s+not|do\s?n[o']t|dont|never|without|avoid|excluding|no\s+longer|not|no)\b/gi;
@@ -529,6 +530,30 @@ function constraintScope(
   return null;
 }
 
+function provenLocalCliIdentifiers(input: string): string[] {
+  const ids = new Set<string>();
+  try {
+    for (const match of matchToolChoicesForStep(input)) {
+      if (match.kind === 'cli' && match.identifier && (match.autoBindable || match.alreadyBound || match.tier === 'high')) {
+        ids.add(match.identifier);
+      }
+    }
+  } catch { /* bind-tier unreadability is not MCP authority */ }
+  try {
+    const digest = acceptedPhraseDigest(input);
+    if (digest) {
+      for (const rec of listToolChoices()) {
+        if (rec.choice?.kind !== 'cli' || !rec.choice.identifier) continue;
+        for (const alias of rec.aliases ?? []) {
+          if (alias.status && alias.status !== 'active') continue;
+          if (acceptedPhraseDigest(alias.intent) === digest) ids.add(rec.choice.identifier);
+        }
+      }
+    }
+  } catch { /* exact-alias unreadability is not MCP authority */ }
+  return [...ids];
+}
+
 /**
  * Resolve the external MCP tool surface for a fresh user turn.
  *
@@ -670,6 +695,20 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
       maxTools: 8,
       serverMaxTools: { googlesheets: 8, google_sheets: 8, google: 8 },
     });
+    // A collect→construct ask ("find the top 5 … add them to a Google sheet")
+    // needs the COLLECTION provider too: sheets-only scoping dropped the
+    // search provider and the model had nothing to collect with (live
+    // 2026-08-19 seq 59105). The destination never narrows away the source.
+    if (!wantsWeb && !wantsSeo && /\b(find|top\s+\d+|best|search|look\s*up|latest|research)\b/i.test(input)) {
+      scopes.push({
+        reason: 'collect-into-sheets: keep the search provider',
+        allowedServerSlugs: ['browser', 'browsermcp', 'playwright', 'firecrawl'],
+        toolPatterns: ['search', 'scrape', 'crawl', 'fetch'],
+        priorityKeywords: ['search', 'scrape', 'crawl', 'fetch'],
+        maxTools: 8,
+        serverMaxTools: { browser: 8, browsermcp: 8, playwright: 8, firecrawl: 8 },
+      });
+    }
   }
 
   if (wantsGithub) {
@@ -700,6 +739,23 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
         maxTools: 0,
       };
     }
+    // A proven local CLI for THIS ask is the capability. Only a bind-tier
+    // match (the user named the program/service) or an exact learned phrase
+    // may suppress fail-open. Token-overlap advertise hits must not hide
+    // every connector on an unrelated turn.
+    try {
+      const localCli = provenLocalCliIdentifiers(input);
+      if (localCli.length > 0) {
+        return {
+          reason: `proven local CLI capability (${[...new Set(localCli)].join(', ')}); no external MCP needed: ${lower.slice(0, 120)}`,
+          authority: 'catalog',
+          ...denied,
+          allowedServerSlugs: [],
+          toolPatterns: [],
+          maxTools: 0,
+        };
+      }
+    } catch { /* store unreadability must not invent MCP authority */ }
     // No keyword family matched. The old behavior returned maxTools:0 — which
     // made ANY connected app outside the 6 hardcoded families (Airtable, Slack,
     // Notion, Stripe, …) silently invisible, so Clem falsely reported "not

@@ -63,9 +63,9 @@ export { upsertEntity } from './entity-identity.js';
  *     map to a specific (session_id, call_id) so the agent can refer to
  *     the source without re-fetching from the provider.
  *
- * Non-blocking. Fired from hooks.ts onToolEnd as a fire-and-forget
- * Promise that catches all errors. A reflection failure must never
- * affect the tool result returning to the SDK.
+ * Learning is drained from durable, terminal-gated memory batches. It is not
+ * fired from a tool-return or worker hook, so reflection cannot compete with
+ * the interactive critical path or disappear from a process-local queue.
  *
  * The "pointer-first" novelty (see [[project_brain_architecture]]) is
  * what makes this useful at scale: the brain stores derived knowledge
@@ -190,7 +190,7 @@ function recordReflectionEpisode(
     sourceApp: input.tool ?? null,
     sessionId: input.sessionId,
     callId: input.callId,
-    sourceUri: `tool://${input.sessionId}/${input.callId}`,
+    sourceUri: reflectionSourceUri(input),
     occurredAt: now,
     content: reflectionEpisodeExcerpt(input, extraction),
     rawRetainedUntil: new Date(Date.parse(now) + 14 * 24 * 60 * 60 * 1000).toISOString(),
@@ -207,6 +207,18 @@ export interface ReflectionInput {
    * best-effort learning beside that run, so it receives a bounded extractor
    * budget rather than issuing one model call for every long tool return. */
   scopeId?: string;
+  /** Exact durable source locator. Terminal-batched learning points to its
+   * immutable memory intake shard rather than pretending the synthetic batch
+   * call id is a provider tool result. */
+  sourceUri?: string;
+  /** The terminal-batch lane is allowed one extractor invocation per durable
+   * shard. It disables hedges, rolling threshold buffers, resource guesses,
+   * and model/embedding-backed conflict resolution. */
+  learningMode?: 'terminal_batch';
+}
+
+function reflectionSourceUri(input: ReflectionInput): string {
+  return input.sourceUri?.trim() || `tool://${input.sessionId}/${input.callId}`;
 }
 
 export interface ReflectionResult {
@@ -727,7 +739,7 @@ type ReflectionExtractorFn = (serialized: string) => Promise<Extraction | null>;
 let extractorOverrideForTest: ReflectionExtractorFn | null = null;
 
 export async function _testOnly_runExtractor(serialized: string): Promise<Extraction | null> {
-  return runExtractor(serialized);
+  return runExtractor(serialized, { allowHedge: true });
 }
 
 export function _testOnly_setReflectionExtractor(fn: ReflectionExtractorFn | null): void {
@@ -757,6 +769,10 @@ const REFLECTION_PROCESSING_LEASE_MS = 10 * 60 * 1000;
 function reflectionInputHash(input: ReflectionInput): string {
   return createHash('sha256')
     .update(input.tool ?? '')
+    .update('\0')
+    .update(input.sourceUri ?? '')
+    .update('\0')
+    .update(input.learningMode ?? '')
     .update('\0')
     .update(input.output)
     .digest('hex');
@@ -1016,7 +1032,10 @@ function quotaResetHintMs(err: unknown): number | undefined {
   return Number.isFinite(secs) && secs > 0 ? secs * 1000 : undefined;
 }
 
-async function runExtractor(serialized: string): Promise<Extraction | null> {
+async function runExtractor(
+  serialized: string,
+  options: { allowHedge: boolean } = { allowHedge: true },
+): Promise<Extraction | null> {
   if (extractorOverrideForTest) return extractorOverrideForTest(serialized);
   if (!reflectionExtractorAvailable()) return null;
   const route = getReflectorRoute();
@@ -1057,7 +1076,16 @@ async function runExtractor(serialized: string): Promise<Extraction | null> {
       { err: err instanceof Error ? err.message : String(err), kind: cls.kind },
       'reflection extractor failed',
     );
-    if (!cls.retryable) return null;
+    if (!cls.retryable || !options.allowHedge) {
+      if (cls.retryable) {
+        const pauseMs = Math.min(
+          quotaResetHintMs(err) ?? cls.retryAfterMs ?? EXTRACTOR_PAUSE_DEFAULT_MS,
+          EXTRACTOR_PAUSE_MAX_MS,
+        );
+        extractorPausedUntil = Date.now() + pauseMs;
+      }
+      return null;
+    }
     // Quota/auth/transient on the primary judge family — memory must not stop
     // learning because ONE provider is out of quota. Try the other family once
     // (same cross-family judge routing every boundary judge uses).
@@ -2231,6 +2259,70 @@ function storeExtractedPointers(input: ReflectionInput, extraction: Extraction):
   return pointersStored;
 }
 
+const TERMINAL_GROUNDING_STOPWORDS = new Set([
+  'about', 'after', 'also', 'and', 'are', 'been', 'being', 'but', 'can',
+  'could', 'does', 'for', 'from', 'had', 'has', 'have', 'into', 'its', 'not',
+  'only', 'our', 'that', 'the', 'their', 'there', 'these', 'they', 'this',
+  'those', 'was', 'were', 'will', 'with', 'would', 'your',
+]);
+
+function normalizedGroundingText(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function groundingTokens(value: string): string[] {
+  return [...new Set(normalizedGroundingText(value).split(' ').filter((token) => (
+    token.length >= 3 && !TERMINAL_GROUNDING_STOPWORDS.has(token)
+  )))];
+}
+
+/** The extractor may summarize exact evidence, but it may not manufacture a
+ * durable claim. Terminal batches therefore require distinctive lexical
+ * support in the immutable source slice before a candidate is even admitted. */
+function terminalFactGrounded(sourceText: string, claim: string): boolean {
+  const source = normalizedGroundingText(sourceText);
+  const claimText = normalizedGroundingText(claim);
+  if (!source || !claimText) return false;
+  if (source.includes(claimText)) return true;
+  const tokens = groundingTokens(claim);
+  if (tokens.length === 0) return false;
+  const matched = tokens.filter((token) => source.split(' ').includes(token)).length;
+  if (tokens.length === 1) return matched === 1 && claimText.length >= 8;
+  return matched >= Math.max(2, Math.ceil(tokens.length * 0.75));
+}
+
+function terminalEntityGrounded(sourceText: string, entity: Extraction['entities'][number]): boolean {
+  const source = normalizedGroundingText(sourceText);
+  return [entity.name, ...(entity.aliases ?? [])]
+    .map(normalizedGroundingText)
+    .some((name) => name.length >= 2 && source.includes(name));
+}
+
+function terminalRelationshipGrounded(
+  sourceText: string,
+  relationship: NonNullable<Extraction['relationships']>[number],
+): boolean {
+  const source = normalizedGroundingText(sourceText);
+  const excerpt = normalizedGroundingText(relationship.evidence_excerpt);
+  return excerpt.length >= 3
+    && source.includes(excerpt)
+    && source.includes(normalizedGroundingText(relationship.subject))
+    && source.includes(normalizedGroundingText(relationship.object));
+}
+
+function applyTerminalGrounding(extraction: Extraction, sourceText: string): void {
+  extraction.entities = (extraction.entities ?? []).filter((entity) => (
+    terminalEntityGrounded(sourceText, entity)
+  ));
+  extraction.pointers = [];
+  extraction.resources = [];
+  if (Array.isArray(extraction.relationships)) {
+    extraction.relationships = extraction.relationships.filter((relationship) => (
+      terminalRelationshipGrounded(sourceText, relationship)
+    ));
+  }
+}
+
 interface ReflectionCommitStats {
   factsWritten: number;
   factsUpdated: number;
@@ -2260,6 +2352,79 @@ function mergeCommitStats(into: ReflectionCommitStats, next: ReflectionCommitSta
   into.sumImportance += next.sumImportance;
 }
 
+function terminalConflictNeedsReview(candidate: string, existing: ConsolidatedFact): boolean {
+  const candidateTokens = new Set(groundingTokens(candidate));
+  const existingTokens = new Set(groundingTokens(existing.content));
+  if (candidateTokens.size === 0 || existingTokens.size === 0) return false;
+  let overlap = 0;
+  for (const token of candidateTokens) if (existingTokens.has(token)) overlap += 1;
+  return overlap >= 2 && overlap / Math.min(candidateTokens.size, existingTokens.size) >= 0.6;
+}
+
+/** Terminal learning has already spent its one allowed generative call on
+ * extraction. Exact repeats and clearly novel claims can be committed with
+ * local evidence; plausible conflicts stay as durable pending candidates for
+ * owner review instead of silently spending a second model call. */
+function commitTerminalFactDeterministically(input: {
+  reflection: ReflectionInput;
+  fact: Extraction['facts'][number];
+  episodeId?: string;
+  sourceText: string;
+  sourceApp?: string;
+  trust?: number;
+}): { factId?: number; written: number; noop: number; deferred: boolean } {
+  const normalized = normalizedGroundingText(input.fact.text);
+  const lexical = searchFactsByText(input.fact.text, 8);
+  const exact = lexical.find((fact) => normalizedGroundingText(fact.content) === normalized);
+  const ambiguous = !exact && lexical.some((fact) => terminalConflictNeedsReview(input.fact.text, fact));
+  if (ambiguous) {
+    recordReflectionCandidate({
+      episodeId: input.episodeId ?? null,
+      sessionId: input.reflection.sessionId,
+      callId: input.reflection.callId,
+      kind: input.fact.kind,
+      text: input.fact.text,
+      importance: input.fact.importance,
+      status: 'pending',
+      reason: 'deterministic_conflict_review_required',
+      sourceType: 'tool_reflection',
+      intakeReason: 'terminal batch claim retained without a second model call',
+      trustLevel: input.trust ?? 0.6,
+      authority: 'derived',
+      sourceUri: reflectionSourceUri(input.reflection),
+    });
+    return { written: 0, noop: 0, deferred: true };
+  }
+  const excerpt = selectSupportingExcerpt(input.sourceText, input.fact.text, 1_500);
+  const stored = rememberFact({
+    kind: input.fact.kind,
+    content: input.fact.text,
+    sessionId: input.reflection.sessionId,
+    derivedFrom: {
+      sessionId: input.reflection.sessionId,
+      callId: input.reflection.callId,
+      tool: input.reflection.tool ?? undefined,
+    },
+    importance: input.fact.importance,
+    trustLevel: input.trust,
+    sourceApp: input.sourceApp,
+    sourceUri: reflectionSourceUri(input.reflection),
+    ...(input.episodeId && excerpt ? {
+      evidence: {
+        episodeId: input.episodeId,
+        excerpt,
+        sourceUri: reflectionSourceUri(input.reflection),
+      },
+    } : {}),
+  });
+  return {
+    factId: stored.id,
+    written: exact ? 0 : 1,
+    noop: exact ? 1 : 0,
+    deferred: false,
+  };
+}
+
 async function commitExtractionMemory(input: ReflectionInput, extraction: Extraction): Promise<ReflectionCommitStats> {
   const stats = emptyCommitStats();
   let evidenceEpisodeId: string | undefined;
@@ -2287,29 +2452,40 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
       // shared consolidation path: find similar existing facts and let
       // the LLM decide ADD / UPDATE / DELETE / NOOP. Falls back to ADD
       // if anything fails — we never lose information silently.
-      const outcome = await consolidateFact(
-        {
-          kind: fact.kind,
-          text: fact.text,
-          importance: fact.importance,
-          trustLevel: source?.trust,
-          sourceApp: source?.app,
-          authority: 'derived',
-        },
-        {
-          sessionId: input.sessionId,
-          derivedFrom: {
-            sessionId: input.sessionId,
-            callId: input.callId,
-            tool: input.tool ?? undefined,
-          },
-        },
-      );
+      const outcome = input.learningMode === 'terminal_batch'
+        ? commitTerminalFactDeterministically({
+            reflection: input,
+            fact,
+            episodeId: evidenceEpisodeId,
+            sourceText: evidenceSourceText,
+            sourceApp: source?.app,
+            trust: source?.trust,
+          })
+        : await consolidateFact(
+            {
+              kind: fact.kind,
+              text: fact.text,
+              importance: fact.importance,
+              trustLevel: source?.trust,
+              sourceApp: source?.app,
+              authority: 'derived',
+            },
+            {
+              sessionId: input.sessionId,
+              derivedFrom: {
+                sessionId: input.sessionId,
+                callId: input.callId,
+                tool: input.tool ?? undefined,
+              },
+            },
+          );
       stats.factsWritten += outcome.written;
-      stats.factsUpdated += outcome.updated;
-      stats.factsDeleted += outcome.deleted;
+      stats.factsUpdated += 'updated' in outcome ? outcome.updated : 0;
+      stats.factsDeleted += 'deleted' in outcome ? outcome.deleted : 0;
       stats.factsNoop += outcome.noop;
-      stats.sumImportance += outcome.importanceAdded;
+      stats.sumImportance += 'importanceAdded' in outcome
+        ? outcome.importanceAdded
+        : outcome.deferred ? 0 : fact.importance;
       if (outcome.factId) committedFacts.push({ fact, factId: outcome.factId });
       if (outcome.factId && evidenceEpisodeId && evidenceSourceText) {
         try {
@@ -2318,7 +2494,7 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
             factId: outcome.factId,
             episodeId: evidenceEpisodeId,
             excerpt,
-            sourceUri: `tool://${input.sessionId}/${input.callId}`,
+            sourceUri: reflectionSourceUri(input),
           });
           if (excerpt) attachGroundedFactResources({
             factId: outcome.factId,
@@ -2329,14 +2505,16 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
           logger.warn({ err: err instanceof Error ? err.message : String(err), factId: outcome.factId }, 'reflection: attach consolidation evidence or resource link failed');
         }
       }
-      resolveReflectionCandidate({
-        sessionId: input.sessionId,
-        callId: input.callId,
-        text: fact.text,
-        status: 'promoted',
-        reason: `consolidation:${outcome.action}`,
-        resultingFactId: outcome.factId ?? null,
-      });
+      if (!('deferred' in outcome) || !outcome.deferred) {
+        resolveReflectionCandidate({
+          sessionId: input.sessionId,
+          callId: input.callId,
+          text: fact.text,
+          status: 'promoted',
+          reason: `consolidation:${'action' in outcome ? outcome.action : (outcome.noop ? 'reinforce' : 'add')}`,
+          resultingFactId: outcome.factId ?? null,
+        });
+      }
     } catch (err) {
       resolveReflectionCandidate({
         sessionId: input.sessionId,
@@ -2359,7 +2537,7 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
         aliases: entity.aliases,
         confidence: source?.trust ?? 0.7,
         evidenceEpisodeId,
-        sourceUri: `tool://${input.sessionId}/${input.callId}`,
+        sourceUri: reflectionSourceUri(input),
         sourceKind: 'entity_upsert',
       });
       entityIdByName.set(entity.name.trim().toLowerCase(), id);
@@ -2415,7 +2593,7 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
           evidenceEpisodeId,
           evidenceExcerpt: rel.evidence_excerpt,
           sourceText: input.output,
-          sourceUri: `tool://${input.sessionId}/${input.callId}`,
+          sourceUri: reflectionSourceUri(input),
           confidence: rel.confidence ?? source?.trust ?? 0.7,
           validFrom: rel.valid_from,
           validTo: rel.valid_to,
@@ -2492,7 +2670,7 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
       })
     : input.output;
 
-  if (!claimReflectionScopeBudget(input, serialized.length)) {
+  if (input.learningMode !== 'terminal_batch' && !claimReflectionScopeBudget(input, serialized.length)) {
     const pointersStored = storeFallbackPointer(input, 'scope_budget');
     const result: ReflectionResult = {
       factsWritten: 0,
@@ -2504,9 +2682,14 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     return emitObservability(result);
   }
 
-  const extraction = await runExtractor(`Tool: ${input.tool ?? 'unknown'}\nCall: ${input.callId}\n\n${serialized}`);
+  const extraction = await runExtractor(
+    `Tool: ${input.tool ?? 'unknown'}\nCall: ${input.callId}\n\n${serialized}`,
+    { allowHedge: input.learningMode !== 'terminal_batch' },
+  );
   if (!extraction) {
-    const pointersStored = storeFallbackPointer(input, 'extractor_failed');
+    const pointersStored = input.learningMode === 'terminal_batch'
+      ? 0
+      : storeFallbackPointer(input, 'extractor_failed');
     const result: ReflectionResult = { factsWritten: 0, entitiesUpserted: 0, pointersStored, skipped: 'extractor_failed' };
     settleReflectionReceipt(input, receipt.inputHash, 'failed', result, 'extractor_failed');
     return emitObservability(result);
@@ -2525,7 +2708,10 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     const hash = reflectionCandidateHash(fact.text);
     if (candidateHashes.has(hash)) continue;
     candidateHashes.add(hash);
-    const rejectionReason = derivedFactRejectionReason(fact.text);
+    const rejectionReason = derivedFactRejectionReason(fact.text)
+      ?? (input.learningMode === 'terminal_batch' && !terminalFactGrounded(input.output, fact.text)
+        ? 'ungrounded_terminal_batch'
+        : null);
     if (rejectionReason) {
       candidateDecisions.push({ fact, status: 'rejected', reason: rejectionReason });
     } else {
@@ -2534,6 +2720,7 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     }
   }
   extraction.facts = acceptedFacts;
+  if (input.learningMode === 'terminal_batch') applyTerminalGrounding(extraction, input.output);
   const candidateEpisodeId = recordReflectionEpisode(
     input,
     extraction,
@@ -2550,10 +2737,12 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
       status: decision.status,
       reason: decision.reason,
       sourceType: 'tool_reflection',
-      intakeReason: 'durable claim extracted from a tool result',
+      intakeReason: input.learningMode === 'terminal_batch'
+        ? 'source-grounded claim extracted once from a terminal batch shard'
+        : 'durable claim extracted from a tool result',
       trustLevel: 0.6,
       authority: 'derived',
-      sourceUri: `tool://${input.sessionId}/${input.callId}`,
+      sourceUri: reflectionSourceUri(input),
     });
   }
 
@@ -2563,7 +2752,12 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
   // which the importance gate deliberately throttles. Only for systems of
   // record (the apps the user navigates), tagged with the source app + trust.
   // Flag-gated (CLEMMY_SOURCE_MAP) + best-effort — never perturbs reflection.
-  if (isSourceMapEnabled() && extraction.resources && extraction.resources.length > 0) {
+  if (
+    input.learningMode !== 'terminal_batch'
+    && isSourceMapEnabled()
+    && extraction.resources
+    && extraction.resources.length > 0
+  ) {
     const cls = classifySource(input.tool);
     if (cls && cls.category === 'system_of_record') {
       for (const r of extraction.resources) {
@@ -2598,11 +2792,13 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
   // a call_id breadcrumb for recall_tool_result/tool_output_query. If the
   // extractor found facts but emitted no pointer, create a deterministic source
   // pointer so recovery does not depend on pointer-field extraction.
-  let pointersStored = storeExtractedPointers(input, extraction);
-  if (pointersStored === 0 && extractionImportance > 0) {
+  let pointersStored = input.learningMode === 'terminal_batch'
+    ? 0
+    : storeExtractedPointers(input, extraction);
+  if (input.learningMode !== 'terminal_batch' && pointersStored === 0 && extractionImportance > 0) {
     pointersStored += storeFallbackPointer(input, 'derived_fact_source');
   }
-  const threshold = getReflectionThreshold();
+  const threshold = input.learningMode === 'terminal_batch' ? 0 : getReflectionThreshold();
   let batchesToCommit: PendingReflectionBatch[] = [{ input, extraction, importance: extractionImportance }];
   let pendingImportance = extractionImportance;
   let clearPendingAfterCommit = false;
@@ -2651,70 +2847,6 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
   };
   settleReflectionReceipt(input, receipt.inputHash, 'completed', result);
   return emitObservability(result);
-}
-
-/**
- * Fire-and-forget convenience used by hooks.ts. Runs in the background;
- * any error is swallowed (logged at warn level). NEVER awaited by the
- * caller — the SDK's tool return must not be blocked by reflection.
- */
-// ── Off-loop serialization ────────────────────────────────────────────
-// Reflection runs the fast-tier extractor on the SAME provider token as the
-// active brain. Firing it concurrently after every tool return (the old
-// queueMicrotask path) let a burst of tool calls launch 6+ extractor calls at
-// once, saturating the token and STARVING the user-facing brain loop — measured
-// at 9.3 min of extractor wall-clock in one session, stalling brain steps to
-// 27-37s. Draining reflections through a single-slot FIFO chain caps in-flight
-// extractions at 1, so background learning yields to the live loop instead of
-// competing with it. Best-effort: a bounded queue drops overflow rather than
-// growing unbounded on a long autonomous run; once an extractor succeeds, the
-// threshold buffer above is durable. CLEMMY_REFLECTION_SERIAL=off reverts to the
-// legacy concurrent path.
-const REFLECTION_MAX_PENDING = 32;
-let reflectionPending = 0;
-let reflectionTail: Promise<void> = Promise.resolve();
-
-function reflectionSerialEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_REFLECTION_SERIAL', 'on') || 'on').toLowerCase() !== 'off';
-}
-
-// Exported for tests: number of reflections queued but not yet drained.
-export function _testOnly_reflectionPending(): number {
-  return reflectionPending;
-}
-
-function runScheduled(input: ReflectionInput): void {
-  reflectOnToolReturn(input).catch((err) => {
-    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection: scheduled run errored');
-  });
-}
-
-export function scheduleReflection(input: ReflectionInput): void {
-  if (!reflectionSerialEnabled()) {
-    // Legacy path: fire-and-forget on next tick, concurrent. Kept as the
-    // kill-switch fallback so a regression can be reverted without a redeploy.
-    queueMicrotask(() => runScheduled(input));
-    return;
-  }
-  if (reflectionPending >= REFLECTION_MAX_PENDING) {
-    // Backpressure: the drain is falling behind a fast tool loop. Drop rather
-    // than block the caller or grow without bound — reflection is best-effort.
-    logger.debug({ tool: input.tool, pending: reflectionPending }, 'reflection: queue full — dropping (backpressure)');
-    return;
-  }
-  reflectionPending += 1;
-  // Chain onto the tail so at most ONE extractor runs at a time. The inner
-  // reflectOnToolReturn swallows its own errors; the .then keeps the chain
-  // alive regardless. Decrement in finally so a throw can't leak the slot.
-  reflectionTail = reflectionTail.then(async () => {
-    try {
-      await reflectOnToolReturn(input);
-    } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection: scheduled run errored');
-    } finally {
-      reflectionPending -= 1;
-    }
-  });
 }
 
 // ─────────────────────────────────────────────────────────────────

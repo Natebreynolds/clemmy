@@ -44,7 +44,7 @@ test('a single-act read participates and never falls through to an untyped loop'
 
   const dispatched = await dispatchAdmittedSource(identity);
   // The shape this file's header describes: the read lands the model turn with
-  // tools, zero ceremony. Live sess-mt30mfyc proved the alternative is a
+  // tools, zero ceremony. Live session-fixture-single-read proved the alternative is a
   // regression — a calendar turn compiled ten nodes, bound ZERO, and refusing
   // it meant "what's on my calendar today" got an apology instead of an answer.
   // Restore a stricter terminal here once a read actually binds.

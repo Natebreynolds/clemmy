@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import {
+  ActionWorkTopologySchema,
+  validateWorkTopology,
+  workTopologyDigest,
+} from '../graph/work-topology.js';
 
 /**
  * Transient model-owned interpretation for one accepted turn.
@@ -160,6 +165,12 @@ export const ProposedSemanticWorkV1Schema = z.object({
   /** Projection of destinations[0] for existing proposal authors. */
   destination: proposedDestinationSchema.nullable(),
   requestedEffect: requestedEffectSchema,
+  /** The one provider-neutral operation topology. Capability bindings below
+   * annotate these ids; they do not restate cardinality, coverage, or lineage. */
+  topology: ActionWorkTopologySchema.nullish(),
+  /** Content digest when topology is present. Admission recomputes it; the
+   * model cannot grant authority by supplying a matching string. */
+  topologyHash: z.string().regex(/^[a-f0-9]{64}$/).nullish(),
   operations: z.array(proposedOperationSchema).max(32),
   deliverables: z.array(proposedDeliverableSchema).max(32),
   evidenceRequirements: z.array(opaqueIdSchema).max(32),
@@ -178,6 +189,70 @@ export const ProposedSemanticWorkV1Schema = z.object({
         message: 'destinations[0] must match destination',
       });
     }
+  }
+  if (work.topology) {
+    // The digest is HOST-computed and grants no authority (see the field's own
+    // doc comment). Demanding it from the model gated every topology-bearing
+    // proposal on a sha256 the model cannot produce: live 2026-08-24 the
+    // scorpion-facebook-trends workflow step failed admission with
+    // `model_failed` at "work.topologyHash", and the run ended blocked telling
+    // a scheduled step to "restate it". The host derives the digest from the
+    // normalized topology at admission; a digest the model DOES supply is still
+    // checked below, so a wrong one can never pass.
+    const validatedTopology = validateWorkTopology(work.topology);
+    if (!validatedTopology.ok) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['topology'],
+        message: validatedTopology.errors.join('; '),
+      });
+      return;
+    }
+    if (
+      work.topologyHash
+      && workTopologyDigest(validatedTopology.topology) !== work.topologyHash
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['topologyHash'],
+        message: 'topologyHash does not match the normalized topology',
+      });
+    }
+    const bindings = new Map(work.operations.map((operation) => [operation.id, operation]));
+    if (bindings.size !== work.operations.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['operations'],
+        message: 'topology capability bindings must have unique operation ids',
+      });
+    }
+    const topologyIds = new Set(validatedTopology.topology.operations.map((operation) => operation.id));
+    if (topologyIds.size !== bindings.size || [...topologyIds].some((id) => !bindings.has(id))) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['operations'],
+        message: 'topology and capability bindings must cover the same operation ids',
+      });
+    }
+    // The topology is CANONICAL and this schema says so: "Capability bindings
+    // below annotate these ids; they do not restate cardinality, coverage, or
+    // lineage." Requiring the binding to ALSO restate `effect` and `dependsOn`
+    // -- byte-for-byte and in order -- contradicted that, and made a whole
+    // workflow die on a duplication mistake. Live 2026-08-24, three scheduled
+    // workflows blocked in one batch:
+    //   daily-standup-email -> "capability binding effect must match the canonical topology"
+    //   morning-briefing    -> "capability binding dependencies must match the canonical topology"
+    // Admission RECONCILES against the canonical topology instead (see
+    // reconcileOperationToTopology): lineage is taken from the topology, and
+    // effect takes the MORE RESTRICTIVE of the two, so reconciliation can never
+    // escalate authority. Coverage is still enforced above -- every topology id
+    // must still have a binding and vice versa.
+  } else if (work.topologyHash) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['topologyHash'],
+      message: 'topologyHash is invalid without a topology',
+    });
   }
 });
 
@@ -469,16 +544,60 @@ function requireExactActiveGoal(
   }
 }
 
+/**
+ * Does this work object ask for anything to happen?
+ *
+ * `work === null` is one way a proposal says "no work", and it was treated as
+ * the ONLY way. A model that fills the schema's shape instead — every list
+ * empty, construct `none`, effect `none` — was read as carrying work, so a
+ * plain greeting failed the conversation branch and the whole turn terminated
+ * `blocked` with "I could not finish planning that". Live 2026-08-22: a canary
+ * that asked only for a fixed sentence back; and 2026-08-21, the same shape
+ * inside a workflow synthesis.
+ *
+ * Emptiness is the honest test, because the invariant this protects is that a
+ * conversation must not smuggle executable intent — and nothing can execute
+ * without an operation or a deliverable to bind. The effect enum is still
+ * checked so a proposal that CLAIMS a write is never quietly read as inert.
+ */
+function workRequestsNothing(work: TurnSemanticProposalV1['work']): boolean {
+  if (work === null) return true;
+  return work.construct === 'none'
+    && work.operations.length === 0
+    && work.deliverables.length === 0
+    && work.evidenceRequirements.length === 0
+    && work.cardinality === null
+    && work.destination === null
+    && (work.destinations ?? []).length === 0
+    && (work.requestedEffect === 'none'
+      || work.requestedEffect === 'compute'
+      || work.requestedEffect === 'host_only');
+}
+
 function validateRelationMatrix(
   proposal: TurnSemanticProposalV1,
   host: TurnSemanticHostViewV1,
   issues: TurnSemanticValidationIssue[],
 ): void {
   const noAnswers = proposal.slotAnswers.length === 0;
-  const noWork = proposal.work === null;
+  // Two different questions were being asked of one flag, and conflating them
+  // is what turned a greeting into a blocked turn.
+  //
+  //  - "does this relation illegally CARRY work?" — asked by conversation,
+  //    continue_goal and answer_open_slot. A work object that asks for nothing
+  //    carries nothing, whatever its shape.
+  //  - "did the proposal SUPPLY structured work?" — asked by new_goal and
+  //    amend_goal, which need a plan to exist. That one still means a work
+  //    object was provided at all, deliberately left as it was: making it
+  //    inert-aware would newly reject a new_goal whose work is present but
+  //    empty, which is a real question (an admitted graph with zero operations
+  //    is the pathology behind the near-zero bind rate) but a separate change
+  //    with its own blast radius. It does not belong in this fix.
+  const carriesNoWork = workRequestsNothing(proposal.work);
+  const suppliedNoWork = proposal.work === null;
   switch (proposal.relation) {
     case 'conversation':
-      if (proposal.targetGoal !== null || proposal.goal !== null || !noWork || !noAnswers) {
+      if (proposal.targetGoal !== null || proposal.goal !== null || !carriesNoWork || !noAnswers) {
         issue(issues, 'illegal_relation_payload', '', 'conversation cannot carry goal, work, or slot answers');
       }
       return;
@@ -488,11 +607,11 @@ function validateRelationMatrix(
       // executable plan.
       const clarifyingOpenSlots = proposal.goal !== null
         && proposal.goal.openSlots.length > 0
-        && (noWork || (proposal.work?.operations.length ?? 0) === 0);
+        && (suppliedNoWork || (proposal.work?.operations.length ?? 0) === 0);
       if (
         proposal.targetGoal !== null
         || proposal.goal === null
-        || (!clarifyingOpenSlots && noWork)
+        || (!clarifyingOpenSlots && suppliedNoWork)
         || !noAnswers
       ) {
         issue(issues, 'illegal_relation_payload', '', 'new_goal requires one goal, structured work or clarifying open slots, and no target or slot answers');
@@ -501,19 +620,19 @@ function validateRelationMatrix(
     }
     case 'continue_goal':
       requireExactActiveGoal(proposal, host, issues);
-      if (proposal.goal !== null || !noWork || !noAnswers) {
+      if (proposal.goal !== null || !carriesNoWork || !noAnswers) {
         issue(issues, 'illegal_relation_payload', '', 'continue_goal cannot replace the goal, work, or answer slots');
       }
       return;
     case 'answer_open_slot':
       requireExactActiveGoal(proposal, host, issues);
-      if (proposal.goal !== null || !noWork || noAnswers) {
+      if (proposal.goal !== null || !carriesNoWork || noAnswers) {
         issue(issues, 'illegal_relation_payload', '', 'answer_open_slot requires slot answers and no replacement goal or work');
       }
       return;
     case 'amend_goal':
       requireExactActiveGoal(proposal, host, issues);
-      if (proposal.goal === null || noWork || !noAnswers) {
+      if (proposal.goal === null || suppliedNoWork || !noAnswers) {
         issue(
           issues,
           'illegal_relation_payload',
@@ -524,12 +643,12 @@ function validateRelationMatrix(
       return;
     case 'abandon_goal':
       requireExactActiveGoal(proposal, host, issues);
-      if (proposal.goal !== null || !noWork || !noAnswers) {
+      if (proposal.goal !== null || !carriesNoWork || !noAnswers) {
         issue(issues, 'illegal_relation_payload', '', 'abandon_goal cannot replace the goal, work, or answer slots');
       }
       return;
     case 'ambiguous':
-      if (proposal.goal !== null || !noWork || !noAnswers) {
+      if (proposal.goal !== null || !carriesNoWork || !noAnswers) {
         issue(issues, 'illegal_relation_payload', '', 'ambiguous cannot replace the goal, work, or settle slots');
       }
       if (proposal.targetGoal !== null) requireExactActiveGoal(proposal, host, issues);
