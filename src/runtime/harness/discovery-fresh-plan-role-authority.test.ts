@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { HOST_UNSCOPED_DISCOVERY_SUBJECT } from './discovery-governor.js';
 import { after, test } from 'node:test';
 import { tool } from '@openai/agents';
 import { z } from 'zod';
@@ -95,21 +96,24 @@ test('fresh-plan authority preserves one exact claim per frozen unresolved role'
     ['clause-0:read', 'clause-1:write'],
   );
 
-  for (const [roleKey, reason] of [
-    ['invented-provider-role', 'role_not_unresolved'],
-    ['clause-2:write', 'role_resolved'],
-  ] as const) {
-    assert.throws(() => admitDiscoveryBoundary({
+  // An invented or already-resolved role no longer refuses the search. What it
+  // must never do is become the claim key: role_key arrives from the MODEL, and
+  // the claim primary key contains the subject, so both collapse onto ONE
+  // host-owned subject. Frozen roles above keep their exact claims.
+  for (const roleKey of ['invented-provider-role', 'clause-2:write'] as const) {
+    const admission = admitDiscoveryBoundary({
       ...key,
       toolName: 'tool_search',
       input: { query: 'spoofed search', role_key: roleKey, limit: 8 },
-      callId: `fresh-denied-${roleKey}`,
+      callId: `fresh-coerced-${roleKey}`,
       freshPlanCatalogDisclosure: true,
-    }), (error: unknown) => {
-      assert.ok(error instanceof DiscoveryBudgetDeniedError);
-      assert.equal(error.reason, reason);
-      return true;
     });
+    assert.ok(admission, `${roleKey} still gets its search`);
+    assert.equal(
+      admission.subject,
+      HOST_UNSCOPED_DISCOVERY_SUBJECT,
+      `${roleKey} may never key the claim ledger`,
+    );
   }
 });
 

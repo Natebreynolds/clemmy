@@ -124,12 +124,18 @@ export type DiscoveryAdmissionReason =
    *  has already paid for the call, and refusing only buys a reformulated
    *  retry. */
   | 'subject_replay'
+  /** The caller named no role, an unknown one, or an already-resolved one. The
+   *  search is admitted against a HOST-OWNED subject and the caller is told. */
+  | 'role_coerced'
   /** A prior epoch was closed by new evidence; this epoch has its own budget. */
   | 'new_evidence_admitted'
   | 'task_not_initialized'
   | 'role_required'
   | 'role_not_unresolved'
-  | 'role_resolved';
+  | 'role_resolved'
+  /** Runaway backstop: this task has issued an implausible number of
+   *  discoveries. Turn-scoped, high, always on, and stops the turn cleanly. */
+  | 'turn_discovery_ceiling';
 
 export interface DiscoveryGovernorMetric {
   name: 'discovery_governor_decisions_total';
@@ -179,6 +185,10 @@ interface DiscoveryDecisionBase {
   policy: DiscoveryTaskPolicy | null;
   claim: DiscoveryClaim | null;
   telemetry: DiscoveryGovernorTelemetry;
+  /** Host-owned correction to hand back WITH an admitted result, never instead
+   *  of one. A caller that named a role the task does not have still gets its
+   *  search; it also gets told what the host actually knows. */
+  advisory?: string;
 }
 
 export interface DiscoveryAdmittedDecision extends DiscoveryDecisionBase {
@@ -187,7 +197,8 @@ export interface DiscoveryAdmittedDecision extends DiscoveryDecisionBase {
     | 'novel_discovery_admitted'
     | 'schema_refresh_admitted'
     | 'same_call_replay'
-    | 'subject_replay';
+    | 'subject_replay'
+    | 'role_coerced';
 }
 
 export interface DiscoveryDeniedDecision extends DiscoveryDecisionBase {
@@ -196,7 +207,8 @@ export interface DiscoveryDeniedDecision extends DiscoveryDecisionBase {
     | 'task_not_initialized'
     | 'role_required'
     | 'role_not_unresolved'
-    | 'role_resolved';
+    | 'role_resolved'
+    | 'turn_discovery_ceiling';
 }
 
 export type DiscoveryDecision = DiscoveryAdmittedDecision | DiscoveryDeniedDecision;
@@ -765,6 +777,7 @@ function buildDecision(input: {
   consumedBudget: boolean;
   policy: DiscoveryTaskPolicy | null;
   claim: DiscoveryClaim | null;
+  advisory?: string;
 }): DiscoveryDecision {
   const common = {
     key: input.key,
@@ -776,6 +789,7 @@ function buildDecision(input: {
     consumedBudget: input.consumedBudget,
     policy: input.policy,
     claim: input.claim,
+    ...(input.advisory ? { advisory: input.advisory } : {}),
     telemetry: decisionTelemetry(input),
   };
   if (input.admitted) {
@@ -1118,6 +1132,7 @@ export class DiscoveryGovernor {
       && input.authorityClass === 'fresh_plan_catalog_disclosure';
     const requestedSubject = normalizedSubject(input.category, input.subject);
     let subject = requestedSubject;
+    let roleAdvisory: string | undefined;
     const db = this.databaseProvider();
     ensureSchema(db);
     const decide = db.transaction((): DiscoveryDecision => {
@@ -1150,28 +1165,72 @@ export class DiscoveryGovernor {
         subject = freshPlanCatalogDisclosure ? 'host:fresh_plan_catalog' : '';
       }
 
+      // COERCE, DO NOT REFUSE. A role the task does not have is a correction to
+      // hand back with the results, not a reason to withhold them: measured
+      // 2026-08-24, 30 turns hit this gate, 26 completed anyway, and the 86
+      // refused calls had already been paid for. The subject still collapses to
+      // a HOST-OWNED key so the claim ledger can never be keyed on model text.
       if (input.category === 'broad_discovery' && policy.roleScoped) {
-        const denyRole = (
-          reason: 'role_required' | 'role_not_unresolved' | 'role_resolved',
-        ): DiscoveryDecision => buildDecision({
+        const role = subject
+          ? db.prepare(`
+              SELECT * FROM discovery_governor_roles
+               WHERE session_id = ? AND source_user_seq = ? AND role_key = ?
+            `).get(key.sessionId, key.sourceUserSeq, subject) as RawRoleRow | undefined
+          : undefined;
+        const openRoles = (): string => {
+          const keys = rawRoles(db, key)
+            .filter((row) => row.resolved !== 1)
+            .map((row) => row.role_key)
+            .filter((roleKey): roleKey is string => Boolean(roleKey));
+          return keys.length
+            ? ` Unresolved requirement roles for this task: ${keys.slice(0, 12).join(', ')}.`
+            : ' This task has no unresolved requirement role.';
+        };
+        if (!subject) {
+          roleAdvisory = `This search was not scoped to a requirement role.${openRoles()}`;
+          subject = HOST_UNSCOPED_DISCOVERY_SUBJECT;
+        } else if (!role) {
+          roleAdvisory = `"${subject}" is not a requirement role of this task, so the search ran unscoped.${openRoles()}`;
+          subject = HOST_UNSCOPED_DISCOVERY_SUBJECT;
+        } else if (role.resolved === 1) {
+          roleAdvisory = `"${subject}" is already resolved — you can execute that path directly instead of searching for it.${openRoles()}`;
+          subject = HOST_UNSCOPED_DISCOVERY_SUBJECT;
+        }
+      }
+
+      // The backstop is counted over the whole task, across every epoch and
+      // subject, because a runaway is a runaway regardless of how it labels
+      // itself. It is checked BEFORE the claim lookup so a replay cannot ride
+      // past it.
+      // Counted from the durable decision telemetry the governor already emits,
+      // so the backstop survives a restart without a new authority table.
+      let admittedSoFar: { count: number } | undefined;
+      try {
+        admittedSoFar = db.prepare(`
+          SELECT COUNT(*) AS count FROM events
+           WHERE session_id = ?
+             AND type = 'discovery_governor_decision'
+             AND json_extract(data_json, '$.sourceUserSeq') = ?
+             AND json_extract(data_json, '$.decision') = 'admitted'
+        `).get(key.sessionId, key.sourceUserSeq) as { count: number };
+      } catch {
+        // A backstop must never be the reason discovery fails. If the count
+        // cannot be read, admit and rely on the user's stop.
+        admittedSoFar = undefined;
+      }
+      if ((admittedSoFar?.count ?? 0) >= MAX_TURN_DISCOVERY_ADMISSIONS) {
+        return buildDecision({
           key,
           category: input.category,
           subject,
           callId,
           admitted: false,
-          reason,
+          reason: 'turn_discovery_ceiling',
           replay: false,
           consumedBudget: false,
           policy,
           claim: null,
         });
-        if (!subject) return denyRole('role_required');
-        const role = db.prepare(`
-          SELECT * FROM discovery_governor_roles
-           WHERE session_id = ? AND source_user_seq = ? AND role_key = ?
-        `).get(key.sessionId, key.sourceUserSeq, subject) as RawRoleRow | undefined;
-        if (!role) return denyRole('role_not_unresolved');
-        if (role.resolved === 1) return denyRole('role_resolved');
       }
 
       const rawExisting = db.prepare(`
@@ -1209,6 +1268,7 @@ export class DiscoveryGovernor {
           consumedBudget: false,
           policy,
           claim: existing,
+          ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
         });
       }
 
@@ -1244,6 +1304,7 @@ export class DiscoveryGovernor {
           consumedBudget: false,
           policy,
           claim,
+          ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
         });
       }
       return buildDecision({
@@ -1252,15 +1313,18 @@ export class DiscoveryGovernor {
         subject,
         callId,
         admitted: true,
-        reason: policy.epoch > 0
-          ? 'new_evidence_admitted'
-          : input.category === 'broad_discovery'
-            ? 'novel_discovery_admitted'
-            : 'schema_refresh_admitted',
+        reason: roleAdvisory
+          ? 'role_coerced'
+          : policy.epoch > 0
+            ? 'new_evidence_admitted'
+            : input.category === 'broad_discovery'
+              ? 'novel_discovery_admitted'
+              : 'schema_refresh_admitted',
         replay: false,
         consumedBudget: true,
         policy,
         claim,
+        ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
       });
     });
     return decide.immediate();
@@ -1440,6 +1504,37 @@ export class DiscoveryGovernor {
  * Read-only and failure-tolerant: a diagnostic can never be the reason a
  * refusal fails to reach its caller.
  */
+/**
+ * The subject an unusable role collapses onto.
+ *
+ * The claim primary key is (session, sourceUserSeq, epoch, category, subject),
+ * and role_key arrives from the MODEL on the wire. The old role gate was the
+ * only thing keeping that key inside a host-frozen set: refuse anything not in
+ * discovery_governor_roles. Simply deleting the refusal would have made the
+ * ledger key model-controlled free text, where `clause-1:read`, `Clause-1:read`
+ * and `[role:sheets]` are three distinct claims and three live provider
+ * searches — and a model GUESSING an identifier produces distinct strings by
+ * construction. Coercing instead of refusing keeps admission unconditional and
+ * the key host-owned.
+ */
+export const HOST_UNSCOPED_DISCOVERY_SUBJECT = 'host:unscoped_role';
+
+/**
+ * Runaway backstop, not a policy gate.
+ *
+ * Per-call refusal was removed because it never saved the call it refused and
+ * bought a reformulated retry instead. That leaves nothing bounding a model
+ * that loops, and every admitted discovery is a live provider round trip. The
+ * shape here is deliberately the one the reference harness settled on after
+ * removing its own turn ceilings: a single high, turn-scoped, always-on cap
+ * that stops the turn cleanly, rather than many low per-call refusals the
+ * caller must recover from.
+ *
+ * High enough that no observed real turn reaches it: the busiest measured turn
+ * on the production home issued 43 discovery attempts.
+ */
+export const MAX_TURN_DISCOVERY_ADMISSIONS = 120;
+
 export function unresolvedDiscoveryRoleKeys(key: DiscoveryTaskKey): string[] {
   try {
     return rawRoles(openEventLog(), key)

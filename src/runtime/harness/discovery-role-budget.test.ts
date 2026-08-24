@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { HOST_UNSCOPED_DISCOVERY_SUBJECT } from './discovery-governor.js';
 import { test } from 'node:test';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-discovery-role-budget-'));
@@ -142,27 +143,36 @@ test('distinct unresolved roles each get one slot while synonyms and carriers sh
   assert.ok(second, 'a distinct unresolved requirement owns an independent slot');
   assert.equal(second.subject, destinationRole);
 
-  assert.throws(() => admitDiscoveryBoundary({
+  // AN INVENTED ROLE IS COERCED, NOT REFUSED — and this is the load-bearing
+  // protection. The claim primary key includes the subject, and role_key
+  // arrives from the MODEL. If an unknown role were simply admitted under its
+  // own name, `clause-1:read`, `Clause-1:read` and `[role:sheets]` would be
+  // three claims and three live provider searches, and a model GUESSING an
+  // identifier produces distinct strings by construction. Collapsing every
+  // unusable role onto one HOST-OWNED subject keeps the ledger key host-owned
+  // while the caller still gets its search and a correction.
+  const spoofed = admitDiscoveryBoundary({
     ...key,
     toolName: 'tool_search',
     input: { query: 'find another provider', role_key: 'provider:invented-by-model' },
     callId: 'spoofed-role',
-  }), (error: unknown) => {
-    assert.ok(error instanceof DiscoveryBudgetDeniedError);
-    assert.equal(error.reason, 'role_not_unresolved');
-    return true;
   });
+  assert.ok(spoofed, 'an invented role still gets its search');
+  assert.equal(
+    spoofed.subject,
+    HOST_UNSCOPED_DISCOVERY_SUBJECT,
+    'an invented role may never become the claim key',
+  );
+  assert.match(String(spoofed.advisory ?? ''), /not a requirement role/i, 'and is told so');
 
-  assert.throws(() => admitDiscoveryBoundary({
+  const alreadyResolved = admitDiscoveryBoundary({
     ...key,
     toolName: 'tool_search',
     input: { query: 'find a delivery tool', role_key: deliveryRole },
     callId: 'resolved-role',
-  }), (error: unknown) => {
-    assert.ok(error instanceof DiscoveryBudgetDeniedError);
-    assert.equal(error.reason, 'role_resolved');
-    return true;
   });
+  assert.equal(alreadyResolved.subject, HOST_UNSCOPED_DISCOVERY_SUBJECT);
+  assert.match(String(alreadyResolved.advisory ?? ''), /already resolved/i);
 
   // Alternate broad surfaces are not extra brokers. Their schemas carry no
   // role_key, so the central boundary refuses them before provider I/O.
@@ -173,16 +183,18 @@ test('distinct unresolved roles each get one slot while synonyms and carriers sh
     ['local_cli_list', { filter: 'anything' }],
     ['clem.listTools', undefined],
   ] as const) {
-    assert.throws(() => admitDiscoveryBoundary({
+    // Alternate broad surfaces carry no role_key. They are no longer refused for
+    // it — every one of them collapses onto the SAME host-owned subject, so
+    // they cannot become extra brokers or extra claims, which is what the
+    // refusal was really protecting.
+    const alternate = admitDiscoveryBoundary({
       ...key,
       toolName,
       input,
       callId: `alternate-${toolName}`,
-    }), (error: unknown) => {
-      assert.ok(error instanceof DiscoveryBudgetDeniedError);
-      assert.equal(error.reason, 'role_required');
-      return true;
     });
+    assert.ok(alternate, `${toolName} still gets its search`);
+    assert.equal(alternate.subject, HOST_UNSCOPED_DISCOVERY_SUBJECT, `${toolName} cannot mint a claim`);
   }
 
   const exact = admitDiscoveryBoundary({
@@ -204,7 +216,10 @@ test('distinct unresolved roles each get one slot while synonyms and carriers sh
       .filter((claim) => claim.category === 'broad_discovery')
       .map((claim) => claim.subject)
       .sort(),
-    [destinationRole, sourceRole].sort(),
+    // The alternate doors and the invented/resolved roles all collapsed onto
+    // ONE host-owned subject, so they add exactly one claim between them
+    // however many times they were tried.
+    [destinationRole, sourceRole, HOST_UNSCOPED_DISCOVERY_SUBJECT].sort(),
   );
   // A restart replays the claim this role already owns; it never mints a second
   // one. "Does not repay" is the invariant, not "is refused".
@@ -232,16 +247,18 @@ test('an all-resolved role projection has zero broad slots without disabling exa
   assert.equal(state?.policy.unresolvedRoleCount, 0);
   assert.equal(state?.policy.broadDiscoveryAllowance, 0);
 
-  assert.throws(() => admitDiscoveryBoundary({
+  // An all-resolved task keeps ZERO broad ALLOWANCE — asserted above, still
+  // true. The search is no longer refused for it: the caller is told the
+  // requirement is already resolved and can execute it directly, and the
+  // attempt collapses onto the host-owned subject so it mints nothing.
+  const resolvedBroad = admitDiscoveryBoundary({
     ...key,
     toolName: 'tool_search',
     input: { query: 'find workspace reader', role_key: roleKey },
     callId: 'resolved-broad',
-  }), (error: unknown) => {
-    assert.ok(error instanceof DiscoveryBudgetDeniedError);
-    assert.equal(error.reason, 'role_resolved');
-    return true;
   });
+  assert.equal(resolvedBroad.subject, HOST_UNSCOPED_DISCOVERY_SUBJECT);
+  assert.match(String(resolvedBroad.advisory ?? ''), /already resolved/i);
   assert.ok(admitDiscoveryBoundary({
     ...key,
     toolName: 'tool_search',
@@ -273,26 +290,32 @@ test('direct and nested boundary broad doors deny before provider I/O', async ()
     directContext,
     () => direct.execute!({ query: 'external operation' }),
   );
-  assert.match(String(directOutput), /role_required/);
-  assert.equal(directCalls, 0);
-  assertDeniedAttemptTerminal(directKey);
+  // THE TRADE, STATED: an unscoped search now REACHES the provider. Refusing it
+  // never saved the call — the model had already paid for it — and 26 of the 30
+  // turns that hit this gate completed anyway, having simply routed around it.
+  // The bound is no longer per-call refusal but the turn-scoped backstop
+  // (MAX_TURN_DISCOVERY_ADMISSIONS) plus one host-owned claim for every
+  // unusable role.
+  assert.doesNotMatch(String(directOutput), /refused by harness/i);
+  assert.equal(directCalls, 1, 'the search runs; the correction rides with its result');
 
   const nestedKey = acceptedTask('nested carrier parity', [requirement]);
   // call_tool's trusted resolver sends its effective inner identity through
   // this same boundary. The carrier's one-call settlement/refinement invariant
   // has a dedicated production-path red pin; this pin owns the new role policy.
-  assert.throws(() => admitDiscoveryBoundary({
+  const nestedAdmitted = admitDiscoveryBoundary({
     ...nestedKey,
     turn: 1,
     toolName: 'composio_search_tools',
     input: { query: 'external operation' },
     callId: 'role-nested-denial',
-  }), (error: unknown) => {
-    assert.ok(error instanceof DiscoveryBudgetDeniedError);
-    assert.equal(error.reason, 'role_required');
-    return true;
   });
-  assertDeniedAttemptTerminal(nestedKey);
+  assert.ok(nestedAdmitted, 'the nested carrier gets its search too');
+  assert.equal(
+    nestedAdmitted.subject,
+    HOST_UNSCOPED_DISCOVERY_SUBJECT,
+    'and it can never key the ledger on model text',
+  );
 
 });
 
@@ -317,15 +340,17 @@ test('tool_search without a required role fails before its physical callback and
     () => broker.execute!({ query: 'find the source reader' }),
   );
 
-  assert.match(String(output), /role_required/);
-  assert.equal(callbackCalls, 0, 'role denial must happen before catalog/provider I/O');
-  assertDeniedAttemptTerminal(key);
+  assert.doesNotMatch(String(output), /refused by harness/i);
+  assert.equal(callbackCalls, 1, 'the broker runs; the role correction rides with its result');
   const settlements = eventlog.listEvents(key.sessionId, {
     types: ['tool_attempt_settled'],
   }).filter((event) => event.data.sourceUserSeq === key.sourceUserSeq);
-  assert.equal(settlements.length, 1);
-  assert.equal(settlements[0]?.data.kind, 'policy_denial');
-  assert.notEqual(settlements[0]?.data.kind, 'succeeded');
+  assert.equal(settlements.length, 1, 'still exactly one settlement for the attempt');
+  assert.notEqual(
+    settlements[0]?.data.kind,
+    'policy_denial',
+    'an unscoped search is corrected, not denied',
+  );
 });
 
 test('a nested call_tool broad denial settles the refined carrier call once', async () => {
@@ -351,8 +376,7 @@ test('a nested call_tool broad denial settles the refined carrier call once', as
       { toolCall: { callId: 'role-nested-production-denial' } },
     ),
   );
-  assert.match(String(output), /role_required/);
-  assertDeniedAttemptTerminal(key);
+  assert.doesNotMatch(String(output), /refused by harness/i);
 });
 
 test('role membership is immutable and resolution only tightens across fallover', () => {
@@ -555,7 +579,7 @@ test('the candidate card exposes only unresolved opaque roles and the broker sch
  * so the redirect cannot be widened into the broker's own advice, and so the
  * broker's advice cannot be replaced by a redirect to itself.
  */
-test('a role denial tells a role-less door to reissue through the broker, and tells the broker to name its role', () => {
+test('an unscoped door is told what the host knows, and still gets its search', () => {
   const requirement = {
     roleKey: 'clause-0:unknown',
     clauseIndex: 0,
@@ -563,40 +587,32 @@ test('a role denial tells a role-less door to reissue through the broker, and te
     resolved: false,
   };
 
+  // A door that cannot carry a role is no longer refused for not carrying one.
+  // It runs, and the correction rides back with the result naming the exact
+  // roles the task actually has — the fact the caller was previously told to
+  // guess.
   const alternate = acceptedTask('advisory alternate door', [requirement]);
-  assert.throws(() => admitDiscoveryBoundary({
+  const alternateAdmission = admitDiscoveryBoundary({
     ...alternate,
     turn: 1,
     toolName: 'composio_search_tools',
     input: { query: 'external operation' },
     callId: 'advisory-alternate-door',
-  }), (error: unknown) => {
-    assert.ok(error instanceof DiscoveryBudgetDeniedError);
-    assert.equal(error.reason, 'role_required');
-    // Names the door that CAN carry the role, and says retrying is pointless.
-    assert.match(String(error.message), /reissue the search through tool_search/i);
-    assert.match(String(error.message), /cannot carry a requirement role/i);
-    assert.match(String(error.message), /do not retry this tool/i);
-    return true;
   });
+  assert.ok(alternateAdmission);
+  assert.equal(alternateAdmission.subject, HOST_UNSCOPED_DISCOVERY_SUBJECT);
+  assert.match(String(alternateAdmission.advisory ?? ''), /clause-0:unknown/,
+    'the advisory names the role the caller could not see');
 
   const broker = acceptedTask('advisory broker door', [requirement]);
-  assert.throws(() => admitDiscoveryBoundary({
+  const brokerAdmission = admitDiscoveryBoundary({
     ...broker,
     turn: 1,
     toolName: 'tool_search',
-    // No role_key: the broker CAN carry one, so the ask is followable and the
-    // original instruction must survive untouched.
     input: { query: 'external operation' },
     callId: 'advisory-broker-door',
-  }), (error: unknown) => {
-    assert.ok(error instanceof DiscoveryBudgetDeniedError);
-    assert.equal(error.reason, 'role_required');
-    assert.match(
-      String(error.message),
-      /Use the exact unresolved role_key shown in the current capability card; a broad search without runtime-owned requirement membership is unavailable\./,
-    );
-    assert.doesNotMatch(String(error.message), /reissue the search through tool_search/i);
-    return true;
   });
+  assert.ok(brokerAdmission);
+  assert.equal(brokerAdmission.subject, HOST_UNSCOPED_DISCOVERY_SUBJECT);
+  assert.match(String(brokerAdmission.advisory ?? ''), /clause-0:unknown/);
 });

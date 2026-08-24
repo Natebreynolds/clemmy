@@ -3656,7 +3656,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
       : undefined;
     // All nudges ride the same advisory rail (appended to the tool result by the
     // caller). Combine so a turn that trips several still delivers each.
-    const nudges = [fanoutNudge, cacheNudge, workerFinishNudge, managerNudge].filter(Boolean);
+    // A discovery correction is a NUDGE, not a refusal. The caller named a role
+    // the task does not have; it still gets its results, and it rides the same
+    // rail as every other advisory so it reaches the model with them.
+    const discoveryAdvisory = (discovery as { advisory?: string } | null)?.advisory;
+    const nudges = [fanoutNudge, cacheNudge, workerFinishNudge, managerNudge, discoveryAdvisory].filter(Boolean);
     const advisory = nudges.length > 0 ? nudges.join('\n\n') : undefined;
     return advisory || reservation || discovery
       ? { advisory, reservation, discovery: discovery ?? undefined }

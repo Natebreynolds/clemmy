@@ -467,6 +467,10 @@ export function admitDiscoveryBoundary(
     sourceUserSeq: decision.key.sourceUserSeq,
     callId: decision.callId,
     replay: decision.replay,
+    // A host-owned correction rides WITH the admitted result. The caller named
+    // a role the task does not have; it still gets its search, and it also gets
+    // told what the host actually knows.
+    ...(decision.advisory ? { advisory: decision.advisory } : {}),
     ...(Number.isSafeInteger(input.turn) && (input.turn ?? 0) > 0 ? { turn: input.turn as number } : {}),
     ...(input.attemptId?.trim() ? { attemptId: input.attemptId.trim() } : {}),
   };
