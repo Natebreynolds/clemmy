@@ -319,36 +319,24 @@ export function validateWorkTopology(value: unknown): WorkTopologyValidation {
     for (const source of dataFrom) {
       if (!dependsOn.includes(source)) errors.push(`${label}.dataFrom ${source} must also be a dependency`);
     }
-    // COVERAGE IS HOST-DERIVED. `coverage` and `cardinality` are two views of
-    // one fact, and requiring an author to state both consistently was the last
-    // member of a class that killed real scheduled work: live 2026-08-24,
-    // weekly-review died with `work.topology (operation[1].coverage and
-    // cardinality describe different read sets)` -- alongside topologyHash (a
-    // host-computed sha256) and binding effect/dependsOn (a hand-copied
-    // restatement of the canonical topology). Each demanded consistency the
-    // author cannot reliably supply; each killed a scheduled run outright.
-    //
-    // Cardinality is executional (how many times the op runs) and therefore
-    // authoritative; coverage is descriptive and is normalized to match it.
-    // Where cardinality does not force a single answer -- `once` admits both
-    // `single` and `complete_set` -- the declared value stands if it is legal,
-    // and the fallback is the CONSERVATIVE one. Never widen a read's claimed
-    // coverage: an unsupported universal claim is precisely what honest-coverage
-    // forbids, so an ambiguous `once` resolves to `single`, never `complete_set`.
-    const derivedCoverage: WorkTopologyCoverageV1 | undefined = raw.effect !== 'read'
-      ? undefined
-      : cardinality.kind === 'set'
-        ? 'accepted_set'
-        : cardinality.kind === 'each'
-          ? 'single'
-          : raw.coverage === 'complete_set' || raw.coverage === 'single'
-            ? raw.coverage
-            : 'single';
+    if (
+      raw.effect === 'read'
+      && (
+        (raw.coverage === 'accepted_set' && cardinality.kind !== 'set')
+        || (cardinality.kind === 'set' && raw.coverage !== 'accepted_set')
+        || (raw.coverage === 'complete_set' && cardinality.kind !== 'once')
+        || (cardinality.kind === 'each' && raw.coverage !== 'single')
+      )
+    ) {
+      errors.push(`${label}.coverage and cardinality describe different read sets`);
+    }
     if (cardinality.kind !== 'once' && cardinality.kind !== 'each' && cardinality.kind !== 'set') continue;
     operations.push({
       id: String(raw.id),
       effect: raw.effect as WorkTopologyEffectV1,
-      ...(derivedCoverage ? { coverage: derivedCoverage } : {}),
+      ...(raw.effect === 'read' && coverageOk
+        ? { coverage: raw.coverage as WorkTopologyCoverageV1 }
+        : {}),
       dependsOn,
       dataFrom,
       cardinality: cardinality.kind === 'once'
