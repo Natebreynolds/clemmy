@@ -13344,6 +13344,52 @@ async function processOneRunFile(
             }
           } catch { /* ledger bookkeeping must never mask the block itself */ }
         }
+        // Hand the block to the Doctor. This branch already assembled exactly
+        // the input diagnoseWorkflowBlock takes -- {stepId, reason} -- and then
+        // threw it away: recordProposedFix had only two callers, one needing an
+        // output-contract violation and one an authored-step shape, so NONE of
+        // the failures users actually hit could reach self-heal. That is why the
+        // newest proposed fix on this machine was 2026-08-13 while workflows
+        // blocked repeatedly through 08-24.
+        //
+        // The fix is PROPOSED, never applied here: the user owns their workflow,
+        // and a blocked run is exactly when a silent rewrite would be least
+        // welcome. It lands in `fixes` for them to apply or dismiss.
+        if (definitionResolution.definitionSource !== 'compiled_snapshot') {
+          try {
+            // 'blocked', not 'self_reported_failure': the harness explicitly
+            // refused this step, which is the kind the Doctor may propose a
+            // prompt/connection/input fix for. A step that RAN and reported its
+            // own failure is a different thing and must not be prompt-rewritten.
+            const blockedSteps: BlockedStep[] = [
+              { stepId: error.stepId, reason: error.reason, kind: 'blocked' },
+            ];
+            // Reuse a fix that provably resolved this same signature before, so
+            // a recurring block converges instead of re-deriving every time.
+            let priorFix: { fixKind: string; fixDescription: string; fixJson?: string } | undefined;
+            try {
+              const remembered = recallConfirmedFix(
+                workflow.data.name,
+                error.stepId,
+                fixSignature(error.reason),
+              );
+              if (remembered) {
+                priorFix = {
+                  fixKind: remembered.fixKind,
+                  fixDescription: remembered.fixDescription,
+                  fixJson: JSON.stringify(remembered.fix),
+                };
+              }
+            } catch { /* recall is best-effort */ }
+            const diagnosis = await diagnoseWorkflowBlock({
+              workflow: workflow.data,
+              blockedSteps,
+              toolErrors: [error.reason],
+              ...(priorFix ? { priorFix } : {}),
+            });
+            if (diagnosis) recordProposedFix(workflow.data.name, run.id, diagnosis);
+          } catch { /* diagnosis is advisory; it must never mask the block */ }
+        }
         finishRun(run.id, {
           status: 'blocked',
           message: detail,
