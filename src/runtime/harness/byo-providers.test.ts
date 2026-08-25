@@ -1,9 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   getByoProviders, resolveByoProviderForModel, resolveDeclaredByoProviderForModel,
   byoProviderKeyEnvKey, slugifyProviderId, serializeExtraProviders, getByoProviderSnapshots,
   normalizeModelsList, resolveEffectiveProviderForModel, unqualifiedModelCollisionReason,
+  recordDiscoveredProviderModels,
+  readDiscoveredProviderModels,
 } from './byo-providers.js';
 
 // These read process.env (getRuntimeEnv checks process.env before BASE_DIR/.env),
@@ -309,5 +314,53 @@ test('not-served memo: the provider 400 teaches the catalog; repair then transla
     for (const [k, v] of Object.entries({ BYO_MODEL_BASE_URL: prev.url, BYO_MODEL_ID: prev.id, BYO_MODEL_API_KEY: prev.key, OPENAI_MODEL_WORKER: prev.worker, MODEL_ROUTING_MODE: prev.mode })) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
+  }
+});
+
+// ─── The picker must offer what the provider actually serves ─────────────────
+//
+// `modelIds` means "the models this provider offers", and the code that mints a
+// provider with an empty list says "Refresh fills them" — but nothing filled
+// them without a person opening Settings. For the legacy `default` provider the
+// list was never a catalog at all: it is built from [primaryId, judgeId,
+// worker], i.e. the models ALREADY ASSIGNED to roles, so that picker could only
+// ever offer what had already been picked.
+//
+// Observed 2026-08-25: Z.ai served glm-4.5 through glm-5.3 while Clementine
+// offered only glm-5.2; Moonshot served four Kimi models while Clementine
+// offered one.
+test('a provider catalog carries the declared model type so non-chat models can be excluded', () => {
+  const models = normalizeModelsList({
+    object: 'list',
+    data: [
+      { id: 'zai-org/GLM-5.3', type: 'chat', context_length: 202752 },
+      { id: 'ByteDance/Seedance-2.0', type: 'video' },
+      { id: 'BAAI/bge-base-en-v1.5', type: 'embedding' },
+      // A provider that publishes no type must never be filtered on a guess.
+      { id: 'glm-5.3' },
+    ],
+  });
+  const byId = new Map(models.map((model) => [model.id, model]));
+  assert.equal(byId.get('zai-org/GLM-5.3')?.kind, 'chat');
+  assert.equal(byId.get('ByteDance/Seedance-2.0')?.kind, 'video');
+  assert.equal(byId.get('glm-5.3')?.kind, undefined, 'no declared type stays undefined, not guessed');
+});
+
+test('a learned catalog is unioned in, and an empty listing never removes a model', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-byo-catalog-'));
+  const previous = process.env.CLEMENTINE_HOME;
+  process.env.CLEMENTINE_HOME = home;
+  try {
+    mkdirSync(path.join(home, 'state'), { recursive: true });
+    recordDiscoveredProviderModels('default', ['glm-5.2', 'glm-5.3']);
+    assert.deepEqual(readDiscoveredProviderModels().default, ['glm-5.2', 'glm-5.3']);
+    // A failed or thin catalog call is not evidence a provider stopped serving
+    // anything; a model in active use must never vanish because of one.
+    recordDiscoveredProviderModels('default', []);
+    assert.deepEqual(readDiscoveredProviderModels().default, ['glm-5.2', 'glm-5.3']);
+  } finally {
+    if (previous === undefined) delete process.env.CLEMENTINE_HOME;
+    else process.env.CLEMENTINE_HOME = previous;
+    rmSync(home, { recursive: true, force: true });
   }
 });

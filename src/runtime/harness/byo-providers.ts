@@ -24,6 +24,9 @@ import { resolveProvider, type ModelProviderClass } from './model-wire-registry.
 import { getStoredXaiOAuthTokens } from '../xai-auth-bridge.js';
 import { claudeAvailable } from './judge-family.js';
 import pino from 'pino';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const logger = pino({ name: 'clementine.byo-providers' });
 
@@ -56,6 +59,96 @@ function cleanId(raw: unknown): string {
  *  rather than a typed key, so it is the one provider whose secret has two
  *  legitimate sources. */
 export const XAI_PROVIDER_ID = 'xai';
+
+
+/**
+ * What each provider actually SERVES, learned from its own catalog.
+ *
+ * `modelIds` means "the models this provider offers" — the code that mints a
+ * provider with `modelIds: []` says so directly: "Refresh fills them". But
+ * nothing filled them without a person opening Settings, and for the legacy
+ * `default` provider the list was never a catalog at all: it is built from
+ * [primaryId, judgeId, worker], i.e. the models ALREADY ASSIGNED to roles. So
+ * that picker could only ever offer what had already been picked, and a model
+ * the provider had just launched could never be selected by any amount of
+ * refreshing.
+ *
+ * Observed 2026-08-25: Z.ai served glm-4.5 through glm-5.3 while Clementine
+ * offered only glm-5.2; Moonshot served four Kimi models while Clementine
+ * offered one.
+ *
+ * The daemon already lists every configured provider's catalog on start
+ * (warmByoProviderCatalogs) and was discarding the ids. It now records them
+ * here, and the ids are UNIONED into modelIds — never subtracted — so a model
+ * in active use can never disappear because a catalog call came back thin, and
+ * a newly published model shows up on its own.
+ */
+/** Model types that can hold a conversation turn. Anything a provider labels
+ *  image/video/audio/embedding/rerank/moderation cannot, and does not belong in
+ *  a model picker. */
+const CONVERSATIONAL_MODEL_KINDS = new Set(['chat', 'language', 'code']);
+
+const DISCOVERED_MODELS_FILE = 'byo-discovered-models.json';
+let discoveredCache: { mtimeMs: number; byProvider: Record<string, string[]> } | undefined;
+
+function discoveredModelsPath(): string | null {
+  try {
+    const base = process.env.CLEMENTINE_HOME?.trim() || path.join(os.homedir(), '.clementine-next');
+    return path.join(base, 'state', DISCOVERED_MODELS_FILE);
+  } catch {
+    return null;
+  }
+}
+
+export function readDiscoveredProviderModels(): Record<string, string[]> {
+  const file = discoveredModelsPath();
+  if (!file) return {};
+  let mtimeMs: number;
+  try {
+    mtimeMs = statSync(file).mtimeMs;
+  } catch {
+    return {};
+  }
+  if (discoveredCache?.mtimeMs === mtimeMs) return discoveredCache.byProvider;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf-8'));
+    const byProvider: Record<string, string[]> = {};
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const [providerId, ids] of Object.entries(parsed as Record<string, unknown>)) {
+        if (!Array.isArray(ids)) continue;
+        byProvider[providerId] = ids
+          .filter((id): id is string => typeof id === 'string' && Boolean(id.trim()))
+          .map((id) => id.trim());
+      }
+    }
+    discoveredCache = { mtimeMs, byProvider };
+    return byProvider;
+  } catch {
+    // A malformed cache must never cost the user their configured models.
+    return {};
+  }
+}
+
+export function recordDiscoveredProviderModels(providerId: string, ids: readonly string[]): void {
+  const file = discoveredModelsPath();
+  if (!file || !providerId.trim()) return;
+  const clean = ids.map((id) => (typeof id === 'string' ? id.trim() : '')).filter(Boolean);
+  // An empty or failed listing is not evidence that a provider stopped serving
+  // anything, so it never overwrites what was learned before.
+  if (clean.length === 0) return;
+  try {
+    const current = { ...readDiscoveredProviderModels() };
+    const previous = current[providerId] ?? [];
+    if (previous.length === clean.length && previous.every((id, index) => id === clean[index])) return;
+    current[providerId] = clean;
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `${JSON.stringify(current, null, 2)}\n`, 'utf-8');
+    discoveredCache = undefined;
+  } catch {
+    // Learning the catalog is additive; failing to persist it must not break
+    // model selection or daemon start.
+  }
+}
 
 export function getByoProviders(): ByoProvider[] {
   const providers: ByoProvider[] = [];
@@ -110,6 +203,19 @@ export function getByoProviders(): ByoProvider[] {
       baseURL: 'https://api.x.ai/v1',
       modelIds: [],
     });
+  }
+
+  // Union in what each provider was last observed to SERVE. Additive only: a
+  // model that is configured or in use is never removed by a thin catalog
+  // response, and a newly published model becomes selectable without anyone
+  // reopening Settings.
+  const discovered = readDiscoveredProviderModels();
+  for (const provider of providers) {
+    const learned = discovered[provider.id];
+    if (!learned?.length) continue;
+    const merged = new Set(provider.modelIds);
+    for (const id of learned) merged.add(id);
+    provider.modelIds = Array.from(merged);
   }
 
   return providers;
@@ -412,6 +518,10 @@ export interface DiscoveredModel {
   /** Provider-published context window for this exact id, when the catalog
    * carries one — recorded as a window observation at discovery time. */
   contextLength?: number;
+  /** The provider's own declared model type, when it publishes one (Together:
+   *  chat / image / video / embedding / …). Absent for providers that do not
+   *  say, which must never be read as "not a chat model". */
+  kind?: string;
 }
 
 /**
@@ -441,10 +551,17 @@ export function normalizeModelsList(raw: unknown): DiscoveredModel[] {
       : undefined;
     const contextLength = typeof cl?.context_length === 'number' ? cl.context_length
       : typeof cl?.max_context_length === 'number' ? cl.max_context_length : undefined;
+    const declaredKind = item && typeof item === 'object'
+      ? (item as { type?: unknown }).type
+      : undefined;
+    const kind = typeof declaredKind === 'string' && declaredKind.trim()
+      ? declaredKind.trim().toLowerCase()
+      : undefined;
     out.push({
       id,
       label: typeof dn === 'string' && dn.trim() ? dn.trim() : undefined,
       ...(contextLength !== undefined ? { contextLength } : {}),
+      ...(kind ? { kind } : {}),
     });
   }
   out.sort((a, b) => a.id.localeCompare(b.id));
@@ -541,6 +658,20 @@ export async function warmByoProviderCatalogs(timeoutMs = 8_000): Promise<number
         const result = await discoverProviderModels({ baseURL: p.baseURL, apiKey }, fetch, timeoutMs);
         if (result.status === 200 && 'models' in result.body) {
           recorded += result.body.models.filter((m) => m.contextLength !== undefined).length;
+          // The catalog was already being fetched purely for context windows;
+          // the ids were thrown away, which is why a provider could serve a new
+          // model for weeks and Clementine would never offer it.
+          // Only models that can actually hold a turn belong in a model
+          // picker. Together publishes a type per model and serves 278 of
+          // them — 29 image, 38 video, 15 audio, 2 embedding — which would
+          // bury the 169 usable ones. A provider that publishes no type
+          // (Z.ai, Moonshot) is never filtered on a guess.
+          recordDiscoveredProviderModels(
+            p.id,
+            result.body.models
+              .filter((model) => model.kind === undefined || CONVERSATIONAL_MODEL_KINDS.has(model.kind))
+              .map((model) => model.id),
+          );
         }
       } catch { /* per-provider best-effort */ }
     }));
