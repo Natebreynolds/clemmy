@@ -520,6 +520,12 @@ export const EVENT_TYPES = [
   // {sourceUserSeq, capabilities[{kind,identifier,effectClass,
   // schemaFingerprint?}]}.
   'capability_discovered',
+  // The capability catalog the planner was ACTUALLY shown for one turn — the
+  // post-truncation union of all three contributors, each descriptor tagged
+  // with which leg supplied it, plus whether resolution completed or hit its
+  // deadline. Record only; replay never reads it. Carries {sourceUserSeq,
+  // resolution, count, capabilities[{id,effect,source}]}.
+  'planning_catalog_disclosed',
   // What occupied this turn's prompt, split by whether it can be cached.
   // Per-step prompt cost is paid once per step and therefore ~100x per task,
   // so the lever on latency is keeping the LARGE part invariant and the

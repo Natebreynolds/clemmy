@@ -73,7 +73,12 @@ test('FIX: recordConnectedGoalCatalog primes the registry once and selects from 
     });
     assert.deepEqual(selection.gaps, [], `no family gap after the prime (got ${JSON.stringify(selection.gaps)})`);
     const ids = selection.entries.map((entry) => entry.identifier);
-    assert.ok(ids.includes('FIRECRAWL_SEARCH'), 'goal search selected from the primed registry');
+    // Zero-evidence floor: FIRECRAWL_SEARCH (brand token + generic token,
+    // overlap 0 with the objective) is abstained; the search slot falls to
+    // the evidence-bearing sheets read. This pin's subject is the PRIME —
+    // selection reflects connected reality instead of a false cold gap —
+    // and that holds regardless of which evidenced candidate wins a slot.
+    assert.ok(!ids.includes('FIRECRAWL_SEARCH'), 'a zero-evidence brand slug is never selected, even primed');
     assert.ok(ids.includes('GOOGLESHEETS_SHEET_FROM_JSON'), 'row create selected from the primed registry');
     assert.ok(ids.includes('GOOGLESHEETS_BATCH_GET'), 'readback selected from the primed registry');
 

@@ -795,6 +795,15 @@ function validateProposedWork(
   const knownOps = new Set(work.operations.map((operation) => operation.id));
   const catalogOpen = host.catalog.capabilityIds.size > 0;
   const descriptors = host.catalog.capabilities ?? [];
+  // Host-native work (host_only/none/compute) is expressed WITHOUT a foreign
+  // capability citation. Every citation requirement below must exempt the same
+  // set, so the predicate is shared: when the two blocks diverged, an open
+  // catalog left no admissible way to state host-native work and the only
+  // path through admission was citing an irrelevant foreign capability.
+  const hostNativeOperation = (operation: { requestedEffect: string }): boolean =>
+    operation.requestedEffect === 'host_only'
+    || operation.requestedEffect === 'none'
+    || operation.requestedEffect === 'compute';
   for (const [index, operation] of work.operations.entries()) {
     for (const dep of operation.dependsOn) {
       if (!knownOps.has(dep)) {
@@ -802,11 +811,7 @@ function validateProposedWork(
       }
     }
     if (!catalogOpen) continue;
-    if (
-      operation.requestedEffect === 'host_only'
-      || operation.requestedEffect === 'none'
-      || operation.requestedEffect === 'compute'
-    ) continue;
+    if (hostNativeOperation(operation)) continue;
     const descriptorById = new Map(descriptors.map((entry) => [entry.id, entry]));
     const boundId = host.catalog.capabilityIds.has(operation.capabilityRef)
       ? operation.capabilityRef
@@ -850,6 +855,7 @@ function validateProposedWork(
       })()
     );
     for (const operation of work.operations) {
+      if (hostNativeOperation(operation)) continue;
       const successor = descriptorForRef(operation.capabilityRef);
       if (!successor) {
         issue(
@@ -862,6 +868,9 @@ function validateProposedWork(
       }
       for (const dep of operation.dependsOn) {
         const predecessorOp = byOp.get(dep);
+        // An edge with a host-native endpoint has no descriptor pair to
+        // compare; kind flow is only checkable between two cited operations.
+        if (predecessorOp && hostNativeOperation(predecessorOp)) continue;
         const predecessor = predecessorOp
           ? descriptorForRef(predecessorOp.capabilityRef)
           : undefined;

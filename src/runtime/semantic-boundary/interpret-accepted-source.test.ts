@@ -953,3 +953,79 @@ test('an admitted record never renders as a failed structural check', async () =
   } as never);
   assert.match(invalid, /did not pass my own structural check either time/i);
 });
+
+// ─── Anti-laundering repair hint (live 2026-08-25) ───────────────────────────
+//
+// Three workflow steps died citing a disclosed foreign capability whose effect
+// could not match — because NO disclosed descriptor carried the operation's
+// requested effect at all. The bounded repair re-cited from the same menu and
+// died identically. The hint now states the measured fact (the menu cannot
+// satisfy this effect) and the admissible expression (host-native effects),
+// and deliberately never enumerates near-miss refs or alternative effects —
+// a listing hint coaches effect-flipping until something validates, which
+// launders a foreign operation through admission instead of repairing it.
+test('repair hint for an unsatisfiable effect states host-native guidance and lists no other capability', async () => {
+  resetEventLog();
+  const sessionId = 'sess-hostnative-hint';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'collect five widgets and store them locally',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const hints: string[] = [];
+  let citedRef = '';
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret(call) {
+        if (call.repairHint) hints.push(call.repairHint);
+        const proposal = fakeSemanticProposal('newConstruct', call.host);
+        // The live shape: keep the honest citation, declare an effect the
+        // disclosed catalog cannot satisfy (no local_write descriptor exists).
+        const ops = proposal.work!.operations;
+        citedRef = ops[0]!.capabilityRef;
+        ops[0] = { ...ops[0]!, requestedEffect: 'local_write' };
+        return {
+          raw: proposal,
+          modelIdentity: 'hint-brain',
+          inputTokens: 10,
+          outputTokens: 5,
+          latencyMs: 1,
+        };
+      },
+      async judgeSourceEffect(call) {
+        return {
+          verdict: 'entailed',
+          effect: call.proposedEffect,
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'hint-judge',
+          inputTokens: 1,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        return entailedPlanGroundingJudge(call, 'hint-grounding');
+      },
+    },
+    turn: 1,
+  });
+  assert.equal(result.status, 'blocked', 'the same broken proposal twice must stay blocked');
+  assert.equal(hints.length, 1, 'exactly one bounded repair with a hint');
+  const hint = JSON.parse(hints[0]!) as { hostNative?: { reason?: string; require?: string } | null };
+  assert.equal(hint.hostNative?.reason, 'no_disclosed_capability_carries_requested_effect');
+  assert.ok(hint.hostNative?.require?.includes('host_only'), 'the admissible expression is named');
+  // No capability id other than the one the model itself cited may appear —
+  // near-miss enumeration is the laundering vector.
+  for (const descriptor of host.catalog.capabilities ?? []) {
+    if (descriptor.id === citedRef) continue;
+    assert.ok(!hints[0]!.includes(descriptor.id), `hint leaked an uncited capability id: ${descriptor.id}`);
+  }
+});

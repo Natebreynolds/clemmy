@@ -4,6 +4,7 @@
  * text or constructed authority.
  */
 import { createHash } from 'node:crypto';
+import { getRuntimeEnv } from '../../config.js';
 import { peekTaskContinuityPacket } from '../../memory/task-continuity.js';
 import { getProactivityPolicySnapshot } from '../../agents/proactivity-policy.js';
 import {
@@ -296,6 +297,16 @@ function planningWords(value: string): Set<string> {
 
 const FRESH_PLANNING_CARD_LIMIT = 8;
 const FRESH_PLANNING_CARD_BYTES = 8_192;
+/** Bound on the pre-model capability-resolution phase. Observed completed
+ *  resolutions on the live home max at 63s (p95 well under 20s); the default
+ *  clears every measured success while converting a silent registry wedge
+ *  (live: 20+ minutes) into a bounded, recorded degradation. Env override is
+ *  an operational tunable, read per-call so tests and incidents can set it
+ *  without a reboot. */
+export function capabilityResolutionDeadlineMs(): number {
+  const raw = Number(getRuntimeEnv('CAPABILITY_RESOLUTION_DEADLINE_MS', ''));
+  return Number.isFinite(raw) && raw > 0 ? raw : 90_000;
+}
 
 function boundedFreshPlanningCard(
   descriptors: readonly HostCapabilityDescriptorV1[],
@@ -980,26 +991,53 @@ export async function prepareDurableAcceptedTurnCompile(
   let indexDescriptors: HostCapabilityDescriptorV1[] = [];
   let primaryPlanningCatalog: (typeof primaryModelPlanningCatalogs extends WeakMap<object, infer V> ? V : never) | undefined;
   let selectedPrimaryCapabilityRefs = new Set<string>();
+  let capabilityResolutionOutcome: 'completed' | 'capability_resolution_deadline_exceeded' = 'completed';
   if (!primaryModelProposal) {
-    try {
-      await recordConnectedGoalCatalog({
-        sessionId: input.identity.sessionId,
-        sourceUserSeq: input.identity.sourceUserSeq,
-        objective: durableText,
-      });
-    } catch { /* catalog priming is additive */ }
-    try {
-      await registerProofProvisionedCapabilities(input.identity);
-    } catch { /* proof provision is additive; bind still fail-closes */ }
-    try {
-      const indexed = await registerIndexedCapabilitiesForTurn({
-        sessionId: input.identity.sessionId,
-        sourceUserSeq: input.identity.sourceUserSeq,
-        objective: durableText,
-      });
-      indexDescriptors = indexed.descriptors;
-    } catch {
+    // The three resolution legs share one deadline: each leg is additive and
+    // already degrades through its catch, but the awaits inside them reach
+    // live registries with no timeout of their own — a slow registry held a
+    // run in this phase for 20+ minutes with only a watchdog notice. Observed
+    // completed resolutions max at 63s on this home, so the deadline clears
+    // every measured success while bounding the wedge. A miss abandons the
+    // phase rather than cancelling it (the underlying fetch has no abort
+    // seam yet); the late legs at worst record/register additively.
+    const resolutionPhase = (async (): Promise<HostCapabilityDescriptorV1[]> => {
+      try {
+        await recordConnectedGoalCatalog({
+          sessionId: input.identity.sessionId,
+          sourceUserSeq: input.identity.sourceUserSeq,
+          objective: durableText,
+        });
+      } catch { /* catalog priming is additive */ }
+      try {
+        await registerProofProvisionedCapabilities(input.identity);
+      } catch { /* proof provision is additive; bind still fail-closes */ }
+      try {
+        const indexed = await registerIndexedCapabilitiesForTurn({
+          sessionId: input.identity.sessionId,
+          sourceUserSeq: input.identity.sourceUserSeq,
+          objective: durableText,
+        });
+        return indexed.descriptors;
+      } catch {
+        return hostDescriptorsFromCapabilityIndex(durableText);
+      }
+    })();
+    const expired = Symbol('capability-resolution-deadline');
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const raced = await Promise.race([
+      resolutionPhase,
+      new Promise<typeof expired>((resolve) => {
+        deadlineTimer = setTimeout(() => resolve(expired), capabilityResolutionDeadlineMs());
+      }),
+    ]);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    if (raced === expired) {
+      capabilityResolutionOutcome = 'capability_resolution_deadline_exceeded';
       indexDescriptors = hostDescriptorsFromCapabilityIndex(durableText);
+      void resolutionPhase.catch(() => { /* abandoned leg; its catches already absorb */ });
+    } else {
+      indexDescriptors = raced;
     }
   } else {
     primaryPlanningCatalog = primaryModelCatalogAuthority
@@ -1070,8 +1108,17 @@ export async function prepareDurableAcceptedTurnCompile(
         input.identity.sourceUserSeq,
       );
   const byId = new Map<string, HostCapabilityDescriptorV1>();
-  for (const descriptor of [...catalogDescriptors, ...proofDescriptors, ...indexDescriptors]) {
-    if (!byId.has(descriptor.id)) byId.set(descriptor.id, descriptor);
+  const disclosureSourceById = new Map<string, 'frozen_snapshot' | 'proof' | 'index'>();
+  for (const [contributor, source] of [
+    [catalogDescriptors, 'frozen_snapshot'],
+    [proofDescriptors, 'proof'],
+    [indexDescriptors, 'index'],
+  ] as const) {
+    for (const descriptor of contributor) {
+      if (byId.has(descriptor.id)) continue;
+      byId.set(descriptor.id, descriptor);
+      disclosureSourceById.set(descriptor.id, source);
+    }
   }
   let capabilities = selectRelevantCapabilityDescriptors([...byId.values()]);
   if (primaryModelProposal) {
@@ -1126,6 +1173,40 @@ export async function prepareDurableAcceptedTurnCompile(
     catalog.digest = sha256(JSON.stringify(canonicalCapabilities));
     capabilities = [...canonicalCapabilities];
   }
+
+  // Durable record of the catalog the model was ACTUALLY shown — the
+  // post-truncation set, with each descriptor's contributor. Three legs feed
+  // this union and only one of them (the goal catalog) left any durable trace,
+  // so reconstructing "what menu produced this citation" required hand
+  // archaeology. Additive record only: replay treats it as data, and a failure
+  // to append never blocks admission.
+  try {
+    const disclosureSource = listEvents(input.identity.sessionId, {
+      sinceSeq: input.identity.sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    }).find((event) => event.seq === input.identity.sourceUserSeq);
+    if (disclosureSource) {
+      appendEvent({
+        sessionId: input.identity.sessionId,
+        turn: disclosureSource.turn,
+        role: 'system',
+        type: 'planning_catalog_disclosed',
+        data: {
+          sourceUserSeq: input.identity.sourceUserSeq,
+          resolution: capabilityResolutionOutcome,
+          count: capabilities.length,
+          capabilities: capabilities.map((descriptor) => ({
+            id: descriptor.id,
+            effect: descriptor.effect,
+            source: primaryModelProposal
+              ? 'primary_planning'
+              : disclosureSourceById.get(descriptor.id) ?? 'index',
+          })),
+        },
+      });
+    }
+  } catch { /* observability only */ }
 
   const continuity = peekTaskContinuityPacket({ sessionId: input.identity.sessionId });
   const packet = continuity.status === 'available'

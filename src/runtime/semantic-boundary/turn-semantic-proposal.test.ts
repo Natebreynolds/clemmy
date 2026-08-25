@@ -868,3 +868,85 @@ test('a topology refinement failure passes the wire and fails admission', async 
   const full = TurnSemanticProposalV1Schema.safeParse(proposal);
   assert.equal(full.success, false, 'admission still refuses the same topology');
 });
+
+// ─── Host-native operations under an open catalog ────────────────────────────
+//
+// Live incident (2026-08-25, morning-briefing brief step): with any descriptor
+// disclosed, the second validator block demanded a successor descriptor from
+// EVERY operation — including host_only/none/compute work, which by definition
+// has no foreign descriptor to cite. The only admissible expression of "notify
+// the user" was citing an irrelevant foreign capability, which then correctly
+// died on capability_ref_effect_mismatch; the bounded repair re-cited from the
+// same menu. Both citation blocks now share one exemption predicate.
+test('a host_only operation admits without a foreign descriptor while the catalog is open', () => {
+  const result = validateTurnSemanticProposalV1(proposal({
+    work: {
+      ...work(),
+      operations: [
+        { id: 'op-read', role: 'source', requestedEffect: 'read', dependsOn: [], evidence: [], capabilityRef: 'cap-1' },
+        { id: 'op-write', role: 'destination', requestedEffect: 'external_write', dependsOn: ['op-read'], evidence: [], capabilityRef: 'cap-2' },
+        { id: 'op-notify', role: 'presentation', requestedEffect: 'host_only', dependsOn: ['op-write'], evidence: [], capabilityRef: 'host_notify' },
+      ],
+    },
+  }), host());
+  assert.equal(result.ok, true, `host-native op must admit uncited: ${issueCodes(result).join(',')}`);
+});
+
+test('a host-native effect never exempts a FOREIGN citation from the effect check', () => {
+  // The same shape, but the notify op cites a DISCLOSED foreign capability
+  // with a mismatched effect — the exact live failure. The exemption keys on
+  // requestedEffect, so a foreign-effect op citing garbage still rejects.
+  const result = validateTurnSemanticProposalV1(proposal({
+    work: {
+      ...work(),
+      operations: [
+        { id: 'op-read', role: 'source', requestedEffect: 'read', dependsOn: [], evidence: [], capabilityRef: 'cap-1' },
+        { id: 'op-notify', role: 'destination', requestedEffect: 'external_write', dependsOn: ['op-read'], evidence: [], capabilityRef: 'cap-1' },
+      ],
+    },
+  }), host());
+  assert.equal(result.ok, false, 'a mismatched foreign citation must still reject');
+  assert.ok(
+    issueCodes(result).includes('capability_ref_effect_mismatch'),
+    `expected capability_ref_effect_mismatch, got: ${issueCodes(result).join(',')}`,
+  );
+});
+
+test('kind-flow checking survives around a host-native operation in a mixed chain', () => {
+  // cited read → host_only transform → cited write: the host-native middle op
+  // is exempt (no descriptor pair to compare on its edges), while an edge
+  // between two CITED ops with incompatible kinds must still reject.
+  const chain = (midEffect: 'host_only' | 'read') => validateTurnSemanticProposalV1(proposal({
+    work: {
+      ...work(),
+      operations: [
+        { id: 'op-read', role: 'source', requestedEffect: 'read', dependsOn: [], evidence: [], capabilityRef: 'cap-1' },
+        { id: 'op-mid', role: 'transform', requestedEffect: midEffect, dependsOn: ['op-read'], evidence: [], capabilityRef: midEffect === 'host_only' ? 'host_transform' : 'cap-collect' },
+        { id: 'op-write', role: 'destination', requestedEffect: 'external_write', dependsOn: ['op-mid'], evidence: [], capabilityRef: 'cap-2' },
+      ],
+    },
+  }), host());
+  const mixed = chain('host_only');
+  assert.equal(mixed.ok, true, `mixed chain with host-native middle must admit: ${issueCodes(mixed).join(',')}`);
+  // Control: the SAME chain with a cited middle op whose produced kinds do not
+  // satisfy the successor still rejects — the exemption did not swallow the
+  // kind check between cited pairs. cap-collect produces 'records'; cap-2
+  // accepts 'records', so build the mismatch on the first edge instead:
+  // cap-1 produces 'records', cap-collect accepts 'records' — compatible.
+  // Use cap-2 (accepts 'records', produces 'created_resource') feeding cap-1
+  // (accepts 'query') to force the kind mismatch between two cited ops.
+  const mismatched = validateTurnSemanticProposalV1(proposal({
+    work: {
+      ...work(),
+      operations: [
+        { id: 'op-a', role: 'destination', requestedEffect: 'external_write', dependsOn: [], evidence: [], capabilityRef: 'cap-2' },
+        { id: 'op-b', role: 'source', requestedEffect: 'read', dependsOn: ['op-a'], evidence: [], capabilityRef: 'cap-1' },
+      ],
+    },
+  }), host());
+  assert.equal(mismatched.ok, false, 'kind mismatch between two cited ops must still reject');
+  assert.ok(
+    issueCodes(mismatched).includes('dag_kind_mismatch'),
+    `expected dag_kind_mismatch, got: ${issueCodes(mismatched).join(',')}`,
+  );
+});

@@ -84,14 +84,25 @@ const LIVE_REGISTRY = {
   ],
 };
 
-test('59796 REPLAY: goal words outrank fillable impostors — search is a search, create is the sheet', () => {
+test('59796 REPLAY: goal words outrank fillable impostors — evidence selects the sheet, zero evidence abstains', () => {
   installConnectedRegistryPort(() => LIVE_REGISTRY);
   try {
     const selection = selectGoalCatalog(LIVE_TEXT);
-    assert.deepEqual(selection.gaps, []);
     const bySlot = Object.fromEntries(selection.entries.map((entry) => [entry.intent.split(':')[0], entry.identifier]));
-    assert.equal(bySlot['goal search'], 'FIRECRAWL_SEARCH', 'the live impostor APIFY_GET_LIST_OF_BUILDS must not win the search slot');
-    assert.equal(bySlot['goal construct'], 'GOOGLESHEETS_SHEET_FROM_JSON', 'the live impostor OUTLOOK_CREATE_CONTACT must not win the create slot');
+    // Zero-evidence floor (live 2026-08-25: three DataForSEO SERP ops with
+    // overlap 0 were minted "proven authoritative" for a morning briefing):
+    // a slug whose every non-generic token is foreign to the objective is
+    // never pushed — here BOTH search-shaped candidates (APIFY impostor and
+    // FIRECRAWL_SEARCH, one brand token + one generic token). The slot then
+    // falls to the only evidence-bearing read on the board. This pins the
+    // floor's composition with the existing ranks, not an endorsement of a
+    // batch-get as a good search — the refused CLASS is the zero-evidence
+    // guess, and ranking among evidenced candidates is unchanged.
+    assert.deepEqual(selection.gaps, []);
+    assert.equal(bySlot['goal search'], 'GOOGLESHEETS_BATCH_GET', 'only an evidence-bearing candidate may hold the search slot');
+    assert.ok(!selection.entries.some((entry) => entry.identifier === 'APIFY_GET_LIST_OF_BUILDS'), 'the live impostor must not win the search slot');
+    assert.ok(!selection.entries.some((entry) => entry.identifier === 'FIRECRAWL_SEARCH'), 'a zero-evidence brand slug must not win the search slot');
+    assert.equal(bySlot['goal construct'], 'GOOGLESHEETS_SHEET_FROM_JSON', 'the objective\'s own words (Google, sheet) select the create — evidence survives the floor');
     assert.equal(bySlot['goal readback'], 'GOOGLESHEETS_BATCH_GET');
   } finally {
     installConnectedRegistryPort(null);
@@ -128,7 +139,57 @@ test('objective without provider words: affinity stays neutral and the genuine s
   try {
     const selection = selectGoalCatalog('collect the eight best coffee roasters in Austin and put them in a spreadsheet');
     const search = selection.entries.find((entry) => entry.intent.startsWith('goal search'));
-    assert.equal(search?.identifier, 'FIRECRAWL_SEARCH', 'both slugs are foreign to the objective — the impostor must not win on a tie-break');
+    // Both search slugs are foreign to the objective — under the
+    // zero-evidence floor neither may win; the slot abstains to a gap
+    // rather than tie-breaking between two guesses.
+    assert.equal(search, undefined, 'both slugs are foreign to the objective — no candidate may win, on tie-break or otherwise');
+    assert.ok(selection.gaps.includes('search'));
+  } finally {
+    installConnectedRegistryPort(null);
+  }
+});
+
+// ─── Zero-evidence floor (live 2026-08-25, morning-briefing brief step) ──────
+//
+// The capability_resolution event "proved" three DataForSEO SERP dataset
+// operations authoritativeForTask:true for a MORNING BRIEFING — every slug
+// token foreign to the objective, selection won on schema fillability alone.
+// Those minted entries then fed the planner a menu where the only citable
+// options were junk. The floor: overlap 0 + foreign > 0 → the candidate is
+// not pushed; a slot with no evidenced candidate abstains to the gaps
+// machinery, which records NOTHING (no proven mint, no factory registration).
+test('a fillable candidate with zero objective overlap and a foreign domain is never selected', () => {
+  installConnectedRegistryPort(() => ({
+    connectedToolkits: ['dataforseo'],
+    tools: [
+      // Generic fillable read + rows-required write, brand-foreign slugs —
+      // tonight's incident shape reduced to its structure.
+      { slug: 'DATAFORSEO_SERP_DATASET_SEARCH', schema: { type: 'object', required: ['q'], properties: { q: { type: 'string' } } } },
+      { slug: 'DATAFORSEO_SERP_TASK_POST', schema: { type: 'object', required: ['payload_json'], properties: { payload_json: { type: 'array' } } } },
+    ],
+  }));
+  try {
+    const selection = selectGoalCatalog('prepare my morning briefing with overdue tasks and top goals');
+    assert.deepEqual(selection.entries, [], 'zero-evidence candidates must not be minted as proven');
+    assert.ok(selection.gaps.includes('search'));
+    assert.ok(selection.gaps.includes('row_create'));
+  } finally {
+    installConnectedRegistryPort(null);
+  }
+});
+
+test('an objective naming the toolkit still selects it — the floor refuses guesses, not evidence', () => {
+  installConnectedRegistryPort(() => ({
+    connectedToolkits: ['googlesheets'],
+    tools: [
+      { slug: 'GOOGLESHEETS_SHEET_FROM_JSON', schema: { type: 'object', required: ['title', 'sheet_name', 'sheet_json'], properties: { title: { type: 'string' }, sheet_name: { type: 'string' }, sheet_json: { type: 'array' } } } },
+      { slug: 'GOOGLESHEETS_BATCH_GET', schema: { type: 'object', required: ['spreadsheet_id'], properties: { spreadsheet_id: { type: 'string' }, ranges: { type: 'array' } } } },
+    ],
+  }));
+  try {
+    const selection = selectGoalCatalog('collect this week\'s wins into a google sheet');
+    const create = selection.entries.find((entry) => entry.intent.startsWith('goal construct'));
+    assert.equal(create?.identifier, 'GOOGLESHEETS_SHEET_FROM_JSON', 'overlap with the objective is evidence — the floor must not abstain it');
   } finally {
     installConnectedRegistryPort(null);
   }

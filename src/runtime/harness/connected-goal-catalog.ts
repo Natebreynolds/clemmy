@@ -162,6 +162,13 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
   const createCandidates: Array<{ slug: string; rank: number; toolkit: string }> = [];
   for (const tool of view.tools) {
     const effect = readEffect(tool.slug);
+    // Zero-evidence floor: when no token of the slug connects to the objective
+    // and at least one names a different domain, fillability alone is a lexical
+    // guess — and a guess selected here is minted downstream as a "proven"
+    // authoritative entry. Abstaining routes to the existing gaps machinery;
+    // a slot with no evidenced candidate reports a gap rather than a winner.
+    const affinity = goalAffinity(tool.slug, objective);
+    if (affinity.overlap === 0 && affinity.foreign > 0) continue;
     if (effect === 'read') {
       // A goal-carrying search: the frozen required fields can be filled from
       // the objective alone (FIRECRAWL_SEARCH's `q` — not keywords-for-site,

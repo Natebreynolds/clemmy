@@ -22,7 +22,7 @@ import {
   type TurnSemanticModelResult,
 } from './turn-semantic-model-port.js';
 import type { TurnSemanticHostViewV1 } from './turn-semantic-proposal.js';
-import { shownGroundingDescriptors } from './turn-semantic-proposal.js';
+import { shownGroundingDescriptors, TurnSemanticProposalV1WireSchema } from './turn-semantic-proposal.js';
 import {
   bindPlanGroundingReceipt,
   catalogSnapshotDigestFromDescriptors,
@@ -1156,6 +1156,37 @@ async function interpretOnce(input: {
   const repairableGrounding = !admitted.ok && Boolean(validationIssue?.code);
   if (genuineConflict || unboundTypedWork || repairableGrounding) {
     repairAttempted = true;
+    // When a citation failed because NO disclosed capability carries the
+    // operation's requested effect, the repair must not re-cite from the same
+    // menu — every option is wrong by the same measurement. State the measured
+    // fact and the admissible expression instead. Deliberately no enumeration
+    // of near-miss refs or alternative effects: a hint listing them coaches
+    // the model to flip an effect until something validates, which launders a
+    // foreign operation through admission instead of repairing the proposal.
+    let hostNativeGuidance: { reason: string; require: string } | null = null;
+    if (!admitted.ok) {
+      const citationIssues = admitted.issues.filter(
+        (entry) => entry.code === 'capability_ref_effect_mismatch' || entry.code === 'unknown_capability_ref',
+      );
+      if (citationIssues.length > 0) {
+        const disclosedEffects = new Set(
+          (host.catalog.capabilities ?? []).map((descriptor) => descriptor.effect),
+        );
+        const wire = TurnSemanticProposalV1WireSchema.safeParse(modelResult.raw);
+        const operations = wire.success ? wire.data.work?.operations ?? [] : [];
+        const unsatisfiable = citationIssues.some((entry) => {
+          const match = /^work\.operations\.(\d+)\./.exec(entry.path);
+          const operation = match ? operations[Number(match[1])] : undefined;
+          return operation ? !disclosedEffects.has(operation.requestedEffect) : false;
+        });
+        if (unsatisfiable) {
+          hostNativeGuidance = {
+            reason: 'no_disclosed_capability_carries_requested_effect',
+            require: 'work the host itself performs declares requestedEffect host_only, none, or compute with a host-native capabilityRef naming the operation itself; do not re-cite a disclosed capability whose effect does not match the operation',
+          };
+        }
+      }
+    }
     try {
       const repaired = await input.port.interpret({
         purpose: TURN_SEMANTIC_CALL_PURPOSE,
@@ -1168,6 +1199,7 @@ async function interpretOnce(input: {
             }
           : {
               issues: admitted.ok ? [] : admitted.issues,
+              hostNative: hostNativeGuidance,
               judge: judgeRecord
                 ? {
                     verdict: judgeRecord.verdict,
