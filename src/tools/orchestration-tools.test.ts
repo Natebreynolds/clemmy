@@ -1556,6 +1556,7 @@ test('bindStepsToToolChoices: a usesSkill step is never re-bound (the skill owns
 
 import { mkdirSync as _mkdirSync, writeFileSync as _writeFileSync } from 'node:fs';
 const { renderWorkflowRunsOverview } = await import('./orchestration-tools.js');
+const { TURN_SCOPED_HOLD_STATUS } = await import('./workflow-turn-scoped-hold.js');
 
 function writeRunRecord(rec: Record<string, unknown>): void {
   _mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
@@ -2090,4 +2091,22 @@ test('workflow_run links one durable action to the shared conversation workstate
   actions = getFocusWorkstate(getActiveFocus())?.actions ?? [];
   assert.equal(actions.length, 1, 'rejoining a run updates its action rather than cloning it');
   assert.match(actions[0].note ?? '', /already-running workflow/i);
+});
+
+// ─── A held run is active, and says so in English ────────────────────────────
+//
+// `awaiting_chat_dispatch_seal` was absent from ACTIVE_RUN_STATUSES, so the run
+// the user had just asked for was filed under "recent" — or fell past the
+// five-row slice entirely — and printed as a bare enum. Measured 2026-08-25:
+// the model read this list during a poll loop and learned nothing from it.
+test('renderWorkflowRunsOverview shows a turn-held run as active, in English', () => {
+  resetState();
+  writeRunRecord({
+    id: 'r-held', workflow: 'weekly-review',
+    status: TURN_SCOPED_HOLD_STATUS, createdAt: new Date().toISOString(),
+  });
+  const out = renderWorkflowRunsOverview();
+  assert.match(out, /weekly-review/, 'the held run is listed at all');
+  assert.match(out, /starting when this turn ends/i, 'and reads as English');
+  assert.doesNotMatch(out, /awaiting_chat_dispatch_seal/, 'never a bare enum');
 });

@@ -44,6 +44,7 @@ const {
   workflowOriginSourceGroupId,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
 } = await import('./workflow-run-queue.js');
+const { describeTurnScopedHold } = await import('./workflow-turn-scoped-hold.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { ExecutionStore } = await import('../execution/store.js');
 const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
@@ -3055,4 +3056,41 @@ test('stale-version self-heal: auto-retest depth persists through the queue and 
   assert.equal(shouldAutoRetestStaleCreationTest({ pass: true, activationCompatible: false, blockedReason: deleted, depth: 0 }), false, 'deletion never retests');
   assert.equal(shouldAutoRetestStaleCreationTest({ pass: false, activationCompatible: false, blockedReason: drift, depth: 0 }), false, 'a failed test is a real failure, not a race');
   assert.equal(shouldAutoRetestStaleCreationTest({ pass: true, activationCompatible: true, blockedReason: '', depth: 0 }), false, 'a clean pass enables, never retests');
+});
+
+// ─── A status the model can read but cannot advance ──────────────────────────
+//
+// awaiting_chat_dispatch_seal resolves when the TURN ends — the seal closes the
+// complete set of workflow_run calls this one message made, so it cannot happen
+// while the model can still add to that set. It is the only status that moves
+// by the model STOPPING, and nothing said so. Measured 2026-08-25: fourteen
+// workflow_run_status reads over three and a half minutes, each returning this
+// status, until the turn ran out of steps.
+test('a prepared chat dispatch tells the model the hold ends when the turn does', () => {
+  const identity = {
+    sessionId: 'sess-chat-hold-copy',
+    sourceUserSeq: 77,
+    replyTarget: { type: 'origin_chat' as const },
+  };
+  const queued = queueWorkflowRun('audit-brief', { url: 'https://hold.example' }, {
+    originSessionId: identity.sessionId,
+    originObserver: identity,
+    prepareChatDispatch: durablePreparationCallback(),
+  });
+  assert.equal(queued.status, 'held');
+  // Assert the MESSAGE THE MODEL RECEIVES carries the explanation — asserting
+  // the helper alone would pass even if the carrier stopped calling it, which
+  // is exactly how the do-not-poll rule ended up on a branch this path never
+  // reaches.
+  assert.ok(
+    queued.message.includes(describeTurnScopedHold()),
+    `the prepared-dispatch message must carry the hold explanation; got: ${queued.message}`,
+  );
+  // The existing hedge is accurate and must survive.
+  assert.match(queued.message, /remains non-executable/i);
+  // The queued-lane sentence promises the run is already executing and will be
+  // delivered automatically. Neither is durable before the seal — a crash here
+  // leaves an orphan the next daemon boot CANCELS — so that claim must never be
+  // copied onto this path.
+  assert.doesNotMatch(queued.message, /running in the BACKGROUND/i);
 });

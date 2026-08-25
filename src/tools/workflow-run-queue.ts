@@ -89,6 +89,12 @@ import {
   type WorkflowRunOriginIdentity,
   type WorkflowRunOriginObserver,
 } from '../execution/workflow-origin-group.js';
+import {
+  TURN_SCOPED_HOLD_STATUS,
+  describeTurnScopedHold,
+} from './workflow-turn-scoped-hold.js';
+
+
 
 export {
   activateWorkflowOriginGroup,
@@ -2735,13 +2741,15 @@ function queueWorkflowRunUnlocked(
     message: catchupHold
       ? `Held missed schedule for "${name}" (run ${id}) — no workflow step will run until the user chooses Resume. They may also Skip it without performing any work.`
       : originObserver
-        ? `Prepared "${name}" (run ${id}) for this chat. It remains non-executable until the complete source dispatch group is durably sealed and activated.`
+        ? `Prepared "${name}" (run ${id}) for this chat. It remains non-executable until the complete source dispatch group is durably sealed and activated. `
+          + describeTurnScopedHold()
       : `Queued "${name}" (run ${id}) — it is now running in the BACKGROUND. `
         + `Tell the user it's running and that you'll report back here when it finishes; the outcome is delivered to this chat automatically on completion. `
         + `Do NOT wait, poll, or call workflow_run_status, and do NOT do the workflow's work yourself — you're free to take the user's next request right now. `
         + `(Only call workflow_run_status later if the user explicitly asks how it's going.)`,
   };
 }
+
 
 /**
  * Queue a dashboard/operator dry-run request. Dry-runs are deliberately fresh

@@ -69,7 +69,16 @@ import {
 } from '../execution/workflow-run-readiness.js';
 import type { WorkflowExecutionPlan } from '../dashboard/workflow-execution-plan.js';
 import { listFinalFailedItems } from '../execution/workflow-events.js';
-import { queueWorkflowRun, queueWorkflowCreationTest, requeueWorkflowFailedItemsFromRun } from './workflow-run-queue.js';
+import {
+  queueWorkflowRun,
+  queueWorkflowCreationTest,
+  requeueWorkflowFailedItemsFromRun,
+} from './workflow-run-queue.js';
+import {
+  TURN_SCOPED_HOLD_STATUS,
+  TURN_SCOPED_HOLD_LABEL,
+  describeTurnScopedHold,
+} from './workflow-turn-scoped-hold.js';
 import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
@@ -571,6 +580,10 @@ const ACTIVE_RUN_STATUSES = new Set([
   'parked',
   'blocked_capability',
   'blocked_mutation',
+  // A run held for the turn-end seal IS active — it is about to run, and it was
+  // the run the model had just started. Excluding it filed the one run the user
+  // was asking about under "recent", or hid it entirely past the five-row slice.
+  TURN_SCOPED_HOLD_STATUS,
 ]);
 
 function formatRunAge(iso?: string): string {
@@ -635,7 +648,11 @@ export function renderWorkflowRunsOverview(limit = 15): string {
   const fmt = (r: RunRow) => {
     const state = r.terminalOutcome
       ? `outcome ${workflowTerminalOutcomeLabel(r.terminalOutcome)}`
-      : r.status;
+      // Every other status reads as English; this one printed as a bare enum,
+      // which is what a status looks like when nobody has explained it.
+      : r.status === TURN_SCOPED_HOLD_STATUS
+        ? TURN_SCOPED_HOLD_LABEL
+        : r.status;
     return `- ${r.workflow} · ${state}${r.needsAttention ? ' · NEEDS ATTENTION' : ''} · run ${r.id}${r.createdAt ? ` · ${formatRunAge(r.createdAt)}` : ''}`;
   };
   const parts: string[] = [];
@@ -2277,6 +2294,12 @@ export function registerOrchestrationTools(server: McpServer): void {
                 `Provider dispatch was proven not to occur; completed work is preserved and this same run will retry after ${String(capabilityBlock?.retryAt ?? 'the dependency is restored')}.`,
               ].join(' ')
             : '';
+          // The one status whose resolution requires the model to STOP calling
+          // this tool, and the only one with no branch here — so it rendered as
+          // a bare enum and the model read it as "not ready yet, look again".
+          const heldLine = record.status === TURN_SCOPED_HOLD_STATUS
+            ? describeTurnScopedHold()
+            : '';
           const mutationLine = mutationNeedsAttention
             ? [
                 `Mutation review: step ${String(mutationBlock?.stepId ?? '?')}, tool ${String(mutationBlock?.tool ?? '?')}, fingerprint ${String(mutationBlock?.fingerprint ?? '').slice(0, 12) || '?'}.`,
@@ -2295,6 +2318,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           const lines = [
             `Run ${run_id}`,
             `Workflow: ${record.workflow ?? '(unknown)'}`,
+            heldLine,
             `Status: ${record.status ?? '(unknown)'}${record.needsAttention || capabilityNeedsAttention || mutationNeedsAttention ? ' · NEEDS ATTENTION' : ''}`,
             terminalOutcome ? `Outcome: ${workflowTerminalOutcomeLabel(terminalOutcome)}` : '',
             record.createdAt ? `Created: ${record.createdAt}` : '',
