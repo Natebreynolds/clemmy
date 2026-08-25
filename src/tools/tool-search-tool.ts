@@ -51,6 +51,11 @@ function candidateToolkitConnected(name: string, connected: Set<string>): boolea
 
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
+/** Bound on one live candidate source's search. Healthy provider searches
+ *  answer in ~1-2s; the local catalog needs no network at all. Generous 10s
+ *  keeps slow-but-alive sources contributing while a wedged one can no longer
+ *  hold a discovery READ for the carrier's whole call window. */
+export const CANDIDATE_SOURCE_SEARCH_DEADLINE_MS = 10_000;
 
 const DESCRIPTION = [
   'Search the full built-in tool catalog by intent and get the tools that match — names + one-line summaries for the top results, plus the complete JSON input schema for the closest few so you can call them right the first time.',
@@ -249,14 +254,31 @@ export function registerToolSearchTool(
       const sourceCandidates = exactNamedHit || exactKnownButDenied
         ? []
         : (await Promise.all((opts.candidateSources ?? []).map(async (source) => {
+            // A candidate source is advisory breadth, never load-bearing: the
+            // local catalog always answers. Live 2026-08-25 (platform-49): a
+            // provider-side search hung and held this READ for ten minutes —
+            // the carrier's whole call window — because the only bound was
+            // the transport timeout. A source that cannot answer inside the
+            // deadline contributes nothing, exactly like one that throws.
+            let deadline: ReturnType<typeof setTimeout> | undefined;
             try {
-              const candidates = await source.search({ query, limit: requestedLimit });
+              const candidates = await Promise.race([
+                source.search({ query, limit: requestedLimit }),
+                new Promise<never>((_, reject) => {
+                  deadline = setTimeout(
+                    () => reject(new Error('candidate source search deadline exceeded')),
+                    CANDIDATE_SOURCE_SEARCH_DEADLINE_MS,
+                  );
+                }),
+              ]);
               return candidates
                 .filter((candidate) => candidate.name.trim() && candidate.summary.trim())
                 .slice(0, requestedLimit)
                 .map((candidate) => ({ ...candidate, sourceKind: source.kind }));
             } catch {
               return [];
+            } finally {
+              if (deadline) clearTimeout(deadline);
             }
           }))).flat();
       const exactSourceHit = sourceCandidates.find((candidate) =>

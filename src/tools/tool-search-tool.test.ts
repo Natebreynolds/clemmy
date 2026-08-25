@@ -268,3 +268,33 @@ test('TIERED RANKING: her own workflow_schedule outranks a third-party scheduler
   assert.ok(foreign === -1 || own < foreign,
     'her own tool outranks the third-party scheduler (live 2026-08-19 session-fixture-tool-search)');
 });
+
+// ─── A wedged candidate source cannot hold a discovery read (live 2026-08-25) ─
+//
+// platform-49 run 1787649706964-0a8b20: a provider-side candidate search hung
+// and tool_search sat for the carrier's entire ten-minute call window — the
+// only bound was the transport timeout. A source that cannot answer inside
+// the per-source deadline contributes nothing, exactly like one that throws,
+// and the local catalog still answers.
+test('a never-resolving candidate source is dropped at the deadline and the search still answers', async () => {
+  const { registerToolSearchTool, CANDIDATE_SOURCE_SEARCH_DEADLINE_MS } = await import('./tool-search-tool.js');
+  assert.ok(CANDIDATE_SOURCE_SEARCH_DEADLINE_MS <= 15_000, 'the bound stays a discovery-read bound, not a work budget');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'deadline-pin', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [
+      { search: () => new Promise(() => { /* never resolves */ }) },
+      { search: async () => [{ name: 'LIVE_PROVIDER_SEARCH', summary: 'A healthy source answers.', score: 0.9 }] },
+    ],
+  } as never);
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+  const startedAt = Date.now();
+  const result = await handler({ query: 'review the channel and read the log sheet', limit: 8 });
+  const elapsedMs = Date.now() - startedAt;
+  assert.ok(
+    elapsedMs < CANDIDATE_SOURCE_SEARCH_DEADLINE_MS + 5_000,
+    `the read returns at the deadline, not the transport window (took ${elapsedMs}ms)`,
+  );
+  const body = JSON.parse(result.content[0].text) as { results: Array<{ name: string }> };
+  assert.ok(body.results.length > 0, 'the local catalog and healthy sources still answer');
+});
