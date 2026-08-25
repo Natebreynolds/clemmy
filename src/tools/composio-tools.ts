@@ -2550,6 +2550,35 @@ export async function resolveComposioDispatch(
   let owner = pinned;
   let identity: string | undefined;
 
+  // META-ACTIONS INHERIT THE INTERROGATED TOOLKIT'S OWNER (live 2026-08-25):
+  // COMPOSIO_SEARCH_TOOLS ran as the CONFIGURED user id and composio
+  // truthfully answered "apify has no active connection" — for that user —
+  // while the ACTIVE apify account this install owns belongs to another
+  // provider identity. Execution already resolves per-connection owners; a
+  // meta view interrogating a toolkit must ask as the same identity or its
+  // statuses describe the wrong user and the model chases a phantom
+  // reconnect. Runtime-discovered from the org inventory, never configured.
+  if (!owner && toolkit === 'composio') {
+    const rawArgs = args as Record<string, unknown>;
+    const interrogated = [rawArgs.toolkit, rawArgs.toolkit_slug, rawArgs.app, rawArgs.app_name,
+      ...(Array.isArray(rawArgs.toolkits) ? rawArgs.toolkits : [])]
+      .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+      .filter(Boolean);
+    if (interrogated.length > 0) {
+      const inventory = peekConnectedToolkits();
+      for (const slugName of interrogated) {
+        const row = inventory.find((c) => (c.slug ?? '').trim().toLowerCase() === slugName
+          && /active|enabled/i.test(c.status ?? '')
+          && Boolean(c.connectionId));
+        if (row?.connectionId) {
+          owner = row.connectionId;
+          notes.push(`[account-route] Interrogating ${slugName} as the identity that owns its active connection.`);
+          break;
+        }
+      }
+    }
+  }
+
   // "Remember this one by name": pin + alias → bind the name to the pinned
   // connection's stable identity (probing its profile once if the email isn't
   // known yet) so future calls resolve by name with no ask.

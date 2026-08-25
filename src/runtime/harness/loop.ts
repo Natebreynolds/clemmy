@@ -11872,17 +11872,33 @@ function handleRunError(
     bumpTurnNumber(sessionId, turn);
     return { sessionId, turn, status: 'killed' };
   }
-  if (err instanceof ToolCallsLimitExceeded) {
+  // Match the wrapped shape too: the SDK re-wraps a throw from inside a
+  // function tool ("Failed to run function tools: ToolCallsLimitExceeded"),
+  // and the bare instanceof missed it — a 48-call workflow step died as a
+  // hard run error instead of a checkpoint (live 2026-08-25, platform-49 on
+  // the unified loop). Same class-by-name-and-message treatment the
+  // MaxTurnsExceeded block below already documents.
+  const toolCallsLimitHit = err instanceof ToolCallsLimitExceeded
+    || (err instanceof Error && /ToolCallsLimitExceeded|tool calls per turn exceeded/i.test(err.message));
+  if (toolCallsLimitHit) {
     safeAppend({
       sessionId,
       turn,
       role: 'system',
       type: 'guardrail_tripped',
-      data: { kind: 'tool_calls_limit', limit: err.limit },
+      data: {
+        kind: 'tool_calls_limit',
+        ...(err instanceof ToolCallsLimitExceeded ? { limit: err.limit } : {}),
+      },
     });
     session.markStatus('failed');
     bumpTurnNumber(sessionId, turn);
-    return { sessionId, turn, status: 'limit_exceeded', error: err.message };
+    return {
+      sessionId,
+      turn,
+      status: 'limit_exceeded',
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
   // The OpenAI/Codex Agents Runner throws MaxTurnsExceededError when a turn hits
   // its maxTurns budget. That escaped to the generic terminal run_failed below —

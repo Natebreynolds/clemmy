@@ -4150,6 +4150,41 @@ async function runStepViaHarness(
       });
     }
 
+    // NEVER-RESTING on the workflow lane (live 2026-08-25, platform-49 on
+    // the unified loop): a 48-call step hit the per-turn tool ceiling and the
+    // run died hard, while every chat surface already auto-resumes a limit
+    // checkpoint. A ceiling is the harness reaching a checkpoint, not the
+    // work reaching an end: resume with the standard continue directive on
+    // the same session, bounded by the chat auto-continue cap, and only
+    // while the parked activation actually made progress.
+    {
+      const { chatAutoContinueDecision, chatAutoContinueCap, buildContinueInput } =
+        await import('../runtime/harness/continue-directive.js');
+      const { getHarnessBudgetSettings } = await import('../runtime/harness/budget-settings.js');
+      let continueAttempts = 0;
+      while (result.status === 'limit_exceeded') {
+        const decision = chatAutoContinueDecision({
+          autoContinueOnLimit: getHarnessBudgetSettings().autoContinueOnLimit,
+          attempts: continueAttempts,
+          cap: chatAutoContinueCap(),
+          stepsThisActivation: result.steps ?? 0,
+        });
+        if (!decision.resume) break;
+        continueAttempts += 1;
+        if (latchWorkflowRunCancellation(workflowRunId)) throw new WorkflowRunCancelledError();
+        result = await runWorkflowConversationImpl({
+          agent,
+          sessionId: realSessionId,
+          input: buildContinueInput(result.lastDecision?.summary),
+          runAttemptId: stepAttempt.attemptId,
+          mcpToolScope: workflowMcpToolScope,
+          ...(scopedMaxTurns !== undefined ? { maxTurns: scopedMaxTurns } : {}),
+          maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
+          maxRunTokens: 0,
+        });
+      }
+    }
+
     // Loop until terminal (completed / failed / awaiting_user_input).
     while (result.status === 'awaiting_approval') {
       hadApprovals = true;
