@@ -78,6 +78,7 @@ interface RawRunRecordLike {
   reportBack?: { outcome?: unknown } | null;
   capabilityBlock?: unknown;
   mutationBlock?: unknown;
+  reportBackAcknowledgedAt?: unknown;
   /** Live step progress stamped by the runner's shared event seam. */
   currentStepId?: unknown;
   stepsCompleted?: unknown;
@@ -147,6 +148,23 @@ function workflowTerminalForOutcome(
     case 'cancelled':
       return { status: 'cancelled', kind: 'cancelled', text: 'Run cancelled.', resumable: false };
     case 'blocked':
+      // A blocked run holds the needs-you surface only until its report-back
+      // is ACKNOWLEDGED — after that the user has been told and the run is
+      // history, not "current". Live 2026-08-25: a night of test runs left
+      // 33 acknowledged blocked runs pinned in Working Now, and the mobile
+      // pill greeted the owner with "37 current tasks".
+      if (text(raw.reportBackAcknowledgedAt)) {
+        // 'blocked' is deliberately NON-final in the surface layer (it holds
+        // the needs-you fold), so retiring an acknowledged block requires a
+        // final status; the kind keeps the truth and resumable stays true.
+        return {
+          status: 'failed',
+          kind: 'blocked_acknowledged',
+          text: text(raw.error)?.slice(0, 300) ?? 'Run blocked; the report-back was delivered.',
+          resumable: true,
+        };
+      }
+      return undefined;
     case undefined:
       return undefined;
   }

@@ -621,3 +621,33 @@ test('a record without step fields projects exactly as before', () => {
   assert.ok(entry);
   assert.equal(entry.activity, undefined, 'forward-only: old records gain nothing and lose nothing');
 });
+
+// ─── An acknowledged blocked run leaves Working Now (live 2026-08-25) ────────
+test('a blocked run with an acknowledged report-back projects a final terminal', async () => {
+  const { projectWorkflowRunActivity, shouldSurfaceInWorkingNow } = await import('./activity-projection.js');
+  const observedAt = '2026-08-25T14:00:00.000Z';
+  const base = {
+    id: 'run-ack-1', workflow: 'morning-briefing', status: 'blocked',
+    terminalOutcome: 'blocked', needsAttention: true,
+    createdAt: '2026-08-25T12:00:00.000Z', startedAt: '2026-08-25T12:00:01.000Z',
+    finishedAt: '2026-08-25T12:02:00.000Z',
+  };
+  const unacknowledged = projectWorkflowRunActivity(base as never, observedAt);
+  assert.ok(unacknowledged, 'projects');
+  assert.equal(
+    shouldSurfaceInWorkingNow(unacknowledged! as never, Date.parse(observedAt)),
+    true,
+    'an UNacknowledged block still holds the needs-you surface',
+  );
+  const acknowledged = projectWorkflowRunActivity(
+    { ...base, reportBackAcknowledgedAt: '2026-08-25T12:02:05.000Z' } as never,
+    observedAt,
+  );
+  assert.ok(acknowledged);
+  assert.equal(
+    shouldSurfaceInWorkingNow(acknowledged! as never, Date.parse(observedAt)),
+    false,
+    'an acknowledged block is history — 33 of these greeted the owner as "37 current tasks"',
+  );
+  assert.equal((acknowledged! as { terminal?: { kind?: string } }).terminal?.kind, 'blocked_acknowledged');
+});

@@ -81,7 +81,18 @@ export function RunningTasksSheet({
   }, [composerRef, entries, open, selected]);
 
   if (entries.length === 0) return null;
-  const total = data?.entries.length ?? entries.length;
+  // "37 current tasks" (live 2026-08-25) counted every needs-attention
+  // remnant as current work. The pill says what is true: how many are
+  // actually RUNNING and how many are waiting on the user — two different
+  // invitations.
+  const all = data?.entries ?? entries;
+  const needsYou = all.filter((entry) => entry.needsAttention
+    || entry.lifecycle === 'blocked' || entry.lifecycle === 'awaiting_input').length;
+  const running = all.length - needsYou;
+  const pillLabel = [
+    running > 0 ? `${running} running` : null,
+    needsYou > 0 ? `${needsYou} need${needsYou === 1 ? 's' : ''} you` : null,
+  ].filter(Boolean).join(' · ') || `${all.length} current ${all.length === 1 ? 'task' : 'tasks'}`;
 
   return (
     <div class="running-tasks-affordance">
@@ -94,7 +105,7 @@ export function RunningTasksSheet({
         onClick={() => { haptic('light'); setOpen(true); }}
       >
         <span class="running-tasks-spark" aria-hidden="true">✳</span>
-        {total} current {total === 1 ? 'task' : 'tasks'}
+        {pillLabel}
       </button>
 
       {open ? (
@@ -106,7 +117,7 @@ export function RunningTasksSheet({
               <h2 id="running-tasks-title">Background tasks</h2>
               <span aria-hidden="true" />
             </header>
-            <div class="running-tasks-filter">Current · {total}</div>
+            <div class="running-tasks-filter">{pillLabel}</div>
             <div class="running-tasks-list">
               {entries.map((entry) => {
                 const expandable = hasExpandableTaskFacts(entry);
@@ -154,8 +165,8 @@ export function RunningTasksSheet({
                   </article>
                 );
               })}
-              {total > entries.length ? (
-                <p class="running-tasks-more">+{total - entries.length} more</p>
+              {all.length > entries.length ? (
+                <p class="running-tasks-more">+{all.length - entries.length} more</p>
               ) : null}
             </div>
           </section>
