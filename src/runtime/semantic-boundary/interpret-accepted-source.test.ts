@@ -1137,3 +1137,64 @@ test('admittedProposalClaimsNoTypedWork: zero-op admitted shapes claim nothing t
   const { admittedProposalClaimsNoTypedWork } = await import('./interpret-accepted-source.js');
   assert.equal(typeof admittedProposalClaimsNoTypedWork, 'function');
 });
+
+test('a topology-consistency failure earns the act-directly hint', async () => {
+  resetEventLog();
+  const sessionId = 'sess-topology-hint';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'produce the morning briefing',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const hints: string[] = [];
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret(call) {
+        if (call.repairHint) hints.push(call.repairHint);
+        const proposal = fakeSemanticProposal('newConstruct', call.host);
+        // The live shape: a fabricated topology whose coverage disagrees with
+        // its cardinality — an internal inconsistency in needless structure.
+        proposal.work = {
+          ...proposal.work!,
+          topology: {
+            version: 1,
+            operations: [{
+              id: proposal.work!.operations[0]!.id,
+              effect: 'read',
+              coverage: 'complete_set',
+              dependsOn: [],
+              dataFrom: [],
+              cardinality: { kind: 'per_item', universeId: 'u-missing' },
+            }],
+            universes: [],
+          } as never,
+        };
+        return { raw: proposal, modelIdentity: 'topology-hint-brain', inputTokens: 10, outputTokens: 5, latencyMs: 1 };
+      },
+      async judgeSourceEffect(call) {
+        return {
+          verdict: 'entailed', effect: call.proposedEffect,
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'topology-hint-judge', inputTokens: 1, outputTokens: 1, latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        return entailedPlanGroundingJudge(call, 'topology-hint-grounding');
+      },
+    },
+    turn: 1,
+  });
+  assert.equal(result.status, 'blocked', 'the same broken structure twice stays blocked');
+  assert.equal(hints.length, 1);
+  const hint = JSON.parse(hints[0]!) as { hostNative?: { reason?: string; require?: string } | null };
+  assert.equal(hint.hostNative?.reason, 'structured_work_shape_failed');
+  assert.ok(hint.hostNative?.require?.includes('NO operations'), 'the act-directly expression is named');
+});

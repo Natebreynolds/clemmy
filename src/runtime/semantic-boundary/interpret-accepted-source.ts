@@ -1186,6 +1186,22 @@ async function interpretOnce(input: {
             require: HOST_NATIVE_REQUIRE,
           };
         }
+      } else if (admitted.issues.some((entry) => (
+        entry.code === 'dag_kind_mismatch'
+        || entry.code === 'dag_kind_metadata_missing'
+        || entry.code === 'illegal_relation_payload'
+        || (typeof entry.path === 'string' && entry.path.startsWith('work.topology'))
+      ))) {
+        // Structured work failed its own internal consistency (live
+        // 2026-08-25, GPT lane: a fabricated topology for a host-native
+        // briefing died on coverage-vs-cardinality — twice, because the
+        // repair rebuilt the same needless structure). The hint names the
+        // act-directly alternative: structure is only owed when the task
+        // genuinely claims typed external work.
+        hostNativeGuidance = {
+          reason: 'structured_work_shape_failed',
+          require: 'structured work and topology are only required when the task claims typed external operations; a host-native task may declare its goal with requestedEffect host_only, none, or compute and NO operations or topology — the tool loop executes it directly',
+        };
       } else if (admitted.issues.some((entry) => entry.code === 'capability_grounding_conflict')) {
         // The grounding judge measured that the cited capability does not
         // serve the operation (live: an Apify queue-lock endpoint cited for
