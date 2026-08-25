@@ -137,8 +137,23 @@ function slugTokens(text: string): string[] {
  * objective never mentions (`builds`, `contact`) are penalized. Generic
  * structure words score nothing either way. No provider names live here.
  */
+// The objective is tokenized once per selection pass, not once per tool: a
+// selection scans the whole contract store and calls goalAffinity per slug, so
+// re-tokenizing a long objective every call multiplies a constant cost by the
+// store size (measured live: 10KB objective x ~2,000 contracts = 2.35s of the
+// admission stage; 114ms with the objective tokenized once).
+let cachedObjectiveTokensFor: string | null = null;
+let cachedObjectiveTokens: string[] = [];
+function objectiveAffinityTokens(objective: string): string[] {
+  if (cachedObjectiveTokensFor !== objective) {
+    cachedObjectiveTokensFor = objective;
+    cachedObjectiveTokens = slugTokens(objective).filter((token) => token.length >= 4);
+  }
+  return cachedObjectiveTokens;
+}
+
 function goalAffinity(slug: string, objective: string): { overlap: number; foreign: number } {
-  const objectiveTokens = slugTokens(objective).filter((token) => token.length >= 4);
+  const objectiveTokens = objectiveAffinityTokens(objective);
   let overlap = 0;
   let foreign = 0;
   for (const token of new Set(slugTokens(slug))) {

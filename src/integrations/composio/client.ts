@@ -1004,8 +1004,22 @@ async function loadConnectedAccountItems(): Promise<Array<Record<string, unknown
   } catch { /* fall through to the SDK listing (no owner ids, but functional) */ }
   const composio = getComposio();
   if (!composio) return [];
-  const resp = await (composio as any).connectedAccounts.list({ limit: 100 });
-  return Array.isArray(resp) ? resp : (resp?.items ?? []);
+  // The SDK listing accepts no abort signal, so bound it the same way the raw
+  // path above is bounded — an unbounded fallback here held the admission
+  // stage for the full capability-resolution deadline (live 2026-08-25:
+  // 27% of workflow turns blew the 90s deadline inside this call chain).
+  // A timeout serves the last-good registry view instead of gating the turn.
+  let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const resp = await Promise.race([
+      (composio as any).connectedAccounts.list({ limit: 100 }),
+      new Promise<null>((resolve) => { fallbackTimer = setTimeout(() => resolve(null), 15_000); }),
+    ]);
+    if (resp === null) return [];
+    return Array.isArray(resp) ? resp : (resp?.items ?? []);
+  } finally {
+    if (fallbackTimer) clearTimeout(fallbackTimer);
+  }
 }
 
 /** Dispatch entity for a resolved/pinned connection: the userId that OWNS it

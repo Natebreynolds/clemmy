@@ -57,6 +57,7 @@ import {
 } from '../graph/turn-graph-shadow.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import {
+  markAdmissionCapabilityResolutionSuperseded,
   provenCapabilityEntriesForTurn,
   resolveTurnCapabilities,
 } from '../harness/capability-resolution.js';
@@ -969,6 +970,19 @@ export async function prepareDurableAcceptedTurnCompile(
   const session = getSession(input.identity.sessionId);
   if (!session) return { ok: false, reason: 'session is missing' };
 
+  // OWNER DECISION 2026-08-25 ("option B"), finished: execution surfaces do
+  // not enter the pre-model semantic ceremony — and must not PAY for it
+  // either. The identical refusal below at the port check discarded this
+  // stage's entire product for every non-chat session AFTER the capability
+  // resolution had spent up to its full deadline (live: 27% of workflow
+  // turns blew the 90s deadline in that race; the disclosed catalog was 97%
+  // local-index regardless). Decline before the cost, not after. In-loop
+  // typed planning arrives WITH a primary proposal and keeps full admission.
+  if (!primaryModelProposal && session.kind !== 'chat') {
+    recordSemanticDispositionOutcome(input.identity.sessionId, input.identity.sourceUserSeq, 'unavailable');
+    return { ok: false, reason: 'semantic port is unavailable' };
+  }
+
   // PARTICIPATION IS STAMPED WHERE A PORT ACTUALLY TAKES THE TURN, not here.
   // `recordSemanticParticipation` is a monotonic ratchet — it upgrades
   // unparticipated→participated and never downgrades — so stamping before the
@@ -1035,6 +1049,14 @@ export async function prepareDurableAcceptedTurnCompile(
     if (raced === expired) {
       capabilityResolutionOutcome = 'capability_resolution_deadline_exceeded';
       indexDescriptors = hostDescriptorsFromCapabilityIndex(durableText);
+      // The turn proceeds on the index-only catalog; the abandoned leg must
+      // not land its authoritative resolution for this source later (observed
+      // live +64s after disclosure — a stale-authority write for a decision
+      // already made without it).
+      markAdmissionCapabilityResolutionSuperseded(
+        input.identity.sessionId,
+        input.identity.sourceUserSeq,
+      );
       void resolutionPhase.catch(() => { /* abandoned leg; its catches already absorb */ });
     } else {
       indexDescriptors = raced;

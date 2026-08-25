@@ -99,6 +99,24 @@ export const _bindResolutionInputForTest = bindResolutionInput;
  * authoritativeForTask hold, so host-bind is never starved on turn one of a
  * fresh session (live 2026-08-19 session-fixture-catalog-starvation).
  */
+// Sources whose turn already started on the index-only catalog after the
+// resolution deadline expired. The abandoned resolution leg keeps running
+// (the fetch has no abort seam) and would otherwise land its AUTHORITATIVE
+// write for a source that decided without it — observed live +64s after
+// disclosure. First writer wins: the deadline outcome supersedes the leg.
+const supersededResolutionSources = new Set<string>();
+
+export function markAdmissionCapabilityResolutionSuperseded(
+  sessionId: string,
+  sourceUserSeq: number,
+): void {
+  supersededResolutionSources.add(`${sessionId}#${sourceUserSeq}`);
+  if (supersededResolutionSources.size > 512) {
+    const oldest = supersededResolutionSources.values().next().value;
+    if (oldest !== undefined) supersededResolutionSources.delete(oldest);
+  }
+}
+
 export function recordAdmissionCapabilityResolution(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -106,6 +124,7 @@ export function recordAdmissionCapabilityResolution(input: {
   entries: CapabilityResolutionEntry[];
 }): void {
   if (input.entries.length === 0) return;
+  if (supersededResolutionSources.has(`${input.sessionId}#${input.sourceUserSeq}`)) return;
   const resolution = bindResolutionInput(
     { entries: input.entries, registryAvailable: true },
     input.acceptedInput,
