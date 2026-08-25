@@ -2035,3 +2035,19 @@ input, textarea { font: inherit; }
 .ws-none-yet { font-size: var(--t-sm); color: var(--fg-2); margin: 0 2px var(--sp-2); }
 .ws-empty-group { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-2); }
 .ws-card-empty { opacity: 0.72; }
+
+/* A live card that can open its detail: the tap target inherits the card's
+   layout instead of looking like a button — the card IS the affordance. */
+.card-open-target {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}

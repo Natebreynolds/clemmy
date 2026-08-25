@@ -21,7 +21,8 @@ import {
   type ReminderItem,
   type RunSummary,
   type WorkspaceDestinationChooser,
-  isActiveRunStatus,
+  listWorkingNow,
+  type ActivityEntry,
 } from '../lib/api';
 import { greetingName, timeGreeting } from '../lib/greeting';
 import { Decisions, relativeTime } from '../components/Approvals';
@@ -29,6 +30,7 @@ import { PushPrompt } from '../components/PushPrompt';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
 import { RunControl } from '../components/RunControl';
+import { mobileRunControl } from '../lib/running-tasks';
 import { useScreenData } from '../lib/use-screen-data';
 
 const POLL_MS = 5000;
@@ -46,6 +48,7 @@ interface HomeData {
   reminders: ReminderItem[];
   runs: RunSummary[];
   sessions: ChatSession[];
+  working: ActivityEntry[];
 }
 
 export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
@@ -53,17 +56,18 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
   // Every section degrades on its own: one failing endpoint must not blank
   // the whole home screen, and a section that failed THIS round keeps its
   // last good rows. Only when everything fails does the screen say so.
-  const lastGood = useRef<HomeData>({ approvals: [], plans: [], workspaceChoosers: [], reminders: [], runs: [], sessions: [] });
+  const lastGood = useRef<HomeData>({ approvals: [], plans: [], workspaceChoosers: [], reminders: [], runs: [], sessions: [], working: [] });
   const loadHome = useCallback(async (): Promise<HomeData> => {
-    const [a, p, w, r, runsResult, chats] = await Promise.all([
+    const [a, p, w, r, runsResult, chats, workingNow] = await Promise.all([
       listApprovals().then((v) => ({ v }), (e) => ({ e })),
       listPlanProposals().then((v) => ({ v }), (e) => ({ e })),
       listWorkspaceDestinationChoosers().then((v) => ({ v }), (e) => ({ e })),
       getReminders().then((v) => ({ v }), (e) => ({ e })),
       listRecentRuns(8).then((v) => ({ v }), (e) => ({ e })),
       listChatSessions().then((v) => ({ v }), (e) => ({ e })),
+      listWorkingNow().then((v) => ({ v }), (e) => ({ e })),
     ]);
-    const allFailed = [a, p, w, r, runsResult, chats].every((res) => 'e' in res);
+    const allFailed = [a, p, w, r, runsResult, chats, workingNow].every((res) => 'e' in res);
     if (allFailed) throw (a as { e: unknown }).e;
     const merged: HomeData = {
       approvals: 'v' in a ? a.v.approvals.filter((row) => row.status === 'pending') : lastGood.current.approvals,
@@ -72,17 +76,22 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
       reminders: 'v' in r ? r.v.items : lastGood.current.reminders,
       runs: 'v' in runsResult ? runsResult.v.runs : lastGood.current.runs,
       sessions: 'v' in chats ? chats.v.sessions : lastGood.current.sessions,
+      working: 'v' in workingNow ? workingNow.v.entries : lastGood.current.working,
     };
     lastGood.current = merged;
     return merged;
   }, []);
   const { data, loading, error, offline, refresh } = useScreenData(loadHome, { intervalMs: POLL_MS });
-  const { approvals, plans, workspaceChoosers, reminders, runs, sessions } = data ?? lastGood.current;
+  const { approvals, plans, workspaceChoosers, reminders, sessions, working } = data ?? lastGood.current;
 
   const decisionCount = approvals.length + plans.length + workspaceChoosers.length;
   useEffect(() => { onDecisionCount(decisionCount); }, [decisionCount, onDecisionCount]);
 
-  const working = runs.filter((run) => isActiveRunStatus(run.status));
+  // The canonical server-owned working-now projection — the SAME one the
+  // running-tasks sheet and the desktop drawer read. Home used to filter the
+  // chat-run summaries instead, mobile's two-truths drift: a workflow
+  // dispatched from chat showed in the sheet but not here, and this screen's
+  // Stop buttons targeted the run-cancel route that 409s for chat-lane rows.
   const recentChats = sessions.slice(0, 3);
   const greeting = timeGreeting(new Date().getHours(), greetingName(name));
 
@@ -141,16 +150,23 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
         <section class="home-section">
           <h2 class="section-head">Working on it</h2>
           <div class="stack">
-            {working.map((run, i) => (
-              <article key={run.id} class="card card-live rise" style={{ '--i': i }}>
-                <span class="pulse-dot" aria-hidden="true" />
-                <div class="min-w-0">
-                  <div class="card-title-sm">{run.title || 'Working…'}</div>
-                  <div class="card-when">{run.status.replace(/_/g, ' ')} · {relativeTime(run.updatedAt)}</div>
-                </div>
-                <RunControl target={{ kind: 'run', runId: run.id }} onChanged={refresh} />
-              </article>
-            ))}
+            {working.map((entry, i) => {
+              const control = mobileRunControl(entry);
+              return (
+                <article key={entry.runKey} class="card card-live rise" style={{ '--i': i }}>
+                  <span class="pulse-dot" aria-hidden="true" />
+                  <div class="min-w-0">
+                    <div class="card-title-sm">{entry.headline || 'Working…'}</div>
+                    <div class="card-when">
+                      {entry.activity?.text || entry.lifecycle.replace(/_/g, ' ')} · {relativeTime(entry.startedAt)}
+                    </div>
+                  </div>
+                  {control ? (
+                    <RunControl target={control.target} resumable={control.resumable} onChanged={refresh} />
+                  ) : null}
+                </article>
+              );
+            })}
           </div>
         </section>
       ) : null}

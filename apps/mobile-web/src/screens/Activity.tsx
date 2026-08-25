@@ -1,5 +1,6 @@
 import { useState } from 'preact/hooks';
-import { isActiveRunStatus, listRecentRuns, type RunSummary } from '../lib/api';
+import { isActiveRunStatus, listRecentRuns, listWorkingNow, type ActivityEntry, type RunSummary } from '../lib/api';
+import { mobileRunControl } from '../lib/running-tasks';
 import { relativeTime } from '../components/Approvals';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
@@ -8,11 +9,26 @@ import { Run } from './Run';
 
 export function Activity() {
   const [openRun, setOpenRun] = useState<string | null>(null);
+  // "Happening now" reads the canonical server-owned working-now projection —
+  // the same one the running-tasks sheet and desktop read — so a workflow
+  // dispatched from chat appears here and its Stop targets the right route.
+  // "Earlier" stays on the run history, which is where terminal rows live.
   const { data, loading, error, offline, refresh } = useScreenData(
-    () => listRecentRuns(),
+    async () => {
+      const [runsResult, workingNow] = await Promise.all([
+        listRecentRuns().then((v) => ({ v }), (e) => ({ e })),
+        listWorkingNow().then((v) => ({ v }), (e) => ({ e })),
+      ]);
+      if ('e' in runsResult && 'e' in workingNow) throw (runsResult as { e: unknown }).e;
+      return {
+        runs: 'v' in runsResult ? runsResult.v.runs : [],
+        working: 'v' in workingNow ? workingNow.v.entries : [],
+      };
+    },
     { intervalMs: 8000, disabled: openRun !== null },
   );
   const runs = data?.runs ?? [];
+  const working = data?.working ?? [];
 
   if (openRun) {
     return <Run sessionId={openRun} onBack={() => { setOpenRun(null); void refresh(); }} />;
@@ -36,17 +52,18 @@ export function Activity() {
     );
   }
 
-  const live = runs.filter((run) => isActiveRunStatus(run.status));
   const done = runs.filter((run) => !isActiveRunStatus(run.status));
 
   return (
     <div class="home">
       {notice}
-      {live.length > 0 ? (
+      {working.length > 0 ? (
         <section class="home-section">
           <h2 class="section-head">Happening now</h2>
           <div class="stack">
-            {live.map((run, i) => <RunCard key={run.id} run={run} index={i} live onChanged={() => void refresh()} onOpen={setOpenRun} />)}
+            {working.map((entry, i) => (
+              <LiveCard key={entry.runKey} entry={entry} index={i} onChanged={() => void refresh()} onOpen={setOpenRun} />
+            ))}
           </div>
         </section>
       ) : null}
@@ -59,6 +76,37 @@ export function Activity() {
         </section>
       ) : null}
     </div>
+  );
+}
+
+
+function LiveCard({ entry, index, onChanged, onOpen }: {
+  entry: ActivityEntry;
+  index: number;
+  onChanged: () => void;
+  onOpen: (sessionId: string) => void;
+}) {
+  const control = mobileRunControl(entry);
+  const body = (
+    <>
+      <span class="pulse-dot" aria-hidden="true" />
+      <div class="min-w-0">
+        <div class="card-title-sm">{entry.headline || 'Working…'}</div>
+        <div class="card-when">
+          {entry.activity?.text || entry.lifecycle.replace(/_/g, ' ')} · {relativeTime(entry.startedAt)}
+        </div>
+      </div>
+    </>
+  );
+  return (
+    <article class="card card-live rise" style={{ '--i': index }}>
+      {entry.sessionId ? (
+        <button type="button" class="card-open-target" onClick={() => onOpen(entry.sessionId as string)}>
+          {body}
+        </button>
+      ) : body}
+      {control ? <RunControl target={control.target} resumable={control.resumable} onChanged={onChanged} /> : null}
+    </article>
   );
 }
 
