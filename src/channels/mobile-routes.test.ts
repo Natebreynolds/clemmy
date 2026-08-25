@@ -47,6 +47,8 @@ const {
   openEventLog,
   recordRunAttemptUserInput,
   resetEventLog,
+  getActiveRunAttempt,
+  isKillRequested,
 } = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { registerResumableApprovalCardAtomically } = await import('../runtime/harness/approval-card.js');
@@ -2790,4 +2792,57 @@ test('a retired token WITHOUT a device proof still revokes the whole chain', asy
       'an unprovable retired token must still take the chain down',
     );
   } finally { await h.close(); }
+});
+
+// ─── The phone can stop a LIVE chat turn ─────────────────────────────────────
+//
+// Before this route the phone could not stop a turn at all: the engine's
+// stop() is stream-detach only, so the screen went quiet while the backend
+// kept burning model calls, tool calls, and external writes. Same
+// exact-attempt primitive as the desktop command center, byte-identical stale
+// semantics: attemptId required (400), stale attempt refused (409), and only
+// the currently-active attempt latches + clears its own approvals.
+test('mobile chat cancel requires the exact live attempt and stops it', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Stop phone');
+    const session = createHarnessSession({ id: 'sess-mobile-chat-stop', kind: 'chat' });
+    const attempt = beginRunAttempt(session.id, { runId: 'run-mobile-stop' });
+    recordRunAttemptUserInput(attempt, {
+      turn: 1, role: 'user', data: { text: 'long job' },
+    }, { armRunInFlight: true });
+
+    const post = (body: unknown) => fetch(
+      `${h.url}/m/api/chat/sessions/${encodeURIComponent(session.id)}/cancel`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify(body),
+      },
+    );
+
+    // Missing attemptId → 400, nothing latched.
+    const missing = await post({});
+    assert.equal(missing.status, 400);
+    assert.equal(((await missing.json()) as { code?: string }).code, 'RUN_ATTEMPT_REQUIRED');
+
+    // Stale attemptId → 409, and the live attempt survives.
+    const stale = await post({ attemptId: 'attempt:not-current' });
+    assert.equal(stale.status, 409);
+    assert.equal(((await stale.json()) as { code?: string }).code, 'STALE_RUN_ATTEMPT');
+    assert.equal(getActiveRunAttempt(session.id)?.attemptId, attempt.attemptId);
+
+    // The exact live attempt → 200 and the durable kill latch names it.
+    const ok = await post({ attemptId: attempt.attemptId });
+    assert.equal(ok.status, 200);
+    const body = (await ok.json()) as { ok: boolean; attemptId: string };
+    assert.equal(body.ok, true);
+    assert.equal(body.attemptId, attempt.attemptId);
+    assert.ok(
+      isKillRequested(session.id, { attemptId: attempt.attemptId, sourceUserSeq: 0 }),
+      'the kill latch is durable and exact',
+    );
+  } finally {
+    await h.close();
+  }
 });

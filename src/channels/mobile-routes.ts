@@ -3564,6 +3564,65 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   });
 
   /**
+   * Stop the LIVE chat turn for a session — the same exact-attempt primitive
+   * the desktop command center uses, byte-identical semantics.
+   *
+   * Before this route existed the phone could not stop a turn at all: the
+   * engine's stop() is stream-detach only, so the screen went quiet while the
+   * backend kept burning model calls, tool calls, and external writes. attemptId
+   * is REQUIRED and checked against the session's currently-active attempt, so
+   * a stale tap can never widen into a session-wide kill (409 STALE_RUN_ATTEMPT,
+   * exactly as on desktop).
+   */
+  router.post('/api/chat/sessions/:sessionId/cancel', requireMobileSession, async (req, res) => {
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? req.body as Record<string, unknown>
+      : {};
+    const requestedAttemptId = typeof body.attemptId === 'string' ? body.attemptId.trim() : '';
+    if (!requestedAttemptId) {
+      res.status(400).json({ error: 'attemptId is required; refresh the run before stopping it', code: 'RUN_ATTEMPT_REQUIRED' });
+      return;
+    }
+    try {
+      const { getActiveRunAttempt } = await import('../runtime/harness/eventlog.js');
+      const { stopExactHarnessAttempt } = await import('../runtime/harness/stop-exact-attempt.js');
+      const activeAttempt = getActiveRunAttempt(sessionId);
+      if (!activeAttempt || activeAttempt.attemptId !== requestedAttemptId) {
+        res.status(409).json({
+          error: activeAttempt
+            ? 'the requested run attempt is stale; refresh before stopping'
+            : 'the requested run attempt is already terminal',
+          code: 'STALE_RUN_ATTEMPT',
+          sessionId,
+          requestedAttemptId,
+          currentAttemptId: activeAttempt?.attemptId ?? null,
+        });
+        return;
+      }
+      const stopped = stopExactHarnessAttempt(
+        sessionId,
+        activeAttempt,
+        'cancelled from the phone',
+        'mobile',
+      );
+      // Do not append conversation_completed here: the executor observes the
+      // durable kill latch and wins appendTerminalEventOnce for its attempt
+      // (same rule as the desktop route — a second terminal key made one Stop
+      // look like two completed runs).
+      res.json({
+        ok: true,
+        sessionId,
+        attemptId: activeAttempt.attemptId,
+        cancelledApprovals: stopped.cancelledApprovals,
+        cancelledTasks: stopped.cancelledTasks,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Stop a tracked run (a chat turn or background job surfaced on Activity).
    * Delegates to the same helper the desktop dashboard uses.
    */

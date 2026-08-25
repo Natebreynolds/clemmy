@@ -402,6 +402,7 @@ import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/pl
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { HarnessSession } from '../runtime/harness/session.js';
+import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.js';
 import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
 import { getSlackRuntimeStatus } from '../channels/slack.js';
@@ -3537,57 +3538,6 @@ function requestRunControlIdentityValue(req: Request, key: 'attemptId' | 'runSco
   const distinct = [...new Set(values)];
   if (distinct.length > 1) throw new Error(`conflicting ${key} values`);
   return distinct[0] ?? null;
-}
-
-/** Apply Stop to one durable attempt. Approval rows predate attempt ids, so
- * only the session's currently-active attempt may clear its time-bounded
- * approvals/interrupt state; the kill latch itself is always exact. */
-function stopExactHarnessAttempt(
-  sessionId: string,
-  attempt: RunAttemptRef,
-  reason: string,
-  resolver: string,
-): { cancelledApprovals: number; cancelledTasks: number } {
-  requestHarnessKill(sessionId, reason, {
-    attemptId: attempt.attemptId,
-    runId: attempt.runId,
-  });
-  const current = getActiveHarnessRunAttempt(sessionId);
-  if (!current || current.attemptId !== attempt.attemptId) return { cancelledApprovals: 0, cancelledTasks: 0 };
-
-  const pending = approvalRegistry.listPending({ sessionId, status: 'pending' })
-    .filter((row) => row.requestedAt >= attempt.startedAt);
-  let cancelledApprovals = 0;
-  for (const row of pending) {
-    if (approvalRegistry.resolve(
-      row.approvalId,
-      'cancelled_by_user',
-      resolver,
-    ).ok) cancelledApprovals += 1;
-  }
-  if (cancelledApprovals > 0) {
-    try {
-      HarnessSession.load(sessionId)?.clearInterruptState({ emitEvent: false });
-    } catch { /* the durable kill and approval resolutions remain authoritative */ }
-  }
-  // Cascade (restored in the fold after the workflow recovery review): any still-active
-  // background task this session spawned (or that runs AS this session) dies
-  // with the stop. Without this the task row kept polling "Working now" on Home
-  // after the user explicitly stopped the chat that owned it (live 2026-07-08
-  // zombie banner), and its external writes kept landing.
-  let cancelledTasks = 0;
-  try {
-    for (const task of listBackgroundTasks()) {
-      const t = task as { id: string; status: string; sessionId?: string; originSessionId?: string; runSessionId?: string };
-      const linked = t.sessionId === sessionId || t.originSessionId === sessionId || t.runSessionId === sessionId;
-      const active = t.status === 'pending' || t.status === 'running' || t.status === 'awaiting_approval';
-      if (linked && active) {
-        cancelBackgroundTask(t.id, 'Cancelled with its chat session from the desktop command center.');
-        cancelledTasks += 1;
-      }
-    }
-  } catch { /* best effort — the stale-runner sweeper still interrupts them later */ }
-  return { cancelledApprovals, cancelledTasks };
 }
 
 export function registerConsoleRoutes(

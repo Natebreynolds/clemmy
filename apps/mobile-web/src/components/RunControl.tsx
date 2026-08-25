@@ -12,11 +12,12 @@
  * their desk.
  */
 import { useState } from 'preact/hooks';
-import { cancelRun, cancelWorkflowRun, controlTask, isOfflineError } from '../lib/api';
+import { cancelChatTurn, cancelRun, cancelWorkflowRun, controlTask, isOfflineError } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
 
 type Target =
   | { kind: 'run'; runId: string }
+  | { kind: 'chat'; sessionId: string; attemptId: string }
   | { kind: 'workflow'; workflow: string; runId: string }
   | { kind: 'task'; taskId: string };
 
@@ -39,6 +40,7 @@ export function RunControl({ target, resumable, onChanged }: Props) {
     try {
       if (target.kind === 'workflow') await cancelWorkflowRun(target.workflow, target.runId);
       else if (target.kind === 'run') await cancelRun(target.runId);
+      else if (target.kind === 'chat') await cancelChatTurn(target.sessionId, target.attemptId);
       else await controlTask(target.taskId, 'cancel');
       haptic('success');
       setConfirming(false);

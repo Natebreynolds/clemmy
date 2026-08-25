@@ -2,6 +2,7 @@ import type { ActivityEntry } from './api';
 
 export type MobileRunControlTarget =
   | { kind: 'run'; runId: string }
+  | { kind: 'chat'; sessionId: string; attemptId: string }
   | { kind: 'workflow'; workflow: string; runId: string }
   | { kind: 'task'; taskId: string };
 
@@ -93,6 +94,17 @@ export function mobileRunControl(entry: ActivityEntry): {
   // The foreground DTO has no terminal field. Still fail closed if a stale or
   // malformed server ever sends one across the structural JSON boundary.
   if ((entry as unknown as { terminal?: unknown }).terminal) return null;
+  // A live chat turn is stoppable from the phone via the same exact-attempt
+  // primitive the desktop uses. Requires BOTH identities: the kill latch names
+  // the attempt, and the route stale-checks it, so this can never widen a
+  // stale row into a session-wide kill. Before this mapping the phone had no
+  // way to stop a turn at all — engine stop() only detached the stream.
+  if (entry.kind === 'chat' && entry.sessionId && entry.attemptId && STOPPABLE_LIFECYCLES.has(entry.lifecycle)) {
+    return {
+      target: { kind: 'chat', sessionId: entry.sessionId, attemptId: entry.attemptId },
+      resumable: false,
+    };
+  }
   if (entry.kind === 'background' && entry.taskId) {
     if (entry.lifecycle === 'paused_budget') {
       return { target: { kind: 'task', taskId: entry.taskId }, resumable: true };

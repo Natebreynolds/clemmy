@@ -24,7 +24,10 @@ const MAX_VISIBLE_TASKS = 12;
 export function RunningTasksSheet({
   composerRef,
 }: {
-  composerRef: { current: HTMLTextAreaElement | null };
+  /** Optional: only the Chat screen has a composer to return focus to. The
+   *  sheet is mounted in the app shell so running work is visible on EVERY
+   *  tab, and on non-chat tabs focus falls back to the document body. */
+  composerRef?: { current: HTMLTextAreaElement | null };
 }) {
   const { data, refresh } = useScreenData(listWorkingNow, { intervalMs: POLL_MS });
   const entries = (data?.entries ?? []).slice(0, MAX_VISIBLE_TASKS);
@@ -70,7 +73,7 @@ export function RunningTasksSheet({
   useEffect(() => {
     if (entries.length === 0 && open) {
       setOpen(false);
-      window.requestAnimationFrame(() => composerRef.current?.focus());
+      window.requestAnimationFrame(() => composerRef?.current?.focus());
     }
     if (selected && !entries.some((entry) => (
       entry.runKey === selected && hasExpandableTaskFacts(entry)

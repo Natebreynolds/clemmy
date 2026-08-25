@@ -935,6 +935,17 @@ export async function cancelRun(runId: string): Promise<{ ok: boolean; message: 
   return api<{ ok: boolean; message: string }>(`/m/api/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
 }
 
+/** Stop the LIVE chat turn for a session — the exact-attempt primitive the
+ *  desktop uses. attemptId is required and stale-checked server-side, so a
+ *  stale tap can never widen into a session-wide kill. */
+export async function cancelChatTurn(sessionId: string, attemptId: string): Promise<{ ok: boolean }> {
+  return api<{ ok: boolean }>(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/cancel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ attemptId }),
+  });
+}
+
 export async function controlTask(taskId: string, action: 'cancel' | 'resume'): Promise<{ ok: true; status: string }> {
   return api<{ ok: true; status: string }>(`/m/api/tasks/${encodeURIComponent(taskId)}/${action}`, { method: 'POST' });
 }

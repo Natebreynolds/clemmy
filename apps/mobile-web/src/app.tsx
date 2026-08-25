@@ -20,6 +20,7 @@ import { Chats } from './screens/Chats';
 import { Memory } from './screens/Memory';
 import { Workflows } from './screens/Workflows';
 import { Workspaces } from './screens/Workspaces';
+import { RunningTasksSheet } from './components/RunningTasksSheet';
 
 type Tab = 'home' | 'chats' | 'spaces' | 'workflows' | 'memory' | 'activity';
 
@@ -229,6 +230,12 @@ export function App() {
             : <Activity />}
         </ScreenBoundary>
       </main>
+
+      {/* Running work is app-level state, not chat state: a workflow started
+          from chat keeps running when the user switches tabs, and this was the
+          only surface showing live timers + Stop — mounted inside Chat, so
+          every other tab went blind. One mount, every tab. */}
+      <RunningTasksSheet />
 
       <nav class="dock" aria-label="Sections">
         {TABS.map((t) => (
