@@ -1134,16 +1134,26 @@ async function interpretOnce(input: {
       || admitted.clamped.route === 'retrieve'
       || admitted.clamped.route === 'act'
     );
-  const repairableGrounding = !admitted.ok && Boolean(validationIssue?.code) && (
-    validationIssue?.code === 'capability_not_grounded'
-    || validationIssue?.code === 'capability_grounding_failed'
-    || validationIssue?.code === 'capability_grounding_unavailable'
-    || validationIssue?.code === 'grounding_verdict_inconsistent'
-    || validationIssue?.code === 'unknown_capability_ref'
-    || validationIssue?.code === 'missing_capability_ref'
-    || validationIssue?.code === 'capability_catalog_empty'
-    || validationIssue?.code === 'grounding_coverage_mismatch'
-  );
+  // A VALIDATION FAILURE IS REPAIRABLE BY DEFINITION.
+  //
+  // This was an allowlist of eight blessed codes, and it did not match what
+  // actually fails. Measured on the production home: of 14 real planner
+  // validation failures, 10 carried codes absent from that list —
+  // dag_kind_mismatch, capability_grounding_conflict (the list named
+  // capability_grounding_FAILED), illegal_relation_payload, write_not_aligned,
+  // effect_exceeds_ceiling, capability_ref_effect_mismatch. Every one of those
+  // ended its run with "I could not finish planning that, so I stopped before
+  // using any tools. You can restate it." — addressed to the USER, for a
+  // structural mistake the MODEL had just been told about in precise terms and
+  // was never shown. Six different scheduled workflows died this way.
+  //
+  // The validator's own output is the repair hint: it names the exact path and
+  // the exact problem, and it is already threaded into the repair prompt below.
+  // Whether the model can act on that does not depend on which code it is, so
+  // the code no longer decides. The attempt stays bounded to ONE by
+  // repairAttempted; an unrepairable proposal costs one model call, where the
+  // alternative cost a dead run and a human restating it.
+  const repairableGrounding = !admitted.ok && Boolean(validationIssue?.code);
   if (genuineConflict || unboundTypedWork || repairableGrounding) {
     repairAttempted = true;
     try {
@@ -1420,6 +1430,13 @@ export function blockedPresentationForSemanticRecord(
   }
   if (!record || record.validationOutcome === 'model_failed') {
     return 'I could not finish planning that, so I stopped before using any tools. You can restate it.';
+  }
+  // "Restate it" is aimed at the user, but a validation failure is the PLAN
+  // failing its own structural check — the request was understood, and
+  // rewording it changes nothing. Say which of the two it was, so a scheduled
+  // run that nobody rephrased does not read as the owner's fault.
+  if (record.repairAttempted) {
+    return 'I built a plan for that twice and it did not pass my own structural check either time, so I stopped before using any tools. This is not your wording — the plan itself was inconsistent.';
   }
   return 'I could not finish planning that, so I stopped before using any tools. You can restate or continue.';
 }

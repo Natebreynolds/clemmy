@@ -851,3 +851,81 @@ function judgeDigest(
     proposalDigest: judgeResult.proposalDigest,
   }));
 }
+
+// ─── Any validation failure earns its one repair ─────────────────────────────
+//
+// The repair condition used to be an allowlist of eight blessed codes, and it
+// did not match what actually fails. Measured on the production home: of 14
+// planner validation failures, 10 carried codes the list did not name —
+// dag_kind_mismatch, capability_grounding_conflict (the list said
+// capability_grounding_FAILED), illegal_relation_payload, write_not_aligned,
+// effect_exceeds_ceiling, capability_ref_effect_mismatch. Each ended its run
+// with "I could not finish planning that… you can restate it", addressed to the
+// USER, for a structural mistake the MODEL had just been told about precisely
+// and was never shown. Six scheduled workflows died this way.
+test('a structurally invalid proposal is repaired once, whatever the issue code', async () => {
+  resetEventLog();
+  const sessionId = 'sess-repair-any-code';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'find five widgets and put them in a workbook',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  let interprets = 0;
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret(call) {
+        interprets += 1;
+        const raw = fakeSemanticProposal('newConstruct', call.host);
+        // A structural violation that is NOT a grounding/capability code: name
+        // a relation payload the schema does not permit. The old allowlist had
+        // no entry for this shape, so the run died instead of being repaired.
+        if (interprets === 1) {
+          return {
+            raw: { ...raw, work: { ...raw.work, relations: [{ bogus: true }] } as never },
+            modelIdentity: 'any-code-brain',
+            inputTokens: 10,
+            outputTokens: 4,
+            latencyMs: 1,
+          };
+        }
+        return {
+          raw,
+          modelIdentity: 'any-code-brain',
+          inputTokens: 10,
+          outputTokens: 4,
+          latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        return entailedPlanGroundingJudge(call, 'any-code-grounding');
+      },
+      async judgeSourceEffect(call) {
+        return {
+          verdict: 'entailed',
+          effect: 'local_write',
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'any-code-judge',
+          inputTokens: 6,
+          outputTokens: 2,
+          latencyMs: 1,
+        };
+      },
+    },
+    turn: 1,
+  });
+  assert.equal(
+    result.record.repairAttempted,
+    true,
+    'the model must get its one correction regardless of which code the validator produced',
+  );
+  assert.equal(interprets, 2, 'exactly one repair, still bounded');
+});
