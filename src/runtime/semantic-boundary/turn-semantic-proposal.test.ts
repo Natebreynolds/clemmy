@@ -822,3 +822,49 @@ test('the wire schema accepts what the full schema refines away', async () => {
   const garbage = TurnSemanticProposalV1WireSchema.safeParse({ version: 1, junk: true });
   assert.equal(garbage.success, false);
 });
+
+// ─── The wire split must not weaken admission, one level down ────────────────
+//
+// After the first wire split, weekly-review STILL died model_failed on
+// "coverage and cardinality describe different read sets" — the topology field
+// itself carried ActionWorkTopologySchema's superRefine, one level below the
+// work schema. The wire now uses the structural base; admission parses the
+// REFINED topology schema, so every topology check (including the
+// inline-members cap, which admission's own superRefine never re-listed) is
+// enforced there, and future checks added to the topology refinement are
+// inherited automatically.
+test('a topology refinement failure passes the wire and fails admission', async () => {
+  const { TurnSemanticProposalV1Schema, TurnSemanticProposalV1WireSchema } = await import('./turn-semantic-proposal.js');
+  const proposal = {
+    version: 1,
+    relation: 'new_goal',
+    targetGoal: null,
+    goal: null,
+    work: {
+      construct: 'single_act',
+      cardinality: null,
+      requestedEffect: 'read',
+      destination: null,
+      destinations: [],
+      topology: {
+        version: 1,
+        operations: [
+          // dependsOn names an operation that does not exist — a DAG check that
+          // lives in validateWorkTopology, reachable only via the refinement.
+          { id: 'op_a', effect: 'read', coverage: null, dependsOn: ['op_missing'], dataFrom: [], cardinality: { kind: 'once' } },
+        ],
+        universes: [],
+      },
+      topologyHash: null,
+      operations: [],
+      deliverables: [],
+      evidenceRequirements: [],
+    },
+    slotAnswers: [],
+    rationale: 'topology wire/admission split fixture',
+  };
+  const wire = TurnSemanticProposalV1WireSchema.safeParse(proposal);
+  assert.equal(wire.success, true, 'the wire must not throw on a topology refinement');
+  const full = TurnSemanticProposalV1Schema.safeParse(proposal);
+  assert.equal(full.success, false, 'admission still refuses the same topology');
+});

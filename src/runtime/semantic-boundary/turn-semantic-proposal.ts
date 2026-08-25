@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import {
   ActionWorkTopologySchema,
+  ActionWorkTopologyBaseSchema,
   validateWorkTopology,
   workTopologyDigest,
 } from '../graph/work-topology.js';
@@ -167,7 +168,14 @@ const proposedSemanticWorkV1BaseSchema = z.object({
   requestedEffect: requestedEffectSchema,
   /** The one provider-neutral operation topology. Capability bindings below
    * annotate these ids; they do not restate cardinality, coverage, or lineage. */
-  topology: ActionWorkTopologySchema.nullish(),
+  // The BASE (wire) shape carries the topology's structural schema only; its
+  // cross-field refinements fire at admission via validateWorkTopology in the
+  // refined schema's superRefine. Carrying the refined topology here re-threw
+  // the exact class at the transport (live 2026-08-25: weekly-review
+  // assess_goals, "coverage and cardinality describe different read sets"
+  // still labelled model_failed AFTER the first wire split — the refinement
+  // lived one level deeper than the work schema).
+  topology: ActionWorkTopologyBaseSchema.nullish(),
   /** Content digest when topology is present. Admission recomputes it; the
    * model cannot grant authority by supplying a matching string. */
   topologyHash: z.string().regex(/^[a-f0-9]{64}$/).nullish(),
@@ -193,6 +201,24 @@ export const ProposedSemanticWorkV1Schema = proposedSemanticWorkV1BaseSchema.sup
     }
   }
   if (work.topology) {
+    // ADMISSION owns the topology's full contract. The base field above is the
+    // structural wire shape only, so every ActionWorkTopologySchema refinement
+    // (DAG/cross-field checks AND the inline-members cap — and anything added
+    // to it later) must be enforced here, by parsing against the refined
+    // schema itself rather than re-listing its checks. Re-listing is how the
+    // inline-members cap would have silently dropped out of admission when the
+    // wire split moved the field to the base shape.
+    const refinedTopology = ActionWorkTopologySchema.safeParse(work.topology);
+    if (!refinedTopology.success) {
+      for (const issue of refinedTopology.error.issues) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['topology', ...issue.path],
+          message: issue.message,
+        });
+      }
+      return;
+    }
     // The digest is HOST-computed and grants no authority (see the field's own
     // doc comment). Demanding it from the model gated every topology-bearing
     // proposal on a sha256 the model cannot produce: live 2026-08-24 the

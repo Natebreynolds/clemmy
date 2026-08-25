@@ -127,9 +127,15 @@ export const WorkTopologySchema = z.object({
   universes: z.array(WorkTopologyUniverseSchema).max(WORK_TOPOLOGY_MAX_UNIVERSES),
 }).strict();
 
-export const ActionWorkTopologySchema = WorkTopologySchema.extend({
+/** Structural shape only — the wire variant. The cross-field/DAG refinements
+ *  live on ActionWorkTopologySchema below; a transport that carried them made
+ *  every topology mistake THROW inside runner.run as `model_failed`, bypassing
+ *  the repair gate that the identical check at admission feeds. */
+export const ActionWorkTopologyBaseSchema = WorkTopologySchema.extend({
   operations: z.array(WorkTopologyOperationSchema).min(1).max(WORK_TOPOLOGY_MAX_OPERATIONS),
-}).strict().superRefine((topology, ctx) => {
+}).strict();
+
+export const ActionWorkTopologySchema = ActionWorkTopologyBaseSchema.superRefine((topology, ctx) => {
   const validated = validateWorkTopology(topology);
   if (!validated.ok) {
     ctx.addIssue({
