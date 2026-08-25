@@ -3129,372 +3129,8 @@ test('normal harness route marker always names provider + transport for untagged
   });
 });
 
-test('generic Claude send parks the SDK boundary; rejected rerun fails instead of re-parking', async () => {
-  resetEventLog();
-  resetHarnessRuntimeConfig();
-  const stateDir = path.join(tmp, 'state');
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(
-    path.join(stateDir, 'auth.json'),
-    JSON.stringify({ codexOauth: { accessToken: 'codex-workflow-park-token', refreshToken: 'refresh' } }),
-    'utf-8',
-  );
-  writeFileSync(
-    path.join(stateDir, 'claude-auth.json'),
-    JSON.stringify({
-      accessToken: 'sk-ant-oat01-workflow-park-token',
-      refreshToken: 'refresh-token',
-      expiresAt: Date.now() + 60 * 60 * 1000,
-    }),
-    'utf-8',
-  );
 
-  const prev = {
-    AUTH_MODE: process.env.AUTH_MODE,
-    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
-    WORKFLOW_APPROVAL_PARKING: process.env.WORKFLOW_APPROVAL_PARKING,
-    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
-    CLEMMY_CLAUDE_WORKFLOW_FULL_LANE: process.env.CLEMMY_CLAUDE_WORKFLOW_FULL_LANE,
-  };
-  const step = {
-    id: 'generic_send',
-    prompt: 'Choose the correct provider action and send the exact message.',
-    model: 'claude-sonnet-4-6',
-    sideEffect: 'send' as const,
-    requiresApproval: true,
-    allowedTools: ['composio_execute_tool'],
-  };
-  const ctx = {
-    workflow: {
-      name: 'Claude Generic Send Park',
-      description: 'test',
-      enabled: true,
-      trigger: { manual: true },
-      allowedTools: ['composio_execute_tool'],
-      steps: [step],
-    },
-    workflowSlug: 'claude-generic-send-park',
-    runId: 'wf-sdk-park-1',
-    inputs: {},
-    stepOutputs: {},
-    assistant: { respond: async () => { throw new Error('legacy assistant should not run'); } },
-    completedItems: new Map(),
-    forEachFailures: [],
-    qualityAdvisories: [],
-  } as unknown as Parameters<typeof executeStep>[1];
-  let approvalId = '';
-  let capturedMode: unknown;
 
-  try {
-    process.env.AUTH_MODE = 'codex_oauth';
-    process.env.WORKFLOW_USE_HARNESS = 'on';
-    process.env.WORKFLOW_APPROVAL_PARKING = 'on';
-    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'on';
-    process.env.CLEMMY_CLAUDE_WORKFLOW_FULL_LANE = 'on';
-    setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
-      capturedMode = options.approvalMode;
-      const sessionId = options.sessionId as string;
-      const prior = approvalRegistry.claimResumableApproval('runner-park-exact-1');
-      const row = prior.state === 'none'
-        ? approvalRegistry.registerResumable({
-            sessionId,
-            subject: 'Run GMAIL_SEND_EMAIL?',
-            tool: 'composio_execute_tool',
-            args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com', body: 'exact' } },
-            resumeKey: 'runner-park-exact-1',
-          }).row
-        : prior.row;
-      approvalId = row.approvalId;
-      throw new ClaudeAgentSdkApprovalBoundaryError({
-        approvalId,
-        sessionId,
-        tool: 'composio_execute_tool',
-        args: row.args ?? {},
-        state: prior.state === 'rejected' ? 'rejected' : 'pending',
-      });
-    });
-
-    await assert.rejects(
-      () => executeStep(step, ctx),
-      (err: unknown) => {
-        assert.ok(err instanceof ParkRunSignal);
-        assert.deepEqual(err.parkedSteps, [{
-          stepId: step.id,
-          kind: 'sdk',
-          approvalIds: [approvalId],
-          sessionId: 'workflow:wf-sdk-park-1:generic_send',
-        }]);
-        return true;
-      },
-    );
-    assert.equal(capturedMode, 'park');
-    assert.notEqual(
-      HarnessSession.load('workflow:wf-sdk-park-1:generic_send')?.sessionRow.status,
-      'failed',
-      'a pending control boundary is parked, not marked as a failed SDK session',
-    );
-
-    approvalRegistry.resolve(approvalId, 'rejected', 'unit-test-human');
-    await assert.rejects(
-      () => executeStep(step, ctx),
-      (err: unknown) => {
-        assert.ok(err instanceof ClaudeAgentSdkApprovalBoundaryError);
-        assert.equal(err.boundary.state, 'rejected');
-        assert.equal(err.boundary.approvalId, approvalId);
-        return true;
-      },
-    );
-    assert.equal(
-      HarnessSession.load('workflow:wf-sdk-park-1:generic_send')?.sessionRow.status,
-      'failed',
-      'a rejected exact decision fails loudly and is never re-parked',
-    );
-
-    const fanStep = {
-      ...step,
-      id: 'generic_send_each',
-      forEach: 'pull',
-    };
-    const fanCtx = {
-      ...ctx,
-      workflow: { ...ctx.workflow, steps: [fanStep] },
-      workflowSlug: 'claude-generic-send-foreach-park',
-      runId: 'wf-sdk-park-each-1',
-      stepOutputs: { pull: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] },
-      completedItems: new Map(),
-      forEachFailures: [],
-      qualityAdvisories: [],
-    } as unknown as Parameters<typeof executeStep>[1];
-    let fanCalls = 0;
-    setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
-      fanCalls += 1;
-      const sessionId = options.sessionId as string;
-      const row = approvalRegistry.registerResumable({
-        sessionId,
-        subject: 'Run exact item send?',
-        tool: 'composio_execute_tool',
-        args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { item: sessionId } },
-        resumeKey: `runner-foreach:${sessionId}`,
-      }).row;
-      throw new ClaudeAgentSdkApprovalBoundaryError({
-        approvalId: row.approvalId,
-        sessionId,
-        tool: 'composio_execute_tool',
-        args: row.args ?? {},
-        state: 'pending',
-      });
-    });
-    await assert.rejects(
-      () => executeStep(fanStep, fanCtx),
-      (err: unknown) => {
-        assert.ok(err instanceof ParkRunSignal);
-        assert.equal(err.parkedSteps.length, 1);
-        assert.equal(err.parkedSteps[0].stepId, fanStep.id);
-        return true;
-      },
-    );
-    assert.equal(fanCalls, 1, 'generic send fan-out stops assigning items after the first concrete card');
-    assert.equal(
-      approvalRegistry.listPending({ status: 'pending' })
-        .filter((row) => row.sessionId.startsWith('workflow:wf-sdk-park-each-1:generic_send_each:')).length,
-      1,
-      'only one exact item approval is live at a time',
-    );
-  } finally {
-    setClaudeAgentSdkWorkflowStepRunForTest(null);
-    resetHarnessRuntimeConfig();
-    for (const [key, value] of Object.entries(prev)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-});
-
-test('workflow Claude-routed read-only step uses Claude Agent SDK and returns structured output', async () => {
-  resetEventLog();
-  resetHarnessRuntimeConfig();
-  const stateDir = path.join(tmp, 'state');
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(
-    path.join(stateDir, 'auth.json'),
-    JSON.stringify({ codexOauth: { accessToken: 'codex-workflow-test-token', refreshToken: 'refresh' } }),
-    'utf-8',
-  );
-  writeFileSync(
-    path.join(stateDir, 'claude-auth.json'),
-    JSON.stringify({
-      accessToken: 'sk-ant-oat01-workflow-step-test-token',
-      refreshToken: 'refresh-token',
-      expiresAt: Date.now() + 60 * 60 * 1000,
-    }),
-    'utf-8',
-  );
-
-  const prev: Record<string, string | undefined> = {
-    AUTH_MODE: process.env.AUTH_MODE,
-    CLEMMY_MODEL_ROLES_REGISTRY: process.env.CLEMMY_MODEL_ROLES_REGISTRY,
-    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
-    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
-    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
-    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
-  };
-  let captured: any;
-  try {
-    process.env.AUTH_MODE = 'codex_oauth';
-    process.env.CLEMMY_MODEL_ROLES_REGISTRY = 'on';
-    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
-    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'on';
-    delete process.env.WORKFLOW_USE_HARNESS;
-    process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
-      { role: 'worker', modelId: 'claude-sonnet-4-6', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
-    ]);
-    setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
-      captured = options;
-      return {
-        text: '{"status":"completed","output":{"report":"CLAUDE_WORKFLOW_STEP_OK"}}',
-        structuredOutput: { status: 'completed', output: { report: 'CLAUDE_WORKFLOW_STEP_OK' } },
-        sessionId: 'sdk-workflow-step-session',
-        model: 'claude-sonnet-4-6',
-        toolUses: ['mcp__clementine-local__skill_read'],
-        usage: { input_tokens: 1, output_tokens: 1 },
-      };
-    });
-
-    const step = {
-      id: 'design_report',
-      prompt: 'Design the report section using the installed test-skill.',
-      intent: 'design',
-      usesSkill: 'test-skill',
-      sideEffect: 'read' as const,
-      output: { type: 'object' as const, required_keys: ['report'], non_empty: ['report'] },
-    };
-    const ctx = {
-      workflow: { name: 'Claude Workflow Step Smoke', description: 'test', enabled: true, steps: [step], trigger: { manual: true } },
-      workflowSlug: 'claude-workflow-step-smoke',
-      runId: 'wf-sdk-1',
-      inputs: {},
-      stepOutputs: {},
-      assistant: { respond: async () => { throw new Error('legacy assistant should not be called'); } },
-      completedItems: new Map(),
-      forEachFailures: [],
-      qualityAdvisories: [],
-    } as unknown as Parameters<typeof executeStep>[1];
-
-    const output = await executeStep(step, ctx);
-    assert.deepEqual(output, { report: 'CLAUDE_WORKFLOW_STEP_OK' });
-    assert.equal(captured.modelId, 'claude-sonnet-4-6');
-    assert.equal(captured.sessionId, 'workflow:wf-sdk-1:design_report', 'read-only SDK steps remain attached to their killable child session');
-    assert.equal(Number.isSafeInteger(captured.sourceUserSeq), true, 'SDK step receives the exact accepted source event');
-    assert.equal(await captured.shouldCancel(), false);
-    assert.ok(captured.prompt.includes('Test Skill Instructions'));
-    assert.ok(captured.allowedLocalMcpTools.includes('skill_read'));
-    assert.deepEqual(captured.outputSchema.required, ['status', 'output']);
-
-    const routed = listEvents('workflow:wf-sdk-1:design_report', { types: ['worker_model_routed'] });
-    assert.equal(routed.length, 1);
-    const data = routed[0].data as Record<string, unknown>;
-    assert.equal(data.seam, 'workflow');
-    assert.equal(data.modelId, 'claude-sonnet-4-6');
-    assert.equal(data.transport, 'claude_agent_sdk_workflow_step');
-    assert.deepEqual(data.toolUses, ['mcp__clementine-local__skill_read']);
-    assert.deepEqual(data.modelRoute, {
-      routeKind: 'claude_agent_sdk_workflow_step',
-      requestedModel: 'claude-sonnet-4-6',
-      effectiveModel: 'claude-sonnet-4-6',
-      provider: 'claude',
-      transport: 'claude_agent_sdk_workflow_step',
-    });
-    assert.equal(
-      HarnessSession.load('workflow:wf-sdk-1:design_report')?.sessionRow.status,
-      'completed',
-      'Claude SDK workflow-step lane closes the harness step session',
-    );
-    const settledAttempt = getLatestRunAttempt('workflow:wf-sdk-1:design_report');
-    assert.equal(settledAttempt?.sourceUserSeq, captured.sourceUserSeq);
-    assert.equal(settledAttempt?.status, 'completed');
-    assert.equal(isKillRequested('workflow:wf-sdk-1:design_report', settledAttempt ?? undefined), false);
-    const completed = readWorkflowEvents('claude-workflow-step-smoke', 'wf-sdk-1')
-      .filter((event) => event.kind === 'step_completed' && event.stepId === 'design_report');
-    assert.equal(completed.length, 1);
-    assert.deepEqual(completed[0].meta?.modelRoute, data.modelRoute);
-  } finally {
-    setClaudeAgentSdkWorkflowStepRunForTest(null);
-    resetHarnessRuntimeConfig();
-    for (const [key, value] of Object.entries(prev)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-});
-
-test('Tasks-board stop reaches the exact active Claude workflow step attempt', async () => {
-  resetEventLog();
-  resetHarnessRuntimeConfig();
-  const prev = {
-    AUTH_MODE: process.env.AUTH_MODE,
-    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
-    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
-  };
-  const runId = `wf-sdk-board-cancel-${Date.now()}`;
-  const sessionId = `workflow:${runId}:long_read`;
-  let entered!: (options: { shouldCancel?: () => boolean | Promise<boolean> }) => void;
-  const enteredPromise = new Promise<{ shouldCancel?: () => boolean | Promise<boolean> }>((resolve) => { entered = resolve; });
-  try {
-    process.env.AUTH_MODE = 'codex_oauth';
-    process.env.WORKFLOW_USE_HARNESS = 'on';
-    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'on';
-    runEvents.startRun({
-      id: runId,
-      sessionId: `workflow:${runId}`,
-      source: 'workflow',
-      title: 'Cancelable SDK step',
-      message: 'Run a long read step.',
-    });
-    setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
-      entered(options);
-      while (!(await options.shouldCancel?.())) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
-      throw new AgentRuntimeCancelledError('Run cancelled by caller.');
-    });
-    const step = {
-      id: 'long_read',
-      prompt: 'Read and summarize a large source.',
-      model: 'claude-sonnet-4-6',
-      sideEffect: 'read' as const,
-    };
-    const ctx = {
-      workflow: { name: 'Board Cancel SDK', description: 'test', enabled: true, steps: [step], trigger: { manual: true } },
-      workflowSlug: 'board-cancel-sdk',
-      runId,
-      inputs: {},
-      stepOutputs: {},
-      assistant: { respond: async () => { throw new Error('legacy assistant should not run'); } },
-      completedItems: new Map(),
-      forEachFailures: [],
-      qualityAdvisories: [],
-    } as unknown as Parameters<typeof executeStep>[1];
-
-    const running = executeStep(step, ctx);
-    const controls = await enteredPromise;
-    assert.equal(typeof controls.shouldCancel, 'function');
-    const active = getLatestRunAttempt(sessionId);
-    assert.equal(active?.status, 'active');
-    runEvents.finishRun(runId, { status: 'cancelled', message: 'Cancelled from the Tasks board.' });
-    await assert.rejects(running, /Workflow run cancelled by user/);
-
-    const settled = getLatestRunAttempt(sessionId);
-    assert.equal(settled?.status, 'cancelled');
-    assert.equal(isKillRequested(sessionId, settled ?? undefined), false, 'terminal owner consumes only its exact latch');
-  } finally {
-    setClaudeAgentSdkWorkflowStepRunForTest(null);
-    resetHarnessRuntimeConfig();
-    for (const [key, value] of Object.entries(prev)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-});
 
 test('Tasks-board stop releases a standard workflow step waiting in-place on approval', async () => {
   resetEventLog();
@@ -3726,80 +3362,6 @@ test('standard workflow approval resume retains the exact step attempt identity'
   }
 });
 
-test('workflow Claude-routed step marks its harness session failed when the SDK throws', async () => {
-  resetEventLog();
-  resetHarnessRuntimeConfig();
-  const stateDir = path.join(tmp, 'state');
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(
-    path.join(stateDir, 'auth.json'),
-    JSON.stringify({ codexOauth: { accessToken: 'codex-workflow-test-token', refreshToken: 'refresh' } }),
-    'utf-8',
-  );
-  writeFileSync(
-    path.join(stateDir, 'claude-auth.json'),
-    JSON.stringify({
-      accessToken: 'sk-ant-oat01-workflow-step-test-token',
-      refreshToken: 'refresh-token',
-      expiresAt: Date.now() + 60 * 60 * 1000,
-    }),
-    'utf-8',
-  );
-
-  const prev: Record<string, string | undefined> = {
-    AUTH_MODE: process.env.AUTH_MODE,
-    CLEMMY_MODEL_ROLES_REGISTRY: process.env.CLEMMY_MODEL_ROLES_REGISTRY,
-    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
-    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
-    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
-    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
-  };
-  try {
-    process.env.AUTH_MODE = 'codex_oauth';
-    process.env.CLEMMY_MODEL_ROLES_REGISTRY = 'on';
-    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
-    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'on';
-    delete process.env.WORKFLOW_USE_HARNESS;
-    process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
-      { role: 'worker', modelId: 'claude-sonnet-4-6', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
-    ]);
-    setClaudeAgentSdkWorkflowStepRunForTest(async () => {
-      throw new Error('permanent sdk failure');
-    });
-
-    const step = {
-      id: 'design_fail',
-      prompt: 'Design the report section.',
-      intent: 'design',
-      sideEffect: 'read' as const,
-    };
-    const ctx = {
-      workflow: { name: 'Claude Workflow Step Failure', description: 'test', enabled: true, steps: [step], trigger: { manual: true } },
-      workflowSlug: 'claude-workflow-step-failure',
-      runId: 'wf-sdk-fail',
-      inputs: {},
-      stepOutputs: {},
-      assistant: { respond: async () => { throw new Error('legacy assistant should not be called'); } },
-      completedItems: new Map(),
-      forEachFailures: [],
-      qualityAdvisories: [],
-    } as unknown as Parameters<typeof executeStep>[1];
-
-    await assert.rejects(() => executeStep(step, ctx), /permanent sdk failure/);
-    assert.equal(
-      HarnessSession.load('workflow:wf-sdk-fail:design_fail')?.sessionRow.status,
-      'failed',
-      'thrown SDK workflow step closes the harness step session as failed',
-    );
-  } finally {
-    setClaudeAgentSdkWorkflowStepRunForTest(null);
-    resetHarnessRuntimeConfig();
-    for (const [key, value] of Object.entries(prev)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-});
 
 test('workflow harness sessions are deterministic per run step', () => {
   resetEventLog();
@@ -7258,76 +6820,63 @@ test('learned workflow read pins are advisory only before the ordinary harness i
 // host-local tools sailed past the wall: four refusals, zero external reads,
 // an honest but empty blocked report. The lane-scoped persist restores the
 // authority; the collision cannot recur here because this lane never admits.
-test('the Claude-SDK workflow lane persists its turn graph before the step model runs', async () => {
-  const stateDir = path.join(tmp, 'state');
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(
-    path.join(stateDir, 'claude-auth.json'),
-    JSON.stringify({
-      accessToken: 'sk-ant-oat01-graph-arm-token',
-      refreshToken: 'refresh-token',
-      expiresAt: Date.now() + 60 * 60 * 1000,
-    }),
-    'utf-8',
-  );
+// ─── The Claude Agent SDK workflow-step lane is REMOVED (owner goal, 2026-08-25) ─
+//
+// "Keep Claude coach but remove Clem from running Claude workflow steps via
+// the Claude agent SDK." The five pins that stood here exercised the removed
+// carrier (SDK parking, SDK structured output, SDK stop targeting, SDK throw
+// handling, and the lane-scoped graph persist). A Claude-model step now takes
+// the SAME harness path as every other model — parking, stop, failure
+// marking, and authority arming are the shared harness-lane machinery already
+// pinned by the standard-step tests in this file. The one contract unique to
+// the removal is pinned below: the SDK executor is never consulted.
+test('a Claude-model step routes through the harness lane and never enters the SDK executor', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
   const prev = {
     AUTH_MODE: process.env.AUTH_MODE,
     WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
-    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
   };
+  let sdkInvocations = 0;
   const step = {
-    id: 'main',
-    prompt: 'Review the channel and read the log sheet.',
+    id: 'claude_step',
+    prompt: 'Summarize the workspace state.',
     model: 'claude-sonnet-4-6',
-    allowedTools: ['composio_execute_tool'],
   };
   const ctx = {
     workflow: {
-      name: 'Graph Arm Probe',
-      description: 'test',
-      enabled: true,
-      trigger: { manual: true },
-      allowedTools: ['composio_execute_tool'],
-      steps: [step],
+      name: 'Fork Kill Probe', description: 'test', enabled: true,
+      trigger: { manual: true }, steps: [step],
     },
-    workflowSlug: 'graph-arm-probe',
-    runId: 'wf-graph-arm-1',
+    workflowSlug: 'fork-kill-probe',
+    runId: 'wf-fork-kill-1',
     inputs: {},
     stepOutputs: {},
-    assistant: { respond: async () => { throw new Error('legacy assistant should not run'); } },
+    assistant: { respond: async () => 'harness-lane-answer' },
     completedItems: new Map(),
     forEachFailures: [],
     qualityAdvisories: [],
   } as unknown as Parameters<typeof executeStep>[1];
-  let observed: { status: string; reason?: string } | null = null;
   try {
     process.env.AUTH_MODE = 'codex_oauth';
-    process.env.WORKFLOW_USE_HARNESS = 'on';
-    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'on';
-    setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
-      const { expectedTaskFor } = await import('../runtime/harness/resolution-ledger.js');
-      const expected = expectedTaskFor(
-        options.sessionId as string,
-        options.sourceUserSeq as number,
-      );
-      observed = { status: expected.status, reason: (expected as { reason?: string }).reason };
-      return {
-        text: 'reviewed',
-        structuredOutput: { status: 'ok', output: 'reviewed' },
-        sessionId: 'sdk-graph-arm',
-        model: 'claude-sonnet-4-6',
-        toolUses: ['composio_execute_tool'],
-      };
+    // WORKFLOW_USE_HARNESS off keeps this probe on the legacy assistant seam —
+    // the routing DECISION under test is identical: the SDK stub must not fire.
+    process.env.WORKFLOW_USE_HARNESS = 'off';
+    setClaudeAgentSdkWorkflowStepRunForTest(async () => {
+      sdkInvocations += 1;
+      throw new Error('the removed SDK workflow-step lane must never be consulted');
     });
     await executeStep(step, ctx);
-    assert.ok(observed, 'the stubbed SDK executor ran — the step took the Claude-SDK lane');
-    assert.equal(
-      observed!.status,
-      'ok',
-      `the turn graph must be persisted before the step model runs — got ${observed!.status}: ${observed!.reason ?? ''}`,
-    );
+    assert.equal(sdkInvocations, 0, 'a Claude-model step never enters the Claude Agent SDK executor');
+    // Lane-absence is a SOURCE property: the runner module must not reference
+    // the SDK step executor or its transport at all — a re-added import or
+    // branch fails here even before any routing scenario exercises it.
+    const runnerSource = readFileSync(path.join(process.cwd(), 'src/execution/workflow-runner.ts'), 'utf-8');
+    assert.ok(!runnerSource.includes('runClaudeAgentSdkWorkflowStep'), 'the SDK step executor is not referenced by the runner');
+    assert.ok(!runnerSource.includes("routeKind: 'claude_agent_sdk_workflow_step'"), 'the SDK step transport is not minted by the runner');
   } finally {
     setClaudeAgentSdkWorkflowStepRunForTest(null);
+    resetHarnessRuntimeConfig();
     for (const [key, value] of Object.entries(prev)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

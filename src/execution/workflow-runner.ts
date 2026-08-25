@@ -331,11 +331,6 @@ import {
   persistWorkflowGraphSnapshot,
 } from './workflow-graph-store.js';
 import { reconcileWorkflowGraphPatchTelemetry } from './workflow-graph-reshape.js';
-import {
-  claudeAgentSdkWorkflowStepEnabled,
-  runClaudeAgentSdkWorkflowStep,
-} from '../runtime/harness/claude-agent-workflow-step.js';
-import { ClaudeAgentSdkApprovalBoundaryError } from '../runtime/harness/claude-agent-sdk.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import type { AssistantRouteDiagnostics } from '../types.js';
 
@@ -4102,140 +4097,16 @@ async function runStepViaHarness(
         });
       } catch { /* trace is best-effort */ }
     };
-    if (
-      !isGraphRuntimeWorkflowStep(step)
-      // The standalone Claude SDK lane can now honor the compiled local-tool
-      // list exactly, but its workspace_artifact_query is still the generic
-      // allowed-root MCP tool. Keep compiled projects on the workflow agent
-      // path, where we replace that name with the run/event-bound reader.
-      && !isCompiledProjectRuntimeWorkflowStep(step)
-      && stepModel
-      && claudeAgentSdkWorkflowStepEnabled(stepModel)
-      && workflowStepCanRunOnClaudeAgentSdk(step)
-    ) {
-      // Claude-SDK lane graph persist (2026-08-25, run 1787649022538-3634b5):
-      // this lane never enters admit-and-compile, so no admitted/ticketed
-      // graph will EVER exist for its source — the collision that forced the
-      // pre-model persist's deletion is structurally impossible here. Without
-      // a persisted graph, callAdmissionAuthorityFor falls through to
-      // expectedTaskFor and every MCP-carried external call is refused
-      // pre-execution ("no persisted turn graph for accepted task"): all four
-      // composio calls of the platform-49 run died this way while host-local
-      // tools sailed past the wall. Persist the shadow graph for THIS lane
-      // only, before the model runs.
-      try {
-        const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
-        recordTurnGraphShadow({
-          identity: {
-            sessionId: realSessionId,
-            sourceUserSeq: sourceUserEvent.seq,
-            turn: sourceUserEvent.turn,
-          },
-          surface: 'workflow',
-        });
-      } catch {
-        // Enablement only: a persist failure surfaces as the settlement
-        // spine's own typed refusal at dispatch, never as a silent skip.
-      }
-      const fullLane = workflowStepUsesFullClaudeLane(step);
-      // Approved-payload replay (2026-07-21): a re-admitted parked step re-runs
-      // the model, which RE-COMPOSES its payload — the exact-payload resume key
-      // then never matches the grant and a fresh approval mints forever (the
-      // approve→re-ask treadmill). Claim the session's approved unconsumed
-      // action and execute the APPROVED bytes first; the model finishes the
-      // step from the result instead of re-proposing the action. Fail-open:
-      // with nothing to replay this is a no-op.
-      let approvedReplayNote = '';
-      try {
-        const { replayApprovedActionForSession, renderApprovedReplayNote } = await import('./approval-replay.js');
-        const replayOutcome = await replayApprovedActionForSession(realSessionId);
-        if (replayOutcome) approvedReplayNote = `\n\n${renderApprovedReplayNote(replayOutcome)}`;
-      } catch { /* replay is best-effort; worst case the step re-asks */ }
-      let sdkResult;
-      try {
-        sdkResult = await runClaudeAgentSdkWorkflowStep({
-          step,
-          workflowName,
-          runId: workflowRunId, // attribute this step's fan-out to the workflow run
-          prompt: approvedReplayNote ? `${message}${approvedReplayNote}` : message,
-          modelId: stepModel,
-          // Every SDK profile receives the real child session + exact source,
-          // including read-only steps. Kill observation is a control-plane
-          // requirement, not a mutating-tool capability.
-          sessionId: realSessionId,
-          sourceUserSeq: sourceUserEvent.seq,
-          runAttemptId: stepAttempt.attemptId,
-          // The one-per-run watcher performs the durable file reads. The SDK
-          // calls this hook at every stream message, so keep this hot path an
-          // in-memory point read instead of hammering the filesystem.
-          shouldCancel: () => observedWorkflowRunCancellations.has(workflowRunId),
-          fullLane,
-          parkApprovals: canPark && parkingEnabled(),
-        });
-      } catch (err) {
-        if (err instanceof ClaudeAgentSdkApprovalBoundaryError && err.boundary.state === 'pending') {
-          markWorkflowRunPausedForApproval(workflowRunId);
-          throw new ParkRunSignal([{
-            stepId: step.id,
-            kind: 'sdk',
-            approvalIds: [err.boundary.approvalId],
-            sessionId: realSessionId,
-          }]);
-        }
-        if (err instanceof AgentRuntimeCancelledError || stepAttemptWasKilled()) {
-          throw new WorkflowRunCancelledError();
-        }
-        markWorkflowHarnessSessionTerminal(session, 'failed');
-        throw err;
-      }
-      const route = normalizeRouteDiagnostics({
-        routeKind: 'claude_agent_sdk_workflow_step',
-        surface: 'workflow',
-        requestedModel: step.model ?? stepModel,
-        effectiveModel: sdkResult.model ?? stepModel,
-        provider: 'claude',
-        transport: 'claude_agent_sdk_workflow_step',
-      });
-      appendWorkerRoute({
-        ...(modelRoute.trace ?? {
-          seam: 'workflow',
-          stepId: step.id,
-          attemptedIntent: step.intent ?? null,
-          matchedIntent: null,
-          modelId: stepModel,
-          provider: 'claude',
-          source: step.model ? 'step-model' : 'default',
-        }),
-        modelId: stepModel,
-        provider: 'claude',
-        transport: 'claude_agent_sdk_workflow_step',
-        sdkSessionId: sdkResult.sdkSessionId ?? null,
-        sdkModel: sdkResult.model ?? null,
-        toolUses: sdkResult.toolUses,
-        structured: sdkResult.structured,
-        modelRoute: workflowModelRouteMeta(route),
-      });
-      // Phantom-completion guard (#2): a send/write step that called no real tool
-      // didn't actually act — surface it as blocked instead of a silent success.
-      const sdkOutput = settlementGuardedStepOutput({
-        step,
-        sessionId: realSessionId,
-        sourceUserSeq: sourceUserEvent.seq,
-        toolUses: sdkResult.toolUses,
-        output: sdkResult.output,
-      });
-      stepAttemptStatus = 'completed';
-      markWorkflowHarnessSessionTerminal(session, 'completed');
-      return {
-        output: sdkOutput,
-        hadApprovals: false,
-        approvalIds: [],
-        usedStructuredResult: sdkResult.structured,
-        sessionId: realSessionId,
-        lane: 'claude_sdk',
-        route,
-      };
-    }
+    // The Claude Agent SDK workflow-step lane was REMOVED here (owner goal,
+    // 2026-08-25): "keep Claude coach but remove Clem from running Claude
+    // workflow steps via the Claude agent SDK." Claude remains a brain — chat,
+    // judge, and worker roles all resolve Claude models through Clem's own
+    // loop — but no step is handed to a second, externally-owned agent loop.
+    // One loop, many brains: a Claude-model step now takes the same harness
+    // path as every other model, under the same admission, settlement, and
+    // authority spine. The fork this deletes was the top parity-bug generator:
+    // its externals were silently disarmed for a night because an authority
+    // fix reasoned only about the lane that runs admission.
     const route = workflowHarnessRoute(step, stepModel);
     appendWorkerRoute(workflowHarnessRouteMarker(step, stepModel, modelRoute.trace));
     const scopedWorkflowStepAgent = graphOrCompiledStep
