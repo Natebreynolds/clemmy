@@ -4446,6 +4446,36 @@ export async function runConversation(
       });
       const result = hostActivationConversationResult(turnResult);
       if (result.status === 'held') return result;
+      // A VERIFIED QUEUE RECEIPT TRANSFERS OWNERSHIP TO THE WORKFLOW GRAPH, ON
+      // EVERY LANE.
+      //
+      // This reducer lived only inside runConversationCore. Fresh chat is
+      // host_v1 by default, so hostOwnsFreshTurn is true and this branch
+      // returns before the spine ever runs that core — which meant a workflow
+      // dispatch prepared by a chat turn was NEVER closed or activated.
+      // Measured 2026-08-25: four dispatches prepared since the day before,
+      // zero closed, zero dispatched. Each orphan then blocked every later run
+      // of that workflow, because the correct no-duplicate check kept finding
+      // it, and the user was told "its dispatch still needs exact recovery" —
+      // a promise nobody could keep. The same carrier worked on 2026-08-03 and
+      // 08-07, before chat moved to the host engine.
+      //
+      // Ownership of a queued run belongs to the TURN, not to whichever lane
+      // executed it, so it is finalized here exactly as the core does.
+      const hostDispatch = finalizePreparedWorkflowDispatchForSource(
+        options.sessionId,
+        sourceUserSeq,
+      );
+      if (hostDispatch) {
+        return recordAsyncWorkflowDispatch({
+          sessionId: options.sessionId,
+          sourceUserSeq,
+          receipts: [hostDispatch.receipt],
+          steps: 1,
+          lastDecision: undefined,
+          lastTurn: turnResult.turn,
+        });
+      }
       const reduced = reduceStandardConversationTerminal({ result, sourceUserSeq });
       emitRuntimeTerminalEvent(options.sessionId, reduced);
       refreshTerminalWorkingMemory(options.sessionId);
