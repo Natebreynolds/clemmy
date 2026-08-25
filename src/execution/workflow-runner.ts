@@ -4167,7 +4167,12 @@ async function runStepViaHarness(
           autoContinueOnLimit: getHarnessBudgetSettings().autoContinueOnLimit,
           attempts: continueAttempts,
           cap: chatAutoContinueCap(),
-          stepsThisActivation: result.steps ?? 0,
+          // A tool-calls ceiling only trips AFTER the limit's worth of calls
+          // — progress by construction, even though the loop's catch path
+          // cannot carry a step count (live: the first continue never fired
+          // because steps was absent and the no-progress guard read zero).
+          stepsThisActivation: result.steps
+            ?? (/ToolCallsLimitExceeded|tool calls per turn/i.test(result.error ?? '') ? 1 : 0),
         });
         if (!decision.resume) break;
         continueAttempts += 1;
