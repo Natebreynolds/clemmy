@@ -24,6 +24,7 @@ const {
   isChatBrainFalloverEligible,
   synthesizeCompletedWorkReport,
   _setBridgeImplsForTests,
+  composeDispatchedReplyText,
 } = await import('./respond-bridge.js');
 // eslint-disable-next-line import/first
 const {
@@ -4198,4 +4199,41 @@ test('always-reports-back: synthesizeCompletedWorkReport describes external writ
 
   // Nothing durable to report → null (a pure ack is not force-reported).
   assert.equal(synthesizeCompletedWorkReport(sessionId, 2), null);
+});
+
+// ─── The dispatched reply is the model's voice, not a template ───────────────
+//
+// The dispatch ACK used to deliver only the projection's canned line, and the
+// model's actual closing message for that turn was discarded. Observed
+// 2026-08-25: the discarded message warned "this workflow has been
+// blocking/cancelling repeatedly today…" — replaced by boilerplate. Composed
+// from durable turn_ended events only, so a restart replay derives identical
+// text; the words must never ride on the async_work_dispatched event itself,
+// which is deep-strict-equal-checked against its replay winner.
+test('a dispatched turn delivers the model\'s own words, with the canned line as floor', () => {
+  const sessionId = 'sess-dispatch-voice';
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'run my weekly review' },
+  });
+  appendEvent({
+    sessionId, turn: 1, role: 'Clem', type: 'turn_ended',
+    data: { output: 'Kicked off weekly-review — heads up, it has been blocking repeatedly today.' },
+  });
+  // A later turn_ended with no output (the host emits one) must not erase the words.
+  appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'turn_ended', data: { items: 3 } });
+
+  const composed = composeDispatchedReplyText(source, 'Started — canned.');
+  assert.equal(
+    composed,
+    'Kicked off weekly-review — heads up, it has been blocking repeatedly today.',
+  );
+
+  // No words recorded → the ACK floor holds.
+  const bare = appendEvent({
+    sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'run it again' },
+  });
+  assert.equal(composeDispatchedReplyText(bare, 'Started — canned.'), 'Started — canned.');
 });

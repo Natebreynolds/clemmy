@@ -1523,6 +1523,42 @@ async function tryServeCompletedAnswerReplay(
   }
 }
 
+/**
+ * The model's own closing words for the turn that performed a dispatch.
+ *
+ * The dispatched reply used to be only the projection's canned line ("Started —
+ * I'll post the result here when it's ready"), and the model's actual final
+ * message for that turn was discarded. Observed 2026-08-25: the discarded
+ * message read "this workflow has been blocking/cancelling repeatedly today…" —
+ * exactly what the owner needed to hear, replaced by boilerplate. The owner's
+ * standing rule is the model's voice, never a template.
+ *
+ * Composed from DURABLE turn_ended events only, so a restart replay derives the
+ * identical text — which is also why the words must never ride on the
+ * async_work_dispatched event itself: that event is deep-strict-equal-checked
+ * against its replay winner, and free text minted at dispatch time would
+ * conflict with the rebuilt copy.
+ *
+ * Falls back to the canned line when the turn recorded no words, so the ACK
+ * floor never regresses.
+ */
+export function composeDispatchedReplyText(
+  source: EventRow,
+  fallback: string,
+): string {
+  try {
+    let words = '';
+    for (const event of listEvents(source.sessionId, { types: ['turn_ended'] })) {
+      if (event.turn !== source.turn || event.seq <= source.seq) continue;
+      const output = (event.data as { output?: unknown }).output;
+      if (typeof output === 'string' && output.trim()) words = output.trim();
+    }
+    return words || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function exactAsyncDispatchForSource(source: EventRow): ReturnType<typeof publicAsyncWorkDispatchedData> {
   const verifiedEventIds = new Set(
     verifiedWorkflowRunDispatchReceipts(source.sessionId, source.turn, source.seq)
@@ -1996,7 +2032,7 @@ export async function respondViaHarness(
           throw new Error('Harness returned dispatched without exact durable dispatch authority.');
         }
         return withRouteDiagnostics({
-          text: dispatch.text,
+          text: composeDispatchedReplyText(sourceUserEvent, dispatch.text),
           sessionId,
           // This closes only the synchronous provider request. The durable
           // async_work_dispatched event remains the nonterminal logical edge.
