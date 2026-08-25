@@ -79,6 +79,8 @@ import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { withModelUsageAttribution } from '../runtime/usage-log.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { reapOrphanedWorkflowChatDispatches } from '../tools/workflow-run-queue.js';
+import { cancelWorkflowRunAtBoundary } from '../execution/workflow-run-cancellation.js';
 import {
   reconcileActivatedWorkflowDispatchGroups,
   reconcileClosedWorkflowDispatchBatches,
@@ -2181,6 +2183,24 @@ export async function startDaemon(
     logger.warn(
       { err: err instanceof Error ? err.message : String(err) },
       'Boot activated workflow dispatch reconcile failed',
+    );
+  }
+  // The closed-batch and activated-group reconcilers above both replay from a
+  // durable receipt. A dispatch that was PREPARED and never closed has neither,
+  // so nothing reclaimed it: the run stayed held forever AND blocked every
+  // later run of that workflow, because the correct no-duplicate check kept
+  // finding it. One interrupted turn disabled a workflow permanently.
+  try {
+    const reaped = reapOrphanedWorkflowChatDispatches(
+      (input) => cancelWorkflowRunAtBoundary(input),
+    );
+    if (reaped.cancelled > 0 || reaped.rejected > 0) {
+      logger.warn(reaped, 'Cancelled orphaned prepared workflow chat dispatches on boot');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Boot orphaned workflow dispatch reap failed',
     );
   }
   // Chat runs execute in-process with no resumer; a restart mid-run would

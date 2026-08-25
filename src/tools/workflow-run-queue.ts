@@ -3333,3 +3333,76 @@ export function requeueWorkflowFailedItemsFromRun(
       : queued.message,
   };
 }
+
+export interface ReapOrphanedWorkflowChatDispatchesResult {
+  examined: number;
+  cancelled: number;
+  rejected: number;
+}
+
+/**
+ * Boot recovery for the one dispatch state nothing else reclaims: PREPARED but
+ * never closed.
+ *
+ * A chat turn that calls workflow_run prepares a dispatch and records its
+ * ownership; the reducer that closes and activates it is keyed to that exact
+ * (sessionId, sourceUserSeq). If the originating turn ends without reaching
+ * that reducer — a restart, a throw, a park — the preparation is orphaned. The
+ * closed-batch and activated-group reconcilers both run at boot, but neither
+ * can see this state: there is no closed batch and no activation receipt to
+ * replay from. Nothing else looks.
+ *
+ * The cost was not one lost run. Every later attempt correctly refused to
+ * duplicate the held run ("already awaiting_chat_dispatch_seal") and parked, so
+ * ONE interrupted turn disabled that workflow permanently, and the failure
+ * surfaced as a promise to resume that nobody could keep. Observed on the
+ * production home 2026-08-25: five runs held this way across four workflows,
+ * every one of them zero-step and never started.
+ *
+ * Orphans are CANCELLED rather than released. They never started, so nothing is
+ * lost, and the owner re-runs whatever they still want; auto-releasing a
+ * days-old briefing would publish a surprise nobody asked for. A run whose
+ * group is still closed-or-active is left alone — those have their own
+ * reducers, and this must not race them.
+ */
+export function reapOrphanedWorkflowChatDispatches(
+  cancel: (input: { runId: string; reason: string; source: string }) => { status: string },
+): ReapOrphanedWorkflowChatDispatchesResult {
+  const result: ReapOrphanedWorkflowChatDispatchesResult = { examined: 0, cancelled: 0, rejected: 0 };
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return result;
+  for (const entry of readdirSync(WORKFLOW_RUNS_DIR).sort()) {
+    if (!entry.endsWith('.json')) continue;
+    try {
+      const record = JSON.parse(
+        readFileSync(path.join(WORKFLOW_RUNS_DIR, entry), 'utf-8'),
+      ) as {
+        status?: unknown;
+        steps?: unknown;
+        chatDispatchSourceGroupId?: unknown;
+      };
+      if (record.status !== 'awaiting_chat_dispatch_seal') continue;
+      result.examined += 1;
+      // Only a run that provably never started. A held run with steps belongs
+      // to a different protocol and is never this reaper's business.
+      if (Array.isArray(record.steps) && record.steps.length > 0) continue;
+      const sourceGroupId = typeof record.chatDispatchSourceGroupId === 'string'
+        ? record.chatDispatchSourceGroupId
+        : '';
+      if (!sourceGroupId) continue;
+      // Still owned by a live reducer: leave it.
+      if (readActiveWorkflowOriginGroup(sourceGroupId)) continue;
+      if (readWorkflowOriginGroupClosedBatch(sourceGroupId)) continue;
+      const runId = entry.replace(/\.json$/, '');
+      const outcome = cancel({
+        runId,
+        reason: 'This run was prepared for chat dispatch but its originating turn never completed the handoff, so it could never start and was blocking new runs of this workflow.',
+        source: 'boot:orphaned-chat-dispatch-reaper',
+      });
+      if (outcome.status === 'cancelled') result.cancelled += 1;
+      else result.rejected += 1;
+    } catch {
+      result.rejected += 1;
+    }
+  }
+  return result;
+}
