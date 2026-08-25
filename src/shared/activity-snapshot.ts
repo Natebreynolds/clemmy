@@ -194,7 +194,11 @@ export function buildActivitySnapshot(now: Date = new Date()): ActivitySnapshot 
   const activityEntries = safe(
     () => projectActivitySnapshot({
       observedAt: now.toISOString(),
-      kinds: ['chat', 'background', 'fanout'],
+      // Workflows INCLUDED: a live workflow run is exactly what "Clem is
+      // running N things" exists to count, and the notch/Slack/Discord
+      // runningCount said 0 while a dispatched workflow executed. The owner
+      // explicitly wants progress visible on push surfaces.
+      kinds: ['chat', 'background', 'fanout', 'workflow'],
     }).entries,
     [] as ActivityEntry[],
   );

@@ -122,3 +122,20 @@ test('formatElapsed / formatNextRun produce compact, bounded strings', () => {
   assert.equal(formatNextRun(new Date(now.getTime() + 3 * 60 * 60_000).toISOString(), now), 'in 3h');
 });
 
+
+// ─── A running workflow counts as running ────────────────────────────────────
+//
+// The notch/Slack/Discord runningCount excluded the workflow kind, so a
+// dispatched workflow executed while every push surface said nothing was
+// running. Pinned against the kinds list rather than a full fixture: the
+// projection itself is covered by activity-projection tests; what regressed
+// here was membership.
+test('the running-now projection includes the workflow kind', async () => {
+  const source = await import('node:fs').then((fs) =>
+    fs.readFileSync(new URL('./activity-snapshot.ts', import.meta.url), 'utf-8'));
+  assert.match(
+    source,
+    /kinds: \['chat', 'background', 'fanout', 'workflow'\]/,
+    'a live workflow run is exactly what "running N things" exists to count',
+  );
+});

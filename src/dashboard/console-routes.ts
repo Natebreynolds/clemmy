@@ -11526,7 +11526,10 @@ export function registerConsoleRoutes(
               : logicalProgressHint || task.lastCheckInMessage)
             || ''),
           sessionId: task.runSessionId,
-          ageMs: ageMs(task.updatedAt),
+          // A timer on a running card is RUN DURATION. Keying it to updatedAt
+          // made the clock reset on every touch (progress write, poll, note),
+          // so a two-hour run that just logged something read as seconds old.
+          ageMs: ageMs((task as { createdAt?: string }).createdAt || task.updatedAt),
           updatedAt: task.updatedAt,
           actions,
           primaryAction: action.primaryAction,
@@ -11619,7 +11622,7 @@ export function registerConsoleRoutes(
             || linkedLegacy?.outputPreview?.slice(0, 600)
             || (attempt.status === 'active' ? `Working in ${source}` : status),
           sessionId: session.id,
-          ageMs: ageMs(updatedAt),
+          ageMs: ageMs(attempt.startedAt || updatedAt),
           updatedAt,
           actions,
           attemptId: attempt.attemptId,
@@ -11697,7 +11700,9 @@ export function registerConsoleRoutes(
           progressHint: run.outputPreview?.slice(0, 600)
             || run.events[run.events.length - 1]?.message || '',
           sessionId: run.sessionId,
-          ageMs: ageMs(run.updatedAt),
+          ageMs: ageMs((run as { startedAt?: string; createdAt?: string }).startedAt
+            || (run as { createdAt?: string }).createdAt
+            || run.updatedAt),
           updatedAt: run.updatedAt,
           actions,
           primaryAction: action.primaryAction,
