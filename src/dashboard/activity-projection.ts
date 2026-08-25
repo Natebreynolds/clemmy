@@ -78,6 +78,10 @@ interface RawRunRecordLike {
   reportBack?: { outcome?: unknown } | null;
   capabilityBlock?: unknown;
   mutationBlock?: unknown;
+  /** Live step progress stamped by the runner's shared event seam. */
+  currentStepId?: unknown;
+  stepsCompleted?: unknown;
+  stepsTotal?: unknown;
 }
 
 function text(value: unknown): string | undefined {
@@ -205,6 +209,22 @@ export function projectWorkflowRunActivity(
     observedAt,
     revision: revisionFromEvidence(lastEvidenceAt),
     ...(terminal ? { typedTerminal: terminal } : {}),
+    // Live step progress, stamped onto the record by the runner's shared event
+    // seam. Before this the working-now row was the only live evidence a
+    // dispatched workflow existed and it said nothing but the name. Records
+    // that predate the fields project exactly as before.
+    ...(!terminal && (typeof raw.currentStepId === 'string' || typeof raw.stepsCompleted === 'number')
+      ? {
+          activityLabel: {
+            phase: 'working_items' as const,
+            ...(typeof raw.currentStepId === 'string' && raw.currentStepId
+              ? { stepId: raw.currentStepId }
+              : {}),
+            ...(typeof raw.stepsCompleted === 'number' ? { completed: raw.stepsCompleted } : {}),
+            ...(typeof raw.stepsTotal === 'number' ? { total: raw.stepsTotal } : {}),
+          },
+        }
+      : {}),
   });
   return asEntry(snapshot, 'workflow', {
     runId: id,

@@ -126,6 +126,10 @@ export interface SurfaceActivityLabel {
   /** Safe counters only: "3 of 40". */
   completed?: number;
   total?: number;
+  /** The workflow step currently executing — a user-authored step id, shown to
+   *  the workflow's own owner. This is what turns a nameless spinner into
+   *  "Step 2 of 5 · write_summary". */
+  stepId?: string;
 }
 
 /** Render a bounded human label from safe fields only. */
@@ -146,7 +150,18 @@ export function renderActivityLabel(label: SurfaceActivityLabel): string {
         ? 'Running 1 call'
         : `Running ${total} calls in parallel${done > 0 ? ` · ${done} settled` : ''}`;
     }
-    case 'working_items': return `Working on${scope || ' the items'}`;
+    case 'working_items': {
+      if (label.stepId) {
+        // completed is unset until the FIRST step finishes; a running first
+        // step is still step 1 of N, not a bare "Step".
+        const done = typeof label.completed === 'number' ? label.completed : 0;
+        const position = typeof label.total === 'number'
+          ? `Step ${Math.min(done + 1, label.total)} of ${label.total}`
+          : 'Step';
+        return `${position} · ${label.stepId}`;
+      }
+      return `Working on${scope || ' the items'}`;
+    }
     case 'combining': return 'Combining results';
     case 'verifying': return 'Verifying the result';
     case 'awaiting_approval': return 'Waiting for your approval';

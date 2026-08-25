@@ -595,3 +595,29 @@ test('Working Now shows a foreground turn as soon as it has work to show', () =>
     'a settled run is not working, even with activity evidence',
   );
 });
+
+// ─── A running workflow names its step ───────────────────────────────────────
+//
+// The working-now row is the ONLY live evidence a dispatched workflow exists
+// (the dispatch reply is the model's words, the run executes detached), and it
+// used to say nothing but the workflow's name. The runner's shared event seam
+// now stamps currentStepId/stepsCompleted/stepsTotal onto the run record;
+// this pin holds the projection's half of that contract.
+test('a running workflow with stamped step progress projects a step label', () => {
+  const entry = projectWorkflowRunActivity({
+    id: 'run-steps', workflow: 'weekly-review', status: 'running',
+    createdAt: '2026-08-25T02:00:00Z', startedAt: '2026-08-25T02:00:01Z',
+    currentStepId: 'write_summary', stepsCompleted: 1, stepsTotal: 5,
+  }, '2026-08-25T02:01:00Z');
+  assert.ok(entry);
+  assert.equal(entry.activity?.text, 'Step 2 of 5 · write_summary');
+});
+
+test('a record without step fields projects exactly as before', () => {
+  const entry = projectWorkflowRunActivity({
+    id: 'run-legacy', workflow: 'old-flow', status: 'running',
+    createdAt: '2026-08-25T02:00:00Z', startedAt: '2026-08-25T02:00:01Z',
+  }, '2026-08-25T02:01:00Z');
+  assert.ok(entry);
+  assert.equal(entry.activity, undefined, 'forward-only: old records gain nothing and lose nothing');
+});

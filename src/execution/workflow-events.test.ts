@@ -542,3 +542,33 @@ test('append is silent on filesystem errors (durability layer is best-effort)', 
     appendWorkflowEvent('collision-test', 'r1', { kind: 'run_started' });
   });
 });
+
+// ─── Step boundaries stamp live progress onto the run record ─────────────────
+//
+// Stamped at the shared emit seam so a new step shape cannot forget it, and
+// best-effort so display can never fail a run (no record file → no-op).
+test('step events stamp currentStepId/stepsCompleted/stepsTotal onto the run record', async () => {
+  const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+  const { mkdirSync, writeFileSync, readFileSync } = await import('node:fs');
+  const path = await import('node:path');
+  const runId = `stamp-test-${Date.now()}`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(file, JSON.stringify({
+    id: runId, workflow: 'stamp-flow', status: 'running',
+    workflowDefinitionSnapshot: { definition: { steps: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] } },
+  }), 'utf-8');
+
+  appendWorkflowEvent('stamp-flow', runId, { kind: 'step_started', stepId: 'a' });
+  let record = JSON.parse(readFileSync(file, 'utf-8'));
+  assert.equal(record.currentStepId, 'a');
+  assert.equal(record.stepsTotal, 3);
+
+  appendWorkflowEvent('stamp-flow', runId, { kind: 'step_completed', stepId: 'a' });
+  record = JSON.parse(readFileSync(file, 'utf-8'));
+  assert.equal(record.stepsCompleted, 1);
+  assert.equal(record.currentStepId, null);
+
+  // A run with NO record file (e.g. a dry-run) must not throw.
+  appendWorkflowEvent('stamp-flow', `${runId}-missing`, { kind: 'step_started', stepId: 'x' });
+});

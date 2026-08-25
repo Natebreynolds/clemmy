@@ -20,7 +20,12 @@ import type {
   StepOutputArtifactReference,
 } from './workflow-run-workspace.js';
 import { isOperationalEventType, recordOperationalEvent, type OperationalEventSeverity, type OperationalEventSource, type OperationalEventType } from '../runtime/operational-telemetry.js';
-import { scanWorkflowRunRecordSnapshot } from './workflow-run-record.js';
+import {
+  scanWorkflowRunRecordSnapshot,
+  withWorkflowRunRecordLock,
+  readWorkflowRunRecordUnlocked,
+  writeWorkflowRunRecordDurablyUnlocked,
+} from './workflow-run-record.js';
 
 /**
  * Append-only event log per workflow run — the durability layer.
@@ -230,6 +235,49 @@ function completeWorkflowEvent(event: Omit<WorkflowEvent, 't'>): WorkflowEvent {
  * captured into the meta of subsequent in-memory events but the run
  * itself continues.
  */
+
+/**
+ * Stamp live step progress onto the durable run record, at the one seam every
+ * step boundary already crosses.
+ *
+ * Why: with the dispatch reply being the model's own words and the run
+ * executing in the background, the working-now row is the ONLY live evidence a
+ * dispatched workflow exists — and it said nothing but the workflow's name.
+ * The step events were emitted right here and the record never learned them, so
+ * every surface (desktop drawer, mobile sheet/Home, /tasks) showed a nameless
+ * spinner. Stamped in the shared emit helper rather than at each of the
+ * runner's call sites, so a new step shape cannot forget it.
+ *
+ * Display stamping must never fail a run: best-effort, swallow everything.
+ * Old records without these fields keep projecting exactly as before.
+ */
+function stampRunStepProgress(runId: string, event: { kind?: string; stepId?: string }): void {
+  if (event.kind !== 'step_started' && event.kind !== 'step_completed') return;
+  try {
+    const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    if (!existsSync(file)) return;
+    withWorkflowRunRecordLock(file, () => {
+      const record = readWorkflowRunRecordUnlocked<Record<string, unknown>>(file);
+      if (!record) return;
+      const snapshot = record.workflowDefinitionSnapshot as
+        | { definition?: { steps?: unknown[] } }
+        | undefined;
+      const total = Array.isArray(snapshot?.definition?.steps)
+        ? snapshot.definition.steps.length
+        : undefined;
+      const next: Record<string, unknown> = { ...record };
+      if (event.kind === 'step_started') {
+        next.currentStepId = event.stepId ?? null;
+      } else {
+        next.stepsCompleted = (typeof record.stepsCompleted === 'number' ? record.stepsCompleted : 0) + 1;
+        next.currentStepId = null;
+      }
+      if (total !== undefined) next.stepsTotal = total;
+      writeWorkflowRunRecordDurablyUnlocked(file, next);
+    });
+  } catch { /* progress display must never break execution */ }
+}
+
 export function appendWorkflowEvent(
   workflowName: string,
   runId: string,
@@ -245,6 +293,7 @@ export function appendWorkflowEvent(
     // event when the per-run log is unwritable.
   }
   mirrorWorkflowOperationalEvent(workflowName, runId, full);
+  stampRunStepProgress(runId, full);
   return full;
 }
 
@@ -271,6 +320,7 @@ export function appendWorkflowEventDurably(
   }
   fsyncDirectoryBestEffort(dir);
   mirrorWorkflowOperationalEvent(workflowName, runId, full);
+  stampRunStepProgress(runId, full);
   return full;
 }
 
