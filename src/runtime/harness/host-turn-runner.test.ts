@@ -5785,3 +5785,40 @@ test('a dead registered read replans instead of poisoning the turn', async () =>
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
   }
 });
+
+// ─── The retirement terminal names what the host can measure ─────────────────
+//
+// Live 2026-08-25 (Discord "top 5 opportunities → sheet"): four minutes of
+// discovery, then the bare "that exact capability is unavailable" — while the
+// CLI auth-health store already knew the needed CLI was not signed in. Only
+// host-declared facts may be echoed: registry tool names and host-measured
+// health entries; a model-invented tool name is never repeated back.
+test('capabilityUnavailableTextFor carries host-measured causes and never echoes foreign names', async () => {
+  const healthPath = path.join(TMP_HOME, 'state', 'cli-auth-health.json');
+  mkdirSync(path.dirname(healthPath), { recursive: true });
+  writeFileSync(healthPath, JSON.stringify({
+    version: 'v1',
+    entries: {
+      salesforce: {
+        id: 'salesforce', command: 'sf', installed: true,
+        authStatus: 'signed_out', checkedAt: '2026-08-25T09:22:32.497Z',
+      },
+      railway: {
+        id: 'railway', command: 'railway', installed: true,
+        authStatus: 'ok', username: 'nate', checkedAt: '2026-08-25T09:22:32.497Z',
+      },
+    },
+  }), 'utf-8');
+  const { capabilityUnavailableTextFor, HOST_CAPABILITY_UNAVAILABLE_TEXT } =
+    await import('../runtime/harness/host-turn-runner.js').catch(() => import('./host-turn-runner.js'));
+  const text = capabilityUnavailableTextFor([
+    { name: 'call_tool', argumentsJson: JSON.stringify({ name: 'run_shell_command', args_json: JSON.stringify({ command: 'sf data query --query "SELECT..."' }) }) },
+    { name: 'TOTALLY_MADE_UP_PROVIDER_TOOL', argumentsJson: '{}' },
+  ]);
+  assert.ok(text.startsWith(HOST_CAPABILITY_UNAVAILABLE_TEXT), 'the base terminal copy is preserved');
+  assert.ok(text.includes('call_tool'), 'registry-declared names are echoed');
+  assert.ok(!text.includes('TOTALLY_MADE_UP_PROVIDER_TOOL'), 'a model-invented name is never repeated back');
+  assert.ok(text.includes('the sf CLI is signed out'), `the host-measured cause is named: ${text}`);
+  assert.ok(!text.includes('railway'), 'a healthy CLI is not blamed');
+  assert.ok(text.includes('Signing that CLI back in'), 'the terminal names the unblocking action');
+});

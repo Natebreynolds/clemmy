@@ -83,7 +83,8 @@ import {
 } from './tool-effect.js';
 import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
 import { classifyDiscoveryCall } from './discovery-boundary.js';
-import { hostControlFrameFor, hostReadOnlyExecutionContractFor } from '../../tools/tool-registry.js';
+import { hostControlFrameFor, hostReadOnlyExecutionContractFor, isRegistryDeclaredTool } from '../../tools/tool-registry.js';
+import { readPersistedHealth } from '../../integrations/cli-catalog/auth-health.js';
 import {
   isHostPlanRequiredWorkCall,
   releasePreparedHostWorkCallForRepair,
@@ -182,6 +183,75 @@ export const HOST_TOOL_UNCERTAIN_BLOCKED_TEXT =
 
 export const HOST_CAPABILITY_UNAVAILABLE_TEXT =
   'That exact capability is unavailable for this request after two safe, no-effect attempts. I kept the conversation intact; choose another available capability or adjust the request before trying again.';
+
+/**
+ * Retirement terminal WITH the host's own measured cause. Live 2026-08-25
+ * (Discord, "top 5 opportunities → sheet"): eleven discovery searches, four
+ * minutes, then the bare retirement line — while the CLI auth-health store
+ * already knew the one CLI the request needed was not signed in. The user's
+ * verdict on that shape: an assistant who says "I couldn't, go figure out
+ * why" gets fired.
+ *
+ * Value-opaque rule holds: only HOST-declared facts are echoed — registry
+ * tool names (never a model-invented name) and CLI health entries the host
+ * itself measured. Model args are used solely to SELECT among host entries,
+ * never quoted.
+ */
+export function capabilityUnavailableTextFor(
+  calls: readonly { name: string; argumentsJson: string }[],
+): string {
+  const parts: string[] = [HOST_CAPABILITY_UNAVAILABLE_TEXT];
+  try {
+    const names = new Set<string>();
+    const argTokens = new Set<string>();
+    for (const call of calls) {
+      let parsed: unknown = null;
+      try { parsed = JSON.parse(call.argumentsJson); } catch { /* opaque args stay opaque */ }
+      const effective = parsed && typeof parsed === 'object'
+        ? unwrapRuntimeEffectiveToolIdentity(call.name, parsed as Record<string, unknown>).toolName
+        : call.name;
+      for (const candidate of [call.name, effective]) {
+        if (candidate && isRegistryDeclaredTool(candidate)) names.add(candidate);
+      }
+      const collect = (value: unknown, depth: number): void => {
+        if (depth > 4) return;
+        if (typeof value === 'string') {
+          // Nested args often arrive as COMPACT JSON-in-a-string, where
+          // whitespace splitting leaves `"command":"sf` fused; split on
+          // every non-token character so `sf` matches the health entry `sf`.
+          for (const token of value.split(/[^A-Za-z0-9._-]+/).slice(0, 48)) {
+            if (token && token.length <= 40) argTokens.add(token);
+          }
+          return;
+        }
+        if (Array.isArray(value)) { for (const entry of value.slice(0, 32)) collect(entry, depth + 1); return; }
+        if (value && typeof value === 'object') {
+          for (const entry of Object.values(value as Record<string, unknown>).slice(0, 32)) collect(entry, depth + 1);
+        }
+      };
+      collect(parsed, 0);
+    }
+    if (names.size > 0) {
+      parts.push(`The retired request used ${[...names].sort().join(', ')}.`);
+    }
+    const health = readPersistedHealth();
+    const causes: string[] = [];
+    for (const entry of Object.values(health)) {
+      if (!entry.installed || entry.authStatus === 'ok') continue;
+      if (!argTokens.has(entry.command)) continue;
+      const status = entry.authStatus === 'signed_out'
+        ? 'is signed out'
+        : entry.authStatus === 'error'
+          ? 'is failing its sign-in probe'
+          : 'has an unverified sign-in';
+      causes.push(`the ${entry.command} CLI ${status} (last checked ${entry.checkedAt})`);
+    }
+    if (causes.length > 0) {
+      parts.push(`One measured cause on this machine: ${causes.sort().join('; ')}. Signing that CLI back in should unblock this request.`);
+    }
+  } catch { /* the bare terminal is still an honest terminal */ }
+  return parts.join(' ');
+}
 
 const HOST_TOOL_DISPOSITION_PROTOCOL = 'host_tool_disposition_v1' as const;
 
@@ -3196,7 +3266,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         resultItems: paired.resultItems,
         responseId: step.responseId,
       });
-      return await completedOutcome(HOST_CAPABILITY_UNAVAILABLE_TEXT);
+      return await completedOutcome(capabilityUnavailableTextFor(canonicalCalls));
     }
     let frameDisposition: HostModelFrameDisposition;
     try {

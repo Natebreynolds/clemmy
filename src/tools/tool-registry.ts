@@ -545,6 +545,13 @@ export function actionTopologyRoleFor(toolName: string): ActionTopologyRole {
     ?.actionTopologyRole ?? 'business';
 }
 
+/** Registry membership for PRESENTATION: only a host-declared name may be
+ * echoed into user-facing terminal copy — an unknown name is model input and
+ * is never repeated back (value-opaque terminal rule). */
+export function isRegistryDeclaredTool(toolName: string): boolean {
+  return TOOL_REGISTRY.some((declaration) => declaration.name === toolName);
+}
+
 export function hostControlFrameFor(toolName: string): 'sole' | null {
   return TOOL_REGISTRY.find((declaration) => declaration.name === toolName)
     ?.hostControlFrame ?? null;
