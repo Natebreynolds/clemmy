@@ -3481,28 +3481,6 @@ function resolveWorkflowStepModel(step: WorkflowStepInput, workflow?: WorkflowDe
 // NOTE: both predicates below are consulted at the SDK-lane dispatch ONLY after
 // the step model is confirmed to be a Claude id (claudeAgentSdkWorkflowStepEnabled).
 // So they gate purely on the kill-switch — a Claude step is a Claude step whether
-// Claude is the brain or a Codex-brain workflow injected it via intent routing.
-function workflowStepCanRunOnClaudeAgentSdk(step: WorkflowStepInput): boolean {
-  // executeStep awaits runner-owned declarative approval before dispatch reaches
-  // this predicate. An approved step can use the gated, tool-capable SDK lane.
-  // Full gated lane: write/send run through the harness gate chain (grounding /
-  // goal-fidelity / confirm-first / async approval) on the SDK worker tool
-  // profile, with the step's session carrying the workflow's auto-approval grants.
-  if (claudeWorkflowLaneFlagEnabled()) return true;
-  if (step.sideEffect === 'write' || step.sideEffect === 'send') return false;
-  if (stepLooksMutating(step) || stepLooksLikeIrreversibleSend(step.prompt)) return false;
-  return true;
-}
-
-/** Whether THIS step should run the SDK workflow-step lane in tool-capable
- *  (gated mutating) mode rather than the read-only profile. True under the lane
- *  flag — so even read steps that hit external read-only APIs (DataForSEO via
- *  composio) have the tools — and required for any write/send step. Applies to an
- *  injected Claude step (Codex brain) exactly as to a Claude-brain step. */
-function workflowStepUsesFullClaudeLane(step: WorkflowStepInput): boolean {
-  if (!claudeWorkflowLaneFlagEnabled()) return false;
-  return true;
-}
 
 function workflowAutoApprovalTools(workflow: WorkflowDefinition, step: WorkflowStepInput): string[] {
   if (isGraphRuntimeWorkflowStep(step)) {
@@ -3765,8 +3743,6 @@ export const workflowRunnerInternalsForTest = {
   renderSelfHealRequeueFailedStatus,
   selfHealAutoMaxAttempts,
   resolveWorkflowStepModel,
-  workflowStepCanRunOnClaudeAgentSdk,
-  workflowStepUsesFullClaudeLane,
   workflowAutoApprovalTools,
   workflowStepRunMaxTurns,
   shouldUseDeclarativeStepApproval,
