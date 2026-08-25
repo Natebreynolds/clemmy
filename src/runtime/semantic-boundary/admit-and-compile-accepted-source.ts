@@ -1274,6 +1274,22 @@ export async function prepareDurableAcceptedTurnCompile(
     }
     admitted = direct;
   } else {
+    // OWNER DECISION 2026-08-25 ("option B"): execution surfaces do not enter
+    // the pre-model semantic ceremony. A full day of live runs showed every
+    // workflow failure was a ceremony wall — junk citation, self-reference,
+    // fabricated topology, zero-op shapes, grounding conflict, and finally
+    // "no unique work node" — while every SUCCESS executed in the gated tool
+    // loop, where the settlement wall, effect gates, and approvals do the
+    // actual protecting. The port therefore declines to participate for any
+    // non-chat session; the wrapper below degrades to the validated shadow
+    // graph, dispatch reads the source as unparticipated and runs the model
+    // loop with tools. Typed planning remains available IN the loop when the
+    // model reaches for plan_task — model-driven, never pre-model.
+    const sessionKind = getSession(input.identity.sessionId)?.kind ?? 'chat';
+    if (sessionKind !== 'chat') {
+      recordSemanticDispositionOutcome(input.identity.sessionId, input.identity.sourceUserSeq, 'unavailable');
+      return { ok: false, reason: 'semantic port is unavailable' };
+    }
     const port = peekTurnSemanticModelPort();
     if (!port) {
       recordSemanticDispositionOutcome(input.identity.sessionId, input.identity.sourceUserSeq, 'unavailable');

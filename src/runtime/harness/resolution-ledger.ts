@@ -23,6 +23,7 @@ import {
   type EventRow,
 } from './eventlog.js';
 import { acceptedTaskIdFor } from './attempt-identity.js';
+import { readSemanticDisposition } from '../semantic-boundary/semantic-disposition.js';
 import {
   actionTopologyRoleForRuntimeCall,
   canonicalRuntimeEffectiveToolName,
@@ -152,7 +153,22 @@ export function expectedTaskFor(sessionId: string, sourceUserSeq: number): Expec
     };
   }
   if (graph.classification.route !== 'direct_reply' && candidates.length !== 1) {
-    if (!aggregate) {
+    if (!aggregate && candidates.length === 0) {
+      // A unique work node exists to bind TYPED work. An UNPARTICIPATED
+      // source (no semantic claim — execution surfaces skip the pre-model
+      // ceremony by owner decision, 2026-08-25) has nothing typed to bind:
+      // the heuristic prose graph classifies act-shaped but carries zero
+      // work nodes, and demanding one killed a scheduled run at admission
+      // plumbing ("no unique work node", scorpion-facebook-trends). Such a
+      // source arms conversation-shaped; every call it makes still settles
+      // per-call under the same effect gates. A PARTICIPATED source keeps
+      // the demand — a typed claim must bind or refuse.
+      if (readSemanticDisposition(sessionId, sourceUserSeq)?.participation !== 'participated') {
+        // Fall through to the conversation-shaped expectation below.
+      } else {
+        return { status: 'ambiguous', reason: 'non-conversational graph has no unique work node' };
+      }
+    } else if (!aggregate) {
       return { status: 'ambiguous', reason: 'non-conversational graph has no unique work node' };
     }
   }

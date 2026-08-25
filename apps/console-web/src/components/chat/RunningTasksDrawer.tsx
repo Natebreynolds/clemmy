@@ -44,6 +44,18 @@ export function RunningTasksDrawer({
   const panelRef = useRef<HTMLElement>(null);
   const rows = (activity.data?.entries ?? []).slice(0, MAX_RENDERED_TASKS);
   const total = activity.data?.entries.length ?? 0;
+  // "N current tasks" lumped live work with needs-attention remnants (live
+  // 2026-08-25: 33 acknowledged blocked runs read as "37 current tasks").
+  // The trigger says what is true: how many are RUNNING and how many wait
+  // on the user — two different invitations.
+  const allEntries = activity.data?.entries ?? [];
+  const needsYou = allEntries.filter((entry) => entry.needsAttention
+    || entry.lifecycle === 'blocked' || entry.lifecycle === 'awaiting_input').length;
+  const running = total - needsYou;
+  const pillLabel = [
+    running > 0 ? `${running} running` : null,
+    needsYou > 0 ? `${needsYou} need${needsYou === 1 ? 's' : ''} you` : null,
+  ].filter(Boolean).join(' · ') || `${total} current ${total === 1 ? 'task' : 'tasks'}`;
   const cards = useMemo(() => board.data?.cards ?? [], [board.data]);
 
   const close = useCallback(() => {
@@ -117,7 +129,7 @@ export function RunningTasksDrawer({
         className="inline-flex min-h-11 items-center gap-2 rounded-md px-2 text-small font-medium text-muted transition-colors hover:bg-hover hover:text-fg cursor-pointer"
       >
         <Asterisk className="h-4 w-4 text-primary" aria-hidden />
-        <span aria-live="polite">{total} current {total === 1 ? 'task' : 'tasks'}</span>
+        <span aria-live="polite">{pillLabel}</span>
       </button>
 
       {open && (
@@ -130,7 +142,7 @@ export function RunningTasksDrawer({
             <header className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
               <div>
                 <h2 id="chat-running-tasks-title" className="text-h3 text-fg">Background tasks</h2>
-                <p className="mt-0.5 text-caption text-faint">Current · {total}</p>
+                <p className="mt-0.5 text-caption text-faint">{pillLabel}</p>
               </div>
               <Button ref={closeRef} size="icon" variant="ghost" className="h-11 w-11" aria-label="Close" onClick={close}>
                 <X className="h-4 w-4" aria-hidden />
