@@ -287,3 +287,27 @@ test('ClaudeTransportRoutingModel picks the transport per request', async () => 
   for await (const _ of router.getStreamedResponse({ input: 'hi', tools: [], handoffs: [{}] } as never)) break;
   assert.deepEqual(calls, ['headless:get', 'raw:get', 'raw:stream']);
 });
+
+// ─── Assistant-terminal conversations gain a user continuation ───────────────
+//
+// Live 2026-08-25 (workflow continuation, claude-sonnet-5): the loop's
+// auto-continue checkpoint left the conversation assistant-terminal, which
+// Anthropic rejects on models without prefill support ("This model does not
+// support assistant message prefill") while the Codex wire accepts — the
+// same run shape worked on one family and killed the other.
+test('envelope: an assistant-terminal conversation gains one neutral user continuation', () => {
+  const shimmed = JSON.parse(applyClaudeEnvelope({ body: JSON.stringify({
+    model: 'claude-sonnet-5',
+    messages: [
+      { role: 'user', content: 'do the work' },
+      { role: 'assistant', content: 'checkpoint: partial progress' },
+    ],
+  }) }, 'sk-ant-oat01-x').body as string);
+  const last = shimmed.messages[shimmed.messages.length - 1];
+  assert.equal(last.role, 'user', 'the wire conversation must end with a user message');
+  const untouched = JSON.parse(applyClaudeEnvelope({ body: JSON.stringify({
+    model: 'claude-sonnet-5',
+    messages: [{ role: 'user', content: 'do the work' }],
+  }) }, 'sk-ant-oat01-x').body as string);
+  assert.equal(untouched.messages.length, 1, 'a user-terminal conversation is left alone');
+});

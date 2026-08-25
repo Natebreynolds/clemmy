@@ -132,6 +132,14 @@ export function applyClaudeEnvelope(
       // to the turn input (valid for Codex/OpenAI), so hoist them into the system
       // blocks here so the request is valid on EVERY Claude model, not just Opus.
       hoistSystemMessagesIntoSystem(parsed);
+      // Sibling incompatibility, same rule (live 2026-08-25, workflow
+      // continuation on claude-sonnet-5): Anthropic rejects an assistant-
+      // terminal conversation on models without prefill support ("This model
+      // does not support assistant message prefill"), while the Codex wire
+      // accepts it — so the loop's auto-continue checkpoint shape worked on
+      // one family and killed the other. Append one neutral user continuation
+      // so the request is valid on every Claude model.
+      ensureUserTerminalMessage(parsed);
       if (parsed.max_tokens == null) parsed.max_tokens = CLAUDE_DEFAULT_MAX_TOKENS;
       body = JSON.stringify(parsed);
     } catch {
@@ -139,6 +147,18 @@ export function applyClaudeEnvelope(
     }
   }
   return { headers, body };
+}
+
+/** Anthropic-valid conversations end with a user message on models without
+ *  prefill support. The continuation text is a neutral nudge, not content —
+ *  the assistant's own last message remains the authoritative context. */
+function ensureUserTerminalMessage(parsed: Record<string, unknown>): void {
+  const messages = Array.isArray(parsed.messages) ? (parsed.messages as Array<Record<string, unknown>>) : null;
+  if (!messages || messages.length === 0) return;
+  const last = messages[messages.length - 1];
+  if (last && last.role === 'assistant') {
+    messages.push({ role: 'user', content: 'Continue.' });
+  }
 }
 
 /** Best-effort plain text from an Anthropic message `content` (string or an
