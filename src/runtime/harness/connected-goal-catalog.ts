@@ -34,6 +34,7 @@ import type { GraphNodeInvocationEnvelopeV1 } from './graph-node-envelope.js';
 import { listConnectedToolkits, peekConnectedToolkits } from '../../integrations/composio/client.js';
 import { listToolContractFiles, readToolContractFile } from '../../tools/tool-contract-store.js';
 import { registeredToolkitOfSlug } from '../../integrations/composio/toolkit-slug.js';
+import { peekHostCapabilityCatalogFactory } from './host-capability-catalog-factory.js';
 import { classifyComposioSlugEffect } from '../../integrations/composio/slug-effect.js';
 
 export interface ConnectedRegistryTool {
@@ -154,6 +155,36 @@ function affinityRank(slug: string, objective: string): number {
   return foreign * 2 - overlap * 5;
 }
 
+
+/** Attested advisory roles for a slug, read from the registered capability
+ *  factory. A DECLARED role is structured evidence: the lexical zero-evidence
+ *  floor exists for fillability-only guesses over raw provider probes, and an
+ *  attested registration is not a guess (live 2026-08-25: the floor starved
+ *  the typed host-bind fixtures whose capabilities declare collection/
+ *  transform roles, while the junk it was built to stop carried no roles).
+ *  Roles never authorize execution — they only spare a registered capability
+ *  from being treated as lexically evidence-free. */
+function attestedRolesForSlug(slug: string): readonly string[] {
+  try {
+    const factory = peekHostCapabilityCatalogFactory();
+    if (!factory) return [];
+    const lower = slug.trim().toLowerCase();
+    for (const entry of factory.snapshot()) {
+      const operation = (entry.manifest?.operationId ?? entry.toolName ?? '').trim().toLowerCase();
+      if (operation !== lower) continue;
+      // Proof-provisioned mints derive their roles FROM a prior goal-catalog
+      // selection — the very thing this floor guards. Exempting them would be
+      // circular: yesterday's lexical guess laundered into today's evidence.
+      // Only a registration whose manifest was issued OUTSIDE resolution
+      // proof (connect-time deposit, local registry, reviewed CLI, bootstrap)
+      // counts as attested.
+      if (entry.manifest?.provenance?.issuer === 'host:resolution-proof') return [];
+      return entry.advisoryRoles ?? [];
+    }
+  } catch { /* advisory only — a factory failure never blocks selection */ }
+  return [];
+}
+
 export interface GoalCatalogSelection {
   entries: CapabilityResolutionEntry[];
   gaps: Array<'search' | 'row_create' | 'readback'>;
@@ -179,7 +210,11 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
     // authoritative entry. Abstaining routes to the existing gaps machinery;
     // a slot with no evidenced candidate reports a gap rather than a winner.
     const affinity = goalAffinity(tool.slug, objective);
-    if (affinity.overlap === 0 && affinity.foreign > 0) continue;
+    if (
+      affinity.overlap === 0
+      && affinity.foreign > 0
+      && attestedRolesForSlug(tool.slug).length === 0
+    ) continue;
     if (effect === 'read') {
       // A goal-carrying search: the frozen required fields can be filled from
       // the objective alone (FIRECRAWL_SEARCH's `q` — not keywords-for-site,

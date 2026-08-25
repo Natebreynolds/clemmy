@@ -198,3 +198,49 @@ test('an objective naming the toolkit still selects it — the floor refuses gue
     installConnectedRegistryPort(null);
   }
 });
+
+// ─── Attested roles are evidence; proof-minted roles are not ─────────────────
+//
+// The zero-evidence floor starved the typed host-bind path: attested
+// registrations (connect-time deposits, local registry) declare goal-carrying
+// roles that ARE structured evidence, while proof-provisioned mints derive
+// their roles FROM a prior goal-catalog selection — the very thing the floor
+// guards. Exempting those would launder yesterday's lexical guess into
+// today's evidence, resurrecting the DataForSEO class from any earlier mint.
+test('an attested role survives the floor; a proof-minted role does not', async () => {
+  const factoryMod = await import('./host-capability-catalog-factory.js');
+  const factory = factoryMod.createHostCapabilityCatalogFactory();
+  factoryMod.installHostCapabilityCatalogFactory(factory);
+  const entry = (slug: string, issuer: string) => ({
+    capabilityId: `cap:resolved:${slug.toLowerCase()}`,
+    toolName: slug,
+    schemaVersion: '1',
+    schemaDigest: 'f'.repeat(64),
+    effect: 'read' as const,
+    advisoryRoles: ['collection'],
+    providerKind: 'composio' as const,
+    manifest: {
+      operationId: slug,
+      provenance: { issuer, issuedAt: '2026-08-25T00:00:00.000Z', trusted: true },
+    } as never,
+    invoke: async () => ({}),
+  });
+  factory.register(entry('KITX_QUERY_BATCH', 'host:test') as never);
+  factory.register(entry('DATAFORSEO_SERP_DATASET_SEARCH', 'host:resolution-proof') as never);
+  installConnectedRegistryPort(() => ({
+    connectedToolkits: ['kitx', 'dataforseo'],
+    tools: [
+      { slug: 'KITX_QUERY_BATCH', schema: { type: 'object', required: ['q'], properties: { q: { type: 'string' } } } },
+      { slug: 'DATAFORSEO_SERP_DATASET_SEARCH', schema: { type: 'object', required: ['q'], properties: { q: { type: 'string' } } } },
+    ],
+  }));
+  try {
+    const selection = selectGoalCatalog('prepare my morning briefing with overdue items and top goals');
+    const ids = selection.entries.map((e) => e.identifier);
+    assert.ok(ids.includes('KITX_QUERY_BATCH'), `attested role must survive the floor: ${ids.join(',')}`);
+    assert.ok(!ids.includes('DATAFORSEO_SERP_DATASET_SEARCH'), 'a proof-minted role must not defeat the floor');
+  } finally {
+    installConnectedRegistryPort(null);
+    factoryMod.installHostCapabilityCatalogFactory(factoryMod.createHostCapabilityCatalogFactory());
+  }
+});
