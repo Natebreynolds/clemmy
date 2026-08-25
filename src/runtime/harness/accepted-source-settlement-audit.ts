@@ -138,7 +138,41 @@ function turnEventsForAcceptedSource(sessionId: string, sourceUserSeq: number): 
  * an unclassified write still fails closed here.
  */
 function uncertainWriteVetoesDelivery(event: EventRow): boolean {
+  // Classify by the canonical ACTION, never the carrier: `toolName` on a
+  // write-evidence event names the dispatch tool, and ONE carrier fans out
+  // every provider action — keying the plane exemption on it would exempt
+  // genuine business writes (live: GOOGLESHEETS_BATCH_UPDATE write events
+  // carry the carrier's toolName). `shapeKey` is the action's own identity.
+  const data = event.data as { shapeKey?: unknown; slug?: unknown };
+  const action = [data.shapeKey, data.slug]
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0) ?? '';
+  if (platformMetaPlaneOperation(action)) return false;
   return event.data.irreversible !== false;
+}
+
+/**
+ * The tool-platform's own management/catalog plane — connection pokes,
+ * catalog searches, schema retrievals — recognized by the operation's
+ * namespace being the platform carrier itself, never a slug list. An
+ * ambiguous outcome there is ambiguity about Clementine's own tool plumbing,
+ * not about the user's external state: no business record moved, so nothing
+ * exists for a human to reconcile. Mirroring the refused_pre_dispatch
+ * exemption below, letting such a poke veto delivery makes the harness's own
+ * preparation instruments the reason she cannot report (live 2026-08-25: a
+ * composio_manage_connections probe settled uncertain_write AFTER the real
+ * scrape succeeded and was captured, and the blocked step skipped notify).
+ * A real provider business write settling uncertain_write must keep vetoing —
+ * that hazard is this audit's entire purpose.
+ */
+function platformMetaPlaneOperation(toolName: string): boolean {
+  const normalized = toolName.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  const namespace = normalized.split('_')[0] ?? '';
+  if (namespace !== 'composio') return false;
+  // The execute wrapper dispatches a NESTED business action: its namespace is
+  // the platform's, but its EFFECT is the user's external state. It is never
+  // plane-exempt — only the platform's own management/catalog verbs are.
+  if (normalized.includes('execute')) return false;
+  return true;
 }
 
 interface ReversibleWriteShape {
@@ -309,10 +343,17 @@ export function auditAcceptedSourceSettlementTruth(input: {
     // a call present in the reversible index remains a reportable failure, but
     // it is not the one deterministic reason to make a human inspect state.
     const blockingUncertainSettlements = uncertainSettlements.filter(
-      (row) => !reversibleWrites.has(row.logical_tool_call_id),
+      (row) => !platformMetaPlaneOperation(row.tool_name)
+        && !reversibleWrites.has(row.logical_tool_call_id),
     );
     const unrecovered = failed.filter((row) => {
-      if (row.outcome_kind === 'uncertain_write') return true;
+      // PLATFORM-PLANE AMBIGUITY IS NOT A BUSINESS FAILURE — see
+      // platformMetaPlaneOperation: the poke moved harness plumbing, not the
+      // user's external state, and its uncertainty stays reported without
+      // withholding the business work that DID settle.
+      if (row.outcome_kind === 'uncertain_write') {
+        return !platformMetaPlaneOperation(row.tool_name);
+      }
       // A REFUSAL IS NOT A FAILED EFFECT. `refused_pre_dispatch` means the
       // harness blocked the call before it crossed the boundary: no request was
       // sent, no external state moved, nothing exists to reconcile — and this

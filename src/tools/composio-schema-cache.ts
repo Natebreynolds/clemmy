@@ -501,6 +501,11 @@ function refreshSchemaFromProvider(
     } catch {
       result = { outcome: 'failed', durationMs: Date.now() - startedAt };
     }
+    // A slug the provider just described is provably not undescribable: a
+    // live observation reopens the once-per-process validation latch so one
+    // earlier transient failure cannot poison the slug for the daemon's
+    // lifetime.
+    if (result.outcome === 'refreshed') schemaLoadAttempted.delete(toolSlug);
     try {
       entry.observer?.({
         outcome: result.outcome,

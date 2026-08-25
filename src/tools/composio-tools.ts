@@ -110,6 +110,7 @@ import {
   ensureToolSchema,
   liveComposioSchemaFingerprint,
   liveComposioOperationVersion,
+  refreshExactComposioSchemaFromProvider,
 } from './composio-schema-cache.js';
 import {
   digestSchema,
@@ -2000,6 +2001,19 @@ function exactProviderInputSchemaIdentity(
   }
 }
 
+/** An action on the platform's own catalog/connection plane — the same
+ * toolkit classification meta-action owner inheritance uses, never a slug
+ * list. These operations are the instruments preparation itself prescribes:
+ * refusing one for lacking a prepared provider definition makes the refusal's
+ * own remedy unreachable, and that recursion cannot terminate. */
+function composioPlatformPlaneOperation(toolSlug: string): boolean {
+  if (registeredToolkitOfSlug(toolSlug) !== 'composio') return false;
+  // The execute wrapper carries a NESTED business action — platform namespace,
+  // business effect. It must never inherit the instrument bypass: a cold
+  // business write would dispatch without its one-shot preparation.
+  return !/execute/i.test(toolSlug);
+}
+
 function schemaRequiresComposioFileUpload(schema: unknown): boolean {
   const queue: unknown[] = [schema];
   const seen = new Set<object>();
@@ -2920,36 +2934,44 @@ export async function resolveComposioDispatch(
   let dispatchSchema = opts.preparedExecution
     ? getCachedToolSchema(toolSlug)
     : await ensureToolSchema(toolSlug);
-  if (opts.preparedExecution && !dispatchSchema) {
+  const preparationInstrument = composioPlatformPlaneOperation(toolSlug);
+  let preparedSchemaIdentity = exactProviderInputSchemaIdentity(toolSlug, dispatchSchema);
+  let preparedOperationVersion = opts.preparedExecution && !cliOnlyLane
+    ? liveComposioOperationVersion(toolSlug)
+    : undefined;
+  // Every leg the refusal below demands, so the remedy and the gate read the
+  // SAME predicate — a remedy that discharges less than the demand deadlocks.
+  const preparedDefinitionCold = (): boolean =>
+    !dispatchSchema
+    || !preparedSchemaIdentity.schemaFingerprint
+    || !preparedSchemaIdentity.providerInputSchemaDigest
+    || (!cliOnlyLane && !preparedOperationVersion);
+  if (opts.preparedExecution && preparedDefinitionCold()) {
     // RE-VALIDATION IS NOT DISCOVERY (live 2026-08-25, second gate of the
     // same class): fetching the provider's input definition for an ALREADY
     // ACCEPTED call is preparation of that exact call, not a hidden look at
     // the catalog. Refusing here deadlocked live — the prescribed remediation
     // reads (describe/search) transit this same gateway and were refused by
     // this same gate, so "run the preparation read, then retry" could never
-    // terminate. Bounded to one fetch; the gate below still owns refusal
-    // when the definition is genuinely unavailable.
+    // terminate. Only the STRONG exact-slug provider observation discharges
+    // the demand: it stamps providerObservedAt and the operation version, so
+    // every leg re-derives. ensureToolSchema cannot — its cached return never
+    // moves the authority lease, and its once-per-process latch would let one
+    // transient failure poison the slug for the daemon's lifetime. Bounded to
+    // one fetch; the gate below still owns refusal when the definition is
+    // genuinely unavailable.
     try {
-      let ensureTimer: ReturnType<typeof setTimeout> | undefined;
-      dispatchSchema = await Promise.race([
-        ensureToolSchema(toolSlug),
-        new Promise<undefined>((resolve) => { ensureTimer = setTimeout(() => resolve(undefined), 12_000); }),
-      ]).finally(() => { if (ensureTimer) clearTimeout(ensureTimer); }) ?? getCachedToolSchema(toolSlug);
-    } catch { dispatchSchema = getCachedToolSchema(toolSlug); }
+      let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        refreshExactComposioSchemaFromProvider(toolSlug),
+        new Promise<null>((resolve) => { refreshTimer = setTimeout(() => resolve(null), 12_000); }),
+      ]).finally(() => { if (refreshTimer) clearTimeout(refreshTimer); });
+    } catch { /* the legs re-derived below own the refusal */ }
+    dispatchSchema = getCachedToolSchema(toolSlug);
+    preparedSchemaIdentity = exactProviderInputSchemaIdentity(toolSlug, dispatchSchema);
+    preparedOperationVersion = !cliOnlyLane ? liveComposioOperationVersion(toolSlug) : undefined;
   }
-  const preparedSchemaIdentity = exactProviderInputSchemaIdentity(toolSlug, dispatchSchema);
-  const preparedOperationVersion = opts.preparedExecution && !cliOnlyLane
-    ? liveComposioOperationVersion(toolSlug)
-    : undefined;
-  if (
-    opts.preparedExecution
-    && (
-      !dispatchSchema
-      || !preparedSchemaIdentity.schemaFingerprint
-      || !preparedSchemaIdentity.providerInputSchemaDigest
-      || (!cliOnlyLane && !preparedOperationVersion)
-    )
-  ) {
+  if (opts.preparedExecution && !preparationInstrument && preparedDefinitionCold()) {
     const message =
       `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started because its exact current provider input `
       + 'definition is not prepared for this accepted call. Run one exact Composio search/list/describe read '
@@ -3036,12 +3058,20 @@ export async function resolveComposioDispatch(
         providerOperationVersion: preparedOperationVersion,
       });
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      const message = `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started. ${detail} Refresh the exact account/action readiness and retry. No provider dispatch was started.`;
-      emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
-        guard: 'terminal-one-shot-preparation-required',
-      });
-      return { ok: false, reason: 'invalid-args', message, toolkit };
+      // A preparation instrument stays dispatchable without the one-shot: the
+      // exact-definition authority the mint demands is what this operation
+      // exists to build, so demanding it of the instrument is the same
+      // non-terminating recursion the definition gate above refuses to enter.
+      // It dispatches on the compatibility lane instead; business actions
+      // keep the strict refusal.
+      if (!preparationInstrument) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const message = `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started. ${detail} Refresh the exact account/action readiness and retry. No provider dispatch was started.`;
+        emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+          guard: 'terminal-one-shot-preparation-required',
+        });
+        return { ok: false, reason: 'invalid-args', message, toolkit };
+      }
     }
   }
   return {
@@ -3111,6 +3141,12 @@ export async function dispatchComposioTool(
     }
     let providerOutcomeSettled = false;
     try {
+      // Resolution withholds the one-shot only for a platform-plane
+      // preparation instrument whose exact definition could not be observed;
+      // that instrument still runs, on the compatibility lane.
+      const providerBody = (): Promise<unknown> => resolved.preparedDispatch
+        ? executePreparedComposioTool(resolved.preparedDispatch)
+        : executeComposioTool(toolSlug, resolved.args, resolved.connectionId);
       const providerDispatch = (): Promise<unknown> => {
         if (run?.sessionId && Number.isSafeInteger(run.sourceUserSeq) && (run.sourceUserSeq ?? 0) > 0) {
           return withPhysicalDispatch(
@@ -3131,10 +3167,10 @@ export async function dispatchComposioTool(
                   : {}),
               },
             },
-            () => executePreparedComposioTool(resolved.preparedDispatch!),
+            providerBody,
           );
         }
-        return executePreparedComposioTool(resolved.preparedDispatch!);
+        return providerBody();
       };
       const result = opts.dispatchBoundary
         ? await opts.dispatchBoundary({
@@ -3484,7 +3520,11 @@ async function runComposioExecuteInner(
     attemptStartedAt = Date.now();
     try {
       hooks.beforePhysicalDispatchForTest?.();
-      const preparedAttempt = hooks.execute
+      // A resolution WITHOUT a one-shot is the gateway's deliberate verdict
+      // for exactly one class — a platform-plane preparation instrument whose
+      // exact definition could not be observed. That class dispatches on the
+      // compatibility lane; every other absence is a broken contract.
+      const preparedAttempt = hooks.execute || !resolved.preparedDispatch
         ? undefined
         : attempt === 1
           ? resolved.preparedDispatch
@@ -3494,7 +3534,7 @@ async function runComposioExecuteInner(
               connectedAccountId: effectiveConnectionId,
               providerOperationVersion: resolved.providerOperationVersion,
             });
-      if (!hooks.execute && !preparedAttempt) {
+      if (!hooks.execute && !preparedAttempt && !composioPlatformPlaneOperation(toolSlug)) {
         throw new Error(`${toolSlug} terminal one-shot preparation is absent.`);
       }
       // Each pass through this loop is a PAID provider crossing. One identity
@@ -3522,7 +3562,9 @@ async function runComposioExecuteInner(
         async (crossing) => {
           priorDispatchId = crossing.physicalDispatchId;
           if (hooks.execute) return hooks.execute(toolSlug, args, effectiveConnectionId);
-          return executePreparedComposioTool(preparedAttempt!);
+          return preparedAttempt
+            ? executePreparedComposioTool(preparedAttempt)
+            : executeComposioTool(toolSlug, args, effectiveConnectionId);
         },
       );
       let output = formatComposioExecuteOutput(result, { ...options, toolSlug });
