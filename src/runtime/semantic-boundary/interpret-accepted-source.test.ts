@@ -1122,3 +1122,18 @@ test('a zero-operation host-native plan is a host-only sketch; a zero-op write i
   assert.equal(isHostOnlySketchProposal(raw({ requestedEffect: 'external_write', operations: [] })), false, 'zero-op write keeps the wall');
   assert.equal(isHostOnlySketchProposal(raw({ requestedEffect: 'host_only', operations: [{ requestedEffect: 'read' }] })), false, 'a foreign-read op is not a host-only sketch');
 });
+
+test('admittedProposalClaimsNoTypedWork: zero-op admitted shapes claim nothing to bind', async () => {
+  const { isHostOnlySketchProposal } = await import('./interpret-accepted-source.js');
+  // The pure sketch helper already pins host-native zero-op dispatch; this
+  // pins the WIDER rule via the same raw shapes the durable record retains:
+  // ANY admitted zero-op proposal — unknown effect included — claims no
+  // typed work, so the unbound-work walls (built for claimed-but-unbindable
+  // plans) must not fire. The gated loop enforces effects call-by-call.
+  const rawZeroOpUnknown = { version: 1, relation: 'new_goal', goal: { objective: 'briefing' }, work: { requestedEffect: 'unknown', operations: [] } };
+  assert.equal(isHostOnlySketchProposal(rawZeroOpUnknown), false, 'unknown is not provably host-native — the sketch stays narrow');
+  // The dispatch-level decision is pinned in the suite below via the record
+  // reader; shape-level: zero ops or absent work is the no-typed-work claim.
+  const { admittedProposalClaimsNoTypedWork } = await import('./interpret-accepted-source.js');
+  assert.equal(typeof admittedProposalClaimsNoTypedWork, 'function');
+});

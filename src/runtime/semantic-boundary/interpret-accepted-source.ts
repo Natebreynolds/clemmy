@@ -1456,6 +1456,27 @@ export function hostOnlySketchForSource(
   return isHostOnlySketchProposal(persisted.raw);
 }
 
+/** An ADMITTED proposal that claims no typed operations has nothing to bind:
+ *  "unbound work" requires claimed work. Zero-op turns dispatch to the gated
+ *  model loop, where every actual call still meets its own effect gate — a
+ *  write cannot happen ungated there. Live 2026-08-25 (unified lane, three
+ *  variants in a row): honest zero-op proposals declaring host_only, then
+ *  null work, then unknown each fell into the unbound-work walls built for
+ *  claimed-but-unbindable plans, blocking or parking a fully-specified step. */
+export function admittedProposalClaimsNoTypedWork(
+  sessionId: string,
+  sourceUserSeq: number,
+): boolean {
+  const persisted = readPersistedInterpretation(sessionId, sourceUserSeq);
+  if (!persisted || persisted.validationOutcome !== 'admitted' || !persisted.raw || typeof persisted.raw !== 'object') {
+    return false;
+  }
+  const raw = persisted.raw as { work?: { operations?: unknown[] | null } | null };
+  if (raw.work === null || raw.work === undefined) return true;
+  const operations = Array.isArray(raw.work.operations) ? raw.work.operations : [];
+  return operations.length === 0;
+}
+
 /** Pure shape decision behind hostOnlySketchForSource, exported for pins. */
 export function isHostOnlySketchProposal(rawProposal: unknown): boolean {
   if (!rawProposal || typeof rawProposal !== 'object') return false;

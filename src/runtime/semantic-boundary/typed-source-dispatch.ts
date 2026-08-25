@@ -17,6 +17,7 @@ import type { TurnIdentity } from '../harness/turn-outcome.js';
 import { readSemanticDisposition } from './semantic-disposition.js';
 import {
   clarifyingOpenSlotQuestionForSource,
+  admittedProposalClaimsNoTypedWork,
   hostOnlySketchForSource,
   readClaimLinkedSemanticInterpretation,
 } from './interpret-accepted-source.js';
@@ -415,6 +416,19 @@ export async function dispatchAdmittedSource(
     return { kind: 'conversation', capabilityRoute: 'direct_reply' };
   }
   if (!typedGraphHasExecutableOperations(graph)) {
+    // "Unbound work" requires CLAIMED work. An admitted proposal with zero
+    // typed operations claimed nothing to bind — the walls below exist for
+    // claimed-but-unbindable plans. Zero-op turns run the gated model loop,
+    // where every actual call still meets its own effect gate; a write
+    // cannot happen ungated there. (Live 2026-08-25: three honest zero-op
+    // shapes in a row blocked or parked a fully-specified workflow step.)
+    if (admittedProposalClaimsNoTypedWork(identity.sessionId, identity.sourceUserSeq)) {
+      const route = graph.classification.route;
+      return {
+        kind: 'conversation',
+        capabilityRoute: route === 'act' || route === 'retrieve' ? route : 'direct_reply',
+      };
+    }
     return stopUnboundParticipated(identity, graph);
   }
   const construct = graph.classification.goalConstraints?.construct ?? 'none';
