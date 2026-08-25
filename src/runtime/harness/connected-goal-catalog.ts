@@ -109,10 +109,21 @@ const GENERIC_SLUG_TOKENS = new Set([
   'get', 'list', 'search', 'query', 'find', 'lookup', 'fetch', 'create', 'new',
   'add', 'from', 'to', 'by', 'of', 'all', 'json', 'batch', 'item', 'items',
   'data', 'record', 'records', 'row', 'rows', 'v1', 'v2', 'v3', 'api', 'the', 'a',
+  // Live 2026-08-25: DATAFORSEO_GET_SERP_G_DATASET_SEARCH_TASK_ADV_BY_ID
+  // survived the zero-evidence floor because its slug token TASK matched
+  // "tasks" in a briefing objective. In a tool slug, task/run/job name the
+  // provider's execution plumbing, not a user domain — structure words, like
+  // item/record above.
+  'task', 'run', 'job',
 ]);
 
 function slugTokens(text: string): string[] {
-  return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map((token) => token.replace(/s$/, ''));
+  // Tokens of one or two characters (the G in SERP_G_DATASET, ID, AD) can
+  // only ever match as substrings of longer objective words — pure noise
+  // that manufactured overlap where no domain connection exists.
+  return text.toLowerCase().split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 3)
+    .map((token) => token.replace(/s$/, ''));
 }
 
 /**

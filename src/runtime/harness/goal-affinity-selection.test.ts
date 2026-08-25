@@ -166,6 +166,10 @@ test('a fillable candidate with zero objective overlap and a foreign domain is n
       // tonight's incident shape reduced to its structure.
       { slug: 'DATAFORSEO_SERP_DATASET_SEARCH', schema: { type: 'object', required: ['q'], properties: { q: { type: 'string' } } } },
       { slug: 'DATAFORSEO_SERP_TASK_POST', schema: { type: 'object', required: ['payload_json'], properties: { payload_json: { type: 'array' } } } },
+      // Second-round leak (same night, verbatim slug): the token TASK matched
+      // "tasks" in the objective and manufactured overlap. task/run/job are
+      // provider execution plumbing, not domain evidence — still floored.
+      { slug: 'DATAFORSEO_GET_SERP_G_DATASET_SEARCH_TASK_ADV_BY_ID', schema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
     ],
   }));
   try {
