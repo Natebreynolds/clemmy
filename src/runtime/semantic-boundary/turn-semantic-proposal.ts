@@ -495,7 +495,20 @@ function resolveDescriptorSuccessorId(
   byId: Map<string, HostCapabilityDescriptorV1>,
 ): string | undefined {
   if (byId.has(id)) return id;
-  return [...byId.keys()].find((key) => key.startsWith(`${id}:v`) || key.startsWith(`${id}:`));
+  const successor = [...byId.keys()].find((key) => key.startsWith(`${id}:v`) || key.startsWith(`${id}:`));
+  if (successor) return successor;
+  // The reverse direction (live 2026-08-25, platform-49 on the unified lane):
+  // proof provisioning mints `${base}:definition:<fp>` when a DIFFERENT
+  // definition already holds the base id, and destination binding carries
+  // that qualified id into the operation's ref — while the shown catalog
+  // discloses the BASE. A host-minted qualifier resolves back to its shown
+  // base; the qualifier grammar is exact, never a fuzzy prefix walk.
+  const qualifier = id.lastIndexOf(':definition:');
+  if (qualifier > 0) {
+    const base = id.slice(0, qualifier);
+    if (byId.has(base)) return base;
+  }
+  return undefined;
 }
 
 export function shownGroundingDescriptors(input: {

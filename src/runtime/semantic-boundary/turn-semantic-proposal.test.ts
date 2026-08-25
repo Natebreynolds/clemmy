@@ -976,3 +976,25 @@ test('a candidate id outside the catalog admits — authority lives in the opera
   }), host());
   assert.equal(result.ok, true, `advisory candidates must not block: ${issueCodes(result).join(',')}`);
 });
+
+// ─── A host-minted definition qualifier resolves to its shown base ───────────
+//
+// Live 2026-08-25 (platform-49, unified lane): proof provisioning minted
+// `${base}:definition:<fp>` because a different definition held the base id,
+// destination binding carried the qualified id into the write op's ref, and
+// grounding — shown only the BASE — refused its own host-qualified ref as
+// "not present in the frozen host catalog". Resolution is now symmetric.
+test('shownGroundingDescriptors resolves a definition-qualified ref to its shown base', async () => {
+  const { shownGroundingDescriptors } = await import('./turn-semantic-proposal.js');
+  const shown = shownGroundingDescriptors({
+    descriptors: [descriptor('cap-2', 'external_write', 'records', 'created_resource')],
+    referencedIds: ['cap-2:definition:b01acc373d28fd91d88b5f0c'],
+  });
+  assert.equal(shown.ok, true, JSON.stringify(shown));
+  // A foreign qualifier whose base is NOT shown still refuses.
+  const refused = shownGroundingDescriptors({
+    descriptors: [descriptor('cap-2', 'external_write', 'records', 'created_resource')],
+    referencedIds: ['cap-9:definition:b01acc373d28fd91d88b5f0c'],
+  });
+  assert.equal(refused.ok, false, 'an unshown base never resolves via its qualifier');
+});
