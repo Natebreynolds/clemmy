@@ -4162,17 +4162,20 @@ async function runStepViaHarness(
         await import('../runtime/harness/continue-directive.js');
       const { getHarnessBudgetSettings } = await import('../runtime/harness/budget-settings.js');
       let continueAttempts = 0;
-      while (result.status === 'limit_exceeded') {
+      // Resume ONLY on the typed tool-calls marker, never on a step-count
+      // heuristic: every live limit park arrives with steps >= 1 (stepIndex
+      // increments before runTurn), so a steps>0 gate would also auto-resume
+      // the identical-args guardrail escalation — a deliberate spin-stop on
+      // mutating tools that must stay stopped. Untyped limit parks terminate.
+      while (result.status === 'limit_exceeded' && result.limitKind === 'tool_calls') {
         const decision = chatAutoContinueDecision({
           autoContinueOnLimit: getHarnessBudgetSettings().autoContinueOnLimit,
           attempts: continueAttempts,
           cap: chatAutoContinueCap(),
-          // A tool-calls ceiling only trips AFTER the limit's worth of calls
-          // — progress by construction, even though the loop's catch path
-          // cannot carry a step count (live: the first continue never fired
-          // because steps was absent and the no-progress guard read zero).
-          stepsThisActivation: result.steps
-            ?? (/ToolCallsLimitExceeded|tool calls per turn/i.test(result.error ?? '') ? 1 : 0),
+          // A tool-calls ceiling only trips AFTER the limit's worth of
+          // settled calls — progress by construction even when the activation
+          // parked before completing an orchestrator step.
+          stepsThisActivation: Math.max(result.steps ?? 0, 1),
         });
         if (!decision.resume) break;
         continueAttempts += 1;

@@ -909,14 +909,21 @@ function reduceStandardConversationTerminal(input: {
       legacyReason = 'awaiting_user_input';
       break;
     case 'limit_exceeded':
+      // A ceiling is a checkpoint, not an end (budget-settings NEVER-RESTING
+      // contract). The terminal must stay continue-shaped: a blocked park here
+      // erased the resumable status, so no caller's continue loop could ever
+      // receive a limit checkpoint. The legacyReason is structural — the
+      // continue-directive resume door, session reconciliation, and the
+      // gateway drain all match 'step_budget_parked' — and must not change.
       outcome = {
         version: 2,
         id: turnOutcomeId(identity),
         identity,
-        status: 'blocked',
+        status: 'needs_input',
         resumable: true,
+        needs: { kind: 'continue' },
         presentation: {
-          kind: 'blocked',
+          kind: 'continue',
           text: 'This run reached its current budget with more work remaining. Progress is checkpointed.',
         },
       };
@@ -2413,6 +2420,11 @@ export interface RunTurnResult {
    *  outer loop to detect sub-agent stalls (zero tools + short generic
    *  output = the model punted on the directive). */
   toolCalls?: number;
+  /** Set when a 'limit_exceeded' status is the per-turn tool-call ceiling.
+   *  The ceiling only trips AFTER the limit's worth of settled calls, so
+   *  callers' no-progress guards must read it as progress by construction —
+   *  unlike the other limit terminals, which can genuinely carry zero work. */
+  limitKind?: 'tool_calls';
   /** W1a chat step-boundary fallover: set to the BoundaryError kind when the turn
    *  failed on a TRANSIENT model/codex error AND the caller asked to defer the
    *  infra ask (deferInfraAsk) so it can try cross-brain fallover first. The ask
@@ -2651,8 +2663,10 @@ export interface RunConversationResult {
   publicPresentation?: PresentationEvent;
   /** Which ceiling produced a 'limit_exceeded' status — the bridge maps
    *  'token_budget' to its own distinct stoppedReason so the background
-   *  drain parks instead of misclassifying the run (Stage 4). */
-  limitKind?: 'wall_clock' | 'max_steps' | 'token_budget';
+   *  drain parks instead of misclassifying the run (Stage 4). 'tool_calls'
+   *  is the per-turn ceiling: progress by construction for no-progress
+   *  guards, because it cannot trip before the limit's worth of calls. */
+  limitKind?: 'wall_clock' | 'max_steps' | 'token_budget' | 'tool_calls';
 }
 
 /**
@@ -2698,6 +2712,7 @@ function hostActivationConversationResult(turnResult: RunTurnResult): RunConvers
     lastTurn: turnResult.turn,
     ...(lastDecision ? { lastDecision } : {}),
     ...(turnResult.error ? { error: turnResult.error } : {}),
+    ...(turnResult.limitKind ? { limitKind: turnResult.limitKind } : {}),
   };
 }
 
@@ -5391,6 +5406,7 @@ async function runConversationCore(
         lastDecision,
         lastTurn,
         error: turnResult.error,
+        ...(turnResult.limitKind ? { limitKind: turnResult.limitKind } : {}),
         ...(turnResult.hold ? { hold: turnResult.hold } : {}),
       };
     }
@@ -11191,6 +11207,7 @@ async function runConversationFromResumeCore(opts: {
         lastDecision,
         lastTurn,
         error: turnResult.error,
+        ...(turnResult.limitKind ? { limitKind: turnResult.limitKind } : {}),
       };
     }
     decision = toOrchestratorDecision(turnResult.finalOutput);
@@ -11897,6 +11914,7 @@ function handleRunError(
       sessionId,
       turn,
       status: 'limit_exceeded',
+      limitKind: 'tool_calls',
       error: err instanceof Error ? err.message : String(err),
     };
   }

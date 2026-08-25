@@ -178,10 +178,13 @@ test('a Claude one-step budget park with ZERO progress rests honestly', async ()
   assert.doesNotMatch(String(terminal?.data.reply ?? ''), /continuing automatically/i);
 });
 
-test('the loop reducer parks bypass limit paths honestly — blocked+resumable, no autoResume, no banner', async () => {
+test('the loop reducer parks bypass limit paths honestly — continue-shaped+resumable, no autoResume, no banner', async () => {
   // SDK MaxTurnsExceededError / tool-guardrail paths bypass the in-loop
-  // claims; their paired terminal is an honest rest a next user message
-  // re-enters — never a fake self-resume marker.
+  // claims; their paired terminal is an honest continue checkpoint (a ceiling
+  // is a checkpoint, not an end) — resumable by the host's continue loop or a
+  // next user message, never a fake self-resume marker and never coaching
+  // copy. The 2026-08-18 blocked demotion here erased the resumable status,
+  // so no caller's continue loop could ever receive a limit checkpoint.
   const progressed = createSession({ id: 'never-resting-reducer', kind: 'chat', userId: 'user-1' });
   const source = appendEvent({
     sessionId: progressed.id, turn: 1, role: 'user',
@@ -192,11 +195,15 @@ test('the loop reducer parks bypass limit paths honestly — blocked+resumable, 
     result: { sessionId: progressed.id, status: 'limit_exceeded', steps: 7, lastTurn: 1, limitKind: 'max_steps' },
     sourceUserSeq: source.seq,
   });
-  assert.equal(reduced.status, 'blocked', 'the committed typed public winner controls compatibility status');
+  assert.equal(reduced.status, 'limit_exceeded', 'the committed typed public winner controls compatibility status');
   const terminal = listEvents(progressed.id, { types: ['conversation_completed'] }).at(-1);
   assert.equal(terminal?.data.autoResume, undefined);
   assert.equal(terminal?.data.reason, 'step_budget_parked');
-  assert.equal((terminal?.data.turnOutcome as { status?: string })?.status, 'blocked');
+  assert.equal((terminal?.data.turnOutcome as { status?: string })?.status, 'needs_input');
+  assert.equal(
+    (terminal?.data.turnOutcome as { needs?: { kind?: string } })?.needs?.kind,
+    'continue',
+  );
   assert.doesNotMatch(String(terminal?.data.reply ?? ''), /continuing automatically/i);
   assert.doesNotMatch(String(terminal?.data.reply ?? ''), /say\s+["“`]?continue/i);
 });
