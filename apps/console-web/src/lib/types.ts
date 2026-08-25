@@ -74,7 +74,6 @@ export interface CommandCenter {
   presence?: { status?: string; label?: string; awayMessage?: string; mode?: string };
   counts?: Record<string, number>;
   needsYou?: CommandCenterItem[];
-  workingNow?: CommandCenterItem[];
   recentCompleted?: CommandCenterItem[];
   memory?: Record<string, unknown>;
   integrations?: Record<string, unknown>;

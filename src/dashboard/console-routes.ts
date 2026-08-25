@@ -13582,7 +13582,12 @@ export function registerConsoleRoutes(
           requiredSetupMissing: requiredMissing,
         },
         needsYou: needsYouMerged,
-        workingNow,
+        // workingNow was REMOVED from this payload. It was a second, parallel
+        // answer to "what is running" with its own staleness heuristic, and no
+        // client read it — the badge, drawer, /tasks, and mobile all read the
+        // activity/v2 projection. The assembly above still runs because its
+        // rows fold into needs-you card metas, which ARE consumed; the list
+        // itself must not leave the server as a competing truth.
         recentCompleted: recentMerged,
         memory: {
           chunks: memory.chunks,

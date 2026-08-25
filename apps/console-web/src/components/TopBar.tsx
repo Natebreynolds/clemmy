@@ -11,16 +11,14 @@ export function TopBar({
   title,
   onToggleSidebar,
   sidebarCollapsed,
-  liveAgentsOpen,
   liveRunCount,
-  onToggleLiveAgents,
+  onOpenTasks,
 }: {
   title: string;
   onToggleSidebar: () => void;
   sidebarCollapsed: boolean;
-  liveAgentsOpen: boolean;
   liveRunCount: number;
-  onToggleLiveAgents: () => void;
+  onOpenTasks: () => void;
 }) {
   const openPalette = () => window.dispatchEvent(new Event('clem:command-palette'));
   const openVoice = () => window.dispatchEvent(new Event('clem:open-voice'));
@@ -62,18 +60,15 @@ export function TopBar({
         <ThemeToggle />
 
         <Button
-          variant={liveAgentsOpen ? 'secondary' : 'ghost'}
+          variant="ghost"
           size="sm"
-          onClick={onToggleLiveAgents}
-          aria-pressed={liveAgentsOpen}
-          aria-expanded={liveAgentsOpen}
-          aria-controls="live-agents-panel"
-          aria-label={liveRunCount > 0 ? `Live agents, ${liveRunCount} working` : 'Live agents'}
-          title="What Clem is working on right now"
+          onClick={onOpenTasks}
+          aria-label={liveRunCount > 0 ? `Tasks, ${liveRunCount} working` : 'Tasks'}
+          title="Everything Clem is working on right now"
           className="relative gap-2"
         >
           <Activity className="h-4 w-4" aria-hidden />
-          <span className="hidden lg:inline">Agents</span>
+          <span className="hidden lg:inline">Tasks</span>
           {liveRunCount > 0 && (
             <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-caption font-bold text-primary-fg">
               {liveRunCount > 99 ? '99+' : liveRunCount}

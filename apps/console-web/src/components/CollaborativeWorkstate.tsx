@@ -208,7 +208,14 @@ export function CollaborativeWorkstate({
                 <ListChecks className="h-3.5 w-3.5" aria-hidden /> In motion
               </p>
               <ul className="space-y-1.5">
-                {state.actions.slice(0, itemLimit).map((action) => {
+                {state.actions
+                  // Running rows are already shown — with a timer and a Stop —
+                  // by the working-now surfaces (/tasks, the drawer, the top-bar
+                  // badge). Repeating them here as un-stoppable pills was one of
+                  // the redundant answers to "what is running"; this card keeps
+                  // only what needs a decision or has settled.
+                  .filter((action) => action.status !== 'running')
+                  .slice(0, itemLimit).map((action) => {
                   const href = focusActionHref(action);
                   const content = (
                     <>
@@ -228,7 +235,7 @@ export function CollaborativeWorkstate({
                     </li>
                   );
                 })}
-                <MoreCount count={state.actions.length - itemLimit} />
+                <MoreCount count={state.actions.filter((action) => action.status !== 'running').length - itemLimit} />
               </ul>
             </div>
           )}

@@ -28,7 +28,6 @@ import { cn } from '@/lib/cn';
 import { BoardColumn } from '@/components/board/BoardColumn';
 import { DeliveredShelf } from '@/components/board/DeliveredShelf';
 import { LiveTraceDrawer } from '@/components/board/LiveTraceDrawer';
-import { NowStrip } from '@/components/board/NowStrip';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { listFocusSnapshot } from '@/lib/focus';
 import {
@@ -269,7 +268,6 @@ export function BackgroundTasks() {
             <CollaborativeWorkstate snapshot={focus.data} className="mb-4" />
           )}
 
-          <NowStrip cards={cards} onOpen={setOpen} />
 
           {board.isLoading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">

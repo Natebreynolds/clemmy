@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Outlet, useLocation } from 'react-router-dom';
+import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { AlertTriangle, X } from 'lucide-react';
 import { Sidebar } from './Sidebar';
 import { TopBar } from './TopBar';
@@ -8,13 +8,9 @@ import { VoiceOverlay } from './VoiceOverlay';
 import { UpdaterBanner } from './UpdaterBanner';
 import { ErrorBoundary } from './ErrorBoundary';
 import { LocalRecordingBanner } from './LocalRecordingBanner';
-import { LiveAgentsPanel } from './LiveAgentsPanel';
 import { ALL_NAV } from '@/lib/nav';
-import { listBoard } from '@/lib/board';
 import { usePoll } from '@/lib/poll';
-import { liveAgentBadgeCount } from '@/lib/live-agents';
-
-const LIVE_AGENTS_PREF = 'clem.live-agents.open';
+import { listWorkingNow } from '@/lib/activity';
 
 function titleForPath(pathname: string): string {
   // Longest matching prefix wins (so /advanced/usage beats /advanced).
@@ -30,35 +26,21 @@ export function AppShell() {
   ));
   const location = useLocation();
   const title = titleForPath(location.pathname);
-  const [liveAgentsOpen, setLiveAgentsOpen] = useState(() => {
-    try { return localStorage.getItem(LIVE_AGENTS_PREF) === '1'; } catch { return false; }
-  });
-  // One shared board poll powers the passive detached-work badge and rows.
-  // Faster while the panel is open; a slow heartbeat while closed so a freshly
-  // kicked-off background work updates the badge without moving the user's UI.
-  const board = usePoll(['board'], listBoard, liveAgentsOpen ? 4000 : 12_000);
-  const boardCards = board.data?.cards ?? [];
-  // The badge never counts the conversation the user is currently watching —
-  // its bubble already narrates itself; other live work (background AND
-  // foreground turns in other chats) counts.
+
+  const navigate = useNavigate();
+  // ONE working-now source for the whole app. The badge used to count from its
+  // own board-derived feed while the drawer, /tasks, and mobile counted from
+  // the activity/v2 projection — two numbers for one question, and they
+  // disagreed. Same projection everywhere, and the click goes to /tasks: the
+  // one place that shows every running thing with a timer and a Stop.
+  const workingNow = usePoll(['working-now-badge'], listWorkingNow, 12_000);
   const currentChatMatch = /^\/chat\/([^/]+)/.exec(location.pathname);
-  const liveRunCount = liveAgentBadgeCount(
-    boardCards,
-    currentChatMatch ? decodeURIComponent(currentChatMatch[1]) : null,
-  );
-
-  const toggleLiveAgents = () => {
-    setLiveAgentsOpen((current) => {
-      const next = !current;
-      try { localStorage.setItem(LIVE_AGENTS_PREF, next ? '1' : '0'); } catch { /* preference only */ }
-      return next;
-    });
-  };
-
-  const closeLiveAgents = () => {
-    setLiveAgentsOpen(false);
-    try { localStorage.setItem(LIVE_AGENTS_PREF, '0'); } catch { /* preference only */ }
-  };
+  const currentChatSession = currentChatMatch ? decodeURIComponent(currentChatMatch[1]) : null;
+  // The badge never counts the conversation the user is currently watching —
+  // its bubble already narrates itself; other live work counts.
+  const liveRunCount = (workingNow.data ?? []).filter(
+    (entry) => !(currentChatSession && entry.sessionId === currentChatSession),
+  ).length;
 
   // A 401 from the daemon dispatches a global `clem:needs-login` event
   // (see lib/api.ts). Nothing surfaced it before, so an expired session was a
@@ -95,9 +77,8 @@ export function AppShell() {
           title={title}
           sidebarCollapsed={collapsed}
           onToggleSidebar={() => setCollapsed((v) => !v)}
-          liveAgentsOpen={liveAgentsOpen}
           liveRunCount={liveRunCount}
-          onToggleLiveAgents={toggleLiveAgents}
+          onOpenTasks={() => navigate('/tasks')}
         />
         <LocalRecordingBanner />
         {needsLogin && (
@@ -124,14 +105,6 @@ export function AppShell() {
         </main>
       </div>
 
-      <LiveAgentsPanel
-        open={liveAgentsOpen}
-        cards={boardCards}
-        loading={board.isLoading}
-        error={board.isError}
-        onRetry={() => { void board.refetch(); }}
-        onClose={closeLiveAgents}
-      />
 
       <CommandPalette />
       <VoiceOverlay />
