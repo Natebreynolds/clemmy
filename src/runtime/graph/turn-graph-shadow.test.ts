@@ -628,3 +628,48 @@ test('an affirmative-looking changed topic remains a fresh B graph with no paren
     'the parent send is not smuggled into the fresh delete request',
   );
 });
+
+// ─── The prompt-step pre-model persist stays deleted ─────────────────────────
+//
+// A legacy identity-only persist compiles a heuristic graph from PROSE and
+// stores it with NO semanticProvenanceDigest. When the workflow step lane did
+// this before the model ran (workflow-runner, 2026-08-11 → deleted 2026-08-25),
+// the typed lane's admitted graph then collided with that digestless prior at
+// the provenance comparison and the step died with "admitted graph persist
+// failed" — AFTER planning had succeeded (live: run 1787632002319-9538bf, step
+// "research"). The refusal itself is correct authority (two different graphs
+// must not share one source identity); the bug was the competing writer.
+test('a legacy identity-only workflow persist carries no provenance digest', () => {
+  const session = createSession({ id: 'shadow-legacy-workflow', kind: 'workflow' });
+  const source = appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Workflow: fixture\nStep: research\nResearch the prospect.' },
+  });
+  const event = recordTurnGraphShadow({
+    identity: { sessionId: session.id, turn: 1, sourceUserSeq: source.seq },
+    surface: 'workflow',
+  });
+  assert.ok(event, 'the legacy compile still works where it is legitimately used');
+  assert.equal(
+    (event.data as { semanticProvenanceDigest?: unknown }).semanticProvenanceDigest,
+    undefined,
+    'identity-only persists are digestless — which is exactly why one must never precede the typed lane',
+  );
+});
+
+test('the workflow prompt-step lane no longer persists a pre-model graph', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(
+    new URL('../../execution/workflow-runner.ts', import.meta.url),
+    'utf-8',
+  );
+  const calls = source.match(/recordTurnGraphShadow\(\{/g) ?? [];
+  // Exactly ONE writer remains: ensureWorkflowCallIdentity, for structured
+  // CALL nodes, which never enter the typed lane. A second call site here is
+  // the collision coming back.
+  assert.equal(
+    calls.length,
+    1,
+    'a new pre-model graph persist in the step lane will collide with the typed lane again',
+  );
+});

@@ -4039,25 +4039,23 @@ async function runStepViaHarness(
         attemptId: stepAttempt.attemptId,
       },
     });
-    // Persist the turn graph for this exact accepted source. Lanes that run
-    // through the harness loop arm themselves; the SDK workflow-step lane
-    // never enters the loop, and dispatch admission requires the persisted
-    // graph — without it every business call on the step was refused
-    // 'no persisted turn graph for accepted task' and the step blocked
-    // silently (live 2026-08-11, team-activity-slack-updates pull_activity:
-    // run_shell_command refused twice, run "completed" with 2 blocked steps
-    // and no notification). Same pattern as ensureWorkflowCallIdentity.
-    try {
-      const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
-      recordTurnGraphShadow({
-        identity: {
-          sessionId: realSessionId,
-          turn: sourceUserEvent.turn,
-          sourceUserSeq: sourceUserEvent.seq,
-        },
-        surface: 'workflow',
-      });
-    } catch { /* admission's typed refusal remains the fail-closed backstop */ }
+    // The pre-model graph persist that used to live here was DELETED
+    // (2026-08-25). It compiled a heuristic graph from the step PROSE before
+    // any model ran, and that legacy digestless graph then collided with the
+    // typed lane's admitted graph for the same source: the semantic planner
+    // would repair and admit a real plan, recordTurnGraphShadow would find the
+    // heuristic prior, compare its absent provenance digest against the
+    // ticket's, and refuse — killing the step with "admitted graph persist
+    // failed" AFTER planning had succeeded (live 2026-08-25, run
+    // 1787632002319-9538bf step "research").
+    //
+    // The 2026-08-11 dispatch-refusal class it was added for cannot recur: the
+    // prompt-step lane now runs recordAcceptedSourceGraph at brain prepare and
+    // fails closed BEFORE any provider or tool work; a port-unavailable step
+    // falls back to the legacy shadow compile inside admitAndCompileAccepted-
+    // Source, so a graph still exists before dispatch; and a model_failed step
+    // dispatches nothing at all. Structured CALL nodes never enter the typed
+    // lane and keep their own writer (ensureWorkflowCallIdentity).
     // Flag-gated (WORKFLOW_STEP_AGENT): the constrained step agent emits
     // structured output via workflow_step_result and CANNOT re-trigger
     // workflows (no recursion). Default off → the full orchestrator +
