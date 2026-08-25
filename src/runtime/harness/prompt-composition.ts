@@ -33,6 +33,7 @@
  * harness hands over at turn start — the part we control and can cut.
  */
 import { estimateTokens } from './budget.js';
+import { CACHE_BREAK_SENTINEL } from './model-wire-registry.js';
 import { createHash } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
 
@@ -84,6 +85,19 @@ export interface PromptCompositionInput {
   /** Rough per-schema cost when the real schemas are not in hand. Tool schemas
    *  are not free and pretending they are is how a "lean" prompt stays fat. */
   approxTokensPerToolSchema?: number;
+  /** MEASURED first-class tool schema tokens (name + description + parameters),
+   *  when the caller has the real serialized schemas in hand. Wins over the
+   *  toolNames x perSchema approximation. Measured 2026-08-25: the codex lane
+   *  passed neither, so a wire that carried 9,198 tokens was recorded as 6,850 —
+   *  ~1,939 tokens of tool schemas counted NOWHERE, and the meter was off by
+   *  34% of its own figure on the exact turn used to justify a trim. */
+  measuredToolSchemaTokens?: number;
+  /** MEASURED deferred-tool index tokens (name + description only), the
+   *  schema-on-demand catalog advertisement. Stable: same catalog every turn. */
+  deferredToolIndexTokens?: number;
+  /** MEASURED history tokens for callers whose history is structured items
+   *  rather than one string. Wins over estimating the history string. */
+  measuredHistoryTokens?: number;
 }
 
 const DEFAULT_TOKENS_PER_TOOL_SCHEMA = 120;
@@ -98,15 +112,39 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
     bytes: Buffer.byteLength(text, 'utf8'),
     sha256: createHash('sha256').update(text, 'utf8').digest('hex'),
   });
+  // Instructions are split at the cache-break sentinel the wire adapters
+  // already use: the half BEFORE it is the invariant system prompt; the half
+  // AFTER it is the per-turn memory context, which carries a minute-resolution
+  // clock and is deliberately kept OUT of the cacheable prefix by the codex
+  // adapter. Scoring the whole thing "stable" produced the 97%-fixed-overhead
+  // reading that nearly justified cutting the wrong bucket — ~2,950 of those
+  // "stable" tokens change every turn.
+  const instructionsText = input.instructions ?? '';
+  const sentinelAt = instructionsText.indexOf(CACHE_BREAK_SENTINEL);
+  const staticInstructions = sentinelAt >= 0 ? instructionsText.slice(0, sentinelAt) : instructionsText;
+  const memoryContext = sentinelAt >= 0 ? instructionsText.slice(sentinelAt + CACHE_BREAK_SENTINEL.length) : '';
+  const measuredTools = Number.isFinite(input.measuredToolSchemaTokens)
+    ? Math.max(0, Math.trunc(input.measuredToolSchemaTokens as number))
+    : null;
+  const measuredHistory = Number.isFinite(input.measuredHistoryTokens)
+    ? Math.max(0, Math.trunc(input.measuredHistoryTokens as number))
+    : null;
+  const deferredIndex = Number.isFinite(input.deferredToolIndexTokens)
+    ? Math.max(0, Math.trunc(input.deferredToolIndexTokens as number))
+    : 0;
   const raw: Array<[string, number, PromptBucketStability, string | null]> = [
     // STABLE: same bytes every turn for a given session, so the provider keeps
     // them warm. Large is FINE here — that is the whole point of the split.
-    ['instructions', estimateTokens(input.instructions ?? ''), 'stable', input.instructions ?? ''],
-    ['toolSchemas', toolNames.length * perSchema, 'stable', null],
+    ['instructions', estimateTokens(staticInstructions), 'stable', staticInstructions],
+    ['memoryContext', estimateTokens(memoryContext), 'variable', memoryContext],
+    // The measured serialized schemas win; the names x 120 guess is only for
+    // callers that never had the real schemas in hand.
+    ['toolSchemas', measuredTools ?? toolNames.length * perSchema, 'stable', null],
+    ['deferredToolIndex', deferredIndex, 'stable', null],
     // History is a stable PREFIX in principle (it only appends) but any change
     // upstream of it re-pays the lot, so it is scored with the variable side
     // where it will be noticed.
-    ['history', estimateTokens(input.history ?? ''), 'variable', input.history ?? ''],
+    ['history', measuredHistory ?? estimateTokens(input.history ?? ''), 'variable', measuredHistory !== null ? null : input.history ?? ''],
     ['contextPacket', estimateTokens(input.contextPacket ?? ''), 'variable', input.contextPacket ?? ''],
     ['currentMessage', estimateTokens(input.currentMessage ?? ''), 'variable', input.currentMessage ?? ''],
     ['outputSchema', estimateTokens(input.outputSchema ?? ''), 'variable', input.outputSchema ?? ''],

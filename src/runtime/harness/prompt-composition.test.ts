@@ -21,6 +21,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { summarizePromptComposition } = await import('./prompt-composition.js');
+const { CACHE_BREAK_SENTINEL } = await import('./model-wire-registry.js');
 
 after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
 
@@ -123,4 +124,48 @@ test('BYTE-STABILITY: the frozen system append is byte-identical across consecut
   } as never);
   assert.match(turnContext, /CALENDAR_LIST_RECORDS/,
     'moving the volatile card out of the stable prefix must not drop it from the model turn');
+});
+
+// ─── The meter must measure what is actually sent ────────────────────────────
+//
+// Measured 2026-08-25: prompt_composition reported 6,850 tokens while the wire
+// carried 9,198 — off by 34% of its own figure, on the exact turn used to
+// justify a prompt trim. Two causes, both pinned here: the codex call site
+// passed neither tool schemas nor history (the measured components existed two
+// lines up and were discarded), and instructions were scored wholly "stable"
+// although everything after the cache-break sentinel is per-turn memory context
+// carrying a minute-resolution clock.
+test('measured tool and history tokens win over approximations', () => {
+  const summary = summarizePromptComposition({
+    instructions: 'be helpful',
+    toolNames: ['a', 'b'],           // would approximate 2 x 120 = 240
+    measuredToolSchemaTokens: 1939,  // the real serialized cost
+    deferredToolIndexTokens: 581,
+    measuredHistoryTokens: 800,
+    currentMessage: 'hi',
+  });
+  const byName = new Map(summary.buckets.map((bucket) => [bucket.name, bucket]));
+  assert.equal(byName.get('toolSchemas')?.tokens, 1939, 'measured schemas, not names x 120');
+  assert.equal(byName.get('deferredToolIndex')?.tokens, 581);
+  assert.equal(byName.get('deferredToolIndex')?.stability, 'stable', 'same catalog every turn');
+  assert.equal(byName.get('history')?.tokens, 800);
+});
+
+test('instructions split at the cache sentinel: memory context is variable, not stable', () => {
+  const staticPart = 'You are Clem. Standing rules here.';
+  const memoryPart = 'Current time: 03:14. Recent facts: …';
+  const summary = summarizePromptComposition({
+    instructions: `${staticPart}${CACHE_BREAK_SENTINEL}${memoryPart}`,
+    currentMessage: 'hi',
+  });
+  const byName = new Map(summary.buckets.map((bucket) => [bucket.name, bucket]));
+  assert.equal(byName.get('instructions')?.stability, 'stable');
+  assert.equal(byName.get('memoryContext')?.stability, 'variable',
+    'the clock-bearing half must never inflate stableTokens');
+  assert.ok((byName.get('memoryContext')?.tokens ?? 0) > 0);
+  // Without the sentinel nothing changes shape — the whole text stays one
+  // stable instructions bucket, so the Claude lane is unaffected.
+  const plain = summarizePromptComposition({ instructions: staticPart, currentMessage: 'hi' });
+  const plainNames = new Map(plain.buckets.map((bucket) => [bucket.name, bucket]));
+  assert.equal(plainNames.get('memoryContext')?.tokens ?? 0, 0);
 });

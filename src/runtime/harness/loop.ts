@@ -8971,6 +8971,18 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // Observation only — this reads what is already being sent.
       recordPromptComposition(options.sessionId, 'codex', summarizePromptComposition({
         instructions: value.instructions ?? '',
+        // The MEASURED costs. This call previously passed neither tools nor
+        // history, so a wire carrying 9,198 tokens was recorded as 6,850 — the
+        // meter was off by 34% of its own figure on the very turn used to
+        // justify a prompt trim. The measured components were already computed
+        // two lines up and thrown away for this event.
+        ...(typeof toolPromptComponents.toolSchemas === 'number'
+          ? { measuredToolSchemaTokens: toolPromptComponents.toolSchemas }
+          : {}),
+        ...(typeof toolPromptComponents.deferredToolIndex === 'number'
+          ? { deferredToolIndexTokens: toolPromptComponents.deferredToolIndex }
+          : {}),
+        measuredHistoryTokens: estimateInputTokens(value.input),
         contextPacket: [
           contextPacket.text,
           opennessBlock,
