@@ -1453,16 +1453,33 @@ export function hostOnlySketchForSource(
   if (!persisted || persisted.validationOutcome !== 'admitted' || !persisted.raw || typeof persisted.raw !== 'object') {
     return false;
   }
-  const raw = persisted.raw as {
-    work?: { operations?: Array<{ requestedEffect?: unknown }> | null } | null;
+  return isHostOnlySketchProposal(persisted.raw);
+}
+
+/** Pure shape decision behind hostOnlySketchForSource, exported for pins. */
+export function isHostOnlySketchProposal(rawProposal: unknown): boolean {
+  if (!rawProposal || typeof rawProposal !== 'object') return false;
+  const raw = rawProposal as {
+    work?: {
+      requestedEffect?: unknown;
+      operations?: Array<{ requestedEffect?: unknown }> | null;
+    } | null;
   };
+  const hostNative = (effect: unknown): boolean => (
+    effect === 'host_only' || effect === 'none' || effect === 'compute'
+  );
   const operations = Array.isArray(raw.work?.operations) ? raw.work.operations : [];
-  return operations.length > 0
-    && operations.every((operation) => (
-      operation.requestedEffect === 'host_only'
-      || operation.requestedEffect === 'none'
-      || operation.requestedEffect === 'compute'
-    ));
+  if (operations.length > 0) {
+    return operations.every((operation) => hostNative(operation.requestedEffect));
+  }
+  // Zero operations is the ACT-DIRECTLY shape (live 2026-08-25, unified-lane
+  // morning-briefing): an admitted goal whose work is absent, or declares a
+  // host-native effect with nothing typed to bind, is host work for the model
+  // loop — the same loop that would have run it as a chat turn. A zero-op
+  // work that DECLARES a write keeps the fail-closed wall: consequential
+  // writes never fall through to the conversation loop unbound.
+  if (raw.work === null || raw.work === undefined) return true;
+  return hostNative(raw.work.requestedEffect);
 }
 
 export function blockedPresentationForSemanticRecord(

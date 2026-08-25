@@ -1104,3 +1104,21 @@ test('repair hint for a grounding conflict names the host-native expression and 
     assert.ok(!hints[0]!.includes(descriptor.id), `hint leaked an uncited capability id: ${descriptor.id}`);
   }
 });
+
+// ─── The act-directly shape is a host-only sketch (live 2026-08-25) ──────────
+//
+// Unified-lane morning-briefing: Sonnet's ADMITTED proposal declared
+// collect_then_construct with requestedEffect host_only and ZERO operations —
+// nothing typed to bind. The sketch detector demanded at least one operation,
+// so dispatch fell through to the unknown-ceiling wall and the run blocked
+// after a successful plan. Zero-op host-native work (or absent work) is the
+// model loop's job; a zero-op WRITE declaration keeps the fail-closed wall.
+test('a zero-operation host-native plan is a host-only sketch; a zero-op write is not', async () => {
+  const { isHostOnlySketchProposal } = await import('./interpret-accepted-source.js');
+  const raw = (work: unknown) => ({ version: 1, relation: 'new_goal', goal: { objective: 'briefing' }, work });
+  assert.equal(isHostOnlySketchProposal(raw(null)), true, 'work null — the act-directly shape');
+  assert.equal(isHostOnlySketchProposal(raw({ requestedEffect: 'host_only', operations: [] })), true, 'zero-op host_only');
+  assert.equal(isHostOnlySketchProposal(raw({ requestedEffect: 'compute', operations: [] })), true, 'zero-op compute');
+  assert.equal(isHostOnlySketchProposal(raw({ requestedEffect: 'external_write', operations: [] })), false, 'zero-op write keeps the wall');
+  assert.equal(isHostOnlySketchProposal(raw({ requestedEffect: 'host_only', operations: [{ requestedEffect: 'read' }] })), false, 'a foreign-read op is not a host-only sketch');
+});
