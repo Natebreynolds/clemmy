@@ -301,7 +301,37 @@ function suppliedGraphMatchesAcceptedSource(input: {
  * A/Q/B lineage returns null and the provider admission boundary fails closed.
  * This function never performs external work.
  */
-export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventRow | null {
+/** Closed refusal vocabulary. Host-owned strings only — never model or source
+ *  text: reasons land in logs and durable turn outcomes, and free text in a
+ *  durable discriminator is the exact class two prior reviews caught. */
+export type TurnGraphShadowRefusalReason =
+  | 'session_missing'
+  | 'source_missing'
+  | 'continuation_unverified'
+  | 'ticket_invalid'
+  | 'prior_lineage_mismatch'
+  | 'prior_undecodable'
+  | 'prior_source_mismatch'
+  | 'provenance_digest_mismatch'
+  | 'graph_hash_mismatch'
+  | 'admitted_without_graph'
+  | 'compile_validation_failed'
+  | 'append_failed'
+  | 'internal_error';
+
+/**
+ * The checked variant: every refusal names itself.
+ *
+ * recordTurnGraphShadow had ~13 silent `return null` paths, so a caller could
+ * only report "admitted graph persist failed" with no reason — which is what
+ * made the 2026-08-25 workflow-step deaths (a repaired, ADMITTED plan refused
+ * at persist against a digestless legacy prior) cost hours to attribute. The
+ * legacy nullable wrapper below is kept for fixtures and non-diagnostic
+ * callers; production admission paths call this and thread the reason.
+ */
+export function recordTurnGraphShadowChecked(
+  input: RecordTurnGraphShadowInput,
+): { ok: true; event: EventRow } | { ok: false; reason: TurnGraphShadowRefusalReason } {
   try {
     const session = getSession(input.identity.sessionId);
     // Every lane that dispatches through the settlement spine needs a
@@ -313,9 +343,9 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
     // contracts, and terminal adjudication remain chat-scoped at their own
     // seams (loop.ts / claude-agent-brain / delivery-committer kind checks);
     // the graph itself is lane-neutral dispatch admission.
-    if (!session) return null;
+    if (!session) return { ok: false, reason: 'session_missing' };
     const source = acceptedSource(input.identity);
-    if (!source || source.turn !== input.identity.turn) return null;
+    if (!source || source.turn !== input.identity.turn) return { ok: false, reason: 'source_missing' };
     const sourceText = acceptedText(source);
     const verifiedContinuation = input.verifiedTaskContinuation
       ? verifyDurableClarificationContext({
@@ -328,7 +358,7 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
     // Continuation semantics can raise the route/effect ceiling. A stale or
     // caller-forged A/Q/B capsule therefore fails closed instead of compiling
     // the bare answer and later admitting work under contradictory authority.
-    if (input.verifiedTaskContinuation && !verifiedContinuation) return null;
+    if (input.verifiedTaskContinuation && !verifiedContinuation) return { ok: false, reason: 'continuation_unverified' };
     const lineage = verifiedContinuation
       ? continuationLineageFor(input.identity.sessionId, verifiedContinuation)
       : undefined;
@@ -339,7 +369,7 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
           graph: input.graph,
         })
       : null;
-    if (input.persistenceTicket && !durablePersistence) return null;
+    if (input.persistenceTicket && !durablePersistence) return { ok: false, reason: 'ticket_invalid' };
     const prior = getTurnGraphEventForSource(
       input.identity.sessionId,
       input.identity.sourceUserSeq,
@@ -349,7 +379,7 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
         ? undefined
         : parseContinuationLineage(prior.data.taskContinuationLineage);
       if (lineage && (!priorLineage || !sameContinuationLineage(lineage, priorLineage))) {
-        return null;
+        return { ok: false, reason: 'prior_lineage_mismatch' };
       }
       const priorGraph = turnGraphFromShadowEvent(prior);
       if (
@@ -357,7 +387,7 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
         || prior.turn !== source.turn
         || prior.parentEventId !== source.id
         || prior.data.graphId !== graphId
-      ) return null;
+      ) return { ok: false, reason: 'prior_undecodable' };
 
       // A typed admit/compile caller supplies the exact graph it intends to
       // persist. Reusing an older graph solely because it shares the source
@@ -372,22 +402,22 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
           identity: input.identity,
           graphId,
           sourceText,
-        })) return null;
+        })) return { ok: false, reason: 'prior_source_mismatch' };
         if (durablePersistence) {
           if (
             prior.data.semanticProvenanceDigest
               !== durablePersistence.semanticProvenanceDigest
-          ) return null;
+          ) return { ok: false, reason: 'provenance_digest_mismatch' };
         } else if (input.graph.compiler.graphHash !== priorGraph.compiler.graphHash) {
-          return null;
+          return { ok: false, reason: 'graph_hash_mismatch' };
         }
       } else if (input.admitted) {
         // Admitted semantics must arrive through the atomic precompile seam;
         // accepting an opaque admission beside a pre-existing legacy graph
         // provides no graph hash with which to prove equivalence.
-        return null;
+        return { ok: false, reason: 'admitted_without_graph' };
       }
-      return prior;
+      return { ok: true, event: prior };
     }
 
     const text = graphSemanticText(
@@ -401,7 +431,7 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
       : snapshotTurnGraphPolicy(input.policy ?? getProactivityPolicySnapshot());
     const startedAt = performance.now();
     if (input.admitted !== undefined && !isAdmittedTurnSemantics(input.admitted)) {
-      return null;
+      return { ok: false, reason: 'ticket_invalid' };
     }
     const compiled = input.graph
       ? {
@@ -437,7 +467,7 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
             ),
           },
         });
-    if (!compiled.validation.ok) return null;
+    if (!compiled.validation.ok) return { ok: false, reason: 'compile_validation_failed' };
     const compileMs = Number((performance.now() - startedAt).toFixed(3));
     const graph = compiled.graph;
     const authorityRequirements = [...new Set(graph.nodes
@@ -446,7 +476,7 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
     const capabilityKinds = [...new Set(graph.nodes
       .flatMap((node) => node.capabilities.map((capability) => capability.kind)))].sort();
 
-    return appendTurnGraphEventOnce({
+    const appended = appendTurnGraphEventOnce({
       sessionId: input.identity.sessionId,
       turn: input.identity.turn,
       sourceUserSeq: input.identity.sourceUserSeq,
@@ -474,7 +504,19 @@ export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventR
         graph,
       },
     }).event;
+    if (!appended) return { ok: false, reason: 'append_failed' };
+    return { ok: true, event: appended };
   } catch {
-    return null;
+    // Load-bearing blanket catch: this runs inside brain prepare, and a throw
+    // here would take the turn down harder than a refusal. Reason construction
+    // above is throw-free by design.
+    return { ok: false, reason: 'internal_error' };
   }
+}
+
+/** Legacy nullable shape, kept for fixtures and non-diagnostic callers.
+ *  Production admission paths use the checked variant and thread the reason. */
+export function recordTurnGraphShadow(input: RecordTurnGraphShadowInput): EventRow | null {
+  const result = recordTurnGraphShadowChecked(input);
+  return result.ok ? result.event : null;
 }

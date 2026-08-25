@@ -50,6 +50,7 @@ import {
 import { synthesizeConstructOperations } from './host-bind-operations.js';
 import {
   recordTurnGraphShadow,
+  recordTurnGraphShadowChecked,
   sessionHasPriorRetrieveOrAct,
   turnGraphFromShadowEvent,
 } from '../graph/turn-graph-shadow.js';
@@ -1337,7 +1338,7 @@ export async function admitAndCompileAcceptedSource(input: {
       },
     };
   }
-  const event = recordTurnGraphShadow({
+  const persisted = recordTurnGraphShadowChecked({
     identity: input.identity,
     surface: input.surface,
     allowedToolNames: input.allowedToolNames,
@@ -1346,7 +1347,11 @@ export async function admitAndCompileAcceptedSource(input: {
     graph: compiled.compiled.graph,
     persistenceTicket: compiled.persistenceTicket,
   });
-  if (!event) return { ok: false, reason: 'admitted graph persist failed' };
+  // The refusal names itself. "admitted graph persist failed" with no reason is
+  // what made the 2026-08-25 step deaths (an ADMITTED plan refused against a
+  // digestless legacy prior) cost hours to attribute.
+  if (!persisted.ok) return { ok: false, reason: `admitted graph persist refused: ${persisted.reason}` };
+  const event = persisted.event;
   const durableGraph = turnGraphFromShadowEvent(event);
   if (!durableGraph) return { ok: false, reason: 'admitted graph replay failed durable validation' };
   const validation = validateTurnGraph(durableGraph);
@@ -1383,7 +1388,7 @@ export async function admitAndCompilePrimaryModelProposal(input: {
   if (compiled.compiled.graph.classification.route !== 'act') {
     return { ok: false, reason: 'plan_task may persist only an admitted action graph' };
   }
-  const event = recordTurnGraphShadow({
+  const persisted = recordTurnGraphShadowChecked({
     identity: input.identity,
     surface: input.surface,
     allowedToolNames: input.allowedToolNames,
@@ -1392,7 +1397,11 @@ export async function admitAndCompilePrimaryModelProposal(input: {
     graph: compiled.compiled.graph,
     persistenceTicket: compiled.persistenceTicket,
   });
-  if (!event) return { ok: false, reason: 'admitted graph persist failed' };
+  // The refusal names itself. "admitted graph persist failed" with no reason is
+  // what made the 2026-08-25 step deaths (an ADMITTED plan refused against a
+  // digestless legacy prior) cost hours to attribute.
+  if (!persisted.ok) return { ok: false, reason: `admitted graph persist refused: ${persisted.reason}` };
+  const event = persisted.event;
   const durableGraph = turnGraphFromShadowEvent(event);
   if (!durableGraph) return { ok: false, reason: 'admitted graph replay failed durable validation' };
   const validation = validateTurnGraph(durableGraph);

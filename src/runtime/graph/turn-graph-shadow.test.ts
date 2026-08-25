@@ -673,3 +673,44 @@ test('the workflow prompt-step lane no longer persists a pre-model graph', async
     'a new pre-model graph persist in the step lane will collide with the typed lane again',
   );
 });
+
+// ─── Every persist refusal names itself ──────────────────────────────────────
+//
+// recordTurnGraphShadow had ~13 silent null paths, so admission could only say
+// "persist failed" with no reason — which made the 2026-08-25 step deaths cost
+// hours to attribute. The checked variant returns a CLOSED host enum; model or
+// source text must never appear in a reason (free text in a durable
+// discriminator is the class two prior reviews caught).
+test('the checked persist names its refusal from a closed host vocabulary', async () => {
+  const { recordTurnGraphShadowChecked } = await import('./turn-graph-shadow.js');
+  const CLOSED = new Set([
+    'session_missing', 'source_missing', 'continuation_unverified', 'ticket_invalid',
+    'prior_lineage_mismatch', 'prior_undecodable', 'prior_source_mismatch',
+    'provenance_digest_mismatch', 'graph_hash_mismatch', 'admitted_without_graph',
+    'compile_validation_failed', 'append_failed', 'internal_error',
+  ]);
+  // No session at all → the first refusal on the path.
+  const missing = recordTurnGraphShadowChecked({
+    identity: { sessionId: 'no-such-session-shadow', turn: 1, sourceUserSeq: 1 },
+    surface: 'workflow',
+  });
+  assert.equal(missing.ok, false);
+  assert.equal((missing as { reason: string }).reason, 'session_missing');
+  assert.ok(CLOSED.has((missing as { reason: string }).reason));
+
+  // A session whose source seq does not exist → source_missing.
+  createSession({ id: 'shadow-checked-src', kind: 'chat' });
+  const noSource = recordTurnGraphShadowChecked({
+    identity: { sessionId: 'shadow-checked-src', turn: 1, sourceUserSeq: 999999 },
+    surface: 'chat',
+  });
+  assert.equal(noSource.ok, false);
+  assert.equal((noSource as { reason: string }).reason, 'source_missing');
+
+  // The legacy nullable wrapper still behaves identically for fixtures.
+  const { recordTurnGraphShadow } = await import('./turn-graph-shadow.js');
+  assert.equal(recordTurnGraphShadow({
+    identity: { sessionId: 'no-such-session-shadow', turn: 1, sourceUserSeq: 1 },
+    surface: 'workflow',
+  }), null);
+});
