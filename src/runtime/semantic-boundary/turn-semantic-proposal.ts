@@ -669,16 +669,21 @@ function validateRelationMatrix(
       // Clarifying open-slots with no work are conversation, not illegal work.
       // Structured work remains required only when the proposal claims an
       // executable plan.
-      const clarifyingOpenSlots = proposal.goal !== null
-        && proposal.goal.openSlots.length > 0
-        && (suppliedNoWork || (proposal.work?.operations.length ?? 0) === 0);
+      // A goal WITHOUT structured work is the act-directly shape: "here is
+      // what I am doing; I will do it with tools now." It admits and routes
+      // as model-driven execution — no operations means nothing typed to
+      // bind, so the turn proceeds through the ordinary tool loop under the
+      // same effect gates as any other turn. Refusing it forced every brain
+      // to fabricate a work topology for host-native tasks; the first Claude
+      // proposal on the unified lane (live 2026-08-25, morning-briefing)
+      // declared an honest goal with work:null and was blocked twice for the
+      // shape alone. Structured work stays fully validated WHEN CLAIMED.
       if (
         proposal.targetGoal !== null
         || proposal.goal === null
-        || (!clarifyingOpenSlots && suppliedNoWork)
         || !noAnswers
       ) {
-        issue(issues, 'illegal_relation_payload', '', 'new_goal requires one goal, structured work or clarifying open slots, and no target or slot answers');
+        issue(issues, 'illegal_relation_payload', '', 'new_goal requires one goal and carries no target or slot answers');
       }
       return;
     }

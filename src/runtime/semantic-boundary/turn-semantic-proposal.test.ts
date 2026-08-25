@@ -325,13 +325,18 @@ test('new_goal with clarifying open-slots and no work is legal conversation, not
   assert.equal(result.ok, true, issueCodes(result).join(','));
 });
 
-test('new_goal with no work and no open-slots is still illegal', () => {
+test('new_goal with no work is the act-directly shape and admits', () => {
+  // Live 2026-08-25 (first Claude proposal on the unified workflow lane): an
+  // honest goal with work:null — "I will do this with tools now" — was
+  // blocked twice for the shape alone, forcing every brain to fabricate a
+  // work topology for host-native tasks. Goal-only new_goal admits and the
+  // turn proceeds as model-driven execution; structured work stays fully
+  // validated when the proposal claims one.
   const result = validateTurnSemanticProposalV1(proposal({
     work: null,
     goal: { ...goal(), openSlots: [], candidates: [] },
   }), host());
-  assert.equal(result.ok, false);
-  assert.ok(issueCodes(result).includes('illegal_relation_payload'));
+  assert.equal(result.ok, true, issueCodes(result).join(','));
 });
 
 test('relation matrix rejects model payloads that imply another lifecycle', () => {
