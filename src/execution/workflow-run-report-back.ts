@@ -653,6 +653,25 @@ function resolveWorkflowOriginGroupReport(
 }
 
 const CORRUPT_EVIDENCE_MAX_ATTEMPTS = 3;
+/**
+ * Delivery had NO give-up at all: it retried forever on a 5-minute backoff,
+ * silently. A run could finish, record its result, and never reach the person
+ * who asked for it — with nothing surfacing that fact anywhere.
+ *
+ * Observed 2026-08-25: report-back delivery is gated on the run's source group
+ * having activated, so when a dispatch orphaned, delivery failed with "waiting
+ * for source group … to activate" and simply kept waiting. Runs reached 10 and
+ * 11 consecutive failures and would have gone on indefinitely. The failure mode
+ * is at its worst exactly when it matters most — the thing that broke is the
+ * thing reporting depends on.
+ *
+ * Quarantine does not hide it: it stops the pointless I/O and leaves the run
+ * report-back-pending, which is what the stalled-run watchdog surfaces to the
+ * user as "finished, but the result could not be delivered". With the backoff
+ * above this allows roughly twenty minutes of genuine retrying first, so an
+ * ordinary transient failure still recovers on its own.
+ */
+const DELIVERY_MAX_ATTEMPTS = 12;
 const RETRY_BASE_DELAY_MS = 1_000;
 const RETRY_MAX_DELAY_MS = 5 * 60_000;
 
@@ -667,7 +686,10 @@ function nextRetryState(
     : undefined;
   const failureCount = (previous?.failureCount ?? 0) + 1;
   const nowIso = new Date(now).toISOString();
-  if (kind === 'corrupt_evidence' && failureCount >= CORRUPT_EVIDENCE_MAX_ATTEMPTS) {
+  const exhausted = kind === 'corrupt_evidence'
+    ? failureCount >= CORRUPT_EVIDENCE_MAX_ATTEMPTS
+    : failureCount >= DELIVERY_MAX_ATTEMPTS;
+  if (exhausted) {
     return {
       version: 1,
       kind,
