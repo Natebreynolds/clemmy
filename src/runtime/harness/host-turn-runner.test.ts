@@ -541,6 +541,7 @@ function commitHostSettlement(input: {
   args: unknown;
   signals: Parameters<typeof outcomes.classifyAttemptOutcome>[0];
   executionKind?: 'refused_pre_dispatch' | 'local_execution';
+  recovery?: { businessCall: boolean; mutating: boolean };
 }) {
   const identity = {
     ...input.task,
@@ -556,7 +557,7 @@ function commitHostSettlement(input: {
     contract: { toolName: input.toolName, args: input.args },
     execution: { kind: input.executionKind ?? 'refused_pre_dispatch' },
     outcome: outcomes.classifyAttemptOutcome(input.signals),
-    recovery: { businessCall: true, mutating: false },
+    recovery: input.recovery ?? { businessCall: true, mutating: false },
     observer: { lane: 'agents_runner', callId: input.callId, turn: 1 },
   });
   assert.equal(committed.status, 'committed');
@@ -5731,4 +5732,56 @@ test('a retired frame is retryable after the user speaks again', async () => {
   );
   assert.equal(second.finalOutput, 'tried again after the user remediated');
   assert.ok(secondModel.calls() >= 2, 'the model must be reached, not short-circuited from history');
+});
+
+// ─── A dead read is not an uncertain write (live 2026-08-25) ─────────────────
+//
+// tool_search — local execution, declared non-mutating, ZERO crossings that
+// left the machine — hit a TimeoutError and the turn terminated with "its
+// effect must be reconciled before continuing", killing two workflow
+// dispatches in a row. The invocation kernel's own durable settlement proves
+// there is nothing to reconcile (non-mutating, transient-retryable, no bytes
+// crossed out); classification now honors it and the model replans. The
+// blocked side of the boundary is pinned by "a refused or failed plan
+// barrier never starts its fused read" above: a settled failure whose
+// directive is NOT transient-retryable still blocks, and an unbound local
+// write never reaches invoke at all (refused pre-dispatch by admission).
+test('a dead registered read replans instead of poisoning the turn', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('read-timeout-replan');
+    let invocations = 0;
+    const readTool = brackets.wrapToolForHarness({
+      type: 'function', name: 'task_list', description: 'host task read',
+      parameters: { type: 'object', additionalProperties: true },
+      needsApproval: async () => false,
+      invoke: async () => {
+        invocations += 1;
+        const err = new Error('deadline elapsed');
+        err.name = 'TimeoutError';
+        throw err;
+      },
+    });
+    const model = stubModel([
+      [toolCall('read-timeout-1', 'task_list', {})],
+      [textMsg('recovered')],
+    ]);
+    const agent = { model, tools: [readTool] };
+    bindHostCanarySurface(fixture, agent, [readTool]);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(invocations, 1, 'the read actually entered invoke — this exercises the settlement path, not a pre-dispatch refusal');
+    assert.equal(outcome.finalOutput, 'recovered',
+      `the model replans instead of the turn dying: ${JSON.stringify(outcome.terminal ?? {})}`);
+    assert.equal(model.calls(), 2);
+    assert.deepEqual(dispositionMarkers(outcome.history), [{
+      disposition: 'refused_pre_dispatch',
+      effect: 'none',
+      retry: 'replan',
+      requiresReconciliation: false,
+    }]);
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
 });

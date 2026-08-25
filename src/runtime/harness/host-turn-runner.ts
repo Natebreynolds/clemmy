@@ -2407,12 +2407,33 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         acceptedTaskId: acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq),
         logicalToolCallId: call.callId,
       });
-      return redeemed.status === 'ok'
-        && redeemed.settlement.executionKind === 'refused_pre_dispatch'
-        && redeemed.settlement.physicalCrossingCount === 0
-        && redeemed.settlement.hostCrossingCount === 0
-        ? 'zero_crossing'
-        : 'effect_may_have_started';
+      if (redeemed.status !== 'ok') return 'effect_may_have_started';
+      const settlement = redeemed.settlement;
+      if (
+        settlement.executionKind === 'refused_pre_dispatch'
+        && settlement.physicalCrossingCount === 0
+        && settlement.hostCrossingCount === 0
+      ) return 'zero_crossing';
+      // A DECLARED-READ call with zero crossings that left the machine has no
+      // external effect to reconcile: the settlement is host-authored at mint
+      // (never the model, never a name heuristic), physicalCrossingCount
+      // means bytes crossed OUT, and a read that died mid-execution changed
+      // nothing anywhere. Live 2026-08-25: tool_search — local, non-mutating,
+      // zero physical crossings — hit a TimeoutError and the turn ended with
+      // "its effect must be reconciled", killing two workflow dispatches.
+      // Three bounds keep this narrow: a mutating or business call keeps
+      // reconciliation ownership even with zero recorded crossings (a partial
+      // local write is real), and the settlement's OWN recovery verdict must
+      // say the failure is transient-retryable — a failed control barrier
+      // (e.g. a plan that was not admitted) settles with a different
+      // directive and must still block its fused frame.
+      if (
+        settlement.recovery.mutating === false
+        && settlement.recovery.businessCall === false
+        && settlement.physicalCrossingCount === 0
+        && settlement.outcome.directive.action === 'retry_with_backoff'
+      ) return 'zero_crossing';
+      return 'effect_may_have_started';
     } catch {
       return 'effect_may_have_started';
     }
