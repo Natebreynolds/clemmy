@@ -22,15 +22,14 @@ const iso = (msAgo: number) => new Date(T0 - msAgo).toISOString();
 const FIVE_MIN = 5 * 60_000;
 
 test('recommendedRecoveryForStalledRun maps every watchdog reason to a concrete Tasks action', () => {
-  assert.deepEqual(
-    recommendedRecoveryForStalledRun({ id: 'q1', workflow: 'wf', reason: 'queued_not_draining' }),
-    {
-      action: 'open_tasks',
-      label: 'Open Tasks',
-      detail: 'Open Tasks to start or reprioritize the queued run; restart the daemon if the queue still does not drain.',
-      href: '/tasks',
-    },
-  );
+  const queued = recommendedRecoveryForStalledRun({ id: 'q1', workflow: 'wf', reason: 'queued_not_draining' });
+  assert.equal(queued.action, 'open_tasks');
+  assert.equal(queued.href, '/tasks');
+  // These strings are read by the person whose work did not run. They must name
+  // the workflow and must not hand over operator chores: "restart the daemon"
+  // made a queue that never drained look like the owner's problem to solve.
+  assert.match(queued.detail, /"wf"/, 'the person is told WHICH workflow stalled');
+  assert.doesNotMatch(queued.detail, /restart the daemon/i);
   assert.equal(
     recommendedRecoveryForStalledRun({ id: 'p1', workflow: 'wf', reason: 'parked_awaiting_approval' }).action,
     'approve_or_reject',
@@ -39,9 +38,21 @@ test('recommendedRecoveryForStalledRun maps every watchdog reason to a concrete 
     recommendedRecoveryForStalledRun({ id: 'r1', workflow: 'wf', reason: 'running_silent' }).action,
     'cancel_and_resume',
   );
-  assert.equal(
-    recommendedRecoveryForStalledRun({ id: 't1', workflow: 'wf', reason: 'terminal_unnotified' }).action,
-    'open_result',
+  const terminal = recommendedRecoveryForStalledRun({ id: 't1', workflow: 'wf', reason: 'terminal_unnotified' });
+  assert.equal(terminal.action, 'open_result');
+  // The outcome is ALREADY KNOWN at this point. Telling someone to go "inspect
+  // the terminal run result and confirm the user-visible report-back state" is
+  // withholding the answer while sounding helpful.
+  assert.match(terminal.detail, /finished/i, 'say that it finished');
+  assert.doesNotMatch(terminal.detail, /inspect|confirm the user-visible/i);
+
+  const stuckDelivery = recommendedRecoveryForStalledRun({
+    id: 't2', workflow: 'wf', reason: 'terminal_unnotified', reportBackPending: true,
+  });
+  assert.match(
+    stuckDelivery.detail,
+    /could not deliver/i,
+    'when delivery is what failed, say so instead of implying the result is unknown',
   );
 });
 

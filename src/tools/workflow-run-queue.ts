@@ -3395,7 +3395,7 @@ export function reapOrphanedWorkflowChatDispatches(
       const runId = entry.replace(/\.json$/, '');
       const outcome = cancel({
         runId,
-        reason: 'This run was prepared for chat dispatch but its originating turn never completed the handoff, so it could never start and was blocking new runs of this workflow.',
+        reason: 'This run never started. The request that queued it did not finish handing it off, so nothing ran and nothing changed — and it was blocking new runs of this workflow. Ask me to run it again whenever you want it.',
         source: 'boot:orphaned-chat-dispatch-reaper',
       });
       if (outcome.status === 'cancelled') result.cancelled += 1;

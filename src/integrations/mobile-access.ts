@@ -109,7 +109,7 @@ export function mobileAccessTarget(
     url: `http://127.0.0.1:${WEBHOOK_PORT}/m/`,
     mode: 'local-preview',
     qrReady: false,
-    qrBlockedReason: 'The direct-app door is closed, so a phone cannot reach this Mac. Restart the daemon to open it.',
+    qrBlockedReason: 'Your phone cannot reach this Mac right now because the direct connection is closed. Quit and reopen Clementine to reopen it.',
   };
 }
 

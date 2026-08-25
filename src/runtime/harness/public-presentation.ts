@@ -104,7 +104,7 @@ export function publicHeldExecutionText(input: PublicHeldExecutionInput): string
         : input.cause === 'observation'
           ? 'Next: reconnect the provider so I can observe the live operation and account.'
           : input.cause === 'settlement'
-            ? 'Next: wait for recovery, or ask me to inspect the reserved crossing.'
+            ? 'Next: wait for recovery to finish, or ask me to check whether that step actually went through.'
             : 'Next: restate the request, or approve the capability if one is missing.';
   const lead = input.kind === 'uncertain'
     ? 'I stopped because I cannot prove whether that work finished.'

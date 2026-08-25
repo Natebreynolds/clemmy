@@ -33,7 +33,11 @@ test('getMobileAccessStatusPayload returns a coherent door-closed payload', asyn
   assert.match(payload.targetUrl ?? '', /^http:\/\/127\.0\.0\.1:\d+\/m\/$/);
   assert.equal(payload.target.mode, 'local-preview');
   assert.equal(payload.target.qrReady, false);
-  assert.match(payload.target.qrBlockedReason ?? '', /door is closed/i);
+  // The reason is read by the person holding the phone, so it must say what is
+  // wrong in their terms and must not hand them an operator chore ("restart the
+  // daemon" was the previous wording).
+  assert.match(payload.target.qrBlockedReason ?? '', /phone cannot reach this Mac/i);
+  assert.doesNotMatch(payload.target.qrBlockedReason ?? '', /restart the daemon/i);
   assert.equal(payload.targetMode, 'local-preview');
   assert.ok(payload.setup, 'the derived setup view rides along');
 });

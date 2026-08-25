@@ -210,8 +210,20 @@ export function dropReportedBackTerminalRuns(
   );
 }
 
+/**
+ * What the user is told when a run stalls.
+ *
+ * These are the words a person actually receives, so they must say what
+ * happened and what is needed. Two of them used to hand over an operator
+ * runbook instead: terminal_unnotified said "open Tasks to inspect the terminal
+ * run result and confirm the user-visible report-back state", and
+ * queued_not_draining said "restart the daemon if the queue still does not
+ * drain". Neither is something to ask of the person whose work did not run, and
+ * the first is worse than useless — the outcome is already known here, so
+ * telling them to go find it is withholding the answer while sounding helpful.
+ */
 export function recommendedRecoveryForStalledRun(
-  run: Pick<StalledRun, 'id' | 'workflow' | 'reason'>,
+  run: Pick<StalledRun, 'id' | 'workflow' | 'reason' | 'reportBackPending'>,
 ): WorkflowRecommendedRecovery {
   switch (run.reason) {
     case 'parked_awaiting_approval':
@@ -229,18 +241,25 @@ export function recommendedRecoveryForStalledRun(
         href: '/tasks',
       };
     case 'terminal_unnotified':
+      // The run FINISHED and its result is already recorded. The only thing
+      // that failed is delivery, so say that rather than implying the outcome
+      // is unknown or that the person needs to determine it.
       return {
         action: 'open_result',
         label: 'Open result',
-        detail: 'Open Tasks to inspect the terminal run result and confirm the user-visible report-back state.',
+        detail: run.reportBackPending === true
+          ? `"${run.workflow}" finished and its result was recorded, but Clementine could not deliver the report back to this conversation and is still retrying. The result is waiting in Tasks.`
+          : `"${run.workflow}" finished and its result was recorded, but there is no confirmation it was reported back to you. The result is waiting in Tasks.`,
         href: '/tasks',
       };
     case 'queued_not_draining':
     default:
+      // Restarting the daemon is not a user's job, and naming it here made a
+      // queue that never drained look like the owner's problem to solve.
       return {
         action: 'open_tasks',
         label: 'Open Tasks',
-        detail: 'Open Tasks to start or reprioritize the queued run; restart the daemon if the queue still does not drain.',
+        detail: `"${run.workflow}" is queued but has not started. Start or reprioritize it from Tasks; if it stays queued, the run queue is not draining and that is a Clementine fault, not something you need to fix.`,
         href: '/tasks',
       };
   }
