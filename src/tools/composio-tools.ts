@@ -35,6 +35,8 @@ import {
   listComposioToolkitTools,
   searchConnectedComposioTools,
   listUsableConnectedToolkits,
+  listConnectedToolkits,
+  peekConnectedToolkits,
   peekCurrentConnectedToolkits,
   peekCurrentComposioCliExecutionStatus,
   filterSuppressedConnectedToolkits,
@@ -2397,9 +2399,34 @@ export async function resolveComposioDispatch(
   // Execution consumes the exact provider observations prepared by discovery
   // or plan publication. It must never hide an account-list request inside the
   // business logical call before that call owns a physical provider attempt.
-  const preparedConnectionSnapshot = opts.preparedExecution
+  //
+  // RE-VALIDATION IS NOT DISCOVERY (live 2026-08-25, scorpion-facebook-trends):
+  // the observation is current for 60 seconds, and on a day of 3-30s provider
+  // latencies the model's read→dispatch cycle routinely lost the race — every
+  // Apify call refused "no current connected-account observation", the model
+  // ran the prescribed preparation reads, and the observation aged out again
+  // before the next dispatch. When a PRIOR observation exists (last-good
+  // registry non-empty — so this is never a hidden first look at the account
+  // list), a stale observation is refreshed here once, bounded, before the
+  // gate reads it. A machine that has never observed accounts still refuses
+  // and prescribes the explicit read.
+  let preparedConnectionSnapshot = opts.preparedExecution
     ? peekCurrentConnectedToolkits()
     : undefined;
+  if (
+    opts.preparedExecution
+    && preparedConnectionSnapshot === null
+    && peekConnectedToolkits().length > 0
+  ) {
+    try {
+      let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        listConnectedToolkits({ requireFresh: true }),
+        new Promise((resolve) => { refreshTimer = setTimeout(resolve, 12_000); }),
+      ]).finally(() => { if (refreshTimer) clearTimeout(refreshTimer); });
+    } catch { /* the gate below still owns the refusal */ }
+    preparedConnectionSnapshot = peekCurrentConnectedToolkits();
+  }
   let conns: ConnectedToolkit[] = [];
   if (opts.preparedExecution) {
     conns = preparedConnectionSnapshot === null
