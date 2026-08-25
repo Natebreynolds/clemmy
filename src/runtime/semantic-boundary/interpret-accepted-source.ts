@@ -1431,6 +1431,14 @@ export function blockedPresentationForSemanticRecord(
   if (!record || record.validationOutcome === 'model_failed') {
     return 'I could not finish planning that, so I stopped before using any tools. You can restate it.';
   }
+  // A record that was ADMITTED and still reaches this blocked presentation
+  // means the failure came AFTER planning — observed live 2026-08-25: the
+  // repaired plan was admitted and the graph persist was refused, yet the user
+  // was told the plan "did not pass my own structural check either time". A
+  // blocked message must never contradict the durable record it is standing on.
+  if (record.validationOutcome === 'admitted') {
+    return 'I planned that successfully, but an internal step failed before I could start executing, so nothing ran and nothing changed. This is a fault on my side — not your wording, and not the plan. Ask me to run it again.';
+  }
   // "Restate it" is aimed at the user, but a validation failure is the PLAN
   // failing its own structural check — the request was understood, and
   // rewording it changes nothing. Say which of the two it was, so a scheduled

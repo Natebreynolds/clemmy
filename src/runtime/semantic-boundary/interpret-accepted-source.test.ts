@@ -929,3 +929,27 @@ test('a structurally invalid proposal is repaired once, whatever the issue code'
   );
   assert.equal(interprets, 2, 'exactly one repair, still bounded');
 });
+
+// ─── A blocked message must never contradict its own durable record ──────────
+//
+// Observed live 2026-08-25 (run 1787632002319-9538bf, step "research"): the
+// planner failed once, REPAIRED successfully — validationOutcome=admitted — and
+// the turn then blocked downstream (graph persist refused). The presentation
+// keyed on repairAttempted alone and told the user the plan "did not pass my
+// own structural check either time". The plan had passed.
+test('an admitted record never renders as a failed structural check', async () => {
+  const { blockedPresentationForSemanticRecord } = await import('./interpret-accepted-source.js');
+  const admitted = blockedPresentationForSemanticRecord({
+    validationOutcome: 'admitted',
+    repairAttempted: true,
+  } as never);
+  assert.doesNotMatch(admitted, /did not pass/i, 'the plan passed; do not say it failed');
+  assert.match(admitted, /fault on my side/i, 'own the internal failure plainly');
+  assert.match(admitted, /nothing ran and nothing changed/i);
+
+  const invalid = blockedPresentationForSemanticRecord({
+    validationOutcome: 'invalid',
+    repairAttempted: true,
+  } as never);
+  assert.match(invalid, /did not pass my own structural check either time/i);
+});
