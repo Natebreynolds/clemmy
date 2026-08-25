@@ -56,6 +56,10 @@ const TOP_SCHEMAS = 3;
  *  keeps slow-but-alive sources contributing while a wedged one can no longer
  *  hold a discovery READ for the carrier's whole call window. */
 export const CANDIDATE_SOURCE_SEARCH_DEADLINE_MS = 10_000;
+/** Budget for the planning-disclosure materialization stage as a whole:
+ *  generous against one slow candidate, fatal to a full-list walk of a slow
+ *  provider (~3.3s/fetch measured live × 20 candidates = the 60s stalls). */
+export const PLANNING_DISCLOSURE_DEADLINE_MS = 15_000;
 
 const DESCRIPTION = [
   'Search the full built-in tool catalog by intent and get the tools that match — names + one-line summaries for the top results, plus the complete JSON input schema for the closest few so you can call them right the first time.',
@@ -350,8 +354,25 @@ export function registerToolSearchTool(
           }))).filter((candidate): candidate is ToolSearchPlanningDisclosureCandidate => candidate !== null)
         : [];
       const planningCandidateByName = new Map(planningCandidates.map((candidate) => [candidate.name, candidate]));
+      // Planning disclosure materializes exact host refs, which can mean one
+      // LIVE schema fetch per candidate — measured ~3.3s each against the
+      // provider today, and five consecutive 60-second tool_search calls in
+      // one live turn (2026-08-25, the team-slack-update request) were this
+      // stage walking a candidate list with no budget. Discovery is a READ:
+      // it answers with what materialized inside the budget, and the
+      // existing no-materialized-ref copy stays honest about the rest.
+      let disclosureTimer: ReturnType<typeof setTimeout> | undefined;
+      const disclosureExpired = Symbol('planning-disclosure-deadline');
       const planningRefs = opts.discloseForPlanning
-        ? await opts.discloseForPlanning(planningCandidates)
+        ? await Promise.race([
+            opts.discloseForPlanning(planningCandidates),
+            new Promise<typeof disclosureExpired>((resolve) => {
+              disclosureTimer = setTimeout(() => resolve(disclosureExpired), PLANNING_DISCLOSURE_DEADLINE_MS);
+            }),
+          ]).then((outcome) => {
+            if (disclosureTimer) clearTimeout(disclosureTimer);
+            return outcome === disclosureExpired ? {} : outcome;
+          })
         : {};
 
       // When the model supplied an exact tool name, it has already selected

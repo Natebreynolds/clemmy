@@ -68,11 +68,14 @@ final class WebViewModel: NSObject, ObservableObject {
         webView.scrollView.refreshControl = refreshControl
         // The page owns safe-area padding via env(); the shell stays dark and
         // silent — no white flash before first paint, no double insets.
-        let peelBlack = UIColor(red: 12 / 255, green: 9 / 255, blue: 6 / 255, alpha: 1)
+        // 100% light mode (owner directive 2026-08-25): the shell paints the
+        // same warm paper the page uses, so there is no dark flash before
+        // first paint and no dark halo behind rubber-band overscroll.
+        let paper = UIColor(red: 252 / 255, green: 249 / 255, blue: 244 / 255, alpha: 1)
         webView.isOpaque = false
-        webView.backgroundColor = peelBlack
-        webView.underPageBackgroundColor = peelBlack
-        webView.scrollView.backgroundColor = peelBlack
+        webView.backgroundColor = paper
+        webView.underPageBackgroundColor = paper
+        webView.scrollView.backgroundColor = paper
         webView.scrollView.contentInsetAdjustmentBehavior = .never
         #if DEBUG
         webView.isInspectable = true
@@ -127,14 +130,16 @@ final class WebViewModel: NSObject, ObservableObject {
 
     func loadHome() {
         guard let url = pairing.homeURL else { return }
-        // Cookies and the page's device key are per-ORIGIN, so arriving at the
-        // relay door means arriving with no credential — and pairing there is
-        // refused by design (it is a LAN ceremony). The shell is the only
-        // thing that survives the origin switch, so it carries a LAN-minted,
-        // single-use handoff token across and spends it here. Without this,
-        // off-LAN access is a deadlock: the app reaches the Mac and then sits
-        // on a sign-in screen only home wifi can satisfy.
-        if isRelayOrigin(pairing.origin), let handoff = OriginHandoffStore.take() {
+        // Cookies and the page's device key are per-ORIGIN, so arriving at
+        // ANY origin other than the one that minted them means arriving with
+        // no credential — the relay door, but equally the Mac's NEW LAN
+        // address after DHCP moved it (live 2026-08-25: four re-pairs in
+        // four days, one per IP change, because the token was spent only at
+        // the relay). The shell is the only thing that survives an origin
+        // switch, so it carries a LAN-minted, single-use handoff token and
+        // offers it on every load; the page spends it only when the origin
+        // actually lacks a session, and parks a fresh one right after.
+        if let handoff = OriginHandoffStore.take() {
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
             var items = components?.queryItems ?? []
             items.append(URLQueryItem(name: "adopt", value: handoff))

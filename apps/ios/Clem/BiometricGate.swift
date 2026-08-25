@@ -92,18 +92,18 @@ final class BiometricGate: ObservableObject {
 struct LockScreen: View {
     @ObservedObject var gate: BiometricGate
 
-    private let peelBlack = Color(red: 12 / 255, green: 9 / 255, blue: 6 / 255)
+    private let paper = Color(red: 252 / 255, green: 249 / 255, blue: 244 / 255)
 
     var body: some View {
         ZStack {
-            peelBlack.ignoresSafeArea()
+            paper.ignoresSafeArea()
             VStack(spacing: 18) {
                 Image(systemName: "lock.circle.fill")
                     .font(.system(size: 72))
                     .foregroundStyle(Color(red: 1, green: 0.54, blue: 0.24))
                 Text("Clem is locked")
                     .font(.system(.title2, design: .rounded).weight(.bold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Color(red: 43 / 255, green: 31 / 255, blue: 20 / 255))
                 if let message = gate.failureMessage {
                     Text(message)
                         .font(.footnote)
@@ -129,6 +129,6 @@ struct LockScreen: View {
                 .disabled(gate.prompting)
             }
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
     }
 }

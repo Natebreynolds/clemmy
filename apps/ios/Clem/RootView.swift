@@ -2,7 +2,7 @@ import SwiftUI
 
 /// Warm near-black behind everything — matches the web UI's --bg-0 so the
 /// native shell is invisible: no white band, no flash while loading.
-private let peelBlack = Color(red: 12 / 255, green: 9 / 255, blue: 6 / 255)
+private let paper = Color(red: 252 / 255, green: 249 / 255, blue: 244 / 255)
 
 struct RootView: View {
     @State private var model: WebViewModel?
@@ -21,7 +21,7 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
-            peelBlack.ignoresSafeArea()
+            paper.ignoresSafeArea()
             if let model {
                 // The gate wraps the paired experience only. Scanning a QR is
                 // itself a physical act at the Mac, and requiring Face ID
@@ -55,7 +55,7 @@ struct RootView: View {
         .overlay {
             if scenePhase != .active {
                 ZStack {
-                    peelBlack.ignoresSafeArea()
+                    paper.ignoresSafeArea()
                     Image(systemName: "lock.fill")
                         .font(.system(size: 44))
                         .foregroundStyle(Color(red: 1, green: 0.54, blue: 0.24).opacity(0.85))
@@ -63,7 +63,7 @@ struct RootView: View {
                 .transition(.opacity)
             }
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             // .inactive fires before the app is visible in the switcher, so

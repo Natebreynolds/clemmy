@@ -19,11 +19,11 @@
  */
 
 import express from 'express';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PKG_DIR } from '../config.js';
+import { BASE_DIR, PKG_DIR } from '../config.js';
 import { hasPin, pinNeedsRotation, readPinMeta, setPin, validatePinForSet, verifyPin } from '../runtime/mobile-pin.js';
 import { consumeMobilePairingCode } from '../runtime/mobile-pairing.js';
 import { beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
@@ -682,43 +682,84 @@ function consumeStreamTicket(ticket: string, deviceId: string, pathname: string)
  *
  * The handoff breaks it without weakening the ceremony. The token is minted
  * ONLY by an already-authenticated request on a LAN door — the trust decision
- * still happens at home, in person — and is single-use with a short TTL. It
- * is then redeemable at the relay origin to mint a second session for the
- * SAME device, so the phone keeps one identity in the device list. A remote
- * attacker without a token gains nothing; a token that leaks is one device
- * session, expiring in minutes, revocable from the desktop like any other.
+ * still happens at home, in person — and is single-use. It is then
+ * redeemable at another of THIS Mac's origins (the relay door, or a new LAN
+ * address after DHCP moved the Mac) to mint a second session for the SAME
+ * device, so the phone keeps one identity in the device list.
+ *
+ * LIFETIME AND DURABILITY (live 2026-08-25, "off wifi has never worked"):
+ * the original 10-minute in-memory token was a dead letter in practice —
+ * iOS suspends the webview on lock so the parking page cannot refresh it,
+ * and any daemon restart wiped the store entirely. The phone would arrive
+ * at the relay hours later holding nothing redeemable and land on the scan
+ * screen with no way forward. The token now lives seven days and survives
+ * restarts (persisted HASHED — the file grants nothing readable). The
+ * trust story is unchanged: single-use, one live token per device, spent
+ * only by the shell that holds it, rate-limited on the pairing budget, and
+ * revocable by revoking the device like any other session.
  */
-const ORIGIN_HANDOFF_TTL_MS = 10 * 60_000;
-const originHandoffs = new Map<string, { deviceId: string; deviceLabel?: string; expiresAt: number }>();
+const ORIGIN_HANDOFF_TTL_MS = 7 * 24 * 60 * 60_000;
+const ORIGIN_HANDOFF_FILE = 'mobile-origin-handoffs.json';
+
+interface PersistedOriginHandoffs {
+  version: 1;
+  /** Keyed by sha256(token) — the raw token never touches disk. */
+  entries: Record<string, { deviceId: string; deviceLabel?: string; expiresAt: number }>;
+}
+
+function originHandoffFile(): string {
+  return path.join(BASE_DIR, 'state', ORIGIN_HANDOFF_FILE);
+}
+
+function readOriginHandoffs(): PersistedOriginHandoffs {
+  try {
+    const parsed = JSON.parse(readFileSync(originHandoffFile(), 'utf-8')) as PersistedOriginHandoffs;
+    if (parsed && parsed.version === 1 && parsed.entries && typeof parsed.entries === 'object') return parsed;
+  } catch { /* absent or unreadable resets to empty — a handoff is re-mintable on the next LAN visit */ }
+  return { version: 1, entries: {} };
+}
+
+function writeOriginHandoffs(state: PersistedOriginHandoffs): void {
+  try {
+    mkdirSync(path.dirname(originHandoffFile()), { recursive: true, mode: 0o700 });
+    writeFileSync(originHandoffFile(), JSON.stringify(state, null, 2), { mode: 0o600 });
+  } catch { /* best effort — worst case is the pre-fix behavior (re-pair on LAN) */ }
+}
+
+function handoffTokenDigest(token: string): string {
+  return createHash('sha256').update(token, 'utf8').digest('hex');
+}
 
 function mintOriginHandoff(deviceId: string, deviceLabel?: string): { token: string; expiresAt: number } {
   const now = Date.now();
-  for (const [key, value] of originHandoffs) {
-    if (value.expiresAt <= now) originHandoffs.delete(key);
-  }
-  // One live handoff per device: minting a fresh one retires the old, so a
-  // token left unused on a previous LAN visit cannot be redeemed later.
-  for (const [key, value] of originHandoffs) {
-    if (value.deviceId === deviceId) originHandoffs.delete(key);
+  const state = readOriginHandoffs();
+  for (const [key, value] of Object.entries(state.entries)) {
+    // Expired tokens and this device's PRIOR token both retire: one live
+    // handoff per device, so a token left on an old LAN visit cannot be
+    // redeemed after a fresh one exists.
+    if (value.expiresAt <= now || value.deviceId === deviceId) delete state.entries[key];
   }
   const token = randomBytes(32).toString('base64url');
   const expiresAt = now + ORIGIN_HANDOFF_TTL_MS;
-  originHandoffs.set(token, { deviceId, deviceLabel, expiresAt });
+  state.entries[handoffTokenDigest(token)] = { deviceId, deviceLabel, expiresAt };
+  writeOriginHandoffs(state);
   return { token, expiresAt };
 }
 
 function consumeOriginHandoff(token: string): { deviceId: string; deviceLabel?: string } | null {
-  const entry = originHandoffs.get(token);
+  const state = readOriginHandoffs();
+  const entry = state.entries[handoffTokenDigest(token)];
   if (!entry) return null;
   // Single use, whatever the outcome.
-  originHandoffs.delete(token);
+  delete state.entries[handoffTokenDigest(token)];
+  writeOriginHandoffs(state);
   if (entry.expiresAt <= Date.now()) return null;
   return { deviceId: entry.deviceId, deviceLabel: entry.deviceLabel };
 }
 
-/** Test seam: a fresh process starts with no outstanding handoffs. */
+/** Test seam: a fresh test starts with no outstanding handoffs. */
 export function _clearOriginHandoffsForTests(): void {
-  originHandoffs.clear();
+  writeOriginHandoffs({ version: 1, entries: {} });
 }
 
 /**

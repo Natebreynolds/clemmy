@@ -298,3 +298,26 @@ test('a never-resolving candidate source is dropped at the deadline and the sear
   const body = JSON.parse(result.content[0].text) as { results: Array<{ name: string }> };
   assert.ok(body.results.length > 0, 'the local catalog and healthy sources still answer');
 });
+
+test('a wedged planning-disclosure stage is dropped at its deadline and the search still answers', async () => {
+  const { registerToolSearchTool, PLANNING_DISCLOSURE_DEADLINE_MS } = await import('./tool-search-tool.js');
+  assert.ok(PLANNING_DISCLOSURE_DEADLINE_MS <= 20_000, 'discovery stays a read budget, not a work budget');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'disclosure-deadline-pin', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [
+      { search: async () => [{ name: 'LIVE_PROVIDER_OP', summary: 'A live provider operation.', score: 0.9 }] },
+    ],
+    discloseForPlanning: () => new Promise(() => { /* the live 60s-per-call walk, never resolving */ }),
+  } as never);
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+  const startedAt = Date.now();
+  const result = await handler({ query: 'send my team update', limit: 8 });
+  const elapsedMs = Date.now() - startedAt;
+  assert.ok(
+    elapsedMs < PLANNING_DISCLOSURE_DEADLINE_MS + 5_000,
+    `the read returns at the stage deadline (took ${elapsedMs}ms)`,
+  );
+  const body = JSON.parse(result.content[0].text) as { results: Array<{ name: string }> };
+  assert.ok(body.results.length > 0, 'candidates still answer without materialized refs');
+});

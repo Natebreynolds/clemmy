@@ -1,40 +1,47 @@
 /* ────────────────────────────────────────────────────────────────────
-   Clementine mobile — "clementine at night"
+   Clementine mobile — "clementine in daylight"
 
    The design brief: an assistant in your pocket, not a dashboard. So the
    type scale is fluid (one layout from an iPhone SE to an iPad in
    landscape), surfaces have real depth instead of flat outlines, motion
    acknowledges every touch, and the citrus accent is spent only where it
    means something — the thing that needs you, the thing you tap next.
+
+   100% LIGHT, by owner directive (2026-08-25): one committed palette,
+   never dark, whatever the system setting says. Same warm-citrus brand
+   inverted — paper with a warm undertone instead of peel-black, ink
+   instead of cream, and the citrus deepened a step so it keeps its
+   contrast against light ground.
    ──────────────────────────────────────────────────────────────────── */
 
 :root {
-  /* Peel-dark surfaces: warm undertone, never pure gray. Each step is a
-     real elevation, not just a lighter box. */
-  --bg-0: #0b0806;
-  --bg-1: #141009;
-  --bg-2: #1d170f;
-  --bg-3: #292016;
-  --bg-4: #362a1c;
+  /* Warm paper surfaces: cream undertone, never clinical gray-white.
+     Elevation DARKENS a step toward parchment — cards sit on the page the
+     way paper sits on a desk. */
+  --bg-0: #fcf9f4;
+  --bg-1: #ffffff;
+  --bg-2: #f7f1e7;
+  --bg-3: #f0e7d8;
+  --bg-4: #e8dcc8;
 
-  --line: rgba(255, 232, 200, 0.075);
-  --line-strong: rgba(255, 232, 200, 0.14);
-  --line-hot: rgba(255, 138, 61, 0.38);
+  --line: rgba(63, 42, 22, 0.10);
+  --line-strong: rgba(63, 42, 22, 0.18);
+  --line-hot: rgba(239, 95, 12, 0.38);
 
-  --fg: #fbf5ec;
-  --fg-2: #c9baa4;
-  --fg-3: #8d7e6a;
+  --fg: #2b1f14;
+  --fg-2: #6d5b47;
+  --fg-3: #9a8871;
 
-  --accent: #ff8a3d;
-  --accent-hi: #ffa668;
-  --accent-deep: #ef5f0c;
-  --accent-soft: rgba(255, 138, 61, 0.13);
-  --accent-glow: rgba(255, 138, 61, 0.42);
-  --accent-2: #8ec96f;              /* leaf — connected / success */
-  --accent-warn: #f5b942;
-  --accent-fail: #f0655a;
-  --fail-soft: rgba(240, 101, 90, 0.12);
-  --on-accent: #1a0d02;
+  --accent: #ef5f0c;
+  --accent-hi: #ff8a3d;
+  --accent-deep: #c94e05;
+  --accent-soft: rgba(239, 95, 12, 0.10);
+  --accent-glow: rgba(239, 95, 12, 0.26);
+  --accent-2: #4d9337;              /* leaf — connected / success */
+  --accent-warn: #b07d0a;
+  --accent-fail: #d0453a;
+  --fail-soft: rgba(208, 69, 58, 0.10);
+  --on-accent: #fff8f0;
 
   --font-display: ui-rounded, -apple-system, BlinkMacSystemFont, 'SF Pro Rounded', sans-serif;
   --font-body: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
@@ -76,9 +83,9 @@
      Only a true overlay — a sheet floating over content the user can
      still see — earns a real shadow. */
   --shadow-card: none;
-  --shadow-lift: 0 16px 40px rgba(0, 0, 0, 0.5);
+  --shadow-lift: 0 16px 40px rgba(74, 46, 16, 0.18);
 
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 * { box-sizing: border-box; }
@@ -89,8 +96,8 @@ body {
   /* Two warm lights: a citrus dawn at the top, an ember low and left. The
      page is never a flat black rectangle. */
   background:
-    radial-gradient(130% 46% at 50% -12%, rgba(255, 138, 61, 0.10), transparent 62%),
-    radial-gradient(90% 40% at 8% 108%, rgba(240, 101, 17, 0.07), transparent 70%),
+    radial-gradient(130% 46% at 50% -12%, rgba(255, 138, 61, 0.12), transparent 62%),
+    radial-gradient(90% 40% at 8% 108%, rgba(240, 101, 17, 0.06), transparent 70%),
     var(--bg-0);
   background-attachment: fixed;
   color: var(--fg);
@@ -156,7 +163,7 @@ input, textarea { font: inherit; }
   height: 28px;
   flex: 0 0 auto;
   image-rendering: -webkit-optimize-contrast;
-  filter: drop-shadow(0 0 10px rgba(255, 138, 61, 0.4));
+  filter: drop-shadow(0 0 10px rgba(239, 95, 12, 0.30));
 }
 .app-header .meta { display: flex; align-items: center; gap: var(--sp-2); }
 
@@ -189,7 +196,7 @@ input, textarea { font: inherit; }
 
 /* The pill carries three truths, and the color is the fastest read: local,
    remote-but-encrypted, or not reaching the Mac at all. */
-.conn-relay { color: var(--accent-hi); border-color: rgba(255, 138, 61, 0.3); }
+.conn-relay { color: var(--accent-hi); border-color: rgba(239, 95, 12, 0.30); }
 .conn-relay .conn-dot { background: var(--accent); }
 .conn-offline { color: var(--fg-3); }
 .conn-offline .conn-dot { background: var(--fg-3); box-shadow: none; animation: none; }
@@ -225,12 +232,12 @@ input, textarea { font: inherit; }
   transition: transform 0.14s var(--ease-out), color 0.16s ease, border-color 0.16s ease;
 }
 .btn-quiet:active { transform: scale(0.94); }
-.btn-resume { color: var(--accent-2); border-color: rgba(142, 201, 111, 0.35); }
+.btn-resume { color: var(--accent-2); border-color: rgba(77, 147, 55, 0.35); }
 /* Destructive confirm earns red — it is the one action here that throws work
    away, and it should never be mistaken for the neutral button beside it. */
 .btn-stop-yes {
   background: var(--fail-soft);
-  border: 1px solid rgba(240, 101, 90, 0.45);
+  border: 1px solid rgba(208, 69, 58, 0.45);
   color: var(--accent-fail);
   border-radius: 999px;
   padding: 9px 16px;
@@ -364,7 +371,7 @@ input, textarea { font: inherit; }
   align-items: center;
   gap: var(--sp-2);
   padding: 6px 6px 6px 6px;
-  background: linear-gradient(180deg, rgba(255, 232, 200, 0.05), transparent 60%), var(--bg-2);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.6), transparent 60%), var(--bg-2);
   border: 1px solid var(--line-strong);
   border-radius: 999px;
   transition: border-color 0.22s ease, box-shadow 0.28s ease, transform 0.16s var(--ease-out);
@@ -406,7 +413,7 @@ input, textarea { font: inherit; }
 .card {
   position: relative;
   background:
-    linear-gradient(180deg, rgba(255, 232, 200, 0.045), rgba(255, 232, 200, 0) 46%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0) 46%),
     var(--bg-1);
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
@@ -424,7 +431,7 @@ input, textarea { font: inherit; }
 .card-tap:active {
   transform: scale(0.985);
   border-color: var(--line-strong);
-  background: linear-gradient(180deg, rgba(255, 232, 200, 0.06), rgba(255, 232, 200, 0) 46%), var(--bg-2);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.65), rgba(255, 255, 255, 0) 46%), var(--bg-2);
 }
 .card-chevron { width: 18px; height: 18px; flex: 0 0 auto; color: var(--fg-3); margin-left: auto; }
 
@@ -462,11 +469,11 @@ input, textarea { font: inherit; }
    because it moves only while the work does. */
 .card-approval, .card-plan {
   background: var(--accent-soft);
-  border-color: rgba(255, 138, 61, 0.22);
+  border-color: rgba(239, 95, 12, 0.24);
 }
 .card-plan {
-  background: var(--warn-soft, rgba(240, 180, 90, 0.09));
-  border-color: rgba(240, 180, 90, 0.24);
+  background: var(--warn-soft, rgba(176, 125, 10, 0.09));
+  border-color: rgba(176, 125, 10, 0.22);
 }
 
 .chip {
@@ -482,7 +489,7 @@ input, textarea { font: inherit; }
 .chip-tool { color: var(--accent); background: var(--accent-soft); }
 .chip-plan {
   color: var(--accent-warn);
-  background: rgba(245, 185, 66, 0.14);
+  background: rgba(176, 125, 10, 0.12);
   font-family: var(--font-display);
   letter-spacing: 0.05em;
 }
@@ -644,7 +651,7 @@ input, textarea { font: inherit; }
   border-radius: var(--r-lg);
   border: 1px solid var(--line);
   background:
-    linear-gradient(100deg, transparent 20%, rgba(255, 232, 200, 0.05) 40%, transparent 60%),
+    linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.6) 40%, transparent 60%),
     var(--bg-1);
   background-size: 220% 100%;
   animation: shimmer 1.5s ease-in-out infinite;
@@ -669,7 +676,7 @@ input, textarea { font: inherit; }
 }
 .global-error {
   background: var(--fail-soft);
-  border: 1px solid rgba(240, 101, 90, 0.35);
+  border: 1px solid rgba(208, 69, 58, 0.35);
   color: var(--accent-fail);
   border-radius: var(--r-md);
   padding: var(--sp-3) var(--sp-4);
@@ -693,11 +700,11 @@ input, textarea { font: inherit; }
   gap: 2px;
   padding: 6px;
   border-radius: 999px;
-  background: rgba(29, 23, 15, 0.82);
+  background: rgba(255, 253, 248, 0.88);
   -webkit-backdrop-filter: blur(22px) saturate(1.5);
   backdrop-filter: blur(22px) saturate(1.5);
   border: 1px solid var(--line-strong);
-  box-shadow: var(--shadow-lift), inset 0 1px 0 rgba(255, 232, 200, 0.07);
+  box-shadow: var(--shadow-lift), inset 0 1px 0 rgba(255, 255, 255, 0.8);
   max-width: calc(100% - 20px);
 }
 .dock button {
@@ -733,7 +740,7 @@ input, textarea { font: inherit; }
   color: var(--accent);
   background: var(--accent-soft);
 }
-.dock button.active svg { stroke-width: 2.1; filter: drop-shadow(0 0 8px rgba(255, 138, 61, 0.45)); }
+.dock button.active svg { stroke-width: 2.1; filter: drop-shadow(0 0 8px rgba(239, 95, 12, 0.35)); }
 
 /* The unread count rides the icon, so it survives even at the smallest
    dock width where labels get tight. */
@@ -751,7 +758,7 @@ input, textarea { font: inherit; }
   font-weight: 800;
   line-height: 17px;
   text-align: center;
-  box-shadow: 0 0 0 2px rgba(29, 23, 15, 0.9);
+  box-shadow: 0 0 0 2px rgba(252, 249, 244, 0.9);
 }
 
 /* ── login / pairing ────────────────────────────────────────────── */
@@ -770,7 +777,7 @@ input, textarea { font: inherit; }
   text-align: center;
 }
 .login-mark {
-  filter: drop-shadow(0 0 26px rgba(255, 138, 61, 0.4));
+  filter: drop-shadow(0 0 26px rgba(239, 95, 12, 0.30));
   margin-bottom: var(--sp-1);
 }
 .login-shell h1 {
@@ -1156,8 +1163,8 @@ input, textarea { font: inherit; }
   padding: 1px 8px;
   margin-right: 4px;
 }
-.wf-chip-effect { color: var(--accent-warn); border-color: rgba(240, 180, 90, 0.35); }
-.wf-chip-gated { color: var(--accent); border-color: rgba(255, 138, 61, 0.35); }
+.wf-chip-effect { color: var(--accent-warn); border-color: rgba(176, 125, 10, 0.30); }
+.wf-chip-gated { color: var(--accent); border-color: rgba(239, 95, 12, 0.32); }
 .wf-inputs { margin: var(--sp-3) 0; }
 .wf-input-row { display: block; margin: var(--sp-2) 0; }
 .wf-input-label { display: block; font-size: var(--t-sm); color: var(--fg-2); margin-bottom: 4px; }
@@ -1197,8 +1204,8 @@ input, textarea { font: inherit; }
   margin: var(--sp-2) 0;
   color: var(--fg-2);
 }
-.ws-refresh-approval { color: var(--accent-warn); border-color: rgba(240, 180, 90, 0.35); }
-.ws-refresh-failed { color: var(--accent-fail); border-color: rgba(240, 101, 90, 0.35); }
+.ws-refresh-approval { color: var(--accent-warn); border-color: rgba(176, 125, 10, 0.30); }
+.ws-refresh-failed { color: var(--accent-fail); border-color: rgba(208, 69, 58, 0.35); }
 .ws-presence {
   display: flex;
   align-items: center;
@@ -1276,7 +1283,7 @@ input, textarea { font: inherit; }
 .memory-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin: var(--sp-3) 0; }
 .btn-danger {
   background: var(--fail-soft);
-  border: 1px solid rgba(240, 101, 90, 0.4);
+  border: 1px solid rgba(208, 69, 58, 0.40);
   border-radius: 999px;
   color: var(--accent-fail);
   font-size: var(--t-sm);
@@ -1362,7 +1369,7 @@ input, textarea { font: inherit; }
   background: var(--bg-1);
   white-space: nowrap;
 }
-.conn-recovering { color: var(--accent-warn); border-color: rgba(240, 180, 90, 0.35); }
+.conn-recovering { color: var(--accent-warn); border-color: rgba(176, 125, 10, 0.30); }
 
 /* The composer is a tool, not a headline: it holds the bottom of the screen
    without drawing the eye off the transcript. */
@@ -1422,7 +1429,7 @@ input, textarea { font: inherit; }
   position: absolute;
   inset: 0;
   border: 0;
-  background: rgba(5, 3, 2, 0.62);
+  background: rgba(43, 31, 20, 0.38);
   -webkit-backdrop-filter: blur(3px);
   backdrop-filter: blur(3px);
 }
@@ -1437,8 +1444,8 @@ input, textarea { font: inherit; }
   border: 1px solid var(--line-strong);
   border-bottom: 0;
   border-radius: 28px 28px 0 0;
-  background: rgba(20, 16, 9, 0.98);
-  box-shadow: 0 -22px 80px rgba(0, 0, 0, 0.45);
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 -22px 80px rgba(74, 46, 16, 0.16);
   animation: running-sheet-in 0.24s var(--ease-out);
 }
 @keyframes running-sheet-in {
@@ -1640,7 +1647,7 @@ input, textarea { font: inherit; }
 
 .memory-hit, .memory-section, .workflow-row, .workflow-detail, .chat-row, .pending-action,
 .run-card, .approval-card {
-  background: linear-gradient(180deg, rgba(255, 232, 200, 0.045), rgba(255, 232, 200, 0) 46%), var(--bg-1);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0) 46%), var(--bg-1);
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   padding: var(--sp-4);
@@ -1688,7 +1695,7 @@ input, textarea { font: inherit; }
   left: 10px;
   right: 10px;
   bottom: 10px;
-  background: rgba(29, 23, 15, 0.94);
+  background: rgba(255, 255, 255, 0.96);
   -webkit-backdrop-filter: blur(18px);
   backdrop-filter: blur(18px);
   border: 1px solid var(--line-strong);
@@ -1732,7 +1739,7 @@ input, textarea { font: inherit; }
   font-weight: 800;
   letter-spacing: 0.01em;
   color: var(--accent-2);
-  background: rgba(142, 201, 111, 0.13);
+  background: rgba(77, 147, 55, 0.12);
   border-radius: 7px;
   padding: 3px 9px;
 }
@@ -1833,13 +1840,13 @@ input, textarea { font: inherit; }
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
-  background: linear-gradient(180deg, rgba(255, 138, 61, 0.11), rgba(255, 138, 61, 0.04)), var(--bg-1);
-  border: 1px solid rgba(255, 138, 61, 0.24);
+  background: linear-gradient(180deg, rgba(239, 95, 12, 0.10), rgba(239, 95, 12, 0.04)), var(--bg-1);
+  border: 1px solid rgba(239, 95, 12, 0.26);
   border-radius: var(--r-lg);
   padding: var(--sp-4);
   box-shadow: var(--shadow-card);
 }
-.push-banner-error { border-color: rgba(240, 101, 90, 0.35); }
+.push-banner-error { border-color: rgba(208, 69, 58, 0.35); }
 .push-banner-body { font-size: var(--t-sm); color: var(--fg-2); }
 .push-banner-body strong {
   display: block;
@@ -1931,7 +1938,7 @@ input, textarea { font: inherit; }
   flex-direction: column;
   gap: 4px;
   background: var(--fail-soft);
-  border: 1px solid rgba(240, 101, 90, 0.32);
+  border: 1px solid rgba(208, 69, 58, 0.32);
   border-radius: var(--r-md);
   padding: var(--sp-3) var(--sp-4);
   margin-bottom: var(--sp-3);
@@ -1952,7 +1959,7 @@ input, textarea { font: inherit; }
   gap: var(--sp-2);
 }
 .ws-tile {
-  background: linear-gradient(180deg, rgba(255, 232, 200, 0.05), transparent 55%), var(--bg-1);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.6), transparent 55%), var(--bg-1);
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   padding: var(--sp-3);

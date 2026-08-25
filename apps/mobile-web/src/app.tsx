@@ -91,6 +91,19 @@ export function App() {
     };
     void (async () => {
       try {
+        // The shell now appends ?adopt= on EVERY origin change (relay OR a
+        // new LAN address). If this origin already holds a live session, the
+        // single-use token must not be spent on nothing — the park effect
+        // will re-mint moments after auth confirms.
+        const already = await fetch('/m/auth/status', { credentials: 'include' })
+          .then((r) => (r.ok ? r.json() as Promise<{ authenticated?: boolean }> : null))
+          .catch(() => null);
+        if (already?.authenticated) {
+          if (cancelled) return;
+          cleanUrl();
+          await refreshAuth();
+          return;
+        }
         await adoptOriginSession(token);
         if (cancelled) return;
         cleanUrl();
@@ -119,9 +132,20 @@ export function App() {
       } catch { /* best effort — absence just means re-pair on the next LAN visit */ }
     };
     void park();
-    // Refresh well inside the token's lifetime.
+    // Refresh well inside the token's lifetime — and once more at the moment
+    // the app backgrounds, which is the freshest the parked token can ever be
+    // when the phone later wakes up off-LAN. iOS suspends this page on lock,
+    // so the interval alone always left a stale token behind (live: "off
+    // wifi has never worked" — the shell arrived at the relay holding a
+    // token minted the previous morning).
+    const parkOnHide = () => { if (document.visibilityState === 'hidden') void park(); };
+    document.addEventListener('visibilitychange', parkOnHide);
     const timer = setInterval(() => { void park(); }, 5 * 60_000);
-    return () => { cancelled = true; clearInterval(timer); };
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', parkOnHide);
+    };
   }, [authStatus?.authenticated, door]);
 
   useEffect(() => {
