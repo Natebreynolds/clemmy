@@ -2888,9 +2888,26 @@ export async function resolveComposioDispatch(
   // required fields instead of a heuristic (live 2026-08-07: two paid 400s for
   // an APIFY_RUN_ACTOR with no actorId). Fail-open — an unavailable schema
   // simply keeps the previous heuristic behavior.
-  const dispatchSchema = opts.preparedExecution
+  let dispatchSchema = opts.preparedExecution
     ? getCachedToolSchema(toolSlug)
     : await ensureToolSchema(toolSlug);
+  if (opts.preparedExecution && !dispatchSchema) {
+    // RE-VALIDATION IS NOT DISCOVERY (live 2026-08-25, second gate of the
+    // same class): fetching the provider's input definition for an ALREADY
+    // ACCEPTED call is preparation of that exact call, not a hidden look at
+    // the catalog. Refusing here deadlocked live — the prescribed remediation
+    // reads (describe/search) transit this same gateway and were refused by
+    // this same gate, so "run the preparation read, then retry" could never
+    // terminate. Bounded to one fetch; the gate below still owns refusal
+    // when the definition is genuinely unavailable.
+    try {
+      let ensureTimer: ReturnType<typeof setTimeout> | undefined;
+      dispatchSchema = await Promise.race([
+        ensureToolSchema(toolSlug),
+        new Promise<undefined>((resolve) => { ensureTimer = setTimeout(() => resolve(undefined), 12_000); }),
+      ]).finally(() => { if (ensureTimer) clearTimeout(ensureTimer); }) ?? getCachedToolSchema(toolSlug);
+    } catch { dispatchSchema = getCachedToolSchema(toolSlug); }
+  }
   const preparedSchemaIdentity = exactProviderInputSchemaIdentity(toolSlug, dispatchSchema);
   const preparedOperationVersion = opts.preparedExecution && !cliOnlyLane
     ? liveComposioOperationVersion(toolSlug)
