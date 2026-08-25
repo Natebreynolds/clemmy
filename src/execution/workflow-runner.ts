@@ -4113,6 +4113,30 @@ async function runStepViaHarness(
       && claudeAgentSdkWorkflowStepEnabled(stepModel)
       && workflowStepCanRunOnClaudeAgentSdk(step)
     ) {
+      // Claude-SDK lane graph persist (2026-08-25, run 1787649022538-3634b5):
+      // this lane never enters admit-and-compile, so no admitted/ticketed
+      // graph will EVER exist for its source — the collision that forced the
+      // pre-model persist's deletion is structurally impossible here. Without
+      // a persisted graph, callAdmissionAuthorityFor falls through to
+      // expectedTaskFor and every MCP-carried external call is refused
+      // pre-execution ("no persisted turn graph for accepted task"): all four
+      // composio calls of the platform-49 run died this way while host-local
+      // tools sailed past the wall. Persist the shadow graph for THIS lane
+      // only, before the model runs.
+      try {
+        const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+        recordTurnGraphShadow({
+          identity: {
+            sessionId: realSessionId,
+            sourceUserSeq: sourceUserEvent.seq,
+            turn: sourceUserEvent.turn,
+          },
+          surface: 'workflow',
+        });
+      } catch {
+        // Enablement only: a persist failure surfaces as the settlement
+        // spine's own typed refusal at dispatch, never as a silent skip.
+      }
       const fullLane = workflowStepUsesFullClaudeLane(step);
       // Approved-payload replay (2026-07-21): a re-admitted parked step re-runs
       // the model, which RE-COMPOSES its payload — the exact-payload resume key

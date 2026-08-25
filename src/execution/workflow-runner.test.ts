@@ -7246,3 +7246,91 @@ test('learned workflow read pins are advisory only before the ordinary harness i
     }
   }
 });
+
+// ─── Claude-SDK lane arms turn-graph authority before its model runs ─────────
+//
+// Live (2026-08-25, platform-49 run 1787649022538-3634b5): deleting the
+// pre-model graph persist to fix the typed-lane collision ALSO disarmed the
+// Claude-SDK workflow lane — which never enters admit-and-compile, so no
+// admitted graph ever exists for its source. callAdmissionAuthorityFor fell
+// through to expectedTaskFor and every MCP-carried composio call was refused
+// pre-execution ("no persisted turn graph for accepted task") while
+// host-local tools sailed past the wall: four refusals, zero external reads,
+// an honest but empty blocked report. The lane-scoped persist restores the
+// authority; the collision cannot recur here because this lane never admits.
+test('the Claude-SDK workflow lane persists its turn graph before the step model runs', async () => {
+  const stateDir = path.join(tmp, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, 'claude-auth.json'),
+    JSON.stringify({
+      accessToken: 'sk-ant-oat01-graph-arm-token',
+      refreshToken: 'refresh-token',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    }),
+    'utf-8',
+  );
+  const prev = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
+  };
+  const step = {
+    id: 'main',
+    prompt: 'Review the channel and read the log sheet.',
+    model: 'claude-sonnet-4-6',
+    allowedTools: ['composio_execute_tool'],
+  };
+  const ctx = {
+    workflow: {
+      name: 'Graph Arm Probe',
+      description: 'test',
+      enabled: true,
+      trigger: { manual: true },
+      allowedTools: ['composio_execute_tool'],
+      steps: [step],
+    },
+    workflowSlug: 'graph-arm-probe',
+    runId: 'wf-graph-arm-1',
+    inputs: {},
+    stepOutputs: {},
+    assistant: { respond: async () => { throw new Error('legacy assistant should not run'); } },
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof executeStep>[1];
+  let observed: { status: string; reason?: string } | null = null;
+  try {
+    process.env.AUTH_MODE = 'codex_oauth';
+    process.env.WORKFLOW_USE_HARNESS = 'on';
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'on';
+    setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+      const { expectedTaskFor } = await import('../runtime/harness/resolution-ledger.js');
+      const expected = expectedTaskFor(
+        options.sessionId as string,
+        options.sourceUserSeq as number,
+      );
+      observed = { status: expected.status, reason: (expected as { reason?: string }).reason };
+      return {
+        text: 'reviewed',
+        structuredOutput: { status: 'ok', output: 'reviewed' },
+        sessionId: 'sdk-graph-arm',
+        model: 'claude-sonnet-4-6',
+        toolUses: ['composio_execute_tool'],
+      };
+    });
+    await executeStep(step, ctx);
+    assert.ok(observed, 'the stubbed SDK executor ran — the step took the Claude-SDK lane');
+    assert.equal(
+      observed!.status,
+      'ok',
+      `the turn graph must be persisted before the step model runs — got ${observed!.status}: ${observed!.reason ?? ''}`,
+    );
+  } finally {
+    setClaudeAgentSdkWorkflowStepRunForTest(null);
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
