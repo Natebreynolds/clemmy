@@ -66,24 +66,19 @@ test('a denied inner discovery settles its carrier call into a redeemable record
   }), 'fixture graph persisted');
   const acceptedTaskId = acceptedTaskIdFor(session.id, source.seq);
 
-  // The turn spine gives every accepted task its durable discovery policy
-  // before any tool can run; then spend the one broad-discovery allowance
-  // through the production boundary, so the NEXT broad search is denied by
-  // the governor — the inner denial of the live incident, deterministically.
-  discoveryGovernor.initializeTask({
-    sessionId: session.id,
-    sourceUserSeq: source.seq,
-    knownCapability: false,
-  });
-  const burned = admitDiscoveryBoundary({
-    sessionId: session.id,
-    sourceUserSeq: source.seq,
-    turn: 1,
-    toolName: 'composio_search_tools',
-    input: { query: 'find provider export tools' },
-    callId: 'prior-broad-search',
-  });
-  assert.ok(burned, 'fixture: the first broad search was admitted and spent the allowance');
+  // The denial this fixture used to rely on — spending a one-per-turn broad
+  // discovery allowance so the NEXT search was refused — no longer exists: the
+  // count budget was removed on 2026-08-25 because refusing a call the model
+  // had already paid for bought only a reformulated retry (266 of 610 broad
+  // attempts denied; one turn refused 37 times).
+  //
+  // The invariant under test is unchanged and still worth pinning: whatever
+  // refuses an inner call, that turn must end with exactly ONE logical call,
+  // settled and unpoisoned, redeemable as host authority. So drive it with a
+  // refusal that DOES still exist — a task whose durable discovery policy was
+  // never initialized is refused before any catalog or provider work.
+  //
+  // Deliberately does NOT call discoveryGovernor.initializeTask.
 
   const callId = 'call_denied_discovery_1';
   const wrapped = wrapToolForHarness(
