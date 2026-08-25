@@ -146,7 +146,7 @@ export type PlanGroundingOperationVerdictV1 = z.infer<typeof PlanGroundingOperat
 export type PlanGroundingJudgeV1 = z.infer<typeof PlanGroundingJudgeV1Schema>;
 
 /** Structured work the model proposes. IDs are opaque; meaning is in kinds. */
-export const ProposedSemanticWorkV1Schema = z.object({
+const proposedSemanticWorkV1BaseSchema = z.object({
   construct: z.enum(['none', 'collect_then_construct', 'fanout', 'single_act']),
   cardinality: z.object({
     count: z.number().int().min(1).max(10_000),
@@ -174,7 +174,9 @@ export const ProposedSemanticWorkV1Schema = z.object({
   operations: z.array(proposedOperationSchema).max(32),
   deliverables: z.array(proposedDeliverableSchema).max(32),
   evidenceRequirements: z.array(opaqueIdSchema).max(32),
-}).strict().superRefine((work, ctx) => {
+}).strict();
+
+export const ProposedSemanticWorkV1Schema = proposedSemanticWorkV1BaseSchema.superRefine((work, ctx) => {
   const listed = work.destinations ?? [];
   if (listed.length > 0 && work.destination) {
     const first = listed[0]!;
@@ -287,6 +289,42 @@ export const TurnSemanticProposalV1Schema = z.object({
   work: ProposedSemanticWorkV1Schema.nullable(),
   slotAnswers: z.array(slotAnswerSchema).max(MAX_SLOT_ANSWERS),
   /** Bounded telemetry only. Validators must never derive authority from it. */
+  rationale: z.string().max(MAX_RATIONALE_CHARS),
+}).strict();
+
+/**
+ * The WIRE variant: identical shape, no semantic refinements.
+ *
+ * The full schema serves two masters. As the SDK `outputType` it made every
+ * semantic refinement failure THROW inside runner.run — labelled
+ * `model_failed`, bypassing the bounded one-repair gate entirely — while the
+ * identical check at admission produces a typed issue that IS repairable. All
+ * six `model_failed` records since 2026-08-24 were this: our own topology /
+ * dependsOn / requestedEffect refinements firing at the transport layer, one
+ * layer before the repair they were entitled to. Zero were provider errors.
+ *
+ * So the wire accepts anything structurally parseable, and admission — which
+ * has ALWAYS re-validated the raw with the full schema, refinements included —
+ * stays the sole judge. Nothing is weakened: a proposal that fails a
+ * refinement still never compiles; it now fails where the repair loop can see
+ * it. (Deliberately NOT the forbidden variant: the refinements were not
+ * removed from the admission schema, which would have left topology unchecked.)
+ */
+export const TurnSemanticProposalV1WireSchema = z.object({
+  version: z.literal(TURN_SEMANTIC_PROPOSAL_VERSION),
+  relation: z.enum([
+    'conversation',
+    'new_goal',
+    'continue_goal',
+    'answer_open_slot',
+    'amend_goal',
+    'abandon_goal',
+    'ambiguous',
+  ]),
+  targetGoal: goalRefSchema.nullable(),
+  goal: semanticGoalDraftSchema.nullable(),
+  work: proposedSemanticWorkV1BaseSchema.nullable(),
+  slotAnswers: z.array(slotAnswerSchema).max(MAX_SLOT_ANSWERS),
   rationale: z.string().max(MAX_RATIONALE_CHARS),
 }).strict();
 

@@ -781,3 +781,44 @@ test('capability bindings reconcile to the canonical topology and never widen ef
     'a narrower binding is never widened to the more permissive topology effect',
   );
 });
+
+// ─── Refinement failures belong to admission, not the transport ──────────────
+//
+// The full schema used to serve as the SDK outputType, so a semantic
+// refinement failure THREW inside runner.run — labelled `model_failed`,
+// bypassing the bounded one-repair gate — while the identical check at
+// admission produces a typed, repairable issue. All six `model_failed` records
+// since 2026-08-24 were this class; zero were provider errors.
+test('the wire schema accepts what the full schema refines away', async () => {
+  const { TurnSemanticProposalV1Schema, TurnSemanticProposalV1WireSchema } = await import('./turn-semantic-proposal.js');
+  // A proposal whose work topology violates a refinement (coverage vs
+  // cardinality mismatch class): destinations[0] disagreeing with destination
+  // is the cheapest deterministic refinement to trip.
+  const proposal = {
+    version: 1,
+    relation: 'new_goal',
+    targetGoal: null,
+    goal: null,
+    work: {
+      construct: 'single_act',
+      cardinality: null,
+      requestedEffect: 'read',
+      destination: { posture: 'create_new', family: 'document', handleRequired: false },
+      destinations: [{ posture: 'named_existing', family: 'document', handleRequired: false }],
+      topology: null,
+      topologyHash: null,
+      operations: [],
+      deliverables: [],
+      evidenceRequirements: [],
+    },
+    slotAnswers: [],
+    rationale: 'wire vs admission split fixture',
+  };
+  const wire = TurnSemanticProposalV1WireSchema.safeParse(proposal);
+  assert.equal(wire.success, true, 'the WIRE must not throw on a semantic refinement — that is admission\'s job');
+  const full = TurnSemanticProposalV1Schema.safeParse(proposal);
+  assert.equal(full.success, false, 'admission still refuses the same proposal — nothing was weakened');
+  // And the wire stays structurally strict: garbage shapes still fail at the wire.
+  const garbage = TurnSemanticProposalV1WireSchema.safeParse({ version: 1, junk: true });
+  assert.equal(garbage.success, false);
+});

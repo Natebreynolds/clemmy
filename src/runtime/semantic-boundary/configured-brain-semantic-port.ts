@@ -14,7 +14,7 @@ import {
 import {
   PlanGroundingJudgeV1Schema,
   SourceEffectJudgeV1Schema,
-  TurnSemanticProposalV1Schema,
+  TurnSemanticProposalV1WireSchema,
   boundHostCapabilityDescriptors,
 } from './turn-semantic-proposal.js';
 import type {
@@ -103,7 +103,7 @@ async function completeStructured(input: {
     instructions: input.system,
     model: role.modelId,
     tools: [],
-    outputType: input.schema as typeof TurnSemanticProposalV1Schema,
+    outputType: input.schema as typeof TurnSemanticProposalV1WireSchema,
   }) as unknown as Agent;
   const runner = new Runner({ workflowName: `clementine-${input.purpose}` });
   const result = await runner.run(agent, input.user, { maxTurns: 1 });
@@ -265,7 +265,11 @@ export async function completeViaConfiguredBrain(input: {
       ? SourceEffectJudgeV1Schema
       : input.schemaName === 'PlanGroundingJudgeV1'
         ? PlanGroundingJudgeV1Schema
-        : TurnSemanticProposalV1Schema,
+        // The WIRE schema: structurally identical, no semantic refinements.
+        // Refinement failures used to THROW here as `model_failed` and bypass
+        // the repair gate; admission re-validates with the full schema and is
+        // the sole judge. See TurnSemanticProposalV1WireSchema's doc.
+        : TurnSemanticProposalV1WireSchema,
   });
 }
 
