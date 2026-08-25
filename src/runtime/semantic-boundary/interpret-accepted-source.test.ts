@@ -1029,3 +1029,78 @@ test('repair hint for an unsatisfiable effect states host-native guidance and li
     assert.ok(!hints[0]!.includes(descriptor.id), `hint leaked an uncited capability id: ${descriptor.id}`);
   }
 });
+
+test('repair hint for a grounding conflict names the host-native expression and lists no other capability', async () => {
+  resetEventLog();
+  const sessionId = 'sess-grounding-hint';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 1,
+    acceptedText: 'collect five widgets and store them in a workbook',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const hints: string[] = [];
+  const result = await interpretAcceptedSource({
+    snapshot,
+    authority: authority(host),
+    port: {
+      async interpret(call) {
+        if (call.repairHint) hints.push(call.repairHint);
+        return {
+          raw: fakeSemanticProposal('newConstruct', call.host),
+          modelIdentity: 'grounding-hint-brain',
+          inputTokens: 10,
+          outputTokens: 5,
+          latencyMs: 1,
+        };
+      },
+      async judgeSourceEffect(call) {
+        return {
+          verdict: 'entailed',
+          effect: call.proposedEffect,
+          destinationPosture: call.proposedDestinationPosture,
+          proposalDigest: call.proposalDigest,
+          modelIdentity: 'grounding-hint-judge',
+          inputTokens: 1,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
+      },
+      async judgePlanGrounding(call) {
+        // The live shape: an honestly-cited, effect-matching capability that
+        // does not SERVE the operation (Apify queue lock cited for a host
+        // task/goal/memory context read).
+        const operations = call.dag.operations.map((operation, index) => ({
+          operationId: operation.id,
+          verdict: index === 0 ? ('conflict' as const) : ('entailed' as const),
+          rationale: index === 0 ? 'The assigned capability is a queue lock endpoint, not context retrieval.' : '',
+        }));
+        return {
+          verdict: 'conflict',
+          operations,
+          modelIdentity: 'grounding-hint-grounding',
+          inputTokens: 1,
+          outputTokens: 1,
+          latencyMs: 1,
+        };
+      },
+    },
+    turn: 1,
+  });
+  assert.equal(result.status, 'blocked', 'the unchanged proposal stays blocked after the bounded repair');
+  assert.equal(hints.length, 1, 'exactly one bounded repair with a hint');
+  const hint = JSON.parse(hints[0]!) as { hostNative?: { reason?: string; require?: string } | null };
+  assert.equal(hint.hostNative?.reason, 'cited_capability_rejected_for_operation');
+  assert.ok(hint.hostNative?.require?.includes('host_only'), 'the admissible expression is named');
+  const cited = new Set(
+    (fakeSemanticProposal('newConstruct', host).work?.operations ?? []).map((operation) => operation.capabilityRef),
+  );
+  for (const descriptor of host.catalog.capabilities ?? []) {
+    if (cited.has(descriptor.id)) continue;
+    assert.ok(!hints[0]!.includes(descriptor.id), `hint leaked an uncited capability id: ${descriptor.id}`);
+  }
+});

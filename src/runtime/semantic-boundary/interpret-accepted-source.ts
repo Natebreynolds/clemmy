@@ -1165,6 +1165,7 @@ async function interpretOnce(input: {
     // foreign operation through admission instead of repairing the proposal.
     let hostNativeGuidance: { reason: string; require: string } | null = null;
     if (!admitted.ok) {
+      const HOST_NATIVE_REQUIRE = 'work the host itself performs — including reading or updating the host\'s own tasks, goals, and working memory — declares requestedEffect host_only, none, or compute with a host-native capabilityRef naming the operation itself; only cite a disclosed capability for genuinely external work, and never one whose effect or purpose does not match the operation';
       const citationIssues = admitted.issues.filter(
         (entry) => entry.code === 'capability_ref_effect_mismatch' || entry.code === 'unknown_capability_ref',
       );
@@ -1182,9 +1183,21 @@ async function interpretOnce(input: {
         if (unsatisfiable) {
           hostNativeGuidance = {
             reason: 'no_disclosed_capability_carries_requested_effect',
-            require: 'work the host itself performs declares requestedEffect host_only, none, or compute with a host-native capabilityRef naming the operation itself; do not re-cite a disclosed capability whose effect does not match the operation',
+            require: HOST_NATIVE_REQUIRE,
           };
         }
+      } else if (admitted.issues.some((entry) => entry.code === 'capability_grounding_conflict')) {
+        // The grounding judge measured that the cited capability does not
+        // serve the operation (live: an Apify queue-lock endpoint cited for
+        // "collect available context" — a host task/goal/memory read). The
+        // effect may match, so the menu test above never fires; the hint
+        // still names the admissible host-native expression and still
+        // enumerates nothing — re-citing a different menu entry is exactly
+        // the doubling-down the live repair attempted.
+        hostNativeGuidance = {
+          reason: 'cited_capability_rejected_for_operation',
+          require: HOST_NATIVE_REQUIRE,
+        };
       }
     }
     try {
