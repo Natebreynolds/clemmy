@@ -764,19 +764,14 @@ function validateGoalDraft(
   for (const key of repeated(candidateKeys)) {
     issue(issues, 'duplicate_candidate', 'goal.candidates', `duplicate candidate: ${key}`);
   }
-  for (const [index, candidate] of goal.candidates.entries()) {
-    const allowed = candidate.kind === 'capability'
-      ? host.catalog.capabilityIds
-      : host.catalog.workflowIds;
-    if (!allowed.has(candidate.id)) {
-      issue(
-        issues,
-        'unknown_candidate',
-        `goal.candidates.${index}.id`,
-        `candidate id is not present in the host ${candidate.kind} catalog`,
-      );
-    }
-  }
+  // Candidates are ADVISORY hints recorded on the graph (candidateRefs) —
+  // no dispatch, binding, or authority path reads them. They were still
+  // validated against the disclosed catalogs as if they authorized work, and
+  // that refusal killed real work: a workflow step truthfully naming ITS OWN
+  // workflow as a goal candidate blocked twice (live 2026-08-25, morning-
+  // briefing on the unified lane — the step catalog never discloses the
+  // step's own workflow id). Authority stays where it is enforced: every
+  // operation's capabilityRef keeps full citation/effect/grounding checks.
 }
 
 function validateProposedWork(

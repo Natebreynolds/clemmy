@@ -429,7 +429,6 @@ test('rejects duplicate semantic ids and unknown advisory candidates', () => {
     'duplicate_slot_key',
     'duplicate_option_id',
     'duplicate_candidate',
-    'unknown_candidate',
   ]));
 });
 
@@ -949,4 +948,26 @@ test('kind-flow checking survives around a host-native operation in a mixed chai
     issueCodes(mismatched).includes('dag_kind_mismatch'),
     `expected dag_kind_mismatch, got: ${issueCodes(mismatched).join(',')}`,
   );
+});
+
+
+// ─── Candidates are hints, not authority (live 2026-08-25, unified lane) ─────
+//
+// A workflow step truthfully named ITS OWN workflow as a goal candidate and
+// admission refused the proposal twice — the step catalog never discloses the
+// step's own workflow id, and candidates were validated as if they authorized
+// work. They authorize nothing: no dispatch or binding path reads them, and
+// every operation keeps full citation checks. A truthful self-reference must
+// not kill a run.
+test('a candidate id outside the catalog admits — authority lives in the operations', () => {
+  const result = validateTurnSemanticProposalV1(proposal({
+    goal: {
+      ...goal(),
+      candidates: [
+        { kind: 'workflow' as const, id: 'morning-briefing' },
+        { kind: 'capability' as const, id: 'cap-1' },
+      ],
+    },
+  }), host());
+  assert.equal(result.ok, true, `advisory candidates must not block: ${issueCodes(result).join(',')}`);
 });
