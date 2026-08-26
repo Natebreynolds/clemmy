@@ -1497,7 +1497,7 @@ input, textarea { font: inherit; }
   align-items: center;
   gap: 6px;
   min-height: 44px;
-  max-width: 38vw;
+  font-variant-numeric: tabular-nums;
   margin: 0;
   padding: 5px 11px;
   border: 1px solid var(--line-hot);
@@ -1513,6 +1513,19 @@ input, textarea { font: inherit; }
   text-align: left;
 }
 .running-tasks-trigger:active { transform: scale(0.98); }
+/* Visually hidden, present for assistive tech — the chip shows digits, the
+   full presenter label remains its spoken name. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
 .running-tasks-spark { color: var(--accent); font-size: 17px; line-height: 1; }
 .running-tasks-layer { position: fixed; inset: 0; z-index: 90; display: flex; align-items: flex-end; justify-content: center; }
 .running-tasks-scrim {

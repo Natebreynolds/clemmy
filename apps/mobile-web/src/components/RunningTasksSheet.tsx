@@ -93,6 +93,11 @@ export function RunningTasksSheet({
   // remnant as current work. The presenter's label says what is true: how
   // many are actually RUNNING and how many are waiting on the user.
   const pillLabel = view.label;
+  // The header has ~38vw for this chip: digits, not words. The full label is
+  // the accessible name and lives inside the sheet; right-aligned overflow
+  // in the header escapes LEFT, straight over the screen title — a compact
+  // chip makes that geometry impossible.
+  const compact = [view.running, view.needsYou].filter((n) => n > 0).join('·');
 
   return (
     <div class="running-tasks-affordance">
@@ -105,7 +110,8 @@ export function RunningTasksSheet({
         onClick={() => { haptic('light'); setOpen(true); }}
       >
         <span class="running-tasks-spark" aria-hidden="true">✳</span>
-        {pillLabel}
+        <span aria-hidden="true">{compact}</span>
+        <span class="sr-only">{pillLabel}</span>
       </button>
 
       {open ? (
