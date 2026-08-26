@@ -12,7 +12,10 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-local-evidence\n', 'utf8');
 
 const eventlog = await import('./eventlog.js');
-const { removeV65StructuresFromHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
+const {
+  dropTriggersReadingColumnForHistoricalMigrationFixture,
+  removeV65StructuresFromHistoricalMigrationFixture,
+} = await import('./historical-migration-fixture.testsupport.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
 const contracts = await import('./expected-work-contract.js');
@@ -545,11 +548,11 @@ test('the execution-site migration is idempotent and preserves existing dispatch
   const beforeDigest = digestOf();
 
   // Return the store to its pre-migration shape, then let the migration run
-  // again exactly as it would on a live store that has never seen it. The
-  // v38 receipt-authority trigger references execution_site, so a faithful
-  // pre-v35 store must shed it too — v38's replay recreates it.
+  // again exactly as it would on a live store that has never seen it. Later
+  // migrations left triggers reading execution_site, so a faithful pre-v35
+  // store must shed them too — their replays recreate them.
   const live = eventlog.openEventLog();
-  live.exec('DROP TRIGGER IF EXISTS trg_evidence_receipt_exact_authority');
+  dropTriggersReadingColumnForHistoricalMigrationFixture(live, 'execution_site');
   live.exec('ALTER TABLE physical_dispatches DROP COLUMN execution_site');
   // The runner resumes from MAX(version), so a store rolled back to its
   // pre-v35 shape must lose every version at or above it.
@@ -596,8 +599,9 @@ test('a store that recorded a PARTIAL earlier version is repaired, not stranded'
   const live = eventlog.openEventLog();
   const rows = (live.prepare('SELECT COUNT(*) AS n FROM logical_tool_calls').get() as { n: number }).n;
   assert.ok(rows > 0, 'the fixture already wrote logical calls');
-  live.exec('DROP TRIGGER IF EXISTS trg_evidence_receipt_exact_authority');
+  dropTriggersReadingColumnForHistoricalMigrationFixture(live, 'conflict_reason');
   live.exec('ALTER TABLE logical_tool_calls DROP COLUMN conflict_reason');
+  dropTriggersReadingColumnForHistoricalMigrationFixture(live, 'execution_site');
   live.exec('ALTER TABLE physical_dispatches DROP COLUMN execution_site');
   // The runner resumes from MAX(version), so simulating "never received v36"
   // means dropping every version at or above it — the same property this pin
