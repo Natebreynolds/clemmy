@@ -160,6 +160,12 @@ export interface ComposioToolkitTool {
  * result surface. One server-side query may oversample for ranking/dedupe, but
  * it never enumerates a toolkit page. */
 export const COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT = 16;
+/** Single-term rungs issued in parallel when narrower rungs return nothing.
+ * Bounded so one unresolved role can never become foreground enumeration. */
+const COMPOSIO_SEARCH_RELAXATION_FANOUT = 4;
+/** Sentinel for the final rung: ask the connected carriers with no text
+ * filter, because a connection already granted its catalog. */
+const PROVIDER_SEARCH_UNFILTERED_RUNG = '';
 export const COMPOSIO_LIVE_SEARCH_RETURN_LIMIT = 8;
 
 export class ComposioSearchProviderContractError extends Error {
@@ -2286,6 +2292,108 @@ export async function listComposioToolkitTools(
  * executable authority, so discovery metadata can never become a stale invoke
  * port by itself.
  */
+/**
+ * Grammatical function words. This is a LANGUAGE list, not a capability list:
+ * it says nothing about which tools exist or which provider owns them, only
+ * which tokens carry no retrieval signal in anyone's catalog.
+ */
+const PROVIDER_SEARCH_FUNCTION_WORDS = new Set([
+  'a', 'an', 'the', 'and', 'or', 'of', 'to', 'for', 'in', 'on', 'at', 'by',
+  'with', 'from', 'into', 'it', 'is', 'are', 'be', 'my', 'me', 'our', 'your',
+  'that', 'this', 'then', 'please', 'can', 'could', 'would', 'should', 'will',
+  'do', 'does', 'let', 'lets', 'us', 'we', 'i',
+]);
+
+/**
+ * Ask the provider in the provider's own language.
+ *
+ * The live `search` filter is a KEYWORD match that narrows as terms are added,
+ * not a semantic one. Measured 2026-08-26 against the real account (19
+ * connected toolkits): the natural-language role "create a Google Sheet and
+ * write a header row" returned ZERO rows, while "sheet header" returned 3 and
+ * a single salient term returned the full 16-row page. Discovery had been
+ * handing the model's English sentence straight to that filter, so an ordinary
+ * request phrased as a sentence discovered nothing and was refused as though
+ * the capability did not exist — with the toolkit connected the whole time.
+ *
+ * A role is therefore asked as a ladder: the exact query, then its content
+ * terms, then a bounded fan-out over the most capability-bearing single terms,
+ * and finally the connected toolkits themselves with no filter at all. That
+ * last rung is the contract a connection already implies: connecting a carrier
+ * grants its catalog, so a connected carrier must never answer an unresolved
+ * role with silence. The first rung the provider answers wins; later rungs are
+ * paid ONLY on a miss, which today costs a hard failure.
+ *
+ * Relaxation widens the QUESTION asked of the provider, never the authority
+ * granted: the caller still admits only identifiers that an actual provider
+ * response contained.
+ *
+ * Nothing here names a provider, a toolkit, or an operation. Salience is read
+ * from the account's own live connections, so a carrier connected tomorrow is
+ * ranked by the same rule with no code change.
+ */
+/**
+ * Order provider rows by how well they answer the request that was actually
+ * made. Used to pick which rows survive the bounded discovery window when a
+ * relaxed rung returns more than the window holds; the caller re-ranks for
+ * presentation. Identifier matches outweigh prose because a slug names the
+ * operation, while a description merely mentions it.
+ */
+function rankAgainstRequest(items: readonly unknown[], query: string): unknown[] {
+  const terms = [...new Set(query.toLowerCase().split(/[^a-z0-9]+/g))]
+    .filter((term) => term.length >= 2 && !PROVIDER_SEARCH_FUNCTION_WORDS.has(term));
+  if (terms.length === 0) return [...items];
+  const relevance = (value: unknown): number => {
+    const item = obj(value);
+    const slug = (str(item.slug) ?? '').toLowerCase();
+    const name = (str(item.name) ?? '').toLowerCase();
+    const description = (str(item.description) ?? '').toLowerCase();
+    let score = 0;
+    for (const term of terms) {
+      if (slug.includes(term)) score += 5;
+      if (name.includes(term)) score += 2;
+      if (description.includes(term)) score += 1;
+    }
+    return score;
+  };
+  return [...items]
+    .map((value, index) => ({ value, index, score: relevance(value) }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map((entry) => entry.value);
+}
+
+export function providerKeywordSearchRungs(
+  query: string,
+  connectedToolkits: readonly string[],
+): readonly (readonly string[])[] {
+  const normalized = query.replace(/\s+/g, ' ').trim();
+  if (!normalized) return [];
+  const terms: string[] = [];
+  for (const raw of normalized.toLowerCase().split(/[^a-z0-9]+/g)) {
+    const term = raw.trim();
+    if (term.length < 2 || PROVIDER_SEARCH_FUNCTION_WORDS.has(term)) continue;
+    if (!terms.includes(term)) terms.push(term);
+  }
+  const rungs: string[][] = [[normalized]];
+  const contentQuery = terms.join(' ');
+  if (contentQuery && contentQuery !== normalized.toLowerCase()) rungs.push([contentQuery]);
+  const slugs = connectedToolkits.map((slug) => slug.toLowerCase());
+  // A term naming one of THIS account's connected carriers is the most
+  // capability-bearing token available; it is derived from live connections,
+  // never from anything written down here.
+  const salience = (term: string): number =>
+    (slugs.some((slug) => slug.includes(term) || term.includes(slug)) ? 100 : 0) + term.length;
+  const fanout = [...terms]
+    .sort((left, right) => salience(right) - salience(left) || left.localeCompare(right))
+    .slice(0, COMPOSIO_SEARCH_RELAXATION_FANOUT);
+  if (fanout.length > 1 || (fanout.length === 1 && fanout[0] !== contentQuery)) {
+    rungs.push(fanout);
+  }
+  // The unfiltered rung: what the connection itself already granted.
+  rungs.push([PROVIDER_SEARCH_UNFILTERED_RUNG]);
+  return rungs;
+}
+
 export async function searchConnectedComposioTools(
   toolkitSlugs: readonly string[],
   query: string,
@@ -2306,25 +2414,25 @@ export async function searchConnectedComposioTools(
     requestedLimit,
     COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT,
   ));
-  const observedAt = Date.now();
-  const raw = await composio.tools.getRawComposioTools({
-    toolkits: connected,
-    search: normalizedQuery,
-    limit: COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT,
-  } as never);
-  const items = Array.isArray(raw)
-    ? raw
-    : (Array.isArray((raw as { items?: unknown[] } | null)?.items)
-        ? (raw as { items: unknown[] }).items
-        : []);
-  if (items.length > COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT) {
-    throw new ComposioSearchProviderContractError();
-  }
   const connectedSet = new Set(connected);
   const seen = new Set<string>();
   const out: ComposioToolkitTool[] = [];
 
-  for (const value of items) {
+  const parse = (raw: unknown): unknown[] => {
+    const items = Array.isArray(raw)
+      ? raw
+      : (Array.isArray((raw as { items?: unknown[] } | null)?.items)
+          ? (raw as { items: unknown[] }).items
+          : []);
+    if (items.length > COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT) {
+      throw new ComposioSearchProviderContractError();
+    }
+    return items;
+  };
+
+  const ingest = (items: readonly unknown[]): void => {
+    const observedAt = Date.now();
+    for (const value of items) {
     const item = obj(value);
     const slug = str(item.slug)?.trim();
     if (!slug) continue;
@@ -2358,7 +2466,30 @@ export async function searchConnectedComposioTools(
     };
     toolSchemaObservedAt.set(tool, observedAt);
     out.push(tool);
-    if (out.length >= returnLimit) break;
+      if (out.length >= returnLimit) break;
+    }
+  };
+
+  for (const rung of providerKeywordSearchRungs(normalizedQuery, connected)) {
+    const responses = await Promise.all(rung.map((search) =>
+      composio.tools.getRawComposioTools({
+        toolkits: connected,
+        ...(search === PROVIDER_SEARCH_UNFILTERED_RUNG ? {} : { search }),
+        limit: COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT,
+      } as never)));
+    // Order the rung's whole union against the ORIGINAL request before the
+    // bounded window is spent. A rung can ask several terms at once, and each
+    // answer arrives in the provider's own order, so draining them as they
+    // land lets ARRIVAL decide what RELEVANCE is supposed to decide.
+    // Measured 2026-08-26: a broad term matching several connected carriers
+    // filled all sixteen rows by itself, and the operation the request was
+    // actually about never entered the window at all. Every row here still
+    // came from a real provider response — this chooses among them, it never
+    // invents one.
+    ingest(rankAgainstRequest(responses.flatMap(parse), normalizedQuery));
+    // The first rung the provider actually answers owns the result. A later
+    // rung is never paid once discovery has rows to rank.
+    if (out.length > 0) break;
   }
   return out;
 }
