@@ -289,6 +289,15 @@ export const EVENT_TYPES = [
   // proceed — but the dashboard now sees the risk and a future
   // workflow-runner extension can react (split / abort / retry).
   'workflow_step_overbudget',
+  // The DELIVERABLE of a workflow-step conversation: the full unclipped
+  // workflow_step_result payload, written by the harness loop at capture
+  // completion so the step output rides a durable, restart-surviving carrier
+  // next to its conversation_completed terminal instead of living only in a
+  // process-local map. Live 2026-08-23 (runs 1787745601613-p49r2/-trnr2): a
+  // demoted blocked terminal threw before process-local adoption, stranding
+  // the payload and reporting the capture tool's own ack echo. Private to the
+  // workflow runner's adoption seam; never projected to chat.
+  'workflow_step_result_captured',
   // Move 2 (confirm-first gate): emitted by the tool-boundary gate each
   // time a mutating external write is ALLOWED through. The gate counts
   // these per session+shape to detect a batch (≥ threshold same-shape

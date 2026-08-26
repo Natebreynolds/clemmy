@@ -303,23 +303,38 @@ export function workflowStepToolUseBehavior(
   return (_context, toolResults) => {
     const structural = toolResults.find((result) =>
       result.tool?.name === 'workflow_step_result');
-    if (
-      !structural
-      || structural.type !== 'function_output'
-      || !sessionId
-      || !peekStepResult(sessionId).found
-    ) {
+    if (!structural || structural.type !== 'function_output' || !sessionId) {
       return NOT_FINAL_TOOL_OUTPUT;
     }
-    const finalOutput = typeof structural.output === 'string'
-      ? structural.output
-      : JSON.stringify(structural.output ?? null);
+    const captured = peekStepResult(sessionId);
+    if (!captured.found) return NOT_FINAL_TOOL_OUTPUT;
     return {
       isFinalOutput: true,
       isInterrupted: undefined,
-      finalOutput,
+      // The DELIVERABLE — not the tool's submission ack — authors the final
+      // output. The ack ("Step result captured …") is transport chrome for the
+      // model; letting it become the final output made it the terminal's
+      // reply/summary and, live 2026-08-23, the blocked reason of two runs
+      // whose real payloads were stranded. Deriving the final output from the
+      // captured value makes ack-echo adoption structurally impossible.
+      finalOutput: workflowStepFinalOutputText(captured.value),
     };
   };
+}
+
+/** Public terminal text for a step that settled its structural capture: a
+ *  truthful, bounded rendering of the deliverable itself. Exported for tests. */
+export function workflowStepFinalOutputText(value: unknown): string {
+  let rendered = '';
+  try {
+    rendered = typeof value === 'string' ? value : JSON.stringify(value) ?? '';
+  } catch {
+    rendered = '';
+  }
+  rendered = rendered.trim();
+  return rendered
+    ? `Workflow step completed with this structured result: ${rendered.slice(0, 2_000)}`
+    : 'Workflow step completed with a structured result.';
 }
 
 export interface BuildWorkflowStepAgentOptions {

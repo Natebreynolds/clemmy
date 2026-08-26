@@ -337,7 +337,13 @@ test('workflow_step_result stops the SDK inner loop only after the result was ac
   recordStepResult(sessionId, { blocked: true, reason: 'upstream unavailable' });
   const accepted = await behavior({} as never, toolResults);
   assert.equal(accepted.isFinalOutput, true, 'an accepted structural result terminates inside the same SDK turn');
-  if (accepted.isFinalOutput) assert.match(accepted.finalOutput, /Step result captured/);
+  if (accepted.isFinalOutput) {
+    // The DELIVERABLE authors the final output — never the tool's submission
+    // ack. The ack echo as final output became two live runs' blocked reason
+    // while their payloads sat stranded (2026-08-23).
+    assert.doesNotMatch(accepted.finalOutput, /Step result captured \(\d+ chars\)\./);
+    assert.match(accepted.finalOutput, /upstream unavailable/);
+  }
   clearStepResult(sessionId);
 });
 

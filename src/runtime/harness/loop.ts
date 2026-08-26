@@ -3995,6 +3995,29 @@ function completeCapturedWorkflowStepResult(opts: {
   steps: number;
   decision?: OrchestratorDecisionShape | null;
 }): RunConversationResult {
+  // THE DELIVERABLE IS THE LOOP'S TERMINAL: persist the full captured payload
+  // as a durable carrier bound to this exact accepted source BEFORE the
+  // terminal is committed. The process-local store remains the same-process
+  // fast path, but adoption no longer depends on it — a runner unwinding on a
+  // demoted (blocked) terminal, or a restarted process, reads the payload back
+  // from this event instead of losing it (live 2026-08-23, runs
+  // 1787745601613-p49r2/-trnr2: the stranded payload's ack echo became the
+  // run's blocked reason).
+  const captured = peekStepResult(opts.sessionId);
+  if (captured.found) {
+    safeAppend({
+      sessionId: opts.sessionId,
+      turn: opts.turn,
+      role: 'system',
+      type: 'workflow_step_result_captured',
+      data: {
+        ...(Number.isSafeInteger(opts.sourceUserSeq)
+          ? { sourceUserSeq: Number(opts.sourceUserSeq) }
+          : {}),
+        value: captured.value === undefined ? null : captured.value,
+      },
+    });
+  }
   safeAppend({
     sessionId: opts.sessionId,
     turn: opts.turn,

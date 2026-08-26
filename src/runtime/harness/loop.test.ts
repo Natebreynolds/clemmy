@@ -8998,6 +8998,42 @@ test('runConversation: captured workflow_step_result terminates despite punt-sha
   );
 });
 
+test('runConversation: a captured workflow_step_result rides a durable carrier next to its terminal', async () => {
+  // THE DELIVERABLE IS THE LOOP'S TERMINAL (live 2026-08-23, runs
+  // 1787745601613-p49r2/-trnr2): adoption was 100% process-local, so a runner
+  // that threw before takeStepResult() — or a restarted process — lost the
+  // payload and reported the capture's own ack echo instead. The loop must
+  // persist the full captured value as a workflow_step_result_captured event
+  // so adoption survives process loss.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'workflow' });
+  clearStepResult(sess.id);
+  const payload = { rows: [{ id: 'durable-1' }], total: 1 };
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    recordStepResult(sess.id, payload);
+    return { history: items, lastResponseId: undefined, finalOutput: 'Done.' };
+  };
+  const result = await runConversation(withSettledWork({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'run one workflow step',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  }));
+  assert.equal(result.status, 'completed');
+  const carriers = listEventsForConv(sess.id, { types: ['workflow_step_result_captured' as never] });
+  assert.equal(carriers.length, 1, 'capture completion must write exactly one durable payload carrier');
+  assert.deepEqual(carriers[0]?.data.value, payload, 'the carrier holds the full unclipped payload');
+  const source = listEventsForConv(sess.id, { types: ['user_input_received'] }).at(-1);
+  assert.equal(
+    carriers[0]?.data.sourceUserSeq,
+    source?.seq,
+    'the carrier binds to the exact accepted source so a later attempt can never adopt a stale payload',
+  );
+  // The process-local store still hands the runner its same-process fast path.
+  assert.deepEqual(takeStepResult(sess.id), { found: true, value: payload });
+});
+
 test('runConversation: fake workflow_step_result transcript is materialized into the structural result channel', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'workflow' });

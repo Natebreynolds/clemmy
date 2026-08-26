@@ -204,7 +204,7 @@ import {
   recordWorkflowOutcome,
   shouldStopAutoHeal,
 } from './workflow-failure-ledger.js';
-import { clearStepContract, registerStepContract, takeStepResult } from '../tools/step-result-tool.js';
+import { clearStepContract, isStepResultAckEcho, peekStepResult, registerStepContract, takeStepResult } from '../tools/step-result-tool.js';
 import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
 import { buildWorkflowMemoryPrimerQuery } from './workflow-memory-primer.js';
 import { fixSignature, recordPendingFix, confirmPendingFix, discardPendingFix, recallConfirmedFix } from './workflow-fix-memory-store.js';
@@ -4648,15 +4648,35 @@ async function runStepViaHarness(
           hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
           recoveredContract: false,
         });
-      case 'blocked':
-        throw new WorkflowHarnessBlockedSignal({
+      case 'blocked': {
+        // THE DELIVERABLE IS THE LOOP'S TERMINAL. A settled structural capture
+        // is this step's deliverable: when one exists (process-local, or the
+        // durable carrier written next to the terminal), fall through to the
+        // settlement-guarded adoption below — the workflow lane's own walls,
+        // not the chat-plane presentation demotion, decide whether the STEP is
+        // blocked. Throwing here regardless used to execute BEFORE
+        // takeStepResult(), stranding the payload and adopting the capture
+        // tool's own ack echo as the run's blocked reason (live 2026-08-23,
+        // runs 1787745601613-p49r2/-trnr2; same stranding class as
+        // 2026-08-25 with a new thrower).
+        const blockedOutcome = workflowStepBlockedOutcome({
           stepId: step.id,
-          sessionId: realSessionId,
-          reason: result.error?.trim()
-            || result.lastDecision?.reply?.trim()
-            || result.lastDecision?.summary?.trim()
-            || `Workflow step "${step.id}" was blocked by the execution harness.`,
+          capturedFound: peekStepResult(realSessionId).found
+            || durableCapturedStepResult(realSessionId, stepExecutionSourceUserSeqs).found,
+          error: result.error,
+          durableBlockedDetail: durableTerminalBlockedDetail(realSessionId),
+          reply: result.lastDecision?.reply ?? undefined,
+          summary: result.lastDecision?.summary ?? undefined,
         });
+        if (blockedOutcome.kind === 'blocked') {
+          throw new WorkflowHarnessBlockedSignal({
+            stepId: step.id,
+            sessionId: realSessionId,
+            reason: blockedOutcome.reason,
+          });
+        }
+        break;
+      }
       case 'killed':
         // A user/control-plane stop can never consume a previously captured
         // partial as permission for downstream workflow steps to continue.
@@ -4714,8 +4734,10 @@ async function runStepViaHarness(
     }
 
     // The explicit structured result the step emitted via workflow_step_result
-    // (captured full, unclipped, keyed by session). Taken once.
-    const captured = takeStepResult(realSessionId);
+    // (captured full, unclipped, keyed by session). Taken once — process-local
+    // first, then the durable carrier bound to this step's exact accepted
+    // sources, so a restart between capture and adoption loses nothing.
+    const captured = adoptCapturedStepResult(realSessionId, stepExecutionSourceUserSeqs);
 
     // Phantom-completion guard (#2), orchestrator-lane parity with the SDK
     // lane above: a send/write step that "completed" while calling ZERO real
@@ -7746,6 +7768,103 @@ export function isPhantomStepCompletion(step: WorkflowStepInput, toolUses: strin
     .map((t) => (typeof t === 'string' ? (t.split('__').at(-1) ?? t) : ''))
     .filter((t) => t.length > 0 && !PHANTOM_GUARD_INERT_TOOLS.has(t));
   return realTools.length === 0;
+}
+
+/**
+ * THE DELIVERABLE IS THE LOOP'S TERMINAL (durable-activation contract; live
+ * regression 2026-08-23, runs 1787745601613-p49r2/-trnr2): a workflow step's
+ * settled structural capture is adopted from the process-local store first,
+ * and otherwise from the durable `workflow_step_result_captured` carrier the
+ * harness loop writes at capture completion — so neither a runner unwinding on
+ * a demoted (blocked) chat terminal nor a process restart can strand the
+ * payload. Adoption of the durable copy is doubly bound: the carrier's
+ * accepted source must belong to THIS step execution, and that source's own
+ * conversation terminal must attest `workflow_step_result_captured` — a stale
+ * carrier from a superseded attempt earns nothing. Exported for tests.
+ */
+export function durableCapturedStepResult(
+  sessionId: string,
+  allowedSourceUserSeqs: ReadonlySet<number>,
+): { found: boolean; value: unknown } {
+  try {
+    const attestedSources = new Set(
+      listHarnessEvents(sessionId, { types: ['conversation_completed'] })
+        .filter((event) => event.data?.reason === 'workflow_step_result_captured'
+          && Number.isSafeInteger(event.data?.sourceUserSeq))
+        .map((event) => Number(event.data.sourceUserSeq)),
+    );
+    const carriers = listHarnessEvents(sessionId, { types: ['workflow_step_result_captured'] })
+      .filter((event) => Number.isSafeInteger(event.data?.sourceUserSeq)
+        && allowedSourceUserSeqs.has(Number(event.data.sourceUserSeq))
+        && attestedSources.has(Number(event.data.sourceUserSeq)));
+    const last = carriers[carriers.length - 1];
+    if (!last) return { found: false, value: undefined };
+    return { found: true, value: (last.data as { value?: unknown }).value };
+  } catch {
+    return { found: false, value: undefined };
+  }
+}
+
+/** Take the step's structural capture: process-local first (same-process fast
+ *  path, cleared on read), durable carrier otherwise. Exported for tests. */
+export function adoptCapturedStepResult(
+  sessionId: string,
+  allowedSourceUserSeqs: ReadonlySet<number>,
+): { found: boolean; value: unknown } {
+  const local = takeStepResult(sessionId);
+  if (local.found) return local;
+  return durableCapturedStepResult(sessionId, allowedSourceUserSeqs);
+}
+
+/**
+ * Blocked-terminal adoption rule. A blocked chat-plane presentation for a step
+ * that already settled its structural capture adopts the CAPTURE — the
+ * settlement-guarded delivery path, not the presentation demotion, decides
+ * whether the STEP is blocked. And a blocked verdict may never be described by
+ * the capture tool's own ack echo: when the only authored text is the ack
+ * ("Step result captured (N chars)."), the reason falls through to the durable
+ * terminal's blocked detail or an honest generic. Pure + exported for tests
+ * (pin: workflow-step-capture-adoption.red.test.ts).
+ */
+export function workflowStepBlockedOutcome(input: {
+  stepId: string;
+  capturedFound: boolean;
+  error?: string | undefined;
+  durableBlockedDetail?: string | undefined;
+  reply?: string | undefined;
+  summary?: string | undefined;
+}): { kind: 'adopt_captured' } | { kind: 'blocked'; reason: string } {
+  if (input.capturedFound) return { kind: 'adopt_captured' };
+  for (const candidate of [input.error, input.durableBlockedDetail, input.reply, input.summary]) {
+    const text = candidate?.trim();
+    if (text && !isStepResultAckEcho(text)) return { kind: 'blocked', reason: text };
+  }
+  return {
+    kind: 'blocked',
+    reason: `Workflow step "${input.stepId}" was blocked by the execution harness.`,
+  };
+}
+
+/** The durable terminal's own account of why it blocked — the committer keeps
+ *  the refusing gate's diagnosis as metadata (blockedReason/verificationDetail)
+ *  even when the authored presentation text says less. */
+function durableTerminalBlockedDetail(sessionId: string): string | undefined {
+  try {
+    const events = listHarnessEvents(sessionId, { types: ['conversation_completed'] });
+    const last = events[events.length - 1];
+    const blockedReason = typeof last?.data?.blockedReason === 'string'
+      ? last.data.blockedReason.trim()
+      : '';
+    if (blockedReason && blockedReason !== 'blocked' && blockedReason !== 'verification_required') {
+      return blockedReason;
+    }
+    const detail = typeof last?.data?.verificationDetail === 'string'
+      ? last.data.verificationDetail.trim()
+      : '';
+    return detail || blockedReason || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function settlementGuardedStepOutput(input: {

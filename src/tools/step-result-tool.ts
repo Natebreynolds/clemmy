@@ -26,6 +26,21 @@ import type { WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
 const stepResults = new Map<string, unknown>();
 
+/** The submission acknowledgement returned to the MODEL inside the turn. It is
+ *  transport chrome, never the deliverable: nothing outside this module may
+ *  adopt it as a step output, terminal text, or blocked reason. Live
+ *  2026-08-23 (runs 1787745601613-p49r2/-trnr2): two runs reported terminal
+ *  blocked BY their own capture ack while the real payload sat stranded. */
+export function stepResultAckText(chars: number): string {
+  return `Step result captured (${chars} chars).`;
+}
+
+/** Recognizer for the ack format above — the belt that lets verdict writers
+ *  refuse the echo even when a carrier smuggles it in as authored text. */
+export function isStepResultAckEcho(text: string): boolean {
+  return /^Step result captured \(\d+ chars\)\.$/.test(text.trim());
+}
+
 // Self-heal move 2 (2026-07-14): the step's OUTPUT CONTRACT, registered by the
 // workflow runner for the step session's lifetime. workflow_step_result
 // validates against it AT SUBMISSION and refuses with the exact problems so
@@ -245,7 +260,7 @@ export function registerStepResultTool(server: McpServer): void {
         const gate = contractRefusal(sessionId, value);
         if ('refusal' in gate) return textResult(gate.refusal);
         recordStepResult(sessionId, gate.accept);
-        return textResult(`Step result captured (${data.length} chars).`);
+        return textResult(stepResultAckText(data.length));
       }
       // No session context — can't correlate to a step. Don't throw;
       // the runner's prose fallback will cover it.
