@@ -81,6 +81,7 @@ import {
   type RuntimeToolEffect,
   type TrustedRuntimeEffectCarrier,
 } from './tool-effect.js';
+import { provenCapabilityEntriesForTurn } from './capability-resolution.js';
 import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
 import { classifyDiscoveryCall } from './discovery-boundary.js';
 import { hostControlFrameFor, hostReadOnlyExecutionContractFor, isRegistryDeclaredTool } from '../../tools/tool-registry.js';
@@ -1690,6 +1691,46 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     };
   };
 
+  /**
+   * READ-FAST-PATH descent (2026-08-26 gauntlet, hole 12): a read-effect
+   * provider call whose exact operation this turn already PROVED (the
+   * capability_resolution proof ledger: status proven, live connection) gets
+   * a cheap shape check — schema + connection + host effect classification,
+   * all already computed at this boundary — and dispatches through its
+   * carrier. The frozen-manifest membership proof is the WRITE bar, not the
+   * read bar: demanding it for reads made the model unable to even LOOK at
+   * the target it must plan against (GOOGLEDRIVE_FIND_FILE, effect 'read',
+   * refused live at this exact wall). Writes keep the full wall unchanged.
+   */
+  const provenTurnReadDescent = (
+    name: string,
+    args: Record<string, unknown> | null,
+  ): { effectiveName: string } | null => {
+    const dbg = (why: string, extra?: unknown) => { if (process.env.CLEM_READ_DESCENT_DEBUG) console.error('READ_DESCENT', why, name, JSON.stringify(extra ?? null)); };
+    if (!hostProduction || !args) { dbg('no-prod-or-args'); return null; }
+    const decision = classifyRuntimeToolEffect(name, args);
+    if (decision.effect !== 'read') { dbg('effect', decision); return null; }
+    // Only provider carriers whose effect provenance is the trusted adapter
+    // classification participate; shell/unknown sources never descend.
+    if (decision.source !== 'composio' && decision.source !== 'native_mcp') { dbg('source', decision); return null; }
+    const effectiveName = unwrapRuntimeEffectiveToolIdentity(name, args).toolName?.trim() ?? '';
+    if (!effectiveName) { dbg('no-effective'); return null; }
+    try {
+      const identity = exactHostIdentity();
+      const entries = provenCapabilityEntriesForTurn({
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+      });
+      const proven = entries.some((entry) => entry.effectClass === 'read'
+        && entry.identifier.trim().toLowerCase() === effectiveName.toLowerCase());
+      if (!proven) dbg('not-proven', { identity, entries });
+      return proven ? { effectiveName } : null;
+    } catch (error) {
+      dbg('threw', String(error));
+      return null;
+    }
+  };
+
   interface ExactProductionHostCall {
     attestation: HostCallAttestation;
     manifest?: CapabilityManifestV1;
@@ -1715,13 +1756,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (!hostProduction || !args || !tool) return null;
     if (
       !harnessToolBracketsEnabled()
-      || !configuredToolRefs.has(tool)
-      || !isHarnessBoundFunctionTool(tool)
       || tool.name !== name
       || logicalToolCallId !== logicalToolCallId.trim()
       || !logicalToolCallId
       || logicalToolCallId.length > 512
     ) return null;
+    // Carrier provenance: the wrapToolForHarness-attested configured object is
+    // the ordinary bar. A read-effect call whose exact operation this turn
+    // proved may descend without it (read-fast-path); every mutation keeps the
+    // attested-carrier requirement.
+    const attestedCarrier = configuredToolRefs.has(tool) && isHarnessBoundFunctionTool(tool);
+    const readDescent = provenTurnReadDescent(name, args);
+    if (!attestedCarrier && !readDescent) return null;
     const identity = exactHostIdentity();
     const surface = currentProductionHostSurface();
     const envelope = surface.envelope;
@@ -1803,6 +1849,41 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (authorityBinding === 'unknown') return null;
     const catalogEntry = candidates[0];
     if (authorityBinding === 'catalog_manifest' || catalogEntry) {
+      if (!catalogEntry && decision.effect === 'read' && readDescent) {
+        // READ-FAST-PATH: no frozen-catalog member exists for this proven
+        // read (pre-plan the production surface is graph-neutral/empty), and
+        // that is fine — frozen membership is the WRITE bar. The carrier
+        // dispatches under its own nested crossing accounting with the host
+        // effect classification (which reads the OPERATION, never a server
+        // name) and this turn's connection proof as the shape check.
+        const binding = {
+          bindingKind: 'local_envelope' as const,
+          capabilityId: capability[0]!.name,
+          schemaFingerprint: capability[0]!.schemaFingerprint,
+          accountId: '',
+          invokePortId: `configured-wrapper:${capability[0]!.schemaFingerprint}`,
+          operationId: name,
+          manifestId: '',
+          manifestDigest: '',
+        };
+        const bindingDigest = hostSurfaceDigest({ version: 1, ...binding, effect: decision.effect });
+        const descentArgs = effective.args && typeof effective.args === 'object' && !Array.isArray(effective.args)
+          ? effective.args as Record<string, unknown>
+          : {};
+        return {
+          attestation: { ...common, ...binding, bindingDigest },
+          effect: decision.effect,
+          boundary: 'nested_owned',
+          logicalToolName: readDescent.effectiveName,
+          logicalArgs: descentArgs,
+          trustedEffectCarrier: trustedRuntimeEffectCarrier(name, args),
+          invoke: async (callSignal) => tool.invoke!(
+            runContextForCall,
+            argumentsJson,
+            { ...(details as Record<string, unknown>), signal: callSignal },
+          ),
+        };
+      }
       const manifest = currentCapabilityManifest(catalogEntry?.manifest);
       if (!catalogEntry || !manifest) return null;
       const port = resolveProductionPortsForManifest(manifest);
@@ -2113,8 +2194,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (
       !harnessToolBracketsEnabled()
       || !tool
-      || !configuredToolRefs.has(tool)
-      || !isHarnessBoundFunctionTool(tool)
+      || (
+        (!configuredToolRefs.has(tool) || !isHarnessBoundFunctionTool(tool))
+        // READ-FAST-PATH: a read-effect call whose exact operation this turn
+        // proved (capability_resolution ledger) is never killed at the
+        // provenance wall — the effect classification this boundary already
+        // computed IS the read bar. Mutations keep the full wall.
+        && !provenTurnReadDescent(name, args)
+      )
     ) {
       return `Tool '${name}' was refused before dispatch because the selected host engine only admits configured harness-bounded tools. No local or external mutation was attempted.`;
     }

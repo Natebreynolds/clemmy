@@ -3811,6 +3811,13 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // catalog (`codex_oauth:<id>` | `claude_oauth:<id>` | `api_key:<id>`),
       // so an invented or stale model id is refused before any state moves.
       const value = typeof req.body?.value === 'string' ? req.body.value.trim() : '';
+      // Optional: the chat session the switch was made from (the BrainSheet in
+      // the chat header knows it; the Settings sheet does not). Session brain
+      // pins (B6) mean the global flip alone no longer re-routes an
+      // already-served conversation, so a chat-context switch re-pins ITS
+      // session below — keeping "applies to your next message" true where the
+      // sheet promises it. No sessionId ⇒ global-only (new sessions).
+      const switchSessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
       const option = brainOptions().find((o) => o.value === value);
       if (!option) {
         res.status(400).json({
@@ -3906,6 +3913,14 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       resetClaudeModelCache();
       resetByoModelCache();
       clearAutonomyAgentCache();
+
+      // Re-pin the conversation the switch was made from (after the env writes
+      // + cache resets, so the pin stamps the NEW global resolution). No
+      // sessionId ⇒ no pin is touched: other live conversations keep theirs.
+      if (switchSessionId) {
+        const { pinSessionBrain } = await import('../runtime/harness/model-roles.js');
+        try { pinSessionBrain(switchSessionId); } catch { /* pin is affinity, never a switch blocker */ }
+      }
 
       res.json({
         ok: true,

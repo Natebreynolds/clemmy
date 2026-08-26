@@ -12,8 +12,10 @@ import {
   AcceptedTaskTerminalPublicationError,
   appendTerminalEventOnce,
   listEvents,
+  openEventLog,
   type EventRow,
 } from './eventlog.js';
+import { HOST_TOOL_UNCERTAIN_BLOCKED_TEXT } from './host-turn-runner.js';
 import {
   InvalidTurnOutcomeError,
   assertPublicPresentationText,
@@ -762,6 +764,44 @@ function repairArgumentsNeedsInputOutcome(
  * caller must never return success, clear recovery state, or stream the proposed
  * text until this function succeeds.
  */
+/** Honest terminal for a host-side failure with a provably effect-free ledger.
+ * Value-opaque like every host constant: no tool names, no model prose. */
+export const HOST_LOCAL_FAILURE_BLOCKED_TEXT =
+  'A host-side step failed after running locally. Nothing external was executed or changed — no call left this machine for this request — so there is nothing to reconcile. Ask me to continue and I will retry from the durable checkpoint.';
+
+/**
+ * Ledger effect-truth for one accepted source: true only when the write ledger
+ * can PROVE nothing external could have run — zero physical dispatches outside
+ * the host site and zero settlements that own reconciliation. Any unreadable
+ * ledger keeps the conservative uncertainty copy: honesty may only ever be
+ * upgraded on proof, never on a query failure.
+ */
+function acceptedSourceHasZeroExternalEffectSurface(
+  identity: TurnIdentity,
+): boolean {
+  try {
+    const row = openEventLog().prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM physical_dispatches
+          WHERE session_id = ? AND source_user_seq = ?
+            AND (execution_site IS NULL OR execution_site <> 'host')) AS external_dispatches,
+        (SELECT COUNT(*) FROM logical_call_settlements
+          WHERE session_id = ? AND source_user_seq = ?
+            AND (outcome_kind = 'uncertain_write' OR requires_reconciliation = 1)) AS reconciliation_owed
+    `).get(
+      identity.sessionId,
+      identity.sourceUserSeq,
+      identity.sessionId,
+      identity.sourceUserSeq,
+    ) as { external_dispatches: number; reconciliation_owed: number } | undefined;
+    return row !== undefined
+      && row.external_dispatches === 0
+      && row.reconciliation_owed === 0;
+  } catch {
+    return false;
+  }
+}
+
 export function commitTurnOutcome(
   outcome: TurnOutcome,
   options: DeliveryCommitOptions = {},
@@ -823,6 +863,36 @@ export function commitTurnOutcome(
         disclosureDetail = deliveryGap;
       }
     }
+  }
+  // TERMINAL COPY DERIVES FROM THE WRITE LEDGER'S EFFECT-TRUTH, never from
+  // tool-shape heuristics. The host runner's uncertain-blocked constant claims
+  // possible external execution; the ledger for this exact accepted source is
+  // the authority on whether anything external could have run. Live 2026-08-26:
+  // all 12 blocked terminals rendered "may have begun… must be reconciled"
+  // about host-only meta-tools with ZERO non-host dispatch rows, and the
+  // phantom uncertainty then poisoned later turns cross-brain (S6) with no
+  // user-reachable path to clear it. A turn whose ledger shows zero external
+  // dispatches may never claim possible external execution; a turn WITH an
+  // unresolved external crossing keeps the reconciliation copy unchanged.
+  if (
+    effectiveOutcome.status === 'blocked'
+    && effectiveOutcome.presentation.text === HOST_TOOL_UNCERTAIN_BLOCKED_TEXT
+    && acceptedSourceHasZeroExternalEffectSurface(effectiveOutcome.identity)
+  ) {
+    effectiveOutcome = {
+      ...effectiveOutcome,
+      // Nothing left the machine, so retrying is provably safe: the honest
+      // terminal is a resumable checkpoint, not a locked reconciliation door.
+      resumable: true,
+      presentation: { kind: 'blocked', text: HOST_LOCAL_FAILURE_BLOCKED_TEXT },
+    };
+    effectiveOptions = {
+      ...effectiveOptions,
+      metadata: {
+        ...(effectiveOptions.metadata ?? {}),
+        blockedReason: 'host_control_failure_no_external_effect',
+      },
+    };
   }
   const proposed = presentationEventForOutcome(effectiveOutcome);
   // A prepared/held workflow admission is durable accepted work, not an error

@@ -558,6 +558,75 @@ function correctiveFailureProse(result: unknown): boolean {
     typeof candidate === 'string' && /^\s*⚠️\s*\S[^\n]{0,120}\bFAILED\b/.test(candidate));
 }
 
+/** Same one-level wrapper tolerance as the other string markers. */
+function stringCandidates(result: unknown): string[] {
+  const candidates: unknown[] = [result];
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const wrapper = result as Record<string, unknown>;
+    candidates.push(wrapper.output, wrapper.text, wrapper.preview, wrapper.result);
+  }
+  return candidates.filter((candidate): candidate is string => typeof candidate === 'string');
+}
+
+/** "Tool call refused by harness: …" is HOST-AUTHORED (softToolError and the
+ * lane brackets are its only writers): the harness refused the call before any
+ * execution. Crossing a carrier boundary as a bare string, it classified as a
+ * SUCCEEDED host execution — live 2026-08-26 (sess-desktop-5bcd…, 12:06:19Z):
+ * the exact_args_repeat guardrail's own block string settled succeeded with a
+ * success=1 durable handle, then failed the plan_task typed-result check and
+ * killed the whole conversation. The prefix is the marker, exactly like
+ * `[provider-dispatch:not-started:*]`. */
+function harnessRefusalString(result: unknown): boolean {
+  return stringCandidates(result)
+    .some((candidate) => /^\s*Tool call refused by harness:/.test(candidate));
+}
+
+/** The Agents SDK's errorFunction launders EVERY invoke error into "An error
+ * occurred while running the tool. Please try again. Error: …" and returns it
+ * as the tool's own result. The prefix is host/SDK-authored, never provider
+ * prose. An InvalidToolInputError detail proves validation refused the call
+ * BEFORE the body ran (repairable arguments); any other detail proves only
+ * that the attempt failed — dispatch state stays unknown, success does not.
+ * Live 2026-08-26: six InvalidToolInputError strings settled succeeded /
+ * success=1 across four sessions (sess-desktop-8823/b3a7/f58f/e0e9). */
+function sdkLaunderedErrorString(result: unknown): 'invalid_input' | 'execution' | null {
+  for (const candidate of stringCandidates(result)) {
+    if (!/^\s*An error occurred while running the tool\. Please try again\. Error:/.test(candidate)) continue;
+    return /InvalidToolInputError|Invalid JSON input for tool/.test(candidate)
+      ? 'invalid_input'
+      : 'execution';
+  }
+  return null;
+}
+
+/** A bare-string payload that is itself a JSON record still carries the same
+ * structured envelope verdict the object form would. Only the NEGATIVE verdict
+ * is extracted: a string payload never settles success (hostExecuted already
+ * proves local success where it is real), but a record that says ok:false must
+ * not classify as a succeeded host execution just because a carrier boundary
+ * serialized it — live 2026-08-26: ~70 typed plan_not_admitted refusal strings
+ * settled outcome_kind='succeeded' with success=1 handles. */
+const STRING_ENVELOPE_MAX_BYTES = 64 * 1024;
+function negativeStringEnvelope(result: unknown): { errorCode?: string | number } | null {
+  for (const candidate of stringCandidates(result)) {
+    const text = candidate.trim();
+    if (!text.startsWith('{') || Buffer.byteLength(text, 'utf8') > STRING_ENVELOPE_MAX_BYTES) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      continue;
+    }
+    const envelope = record(parsed);
+    if (!envelope) continue;
+    const successful = envelope.successful ?? envelope.success ?? envelope.ok;
+    if (successful !== false) continue;
+    const code = envelope.error_code ?? envelope.errorCode ?? envelope.code;
+    return typeof code === 'string' || typeof code === 'number' ? { errorCode: code } : {};
+  }
+  return null;
+}
+
 function hasTaskIdentity(input: SettleToolAttemptInput): input is SettleToolAttemptInput & {
   sessionId: string; sourceUserSeq: number;
 } {
@@ -723,6 +792,30 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // settled succeeded with a durable handle). The prefix is the marker.
   if (extracted.executionFailed === undefined && correctiveFailureProse(input.result)) {
     extracted.executionFailed = true;
+  }
+  // SETTLEMENT CARRIES SEMANTIC TRUTH: a string payload never settles success.
+  // These three shapes each settled outcome_kind='succeeded' live (2026-08-26
+  // gauntlet, ~249 calls), overcounting every settlement-derived metric and
+  // feeding a fail-closed conversation kill downstream. Order matters: the
+  // harness's own refusal prefix is nominal and outranks the generic SDK
+  // laundering, which outranks the structural JSON-record verdict.
+  if (extracted.preDispatch === undefined && harnessRefusalString(input.result)) {
+    extracted.preDispatch = true;
+    extracted.policyRefused = true;
+  } else {
+    const laundered = sdkLaunderedErrorString(input.result);
+    if (laundered === 'invalid_input' && extracted.argumentValidationFailed === undefined) {
+      extracted.preDispatch = true;
+      extracted.argumentValidationFailed = true;
+    } else if (laundered === 'execution' && extracted.executionFailed === undefined) {
+      extracted.executionFailed = true;
+    } else if (laundered === null && extracted.envelopeSuccessful === undefined) {
+      const negative = negativeStringEnvelope(input.result);
+      if (negative) {
+        extracted.envelopeSuccessful = false;
+        if (negative.errorCode !== undefined) extracted.envelopeErrorCode = negative.errorCode;
+      }
+    }
   }
   if (input.result instanceof TruncatedToolOutputResult) {
     extracted.outputTruncated = true;

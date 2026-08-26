@@ -258,9 +258,18 @@ export const completeClaudeLogin = (flowId: string, code: string) =>
 // applies live on the next message — no daemon restart.
 export type ActiveBrain = 'codex_oauth' | 'claude_oauth' | 'api_key';
 // modelId pins WHICH connected BYO model is the brain (only meaningful for
-// brain==='api_key'); omitted for Codex/Claude.
-export const setActiveBrain = (brain: ActiveBrain, modelId?: string) =>
-  patch<{ activeBrain: ActiveBrain; claudeAuth: ClaudeAuth }>('/api/console/settings/active-brain', modelId ? { brain, modelId } : { brain });
+// brain==='api_key'); omitted for Codex/Claude. sessionId is the conversation
+// the switch was made FROM, when there is one: session brain pins mean the
+// global flip alone no longer re-routes an already-served conversation, so a
+// chat-context switch sends its sessionId and the daemon re-pins that session
+// ("applies to your next message" stays true where it was promised). A
+// Settings-context switch has no session and stays global-only.
+export const setActiveBrain = (brain: ActiveBrain, modelId?: string, sessionId?: string) =>
+  patch<{ activeBrain: ActiveBrain; claudeAuth: ClaudeAuth }>('/api/console/settings/active-brain', {
+    brain,
+    ...(modelId ? { modelId } : {}),
+    ...(sessionId ? { sessionId } : {}),
+  });
 
 export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding' | 'certify' | 'watcher';
 export type JudgeMetricOutcome = 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error';

@@ -130,3 +130,61 @@ test('preselected rate-limit rescue emits exact target telemetry without probing
     clearRateLimitedBrainsForTest();
   }
 });
+
+// ── B5 regression pin (gauntlet 2026-08-26): the 12:04:57Z claude→codex mid-turn
+// fallover existed ONLY in the pino log; the session ledger's turn_model_routed
+// still said claude, so the eventlog attributed codex-served content to claude.
+// A fallover must RE-EMIT turn_model_routed into the SESSION eventlog with the
+// new brain and the reason — the ledger answers "who served this token".
+test('a mid-turn fallover re-emits turn_model_routed with the new brain + reason in the SESSION eventlog', async () => {
+  clearRateLimitedBrainsForTest();
+  reviveDeadBrains();
+  const { createSession, listEvents } = await import('./eventlog.js');
+  const sessionId = 'sess-fallover-ledger-1';
+  createSession({ id: sessionId, kind: 'chat' });
+
+  const hung = model({ getStreamedResponse: async function* () { throw { statusCode: 529, message: 'overloaded_error' }; } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    yield { type: 'response_done', response: { output: [{ type: 'message', content: 'rescued' }] } } as never;
+  } });
+  const fb = withModelFallback([
+    identifiedTarget('claude-sonnet-5', 'claude', 'claude-sonnet-5', hung),
+    identifiedTarget('codex', 'codex', 'gpt-5.4', rescue),
+  ], { sessionId });
+  for await (const _event of fb.getStreamedResponse(req())) { /* drain */ }
+
+  const routed = listEvents(sessionId).filter((e) => e.type === 'turn_model_routed');
+  assert.equal(routed.length, 1, 'the fallover re-emitted exactly one turn_model_routed');
+  const data = routed[0].data as Record<string, unknown>;
+  assert.equal(data.model, 'gpt-5.4', 'the ledger names the brain that ACTUALLY serves');
+  assert.equal(data.provider, 'codex');
+  assert.equal(data.fallover, true, 'marked as a fallover re-route, not the pre-turn route');
+  assert.equal(data.reason, 'model.overloaded', 'carries WHY the brain switched');
+  assert.equal(data.fromModel, 'claude-sonnet-5', 'names the brain that was abandoned');
+});
+
+// The preselected-rescue path (a known-dead brain skipped before dispatch) must
+// leave the same ledger truth: the turn was NOT served by the configured primary.
+test('a preselected rescue (dead primary skipped) also re-emits turn_model_routed', async () => {
+  clearRateLimitedBrainsForTest();
+  reviveDeadBrains();
+  const { createSession, listEvents } = await import('./eventlog.js');
+  const sessionId = 'sess-fallover-ledger-2';
+  createSession({ id: sessionId, kind: 'chat' });
+  markBrainAuthDead('dead-primary', 'model.auth_expired');
+
+  const neverCalled = model({ getResponse: async () => { throw new Error('dead primary must not be dispatched'); } });
+  const rescue = model({ getResponse: async () => resp('rescued') });
+  const fb = withModelFallback([
+    identifiedTarget('dead-primary', 'claude', 'claude-opus-4-8', neverCalled),
+    identifiedTarget('codex', 'codex', 'gpt-5.4', rescue),
+  ], { sessionId });
+  await fb.getResponse(req());
+
+  const routed = listEvents(sessionId).filter((e) => e.type === 'turn_model_routed');
+  assert.equal(routed.length, 1);
+  const data = routed[0].data as Record<string, unknown>;
+  assert.equal(data.model, 'gpt-5.4');
+  assert.equal(data.reason, 'preselected-auth-dead');
+  reviveDeadBrains();
+});

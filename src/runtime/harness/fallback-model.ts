@@ -29,6 +29,7 @@ import type { StreamEvent } from '@openai/agents-core/types';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BoundaryError } from '../boundary-error.js';
+import { appendEvent } from './eventlog.js';
 import { classifyModelError } from './resilient-model.js';
 import { isAuthRecoverableError } from '../../execution/transient-error.js';
 import { BASE_DIR, getRuntimeEnv } from '../../config.js';
@@ -926,8 +927,49 @@ export class FallbackModel implements Model {
     });
   }
 
+  /** B5 regression fix (gauntlet 2026-08-26): a mid-turn fallover existed ONLY
+   *  in the pino log — the session ledger's pre-turn turn_model_routed still
+   *  named the abandoned brain, so every brain comparison was log archaeology.
+   *  Re-emit turn_model_routed into the SESSION eventlog at the moment the
+   *  route actually changes (stamped when it HAPPENS, not when intended), so
+   *  the ledger answers "who served this token" with the brain and the reason.
+   *  Best-effort: ledger telemetry must never take the rescued turn down. */
+  private recordFalloverRouteInSessionLedger(
+    from: FallbackTarget,
+    to: FallbackTarget,
+    reason: string,
+    preselected: boolean,
+  ): void {
+    const sessionId = this.opts.sessionId;
+    if (!sessionId) return;
+    const runContext = harnessRunContextStorage.getStore();
+    try {
+      appendEvent({
+        sessionId,
+        turn: runContext?.turn ?? 0,
+        role: 'system',
+        type: 'turn_model_routed',
+        data: {
+          model: to.model ?? to.label,
+          ...(to.provider ? { provider: to.provider } : {}),
+          transport: 'host_harness',
+          routeKind: 'harness_fallover',
+          fallover: true,
+          reason,
+          fromModel: from.model ?? from.label,
+          ...(from.provider ? { fromProvider: from.provider } : {}),
+          ...(preselected ? { preselected: true } : {}),
+          ...(Number.isSafeInteger(runContext?.sourceUserSeq) && (runContext?.sourceUserSeq ?? 0) > 0
+            ? { sourceUserSeq: runContext?.sourceUserSeq }
+            : {}),
+        },
+      });
+    } catch { /* telemetry only — the rescue brain still owns the turn */ }
+  }
+
   private logFallover(chain: FallbackTarget[], i: number, err: unknown): void {
     const reason = this.falloverReason(err);
+    this.recordFalloverRouteInSessionLedger(chain[i], chain[i + 1], reason, false);
     logger.warn(
       {
         from: chain[i].label,
@@ -968,6 +1010,7 @@ export class FallbackModel implements Model {
     reason: string;
   }): void {
     const { from, to, reason } = resolution;
+    this.recordFalloverRouteInSessionLedger(from, to, reason, true);
     logger.warn(
       {
         from: from.label,

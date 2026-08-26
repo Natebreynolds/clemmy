@@ -180,3 +180,96 @@ test('startApprovalReaper sweeps stale approvals immediately on startup', async 
 
   assert.equal(reg.get(row.approvalId)?.status, 'expired');
 });
+
+// ── B7b regression pins (gauntlet 2026-08-26): the approval-reaper rescanned 5
+// durably-held revoked invocations every 60s forever (108+ warns, still firing
+// after the gauntlet) — recovery could neither settle nor abandon. Bounded
+// rescans must give the permanently-held a terminal disposition: quarantined
+// durably, surfaced ONCE, re-probed slowly instead of every tick.
+test('permanently-held revoked invocations get a terminal disposition after bounded rescans (no eternal 60s scan)', () => {
+  reaper.__recoveryTest__.reset();
+  let sweeps = 0;
+  const heldRecord = (id: string) => ({
+    sessionId: 'sess-held', sourceUserSeq: 71310, logicalToolCallId: id,
+    leaseScopeId: 'scope-a', leaseId: `lease-${id}`, status: 'held' as const,
+    reason: 'Tool attempt could not settle durably (closed): accepted-turn call authority is conflict',
+  });
+  reaper.__recoveryTest__.setSweepForTests({
+    sweep: () => {
+      sweeps += 1;
+      return { scanned: 2, settled: 0, held: 2, records: [heldRecord('call-a'), heldRecord('call-b')] };
+    },
+    candidateCount: () => 2,
+  });
+
+  const max = reaper.__recoveryTest__.maxRescans();
+  for (let i = 0; i < max; i++) reaper.reapOnce();
+  assert.equal(sweeps, max, 'every rescan up to the bound actually re-attempted recovery');
+  assert.equal(reaper.__recoveryTest__.quarantinedKeys().length, 2, 'both permanently-held records were quarantined');
+
+  const notes = listNotifications().filter((n) => n.id.startsWith('revoked-recovery-abandoned-'));
+  assert.ok(notes.length >= 1, 'the terminal disposition was surfaced to the user');
+
+  // Quarantined + no new candidates ⇒ the reaper stops re-attempting each tick.
+  reaper.reapOnce();
+  reaper.reapOnce();
+  assert.equal(sweeps, max, 'no further recovery attempts while all held candidates are quarantined');
+
+  // A NEW revoked candidate appears ⇒ the sweep resumes immediately.
+  reaper.__recoveryTest__.setSweepForTests({
+    sweep: () => {
+      sweeps += 1;
+      return { scanned: 3, settled: 0, held: 2, records: [heldRecord('call-a'), heldRecord('call-b')] };
+    },
+    candidateCount: () => 3,
+  });
+  reaper.reapOnce();
+  assert.equal(sweeps, max + 1, 'a new candidate re-opens the recovery sweep despite the quarantine pause');
+  reaper.__recoveryTest__.reset();
+});
+
+test('a quarantined record that finally settles is released from quarantine', () => {
+  reaper.__recoveryTest__.reset();
+  const held = {
+    sessionId: 'sess-heal', sourceUserSeq: 9, logicalToolCallId: 'call-heal',
+    leaseScopeId: 'scope-h', leaseId: 'lease-heal', status: 'held' as const, reason: 'conflict',
+  };
+  reaper.__recoveryTest__.setSweepForTests({
+    sweep: () => ({ scanned: 1, settled: 0, held: 1, records: [held] }),
+    candidateCount: () => 1,
+  });
+  for (let i = 0; i < reaper.__recoveryTest__.maxRescans(); i++) reaper.reapOnce();
+  assert.equal(reaper.__recoveryTest__.quarantinedKeys().length, 1);
+
+  reaper.__recoveryTest__.setSweepForTests({
+    sweep: () => ({ scanned: 1, settled: 1, held: 0, records: [{ ...held, status: 'settled' as const, reason: undefined }] }),
+    candidateCount: () => 1,
+  });
+  // Quarantine pauses the sweep; the slow re-probe (default hourly) is when a
+  // healed record gets noticed — simulate that clock.
+  reaper.reapOnce({ nowMs: Date.now() + 2 * 60 * 60_000 });
+  assert.equal(reaper.__recoveryTest__.quarantinedKeys().length, 0, 'settlement clears the quarantine entry at the re-probe');
+  reaper.__recoveryTest__.reset();
+});
+
+// ── B7a wiring: the periodic reaper OWNS the accepted-input liveness sweep and
+// surfaces every terminalized silent session to the user.
+test('reapOnce terminalizes a silent accepted-input session and notifies the user', async () => {
+  reaper.__recoveryTest__.reset();
+  reaper.__recoveryTest__.setSweepForTests({
+    sweep: () => ({ scanned: 0, settled: 0, held: 0, records: [] }),
+    candidateCount: () => 0,
+  });
+  const { appendEvent, claimRunAttemptLease, finishRunAttempt, getSession } = await import('./eventlog.js');
+  const zombie = createSession({ id: 'sess-reaper-zombie-1', kind: 'chat', channel: 'desktop' });
+  const claim = claimRunAttemptLease({ sessionId: zombie.id, runId: 'desktop:rz-1', ownerId: 'console-test', leaseMs: 60_000 });
+  appendEvent({ sessionId: zombie.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'continue' } });
+  if (claim.attempt) finishRunAttempt(claim.attempt, 'completed');
+
+  reaper.reapOnce({ nowMs: Date.now() + 11 * 60_000 });
+
+  assert.equal(getSession(zombie.id)?.status, 'failed', 'the silent session got its durable liveness terminal');
+  const note = listNotifications().find((n) => n.id === `liveness-no-turn-${zombie.id}`);
+  assert.ok(note, 'the silent no-reply was surfaced to the user, not just the ledger');
+  reaper.__recoveryTest__.reset();
+});

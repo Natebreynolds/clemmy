@@ -1,0 +1,185 @@
+/**
+ * Run: npx tsx --test src/runtime/harness/attempt-settlement.semantic-truth.red.test.ts
+ *
+ * Settlement carries SEMANTIC truth: typed success | typed refusal | typed
+ * error. A string payload never settles success.
+ *
+ * Measured live (gauntlet 2026-08-26, harness.db read-only): every plan_task
+ * settlement of the day is outcome_kind='succeeded' / evidence='nominal' /
+ * detail='host_execution' — including three FAILURE payload shapes:
+ *   (a) typed refusal JSON strings ('{"ok":false,"code":"plan_not_admitted",…}',
+ *       sess-desktop-5bcd… ×~70),
+ *   (b) SDK-laundered validation errors ("An error occurred while running the
+ *       tool. Please try again. Error: InvalidToolInputError: Invalid JSON
+ *       input for tool", sess-desktop-8823/b3a7/f58f/e0e9 ×6),
+ *   (c) harness guardrail blocks ("Tool call refused by harness: tool-call
+ *       guardrail block: Loop detected…", sess-desktop-5bcd… 12:06:19Z).
+ * All three minted durable_result_handles with success=1, so every settlement-
+ * derived evidence consumer overcounted success, and the plan_task typed-result
+ * check downstream failed closed on (b)/(c) and killed whole conversations.
+ *
+ * The classification owner is settleToolAttempt (attempt-settlement.ts): a
+ * bare string with no recognized marker classifies 'unknown', and the
+ * host-execution reclassification then upgrades it to 'succeeded'. These pins
+ * hold the marker seam: each live payload shape settles as its typed failure.
+ */
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-attempt-semantic-truth-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
+mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-semantic-truth\n', 'utf8');
+
+const eventlog = await import('./eventlog.js');
+const shadow = await import('../graph/turn-graph-shadow.js');
+const identity = await import('./attempt-identity.js');
+const dispatch = await import('./dispatch-ledger.js');
+const settlement = await import('./attempt-settlement.js');
+
+test.after(() => {
+  eventlog.closeEventLog();
+  rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+let serial = 0;
+
+function accept(label: string) {
+  const session = eventlog.createSession({ id: `semantic-truth-${++serial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: `Plan and run the ${label} request.` },
+  });
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
+  return {
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    acceptedTaskId: identity.acceptedTaskIdFor(session.id, source.seq),
+  };
+}
+
+/** Mirror production plan_task exactly: the host opens its own crossing before
+ * invoke and settles it 'returned' before the logical settlement. */
+function admitReturnedHostCrossing(input: {
+  task: ReturnType<typeof accept>;
+  logicalToolCallId: string;
+  tool: string;
+  args: unknown;
+}) {
+  const started = dispatch.beginPhysicalDispatch({
+    identity: {
+      sessionId: input.task.sessionId,
+      sourceUserSeq: input.task.sourceUserSeq,
+      acceptedTaskId: input.task.acceptedTaskId,
+      logicalToolCallId: input.logicalToolCallId,
+      physicalDispatchId: `dispatch:host:${input.logicalToolCallId}`,
+      ordinal: 1,
+    },
+    tool: input.tool,
+    args: input.args,
+    relation: 'primary',
+    executionSite: 'host',
+  });
+  assert.equal(started.status, 'inserted');
+  if (started.status !== 'inserted') throw new Error('host crossing was not admitted');
+  assert.equal(dispatch.settlePhysicalDispatch({
+    identity: started.identity,
+    tool: input.tool,
+    outcome: 'returned',
+  }).status, 'inserted');
+}
+
+function successHandleCount(task: ReturnType<typeof accept>): number {
+  const row = eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM durable_result_handles
+     WHERE session_id = ? AND source_user_seq = ? AND success = 1
+  `).get(task.sessionId, task.sourceUserSeq) as { n: number };
+  return row.n;
+}
+
+function settleHostString(task: ReturnType<typeof accept>, callId: string, payload: string) {
+  admitReturnedHostCrossing({
+    task,
+    logicalToolCallId: callId,
+    tool: 'plan_task',
+    args: { preamble: 'On it.', draft: { criteria: ['x'] } },
+  });
+  return settlement.settleToolAttempt({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    turn: task.turn,
+    lane: 'byo',
+    toolName: 'plan_task',
+    callId,
+    args: { preamble: 'On it.', draft: { criteria: ['x'] } },
+    mutating: false,
+    businessCall: false,
+    result: payload,
+  });
+}
+
+test('a typed refusal JSON string settles as a typed failure, never success', () => {
+  const task = accept('typed refusal');
+  const settled = settleHostString(task, 'logical:typed-refusal', JSON.stringify({
+    ok: false,
+    code: 'plan_not_admitted',
+    detail: 'primary model proposal cites a capability that was not disclosed to this source',
+    repair: 'Correct the semantic proposal against the exact host planning catalog, then call plan_task again.',
+  }));
+  assert.notEqual(settled.outcome.kind, 'succeeded',
+    'a payload that says ok:false may not settle succeeded — "succeeded" must mean more than "settled"');
+  assert.equal(settled.outcome.evidence, 'structured',
+    'the envelope field in the parsed record is the structured verdict');
+  assert.equal(settled.resultHandleId, undefined, 'no success-redeemable handle for a refusal');
+  assert.equal(successHandleCount(task), 0, 'no durable handle rows claim success=1');
+});
+
+test('a harness guardrail-block string settles as a typed pre-dispatch refusal', () => {
+  const task = accept('guardrail block');
+  const settled = settleHostString(task, 'logical:guardrail-block',
+    'Tool call refused by harness: tool-call guardrail block: Loop detected: plan_task has been '
+    + 'called 5× with IDENTICAL arguments and keeps failing/returning the same result. Repeating '
+    + 'it will not help. STOP — do something different.');
+  assert.equal(settled.outcome.kind, 'policy_denial',
+    'the harness authored this refusal before any execution; the prefix is the marker, like [provider-dispatch:not-started:*]');
+  assert.equal(settled.resultHandleId, undefined);
+  assert.equal(successHandleCount(task), 0);
+});
+
+test('an SDK-laundered input-validation error string settles as invalid_arguments', () => {
+  const task = accept('laundered validation error');
+  const settled = settleHostString(task, 'logical:laundered-validation',
+    'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid JSON input for tool');
+  assert.equal(settled.outcome.kind, 'invalid_arguments',
+    'validation failed before the tool body ran; the model repairs the arguments and retries');
+  assert.equal(settled.resultHandleId, undefined);
+  assert.equal(successHandleCount(task), 0);
+});
+
+test('an SDK-laundered non-validation error string settles as a failure, not success', () => {
+  const task = accept('laundered execution error');
+  const settled = settleHostString(task, 'logical:laundered-execution',
+    'An error occurred while running the tool. Please try again. Error: Error: provider exploded mid-flight');
+  assert.notEqual(settled.outcome.kind, 'succeeded',
+    'the SDK error prefix marks a laundered throw; dispatch state is unknown, success is not');
+  assert.equal(successHandleCount(task), 0);
+});
+
+test('an ordinary local string result still settles succeeded with host evidence (forward-only)', () => {
+  const task = accept('plain local result');
+  const settled = settleHostString(task, 'logical:plain-result',
+    'Here are the three records you asked about: a, b, c.');
+  assert.equal(settled.outcome.kind, 'succeeded',
+    'unmarked local returns keep their host-execution evidence; the fix must not orphan local reads');
+  assert.equal(settled.outcome.detail, 'host_execution');
+});

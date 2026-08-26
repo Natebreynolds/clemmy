@@ -13,7 +13,7 @@ import {
 } from '../../memory/capability-index.js';
 import type { HostCapabilityDescriptorV1 } from '../semantic-boundary/turn-semantic-proposal.js';
 import {
-  freezeCatalogSnapshotForSource,
+  peekCatalogSnapshotForSource,
   peekHostCapabilityCatalogFactory,
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
@@ -97,7 +97,12 @@ export function catalogEntriesForAcceptedSource(input: {
       .filter((entry) => entry.kind === 'composio' || entry.kind === 'cli' || entry.kind === 'mcp')
       .map((entry) => capabilityIdOf(entry.identifier)),
   );
-  const frozen = freezeCatalogSnapshotForSource({
+  // PEEK, never persist: this runs from pre-model preparation (deterministic
+  // compile, bind enumeration) BEFORE foreground tool_search can disclose
+  // anything. Persisting here durably froze an empty snapshot that every
+  // later plan admission was refused against (2026-08-26 gauntlet). The
+  // snapshot is frozen by plan admission / the execution owner, never by prep.
+  const frozen = peekCatalogSnapshotForSource({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
   });

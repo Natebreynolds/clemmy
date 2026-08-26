@@ -1,5 +1,7 @@
 import {
+  appendTerminalEventOnce,
   configuredSessionRetentionDays,
+  finishRunAttempt,
   listEvents,
   listSessions,
   openEventLog,
@@ -9,6 +11,7 @@ import {
   type SessionRow,
   type SessionStatus,
 } from './eventlog.js';
+import { getRuntimeEnv } from '../../config.js';
 import { listPending } from './approval-registry.js';
 import path from 'node:path';
 import { WORKFLOW_RUNS_DIR } from '../../tools/shared.js';
@@ -445,5 +448,125 @@ export function reconcileDormantTerminalWorkSessions(
     completed,
     failed,
     ids,
+  };
+}
+
+// ── Accepted-input liveness (B7a, gauntlet 2026-08-26) ──────────────────────
+// sess-branch-1d43… accepted user_input_received, its run attempt finished
+// 'completed' 1.2s later having emitted ZERO further events, and the session
+// sat status='active' for 80+ minutes: a silent no-reply. Acceptance is a
+// lifecycle stamped at INTENT; nothing stamped the HAPPENING (a turn actually
+// serving), and the only run-attempt reconciler ran at daemon boot. This sweep
+// runs from the periodic reaper: an active session whose NEWEST event is an
+// accepted user input older than the liveness bound, with no live executor
+// lease, gets a DURABLE terminal — the eventlog answers the input, the session
+// status stops lying 'active', and the caller (reaper) surfaces it to the user.
+
+const DEFAULT_ACCEPTED_INPUT_LIVENESS_MS = 10 * 60_000;
+
+export function acceptedInputLivenessBoundMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_ACCEPTED_INPUT_LIVENESS_MS', '') || '', 10);
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : DEFAULT_ACCEPTED_INPUT_LIVENESS_MS;
+}
+
+export interface SilentAcceptedInputRecord {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedAt: string;
+  ageMs: number;
+  /** True when an unfinished attempt with an expired/absent lease was closed. */
+  attemptClosed: boolean;
+}
+
+export interface SilentAcceptedInputSweep {
+  scanned: number;
+  terminalized: number;
+  ids: string[];
+  records: SilentAcceptedInputRecord[];
+}
+
+export function reconcileSilentAcceptedInputSessions(
+  options: { nowMs?: number; boundMs?: number; limit?: number } = {},
+): SilentAcceptedInputSweep {
+  const nowMs = options.nowMs ?? Date.now();
+  const boundMs = options.boundMs ?? acceptedInputLivenessBoundMs();
+  const limit = Math.max(1, Math.min(500, Math.trunc(options.limit ?? 50)));
+  const records: SilentAcceptedInputRecord[] = [];
+  let scanned = 0;
+
+  let pendingSessionIds: Set<string>;
+  try {
+    pendingSessionIds = new Set(listPending({ status: 'pending' }).map((approval) => approval.sessionId));
+  } catch {
+    pendingSessionIds = new Set();
+  }
+
+  const active = listSessions({ status: ['active'], limit: 2_000 });
+  for (const session of active) {
+    if (records.length >= limit) break;
+    if (pendingSessionIds.has(session.id)) continue;
+    const latest = latestSessionEvent(session.id);
+    if (!latest || latest.type !== 'user_input_received') continue;
+    scanned += 1;
+    const acceptedAtMs = Date.parse(latest.createdAt);
+    if (!Number.isFinite(acceptedAtMs)) continue;
+    const ageMs = nowMs - acceptedAtMs;
+    if (ageMs <= boundMs) continue;
+
+    // A live executor still owns this session: an unfinished attempt whose
+    // lease has not expired. An unfinished attempt with an expired or absent
+    // lease is an executor that died between claim and turn — close it as part
+    // of the disposition instead of letting it keep claiming the session.
+    let attemptClosed = false;
+    try {
+      const attempt = openEventLog().prepare(
+        `SELECT attempt_id, lease_expires_at
+           FROM run_attempts
+          WHERE session_id = ? AND finished_at IS NULL
+          ORDER BY started_at DESC
+          LIMIT 1`,
+      ).get(session.id) as { attempt_id: string; lease_expires_at: string | null } | undefined;
+      if (attempt) {
+        const leaseExpiresMs = attempt.lease_expires_at ? Date.parse(attempt.lease_expires_at) : Number.NaN;
+        if (Number.isFinite(leaseExpiresMs) && leaseExpiresMs > nowMs) continue; // genuinely in flight
+        finishRunAttempt({ sessionId: session.id, attemptId: attempt.attempt_id }, 'interrupted');
+        attemptClosed = true;
+      }
+    } catch {
+      continue; // attempt state unreadable — never terminalize on uncertainty
+    }
+
+    try {
+      const terminal = appendTerminalEventOnce({
+        sessionId: session.id,
+        turn: latest.turn,
+        role: 'system',
+        data: {
+          sourceUserSeq: latest.seq,
+          reason: 'accepted_input_never_started',
+          status: 'failed',
+          text: 'This message was accepted but no turn ever started for it. The session was closed by the liveness reaper — send the request again.',
+        },
+      }, `liveness:${latest.seq}`);
+      updateSession(session.id, { status: 'failed' });
+      if (!terminal.inserted) continue; // an owner already published a terminal for this exact source
+    } catch {
+      continue; // terminal publication refused (e.g. armed authority) — leave for its owner
+    }
+
+    records.push({
+      sessionId: session.id,
+      sourceUserSeq: latest.seq,
+      acceptedAt: latest.createdAt,
+      ageMs,
+      attemptClosed,
+    });
+  }
+
+  return {
+    scanned,
+    terminalized: records.length,
+    ids: records.map((record) => record.sessionId),
+    records,
   };
 }

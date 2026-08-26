@@ -92,6 +92,13 @@ export interface McpToolScope {
    */
   failOpenCandidate?: boolean;
   /**
+   * Set ONLY on the deliberate local-context-follow-up no-tool return. It marks
+   * that the empty surface came from a wording heuristic, not from user intent
+   * or authority — so the continuity resolver may still fill it from the prior
+   * turn's concrete external-family scope when this turn continues that task.
+   */
+  localContextFollowup?: boolean;
+  /**
    * The current user input, threaded through for T1 semantic tool retrieval.
    * When set (and embeddings are healthy), the fail-open surface ranks the
    * user's connected tools by semantic relevance to this text — turning the
@@ -384,13 +391,24 @@ function namesPinnedCalendarLabel(input: string, labels: string[] | undefined): 
     return false;
   }
 }
-const GOOGLE_SHEETS_RE = /\b(google sheets?|googlesheets?|spreadsheet|sheet row|sheet tab|worksheet)\b/i;
+// Bare-noun forms ("the sheet", "spreadsheets", "gauntlet sheet") are family
+// intent too: an unmatched family phrasing must never scope OUT a connected
+// toolkit (2026-08-26 gauntlet: "add a row to the … sheet" fell to fail-open
+// and the write capability was never advertised). Scoping is ADVERTISEMENT
+// only — a false positive costs a few ranked tools, a false negative starved
+// the whole act lane.
+const GOOGLE_SHEETS_RE = /\b(google sheets?|googlesheets?|spreadsheets?|sheets?|sheet (?:row|tab)|worksheet)\b/i;
 const GITHUB_RE =
   /\b(github|pull request|pr\b|gh issue|github issue|issue #\d+)\b/i;
 const LOCAL_DEPLOY_CLI_RE =
   /\b(netlify|vercel|railway|fly\.io|wrangler|cloudflare pages|firebase|render\.com|heroku)\b/i;
+// Bare "append" deliberately absent: it is an external-write verb as much as
+// a local one, and classifying "append after the last row" as a local-context
+// turn zeroed the external surface of a live sheet-write continuation
+// (2026-08-26 gauntlet seq 82133). "append" counts as local only when the same
+// clause names a local artifact (report/markdown/file path/memory/context).
 const LOCAL_CONTEXT_FOLLOWUP_RE =
-  /\b(existing context|use the existing context|from context|remember|remembered|we just ran|previous|already found|append|local file update|local markdown|markdown report|the report|the audit we just ran)\b/i;
+  /\b(existing context|use the existing context|from context|remember|remembered|we just ran|previous|already found|append[^.!?\n]{0,120}\b(?:local(?:ly)?|report|markdown|\.md\b|memory|context)|local file update|local markdown|markdown report|the report|the audit we just ran)\b/i;
 const FRESH_EXTERNAL_RE =
   /\b(fresh|new audit|rerun|re-run|run .*audit|use dataforseo|crawl|lighthouse|current rankings?|latest rankings?|check the site|fetch|scrape|search the web|look up online|new data)\b/i;
 // A local-context follow-up that nonetheless asks for FRESH data from an
@@ -634,6 +652,7 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
       reason: `local context/file follow-up; no fresh external MCP needed: ${lower.slice(0, 120)}`,
       authority: 'catalog',
       ...denied,
+      localContextFollowup: true,
       allowedServerSlugs: [],
       toolPatterns: [],
       maxTools: 0,
@@ -937,7 +956,17 @@ export function resolveMcpToolScopeWithContinuity(
   // connector". Authority is checked before the gap is noticed.
   if (mcpToolScopeAuthority(direct) === 'none') return direct;
   if (scopeIsConcrete(direct)) return direct;
-  if (!options.awaitingAnswer && !isToolScopeContinuation(options.userInput)) return direct;
+  // A local-context follow-up is by definition a continuation of the active
+  // task. When that task's prior turns carried a concrete external-family
+  // scope, the wording heuristic must not strip it mid-task (2026-08-26
+  // gauntlet: the sheet-append follow-up resolved to maxTools:0 and the write
+  // toolkit vanished). Genuinely local threads have no prior concrete family
+  // scope, so their no-tool discipline is preserved by the loop below.
+  if (
+    !options.awaitingAnswer
+    && !isToolScopeContinuation(options.userInput)
+    && !direct.localContextFollowup
+  ) return direct;
   for (const prior of options.priorUserInputs ?? []) {
     const inherited = resolveMcpToolScope({
       userInput: prior,

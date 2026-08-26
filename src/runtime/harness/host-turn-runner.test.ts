@@ -965,15 +965,23 @@ test('a refused or failed plan barrier never starts its fused read and leaves pa
     bindHostCanarySurface(fixture, agent, [planTool, workTool]);
 
     const outcome = await runProductionHost(fixture, agent);
-    assert.equal(outcome.terminal?.status, 'blocked', JSON.stringify(outcome));
+    // Fail-RETURN, not fail-closed (2026-08-26): a plan-barrier refusal is a
+    // settled typed failure returned to the model for bounded repair. The
+    // conversation survives — a repeated identical frame retires through the
+    // capability-unavailable checkpoint instead of terminating reason=blocked.
+    // (Before this, 12 lvl50 authority-failed-closed lines were 12 dead
+    // non-resumable conversations in one gauntlet.)
+    assert.equal(outcome.terminal, undefined, JSON.stringify(outcome));
+    assert.match(String(outcome.finalOutput ?? ''), /unavailable for this request/,
+      'the retired frame ends in the honest capability-unavailable checkpoint, conversation intact');
     assert.equal(planBodies, 1, 'the direct plan barrier is the only admitted body');
     assert.equal(siblingBodies, 0, 'the sibling body stays behind activation');
     const calls = outcome.history.filter((item) =>
       (item as { type?: string }).type === 'function_call') as Array<{ callId?: string }>;
     const results = outcome.history.filter((item) =>
       (item as { type?: string }).type === 'function_call_result') as Array<{ callId?: string }>;
-    assert.deepEqual(calls.map((item) => item.callId), ['refused-plan', 'never-started-read']);
-    assert.deepEqual(results.map((item) => item.callId), ['refused-plan', 'never-started-read'],
+    assert.ok(calls.length >= 2, 'the refused frame is committed');
+    assert.deepEqual(results.map((item) => item.callId), calls.map((item) => item.callId),
       'every committed function call has exactly one paired recovery result');
 
     const db = eventlog.openEventLog();

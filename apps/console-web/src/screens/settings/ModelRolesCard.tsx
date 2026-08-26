@@ -113,7 +113,7 @@ function JudgeMetrics({ metrics }: { metrics?: JudgeMetricsSnapshot }) {
   );
 }
 
-export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}) {
+export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boolean; sessionId?: string } = {}) {
   const qc = useQueryClient();
   const settings = usePoll(['settings'], getSettings, 0);
   const mr = settings.data?.modelRoles;
@@ -185,11 +185,15 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   // The option value is the unique selector: a BYO model is `api_key:<modelId>`,
   // Codex is `codex_oauth:<id>`, Claude is `claude_oauth:<id>` (so any connected
   // model can be the brain). A bare value (no `:`) is the plain auth-mode.
+  // sessionId (when the host mounts this card inside a conversation) makes the
+  // daemon re-pin THAT conversation to the new brain — session brain pins mean
+  // the global flip alone only steers NEW conversations. Settings mounts have
+  // no session and stay global-only.
   const onBrain = (value: string) => run('brain', () =>
-    value.startsWith('api_key:') ? setActiveBrain('api_key', value.slice('api_key:'.length))
-      : value.startsWith('codex_oauth:') ? setActiveBrain('codex_oauth', value.slice('codex_oauth:'.length))
-        : value.startsWith('claude_oauth:') ? setActiveBrain('claude_oauth', value.slice('claude_oauth:'.length))
-          : setActiveBrain(value as ActiveBrain));
+    value.startsWith('api_key:') ? setActiveBrain('api_key', value.slice('api_key:'.length), sessionId)
+      : value.startsWith('codex_oauth:') ? setActiveBrain('codex_oauth', value.slice('codex_oauth:'.length), sessionId)
+        : value.startsWith('claude_oauth:') ? setActiveBrain('claude_oauth', value.slice('claude_oauth:'.length), sessionId)
+          : setActiveBrain(value as ActiveBrain, undefined, sessionId));
   const onRole = (role: 'worker' | 'judge', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
 

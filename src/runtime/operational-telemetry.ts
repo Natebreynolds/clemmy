@@ -140,6 +140,11 @@ export const HARNESS_OPERATIONAL_EVENT_TYPES = [
   'background_task_finished',
   'background_task_parked',
   'background_self_resume_check',
+  // B7b (2026-08-26): the approval-reaper gave a permanently-held revoked
+  // invocation its terminal disposition after bounded rescans — quarantined,
+  // no longer re-attempted every tick. Payload carries the exact identity and
+  // the settlement refusal reason.
+  'host_tool_recovery_abandoned',
 ] as const;
 
 // Scheduler (cron) run lifecycle — direct emits from the daemon runner.

@@ -121,18 +121,20 @@ test('distinct unresolved roles each get one provider slot while synonyms and ca
   assert.equal(first.subject, sourceRole);
   settleDiscoveryBoundary(first, 'succeeded');
 
-  // A synonym carrier for the SAME role shares that role's claim instead of
-  // minting a second one or reaching provider code under a new physical id.
-  assert.throws(
-    () => admitDiscoveryBoundary({
-      ...key,
-      toolName: 'ToolSearch',
-      input: { query: `[role:${sourceRole}] locate something that retrieves the records` },
-      callId: 'source-search-synonym',
-    }),
-    (error: unknown) => error instanceof DiscoveryBudgetDeniedError
-      && error.reason === 'new_call_requires_retry_epoch',
-  );
+  // A synonym carrier for the SAME role shares that role's claim: once the
+  // claim SETTLED SUCCESSFUL, a new physical id is a bounded continuation of
+  // the admitted intent (2026-08-26 gauntlet law: never demand disclosure
+  // while denying the read that discloses). It transfers the one-owner claim
+  // rather than minting a second concurrent one.
+  const synonym = admitDiscoveryBoundary({
+    ...key,
+    toolName: 'ToolSearch',
+    input: { query: `[role:${sourceRole}] locate something that retrieves the records` },
+    callId: 'source-search-synonym',
+  });
+  assert.ok(synonym, 'a settled-successful role claim admits its follow-up search');
+  assert.equal(synonym.subject, sourceRole, 'the continuation stays keyed on the same host-owned role');
+  settleDiscoveryBoundary(synonym, 'succeeded');
 
   const second = admitDiscoveryBoundary({
     ...key,
@@ -224,16 +226,27 @@ test('distinct unresolved roles each get one provider slot while synonyms and ca
     // however many times they were tried.
     [destinationRole, sourceRole, HOST_UNSCOPED_DISCOVERY_SUBJECT].sort(),
   );
-  // Restart cannot mint either another claim or another provider body.
+  // Restart cannot mint another CLAIM: the settled-successful role claim
+  // admits its follow-up as a continuation that TRANSFERS the one-owner slot
+  // and consumes a real admission — bounded by the turn-wide ceiling, never a
+  // free replayed budget.
   const afterRestart = restarted.admit({
     ...key,
     category: 'broad_discovery',
     subject: sourceRole,
     callId: 'source-after-restart',
   });
-  assert.equal(afterRestart.admitted, false);
-  assert.equal(afterRestart.reason, 'new_call_requires_retry_epoch');
-  assert.equal(afterRestart.consumedBudget, false, 'a restart must not repay discovery');
+  assert.equal(afterRestart.admitted, true);
+  assert.equal(afterRestart.reason, 'settled_continuation_admitted');
+  assert.equal(afterRestart.consumedBudget, true, 'continuations spend real admissions');
+  assert.deepEqual(
+    restarted.getTaskState(key)?.epochClaims
+      .filter((claim) => claim.category === 'broad_discovery')
+      .map((claim) => claim.subject)
+      .sort(),
+    [destinationRole, sourceRole, HOST_UNSCOPED_DISCOVERY_SUBJECT].sort(),
+    'a continuation transfers its subject claim instead of minting a new one',
+  );
 });
 
 test('an all-resolved role projection has zero broad slots without disabling exact schema repair', () => {

@@ -604,7 +604,7 @@ function settledPlanTaskResultDisposition(input: {
   if (!exactPlanTaskResultRecord(payload) || typeof payload.ok !== 'boolean') return null;
   if (payload.ok === false) {
     if (
-      payload.code === 'plan_not_admitted'
+      (payload.code === 'plan_not_admitted' || payload.code === 'plan_invalid_input')
       && exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail', 'repair'])
       && boundedPlanTaskResultText(payload.detail)
       && boundedPlanTaskResultText(payload.repair)
@@ -645,9 +645,23 @@ function enforceSettledPlanTaskResult(input: {
   sourceUserSeq: number;
   acceptedTaskId: string;
   logicalToolCallId: string;
+  /** The durable settlement's own verdict for this exact call. */
+  settledOutcomeKind: string;
 }): void {
   const disposition = settledPlanTaskResultDisposition(input);
   if (!disposition) {
+    // FAIL-RETURN over fail-closed. A payload the settlement itself already
+    // recorded as a typed FAILURE (a guardrail block, a laundered validation
+    // error) is ordinary model input for a bounded in-turn repair — the
+    // conversation survives and the corrective text does its job. Live
+    // 2026-08-26: 12 of these fail-closed throws became 12 dead
+    // reason=blocked conversations; the exact_args_repeat loop-saver's own
+    // block string was the payload that failed this check. Fail-closed
+    // remains only for the true invariant breach: a payload that settled
+    // SUCCESS yet is not the exact typed plan_task union.
+    if (input.settledOutcomeKind !== 'succeeded' && input.settledOutcomeKind !== 'empty_result') {
+      return;
+    }
     throw new HostToolInvocationAuthorityError(
       'settled plan_task result is not an exact typed success or refusal',
     );
@@ -774,6 +788,34 @@ export async function invokeHostToolCall<T>(
       );
     }
     if (!['succeeded', 'empty_result'].includes(prior.settlement.outcome.kind)) {
+      // A settled plan_task FAILURE is a durable typed refusal, not a wedge: a
+      // control refusal has no retained success bytes to redeem, so the host
+      // regenerates the exact typed refusal grammar from the settlement's own
+      // verdict and returns it to the model. Re-execution stays impossible
+      // (the settled logical call is immutable) and the conversation survives
+      // a restart instead of failing closed on its own repair outcome.
+      if (contract.toolName === 'plan_task') {
+        const detailSuffix = prior.settlement.outcome.detail
+          ? `: ${prior.settlement.outcome.detail}`
+          : '';
+        return {
+          value: JSON.stringify({
+            ok: false,
+            code: 'plan_not_admitted',
+            detail: `this exact plan_task call already settled ${prior.settlement.outcome.kind}${detailSuffix}`,
+            repair: 'Correct the semantic proposal against the exact host planning catalog, then call plan_task again with a fresh call id.',
+          }) as T,
+          settlement: {
+            outcome: prior.settlement.outcome,
+            openedDiscoveryEpoch: prior.settlement.recovery.openedDiscoveryEpoch,
+            creditedProgress: prior.settlement.recovery.creditedProgress,
+            ...(prior.settlement.resultHandleId
+              ? { resultHandleId: prior.settlement.resultHandleId }
+              : {}),
+            duplicate: true,
+          },
+        };
+      }
       throw new HostToolInvocationAuthorityError(
         `settled logical outcome ${prior.settlement.outcome.kind} is not replayable`,
       );
@@ -805,6 +847,7 @@ export async function invokeHostToolCall<T>(
         sourceUserSeq: input.identity.sourceUserSeq,
         acceptedTaskId,
         logicalToolCallId: modelCallId,
+        settledOutcomeKind: prior.settlement.outcome.kind,
       });
     }
     return {
@@ -1353,6 +1396,7 @@ export async function invokeHostToolCall<T>(
                       sourceUserSeq: input.identity.sourceUserSeq,
                       acceptedTaskId,
                       logicalToolCallId: modelCallId,
+                      settledOutcomeKind: settlement.outcome.kind,
                     });
                   }
                   await revokeDispatchLeaseBeforeRecovery(childLease);

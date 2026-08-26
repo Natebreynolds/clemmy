@@ -367,37 +367,36 @@ export type FrozenCatalogSnapshotResult =
     }
   | { ok: false; reason: 'missing_factory' | 'corrupt_snapshot' | 'identity_mismatch' };
 
-export function freezeCatalogSnapshotForSource(input: {
-  sessionId: string;
-  sourceUserSeq: number;
-}): FrozenCatalogSnapshotResult {
-  const factory = installed;
-  if (!factory) return { ok: false, reason: 'missing_factory' };
-  const live = factory.snapshot();
-  const liveIdentities = live.flatMap((entry) => {
+interface LiveCatalogIdentity {
+  identity: CanonicalCatalogIdentityV1;
+  entry: RegisteredHostCapability;
+}
+
+function liveCatalogIdentities(factory: HostCapabilityCatalogFactory): LiveCatalogIdentity[] {
+  return factory.snapshot().flatMap((entry) => {
     const identity = canonicalCatalogIdentityOf(entry);
     return identity ? [{ identity, entry }] : [];
   });
-  const db = openEventLog();
-  const existing = db.prepare(`
-    SELECT snapshot_digest, snapshot_json FROM accepted_source_catalog_snapshots
-     WHERE session_id = ? AND source_user_seq = ?
-  `).get(input.sessionId, input.sourceUserSeq) as {
-    snapshot_digest: string;
-    snapshot_json: string;
-  } | undefined;
-  if (!existing) {
-    const identities = liveIdentities.map((item) => item.identity);
-    const digest = catalogSnapshotDigestOf(identities);
-    db.prepare(`
-      INSERT INTO accepted_source_catalog_snapshots
-        (session_id, source_user_seq, snapshot_digest, snapshot_json)
-      VALUES (?, ?, ?, ?)
-    `).run(input.sessionId, input.sourceUserSeq, digest, JSON.stringify(identities));
-    const entries = liveIdentities.map((item) => copyRegisteredCapability(item.entry));
-    const frozen = createHostCapabilityCatalogFactory(entries);
-    return { ok: true, digest, catalog: frozen.catalog(), entries };
-  }
+}
+
+function frozenResultFrom(
+  digest: string,
+  items: readonly LiveCatalogIdentity[],
+): Extract<FrozenCatalogSnapshotResult, { ok: true }> {
+  const entries = items.map((item) => copyRegisteredCapability(item.entry));
+  const frozen = createHostCapabilityCatalogFactory(entries);
+  return { ok: true, digest, catalog: frozen.catalog(), entries };
+}
+
+/** Reconstruct one persisted snapshot row against the live factory, or say
+ * exactly why it cannot be trusted. Shared by replay, peek, and the
+ * plan-admission absorb below so every reader applies identical checks. */
+function reconstructPersistedSnapshot(
+  existing: { snapshot_digest: string; snapshot_json: string },
+  liveIdentities: readonly LiveCatalogIdentity[],
+):
+  | { ok: true; persisted: CanonicalCatalogIdentityV1[]; items: LiveCatalogIdentity[] }
+  | { ok: false; reason: 'corrupt_snapshot' | 'identity_mismatch' } {
   let persisted: CanonicalCatalogIdentityV1[];
   try {
     persisted = JSON.parse(existing.snapshot_json) as CanonicalCatalogIdentityV1[];
@@ -408,7 +407,7 @@ export function freezeCatalogSnapshotForSource(input: {
   if (catalogSnapshotDigestOf(persisted) !== existing.snapshot_digest) {
     return { ok: false, reason: 'corrupt_snapshot' };
   }
-  const reconstructed: RegisteredHostCapability[] = [];
+  const items: LiveCatalogIdentity[] = [];
   for (const identity of persisted) {
     const match = liveIdentities.find((item) => catalogIdentitiesEqual(item.identity, identity));
     if (!match) return { ok: false, reason: 'identity_mismatch' };
@@ -419,10 +418,110 @@ export function freezeCatalogSnapshotForSource(input: {
     ) {
       return { ok: false, reason: 'identity_mismatch' };
     }
-    reconstructed.push(copyRegisteredCapability(match.entry));
+    items.push({ identity, entry: match.entry });
   }
-  const frozen = createHostCapabilityCatalogFactory(reconstructed);
-  return { ok: true, digest: existing.snapshot_digest, catalog: frozen.catalog(), entries: reconstructed };
+  return { ok: true, persisted, items };
+}
+
+function readPersistedSnapshotRow(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): { snapshot_digest: string; snapshot_json: string } | undefined {
+  return openEventLog().prepare(`
+    SELECT snapshot_digest, snapshot_json FROM accepted_source_catalog_snapshots
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(input.sessionId, input.sourceUserSeq) as {
+    snapshot_digest: string;
+    snapshot_json: string;
+  } | undefined;
+}
+
+export function freezeCatalogSnapshotForSource(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): FrozenCatalogSnapshotResult {
+  const factory = installed;
+  if (!factory) return { ok: false, reason: 'missing_factory' };
+  const liveIdentities = liveCatalogIdentities(factory);
+  const db = openEventLog();
+  const existing = readPersistedSnapshotRow(input);
+  if (!existing) {
+    const identities = liveIdentities.map((item) => item.identity);
+    const digest = catalogSnapshotDigestOf(identities);
+    db.prepare(`
+      INSERT INTO accepted_source_catalog_snapshots
+        (session_id, source_user_seq, snapshot_digest, snapshot_json)
+      VALUES (?, ?, ?, ?)
+    `).run(input.sessionId, input.sourceUserSeq, digest, JSON.stringify(identities));
+    return frozenResultFrom(digest, liveIdentities);
+  }
+  const reconstructed = reconstructPersistedSnapshot(existing, liveIdentities);
+  if (!reconstructed.ok) return reconstructed;
+  return frozenResultFrom(existing.snapshot_digest, reconstructed.items);
+}
+
+/**
+ * Read the accepted-source catalog view WITHOUT persisting it.
+ *
+ * Pre-model preparation (interpretation, deterministic compile, planning-card
+ * enumeration) runs before foreground tool_search can disclose anything, so a
+ * persist here durably froze an EMPTY snapshot and every later plan admission
+ * was refused against it (2026-08-26 gauntlet: 31 frozen-mismatch refusals,
+ * snapshot_json '[]' for every act turn). Preparation peeks; only plan
+ * admission and execution owners persist, via the functions below.
+ */
+export function peekCatalogSnapshotForSource(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): FrozenCatalogSnapshotResult {
+  const factory = installed;
+  if (!factory) return { ok: false, reason: 'missing_factory' };
+  const liveIdentities = liveCatalogIdentities(factory);
+  const existing = readPersistedSnapshotRow(input);
+  if (!existing) {
+    const digest = catalogSnapshotDigestOf(liveIdentities.map((item) => item.identity));
+    return frozenResultFrom(digest, liveIdentities);
+  }
+  const reconstructed = reconstructPersistedSnapshot(existing, liveIdentities);
+  if (!reconstructed.ok) return reconstructed;
+  return frozenResultFrom(existing.snapshot_digest, reconstructed.items);
+}
+
+/**
+ * The one seam where the frozen snapshot may GROW: plan admission, after this
+ * turn's tool_search disclosures were re-proven and registered into the live
+ * factory. The snapshot exists to pin what admission validated — so it is
+ * taken (or extended monotonically, append-only by capabilityId) exactly
+ * here. Everything already persisted must still match live identity; nothing
+ * is ever removed or replaced. Callers must not use this once graph authority
+ * exists for the source — after that the ordinary write-once replay applies.
+ */
+export function freezeCatalogSnapshotForPlanAdmission(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): FrozenCatalogSnapshotResult {
+  const factory = installed;
+  if (!factory) return { ok: false, reason: 'missing_factory' };
+  const liveIdentities = liveCatalogIdentities(factory);
+  const db = openEventLog();
+  const existing = readPersistedSnapshotRow(input);
+  if (!existing) return freezeCatalogSnapshotForSource(input);
+  const reconstructed = reconstructPersistedSnapshot(existing, liveIdentities);
+  if (!reconstructed.ok) return reconstructed;
+  const persistedIds = new Set(reconstructed.persisted.map((identity) => identity.capabilityId));
+  const absorbed = liveIdentities.filter((item) => !persistedIds.has(item.identity.capabilityId));
+  if (absorbed.length === 0) {
+    return frozenResultFrom(existing.snapshot_digest, reconstructed.items);
+  }
+  const union = [...reconstructed.items, ...absorbed];
+  const identities = union.map((item) => item.identity);
+  const digest = catalogSnapshotDigestOf(identities);
+  db.prepare(`
+    UPDATE accepted_source_catalog_snapshots
+       SET snapshot_digest = ?, snapshot_json = ?
+     WHERE session_id = ? AND source_user_seq = ?
+  `).run(digest, JSON.stringify(identities), input.sessionId, input.sourceUserSeq);
+  return frozenResultFrom(digest, union);
 }
 
 export function persistSealedNodeBinding(input: {

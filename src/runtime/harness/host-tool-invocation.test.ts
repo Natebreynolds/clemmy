@@ -347,73 +347,90 @@ test('exact typed plan_task refusals settle normally and replay without activati
 
       const first = await execute();
       assert.equal(first.value, candidate.value);
-      assert.equal(first.settlement.outcome.kind, 'succeeded');
+      // Settlement carries semantic truth: a payload that says ok:false is a
+      // typed failure, never 'succeeded'. (Before 2026-08-26 these settled
+      // succeeded with success=1 handles — every evidence consumer overcounted.)
+      assert.notEqual(first.settlement.outcome.kind, 'succeeded');
       assert.equal(first.settlement.duplicate, false);
       assert.equal(bodies, 1);
 
       const replay = await execute();
-      assert.equal(replay.value, candidate.value);
-      assert.equal(replay.settlement.outcome.kind, 'succeeded');
       assert.equal(replay.settlement.duplicate, true);
-      assert.equal(bodies, 1, 'the typed refusal replay adopts its retained result');
+      assert.equal(bodies, 1, 'the typed refusal replay never re-enters the tool body');
+      const replayed = JSON.parse(String(replay.value)) as { ok?: unknown; code?: unknown };
+      assert.equal(replayed.ok, false, 'the replay hands back a typed refusal');
+      assert.equal(typeof replayed.code, 'string');
       assert.equal(rows(task, candidate.callId).length, 1);
       leases.revokeDispatchLease(task.parentLease);
     });
   }
 });
 
-test('malformed or non-boolean plan_task results settle but fail closed on first return and replay', async (t) => {
-  const cases = [
-    {
-      label: 'missing refusal fields',
-      callId: 'model:plan-malformed-refusal',
-      value: JSON.stringify({ ok: false, code: 'plan_not_admitted' }),
+test('a malformed ok:false record settles as a typed failure and fail-RETURNS to the model', async () => {
+  // Missing refusal fields keep it outside the closed union, but the payload
+  // still SAYS ok:false, so settlement records the failure and the bytes go
+  // back to the model for a bounded repair — fail-closed here escalated a
+  // repair outcome into a dead conversation (live 2026-08-26, 12 terminals).
+  const task = fixture('Prepare the current request.');
+  let bodies = 0;
+  const value = JSON.stringify({ ok: false, code: 'plan_not_admitted' });
+  const settled = await runCall<string>(task, {
+    callId: 'model:plan-malformed-refusal',
+    toolName: 'plan_task',
+    effect: 'host_only',
+    businessCall: false,
+    args: { draft: { version: 1 }, preamble: 'I’ll prepare this now.' },
+    deadlineMs: 200,
+    invoke: async () => {
+      bodies += 1;
+      return value;
     },
-    {
-      label: 'non-boolean discriminator',
-      callId: 'model:plan-non-boolean',
-      value: JSON.stringify({
+  });
+  assert.equal(bodies, 1);
+  assert.equal(settled.value, value);
+  assert.notEqual(settled.settlement.outcome.kind, 'succeeded');
+  assert.equal(rows(task, 'model:plan-malformed-refusal').length, 1);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('a success-settled non-boolean discriminator still fails closed on first return and replay', async () => {
+  // ok:'false' (a string) carries no structured verdict, so it settles as a
+  // returned host execution — success-shaped. A payload that settled SUCCESS
+  // yet is not the exact typed union remains the invariant breach.
+  const task = fixture('Prepare the current request.');
+  let bodies = 0;
+  const execute = () => runCall(task, {
+    callId: 'model:plan-non-boolean',
+    toolName: 'plan_task',
+    effect: 'host_only',
+    businessCall: false,
+    args: { draft: { version: 1 }, preamble: 'I’ll prepare this now.' },
+    deadlineMs: 200,
+    invoke: async () => {
+      bodies += 1;
+      return JSON.stringify({
         ok: 'false',
         code: 'plan_not_required',
         detail: 'This must not be accepted as a typed refusal.',
-      }),
-    },
-  ] as const;
-
-  for (const candidate of cases) {
-    await t.test(candidate.label, async () => {
-      const task = fixture('Prepare the current request.');
-      let bodies = 0;
-      const execute = () => runCall(task, {
-        callId: candidate.callId,
-        toolName: 'plan_task',
-        effect: 'host_only',
-        businessCall: false,
-        args: { draft: { version: 1 }, preamble: 'I’ll prepare this now.' },
-        deadlineMs: 200,
-        invoke: async () => {
-          bodies += 1;
-          return candidate.value;
-        },
       });
+    },
+  });
 
-      await assert.rejects(
-        execute(),
-        (error: unknown) => error instanceof invocation.HostToolInvocationAuthorityError
-          && /not an exact typed success or refusal/.test(error.message),
-      );
-      assert.equal(bodies, 1);
-      assert.equal(rows(task, candidate.callId).length, 1);
+  await assert.rejects(
+    execute(),
+    (error: unknown) => error instanceof invocation.HostToolInvocationAuthorityError
+      && /not an exact typed success or refusal/.test(error.message),
+  );
+  assert.equal(bodies, 1);
+  assert.equal(rows(task, 'model:plan-non-boolean').length, 1);
 
-      await assert.rejects(
-        execute(),
-        (error: unknown) => error instanceof invocation.HostToolInvocationAuthorityError
-          && /not an exact typed success or refusal/.test(error.message),
-      );
-      assert.equal(bodies, 1, 'replay cannot bypass the closed result discriminator');
-      leases.revokeDispatchLease(task.parentLease);
-    });
-  }
+  await assert.rejects(
+    execute(),
+    (error: unknown) => error instanceof invocation.HostToolInvocationAuthorityError
+      && /not an exact typed success or refusal/.test(error.message),
+  );
+  assert.equal(bodies, 1, 'replay cannot bypass the closed result discriminator');
+  leases.revokeDispatchLease(task.parentLease);
 });
 
 test('an exact successful plan_task result still requires durable post-settlement activation', async () => {

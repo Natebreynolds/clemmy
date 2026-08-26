@@ -42,6 +42,7 @@ import {
   resolveEffectiveProviderForModel,
 } from './byo-providers.js';
 import { slugifyIntent } from '../../memory/tool-choice-store.js';
+import { modelUsageAttributionStorage } from '../usage-log.js';
 import {
   chooseBoundaryJudgeFamily,
   judgeCrossFamilyEnabled,
@@ -92,6 +93,122 @@ export interface ResolvedRoleModel {
 export function modelRolesRegistryEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_MODEL_ROLES_REGISTRY', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
+
+// ── Session brain pin (B6, gauntlet 2026-08-26) ─────────────────────────────
+// The active brain (AUTH_MODE / CLAUDE_MODEL / BYO_BRAIN_MODEL_ID /
+// MODEL_ROUTING_MODE) is one GLOBAL mutable setting: concurrent sessions
+// flipped it under each other and silently re-routed each other's next turn.
+// The fix is scope, not another setting: the brain a session is being SERVED
+// on pins to that session at its first in-turn brain resolution (stamped when
+// serving HAPPENS — the participation-ratchet lesson), and from then on the
+// global setting is only the default for NEW sessions. An explicit per-session
+// switch re-pins via pinSessionBrain(). Explicit role BINDINGS
+// (CLEMMY_MODEL_ROLES) continue to outrank the pin: that door's promise is
+// "applies on the next message", and it is a user-explicit act, not ambient
+// global state. Resolutions OUTSIDE a session turn (settings snapshots,
+// pickers) keep reading the live global so UI == the next NEW session.
+// Kill-switch: CLEMMY_SESSION_BRAIN_PIN=off restores the legacy global-only read.
+
+export interface SessionBrainPin {
+  modelId: string;
+  provider: ModelProviderClass;
+  pinnedAt: number;
+}
+
+const sessionBrainPins = new Map<string, SessionBrainPin>();
+/** Bounded: sessions are unbounded over a daemon's life; pins are serve-time
+ *  affinity, not durable state, so evict oldest-stamped beyond the cap. */
+const SESSION_BRAIN_PIN_CAP = 2048;
+
+function sessionBrainPinningEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_SESSION_BRAIN_PIN', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+/** The session an in-flight turn is being served for, when resolution runs
+ *  inside one. The usage-attribution ALS spans the whole accepted turn
+ *  (agent build included), so this is the honest "is a turn being served"
+ *  signal; no context ⇒ not a turn ⇒ no pin read and no stamping. */
+function activeTurnSessionId(): string | null {
+  const attribution = modelUsageAttributionStorage.getStore();
+  const sessionId = attribution?.sessionId?.trim();
+  return sessionId ? sessionId : null;
+}
+
+/** Live-check seam for a pinned brain. Production refuses a pinned brain whose
+ *  PROVIDER is no longer connected/usable, which drops the pin and re-stamps
+ *  from the healthy global default.
+ *
+ *  D1 (adversarial review 2026-08-26): this must NOT be the role-binding door.
+ *  validateRoleModelBinding('brain', …) refuses role='brain' UNCONDITIONALLY by
+ *  design ("the brain is set through the active-brain provider switch"), so
+ *  routing the pin's live-check through it refused EVERY pin in production and
+ *  silently re-stamped from the global — the pin was a no-op. A pin is
+ *  serve-time PROVIDER affinity, so the honest check is provider liveness:
+ *  claude/codex = the same logged-in+usable checks the judge chains use
+ *  (codex includes the quota latch — a dead-brain state); byo = the pinned
+ *  model is still declared by a configured provider. */
+type SessionBrainPinValidator = (modelId: string, provider: ModelProviderClass) => boolean;
+
+function pinnedBrainLive(modelId: string, provider: ModelProviderClass): boolean {
+  try {
+    const avail = debateBrainsAvailable();
+    if (provider === 'claude') return avail.claude;
+    if (provider === 'codex') return avail.codex;
+    // byo: the pinned model must still be routable to a configured provider.
+    if (resolveDeclaredByoProviderForModel(modelId)) return true;
+    return getByoBackendConfig().configured && resolveEffectiveProviderForModel(modelId) === 'byo';
+  } catch {
+    return false; // ambiguous/unreadable provider state never serves a pin
+  }
+}
+
+let sessionBrainPinValidator: SessionBrainPinValidator = pinnedBrainLive;
+
+function stampSessionBrainPin(sessionId: string, resolution: { modelId: string; provider: ModelProviderClass }): SessionBrainPin {
+  const pin: SessionBrainPin = {
+    modelId: resolution.modelId,
+    provider: resolution.provider,
+    pinnedAt: Date.now(),
+  };
+  sessionBrainPins.set(sessionId, pin);
+  if (sessionBrainPins.size > SESSION_BRAIN_PIN_CAP) {
+    const oldest = sessionBrainPins.keys().next().value;
+    if (oldest !== undefined) sessionBrainPins.delete(oldest);
+  }
+  return pin;
+}
+
+export function pinnedBrainForSession(sessionId: string): SessionBrainPin | null {
+  return sessionBrainPins.get(sessionId) ?? null;
+}
+
+/** Explicit per-session brain switch: resolve the CURRENT global choice and
+ *  overwrite this session's pin with it. This is the seam the active-brain
+ *  switch routes call with the requesting session's id so "applies to your
+ *  next message" stays true for the conversation the user switched from —
+ *  without silently re-routing every other live session. */
+export function pinSessionBrain(sessionId: string): SessionBrainPin | null {
+  const clean = sessionId.trim();
+  if (!clean) return null;
+  sessionBrainPins.delete(clean);
+  const global = resolveRoleModel('brain');
+  return stampSessionBrainPin(clean, global);
+}
+
+/** Session lifecycle end (terminal/reaped): drop the pin. */
+export function releaseSessionBrainPin(sessionId: string): void {
+  sessionBrainPins.delete(sessionId);
+}
+
+export const __sessionBrainPinTest__ = {
+  reset(): void {
+    sessionBrainPins.clear();
+    sessionBrainPinValidator = pinnedBrainLive;
+  },
+  setValidatorForTests(fn: SessionBrainPinValidator | null): void {
+    sessionBrainPinValidator = fn ?? pinnedBrainLive;
+  },
+};
 
 /** Parse durable bindings from CLEMMY_MODEL_ROLES (JSON array). Unset/bad JSON ⇒
  *  [] ⇒ pure defaults (byte-identical to today). Never throws. */
@@ -288,6 +405,24 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
     }
     if (!firstInvalid) firstInvalid = { match, reason: v.reason };
   }
+  // Session brain pin (B6): inside a served turn with no explicit binding, the
+  // brain this session was FIRST served on wins over a concurrently-flipped
+  // global default. A pin that no longer validates (its login died) is dropped
+  // and the healthy global resolution below re-stamps.
+  const pinSessionId = role === 'brain' && sessionBrainPinningEnabled() ? activeTurnSessionId() : null;
+  if (pinSessionId) {
+    const pinned = sessionBrainPins.get(pinSessionId);
+    if (pinned) {
+      if (sessionBrainPinValidator(pinned.modelId, pinned.provider)) {
+        return { modelId: pinned.modelId, provider: pinned.provider, source: 'session' };
+      }
+      sessionBrainPins.delete(pinSessionId);
+    }
+  }
+  const stampPin = <T extends { modelId: string; provider: ModelProviderClass }>(resolution: T): T => {
+    if (pinSessionId) stampSessionBrainPin(pinSessionId, resolution);
+    return resolution;
+  };
   const modelId = defaultForRole(role);
   // Learned route policy — consulted ONLY when no explicit binding matched
   // (user bindings always win), bounded by min-samples/floor/hysteresis inside
@@ -297,7 +432,7 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
     const pick = pickRoutePolicyModel(role, querySlug || undefined, modelId,
       (candidateId) => validateRoleModelBinding(role, candidateId).ok);
     if (pick) {
-      return {
+      return stampPin({
         modelId: pick.modelId,
         provider: resolveEffectiveProviderForModel(pick.modelId),
         source: 'policy',
@@ -318,10 +453,10 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
               },
             }
           : {}),
-      };
+      });
     }
   } catch { /* the policy read must never break resolution */ }
-  return firstInvalid
+  return stampPin(firstInvalid
     ? {
         modelId,
         provider: resolveEffectiveProviderForModel(modelId),
@@ -333,7 +468,7 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
           reason: firstInvalid.reason,
         },
       }
-    : { modelId, provider: resolveEffectiveProviderForModel(modelId), source: 'default' };
+    : { modelId, provider: resolveEffectiveProviderForModel(modelId), source: 'default' });
 }
 
 /** Invalid legacy bindings can be ambiguous by definition. Preserve a usable

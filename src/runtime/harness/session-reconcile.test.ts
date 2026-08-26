@@ -364,3 +364,76 @@ test('terminal detector treats only plain completions and run terminal events as
   );
   assert.equal(terminalStatusForWorkLifecycleEvent({ type: 'awaiting_user_input', data: {} }), null);
 });
+
+// ── B7a regression pins (gauntlet 2026-08-26, sess-branch-1d43…): a branch
+// session accepted user_input_received at 12:23:39Z, its attempt finished
+// 'completed' 1.2s later with ZERO further events, and the session sat
+// status='active' for 80+ minutes — a silent no-reply with no timeout, no
+// reaper, no user-facing signal. The participation-ratchet class: lifecycle
+// stamped at intent (acceptance), never at happening (a turn actually served).
+// An accepted-input session with no turn start within its bound must get a
+// DURABLE liveness terminal — surfaced, not silent.
+test('an accepted-input session that never started a turn gets a durable liveness terminal after its bound', async () => {
+  resetEventLog();
+  const { reconcileSilentAcceptedInputSessions } = await import('./session-reconcile.js');
+  const { listEvents, claimRunAttemptLease, finishRunAttempt: finishAttempt } = await import('./eventlog.js');
+
+  // The zombie shape: accepted input recorded, attempt already finished, no
+  // events after acceptance.
+  const zombie = createSession({ id: 'sess-branch-zombie-1', kind: 'chat', channel: 'desktop' });
+  const claim = claimRunAttemptLease({ sessionId: zombie.id, runId: 'desktop:zombie-run', ownerId: 'console-test', leaseMs: 60_000 });
+  const accepted = appendEvent({ sessionId: zombie.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'continue' } });
+  if (claim.attempt) finishAttempt(claim.attempt, 'completed');
+
+  // A LIVE session (attempt lease unexpired) must never be terminalized.
+  const live = createSession({ id: 'sess-live-turn-1', kind: 'chat', channel: 'desktop' });
+  claimRunAttemptLease({ sessionId: live.id, runId: 'desktop:live-run', ownerId: 'console-test', leaseMs: 60 * 60_000 });
+  appendEvent({ sessionId: live.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'working…' } });
+
+  // A FRESH acceptance inside the bound must be left alone (checked with a
+  // sweep clock still inside ITS bound, before the terminalizing sweep runs).
+  const fresh = createSession({ id: 'sess-fresh-input-1', kind: 'chat', channel: 'desktop' });
+  appendEvent({ sessionId: fresh.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'hi' } });
+  const bound = 10 * 60_000;
+  const early = reconcileSilentAcceptedInputSessions({ nowMs: Date.now() + bound - 60_000, boundMs: bound });
+  assert.equal(early.ids.length, 0, 'no acceptance is terminalized inside its liveness bound');
+
+  const later = Date.now() + bound + 60_000;
+  // The fresh session is protected during the terminalizing sweep by a live lease.
+  claimRunAttemptLease({ sessionId: fresh.id, runId: 'desktop:fresh-run', ownerId: 'console-test', leaseMs: bound + 2 * 60_000 });
+  const sweep = reconcileSilentAcceptedInputSessions({ nowMs: later, boundMs: bound });
+
+  assert.deepEqual(sweep.ids, [zombie.id], 'exactly the silent accepted-input session was terminalized');
+  assert.equal(getSession(zombie.id)?.status, 'failed', 'the session ledger no longer lies "active"');
+  const terminal = listEvents(zombie.id).filter((e) => e.type === 'conversation_completed');
+  assert.equal(terminal.length, 1, 'a durable terminal event was published');
+  const data = terminal[0].data as Record<string, unknown>;
+  assert.equal(data.reason, 'accepted_input_never_started');
+  assert.equal(data.sourceUserSeq, accepted.seq, 'the terminal names the exact accepted input it answers');
+
+  assert.equal(getSession(live.id)?.status, 'active', 'a session with a live attempt lease is untouched');
+  assert.equal(getSession(fresh.id)?.status, 'active', 'an acceptance inside the bound is untouched');
+
+  // Idempotent: a second sweep neither duplicates the terminal nor re-reports.
+  const again = reconcileSilentAcceptedInputSessions({ nowMs: later + 1000, boundMs: bound });
+  assert.equal(again.ids.length, 0, 'already-terminalized sessions are not re-reported');
+});
+
+test('an accepted-input session whose unfinished attempt lease EXPIRED is terminalized (executor died mid-claim)', async () => {
+  resetEventLog();
+  const { reconcileSilentAcceptedInputSessions } = await import('./session-reconcile.js');
+  const { listEvents, claimRunAttemptLease, getActiveRunAttempt } = await import('./eventlog.js');
+
+  const wedged = createSession({ id: 'sess-wedged-lease-1', kind: 'chat', channel: 'desktop' });
+  claimRunAttemptLease({ sessionId: wedged.id, runId: 'desktop:wedged-run', ownerId: 'console-test', leaseMs: 60_000 });
+  appendEvent({ sessionId: wedged.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'do it' } });
+
+  const bound = 10 * 60_000;
+  const later = Date.now() + bound + 60_000; // lease (60s) long expired by then
+  const sweep = reconcileSilentAcceptedInputSessions({ nowMs: later, boundMs: bound });
+
+  assert.deepEqual(sweep.ids, [wedged.id]);
+  assert.equal(getSession(wedged.id)?.status, 'failed');
+  assert.equal(getActiveRunAttempt(wedged.id), null, 'the orphaned attempt was closed, not left claiming the session');
+  assert.equal(listEvents(wedged.id).filter((e) => e.type === 'conversation_completed').length, 1);
+});

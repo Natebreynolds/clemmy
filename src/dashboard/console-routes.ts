@@ -425,7 +425,7 @@ import {
 
 /** The xAI OpenAI-compatible endpoint the OAuth grant is minted against. */
 const XAI_BASE_URL = 'https://api.x.ai/v1';
-import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
+import { resolveRoleModel, readDurableBindings, pinSessionBrain, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
 import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
@@ -14731,6 +14731,13 @@ export function registerConsoleRoutes(
       // model — e.g. a Together AI model in an extra slot — can be the brain, not
       // just the default slot). The router routes this id to its owning provider.
       const brainModelId = typeof req.body?.modelId === 'string' ? req.body.modelId.trim() : '';
+      // Optional: the chat session the user switched FROM. Session brain pins
+      // (B6) mean the global flip alone no longer re-routes an already-served
+      // conversation — so a switch made from inside a conversation carries its
+      // sessionId and re-pins THAT session below, keeping "applies to your next
+      // message" true where it was promised. A Settings-context switch has no
+      // session and stays global-only (new sessions + unpinned resolutions).
+      const switchSessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
 
       // A BYO brain runs all-in (every role on the BYO backend unless a role is
       // bound elsewhere); a Codex/Claude brain cannot coexist with all-in, so step
@@ -14838,6 +14845,13 @@ export function registerConsoleRoutes(
       resetClaudeModelCache();
       resetByoModelCache();
       clearAutonomyAgentCache();
+
+      // Re-pin the conversation the switch was made from (after the env writes
+      // + cache resets above, so the pin stamps the NEW global resolution). No
+      // sessionId ⇒ no pin is touched: other live conversations keep theirs.
+      if (switchSessionId) {
+        try { pinSessionBrain(switchSessionId); } catch { /* pin is affinity, never a switch blocker */ }
+      }
 
       res.json({ activeBrain: getActiveAuthMode(), claudeAuth: getClaudeAuthSnapshot() });
     } catch (err) {

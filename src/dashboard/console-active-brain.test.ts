@@ -34,7 +34,13 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { getActiveAuthMode } = await import('../config.js');
 const { effectiveBrainValue } = await import('../runtime/harness/model-role-options.js');
-const { readDurableBindings, resolveRoleModel } = await import('../runtime/harness/model-roles.js');
+const {
+  readDurableBindings,
+  resolveRoleModel,
+  pinSessionBrain,
+  pinnedBrainForSession,
+  __sessionBrainPinTest__,
+} = await import('../runtime/harness/model-roles.js');
 const claudeOauth = await import('../runtime/claude-oauth.js');
 const fallbackModel = await import('../runtime/harness/fallback-model.js');
 
@@ -63,7 +69,7 @@ async function boot() {
 
 async function patchActiveBrain(
   url: string,
-  body: { brain: 'api_key' | 'codex_oauth' | 'claude_oauth'; modelId?: string },
+  body: { brain: 'api_key' | 'codex_oauth' | 'claude_oauth'; modelId?: string; sessionId?: string },
 ) {
   const response = await fetch(`${url}/api/console/settings/active-brain`, {
     method: 'PATCH',
@@ -307,6 +313,68 @@ test('worker role PATCH survives a route restart and clear removes the live and 
     assert.equal(resolveRoleModel('worker').source, 'default');
   } finally {
     await harness.close();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+// D2 pins (adversarial review 2026-08-26): once session brain pins serve (D1),
+// the global flip alone no longer re-routes an already-pinned conversation —
+// which would silently break the switcher's promise "applies to your next
+// message" for the very conversation the user switched FROM. The route
+// therefore accepts an optional sessionId and re-pins exactly that session.
+test('active-brain PATCH with sessionId re-pins THAT session; without sessionId no pin is touched', async () => {
+  rmSync(path.join(TMP_HOME, '.env'), { force: true });
+  const previous = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    MODEL_ROUTING_MODE: process.env.MODEL_ROUTING_MODE,
+    OPENAI_MODEL_PRIMARY: process.env.OPENAI_MODEL_PRIMARY,
+  };
+  process.env.AUTH_MODE = 'codex_oauth';
+  process.env.MODEL_ROUTING_MODE = 'off';
+  process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.4';
+  __sessionBrainPinTest__.reset();
+  // The bare test home has no live provider grants; pin-serve liveness is
+  // covered by model-roles-session-pin-live.test.ts. Here the ROUTE seam is
+  // under test: which pins a switch stamps and which it must leave alone.
+  __sessionBrainPinTest__.setValidatorForTests(() => true);
+
+  const harness = await boot();
+  try {
+    // Two live conversations, each pinned to the pre-switch global brain.
+    pinSessionBrain('sess-switched-from');
+    pinSessionBrain('sess-bystander');
+    const before = pinnedBrainForSession('sess-bystander');
+    assert.equal(before?.modelId, 'gpt-5.4');
+
+    // The user switches brains FROM sess-switched-from (chat header / console
+    // section with a session in hand): that one session must follow.
+    const switched = await patchActiveBrain(harness.url, {
+      brain: 'api_key',
+      sessionId: 'sess-switched-from',
+    });
+    assert.equal(switched.response.status, 200, switched.body.error);
+    assert.equal(pinnedBrainForSession('sess-switched-from')?.modelId, 'glm-5.2',
+      'the conversation the user switched FROM is re-pinned to the new brain');
+    assert.equal(pinnedBrainForSession('sess-bystander')?.modelId, 'gpt-5.4',
+      'other live conversations keep their own pinned brain');
+
+    // A Settings-context switch (no sessionId) is global-only: existing pins
+    // are left alone in BOTH directions.
+    const globalOnly = await patchActiveBrain(harness.url, {
+      brain: 'codex_oauth',
+      modelId: 'gpt-5.4',
+    });
+    assert.equal(globalOnly.response.status, 200, globalOnly.body.error);
+    assert.equal(pinnedBrainForSession('sess-switched-from')?.modelId, 'glm-5.2',
+      'a sessionless switch must not re-pin the previously switched session');
+    assert.equal(pinnedBrainForSession('sess-bystander')?.modelId, 'gpt-5.4',
+      'a sessionless switch must not touch any existing pin');
+  } finally {
+    await harness.close();
+    __sessionBrainPinTest__.reset();
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

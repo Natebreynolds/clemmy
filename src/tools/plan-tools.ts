@@ -488,6 +488,54 @@ export function buildPlanTaskTool(input: {
       if (!planning) throw new Error('plan_task requires a live host-minted planning catalog');
       return executePlanTask(args as PlanTaskInput, planning);
     },
+    // Input-shape rejections return the typed plan_invalid_input refusal with
+    // the violated paths (see planTaskInvalidInputRefusal). Everything else
+    // keeps the SDK's default text: settlement recognizes that prefix as a
+    // laundered failure, and downstream failure detection keys on it.
+    errorFunction: (_context, error) => {
+      const refusal = planTaskInvalidInputRefusal(error);
+      if (refusal) return refusal;
+      const details = error instanceof Error ? error.toString() : String(error);
+      return `An error occurred while running the tool. Please try again. Error: ${details}`;
+    },
+  });
+}
+
+/**
+ * Typed refusal for a plan_task input-shape rejection, naming every violated
+ * path. The SDK default errorFunction destroys the zod issues into "Invalid
+ * JSON input for tool" — live 2026-08-26 (sess-desktop-8823/b3a7/f58f/e0e9):
+ * six schema-layer rejections whose issues NAMED their own fix ("coverage and
+ * cardinality describe different read sets", a PlanId pattern miss, one stray
+ * strict key) were laundered into that detail-free string; the model retried
+ * the identical arguments five times, the loop guardrail blocked, and the
+ * conversation died. An error that names its own condition must reach the
+ * model (self-healing law), and the result stays inside plan_task's closed
+ * typed union so settlement records a typed failure, never success.
+ */
+function planTaskInvalidInputRefusal(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null;
+  if ((error as { name?: unknown }).name !== 'InvalidToolInputError') return null;
+  const original = (error as { originalError?: unknown }).originalError;
+  const rawIssues = original && typeof original === 'object'
+    ? (original as { issues?: unknown }).issues
+    : undefined;
+  const issues = Array.isArray(rawIssues)
+    ? (rawIssues as Array<{ path?: unknown; message?: unknown }>).slice(0, 8).map((issue) => {
+        const path = Array.isArray(issue.path) && issue.path.length > 0
+          ? issue.path.join('.')
+          : '(root)';
+        return `${path}: ${String(issue.message ?? 'invalid')}`;
+      })
+    : [];
+  const detail = issues.length > 0
+    ? `plan_task input did not match its schema — ${issues.join('; ')}`
+    : 'plan_task input was not one parseable JSON object matching its schema';
+  return JSON.stringify({
+    ok: false,
+    code: 'plan_invalid_input',
+    detail: detail.slice(0, 4_000),
+    repair: 'Fix exactly the named paths and call plan_task again; do not resend the identical arguments.',
   });
 }
 

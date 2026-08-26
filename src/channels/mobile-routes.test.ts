@@ -2976,6 +2976,72 @@ test('brain switch serves the live catalog and rejects anything not a known mode
   } finally { await h.close(); }
 });
 
+// D2 pin (adversarial review 2026-08-26), mobile carrier: once session brain
+// pins serve, the global flip alone no longer re-routes an already-pinned
+// conversation. The chat-header BrainSheet knows its session and sends it, so
+// the route must re-pin exactly that session; the Settings sheet sends none
+// and must leave every existing pin alone.
+test('mobile brain switch with sessionId re-pins THAT session; without sessionId no pin is touched', async () => {
+  const previousEnv: Record<string, string | undefined> = {};
+  for (const key of [
+    'AUTH_MODE', 'MODEL_ROUTING_MODE', 'OPENAI_MODEL_PRIMARY', 'OPENAI_MODEL_WORKER',
+    'BYO_MODEL_BASE_URL', 'BYO_MODEL_API_KEY', 'BYO_MODEL_ID', 'BYO_BRAIN_MODEL_ID',
+  ]) previousEnv[key] = process.env[key];
+  process.env.AUTH_MODE = 'codex_oauth';
+  process.env.MODEL_ROUTING_MODE = 'off';
+  process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.4';
+  process.env.BYO_MODEL_BASE_URL = 'https://api.example.test/v1';
+  process.env.BYO_MODEL_API_KEY = 'test-only-key';
+  process.env.BYO_MODEL_ID = 'glm-5.2';
+  delete process.env.BYO_BRAIN_MODEL_ID;
+
+  const { pinSessionBrain, pinnedBrainForSession, __sessionBrainPinTest__ } =
+    await import('../runtime/harness/model-roles.js');
+  __sessionBrainPinTest__.reset();
+  // Pin-serve liveness runs under the production validator in
+  // model-roles-session-pin-live.test.ts; here the ROUTE seam is under test.
+  __sessionBrainPinTest__.setValidatorForTests(() => true);
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Switcher phone');
+
+    // Two live conversations, each pinned to the pre-switch global brain.
+    pinSessionBrain('m-sess-switched-from');
+    pinSessionBrain('m-sess-bystander');
+    assert.equal(pinnedBrainForSession('m-sess-bystander')?.modelId, 'gpt-5.4');
+
+    const switched = await fetch(`${h.url}/m/api/settings/models/brain`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ value: 'api_key:glm-5.2', sessionId: 'm-sess-switched-from' }),
+    });
+    assert.equal(switched.status, 200, await switched.clone().text());
+    assert.equal(pinnedBrainForSession('m-sess-switched-from')?.modelId, 'glm-5.2',
+      'the conversation the user switched FROM is re-pinned to the new brain');
+    assert.equal(pinnedBrainForSession('m-sess-bystander')?.modelId, 'gpt-5.4',
+      'other live conversations keep their own pinned brain');
+
+    // Settings-context switch: no sessionId ⇒ global-only, no pin is touched.
+    pinSessionBrain('m-sess-switched-from'); // now pinned glm-5.2 under the new global
+    const globalOnly = await fetch(`${h.url}/m/api/settings/models/brain`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ value: 'api_key:glm-5.2' }),
+    });
+    assert.equal(globalOnly.status, 200, await globalOnly.clone().text());
+    assert.equal(pinnedBrainForSession('m-sess-bystander')?.modelId, 'gpt-5.4',
+      'a sessionless switch must not touch any existing pin');
+  } finally {
+    await h.close();
+    __sessionBrainPinTest__.reset();
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test('connections health is a session-gated read-only list', async () => {
   const h = await startHarness();
   try {

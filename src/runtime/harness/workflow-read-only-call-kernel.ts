@@ -11,6 +11,7 @@
 import { createHash } from 'node:crypto';
 
 import {
+  armWorkflowReadOnlyCallAuthority,
   closeWorkflowReadOnlyCallAuthority,
   closeWorkflowV3CallAuthority,
   mintWorkflowReadOnlyCallAttestation,
@@ -40,13 +41,19 @@ import {
 import { classifyAttemptOutcome } from './attempt-outcome.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import {
+  canonicalCatalogIdentityOf,
   peekHostCapabilityCatalogFactory,
+  type CanonicalCatalogIdentityV1,
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
+import { currentCapabilityManifest } from './capability-manifest.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
 import {
+  createWorkflowNodeInvocationPlan,
   parseWorkflowNodeInvocationPlan,
+  type WorkflowNodeArgumentBindingV1,
   type WorkflowNodeInvocationEffectV1,
+  type WorkflowNodeInvocationValueTypeV1,
 } from '../../memory/workflow-node-invocation-plan.js';
 import {
   activateDispatchLease,
@@ -1237,4 +1244,149 @@ export async function executeWorkflowV3Call(input: {
     };
   }
   return executeWorkflowCallKernel(input, workflowV3CallAuthorityPort(parsed.plan.binding.effect));
+}
+
+export type AcquireWorkflowReadOnlyOperationAuthorityResult =
+  | { status: 'armed'; activationId: string; invocationPlan: unknown }
+  | { status: 'refused'; reason: string };
+
+function planValueTypeOf(value: unknown): WorkflowNodeInvocationValueTypeV1 | null {
+  if (typeof value === 'string') return 'string';
+  if (typeof value === 'number' && Number.isFinite(value)) return 'number';
+  if (typeof value === 'boolean') return 'boolean';
+  if (Array.isArray(value)) return 'array';
+  if (value !== null && typeof value === 'object') return 'object';
+  return null;
+}
+
+/**
+ * ADDITIVE mint seam: activate this kernel for one exact catalog-registered
+ * READ operation and hand back the durable activation address. Reads that live
+ * outside the typed workflow lane (Workspace data refreshes) use it to redeem
+ * the same shared durable kernel instead of a raw provider gateway.
+ *
+ * The returned address grants nothing by itself. Execution still reopens the
+ * activation and, at attestation time, re-verifies the live catalog binding,
+ * the immutable production invoke port, and a fresh independent observation —
+ * so a capability that is stale, retired, or unproven refuses at redemption
+ * exactly as it would for a typed workflow node.
+ */
+export function acquireWorkflowReadOnlyOperationAuthority(input: {
+  sessionId: string;
+  workflowId: string;
+  runId: string;
+  runOccurrenceId: string;
+  nodeId: string;
+  requirementId: string;
+  logicalCapabilityId: string;
+  operationId: string;
+  args: Record<string, unknown>;
+}): AcquireWorkflowReadOnlyOperationAuthorityResult {
+  const factory = peekHostCapabilityCatalogFactory();
+  if (!factory) {
+    return { status: 'refused', reason: 'no host capability catalog is installed' };
+  }
+  const candidates: CanonicalCatalogIdentityV1[] = [];
+  for (const entry of factory.snapshot()) {
+    if (!entry.manifest || !currentCapabilityManifest(entry.manifest)) continue;
+    const identity = canonicalCatalogIdentityOf(entry);
+    if (!identity || identity.operationId !== input.operationId || identity.effect !== 'read') continue;
+    candidates.push(identity);
+  }
+  if (candidates.length === 0) {
+    return {
+      status: 'refused',
+      reason: `no current read capability is registered for "${input.operationId}"`,
+    };
+  }
+  const distinct = new Set(candidates.map((identity) => identity.capabilityId));
+  if (distinct.size > 1) {
+    return {
+      status: 'refused',
+      reason: `${distinct.size} read capabilities are registered for "${input.operationId}"; the binding is ambiguous`,
+    };
+  }
+  const identity = candidates[0]!;
+
+  const argumentContract: Record<string, WorkflowNodeArgumentBindingV1> = {};
+  for (const [key, value] of Object.entries(input.args)) {
+    const type = planValueTypeOf(value);
+    if (!type) {
+      return {
+        status: 'refused',
+        reason: `argument "${key}" is not a plan-representable JSON value`,
+      };
+    }
+    argumentContract[key] = {
+      source: { kind: 'workflow_input', key },
+      required: true,
+      type,
+    };
+  }
+
+  let invocationPlan: unknown;
+  let invocationPlanDigest: string;
+  try {
+    const plan = createWorkflowNodeInvocationPlan({
+      requirementId: input.requirementId,
+      logicalCapabilityId: input.logicalCapabilityId,
+      binding: {
+        capabilityId: identity.capabilityId,
+        manifestId: identity.manifestId,
+        manifestDigest: identity.manifestDigest,
+        operationId: identity.operationId,
+        operationVersion: identity.schemaVersion,
+        schemaDigest: identity.schemaDigest,
+        providerVersion: identity.providerVersion,
+        liveFingerprint: identity.liveFingerprint,
+        accountId: identity.account,
+        effect: 'read',
+        invokePortId: identity.invokePortId,
+        argumentCompiler: {
+          id: identity.argumentCompiler.id,
+          version: identity.argumentCompiler.version,
+        },
+      },
+      arguments: argumentContract,
+      // The caller treats the settled provider bytes as one opaque terminal
+      // observation; it does not redeem per-path evidence the way the typed
+      // executor lane does, so the contract stays minimal and truthful.
+      evidence: { requiredPaths: [], nonEmptyPaths: [], minItems: {} },
+      completeness: { kind: 'terminal_result', evidencePaths: ['data'] },
+      continuation: { kind: 'none' },
+    });
+    invocationPlan = plan;
+    invocationPlanDigest = plan.bindingDigest;
+  } catch (error) {
+    return { status: 'refused', reason: boundedReason(error) };
+  }
+
+  const armed = armWorkflowReadOnlyCallAuthority({
+    sessionId: input.sessionId,
+    workflowId: input.workflowId,
+    workflowRevision: 1,
+    workflowDigest: sha256(JSON.stringify({
+      version: 1,
+      workflowId: input.workflowId,
+      operationId: input.operationId,
+      invocationPlanDigest,
+    })),
+    runId: input.runId,
+    runOccurrenceId: input.runOccurrenceId,
+    nodeId: input.nodeId,
+    nodeAttempt: 1,
+    invocationPlanDigest,
+    bindingSnapshotDigest: sha256(JSON.stringify({ version: 1, identity })),
+    controlDigest: sha256(JSON.stringify({
+      version: 1,
+      requirementId: input.requirementId,
+      logicalCapabilityId: input.logicalCapabilityId,
+    })),
+    logicalCallId: `logical:${input.runId}:${input.nodeId}`,
+  });
+  if ('reason' in armed) return { status: 'refused', reason: armed.reason };
+  if (armed.status === 'existing_closed') {
+    return { status: 'refused', reason: 'this exact workflow node attempt already closed its activation' };
+  }
+  return { status: 'armed', activationId: armed.ref.activationId, invocationPlan };
 }

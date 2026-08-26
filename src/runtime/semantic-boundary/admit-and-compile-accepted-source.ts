@@ -32,7 +32,9 @@ import {
   type CanonicalDestinationBindingV1,
 } from '../harness/destination-binding.js';
 import {
+  freezeCatalogSnapshotForPlanAdmission,
   freezeCatalogSnapshotForSource,
+  peekCatalogSnapshotForSource,
   peekHostCapabilityCatalogFactory,
   type RegisteredHostCapability,
 } from '../harness/host-capability-catalog-factory.js';
@@ -1398,10 +1400,30 @@ export async function prepareDurableAcceptedTurnCompile(
     }
   }
 
-  const frozen = freezeCatalogSnapshotForSource({
-    sessionId: input.identity.sessionId,
-    sourceUserSeq: input.identity.sourceUserSeq,
-  });
+  // The frozen snapshot pins what admission validated, so it is taken AT plan
+  // admission — after this turn's tool_search disclosures were re-proven and
+  // registered just above — never at pre-model preparation, which necessarily
+  // runs before any disclosure exists (2026-08-26 gauntlet: the prep-time
+  // freeze persisted '[]' and refused every same-turn-disclosed proposal with
+  // "no longer matches the frozen host catalog"). A repaired proposal later in
+  // the SAME turn may cite a capability disclosed after an earlier attempt's
+  // freeze, so plan admission extends the snapshot monotonically; once graph
+  // authority exists the write-once replay applies. The proposal-free legacy
+  // leg only enumerates for the planning card and peeks.
+  const frozen = primaryModelProposal
+    ? getTurnGraphEventForSource(input.identity.sessionId, input.identity.sourceUserSeq)
+      ? freezeCatalogSnapshotForSource({
+          sessionId: input.identity.sessionId,
+          sourceUserSeq: input.identity.sourceUserSeq,
+        })
+      : freezeCatalogSnapshotForPlanAdmission({
+          sessionId: input.identity.sessionId,
+          sourceUserSeq: input.identity.sourceUserSeq,
+        })
+    : peekCatalogSnapshotForSource({
+        sessionId: input.identity.sessionId,
+        sourceUserSeq: input.identity.sourceUserSeq,
+      });
   const catalogEntries = frozen.ok ? [...frozen.entries] : [];
   const catalogDescriptors = catalogEntries
     .map((entry) => hostDescriptorFromRegistered(entry))

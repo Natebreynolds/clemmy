@@ -123,6 +123,13 @@ export type DiscoveryAdmissionReason =
   /** A different physical call cannot borrow a subject's already-spent claim.
    *  Only host-observed evidence may open a new epoch and authorize a retry. */
   | 'new_call_requires_retry_epoch'
+  /** The subject's claim SETTLED SUCCESSFUL and a new physical call arrived:
+   *  a follow-up/pagination/refinement of the already-admitted intent. It is a
+   *  continuation read, not a new physical discovery — denying it starved the
+   *  exact disclosure plan admission demands (2026-08-26 gauntlet: 147
+   *  denials, 1 epoch reopen, 0 external effects). The turn-wide admission
+   *  ceiling remains the runaway bound. */
+  | 'settled_continuation_admitted'
   /** The caller named no role, an unknown one, or an already-resolved one. The
    *  search is admitted against a HOST-OWNED subject and the caller is told. */
   | 'role_coerced'
@@ -195,6 +202,8 @@ export interface DiscoveryAdmittedDecision extends DiscoveryDecisionBase {
   reason:
     | 'novel_discovery_admitted'
     | 'schema_refresh_admitted'
+    | 'new_evidence_admitted'
+    | 'settled_continuation_admitted'
     | 'role_coerced';
 }
 
@@ -1243,24 +1252,90 @@ export class DiscoveryGovernor {
       if (existing) {
         // The durable claim authorizes one exact physical invocation identity.
         // A distinct call id is not a replay of that invocation: admitting it
-        // would execute another provider body while settlement still belongs
-        // to `existing.callId`. If an upstream physical/result layer can replay
-        // the exact same id's bytes, it returns before reaching this boundary;
-        // reaching the governor again proves there is no such cached path, so
-        // even the same id is denied here rather than re-entering provider code.
+        // while settlement still belongs to `existing.callId` would execute a
+        // second concurrent provider body. If an upstream physical/result
+        // layer can replay the exact same id's bytes, it returns before
+        // reaching this boundary; reaching the governor again proves there is
+        // no such cached path, so even the same id is denied here rather than
+        // re-entering provider code.
+        //
+        // ONE exception, per the constraint-ordering law (never demand
+        // evidence while denying the read that produces it): once the claim
+        // has SETTLED SUCCESSFUL, there is no in-flight settlement to protect,
+        // and a new physical call on the same subject is a follow-up /
+        // pagination / refinement of the already-admitted intent — a bounded
+        // continuation read. The claim transfers to the continuation call
+        // (prior outcomes stay durable in the decision/outcome event ledger),
+        // it consumes a real admission, and MAX_TURN_DISCOVERY_ADMISSIONS
+        // remains the runaway bound. Settled-UNSUCCESSFUL claims keep
+        // recovering only through the host-observed evidence epoch.
+        const settledContinuation = existing.callId !== callId
+          && existing.outcome === 'succeeded';
+        if (!settledContinuation) {
+          return buildDecision({
+            key,
+            category: input.category,
+            subject,
+            callId,
+            admitted: false,
+            reason: existing.callId === callId
+              ? 'same_call_replay'
+              : 'new_call_requires_retry_epoch',
+            replay: true,
+            consumedBudget: false,
+            policy,
+            claim: existing,
+            ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
+          });
+        }
+        const continuationAdmittedAt = new Date().toISOString();
+        const transferred = db.prepare(`
+          UPDATE discovery_governor_claims
+             SET call_id = ?, outcome = 'pending', outcome_detail = NULL,
+                 admitted_at = ?, settled_at = NULL
+           WHERE session_id = ? AND source_user_seq = ?
+             AND epoch = ? AND category = ? AND subject = ?
+             AND call_id = ? AND outcome = 'succeeded'
+        `).run(
+          callId, continuationAdmittedAt,
+          key.sessionId, key.sourceUserSeq,
+          policy.epoch, input.category, subject,
+          existing.callId,
+        );
+        const continuationClaim = rowToClaim(db.prepare(`
+          SELECT * FROM discovery_governor_claims
+           WHERE session_id = ? AND source_user_seq = ?
+             AND epoch = ? AND category = ? AND subject = ?
+        `).get(
+          key.sessionId, key.sourceUserSeq, policy.epoch, input.category, subject,
+        ) as RawClaimRow);
+        if (transferred.changes !== 1 || continuationClaim.callId !== callId) {
+          // Lost a transfer race: exactly one physical owner survives.
+          return buildDecision({
+            key,
+            category: input.category,
+            subject,
+            callId,
+            admitted: false,
+            reason: 'new_call_requires_retry_epoch',
+            replay: true,
+            consumedBudget: false,
+            policy,
+            claim: continuationClaim,
+            ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
+          });
+        }
         return buildDecision({
           key,
           category: input.category,
           subject,
           callId,
-          admitted: false,
-          reason: existing.callId === callId
-            ? 'same_call_replay'
-            : 'new_call_requires_retry_epoch',
-          replay: true,
-          consumedBudget: false,
+          admitted: true,
+          reason: 'settled_continuation_admitted',
+          replay: false,
+          consumedBudget: true,
           policy,
-          claim: existing,
+          claim: continuationClaim,
           ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
         });
       }

@@ -123,7 +123,7 @@ async function probeContinuationInFreshProcess(input: {
   return JSON.parse(stdout) as FreshProcessProbe;
 }
 
-test('long horizon: restart and continuations do not repay discovery; a new accepted correction does', async () => {
+test('long horizon: restart replays stay spent, settled-successful claims continue bounded, and a new accepted correction repays', async () => {
   const session = eventlog.createSession({
     id: 'discovery-long-horizon-session',
     kind: 'chat',
@@ -184,14 +184,17 @@ test('long horizon: restart and continuations do not repay discovery; a new acce
       consumedBudget: false,
       reason: 'same_call_replay',
     },
-    // A durable claim is provider authority for its one physical owner, not an
-    // unlimited replay license. Restart cannot mint either a fresh allowance
-    // or another provider body.
+    // The spent physical id never re-enters provider code (above), but a
+    // SETTLED-SUCCESSFUL claim admits a new physical id as a bounded
+    // continuation of the admitted intent — restart included. Each
+    // continuation consumes a real admission, so the turn-wide ceiling still
+    // bounds it; only unsettled and settled-unsuccessful claims keep the
+    // strict one-owner denial (2026-08-26 gauntlet constraint-ordering law).
     broadContinuation: {
-      admitted: false,
-      replay: true,
-      consumedBudget: false,
-      reason: 'new_call_requires_retry_epoch',
+      admitted: true,
+      replay: false,
+      consumedBudget: true,
+      reason: 'settled_continuation_admitted',
     },
     exactReplay: {
       admitted: false,
@@ -200,14 +203,14 @@ test('long horizon: restart and continuations do not repay discovery; a new acce
       reason: 'same_call_replay',
     },
     exactContinuation: {
-      admitted: false,
-      replay: true,
-      consumedBudget: false,
-      reason: 'new_call_requires_retry_epoch',
+      admitted: true,
+      replay: false,
+      consumedBudget: true,
+      reason: 'settled_continuation_admitted',
     },
     claimCount: 2,
-    broadOutcome: 'succeeded',
-    exactOutcome: 'succeeded',
+    broadOutcome: 'pending',
+    exactOutcome: 'pending',
   });
 
   const afterRestart = new DiscoveryGovernor();
@@ -226,8 +229,10 @@ test('long horizon: restart and continuations do not repay discovery; a new acce
     }),
     /not an accepted user task/i,
   );
-  assert.equal(afterRestart.getTaskState(coldKey)?.claims.broad_discovery?.callId, 'cold-broad-provider-call');
-  assert.equal(afterRestart.getTaskState(coldKey)?.claims.exact_schema_refresh?.callId, 'cold-exact-provider-call');
+  // The settled-successful claims transferred to their continuation calls in
+  // the fresh process; the transfer keeps exactly one physical owner each.
+  assert.equal(afterRestart.getTaskState(coldKey)?.claims.broad_discovery?.callId, 'post-restart-broad-provider-call');
+  assert.equal(afterRestart.getTaskState(coldKey)?.claims.exact_schema_refresh?.callId, 'post-restart-exact-provider-call');
 
   const correctionSource = eventlog.appendEvent({
     sessionId: session.id,
