@@ -203,8 +203,15 @@ export function buildActivitySnapshot(now: Date = new Date()): ActivitySnapshot 
     [] as ActivityEntry[],
   );
   const runningNow: RunningNowItem[] = [];
+  // The push surfaces this snapshot feeds (notch, Slack, Discord presence)
+  // claim "Clem is running N things" — the shared presenter's certificate
+  // semantics apply here too: a STALE non-terminal entry lost its lease, so
+  // it is a fact for a person (needs-you), never quiet background running.
+  // ('unknown' keeps quiet membership, exactly as the presenter treats it.)
+  let stalledCount = 0;
   for (const entry of activityEntries) {
     if (!shouldSurfaceInWorkingNow(entry, nowMs)) continue;
+    if (entry.liveness === 'stale') { stalledCount += 1; continue; }
     const sessionId = entry.sessionId || undefined;
     runningNow.push({
       kind: runningKindLabel(entry),
@@ -270,7 +277,8 @@ export function buildActivitySnapshot(now: Date = new Date()): ActivitySnapshot 
     + safe(() => listPlanProposals({ status: 'all' }).filter(planProposalNeedsUserInput).length, 0)
     + safe(() => listBackgroundTasks({ status: 'blocked' }).length, 0)
     + safe(() => listBackgroundTasks({ status: 'awaiting_input' }).length, 0)
-    + safe(() => listBackgroundTasks({ status: 'awaiting_continue' }).length, 0);
+    + safe(() => listBackgroundTasks({ status: 'awaiting_continue' }).length, 0)
+    + stalledCount;
 
   return {
     runningNow,
