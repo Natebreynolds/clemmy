@@ -140,6 +140,8 @@ const composioClient = await import('../integrations/composio/client.js');
 const proactivity = await import('../agents/proactivity-policy.js');
 const reflection = await import('../memory/reflection.js');
 const memoryDb = await import('../memory/db.js');
+const semantic = await import('../runtime/semantic-boundary/admit-and-compile-accepted-source.js');
+const workTopology = await import('../runtime/graph/work-topology.js');
 
 reflection._testOnly_setReflectionExtractor(async () =>
   ({ facts: [], entities: [], pointers: [], resources: [], relationships: [] } as never));
@@ -1058,14 +1060,25 @@ test('S3-live-catalog-published: a write selected straight off the live catalog 
     async sendFollowup(content: string) { edits.push(content); },
   };
 
-  // TURN 1: ordinary tool_search -> plan_task -> work_call, publishing
-  // LIVE_PUBLISHED_OPERATION into the shared, process-wide factory the real
-  // way (real revalidation, real digests) so TURN 2 can select it live.
-  const turn1Session = eventlog.createSession({
-    id: 'discord-gauntlet-sheet-live-published-turn1',
+  // ONE session, two accepted messages (two sourceUserSeq within it) — not
+  // two sessions. provenCapabilityEntriesForTurn explicitly supplies a LATER
+  // sourceUserSeq's admission from an EARLIER capability_resolution proof
+  // recorded in the SAME session (capability-resolution.ts): "descriptor
+  // supply may draw on the session's latest authoritative resolution at or
+  // before this source." Two separate sessions would never share that
+  // proof, and turn 2's own selected-path revalidation would refuse
+  // selected_definition_not_proven regardless of what is live in the factory.
+  const session = eventlog.createSession({
+    id: 'discord-gauntlet-sheet-live-published',
     kind: 'chat',
     userId: 'discord-user-gauntlet-live-published',
   });
+  const turn1Session = session;
+
+  // TURN 1: ordinary tool_search -> plan_task -> work_call, publishing
+  // LIVE_PUBLISHED_OPERATION into the shared, process-wide factory the real
+  // way (real revalidation, real digests) and recording this session's own
+  // capability_resolution proof, which TURN 2 (below) will draw on.
   let turn1Step = 0;
   const turn1Model = {
     async getResponse(rawRequest: unknown) {
@@ -1185,135 +1198,138 @@ test('S3-live-catalog-published: a write selected straight off the live catalog 
     assert.ok(factory.get(id), `residue ${id} is seeded live before turn 2`);
   }
 
-  const turn2Session = eventlog.createSession({
-    id: 'discord-gauntlet-sheet-live-published-turn2',
-    kind: 'chat',
-    userId: 'discord-user-gauntlet-live-published',
+
+  // TURN 2's own admission, called directly against the exact same seam
+  // plan_task itself uses (admitAndCompilePrimaryModelProposal), the way
+  // local-planning-capability.test.ts already proves out for local
+  // capabilities — this sidesteps a full second scripted Discord turn (whose
+  // own turn/source bookkeeping is unrelated to either mechanism under test
+  // here) while still exercising the real admission code, the real frozen
+  // snapshot, and the real disclosureByName/staged distinction.
+  const turn2Source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: PROMPT },
   });
-  let turn2Step = 0;
-  const turn2Model = {
-    async getResponse(rawRequest: unknown) {
-      const request = (rawRequest ?? {}) as { tools?: Array<{ name?: string }> };
-      const tools = (request.tools ?? []).map((entry) => entry.name ?? '').filter(Boolean);
-      const serialized = JSON.stringify(rawRequest ?? {});
-      turn2Step += 1;
-      let output: unknown[];
-      if (turn2Step === 1) {
-        // THE POINT: no tool_search call, ever, in this turn. The ref is
-        // cited straight off this turn's own initial planning card, which
-        // finds LIVE_PUBLISHED_OPERATION already live in the shared factory
-        // from turn 1 — the disclosureByName path, never staged this turn.
-        assert.match(serialized, /Gauntlet Residue Sheet/, 'the first step sees the accepted request');
-        assert.ok(tools.includes(PLAN_CONTROL), 'plan_task is available before any tool_search call this turn');
-        output = [functionCall('admit-live-published-turn2', PLAN_CONTROL, {
-          preamble: PREAMBLE,
-          draft: {
-            criteria: [
-              'One new Google Sheet named "Gauntlet Residue Sheet" exists with the header row Scenario, Status, Notes.',
-            ],
-            cardinality: null,
-            destination: { posture: 'create_new', family: 'googlesheets', handleRequired: true },
-            topology: {
-              version: 1,
-              operations: [{
-                id: WRITE_REQUIREMENT,
-                effect: 'external_write',
-                coverage: null,
-                dependsOn: [],
-                dataFrom: [],
-                cardinality: { kind: 'once' },
-              }],
-              universes: [],
-            },
-            bindings: [{
-              operationId: WRITE_REQUIREMENT,
-              role: 'destination',
-              capabilityRef: liveCapabilityId,
-              evidence: ['receipt'],
-            }],
-            deliverables: [{ id: 'gauntlet-live-published-sheet-turn2', kind: 'googlesheets' }],
-            evidenceRequirements: ['receipt'],
-          },
-        })];
-      } else if (turn2Step === 2) {
-        const planRecord = eventlog.getToolOutput(turn2Session.id, 'admit-live-published-turn2') as { output?: unknown } | null;
-        const planText = String(planRecord?.output ?? '');
-        assert.match(planText, /"ok":\s*true/,
-          `turn 2 plan_task must admit a write selected straight off the live catalog, never staged this turn: ${planText}`);
-        assert.ok(tools.includes('work_call'), 'the activated business carrier is available');
-        output = [functionCall('turn2-live-published-create', 'work_call', {
-          requirement_id: WRITE_REQUIREMENT,
-          universe_item_id: null,
-          universe_selector: null,
-          seal_amendment: null,
-          name: 'composio_execute_tool',
-          args_json: JSON.stringify({
-            tool_slug: LIVE_PUBLISHED_OPERATION,
-            arguments: JSON.stringify({
-              title: 'Gauntlet Residue Sheet',
-              header_row: ['Scenario', 'Status', 'Notes'],
-            }),
-            connected_account_id: 'conn-googlesheets-live-published',
-          }),
-        })];
-      } else {
-        output = [textMessage(JSON.stringify({
-          summary: SUCCESS, reply: SUCCESS, done: true, nextAction: 'completed', reason: null,
-        }))];
-      }
-      return {
-        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
-        output,
-        responseId: `gauntlet-live-published-turn2-${turn2Step}`,
-      };
+  const turn2Identity = { sessionId: session.id, sourceUserSeq: turn2Source.seq, turn: turn2Source.turn };
+
+  // THE POINT: primePrimaryModelPlanningCatalog builds disclosureByName from
+  // whatever is already live in the shared factory — LIVE_PUBLISHED_OPERATION,
+  // published for real by turn 1 above. Nothing in turn 2 ever calls
+  // disclosePrimaryModelPlanningCapabilities (tool_search's own staging
+  // seam), so this ref reaches turn 2's proposal purely disclosureByName.
+  const primed2 = await semantic.primePrimaryModelPlanningCatalog(turn2Identity);
+  assert.equal(primed2.ok, true, primed2.ok ? '' : primed2.reason);
+  if (!primed2.ok) throw new Error(primed2.reason);
+  assert.ok(
+    primed2.planning.capabilities.some((entry) => entry.id === liveCapabilityId),
+    'turn 2 initial planning card ranks in the write capability live from turn 1, unstaged',
+  );
+
+  // Disclosure already happened (the assertion above): the descriptor is
+  // captured in this turn's own planning card regardless of what the live
+  // factory does next. Evict the live factory entry now, simulating exactly
+  // what an unrelated collateral eviction (this file's own mechanism, or any
+  // other cause) looks like between disclosure and freeze: the ONLY thing
+  // that can put it back before this turn's freeze is THIS turn's own
+  // selected-path revalidation actually publishing it, which is precisely
+  // what the fixed allowlist does and the old staged-only allowlist did not.
+  factory.forget(liveCapabilityId);
+  assert.equal(factory.get(liveCapabilityId), undefined, 'the live factory entry is evicted after disclosure, before freeze');
+
+  const turn2Draft = {
+    criteria: [
+      'One new Google Sheet named "Gauntlet Residue Sheet" exists with the header row Scenario, Status, Notes.',
+    ],
+    cardinality: null,
+    destination: { posture: 'create_new' as const, family: 'googlesheets', handleRequired: true },
+    topology: {
+      version: 1 as const,
+      operations: [{
+        id: WRITE_REQUIREMENT,
+        effect: 'external_write' as const,
+        coverage: null,
+        dependsOn: [],
+        dataFrom: [],
+        cardinality: { kind: 'once' as const },
+      }],
+      universes: [],
     },
-    getStreamedResponse: streamResponse,
+    bindings: [{
+      operationId: WRITE_REQUIREMENT,
+      role: 'destination',
+      capabilityRef: liveCapabilityId,
+      evidence: ['receipt'],
+    }],
+    deliverables: [{ id: 'gauntlet-live-published-sheet-turn2', kind: 'googlesheets' }],
+    evidenceRequirements: ['receipt'],
   };
-  bridge._setBridgeImplsForTests({
-    buildAgent: async (options) => buildOrchestratorAgent({ ...options, model: turn2Model as never }),
-  });
-  let turn2Accepted: { seq: number } | null = null;
-  await discord.runDiscordHarnessConversation({
-    prompt: PROMPT,
-    rawPrompt: PROMPT,
-    channelId: 'discord-channel-gauntlet-live-published',
-    userId: 'discord-user-gauntlet-live-published',
-    guildId: 'discord-guild-gauntlet-live-published',
-    transport,
-    durableRequest: {
-      sessionId: turn2Session.id,
-      runId: 'discord-gauntlet-sheet-live-published-turn2-request-1',
-      onSourceAccepted(source: { seq: number }) { turn2Accepted = { seq: source.seq }; },
+  const turn2ValidatedTopology = workTopology.validateWorkTopology(turn2Draft.topology);
+  assert.ok(turn2ValidatedTopology.ok, JSON.stringify(turn2ValidatedTopology));
+  if (!turn2ValidatedTopology.ok) throw new Error('turn 2 topology is invalid');
+  // The exact TurnSemanticProposalV1 shape plan_task's own handler builds
+  // from a draft (proposalFromDraft, src/tools/plan-tools.ts) — replicated
+  // here because that function is module-private, not because admission
+  // itself is tested any differently than the real plan_task tool would.
+  const turn2Proposal = {
+    version: 1 as const,
+    relation: 'new_goal' as const,
+    targetGoal: null,
+    goal: {
+      objective: PROMPT,
+      criteria: turn2Draft.criteria.map((statement, index) => ({ id: `criterion_${index + 1}`, statement })),
+      openSlots: [],
+      candidates: [{ kind: 'capability' as const, id: liveCapabilityId }],
     },
+    work: {
+      construct: 'single_act' as const,
+      cardinality: null,
+      destinations: [{ ...turn2Draft.destination }],
+      destination: { ...turn2Draft.destination },
+      requestedEffect: 'external_write' as const,
+      topology: turn2Draft.topology,
+      topologyHash: workTopology.workTopologyDigest(turn2ValidatedTopology.topology),
+      operations: turn2ValidatedTopology.topology.operations.map((operation) => ({
+        id: operation.id,
+        role: 'destination',
+        requestedEffect: operation.effect,
+        capabilityRef: liveCapabilityId,
+        dependsOn: [...operation.dependsOn],
+        evidence: ['receipt'],
+      })),
+      deliverables: turn2Draft.deliverables.map((deliverable) => ({ ...deliverable })),
+      evidenceRequirements: [...turn2Draft.evidenceRequirements],
+    },
+    slotAnswers: [],
+    rationale: 'Cite the exact live-catalog capability disclosed only via disclosureByName.',
+  };
+
+  const admitted2 = await semantic.admitAndCompilePrimaryModelProposal({
+    identity: turn2Identity,
+    surface: 'direct',
+    proposal: turn2Proposal as never,
+    planningCatalogAuthority: primed2.planning.authority,
   });
-
-  assert.ok(turn2Accepted, 'turn 2 accepted one durable source');
-  const turn2SourceUserSeq = turn2Accepted!.seq;
-  assert.equal(turn2Step, 3, JSON.stringify({
-    planOutput: eventlog.getToolOutput(turn2Session.id, 'admit-live-published-turn2'),
-    edits,
-  }));
-
-  const planRecord = eventlog.getToolOutput(turn2Session.id, 'admit-live-published-turn2') as { output?: unknown } | null;
-  const planOutput = String(planRecord?.output ?? '');
-  assert.match(planOutput, /"ok":\s*true/, planOutput);
-  assert.doesNotMatch(planOutput, /plan_not_admitted|frozen host catalog|not disclosed/);
+  assert.equal(admitted2.ok, true, admitted2.ok ? '' : JSON.stringify(admitted2));
+  if (!admitted2.ok) throw new Error(JSON.stringify(admitted2));
+  assert.equal(admitted2.compiled.graph.classification.route, 'act');
 
   const snapshotRow = eventlog.openEventLog().prepare(`
     SELECT snapshot_json FROM accepted_source_catalog_snapshots
      WHERE session_id = ? AND source_user_seq = ?
-  `).get(turn2Session.id, turn2SourceUserSeq) as { snapshot_json: string } | undefined;
+  `).get(session.id, turn2Identity.sourceUserSeq) as { snapshot_json: string } | undefined;
   assert.ok(snapshotRow, 'turn 2 plan admission persisted the accepted-source snapshot');
   assert.match(
     snapshotRow!.snapshot_json,
     new RegExp(liveCapabilityId),
-    "a capability SELECTED straight off the live catalog, never staged through turn 2's own tool_search, still lands in turn 2's frozen snapshot",
+    "a capability SELECTED straight off the live catalog, never staged through turn 2's own disclosure, still lands in turn 2's frozen snapshot",
   );
 
-  assert.equal(providerWrites.length, 2, 'turn 2 crossed the provider wire exactly once more');
-
   // BOTH mechanisms exercised together: the live-selected write published in
-  // turn 2, and turn 2's unrelated stale residue never collaterally evicted.
+  // turn 2's frozen snapshot, and turn 2's unrelated stale residue never
+  // collaterally evicted from the live factory by that same-turn admission.
   for (const id of residueCapabilityIds) {
     assert.ok(factory.get(id), `unrelated stale residue ${id} must survive turn 2's registration in the live factory`);
   }
