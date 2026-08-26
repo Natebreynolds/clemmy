@@ -908,3 +908,413 @@ test('S2-residue-survives: registering the selected write must not evict unrelat
     assert.ok(factory.get(id), `unrelated stale residue ${id} must survive this turn's registration in the live factory`);
   }
 });
+
+
+/**
+ * Direction pin for a SECOND, independent mechanism that also empties the
+ * frozen catalog (fixed 2026-08-26 in admit-and-compile-accepted-source.ts,
+ * "Whatever gets revalidated gets published" — that file is off-limits to
+ * this crew, fixed by another): a capability the model selects straight off
+ * the LIVE catalog (primePrimaryModelPlanningCatalog's disclosureByName,
+ * built once at turn-prime time from whatever the shared factory already
+ * holds) rather than through THIS turn's own staged tool_search disclosure
+ * was revalidated (connection checked, schema re-fetched live) and then
+ * omitted from registerProofProvisionedCapabilities's publication allowlist,
+ * which used to be built only from the STAGED selections. Revalidated and
+ * never published: plan admission froze a catalog without it and refused the
+ * very proposal it had just proven (live 2026-08-26: an active, proven
+ * Sheets connection, seven plan_task refusals, zero business calls).
+ *
+ * disclosureByName is computed ONCE per turn from the factory's state AT
+ * PRIME TIME — a capability registered later in the SAME turn (e.g. via this
+ * turn's own tool_search) never retroactively becomes a "live" entry for
+ * that same turn. So this pin uses two turns, exactly like a real multi-turn
+ * conversation: TURN 1 discovers, stages, and publishes
+ * GOOGLESHEETS_LIVE_PUBLISHED_CREATE the ordinary way (tool_search ->
+ * plan_task -> work_call), which registers it into the shared, process-wide
+ * factory with a real, correctly-computed manifest. TURN 2 is a fresh
+ * accepted source in the same process: it seeds stale, unrelated residue
+ * exactly as S1/S2 do, then its model cites the SAME capability directly in
+ * its very first plan_task call — never calling tool_search for it — so for
+ * TURN 2 that ref is disclosureByName-only, exactly the shape production
+ * hits. Both mechanisms are exercised together the way production hits them:
+ * TURN 2's own residue-forgetting exposure (this file's mechanism) and its
+ * live-catalog-selected-but-unpublished exposure (the other fix).
+ */
+const LIVE_PUBLISHED_OPERATION = 'GOOGLESHEETS_LIVE_PUBLISHED_CREATE';
+const LIVE_PUBLISHED_RESIDUE_SLUGS = [
+  'GOOGLESHEETS_RENAME_SHEET',
+  'GOOGLESHEETS_DUPLICATE_SHEET',
+  'GOOGLESHEETS_FORMAT_CELLS',
+] as const;
+
+test('S3-live-catalog-published: a write selected straight off the live catalog (never staged this turn) still lands in the frozen snapshot', { timeout: 180_000 }, async () => {
+  eventlog.resetEventLog();
+  resetHarnessRuntimeConfig();
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+
+  const configured = await configureHarnessRuntime();
+  assert.equal(configured.ok, true, configured.ok ? '' : configured.reason);
+
+  productionAdapters.installProductionTransport(async () => {
+    throw new Error('journey forbids direct catalog execution outside work_call');
+  });
+
+  const factory = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  assert.ok(factory, 'runtime installs one empty searchable host catalog');
+  productionPorts.clearProductionCapabilityPorts();
+
+  connectedCatalog.installConnectedRegistryPort(() => ({
+    connectedToolkits: ['googlesheets'],
+    tools: [
+      { slug: LIVE_PUBLISHED_OPERATION, schema: SHEET_SCHEMA as unknown as Record<string, unknown> },
+    ],
+  }));
+
+  const rawTools = [{
+    slug: LIVE_PUBLISHED_OPERATION,
+    name: 'Create Google Sheet',
+    description: 'Create one new Google Sheet with an optional header row.',
+    toolkit: { slug: 'googlesheets' },
+    inputParameters: SHEET_SCHEMA,
+    outputParameters: SHEET_OUTPUT_SCHEMA,
+    version: 'fixture-googlesheets-live-published-v1',
+  }];
+  composioClient.__test__.setComposioApiKeyOverride('fixture-composio-key');
+  composioClient.__test__.setConnectedAccountsLoader(async () => [
+    { id: 'conn-googlesheets-live-published', status: 'ACTIVE', user_id: 'fixture-user', toolkit: { slug: 'googlesheets' } },
+  ]);
+  const providerWrites: Array<Record<string, unknown>> = [];
+  composioClient.__test__.setComposioClient({
+    client: { baseURL: 'https://backend.composio.dev' },
+    getClient: () => ({
+      withOptions: () => ({
+        tools: {
+          execute: async (
+            operation: string,
+            body: { arguments?: unknown },
+          ) => {
+            assert.equal(operation, LIVE_PUBLISHED_OPERATION);
+            const args = body.arguments as Record<string, unknown>;
+            providerWrites.push(structuredClone(args));
+            return {
+              data: {
+                successful: true,
+                spreadsheetId: `gauntlet-live-published-sheet-${providerWrites.length}`,
+                spreadsheetUrl: SHEET_URL,
+              },
+              error: null,
+              successful: true,
+              log_id: `fixture-write-${providerWrites.length}`,
+            };
+          },
+        },
+      }),
+    }),
+    tools: {
+      async getRawComposioTools(input: { tools?: string[]; toolkits?: string[] }) {
+        const exact = new Set((input.tools ?? []).map((value) => value.toUpperCase()));
+        const toolkits = new Set((input.toolkits ?? []).map((value) => value.toLowerCase()));
+        return rawTools.filter((candidate) =>
+          (exact.size === 0 || exact.has(candidate.slug))
+          && (toolkits.size === 0 || toolkits.has(candidate.toolkit.slug)));
+      },
+      async execute() {
+        throw new Error('journey forbids the legacy Composio high-level execute fallback');
+      },
+    },
+  });
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.startsWith('https://backend.composio.dev/api/v3/tools?')) {
+      return new Response(JSON.stringify({ items: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`journey forbids external network: ${url}`);
+  }) as typeof fetch;
+
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('hidden pre-loop semantic model pass'); },
+    async judgeSourceEffect() { throw new Error('hidden pre-loop semantic effect judge'); },
+    async judgePlanGrounding() { throw new Error('hidden pre-loop semantic grounding judge'); },
+  });
+
+  const gateway = composioTools.getComposioRuntimeTools()
+    .find((candidate) => candidate.name === 'composio_execute_tool');
+  assert.ok(gateway, 'the journey uses the production Composio carrier around the raw provider wire');
+  innerDispatch._setInnerDispatchToolsForTests(new Map([
+    ['composio_execute_tool', gateway as never],
+  ]));
+
+  const liveCapabilityId = `cap:resolved:${LIVE_PUBLISHED_OPERATION.toLowerCase()}`;
+  const edits: string[] = [];
+  const transport = {
+    async sendInitial() {
+      return { async edit(content: string) { edits.push(content); } };
+    },
+    async sendError(content: string) { edits.push(`ERROR:${content}`); },
+    async sendFollowup(content: string) { edits.push(content); },
+  };
+
+  // TURN 1: ordinary tool_search -> plan_task -> work_call, publishing
+  // LIVE_PUBLISHED_OPERATION into the shared, process-wide factory the real
+  // way (real revalidation, real digests) so TURN 2 can select it live.
+  const turn1Session = eventlog.createSession({
+    id: 'discord-gauntlet-sheet-live-published-turn1',
+    kind: 'chat',
+    userId: 'discord-user-gauntlet-live-published',
+  });
+  let turn1Step = 0;
+  const turn1Model = {
+    async getResponse(rawRequest: unknown) {
+      const request = (rawRequest ?? {}) as { tools?: Array<{ name?: string }> };
+      const tools = (request.tools ?? []).map((entry) => entry.name ?? '').filter(Boolean);
+      const serialized = JSON.stringify(rawRequest ?? {});
+      turn1Step += 1;
+      let output: unknown[];
+      if (turn1Step === 1) {
+        assert.ok(tools.includes('tool_search'), 'blank state exposes metadata discovery');
+        output = [functionCall('discover-live-published-write', 'tool_search', {
+          query: 'create a new google sheet with a header row',
+          role_key: serialized.match(/clause-\d+:[a-z_]+/i)?.[0] ?? null,
+          limit: 8,
+        })];
+      } else if (turn1Step === 2) {
+        assert.match(serialized, new RegExp(LIVE_PUBLISHED_OPERATION), 'foreground discovery returns the sheet operation');
+        assert.ok(tools.includes(PLAN_CONTROL), 'disclosure exposes plan_task on the next model surface');
+        output = [functionCall('admit-live-published-turn1', PLAN_CONTROL, {
+          preamble: PREAMBLE,
+          draft: {
+            criteria: [
+              'One new Google Sheet named "Gauntlet Residue Sheet" exists with the header row Scenario, Status, Notes.',
+            ],
+            cardinality: null,
+            destination: { posture: 'create_new', family: 'googlesheets', handleRequired: true },
+            topology: {
+              version: 1,
+              operations: [{
+                id: WRITE_REQUIREMENT,
+                effect: 'external_write',
+                coverage: null,
+                dependsOn: [],
+                dataFrom: [],
+                cardinality: { kind: 'once' },
+              }],
+              universes: [],
+            },
+            bindings: [{
+              operationId: WRITE_REQUIREMENT,
+              role: 'destination',
+              capabilityRef: liveCapabilityId,
+              evidence: ['receipt'],
+            }],
+            deliverables: [{ id: 'gauntlet-live-published-sheet-turn1', kind: 'googlesheets' }],
+            evidenceRequirements: ['receipt'],
+          },
+        })];
+      } else if (turn1Step === 3) {
+        const planRecord = eventlog.getToolOutput(turn1Session.id, 'admit-live-published-turn1') as { output?: unknown } | null;
+        const planText = String(planRecord?.output ?? '');
+        assert.match(planText, /"ok":\s*true/, `turn 1 plan_task must admit the staged write: ${planText}`);
+        assert.ok(tools.includes('work_call'), 'the activated business carrier is available');
+        output = [functionCall('turn1-live-published-create', 'work_call', {
+          requirement_id: WRITE_REQUIREMENT,
+          universe_item_id: null,
+          universe_selector: null,
+          seal_amendment: null,
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            tool_slug: LIVE_PUBLISHED_OPERATION,
+            arguments: JSON.stringify({
+              title: 'Gauntlet Residue Sheet',
+              header_row: ['Scenario', 'Status', 'Notes'],
+            }),
+            connected_account_id: 'conn-googlesheets-live-published',
+          }),
+        })];
+      } else {
+        output = [textMessage(JSON.stringify({
+          summary: SUCCESS, reply: SUCCESS, done: true, nextAction: 'completed', reason: null,
+        }))];
+      }
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+        output,
+        responseId: `gauntlet-live-published-turn1-${turn1Step}`,
+      };
+    },
+    getStreamedResponse: streamResponse,
+  };
+  bridge._setBridgeImplsForTests({
+    buildAgent: async (options) => buildOrchestratorAgent({ ...options, model: turn1Model as never }),
+  });
+  let turn1Accepted: { seq: number } | null = null;
+  await discord.runDiscordHarnessConversation({
+    prompt: PROMPT,
+    rawPrompt: PROMPT,
+    channelId: 'discord-channel-gauntlet-live-published',
+    userId: 'discord-user-gauntlet-live-published',
+    guildId: 'discord-guild-gauntlet-live-published',
+    transport,
+    durableRequest: {
+      sessionId: turn1Session.id,
+      runId: 'discord-gauntlet-sheet-live-published-turn1-request-1',
+      onSourceAccepted(source: { seq: number }) { turn1Accepted = { seq: source.seq }; },
+    },
+  });
+  assert.ok(turn1Accepted, 'turn 1 accepted one durable source');
+  assert.equal(turn1Step, 4, 'turn 1 completed tool_search -> plan_task -> work_call -> summary');
+  assert.equal(providerWrites.length, 1, 'turn 1 crossed the provider wire exactly once');
+  assert.ok(factory.get(liveCapabilityId), 'turn 1 published the write capability into the shared, process-wide factory');
+
+  // TURN 2: a fresh accepted source in the SAME process. Seed stale,
+  // unrelated residue exactly as S1/S2 do, then select
+  // LIVE_PUBLISHED_OPERATION directly — no tool_search this turn — relying
+  // purely on it already being live from TURN 1.
+  for (const slug of LIVE_PUBLISHED_RESIDUE_SLUGS) {
+    seedStaleComposioResidue({
+      slug,
+      accountId: 'ca_residue_sheets_live_published',
+      purposeWords: 'google sheet spreadsheet',
+    });
+  }
+  const residueCapabilityIds = LIVE_PUBLISHED_RESIDUE_SLUGS.map((slug) => `cap:resolved:${slug.toLowerCase()}`);
+  for (const id of residueCapabilityIds) {
+    assert.ok(factory.get(id), `residue ${id} is seeded live before turn 2`);
+  }
+
+  const turn2Session = eventlog.createSession({
+    id: 'discord-gauntlet-sheet-live-published-turn2',
+    kind: 'chat',
+    userId: 'discord-user-gauntlet-live-published',
+  });
+  let turn2Step = 0;
+  const turn2Model = {
+    async getResponse(rawRequest: unknown) {
+      const request = (rawRequest ?? {}) as { tools?: Array<{ name?: string }> };
+      const tools = (request.tools ?? []).map((entry) => entry.name ?? '').filter(Boolean);
+      const serialized = JSON.stringify(rawRequest ?? {});
+      turn2Step += 1;
+      let output: unknown[];
+      if (turn2Step === 1) {
+        // THE POINT: no tool_search call, ever, in this turn. The ref is
+        // cited straight off this turn's own initial planning card, which
+        // finds LIVE_PUBLISHED_OPERATION already live in the shared factory
+        // from turn 1 — the disclosureByName path, never staged this turn.
+        assert.match(serialized, /Gauntlet Residue Sheet/, 'the first step sees the accepted request');
+        assert.ok(tools.includes(PLAN_CONTROL), 'plan_task is available before any tool_search call this turn');
+        output = [functionCall('admit-live-published-turn2', PLAN_CONTROL, {
+          preamble: PREAMBLE,
+          draft: {
+            criteria: [
+              'One new Google Sheet named "Gauntlet Residue Sheet" exists with the header row Scenario, Status, Notes.',
+            ],
+            cardinality: null,
+            destination: { posture: 'create_new', family: 'googlesheets', handleRequired: true },
+            topology: {
+              version: 1,
+              operations: [{
+                id: WRITE_REQUIREMENT,
+                effect: 'external_write',
+                coverage: null,
+                dependsOn: [],
+                dataFrom: [],
+                cardinality: { kind: 'once' },
+              }],
+              universes: [],
+            },
+            bindings: [{
+              operationId: WRITE_REQUIREMENT,
+              role: 'destination',
+              capabilityRef: liveCapabilityId,
+              evidence: ['receipt'],
+            }],
+            deliverables: [{ id: 'gauntlet-live-published-sheet-turn2', kind: 'googlesheets' }],
+            evidenceRequirements: ['receipt'],
+          },
+        })];
+      } else if (turn2Step === 2) {
+        const planRecord = eventlog.getToolOutput(turn2Session.id, 'admit-live-published-turn2') as { output?: unknown } | null;
+        const planText = String(planRecord?.output ?? '');
+        assert.match(planText, /"ok":\s*true/,
+          `turn 2 plan_task must admit a write selected straight off the live catalog, never staged this turn: ${planText}`);
+        assert.ok(tools.includes('work_call'), 'the activated business carrier is available');
+        output = [functionCall('turn2-live-published-create', 'work_call', {
+          requirement_id: WRITE_REQUIREMENT,
+          universe_item_id: null,
+          universe_selector: null,
+          seal_amendment: null,
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            tool_slug: LIVE_PUBLISHED_OPERATION,
+            arguments: JSON.stringify({
+              title: 'Gauntlet Residue Sheet',
+              header_row: ['Scenario', 'Status', 'Notes'],
+            }),
+            connected_account_id: 'conn-googlesheets-live-published',
+          }),
+        })];
+      } else {
+        output = [textMessage(JSON.stringify({
+          summary: SUCCESS, reply: SUCCESS, done: true, nextAction: 'completed', reason: null,
+        }))];
+      }
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+        output,
+        responseId: `gauntlet-live-published-turn2-${turn2Step}`,
+      };
+    },
+    getStreamedResponse: streamResponse,
+  };
+  bridge._setBridgeImplsForTests({
+    buildAgent: async (options) => buildOrchestratorAgent({ ...options, model: turn2Model as never }),
+  });
+  let turn2Accepted: { seq: number } | null = null;
+  await discord.runDiscordHarnessConversation({
+    prompt: PROMPT,
+    rawPrompt: PROMPT,
+    channelId: 'discord-channel-gauntlet-live-published',
+    userId: 'discord-user-gauntlet-live-published',
+    guildId: 'discord-guild-gauntlet-live-published',
+    transport,
+    durableRequest: {
+      sessionId: turn2Session.id,
+      runId: 'discord-gauntlet-sheet-live-published-turn2-request-1',
+      onSourceAccepted(source: { seq: number }) { turn2Accepted = { seq: source.seq }; },
+    },
+  });
+
+  assert.ok(turn2Accepted, 'turn 2 accepted one durable source');
+  const turn2SourceUserSeq = turn2Accepted!.seq;
+  assert.equal(turn2Step, 3, JSON.stringify({
+    planOutput: eventlog.getToolOutput(turn2Session.id, 'admit-live-published-turn2'),
+    edits,
+  }));
+
+  const planRecord = eventlog.getToolOutput(turn2Session.id, 'admit-live-published-turn2') as { output?: unknown } | null;
+  const planOutput = String(planRecord?.output ?? '');
+  assert.match(planOutput, /"ok":\s*true/, planOutput);
+  assert.doesNotMatch(planOutput, /plan_not_admitted|frozen host catalog|not disclosed/);
+
+  const snapshotRow = eventlog.openEventLog().prepare(`
+    SELECT snapshot_json FROM accepted_source_catalog_snapshots
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(turn2Session.id, turn2SourceUserSeq) as { snapshot_json: string } | undefined;
+  assert.ok(snapshotRow, 'turn 2 plan admission persisted the accepted-source snapshot');
+  assert.match(
+    snapshotRow!.snapshot_json,
+    new RegExp(liveCapabilityId),
+    "a capability SELECTED straight off the live catalog, never staged through turn 2's own tool_search, still lands in turn 2's frozen snapshot",
+  );
+
+  assert.equal(providerWrites.length, 2, 'turn 2 crossed the provider wire exactly once more');
+
+  // BOTH mechanisms exercised together: the live-selected write published in
+  // turn 2, and turn 2's unrelated stale residue never collaterally evicted.
+  for (const id of residueCapabilityIds) {
+    assert.ok(factory.get(id), `unrelated stale residue ${id} must survive turn 2's registration in the live factory`);
+  }
+});

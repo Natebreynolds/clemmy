@@ -178,7 +178,12 @@ test('shared step normalization treats model-emitted null optionals as absent', 
   assert.deepEqual(prepared.errors, []);
 });
 
-test('prepareWorkflowCreateForWrite codifies eligible mechanical steps through the shared path', () => {
+test('prepareWorkflowCreateForWrite leaves an eligible mechanical step as a model step — codify-to-call is currently a no-op', () => {
+  // Regression pin (2026-08-26): codifyMechanicalSteps stands down while a
+  // bare `call` step has no production dispatch authority (see
+  // workflow-codify.ts). This step used to get converted to a `call` node
+  // through this exact shared path; it must now stay the working model step
+  // it was authored as.
   const prepared = prepareWorkflowCreateForWrite({
     name: 'codify-create-wf',
     description: 'Codify create test.',
@@ -194,13 +199,13 @@ test('prepareWorkflowCreateForWrite codifies eligible mechanical steps through t
       sideEffect: 'read',
     }],
   });
-  assert.equal(prepared.def.steps[0].call?.tool, 'dataforseo_domain_rank_overview');
-  assert.deepEqual(prepared.def.steps[0].call?.args, { target: '{{input.domain}}' });
-  assert.equal(prepared.def.steps[0].codifiedFrom?.prompt, 'Fetch the domain rank overview.');
-  assert.equal(prepared.codifyNotes.length, 1);
+  assert.equal(prepared.def.steps[0].call, undefined);
+  assert.equal(prepared.def.steps[0].codifiedFrom, undefined);
+  assert.equal(prepared.def.steps[0].prompt, 'Fetch the domain rank overview.');
+  assert.equal(prepared.codifyNotes.length, 0);
 });
 
-test('prepareWorkflowUpdateForWrite codifies edited steps only when requested', () => {
+test('prepareWorkflowUpdateForWrite: requesting codify stays a no-op either way', () => {
   const before = {
     name: 'codify-update-wf',
     description: 'Codify update test.',
@@ -222,8 +227,8 @@ test('prepareWorkflowUpdateForWrite codifies edited steps only when requested', 
   };
   assert.equal(prepareWorkflowUpdateForWrite(before, next).def.steps[0].call, undefined);
   const prepared = prepareWorkflowUpdateForWrite(before, next, { codifyMechanicalSteps: true });
-  assert.equal(prepared.def.steps[0].call?.tool, 'reporter_fetch');
-  assert.equal(prepared.codifyNotes.length, 1);
+  assert.equal(prepared.def.steps[0].call, undefined);
+  assert.equal(prepared.codifyNotes.length, 0);
 });
 
 test('portable model normalization strips exact pins but preserves intent/default routing', () => {
