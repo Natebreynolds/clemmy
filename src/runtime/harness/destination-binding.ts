@@ -45,6 +45,45 @@ function isWriteCapability(entry: RegisteredHostCapability): boolean {
 }
 
 /**
+ * Which operations may name the write destination, in the order they should be
+ * offered to the binder.
+ *
+ * `role` is MODEL-AUTHORED FREE TEXT. Asked to create a spreadsheet the model
+ * writes role "create_google_spreadsheet"; asked to open a ticket it writes
+ * something else again. Selecting candidates by comparing that text to fixed
+ * words means the binder is handed nothing whenever the model does not happen
+ * to use the exact word the code expects — and a destination that fails to
+ * bind is not a neutral outcome: the accepted graph still freezes, and every
+ * later write against it is refused by consent for a reason that names none of
+ * this. Measured live 2026-08-26 on "create a google sheet and put a header row
+ * in it": the operation carried the exact capability ref, the catalog held
+ * exactly one matching create_new writer, and the bind still received an empty
+ * candidate list.
+ *
+ * Identity answers this, and the catalog is the authority: bindExecutableDestination
+ * already filters by write effect and exact destination posture and demands a
+ * unique survivor. So every referenced capability is offered first and the
+ * catalog decides. Self-declared destination roles remain a NARROWING rung for
+ * a plan that legitimately references several compatible writers — a tiebreak,
+ * never the gate.
+ */
+export function destinationCandidateLadder(
+  operations: readonly { role?: string; capabilityRef?: string | null }[] | undefined,
+): readonly (readonly string[])[] {
+  const referenced = (operations ?? [])
+    .map((operation) => operation.capabilityRef)
+    .filter((ref): ref is string => Boolean(ref && ref.trim()));
+  const declared = (operations ?? [])
+    .filter((operation) => operation.role === 'destination' || operation.role === 'create')
+    .map((operation) => operation.capabilityRef)
+    .filter((ref): ref is string => Boolean(ref && ref.trim()));
+  const ladder: string[][] = [];
+  if (referenced.length > 0) ladder.push(referenced);
+  if (declared.length > 0 && declared.length !== referenced.length) ladder.push(declared);
+  return ladder;
+}
+
+/**
  * Select the unique compatible write destination from the frozen catalog.
  * Candidate IDs are host-issued opaque catalog identities. Deliverable
  * kind strings are never compared.

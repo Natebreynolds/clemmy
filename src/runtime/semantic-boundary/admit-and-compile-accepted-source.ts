@@ -28,6 +28,7 @@ import {
 } from './semantic-disposition.js';
 import {
   bindExecutableDestination,
+  destinationCandidateLadder,
   unionEvidenceFloor,
   type CanonicalDestinationBindingV1,
 } from '../harness/destination-binding.js';
@@ -84,10 +85,14 @@ import type { TurnIdentity } from '../harness/turn-outcome.js';
 import type { TaskContinuationContext } from '../../types.js';
 import { appendEvent, getSession, getTurnGraphEventForSource, listEvents, type EventRow } from '../harness/eventlog.js';
 import { pullRecentTurnsForHarnessHistory } from '../harness/session-transcript.js';
+import pino from 'pino';
 
 function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
+
+
+const logger = pino({ name: 'clementine-next.accepted-source-destination' });
 
 export const CONVERSATION_SHORT_CIRCUIT_REASON = 'conversation_short_circuit';
 
@@ -1696,16 +1701,36 @@ export async function prepareDurableAcceptedTurnCompile(
     || clamped.effectCeiling === 'local_write'
     || clamped.effectCeiling === 'admin';
   if (writeCeiling && clamped.destination && frozen.ok) {
-    const candidateIds = (clamped.operations ?? [])
-      .filter((operation) => operation.role === 'destination' || operation.role === 'create')
-      .map((operation) => operation.capabilityRef)
-      .filter((ref): ref is string => Boolean(ref));
-    const bound = bindExecutableDestination({
-      requestedEffect: clamped.effectCeiling,
-      destinationPosture: clamped.destination.posture,
-      candidateIds,
-      catalog: catalogEntries,
-    });
+    // Candidates are named by CAPABILITY IDENTITY, never by the word the model
+    // chose for the step; destinationCandidateLadder owns that rule and carries
+    // the live evidence for it.
+    const candidateLadder = destinationCandidateLadder(clamped.operations);
+    let bound: ReturnType<typeof bindExecutableDestination> = {
+      ok: false,
+      reason: 'destination bind requires an exact capability reference',
+    };
+    for (const candidateIds of candidateLadder) {
+      bound = bindExecutableDestination({
+        requestedEffect: clamped.effectCeiling,
+        destinationPosture: clamped.destination.posture,
+        candidateIds,
+        catalog: catalogEntries,
+      });
+      if (bound.ok) break;
+    }
+    if (!bound.ok) {
+      // Never silent. An unbound destination still freezes into the accepted
+      // graph, and every later write against it is refused for a reason that
+      // cannot be traced back to here.
+      logger.warn({
+        sessionId: input.identity.sessionId,
+        sourceUserSeq: input.identity.sourceUserSeq,
+        reason: bound.reason,
+        effectCeiling: clamped.effectCeiling,
+        posture: clamped.destination.posture,
+        candidateLadder,
+      }, 'accepted write destination could not be bound; downstream consent will refuse this write');
+    }
     if (bound.ok) {
       destinationBinding = bound.binding;
       const carried = carryExactDestinationBinding({ clamped, binding: destinationBinding });
