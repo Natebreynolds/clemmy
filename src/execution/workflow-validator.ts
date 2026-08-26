@@ -47,10 +47,6 @@ import {
   type WorkflowNodeArgumentSourceV1,
   type WorkflowNodeInvocationPlanV1,
 } from '../memory/workflow-node-invocation-plan.js';
-import {
-  workflowRawSubprocessDeclarations,
-  workflowRawSubprocessRetirementReason,
-} from './workflow-raw-subprocess-policy.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -1026,6 +1022,26 @@ export function exactScheduledSendCallEligibility(
   return { eligible: true };
 }
 
+// A deterministic.runner (and its loopUntil.probe.runner twin, checked the
+// same way in workflow-runner.ts's resolveDeterministicRunner) is a fixed
+// script path the workflow's AUTHOR declared at save time — never an argument
+// a live model chooses at call time. It is confined to the workflow's own
+// scripts/ directory (checked again, against the real filesystem, at
+// runtime), launched through an interpreter ALLOWLIST (never a shell — no
+// injection surface), with a scrubbed child environment, a hard timeout, an
+// output-size cap, and secret-redacted output; assertAdmittedWorkflowCodeRevision
+// additionally refuses to run if the script bundle drifted after the run was
+// admitted. That is a fundamentally different risk shape from
+// src/tools/dynamic-tools.ts's installed MCP scripts, where a live model
+// supplies arguments at runtime — those genuinely need the "shared exact
+// authority" kernel before they can run; this lane already had its own,
+// narrower authority and ran safely for months before 60db67d8 retired it
+// wholesale (breaking 5 of the owner's live workflows, 3 on live cron
+// schedules) without a replacement existing. Do not re-block this class
+// without building that replacement first, and without checking whether the
+// case you're worried about is actually author-fixed (this) or
+// model-chosen-at-runtime (dynamic-tools.ts) — conflating them is the exact
+// mistake that broke this the first time.
 function checkDeterministicRunner(step: WorkflowStepShape): string | null {
   if (!step.deterministic) return null;
   const runner = typeof step.deterministic.runner === 'string' ? step.deterministic.runner.trim() : '';
@@ -1579,9 +1595,6 @@ export function validateWorkflowDefinition(
     if (deterministicIssue) {
       if (step.deterministic?.runner?.trim()) errors.push(deterministicIssue);
       else warnings.push(deterministicIssue);
-    }
-    for (const declaration of workflowRawSubprocessDeclarations(step)) {
-      errors.push(workflowRawSubprocessRetirementReason(declaration));
     }
 
     const parallelismIssue = checkParallelismHint(step);

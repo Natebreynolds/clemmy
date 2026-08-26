@@ -1900,7 +1900,16 @@ test('queueWorkflowRun: blocks production runs when required workflow capabiliti
   assert.equal(result.readiness?.blockers[0]?.name, 'missing.py');
 });
 
-test('queueWorkflowRun: retired raw subprocess receipts remain unbound until a sanctioned body recovers each once', () => {
+// RESTORED (2026-08-26): 60db67d8 renamed this from 'queueWorkflowRun:
+// readiness-blocked trigger receipts remain unbound and later each recover
+// exactly once' and inserted a middle assertion that the SAME declaration —
+// script now present on disk — stayed blocked_readiness forever (the
+// retirement), then swapped the workflow to a plain model step before the
+// final 'queued' assertions so a deterministic step could never reach them.
+// Restored to its original scenario: THE READINESS GATE PIN — a scheduled
+// trigger for an enabled deterministic.runner workflow produces a REAL run
+// record once its script exists, not blocked_readiness forever.
+test('queueWorkflowRun: readiness-blocked trigger receipts remain unbound and later each recover exactly once', () => {
   writeWorkflow('pending-trigger-flow', {
     name: 'pending-trigger-flow',
     description: 'Waits for its deterministic helper.',
@@ -1920,22 +1929,6 @@ test('queueWorkflowRun: retired raw subprocess receipts remain unbound until a s
   const scriptsDir = path.join(WORKFLOWS_DIR, 'pending-trigger-flow', 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(path.join(scriptsDir, 'missing.py'), 'print("ready")\n', 'utf-8');
-
-  const installedButUnauthorized = queueWorkflowRun('pending-trigger-flow', {}, {
-    triggerReceiptId: 'pending-receipt-a',
-  });
-  assert.equal(installedButUnauthorized.status, 'blocked_readiness');
-  assert.match(installedButUnauthorized.message, /workflow_raw_subprocess_authority_unrepresented/);
-  assert.equal(readWorkflowTriggerReceiptAcceptance('pending-receipt-a'), null);
-  assert.equal(runFiles().length, 0);
-
-  writeWorkflow('pending-trigger-flow', {
-    name: 'pending-trigger-flow',
-    description: 'Uses a sanctioned model body.',
-    enabled: true,
-    trigger: { manual: true },
-    steps: [{ id: 'merge', prompt: 'Merge evidence.', sideEffect: 'read' }],
-  });
 
   const first = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-a' });
   const second = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-b' });

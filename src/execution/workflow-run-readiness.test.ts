@@ -119,6 +119,44 @@ test('ready items are neither blockers nor warnings', () => {
   assert.equal(warnings.length, 0);
 });
 
+// Regression pin (2026-08-26): 60db67d8 layered an unconditional "retired"
+// blocker on top of the existing 'script' readiness check for
+// deterministic.runner / loopUntil.probe.runner AND filtered the real
+// script-existence item out of blockers to make room for it — refusing every
+// declaration whether or not its script existed. That starved 5 of the
+// owner's live workflows of a run record, 3 of them on live cron schedules
+// (this is THE READINESS GATE PIN: a scheduled trigger for an enabled
+// deterministic.runner workflow must produce a real run, not
+// blocked_readiness). Restored: the pre-existing 'script' check (present ⇒
+// ready, missing ⇒ blocked) is authoritative again, with no retirement layer.
+test('deterministic.runner readiness follows the real script — present is ready, missing still blocks', () => {
+  const slug = 'owner-deterministic-readiness-shape';
+  const scriptsDir = path.join(TMP_HOME, 'vault', '00-System', 'workflows', slug, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(path.join(scriptsDir, 'refresh.mjs'), 'process.stdout.write("{}\\n");\n', 'utf8');
+
+  const withScript: WorkflowDefinition = {
+    name: slug,
+    description: 'Refresh the dashboard from the existing script.',
+    enabled: true,
+    trigger: { type: 'schedule', schedule: '0 7 * * *' },
+    steps: [{ id: 'refresh', prompt: '', sideEffect: 'read', deterministic: { runner: 'refresh.mjs' } }],
+  };
+  const ready = checkWorkflowRunReadiness(withScript, slug);
+  assert.equal(ready.ok, true, ready.message);
+  assert.equal(ready.blockers.length, 0);
+
+  const missingScript: WorkflowDefinition = {
+    ...withScript,
+    steps: [{ id: 'refresh', prompt: '', sideEffect: 'read', deterministic: { runner: 'does-not-exist.mjs' } }],
+  };
+  const blocked = checkWorkflowRunReadiness(missingScript, slug);
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.blockers[0]?.kind, 'script');
+  assert.equal(blocked.blockers[0]?.name, 'does-not-exist.mjs');
+  assert.doesNotMatch(blocked.blockers[0]?.reason ?? '', /shared exact authority/i);
+});
+
 test('workflow readiness does not advertise the removed program executor', () => {
   const inventory = buildWorkflowReadinessInventory();
   assert.ok(!inventory.availableTools?.includes('run_tool_program'), 'the subtracted program surface is not advertised');

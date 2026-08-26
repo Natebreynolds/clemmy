@@ -18,10 +18,6 @@ import {
   type WorkflowToolReadinessItem,
   type WorkflowToolReadinessKind,
 } from '../dashboard/workflow-execution-plan.js';
-import {
-  workflowRawSubprocessDeclarations,
-  workflowRawSubprocessRetirementReason,
-} from './workflow-raw-subprocess-policy.js';
 
 // Only capabilities we can authoritatively verify from LOCAL state hard-block a
 // run: a `usesSkill` whose skill is not installed, a `deterministic.runner`
@@ -109,33 +105,20 @@ export function checkWorkflowRunReadiness(
   const { targetStepId, ...planOptions } = options;
   const plan = buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, planOptions);
   const capabilityReadiness = partitionWorkflowReadiness(plan.toolReadiness.items, targetStepId);
-  const rawSubprocessBlockers: WorkflowToolReadinessItem[] = def.steps
-    .flatMap((step) => workflowRawSubprocessDeclarations(step))
-    .filter((declaration) => !targetStepId || declaration.stepId === targetStepId)
-    .map((declaration) => ({
-      kind: 'script' as const,
-      name: declaration.runner,
-      status: 'missing' as const,
-      reason: workflowRawSubprocessRetirementReason(declaration),
-      stepIds: [declaration.stepId],
-      sources: [declaration.kind === 'deterministic.runner'
-        ? 'deterministic_runner' as const
-        : 'loop_probe_runner' as const],
-      evidence: [{
-        kind: 'script' as const,
-        name: declaration.runner,
-        status: 'missing' as const,
-        detail: 'execution authority unavailable; script body was not admitted',
-      }],
-    }));
+  // A declared deterministic.runner / loopUntil.probe.runner is authoritative
+  // via the SAME 'script' readiness item buildWorkflowExecutionPlan already
+  // emits (workflow-execution-plan.ts, source 'deterministic_runner' /
+  // 'loop_probe_runner') by checking the script's actual presence under the
+  // workflow's own scripts/ directory — 'script' is already in
+  // BLOCKING_READINESS_KINDS above, so a genuinely missing script already
+  // hard-blocks. 60db67d8 (2026-08-25) briefly layered an unconditional
+  // "retired" blocker on top of this — and filtered the real script-existence
+  // item OUT of blockers to make room for it — refusing every declaration
+  // whether or not its script existed, which starved 5 live owner workflows
+  // (3 on live cron schedules) of a run record entirely. Restored: this
+  // function trusts the existing, narrower, already-correct check again.
   const resourceReadiness = requiredResourceReadiness(def);
-  const blockers = [
-    ...rawSubprocessBlockers,
-    ...capabilityReadiness.blockers.filter((item) => !item.sources?.some((source) => (
-      source === 'deterministic_runner' || source === 'loop_probe_runner'
-    ))),
-    ...resourceReadiness.blockers,
-  ];
+  const blockers = [...capabilityReadiness.blockers, ...resourceReadiness.blockers];
   const warnings = [...capabilityReadiness.warnings, ...resourceReadiness.warnings];
   return {
     ok: blockers.length === 0,

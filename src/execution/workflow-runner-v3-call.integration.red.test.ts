@@ -153,6 +153,119 @@ function fixture(label: string, effect: WorkflowNodeInvocationEffectV1 = 'host_o
   return { manifest, plan, step, workflow, ctx, bodies: () => bodies };
 }
 
+/**
+ * Same production-shaped fixture as `fixture()` above, but the step carries
+ * NO invocationPlan — the owner's own salesforce-quarterly-to-sheets shape
+ * (a bare GOOGLESHEETS_BATCH_UPDATE call). Proves compileWorkflowBareCall
+ * InvocationPlan resolves the identical live catalog entry a plan-carrying
+ * step would have been authored against, and that the compiled plan then
+ * rides the exact same executeExactWorkflowV3CallNode path.
+ */
+function bareFixture(
+  label: string,
+  effect: WorkflowNodeInvocationEffectV1 = 'external_write',
+  opts?: { requiresApproval?: boolean },
+) {
+  const manifest = manifests.attachSemanticContract({
+    version: 1,
+    manifestId: `manifest.${label}`,
+    providerKind: 'local_registry',
+    operationId: `operation.${label}`,
+    providerIdentity: `runtime.${label}`,
+    providerVersion: 'runtime.1',
+    operationVersion: '1',
+    definitionFingerprint: digest(`schema.${label}`),
+    effect,
+    accountId: `account.${label}`,
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    purpose: 'bounded_read',
+    acceptedInputKinds: ['scope'],
+    producedOutputKinds: ['records'],
+    applicableDeliverableKinds: ['records'],
+    evidenceContract: { kinds: ['records'], readbackRequired: false },
+    provenance: { issuer: 'runner.v3.test', issuedAt: '2026-08-25T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['write'],
+  });
+  let bodies = 0;
+  assert.equal(ports.registerFixtureCapabilityPort(
+    ports.productionPortIdentityFromManifest(manifest),
+    {
+      invoke: async () => {
+        bodies += 1;
+        // compileWorkflowBareCallInvocationPlan hardcodes evidencePaths:
+        // ['data'] (the composio-shaped {data: ...} convention
+        // acquireWorkflowReadOnlyOperationAuthority's own plans use), unlike
+        // fixture()'s plan-carrying manifest above which declares its own
+        // evidence contract over 'records'.
+        return { data: { id: label } };
+      },
+    },
+  ).ok, true);
+  const entry: catalog.RegisteredHostCapability = {
+    capabilityId: `capability.${label}`,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    advisoryRoles: manifest.advisoryRoles,
+    manifestDigest: manifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => { throw new Error('catalog callback cannot own runner v3 I/O'); },
+  };
+  catalog.installHostCapabilityCatalogFactory(catalog.createHostCapabilityCatalogFactory([entry]));
+  assert.equal(observations.registerIndependentCapabilityObservation({
+    operationId: manifest.operationId,
+    accountId: manifest.accountId,
+    definitionFingerprint: manifest.definitionFingerprint,
+    providerVersion: manifest.providerVersion,
+    operationVersion: manifest.operationVersion,
+    observedAt: Date.now(),
+    origin: 'independent',
+    observe: () => ({
+      operationId: manifest.operationId,
+      accountId: manifest.accountId,
+      definitionFingerprint: manifest.definitionFingerprint,
+      providerVersion: manifest.providerVersion,
+      operationVersion: manifest.operationVersion,
+      observedAt: Date.now(),
+    }),
+  }).ok, true);
+  const step: WorkflowStepInput = {
+    id: `step.${label}`,
+    prompt: '',
+    sideEffect: effect === 'read' || effect === 'host_only' ? 'read' : 'write',
+    ...(opts?.requiresApproval ? { requiresApproval: true } : {}),
+    // No invocationPlan — this is the bare shape.
+    call: { tool: manifest.operationId, args: { scope: '{{input.scope}}' } },
+  };
+  const workflow: WorkflowDefinition = {
+    name: `workflow.${label}`,
+    description: 'Bare structured call, compiled from the live catalog at execution.',
+    enabled: false,
+    trigger: { manual: true },
+    inputs: { scope: { type: 'string', required: true } },
+    steps: [step],
+  };
+  const ctx = {
+    workflow,
+    workflowSlug: workflow.name,
+    runId: `run.${label}`,
+    inputs: { scope: 'exact' },
+    stepOutputs: {},
+    assistant: new Proxy({}, { get: () => { throw new Error('model/raw fallback was consulted'); } }),
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof runner.executeStep>[1];
+  return { manifest, step, workflow, ctx, bodies: () => bodies };
+}
+
 type InstalledFixture = ReturnType<typeof fixture>;
 
 function exactSessionId(installed: InstalledFixture): string {
@@ -378,24 +491,23 @@ test('admin is zero-body and rootless until its exact approval is consumed with 
   `).get(exactSessionId(installed)) as { n: number }).n, 1);
 });
 
-test('legacy name/args call and invalid exact identity refuse with zero body and no synthetic turn', async () => {
+test('dropped-invocationPlan call converges (compiled from the live catalog) and invalid exact identity refuses with zero body', async () => {
   const legacy = fixture('legacy-refused');
   delete legacy.step.invocationPlan;
-  // Dropping the invocationPlan makes this a bare call — no exact compiler
-  // proof exists for it, so it dispatches through the ordinary gated composio
-  // gateway (executeWorkflowBareCallNode) instead of refusing outright
-  // (60db67d8 required an invocationPlan on every call; restored). The
-  // synthetic fixture tool has no real composio connection, so the gateway's
-  // own prepared-definition gate refuses it before any provider dispatch —
-  // proof the restored lane is GATED, not raw. Unlike an exact-kernel
-  // refusal, the gateway lane mints its session/turn identity BEFORE
-  // dispatch (pre-60db67d8 behavior), so a session now exists here.
-  await assert.rejects(
-    runner.executeStep(legacy.step, legacy.ctx),
-    (error: unknown) => error instanceof runner.WorkflowCapabilityBlockedError,
-  );
-  assert.equal(legacy.bodies(), 0);
+  // Dropping the invocationPlan makes this a bare call. It used to dispatch
+  // through the ordinary gated composio gateway (executeWorkflowBareCallNode)
+  // and refuse there for lack of a real composio connection, minting a
+  // FABRICATED user_input_received turn on the way (pre-2026-08-26
+  // convergence). Now it compiles its own invocation plan from the live
+  // catalog at execution (compileWorkflowBareCallInvocationPlan) and rides
+  // the exact same kernel a plan-carrying call uses — this fixture's
+  // operation IS registered (fixture() installs it), so it DISPATCHES for
+  // real, with the kernel's own real activation lineage and no chat turn.
+  const result = await runner.executeStep(legacy.step, legacy.ctx);
+  assert.deepEqual(result, { records: [{ id: 'legacy-refused' }] });
+  assert.equal(legacy.bodies(), 1);
   assert.ok(eventlog.getSession(exactSessionId(legacy)));
+  assert.equal(eventlog.listEvents(exactSessionId(legacy), { types: ['user_input_received'] }).length, 0);
 
   const invalid = fixture('identity-refused');
   invalid.ctx.workflowSlug = 'invalid workflow slug';
@@ -536,4 +648,160 @@ test('structured call source contains no direct Composio dispatch or synthetic i
   assert.ok(start >= 0 && end > start);
   const lane = source.slice(start, end);
   assert.doesNotMatch(lane, /dispatchComposioTool|ensureWorkflowCallIdentity|withHarnessRunContext|executeWorkflowCallMutation/);
+});
+
+// ─── Bare-call convergence (2026-08-26) ────────────────────────────────
+// ff05c19a restored bare-call dispatch through the gated composio gateway,
+// but that gateway lane minted its own identity by appending a FABRICATED
+// user_input_received event purely to satisfy the settlement spine — two
+// execution kernels for one concept. These pins prove the replacement: a
+// bare call compiles its own invocation plan from the live catalog at
+// execution (compileWorkflowBareCallInvocationPlan — the same live-catalog-
+// resolution precedent space-read-authority.ts already uses for workspace
+// reads) and then rides the identical executeExactWorkflowV3CallNode path a
+// plan-carrying step has always used. No chat turn is minted for this lane.
+
+test('BARE CALL CONVERGENCE — the owner\'s shape (autonomous bare write) compiles at execution, dispatches through the one v3 kernel, and mints no synthetic user turn', async () => {
+  const installed = bareFixture('bare-owner-write', 'external_write');
+  const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
+
+  const result = await runner.executeStep(installed.step, installed.ctx);
+  assert.deepEqual(result, { data: { id: 'bare-owner-write' } });
+  assert.equal(installed.bodies(), 1);
+
+  // No fabricated chat turn — this is the fix's whole point. The old
+  // ensureWorkflowCallIdentity appended a synthetic user_input_received
+  // ("Workflow step X: execute SLUG") to satisfy the settlement spine; the
+  // converged kernel needs no chat turn at all.
+  assert.equal(eventlog.listEvents(sessionId, { types: ['user_input_received'] }).length, 0);
+
+  // Real lineage instead: the same durable activation row a plan-carrying
+  // call produces (see the 'production structured host-safe call' pin above).
+  const db = eventlog.openEventLog();
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS n FROM workflow_node_invocation_activations WHERE session_id = ?
+  `).get(sessionId) as { n: number }).n, 1);
+
+  // The autonomous grant is real and auditable: a genuinely resolved
+  // pending_approvals row — armWorkflowV3CallAuthority only ever consumes
+  // one of these (consumeOneShotActivationAuthorizationInTransaction) — and
+  // it is resolved by the runtime under a named, disclosed policy, never a
+  // human decision fabricated on their behalf. This preserves the restored
+  // lane's own "autonomous by default unless requiresApproval" policy
+  // instead of newly demanding a human approval the owner's live scheduled
+  // write never needed.
+  const grants = approvals.listPending({ sessionId, status: 'any' });
+  assert.equal(grants.length, 1);
+  assert.equal(grants[0].resolution, 'approved');
+  assert.equal(grants[0].resolver, 'system:workflow-autonomous_default_mutation');
+  assert.ok(grants[0].consumedAt);
+
+  // Replays without a second body, exactly like a plan-carrying call.
+  const replay = await runner.executeStep(installed.step, installed.ctx);
+  assert.deepEqual(replay, result);
+  assert.equal(installed.bodies(), 1, 'settled exact result replays without a second body');
+});
+
+test('BARE CALL CONVERGENCE — a bare read compiles and executes through the shared kernel with zero consent friction', async () => {
+  const installed = bareFixture('bare-read', 'read');
+  const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
+  const result = await runner.executeStep(installed.step, installed.ctx);
+  assert.deepEqual(result, { data: { id: 'bare-read' } });
+  assert.equal(installed.bodies(), 1);
+  assert.equal(eventlog.listEvents(sessionId, { types: ['user_input_received'] }).length, 0);
+  assert.equal(approvals.listPending({ sessionId, status: 'any' }).length, 0, 'a read needs no consent grant, autonomous or otherwise');
+});
+
+test('BARE CALL CONVERGENCE — a bare call requiring approval is gated once by the runner\'s existing declarative gate, then dispatches with no second v3 prompt', async () => {
+  // requiresApproval on a bare call is gated BEFORE executeWorkflowCallNode
+  // is ever reached, by executeStep's own pre-existing declarative gate
+  // (shouldUseDeclarativeStepApproval / awaitDeclarativeStepApproval) —
+  // unchanged by this convergence. Asking the v3 kernel's own consent
+  // primitive a SECOND time for the same step would be a redundant double
+  // approval, so resolveWorkflowBareCallV3Consent mints the kernel's grant
+  // itself once the declarative gate has already resolved, naming that gate
+  // as the policy — it never re-invokes awaitExactWorkflowV3Authorization.
+  const installed = bareFixture('bare-requires-approval', 'external_write', { requiresApproval: true });
+  const gateSessionId = `workflow-gate:${installed.ctx.runId}:${installed.step.id}`;
+  const v3SessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
+  let parked: unknown;
+  try {
+    await runner.executeStep(installed.step, installed.ctx);
+  } catch (error) {
+    parked = error;
+  }
+  assert.ok(parked instanceof runner.ParkRunSignal, String(parked));
+  const gateRows = approvals.listPending({ sessionId: gateSessionId, status: 'pending' });
+  assert.equal(gateRows.length, 1);
+  assert.equal(gateRows[0].tool, 'workflow_approval_gate');
+  assert.equal(installed.bodies(), 0, 'no body runs while the declarative gate is pending');
+  assert.equal(approvals.listPending({ sessionId: v3SessionId, status: 'any' }).length, 0, 'no v3 grant exists yet — the declarative gate has not resolved');
+
+  const resolved = approvals.resolve(gateRows[0].approvalId, 'approved', 'runner-v3-integration-test');
+  assert.equal(resolved.ok, true, JSON.stringify(resolved));
+  const result = await runner.executeStep(installed.step, installed.ctx);
+  assert.deepEqual(result, { data: { id: 'bare-requires-approval' } });
+  assert.equal(installed.bodies(), 1);
+
+  // Exactly one v3 grant exists, minted (not asked) after the declarative
+  // gate resolved — never a second human-facing prompt.
+  const v3Grants = approvals.listPending({ sessionId: v3SessionId, status: 'any' });
+  assert.equal(v3Grants.length, 1);
+  assert.equal(v3Grants[0].resolution, 'approved');
+  assert.equal(v3Grants[0].resolver, 'system:workflow-declarative_gate_approved');
+  assert.ok(v3Grants[0].consumedAt);
+});
+
+test('BARE CALL CONVERGENCE — an operation absent from the live catalog refuses by name and never dispatches', async () => {
+  catalog.installHostCapabilityCatalogFactory(catalog.createHostCapabilityCatalogFactory([]));
+  const step: WorkflowStepInput = {
+    id: 'step.unregistered',
+    prompt: '',
+    sideEffect: 'write',
+    call: { tool: 'OPERATION_NEVER_REGISTERED', args: {} },
+  };
+  const workflow: WorkflowDefinition = {
+    name: 'workflow.unregistered-bare-call',
+    description: '',
+    enabled: false,
+    trigger: { manual: true },
+    inputs: {},
+    steps: [step],
+  };
+  const ctx = {
+    workflow,
+    workflowSlug: workflow.name,
+    runId: 'run.unregistered',
+    inputs: {},
+    stepOutputs: {},
+    assistant: new Proxy({}, { get: () => { throw new Error('model/raw fallback was consulted'); } }),
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof runner.executeStep>[1];
+  await assert.rejects(
+    runner.executeStep(step, ctx),
+    (error: unknown) => error instanceof runner.WorkflowCapabilityBlockedError
+      && error.reason === 'not-connected'
+      && error.tool === 'OPERATION_NEVER_REGISTERED'
+      && /OPERATION_NEVER_REGISTERED/.test(error.message),
+  );
+});
+
+test('BARE CALL CONVERGENCE — an operation ambiguous in the live catalog refuses by name and never dispatches', async () => {
+  const installed = bareFixture('bare-ambiguous', 'external_write');
+  const primary = catalog.peekHostCapabilityCatalogFactory()!.snapshot()[0]!;
+  const duplicate: catalog.RegisteredHostCapability = {
+    ...primary,
+    capabilityId: `${primary.capabilityId}.duplicate`,
+    account: 'account.bare-ambiguous.duplicate',
+  };
+  catalog.installHostCapabilityCatalogFactory(catalog.createHostCapabilityCatalogFactory([primary, duplicate]));
+  await assert.rejects(
+    runner.executeStep(installed.step, installed.ctx),
+    (error: unknown) => error instanceof runner.WorkflowCapabilityBlockedError
+      && error.reason === 'ambiguous-account'
+      && /operation\.bare-ambiguous/.test(error.message),
+  );
+  assert.equal(installed.bodies(), 0);
 });

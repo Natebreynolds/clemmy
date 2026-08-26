@@ -582,6 +582,46 @@ test('deterministic config without runner → warning', () => {
   );
 });
 
+// Regression pin (2026-08-26): 60db67d8 refused a declared deterministic.runner
+// / loopUntil.probe.runner outright ("raw workflow subprocess execution is
+// retired until this executor compiles to shared exact authority"), breaking
+// 5 of the owner's live workflows at authoring time. Restored: it is a fixed,
+// author-declared script under the workflow's own scripts/ directory (see
+// checkDeterministicRunner above and its shape checks), not a live model
+// choosing arguments at runtime — that is a fully supported, dispatchable lane.
+test('deterministic.runner and loopUntil.probe.runner validate — a fixed author-declared script, not a retired lane', () => {
+  const deterministic = validateWorkflowDefinition({
+    name: 'owner-deterministic-shape',
+    description: 'Run the local helper.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'run_script',
+      prompt: '',
+      sideEffect: 'read',
+      deterministic: { runner: 'run.mjs' },
+    }],
+  });
+  assert.equal(deterministic.ok, true, deterministic.errors.join('\n'));
+
+  const loopProbe = validateWorkflowDefinition({
+    name: 'owner-loop-probe-shape',
+    description: 'Poll the current job state.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'poll',
+      prompt: 'Read the current job state.',
+      sideEffect: 'read',
+      loopUntil: {
+        probe: { runner: 'probe.mjs' },
+        until: { type: 'object', required_keys: ['done'] },
+      },
+    }],
+  });
+  assert.equal(loopProbe.ok, true, loopProbe.errors.join('\n'));
+});
+
 test('tool slug catalog check — unknown slug → warning', () => {
   const knownToolNames = new Set(['notify_user', 'run_shell_command', 'memory_remember']);
   const result = validateWorkflowDefinition({
