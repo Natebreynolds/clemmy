@@ -762,6 +762,138 @@ test('fresh chat selects production host_v1, bypasses the SDK loop, and closes o
   }
 });
 
+// ASK marker terminal misfiling (live 2026-08-23, session
+// sess-mob-00dbfe2e9d6854e2753246a37bedc0ef): the host turn runner reports a
+// plain reply as RunTurnStatus 'completed' no matter what the model wrote, so
+// hostActivationConversationResult used to treat an "ASK: <question>" reply
+// as a finished answer instead of parsing the model's own marker contract
+// (ORCHESTRATOR_DECISION_CONTRACT, clem-rubric.ts). The three tests below pin
+// the fix: an ASK: marker pauses for the user, a no-marker reply still
+// completes, and a CONTINUE: marker still means continue, never ask.
+test('a plain-text ASK: marker under the host engine pauses for the user instead of shipping as a finished answer', async () => {
+  const previous = process.env.CLEMMY_TURN_ENGINE;
+  process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+  try {
+    const session = eventlog.createSession({ id: `host-v1-ask-marker-${++acceptedSerial}`, kind: 'chat' });
+    const askText = 'I found your "platform-49-slack-channel-review" workflow. Do you want me to kick it off now?';
+    const model = stubModel([[textMsg(`ASK: ${askText}`)]]);
+    const outcome = await runConversation({
+      sessionId: session.id,
+      input: 'hello from a fresh chat',
+      turnEngine: 'host_v1',
+      maxSteps: 1,
+      judgeCompletion: false,
+      buildAgent: async () => ({ model, instructions: 'base system', tools: [] } as never),
+      makeRunner: () => {
+        const runner = new EventEmitter();
+        (runner as unknown as { run: () => never }).run = () => {
+          throw new Error('legacy Runner.run must be unreachable');
+        };
+        return runner as never;
+      },
+      maxTurns: 3,
+    });
+    assert.equal(
+      outcome.status,
+      'awaiting_user_input',
+      'an explicit ASK: marker must pause for the user, never ship as a finished answer',
+    );
+    assert.equal(outcome.publicPresentation?.status, 'needs_input');
+    assert.equal(outcome.publicPresentation?.kind, 'question');
+    assert.equal(
+      outcome.publicPresentation?.text,
+      askText,
+      'the "ASK: " prefix must be stripped from the delivered question',
+    );
+    const terminals = eventlog.listEvents(session.id, { types: ['conversation_completed'] });
+    assert.equal(terminals.length, 1);
+    const data = terminals[0]!.data as {
+      presentation?: { status?: string; kind?: string; text?: string; needs?: unknown };
+      awaitingUser?: boolean;
+    };
+    assert.equal(data.presentation?.status, 'needs_input');
+    assert.equal(data.presentation?.kind, 'question');
+    assert.ok(!String(data.presentation?.text ?? '').startsWith('ASK'));
+    assert.deepEqual(data.presentation?.needs, { kind: 'input' });
+    assert.equal(data.awaitingUser, true);
+    // The raw awaiting_user_input event must exist too — clarification
+    // continuity (task-continuity-runtime.ts) and event-stream surfaces
+    // (Discord, desktop SSE) read that event, not just the terminal text.
+    const asks = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
+    assert.equal(asks.length, 1);
+    assert.equal(asks[0]?.data.question, askText);
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_TURN_ENGINE;
+    else process.env.CLEMMY_TURN_ENGINE = previous;
+  }
+});
+
+test('a plain no-marker reply under the host engine still terminates as a completed answer', async () => {
+  const previous = process.env.CLEMMY_TURN_ENGINE;
+  process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+  try {
+    const session = eventlog.createSession({ id: `host-v1-no-marker-${++acceptedSerial}`, kind: 'chat' });
+    const replyText = 'The meeting is scheduled for 3pm tomorrow in the downtown office.';
+    const model = stubModel([[textMsg(replyText)]]);
+    const outcome = await runConversation({
+      sessionId: session.id,
+      input: 'hello from a fresh chat',
+      turnEngine: 'host_v1',
+      maxSteps: 1,
+      judgeCompletion: false,
+      buildAgent: async () => ({ model, instructions: 'base system', tools: [] } as never),
+      makeRunner: () => {
+        const runner = new EventEmitter();
+        (runner as unknown as { run: () => never }).run = () => {
+          throw new Error('legacy Runner.run must be unreachable');
+        };
+        return runner as never;
+      },
+      maxTurns: 3,
+    });
+    assert.equal(outcome.status, 'completed', 'fail-open: a no-marker reply is still a completed answer');
+    assert.equal(outcome.publicPresentation?.status, 'done');
+    assert.equal(outcome.publicPresentation?.kind, 'answer');
+    assert.equal(outcome.publicPresentation?.text, replyText);
+    assert.equal(eventlog.listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0);
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_TURN_ENGINE;
+    else process.env.CLEMMY_TURN_ENGINE = previous;
+  }
+});
+
+test('a CONTINUE: marker under the host engine still means continue, never ask', async () => {
+  const previous = process.env.CLEMMY_TURN_ENGINE;
+  process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+  try {
+    const session = eventlog.createSession({ id: `host-v1-continue-marker-${++acceptedSerial}`, kind: 'chat' });
+    const model = stubModel([[textMsg('CONTINUE: still checking the calendar for conflicts')]]);
+    const outcome = await runConversation({
+      sessionId: session.id,
+      input: 'hello from a fresh chat',
+      turnEngine: 'host_v1',
+      maxSteps: 1,
+      judgeCompletion: false,
+      buildAgent: async () => ({ model, instructions: 'base system', tools: [] } as never),
+      makeRunner: () => {
+        const runner = new EventEmitter();
+        (runner as unknown as { run: () => never }).run = () => {
+          throw new Error('legacy Runner.run must be unreachable');
+        };
+        return runner as never;
+      },
+      maxTurns: 3,
+    });
+    assert.notEqual(outcome.status, 'awaiting_user_input', 'CONTINUE: must never be treated as an ask');
+    assert.equal(eventlog.listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0);
+    const text = outcome.publicPresentation?.text ?? '';
+    assert.ok(!/^CONTINUE/i.test(text), `the "CONTINUE: " prefix must never leak verbatim: ${JSON.stringify(text)}`);
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_TURN_ENGINE;
+    else process.env.CLEMMY_TURN_ENGINE = previous;
+  }
+});
+
 test('fresh host chat enters the host loop before semantic graphs and commits one exact terminal', async () => {
   const previous = process.env.CLEMMY_TURN_ENGINE;
   process.env.CLEMMY_TURN_ENGINE = 'host_v1_read_only';

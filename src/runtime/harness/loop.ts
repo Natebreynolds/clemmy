@@ -2886,7 +2886,10 @@ export interface RunConversationResult {
  * Project that one activation into the shared conversation terminal algebra;
  * never feed it through the legacy outer continuation/judge loop.
  */
-function hostActivationConversationResult(turnResult: RunTurnResult): RunConversationResult {
+function hostActivationConversationResult(
+  turnResult: RunTurnResult,
+  sourceUserSeq?: number,
+): RunConversationResult {
   if (turnResult.status === 'held') {
     return {
       sessionId: turnResult.sessionId,
@@ -2900,6 +2903,63 @@ function hostActivationConversationResult(turnResult: RunTurnResult): RunConvers
       },
     };
   }
+  // The host turn runner executes every tool call itself and reports an
+  // ordinary reply as RunTurnStatus 'completed' no matter what the model
+  // actually wrote — the runner is text-agnostic by design and can never
+  // itself return 'awaiting_user_input' (see the module doc in
+  // host-turn-runner.ts). The model's own ASK:/CONTINUE: marker contract
+  // (ORCHESTRATOR_DECISION_CONTRACT, clem-rubric.ts) therefore lives entirely
+  // in the TEXT, so a 'completed' status must still be parsed through the
+  // SAME marker parser the legacy auto-continuation loop uses below
+  // (toOrchestratorDecision) before the turn is treated as a finished answer.
+  // Without this, an "ASK: <question>" reply shipped verbatim as a done/
+  // answer terminal with needs=null — a question filed as a finished answer
+  // with no pending-question state (live 2026-08-23, session
+  // sess-mob-00dbfe2e9d6854e2753246a37bedc0ef).
+  const decision = turnResult.status === 'completed'
+    ? toOrchestratorDecision(turnResult.finalOutput)
+    : null;
+  if (decision && (decision.nextAction === 'awaiting_user_input' || decision.nextAction === 'awaiting_approval')) {
+    if (decision.nextAction === 'awaiting_user_input') {
+      // Mirror the legacy loop's own synthesis for the identical shape
+      // (the `decision.nextAction === 'awaiting_user_input'` branch further
+      // down in this file): a marker-only ask with no tool call writes no
+      // awaiting_user_input event on its own, which stranded event-stream
+      // surfaces and clarification continuity (task-continuity-runtime.ts)
+      // alike — both read the raw event, not just the terminal text.
+      const askedThisTurn = (() => {
+        try {
+          return listEvents(turnResult.sessionId, { types: ['awaiting_user_input'] })
+            .some((event) => event.turn === turnResult.turn);
+        } catch { return false; }
+      })();
+      if (!askedThisTurn) {
+        const question = decision.reply?.trim()
+          ? decision.reply
+          : decision.summary ?? 'Could you clarify how you\'d like me to proceed?';
+        safeAppend({
+          sessionId: turnResult.sessionId,
+          turn: turnResult.turn,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: {
+            question,
+            source: 'decision_awaiting',
+            ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+              ? { sourceUserSeq }
+              : {}),
+          },
+        });
+      }
+    }
+    return {
+      sessionId: turnResult.sessionId,
+      status: decision.nextAction,
+      steps: 1,
+      lastTurn: turnResult.turn,
+      lastDecision: decision,
+    };
+  }
   const authoredText = publicReplyText(turnResult.finalOutput, '');
   const nextAction = turnResult.status === 'awaiting_approval'
     ? 'awaiting_approval' as const
@@ -2908,7 +2968,12 @@ function hostActivationConversationResult(turnResult: RunTurnResult): RunConvers
       : turnResult.status === 'completed'
         ? 'completed' as const
         : 'abandoned' as const;
-  const lastDecision = authoredText
+  // A parsed CONTINUE:/no-marker/legacy-envelope decision wins over the
+  // hand-rolled shape below so its text is the marker-stripped one the
+  // parser already produced; `decision` is null only for the punt/empty
+  // shapes parseDecisionText deliberately refuses to parse, which keep
+  // today's exact fallback.
+  const lastDecision = decision ?? (authoredText
     ? {
         summary: authoredText,
         reply: authoredText,
@@ -2916,7 +2981,7 @@ function hostActivationConversationResult(turnResult: RunTurnResult): RunConvers
         nextAction,
         reason: turnResult.status === 'completed' ? null : turnResult.error ?? null,
       }
-    : undefined;
+    : undefined);
   return {
     sessionId: turnResult.sessionId,
     status: turnResult.status,
@@ -4760,7 +4825,7 @@ export async function runConversation(
         ...(contextWarmedAtNode ? { contextWarmedAtNode: true } : {}),
         ...(hostPlainConversation ? { skipAutomaticMemoryPrimer: true as const } : {}),
       });
-      const result = hostActivationConversationResult(turnResult);
+      const result = hostActivationConversationResult(turnResult, sourceUserSeq);
       if (result.status === 'held') return result;
       const zeroToolTurnAuthority = hostPlainZeroToolTurnAuthority({
         hostPlainConversation,
