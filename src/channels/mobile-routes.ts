@@ -1038,7 +1038,13 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
     const ticket = typeof req.query.ticket === 'string' ? req.query.ticket : '';
     if (ticket) {
-      return consumeStreamTicket(ticket, record.deviceId, req.path)
+      // Same trap as the proof leg documents below: req.path is
+      // router-relative ('/api/…') while tickets are minted for the full
+      // client path ('/m/api/…' — the mint route validates that prefix), so
+      // comparing req.path made every SSE attach 401 (live 2026-08-26: an
+      // ask-Clem space chat burned a 401 every few seconds for two minutes).
+      // Consume over the path the client actually requested.
+      return consumeStreamTicket(ticket, record.deviceId, req.originalUrl.split('?')[0] ?? req.path)
         ? { ok: true }
         : { ok: false, reason: 'BAD_TICKET' };
     }

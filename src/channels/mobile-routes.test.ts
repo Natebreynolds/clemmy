@@ -861,6 +861,43 @@ test('a key-bound session requires a valid device proof on every request', async
   } finally { await h.close(); }
 });
 
+test('a stream ticket minted for the full client path attaches the stream once', async () => {
+  // Tickets are minted for the client's '/m/api/…' path but were consumed
+  // against the router-relative req.path — never equal, so EVERY SSE attach
+  // 401'd (live 2026-08-26: an ask-Clem space chat burned 401s for two
+  // minutes). Pin the whole mint→attach round trip, plus single-use.
+  const h = await startHarness();
+  try {
+    const fixture = await pairedDeviceAfterRotation(h);
+    const streamPath = '/m/api/chat/sessions/space-pin-check/stream';
+    const mintProof = await deviceProof(fixture.pair, 'POST', '/m/auth/stream-ticket', fixture.currentFingerprint);
+    const minted = await fetch(`${h.url}/m/auth/stream-ticket`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie: fixture.currentCookie,
+        'x-clem-device-proof': mintProof,
+      },
+      body: JSON.stringify({ path: streamPath }),
+    });
+    assert.equal(minted.status, 200, 'ticket mint must succeed for a /m/api stream path');
+    const { ticket } = await minted.json() as { ticket: string };
+    assert.ok(ticket);
+
+    const attach = await fetch(`${h.url}${streamPath}?ticket=${encodeURIComponent(ticket)}`, {
+      headers: { cookie: fixture.currentCookie, accept: 'text/event-stream' },
+    });
+    assert.notEqual(attach.status, 401, 'a fresh ticket over its own path must never 401');
+    await attach.body?.cancel();
+
+    const replay = await fetch(`${h.url}${streamPath}?ticket=${encodeURIComponent(ticket)}`, {
+      headers: { cookie: fixture.currentCookie, accept: 'text/event-stream' },
+    });
+    assert.equal(replay.status, 401, 'a spent ticket must be refused');
+    await replay.body?.cancel();
+  } finally { await h.close(); }
+});
+
 test('parallel pre-rotation proofs follow a post-rotation cookie within the bounded grace', async () => {
   const h = await startHarness();
   try {
