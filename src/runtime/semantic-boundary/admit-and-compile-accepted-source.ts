@@ -1455,7 +1455,8 @@ export async function prepareDurableAcceptedTurnCompile(
     const canonicalCapabilities: HostCapabilityDescriptorV1[] = [];
     for (const descriptor of catalog.capabilities) {
       const staged = catalog.stagedById.get(descriptor.id);
-      if (staged && !selectedPrimaryCapabilityRefs.has(descriptor.id)) continue;
+      const isSelected = selectedPrimaryCapabilityRefs.has(descriptor.id);
+      if (staged && !isSelected) continue;
       if (staged?.providerKind === AUTHORIZED_LOCAL_REGISTRY_PROVENANCE) {
         if (!staged.localDefinition) {
           return { ok: false, reason: 'selected local capability lost its sealed planning definition' };
@@ -1473,9 +1474,26 @@ export async function prepareDurableAcceptedTurnCompile(
         continue;
       }
       const current = currentById.get(descriptor.id);
-      if (!current) return { ok: false, reason: 'primary model planning catalog no longer matches the frozen host catalog' };
+      if (!current) {
+        // An un-staged descriptor is an "initial" entry the prime-time planning
+        // card ranked in from whatever was live in the shared, process-wide
+        // catalog factory — not something this turn's own tool_search disclosed
+        // or this proposal cited. A same-turn capability registration can
+        // collaterally age other live entries out of the factory (live
+        // 2026-08-26 gauntlet: registering the selected write triggered a
+        // readiness recompute that forgot three unrelated, unselected Google
+        // Sheets entries whose independent observation had gone stale, and
+        // every plan_task attempt then refused "no longer matches the frozen
+        // host catalog" even though the disclosed, selected write was fine).
+        // Drop it from the canonical re-derivation exactly like an unselected
+        // STAGED descriptor already is above; only a SELECTED capability going
+        // missing is this proposal's problem.
+        if (!isSelected) continue;
+        return { ok: false, reason: 'primary model planning catalog no longer matches the frozen host catalog' };
+      }
       if (!staged) {
         if (JSON.stringify(current) !== JSON.stringify(descriptor)) {
+          if (!isSelected) continue;
           return { ok: false, reason: 'primary model planning catalog no longer matches the frozen host catalog' };
         }
         canonicalCapabilities.push(current);
