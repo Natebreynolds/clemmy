@@ -15,6 +15,7 @@ import {
 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
 import { requireAcceptedTaskAuthority } from '../runtime/harness/accepted-task-authority.js';
 import { freezePrimaryModelExpectedWorkContract } from '../runtime/harness/expected-work-contract.js';
+import { hostDurableConversationPreambleDelivery } from '../runtime/harness/durable-conversation-preamble.js';
 import { actionExpectedWorkRequired } from '../runtime/harness/expected-work-admission.js';
 import {
   appendConversationPreambleOnce,
@@ -416,11 +417,13 @@ async function executePlanTask(
     || logical.acceptedTaskId !== authority.acceptedTaskId
     || logical.logicalToolCallId !== logical.logicalToolCallId.trim()
   ) throw new Error('plan_task lost its exact logical-call identity before preamble delivery');
-  if (!context.onConversationPreamble) {
-    throw new Error('plan_task requires an awaited conversational preamble delivery port');
-  }
+  // A carrier that paints its own live message supplies a port; one that
+  // renders the conversation from the durable log has already been delivered
+  // to by the append above. Both are deliveries — only one needs a transport.
+  const deliverPreamble = context.onConversationPreamble
+    ?? hostDurableConversationPreambleDelivery();
   const deliveryRequest = conversationPreambleDeliveryRequest(persisted.event);
-  const delivered = await context.onConversationPreamble(deliveryRequest);
+  const delivered = await deliverPreamble(deliveryRequest);
   if (delivered.status === 'failed') {
     throw new Error(`conversation preamble ${delivered.reason}`);
   }
