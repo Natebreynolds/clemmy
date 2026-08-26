@@ -94,6 +94,13 @@ export interface DiscoveryClaim extends DiscoveryTaskKey {
   outcomeDetail: string | null;
   admittedAt: string;
   settledAt: string | null;
+  /** True once this exact (epoch, category, subject) slot has already been
+   *  handed to a fresh physical call after a TIMED_OUT settlement. A CAS flag
+   *  on the row, not a counter in memory: it flips at most once, atomically
+   *  with the transfer UPDATE, so a second consecutive timeout on the same
+   *  subject cannot keep retrying forever — it must earn a new epoch through
+   *  host-observed evidence instead. */
+  timeoutContinuationUsed: boolean;
 }
 
 export interface DiscoveryTaskState {
@@ -139,17 +146,16 @@ export type DiscoveryAdmissionReason =
    *  to learn. It is a continuation read, not a new physical discovery —
    *  denying the succeeded case starved the exact disclosure plan admission
    *  demands (2026-08-26 gauntlet: 147 denials, 1 epoch reopen, 0 external
-   *  effects). The turn-wide admission ceiling remains the runaway bound. */
+   *  effects). The turn-wide admission ceiling remains the runaway bound.
+   *  A TIMED_OUT reclaim is further CAS-bound to ONE per (epoch, category,
+   *  subject): `timeout_continuation_used` flips exactly once, atomically
+   *  with the transfer. A subject that keeps timing out on its own retry is
+   *  not a candidate elapsed time can vouch for being finished with — it must
+   *  earn a new epoch through host-observed evidence like any other
+   *  unsuccessful outcome. A SUCCEEDED claim carries no such cap: pagination
+   *  of an already-answered intent is unbounded by design (the 2026-08-26
+   *  gauntlet fix this pin protects). */
   | 'settled_continuation_admitted'
-  /** The subject's claim never settled at all — no outcome, ever — and has
-   *  sat pending far past any discovery-classified surface's longest
-   *  configured timeout. It is provably not in flight any more; some other
-   *  lane's own deadline concluded the physical attempt (the model already
-   *  received a retry-authorizing refusal for it) without ever calling this
-   *  governor's settle() to say so (same live incident as above — the stuck
-   *  claim never settled at all). Treated exactly like a settled TIMED_OUT
-   *  claim: a fresh physical call may take it over. */
-  | 'stale_pending_claim_reclaimed'
   /** The caller named no role, an unknown one, or an already-resolved one. The
    *  search is admitted against a HOST-OWNED subject and the caller is told. */
   | 'role_coerced'
@@ -224,7 +230,6 @@ export interface DiscoveryAdmittedDecision extends DiscoveryDecisionBase {
     | 'schema_refresh_admitted'
     | 'new_evidence_admitted'
     | 'settled_continuation_admitted'
-    | 'stale_pending_claim_reclaimed'
     | 'role_coerced';
 }
 
@@ -338,26 +343,6 @@ export type DiscoveryEvidenceOutcome =
  */
 export const MAX_DISCOVERY_EPOCHS = 4;
 
-/**
- * How long a still-PENDING claim may sit before admission stops protecting it
- * and treats it as concluded.
- *
- * A pending claim exists to stop a genuinely concurrent physical call from
- * racing the one already in flight — but this governor has no visibility into
- * every lane's own settlement path, and a claim whose settlement never
- * arrives would otherwise hold its subject's slot forever. Live 2026-08-26,
- * sess-desktop-970d457a6554134620236989 source 85009: a host-owned deadline
- * settled the tool ATTEMPT (the model got a retry-authorizing refusal) without
- * ever calling this governor's settle() for the claim it opened — that one
- * orphaned `pending` row then denied 55 later tool_search calls for the rest
- * of the turn. Every discovery-classified surface is a metadata lookup, not a
- * long-running job; the longest configured timeout any of them can reach is
- * five minutes (the externalApi bucket, for composio_search_tools /
- * composio_list_tools). This sits comfortably above that, so a claim this old
- * is provably no longer in flight, not merely slow.
- */
-export const STALE_PENDING_CLAIM_MS = 6 * 60_000;
-
 /** A complex accepted request may expose many clauses, but foreground broad
  * discovery remains a small control surface. Each admitted claim is still
  * keyed by one exact frozen role; this ceiling prevents an oversized role
@@ -468,6 +453,7 @@ interface RawClaimRow {
   outcome_detail: string | null;
   admitted_at: string;
   settled_at: string | null;
+  timeout_continuation_used: number;
 }
 
 type DatabaseProvider = () => Database.Database;
@@ -510,6 +496,8 @@ function migrateClaimKey(db: Database.Database): void {
       outcome_detail   TEXT,
       admitted_at      TEXT NOT NULL,
       settled_at       TEXT,
+      timeout_continuation_used INTEGER NOT NULL DEFAULT 0
+                       CHECK (timeout_continuation_used IN (0, 1)),
       PRIMARY KEY (session_id, source_user_seq, epoch, category, subject),
       FOREIGN KEY (session_id, source_user_seq)
         REFERENCES discovery_governor_tasks(session_id, source_user_seq)
@@ -553,6 +541,8 @@ function ensureSchema(db: Database.Database): void {
       outcome_detail   TEXT,
       admitted_at      TEXT NOT NULL,
       settled_at       TEXT,
+      timeout_continuation_used INTEGER NOT NULL DEFAULT 0
+                       CHECK (timeout_continuation_used IN (0, 1)),
       PRIMARY KEY (session_id, source_user_seq, epoch, category, subject),
       FOREIGN KEY (session_id, source_user_seq)
         REFERENCES discovery_governor_tasks(session_id, source_user_seq)
@@ -566,6 +556,12 @@ function ensureSchema(db: Database.Database): void {
     `);
   }
   migrateClaimKey(db);
+  if (!tableColumns(db, 'discovery_governor_claims').has('timeout_continuation_used')) {
+    db.exec(`
+      ALTER TABLE discovery_governor_claims
+        ADD COLUMN timeout_continuation_used INTEGER NOT NULL DEFAULT 0
+    `);
+  }
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_discovery_governor_claims_call
       ON discovery_governor_claims(session_id, source_user_seq, call_id);
@@ -735,6 +731,7 @@ function rowToClaim(row: RawClaimRow): DiscoveryClaim {
     outcomeDetail: row.outcome_detail,
     admittedAt: row.admitted_at,
     settledAt: row.settled_at,
+    timeoutContinuationUsed: row.timeout_continuation_used === 1,
   };
 }
 
@@ -1300,37 +1297,51 @@ export class DiscoveryGovernor {
         // no such cached path, so even the same id is denied here rather than
         // re-entering provider code.
         //
-        // TWO exceptions, per the constraint-ordering law (never demand
+        // ONE exception, per the constraint-ordering law (never demand
         // evidence while denying the read that produces it):
         //
-        //  1. The claim SETTLED SUCCESSFUL or TIMED OUT. There is no
-        //     in-flight settlement left to protect, and a new physical call on
-        //     the same subject is either a follow-up/pagination/refinement of
-        //     an already-answered intent, or the exact retry a timeout's own
-        //     recovery directive already sanctions (see `settled_continuation_
-        //     admitted` above). `empty`/`failed` still recover only through
-        //     the host-observed evidence epoch.
-        //  2. The claim never settled AT ALL and has sat pending past
-        //     STALE_PENDING_CLAIM_MS. It is provably not in flight any more —
-        //     treated exactly like a settled TIMED_OUT claim (see
-        //     `stale_pending_claim_reclaimed` above).
+        //   The claim SETTLED SUCCESSFUL or TIMED OUT. There is no in-flight
+        //   settlement left to protect, and a new physical call on the same
+        //   subject is either a follow-up/pagination/refinement of an
+        //   already-answered intent, or the exact retry a timeout's own
+        //   recovery directive already sanctions (see `settled_continuation_
+        //   admitted` above). `empty`/`failed` still recover only through the
+        //   host-observed evidence epoch.
+        //
+        // A claim that never settled at all is no longer reclaimed by elapsed
+        // time: elapsed time cannot prove the original provider body actually
+        // stopped (a wall-clock takeover could hand the slot to a second
+        // caller while the first is still in flight — a guess wearing a
+        // timer). Instead, whatever ends the physical call now settles this
+        // exact claim at the moment the body really concludes (see
+        // host-tool-invocation.ts's stop() path, which settles by call id
+        // regardless of which door — deadline, cancellation, or normal
+        // return — closes the call). A claim can therefore only ever be
+        // 'pending' here while its call is genuinely still open.
+        //
+        // A TIMED_OUT reclaim is further CAS-bound to ONE per (epoch,
+        // category, subject): `timeout_continuation_used` flips 0 -> 1
+        // atomically with the transfer below, and a claim that already used
+        // its one grace retry stays denied until real evidence reopens the
+        // epoch — a subject that keeps timing out on retry is not something
+        // more retrying is likely to fix. A SUCCEEDED claim carries no such
+        // cap; its continuations are follow-ups of an answered intent, not
+        // retries of a failure, and are unbounded by design.
         //
         // Either way the claim transfers to the new call (prior outcomes stay
         // durable in the decision/outcome event ledger), it consumes a real
         // admission, and MAX_TURN_DISCOVERY_ADMISSIONS remains the runaway
         // bound.
+        const timedOutRetryAvailable = existing.outcome === 'timed_out'
+          && !existing.timeoutContinuationUsed;
         const retryAuthorizedBySettlement = existing.outcome === 'succeeded'
-          || existing.outcome === 'timed_out';
-        const pendingStale = existing.outcome === 'pending'
-          && Date.now() - Date.parse(existing.admittedAt) > STALE_PENDING_CLAIM_MS;
-        const reclaimReason: 'settled_continuation_admitted' | 'stale_pending_claim_reclaimed' | null =
+          || timedOutRetryAvailable;
+        const reclaimReason: 'settled_continuation_admitted' | null =
           existing.callId === callId
             ? null
             : retryAuthorizedBySettlement
               ? 'settled_continuation_admitted'
-              : pendingStale
-                ? 'stale_pending_claim_reclaimed'
-                : null;
+              : null;
         if (!reclaimReason) {
           return buildDecision({
             key,
@@ -1353,9 +1364,11 @@ export class DiscoveryGovernor {
           UPDATE discovery_governor_claims
              SET call_id = ?, outcome = 'pending', outcome_detail = NULL,
                  admitted_at = ?, settled_at = NULL
+                 ${timedOutRetryAvailable ? ', timeout_continuation_used = 1' : ''}
            WHERE session_id = ? AND source_user_seq = ?
              AND epoch = ? AND category = ? AND subject = ?
              AND call_id = ? AND outcome = ?
+             ${timedOutRetryAvailable ? 'AND timeout_continuation_used = 0' : ''}
         `).run(
           callId, continuationAdmittedAt,
           key.sessionId, key.sourceUserSeq,
@@ -1590,6 +1603,50 @@ export class DiscoveryGovernor {
       };
     });
     return settle.immediate();
+  }
+
+  /**
+   * Settle whatever claim this exact physical call id currently holds,
+   * without requiring the caller to already know its category or subject.
+   *
+   * A host-owned call-ending boundary (host-tool-invocation.ts's stop() path)
+   * ends EVERY call — deadline, cancellation, or normal return — and cannot
+   * know ahead of time whether the call it is ending was ever admitted here
+   * as discovery. call_id is already the claim's durable physical identity
+   * (idx_discovery_governor_claims_call indexes it directly), so a call-id-
+   * only lookup is enough to find and settle it structurally, from the one
+   * place every call is guaranteed to end, instead of relying on whichever
+   * nested wrapper happened to open the claim also being the one that closes
+   * it. A call id that never held a claim — the overwhelming majority of host
+   * tool calls — resolves to `null`: a cheap indexed no-op, never a defect.
+   */
+  settleByCallId(input: {
+    sessionId: string;
+    sourceUserSeq: number;
+    callId: string;
+    outcome: DiscoveryAttemptOutcome;
+    detail?: string;
+  }): DiscoverySettlement | null {
+    const key = taskKey(input);
+    const callId = normalizedCallId(input.callId);
+    const db = this.databaseProvider();
+    ensureSchema(db);
+    const found = db.prepare(`
+      SELECT category, subject FROM discovery_governor_claims
+       WHERE session_id = ? AND source_user_seq = ? AND call_id = ?
+       ORDER BY epoch DESC LIMIT 1
+    `).get(key.sessionId, key.sourceUserSeq, callId) as
+      { category: DiscoveryCategory; subject: string } | undefined;
+    if (!found) return null;
+    return this.settle({
+      sessionId: key.sessionId,
+      sourceUserSeq: key.sourceUserSeq,
+      category: found.category,
+      subject: found.subject,
+      callId,
+      outcome: input.outcome,
+      detail: input.detail,
+    });
   }
 
   getTaskState(input: DiscoveryTaskKey): DiscoveryTaskState | null {

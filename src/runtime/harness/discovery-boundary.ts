@@ -515,8 +515,19 @@ function searchSignals(outcome: DiscoveryAttemptOutcome): AttemptSignals {
   }
 }
 
+/** The minimal facts `reopenEpochAfterUnproductiveSearch` needs. A full
+ *  `DiscoveryBoundaryLease` satisfies this structurally; the host-owned
+ *  call-end settlement below (which never held a lease) builds one directly. */
+interface DiscoveryReopenDescriptor {
+  sessionId: string;
+  sourceUserSeq: number;
+  surface: string;
+  turn?: number;
+  attemptId?: string;
+}
+
 function reopenEpochAfterUnproductiveSearch(
-  lease: DiscoveryBoundaryLease,
+  descriptor: DiscoveryReopenDescriptor,
   outcome: DiscoveryAttemptOutcome,
   detail?: string,
 ): void {
@@ -524,21 +535,21 @@ function reopenEpochAfterUnproductiveSearch(
   if (!attempt.directive.opensDiscoveryEpoch) return;
   try {
     const record = discoveryGovernor.recordEvidence({
-      sessionId: lease.sessionId,
-      sourceUserSeq: lease.sourceUserSeq,
+      sessionId: descriptor.sessionId,
+      sourceUserSeq: descriptor.sourceUserSeq,
       kind: attempt.kind === 'empty_result' ? 'candidate_unavailable' : 'candidate_unsupported',
-      detail: detail ?? `${lease.surface}:${outcome}`,
+      detail: detail ?? `${descriptor.surface}:${outcome}`,
     });
     if (record.outcome !== 'epoch_opened') return;
     appendEvent({
-      sessionId: lease.sessionId,
-      turn: lease.turn ?? 0,
+      sessionId: descriptor.sessionId,
+      turn: descriptor.turn ?? 0,
       role: 'system',
       type: record.telemetry.eventName,
       data: {
         ...record.telemetry.eventData,
-        surface: lease.surface,
-        ...(lease.attemptId ? { attemptId: lease.attemptId } : {}),
+        surface: descriptor.surface,
+        ...(descriptor.attemptId ? { attemptId: descriptor.attemptId } : {}),
       },
     });
   } catch {
@@ -587,5 +598,86 @@ export function settleDiscoveryBoundary(
   } catch {
     // The admission claim is already durable/spent; never replace a provider
     // result with a settlement bookkeeping error.
+  }
+}
+
+/** Synthetic surface tag for a settlement performed by the HOST's own
+ *  call-ending boundary rather than by the tool wrapper that admitted the
+ *  claim. Never a caller-supplied classification — only ever emitted below —
+ *  so it stays visibly distinct from ordinary tool-attributed telemetry. */
+const HOST_OWNED_CALL_END_SURFACE = 'host_owned_call_end';
+
+/**
+ * Settle whatever discovery claim this exact physical call id currently
+ * holds, without requiring the caller to have kept the admitted lease.
+ *
+ * host-tool-invocation.ts's one terminal-owner state machine ends a call —
+ * deadline, cancellation, an unreadable kill authority, or normal return —
+ * WITHOUT necessarily ever running the nested wrapper's own body-completion
+ * settlement: that is the exact seam that orphaned a discovery claim forever
+ * on 2026-08-26 (sess-desktop-970d457a6554134620236989 source 85009). A
+ * host-owned deadline settled the tool ATTEMPT via settleToolAttempt, but the
+ * DiscoveryBoundaryLease admitDiscoveryBoundary had opened moments earlier —
+ * deep inside brackets.ts's own nested closure — was never reachable from
+ * host-tool-invocation.ts's stop(). The claim sat 'pending' forever; every
+ * later tool_search call on the same subject was denied
+ * `new_call_requires_retry_epoch` for the rest of the turn.
+ *
+ * Rather than carry the lease object across that boundary (a second place
+ * that has to remember to forward it, and every future nested carrier has to
+ * remember too), the host settles by call id alone: call_id is already the
+ * claim's durable physical identity
+ * (idx_discovery_governor_claims_call), so this is safe — and cheap — to call
+ * UNCONDITIONALLY every time a host-owned call ends, discovery or not. A call
+ * id that never held a claim (the overwhelming majority of host tool calls)
+ * settles nothing and costs one indexed lookup.
+ */
+export function settleDiscoveryClaimForCallId(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  callId: string;
+  outcome: DiscoveryAttemptOutcome;
+  detail?: string;
+  turn?: number;
+}): void {
+  try {
+    const settlement = discoveryGovernor.settleByCallId({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      callId: input.callId,
+      outcome: input.outcome,
+      detail: input.detail,
+    });
+    if (!settlement) return; // this call id never held a discovery claim
+    try {
+      appendEvent({
+        sessionId: input.sessionId,
+        turn: input.turn ?? 0,
+        role: 'system',
+        type: settlement.telemetry.eventName,
+        data: {
+          ...settlement.telemetry.eventData,
+          surface: HOST_OWNED_CALL_END_SURFACE,
+        },
+      });
+    } catch {
+      // Best-effort trace only.
+    }
+    if (settlement.recorded) {
+      reopenEpochAfterUnproductiveSearch(
+        {
+          sessionId: input.sessionId,
+          sourceUserSeq: input.sourceUserSeq,
+          surface: HOST_OWNED_CALL_END_SURFACE,
+          turn: input.turn,
+        },
+        input.outcome,
+        input.detail,
+      );
+    }
+  } catch {
+    // The host's own call-ending path must never fail because discovery
+    // bookkeeping did; the attempt-level settlement it performs alongside
+    // this is the one that MUST land regardless.
   }
 }

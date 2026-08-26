@@ -30,15 +30,27 @@
  *      directive is "retry the same candidate") admits a new physical call as
  *      a continuation, the same as a settled-successful claim — `empty` and
  *      `failed` are unaffected and still require the evidence-epoch door.
- *   4. A claim that never settled at all and has sat pending past
- *      STALE_PENDING_CLAIM_MS is reclaimed the same way; a claim that is
- *      merely young (the ordinary in-flight case pinned above) is not.
- *   5. A genuine runaway of many DISTINCT physical calls against a claim that
- *      keeps re-settling unsuccessfully still cannot get past the
- *      turn-wide ceiling — reclaim only ever hands the ONE current slot to
- *      ONE new owner at a time.
+ *   5. A genuine runaway of many DISTINCT physical calls/subjects still
+ *      cannot get past the turn-wide ceiling.
+ *
+ * Third regression, same day: a reviewer correctly rejected the original fix
+ * for the never-settled half of the incident above (a claim reclaimed once it
+ * had merely sat PENDING past a fixed wall-clock bound). Elapsed time cannot
+ * prove the original provider body actually stopped — a wall-clock takeover
+ * can hand the slot to a second caller while the first is still genuinely in
+ * flight (a guess wearing a timer, the same family as this codebase's "a
+ * lexical guess is not a proof" rule). The real fix is settlement-driven:
+ * host-tool-invocation.ts's one terminal-owner state machine now settles this
+ * exact claim by call id at the moment ANY path — deadline, cancellation, or
+ * normal return — actually ends the call, so a claim can only be `pending`
+ * here while its call is genuinely open. Contract under pin:
+ *   4. No wall-clock path may reclaim a still-pending claim, ever — the door
+ *      out is settlement, not elapsed time.
+ *   6. A TIMED_OUT reclaim is CAS-bound to ONE per (epoch, category,
+ *      subject): a second consecutive timeout on the same subject must earn
+ *      a new epoch through host-observed evidence, not another free retry.
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -51,7 +63,6 @@ const eventlog = await import('./eventlog.js');
 const {
   DiscoveryGovernor,
   HOST_UNSCOPED_DISCOVERY_SUBJECT,
-  STALE_PENDING_CLAIM_MS,
   MAX_TURN_DISCOVERY_ADMISSIONS,
 } = await import('./discovery-governor.js');
 
@@ -220,13 +231,32 @@ test('a follow-up of a settled-TIMED_OUT search admits as a bounded continuation
   }
 });
 
-// THE LIVE SHAPE, second half: the settlement above never actually happened
-// for the real incident — the claim sat `pending` forever because a
+// THE LIVE SHAPE, second half, CORRECTED: the settlement above never actually
+// happened for the real incident — the claim sat `pending` forever because a
 // host-owned deadline settled the tool ATTEMPT without ever calling this
-// governor's settle(). That is a fact of a lane this governor cannot see
-// inside; the fix is a bounded self-heal, not a dependency on that lane.
-test('a claim that never settled and has gone stale is reclaimed by a new physical call; a young pending claim is not', () => {
-  const key = acceptedTask('stale-pending-reclaim');
+// governor's settle(). The FIRST fix reclaimed a claim once it had merely sat
+// PENDING past a fixed wall-clock bound; a reviewer correctly rejected that —
+// elapsed time cannot prove the original provider body actually stopped, and
+// a wall-clock takeover can hand the slot to a second caller while the first
+// is still genuinely in flight (a guess wearing a timer). The real fix moved
+// upstream: host-tool-invocation.ts's one terminal-owner state machine now
+// settles this exact claim by call id at the moment ANY path — deadline,
+// cancellation, or normal return — actually ends the call (see
+// host-tool-invocation.test.ts for that settlement-driven integration pin).
+// This governor's own admission path must therefore never again authorize a
+// reclaim from elapsed time alone.
+test('a claim whose body is genuinely still in flight is never reclaimable by elapsed time', () => {
+  // DIRECTION, source-structure form: assert the wall-clock branch stays
+  // gone rather than merely unused — a future edit that reintroduces "claim
+  // is old enough, hand it to a new caller" would defeat the exact guarantee
+  // this incident needed.
+  const source = readFileSync(new URL('./discovery-governor.ts', import.meta.url), 'utf8');
+  assert.ok(!/STALE_PENDING_CLAIM_MS/.test(source),
+    'no elapsed-time constant may govern claim reclaim any more');
+  assert.ok(!/Date\.now\(\)\s*-\s*Date\.parse\(\s*existing\.admittedAt\s*\)/.test(source),
+    "no wall-clock comparison against a claim's admission time may authorize a reclaim");
+
+  const key = acceptedTask('pending-never-reclaimed-by-time');
   const governor = new DiscoveryGovernor();
   assert.equal(governor.initializeTask({ ...key, knownCapability: false }).status, 'initialized');
 
@@ -234,19 +264,18 @@ test('a claim that never settled and has gone stale is reclaimed by a new physic
   assert.equal(first.admitted, true, first.reason);
   assert.equal(first.claim?.outcome, 'pending');
 
-  // DIRECTION (pin 2 of the earlier gauntlet, reconfirmed): a claim that is
-  // merely young — the ordinary in-flight case — still protects its one
-  // physical owner. No settlement, no time elapsed.
+  // A young pending claim still protects its one physical owner (unchanged).
   const tooSoon = governor.admit({ ...key, category: 'broad_discovery', callId: 'call-2' });
   assert.equal(tooSoon.admitted, false,
     'a young pending claim must still deny a concurrent second physical call');
   assert.equal(tooSoon.reason, 'new_call_requires_retry_epoch');
 
-  // Backdate the claim's admission past the staleness bound. No lane ever
-  // called settle() for it — this models the orphaned claim exactly as the
-  // live incident produced it, never guessing at another file's timeout.
+  // Backdate the claim's admission far past the OLD (now-deleted) staleness
+  // bound — this models a claim whose body really is still running a slow
+  // provider call, which no elapsed time could ever distinguish from an
+  // orphan. No lane ever called settle() for it.
   const db = eventlog.openEventLog();
-  const backdated = new Date(Date.now() - STALE_PENDING_CLAIM_MS - 1_000).toISOString();
+  const backdated = new Date(Date.now() - 60 * 60_000).toISOString();
   const rewritten = db.prepare(`
     UPDATE discovery_governor_claims
        SET admitted_at = ?
@@ -254,29 +283,79 @@ test('a claim that never settled and has gone stale is reclaimed by a new physic
   `).run(backdated, key.sessionId, key.sourceUserSeq, 'call-1');
   assert.equal(rewritten.changes, 1);
 
-  // THE PIN: past the bound, the orphaned claim no longer starves the turn.
-  const reclaimed = governor.admit({ ...key, category: 'broad_discovery', callId: 'call-2' });
-  assert.equal(reclaimed.admitted, true,
-    `a stale never-settled claim must be reclaimed — got ${reclaimed.reason}`);
-  assert.equal(reclaimed.reason, 'stale_pending_claim_reclaimed');
-  assert.equal(reclaimed.consumedBudget, true);
-  assert.equal(reclaimed.claim?.callId, 'call-2');
-  assert.equal(reclaimed.claim?.outcome, 'pending');
+  // THE PIN: no amount of elapsed time hands this still-pending claim to a
+  // second caller.
+  const stillDenied = governor.admit({ ...key, category: 'broad_discovery', callId: 'call-2' });
+  assert.equal(stillDenied.admitted, false,
+    'elapsed time alone must never authorize a reclaim');
+  assert.equal(stillDenied.reason, 'new_call_requires_retry_epoch');
 
-  // The original callId is no longer this claim's owner: a late settlement
-  // for it (the orphaned lane finally reporting in) is a mismatch, not a
-  // corruption of the reclaimed claim.
-  const lateSettle = governor.settle({
+  // The only real door out is settlement — exactly what the host's own
+  // call-ending boundary now performs the moment the call actually concludes.
+  const settled = governor.settle({
     ...key, category: 'broad_discovery', callId: 'call-1', outcome: 'timed_out',
   });
-  assert.equal(lateSettle.recorded, false);
-  assert.equal(lateSettle.reason, 'claim_call_mismatch');
+  assert.equal(settled.recorded, true, settled.reason);
+  const nowAdmits = governor.admit({ ...key, category: 'broad_discovery', callId: 'call-2' });
+  assert.equal(nowAdmits.admitted, true,
+    `settlement — never elapsed time — must open the door — got ${nowAdmits.reason}`);
+  assert.equal(nowAdmits.reason, 'settled_continuation_admitted');
 });
 
-// DIRECTION: reclaim hands the ONE current slot to ONE new owner at a time —
-// it is not a second budget. A genuine runaway that keeps re-settling
-// unsuccessfully (or timing out) still cannot get past the turn-wide ceiling.
-test('a genuine runaway of distinct physical calls against a repeatedly timed-out claim still hits the turn ceiling', () => {
+// THE REVIEWER'S SECOND ASK: at most one CAS-bound retry per claim, not
+// unlimited continuation. `timeout_continuation_used` flips 0 -> 1 atomically
+// with the transfer UPDATE — a compare-and-swap on the claim row itself, not
+// a counter in memory — so a subject that keeps timing out on its own retry
+// cannot loop forever; it must earn a new epoch through host-observed
+// evidence, same as any other unsuccessful outcome. A SUCCEEDED claim (the
+// gauntlet-fix pagination case above) carries no such cap.
+test('a TIMED_OUT claim gets exactly one CAS-bound continuation; a second consecutive timeout needs the evidence door', () => {
+  const key = acceptedTask('timeout-continuation-cas-bound');
+  const governor = new DiscoveryGovernor();
+  assert.equal(governor.initializeTask({ ...key, knownCapability: false }).status, 'initialized');
+
+  const first = governor.admit({ ...key, category: 'broad_discovery', callId: 'call-1' });
+  assert.equal(first.admitted, true, first.reason);
+  assert.equal(first.claim?.timeoutContinuationUsed, false);
+  const settledFirst = governor.settle({
+    ...key, category: 'broad_discovery', callId: 'call-1', outcome: 'timed_out',
+  });
+  assert.equal(settledFirst.recorded, true, settledFirst.reason);
+
+  // First timeout: the one grace continuation is available and is spent here.
+  const retry1 = governor.admit({ ...key, category: 'broad_discovery', callId: 'call-2' });
+  assert.equal(retry1.admitted, true, retry1.reason);
+  assert.equal(retry1.reason, 'settled_continuation_admitted');
+  assert.equal(retry1.claim?.timeoutContinuationUsed, true,
+    'the CAS flag must flip atomically with the transfer that spent it');
+  const settledSecond = governor.settle({
+    ...key, category: 'broad_discovery', callId: 'call-2', outcome: 'timed_out',
+  });
+  assert.equal(settledSecond.recorded, true, settledSecond.reason);
+
+  // THE PIN: a second CONSECUTIVE timeout on the exact same subject must NOT
+  // get another free continuation — the CAS flag is already spent.
+  const retry2 = governor.admit({ ...key, category: 'broad_discovery', callId: 'call-3' });
+  assert.equal(retry2.admitted, false,
+    `a claim that already used its one timeout continuation must not get a second — got ${retry2.reason}`);
+  assert.equal(retry2.reason, 'new_call_requires_retry_epoch');
+
+  // The evidence door still works exactly as it does for any other
+  // unsuccessful outcome.
+  const evidence = governor.recordEvidence({ ...key, kind: 'candidate_unsupported' });
+  assert.equal(evidence.outcome, 'epoch_opened');
+  const retried = governor.admit({ ...key, category: 'broad_discovery', callId: 'call-3' });
+  assert.equal(retried.admitted, true, retried.reason);
+  assert.equal(retried.reason, 'new_evidence_admitted');
+});
+
+// DIRECTION: the turn-wide ceiling remains the runaway backstop independent
+// of the per-subject CAS bound above. A genuine runaway realistically looks
+// like many DISTINCT subjects (schema refreshes on different tools, or
+// distinct requirement roles), each spending its own admission — not one
+// subject looping on the same claim forever, which the CAS bound above now
+// stops after a single free retry.
+test('a genuine runaway of distinct physical calls against distinct subjects still hits the turn ceiling', () => {
   const key = acceptedTask('runaway-still-bounded');
   const governor = new DiscoveryGovernor();
   assert.equal(governor.initializeTask({ ...key, knownCapability: false }).status, 'initialized');
@@ -284,10 +363,16 @@ test('a genuine runaway of distinct physical calls against a repeatedly timed-ou
   let ceilingHit = false;
   for (let i = 0; i < MAX_TURN_DISCOVERY_ADMISSIONS + 5; i += 1) {
     const callId = `runaway-${i}`;
-    const decision = governor.admit({ ...key, category: 'broad_discovery', callId });
+    // exact_schema_refresh subjects are caller-named and per-tool, so N
+    // distinct subjects mint N distinct claims without needing role-scoping
+    // or evidence-epoch reopens — the cleanest way to exercise the raw
+    // turn-wide ceiling in isolation from the per-subject CAS bound.
+    const decision = governor.admit({
+      ...key, category: 'exact_schema_refresh', callId, subject: `tool-${i}`,
+    });
     // The turn-wide backstop counts durable `discovery_governor_decision`
-    // events, not in-memory calls (discovery-governor.ts:1229 queries the
-    // event log directly so the ceiling survives a restart). Real callers go
+    // events, not in-memory calls (discovery-governor.ts queries the event
+    // log directly so the ceiling survives a restart). Real callers go
     // through discovery-boundary.ts's emitDecisionTelemetry; reproduce that
     // one integration seam here so the ceiling this pin exercises is the
     // actual production one, not a bypassed no-op.
@@ -300,11 +385,13 @@ test('a genuine runaway of distinct physical calls against a repeatedly timed-ou
     });
     if (!decision.admitted) {
       assert.equal(decision.reason, 'turn_discovery_ceiling',
-        `every admission before the ceiling must succeed as a continuation — denied at i=${i} with ${decision.reason}`);
+        `every admission before the ceiling must succeed — denied at i=${i} with ${decision.reason}`);
       ceilingHit = true;
       break;
     }
-    governor.settle({ ...key, category: 'broad_discovery', callId, outcome: 'timed_out' });
+    governor.settle({
+      ...key, category: 'exact_schema_refresh', callId, subject: `tool-${i}`, outcome: 'timed_out',
+    });
   }
   assert.equal(ceilingHit, true, 'the turn-wide backstop must still stop a runaway of distinct calls');
 });

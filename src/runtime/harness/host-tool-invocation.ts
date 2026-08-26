@@ -47,6 +47,7 @@ import {
   persistHostCallCapabilityBinding,
   verifyHostCallCapabilityBindingForReplay,
 } from './host-call-capability-binding.js';
+import { settleDiscoveryClaimForCallId } from './discovery-boundary.js';
 
 export type HostToolInvocationStopReason = 'deadline' | 'caller' | 'kill';
 export type HostToolInvocationBoundary =
@@ -1264,6 +1265,26 @@ export async function invokeHostToolCall<T>(
             cleanup();
             void (async () => {
               const error = stopError(reason, input.deadlineMs);
+              // This is the ONE place every host-owned call that does NOT
+              // return normally concludes, regardless of tool identity. A
+              // nested wrapper's own normal-completion settlement (brackets.ts)
+              // never runs on this path — that gap is exactly what orphaned a
+              // discovery claim forever on 2026-08-26
+              // (sess-desktop-970d457a6554134620236989 source 85009): a
+              // host-owned deadline settled the tool ATTEMPT but never told the
+              // discovery governor its claim had concluded. Settling by call id
+              // here — before anything else can fail — makes that structurally
+              // impossible to skip: it costs one indexed no-op for the
+              // overwhelming majority of calls that were never discovery at all.
+              settleDiscoveryClaimForCallId({
+                sessionId: input.identity.sessionId,
+                sourceUserSeq: input.identity.sourceUserSeq,
+                callId: modelCallId,
+                turn: input.identity.turn,
+                ...(reason === 'deadline'
+                  ? { outcome: 'timed_out' as const, detail: 'host_owned_deadline' }
+                  : { outcome: 'failed' as const, detail: `host_owned_cancelled_${reason}` }),
+              });
               try {
                 await revokeDispatchLeaseBeforeRecovery(childLease);
                 const physicalOutcome: StoppedDispatchOutcome = isMutating
@@ -1321,6 +1342,17 @@ export async function invokeHostToolCall<T>(
                 'kill authority became unreadable',
                 { cause },
               );
+              // Same structural guarantee as stop() above: this call is
+              // concluding right here, whatever tool it was, so settle
+              // whatever discovery claim its call id might hold.
+              settleDiscoveryClaimForCallId({
+                sessionId: input.identity.sessionId,
+                sourceUserSeq: input.identity.sourceUserSeq,
+                callId: modelCallId,
+                turn: input.identity.turn,
+                outcome: 'failed',
+                detail: 'host_owned_kill_authority_unreadable',
+              });
               try {
                 await revokeDispatchLeaseBeforeRecovery(childLease);
                 const terminal = settleStartedPhysicalDispatchesForLease({

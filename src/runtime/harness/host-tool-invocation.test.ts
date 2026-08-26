@@ -19,6 +19,8 @@ const attemptSettlements = await import('./attempt-settlement.js');
 const brackets = await import('./brackets.js');
 const invocation = await import('./host-tool-invocation.js');
 const settlements = await import('./logical-call-settlement-store.js');
+const discoveryBoundary = await import('./discovery-boundary.js');
+const discoveryGovernorModule = await import('./discovery-governor.js');
 const abortContext = await import('../tool-abort-context.js');
 const reaper = await import('./reaper.js');
 const callAuthority = await import('./accepted-turn-call-authority.js');
@@ -645,6 +647,78 @@ test('a cooperative hanging read sees one exact signal and settles timed_out bef
     assert.equal(redeemed.settlement.outcome.directive.action, 'retry_with_backoff');
     assert.equal(redeemed.settlement.crossings[0]?.terminalState, 'timed_out');
   }
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+// Live 2026-08-26, sess-desktop-970d457a6554134620236989 source 85009: a
+// discovery-classified call (tool_search) admitted a governor claim, then hit
+// this exact host-owned deadline path. The attempt above settled `transient`
+// as pinned, but nothing ever told discovery-governor.ts's claim it had
+// concluded — that claim admitted deep inside the nested tool wrapper's own
+// closure (brackets.ts) was never reachable from here, so it sat 'pending'
+// forever and denied 55 later tool_search calls for the rest of the turn.
+// THE PIN: stop() now settles by call id — the claim's durable physical
+// identity — so no pending row can survive the call regardless of which
+// nested wrapper opened it, and the live starvation shape stays fixed with
+// the timer gone (a follow-up on the same subject lands as a continuation).
+test('a discovery call that ends on a host-owned deadline settles its governor claim, not just its attempt', async () => {
+  const task = fixture();
+  assert.equal(
+    discoveryGovernorModule.discoveryGovernor.initializeTask({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      knownCapability: false,
+    }).status,
+    'initialized',
+  );
+
+  await assert.rejects(
+    runCall(task, {
+      callId: 'model:hanging-search',
+      toolName: 'tool_search',
+      args: { query: 'alpha records' },
+      deadlineMs: 25,
+      invoke: () => {
+        // Mirrors what wrapToolForHarness's nested body does deep inside its
+        // own closure before the real provider search runs: admit the
+        // governor claim, then hang forever — modeling the body that never
+        // gets a chance to settle its own lease once the host wins the race.
+        const lease = discoveryBoundary.admitDiscoveryBoundary({
+          sessionId: task.sessionId,
+          sourceUserSeq: task.sourceUserSeq,
+          turn: 1,
+          toolName: 'tool_search',
+          input: { query: 'alpha records' },
+          callId: 'model:hanging-search',
+        });
+        assert.ok(lease, 'the fixture must actually admit a discovery claim to exercise this pin');
+        return new Promise<never>(() => {});
+      },
+    }),
+    (error: unknown) => error instanceof invocation.HostToolInvocationDeadlineError,
+  );
+
+  const state = discoveryGovernorModule.discoveryGovernor.getTaskState({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  const claim = state?.allClaims.find((c) => c.callId === 'model:hanging-search');
+  assert.ok(claim, 'the admitted claim must still be discoverable in the ledger');
+  assert.notEqual(claim?.outcome, 'pending', 'no pending row may survive the call that opened it');
+  assert.equal(claim?.outcome, 'timed_out');
+
+  // THE STARVATION SHAPE, confirmed fixed: a follow-up search on the same
+  // subject now lands as a bounded continuation instead of colliding with an
+  // orphaned claim for the rest of the turn.
+  const followUp = discoveryGovernorModule.discoveryGovernor.admit({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    category: 'broad_discovery',
+    callId: 'model:hanging-search-2',
+  });
+  assert.equal(followUp.admitted, true, `follow-up must admit as a continuation — got ${followUp.reason}`);
+  assert.equal(followUp.reason, 'settled_continuation_admitted');
+
   leases.revokeDispatchLease(task.parentLease);
 });
 
