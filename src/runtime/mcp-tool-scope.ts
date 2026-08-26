@@ -161,11 +161,32 @@ function markerPositions(text: string, pattern: RegExp): number[] {
   return [...text.matchAll(new RegExp(pattern.source, pattern.flags))].map((m) => m.index ?? 0);
 }
 
-/** The nearest marker at or before `index`, or -1. */
-function nearestBefore(positions: number[], index: number): number {
+/** Where the clause containing `index` begins: after the last sentence end or
+ *  line break before it. A constraint governs the clause it is written in —
+ *  not the rest of the document. */
+function clauseStart(text: string, index: number): number {
+  let start = 0;
+  for (let i = Math.min(index, text.length) - 1; i >= 0; i -= 1) {
+    const ch = text[i]!;
+    if (ch === '\n' || ch === '.' || ch === '!' || ch === '?' || ch === ';') { start = i + 1; break; }
+  }
+  return start;
+}
+
+/** The nearest marker at or before `index` WITHIN the same clause, or -1.
+ *
+ * Scope used to be the whole preceding document, so a refusal written early
+ * bound to any mention that appeared later — live 2026-08-26: a long workflow
+ * prompt whose first line said never to post an update, and whose body
+ * mentioned "Integrations" thousands of characters further on, compiled to
+ * DENY ALL CONNECTORS and made every tool unavailable for the rest of the
+ * turn. A refusal about one thing must never silently become a refusal about
+ * everything: an instruction governs its own clause. */
+function nearestBefore(positions: number[], index: number, text?: string): number {
+  const floor = text === undefined ? 0 : clauseStart(text, index);
   let best = -1;
   for (const position of positions) {
-    if (position <= index && position > best) best = position;
+    if (position <= index && position >= floor && position > best) best = position;
   }
   return best;
 }
@@ -241,8 +262,8 @@ export function compileMcpAccessConstraint(
       if (claimed.some((span) => start < span.end && end > span.start)) continue;
       claimed.push({ start, end });
 
-      const negative = nearestBefore(negatives, start);
-      const exception = nearestBefore(exceptions, start);
+      const negative = nearestBefore(negatives, start, text);
+      const exception = nearestBefore(exceptions, start, text);
       // An exception that sits inside a refusal grants; one that sits inside a
       // permission refuses ("use anything except Beta").
       if (exception >= 0 && exception > negative) {
@@ -259,15 +280,15 @@ export function compileMcpAccessConstraint(
         continue;
       }
       allow.add(slug);
-      if (nearestBefore(onlys, start) >= 0) restrictedToNamed = true;
+      if (nearestBefore(onlys, start, text) >= 0) restrictedToNamed = true;
     }
   }
 
   // A blanket refusal of "connectors" with nothing carved out denies everything.
   const genericMentions = markerPositions(text, GENERIC_CONNECTOR_RE);
   const blanketRefusal = genericMentions.some((position) => {
-    const negative = nearestBefore(negatives, position);
-    const exception = nearestBefore(exceptions, position);
+    const negative = nearestBefore(negatives, position, text);
+    const exception = nearestBefore(exceptions, position, text);
     return negative >= 0 && negative > exception;
   });
 

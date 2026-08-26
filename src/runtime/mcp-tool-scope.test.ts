@@ -737,3 +737,31 @@ test('resolveMcpToolScopeWithRecall: a conversational ask reaches its proven ser
   assert.ok((scope.allowedServerSlugs ?? []).includes('notion'), 'the proven server surfaces for a conversational ask');
   assert.ok(!scope.failOpenCandidate, 'precise recall replaces the broad fail-open surface');
 });
+
+test('a refusal governs its own clause, never the rest of a long prompt', () => {
+  // Live 2026-08-26: a long workflow prompt opened with a "never post" rule and
+  // mentioned "Integrations" thousands of characters later. Negation scope was
+  // the whole preceding document, so the early refusal bound to the late
+  // generic mention and compiled to DENY ALL CONNECTORS — every tool
+  // unavailable for the rest of the turn, failing "safely" into an outage.
+  const configured = ['slack', 'googlesheets'];
+  const filler = 'Then summarize each section for the team. '.repeat(40);
+  const longPrompt = [
+    'Never post this update to the channel — send it to me only.',
+    filler,
+    'Check the Integrations tab and record which apps are connected.',
+  ].join('\n');
+
+  const compiled = compileMcpAccessConstraint(longPrompt, configured);
+  assert.notEqual(compiled.mode, 'deny_all',
+    'a refusal about posting must not become a blanket refusal of every connector');
+
+  // The clause that DOES refuse connectors still refuses them.
+  const blanket = compileMcpAccessConstraint('Do not use any integrations for this.', configured);
+  assert.equal(blanket.mode, 'deny_all',
+    'a refusal written about connectors themselves still denies them');
+
+  // And a same-clause named refusal still denies exactly that server.
+  const named = compileMcpAccessConstraint('Never post to Slack for this task.', configured);
+  assert.ok(named.deny.includes('slack'), 'a same-clause named refusal still binds');
+});
