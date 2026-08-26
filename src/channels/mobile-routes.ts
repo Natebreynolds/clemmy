@@ -1082,6 +1082,26 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           return { ok: true, convergedSessionFingerprint: currentFingerprint };
         }
       }
+      // THE MIRROR RACE (live 2026-08-26, one credential-less 401 among six
+      // healthy same-second requests bounced a paired phone to the pairing
+      // screen): the client learns the NEW fingerprint from a response header
+      // the instant rotation commits, but a request already queued still rides
+      // the OLD cookie — new-fp proof over old-cookie token. The presented
+      // token must be the exact graced predecessor of the record's current
+      // token, the same bound as the forward direction; every other proof
+      // check still runs against the one derived fingerprint.
+      const presentedHash = createHash('sha256').update(token).digest('hex');
+      const graceValidUntil = Date.parse(record.previousTokenValidUntil ?? '');
+      const presentedIsGracedPrevious = presentedHash === record.previousTokenHash
+        && /^[a-f0-9]{64}$/.test(record.tokenHash ?? '')
+        && Number.isFinite(graceValidUntil)
+        && graceValidUntil > now;
+      if (presentedIsGracedPrevious) {
+        result = await verifyForFingerprint((record.tokenHash as string).slice(0, 32));
+        if (result.ok) {
+          return { ok: true, convergedSessionFingerprint: (record.tokenHash as string).slice(0, 32) };
+        }
+      }
     }
     return result.ok ? { ok: true } : { ok: false, reason: result.reason };
   }

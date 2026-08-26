@@ -118,7 +118,22 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
   let body: unknown = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
   if (res.status === 401) {
-    window.dispatchEvent(new Event('clem:needs-login'));
+    // ONE 401 IS NOT A SIGN-OUT (live 2026-08-26: a single rotation-race 401
+    // among six healthy same-second requests bounced a paired phone to the
+    // pairing screen). Verify before bouncing: ask /auth/status once — only a
+    // confirmed dead session flips the app to the gate; a transient race
+    // self-heals invisibly. Pre-auth paths keep the immediate signal (their
+    // 401 IS the status).
+    if (isPreAuthPath(path)) {
+      window.dispatchEvent(new Event('clem:needs-login'));
+    } else {
+      void fetch('/m/auth/status', { credentials: 'include' })
+        .then((probe) => (probe.ok ? probe.json() : { authenticated: false }))
+        .then((status: { authenticated?: boolean }) => {
+          if (!status?.authenticated) window.dispatchEvent(new Event('clem:needs-login'));
+        })
+        .catch(() => { /* unreachable daemon reads as offline, not sign-out */ });
+    }
     throw makeError(401, body, 'Not authenticated');
   }
   if (!res.ok) {

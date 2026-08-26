@@ -778,6 +778,7 @@ interface RotatedKeySession {
   currentToken: string;
   currentFingerprint: string;
   previousFingerprint: string;
+  previousCookie: string;
 }
 
 async function pairedDeviceAfterRotation(h: Harness): Promise<RotatedKeySession> {
@@ -802,6 +803,7 @@ async function pairedDeviceAfterRotation(h: Harness): Promise<RotatedKeySession>
     currentToken: rotated.token,
     currentFingerprint: createHash('sha256').update(rotated.token).digest('hex').slice(0, 32),
     previousFingerprint: body.sessionFingerprint,
+    previousCookie: `${MOBILE_SESSION_COOKIE}=${pairedToken}`,
   };
 }
 
@@ -883,6 +885,33 @@ test('parallel pre-rotation proofs follow a post-rotation cookie within the boun
       );
       await response.body?.cancel();
     }
+  } finally { await h.close(); }
+});
+
+test('an old-cookie request signed with the freshly learned fingerprint survives rotation', async () => {
+  // THE MIRROR RACE (live 2026-08-26): rotation commits, the client folds the
+  // NEW fingerprint in from a response header, and a request already queued
+  // still rides the OLD cookie — one credential-less 401 among six healthy
+  // same-second requests bounced a paired phone to the pairing screen. Within
+  // the same bounded grace as the forward direction, a new-fp proof over the
+  // graced previous token must pass and converge the client forward.
+  const h = await startHarness();
+  try {
+    const fixture = await pairedDeviceAfterRotation(h);
+    const proof = await deviceProof(fixture.pair, 'GET', '/m/api/whoami', fixture.currentFingerprint);
+    const response = await fetch(`${h.url}/m/api/whoami`, {
+      headers: {
+        cookie: fixture.previousCookie,
+        'x-clem-device-proof': proof,
+      },
+    });
+    assert.equal(response.status, 200, 'a new-fp proof over the graced previous cookie must survive rotation');
+    assert.equal(
+      response.headers.get('x-clem-session-fp'),
+      fixture.currentFingerprint,
+      'the response converges the client onto the current fingerprint',
+    );
+    await response.body?.cancel();
   } finally { await h.close(); }
 });
 
