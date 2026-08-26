@@ -233,24 +233,22 @@ function operationCount(task: Task): number {
   `).get(task.sessionId, task.sourceUserSeq) as { count: number }).count;
 }
 
-test('a binderless non-chat work graph refuses authority before execution', () => {
+test('a binderless non-chat work graph arms conversation-shaped, never refuses', () => {
+  // Refusal was tried live (2026-08-26, first post-land smoke): the admission
+  // conflict killed 100% of workflow runs before a single call. ARM ONLY WHAT
+  // THE LANE CAN DISCHARGE: without a binding writer the source projects
+  // conversation-shaped — per-call settlement, effect gates, and approvals
+  // still guard every crossing — and the strict binding contract stays the
+  // law of every lane whose binder exists (the tests below).
   const task = accept('workflow');
   const expected = resolution.expectedTaskFor(task.sessionId, task.sourceUserSeq);
-  assert.equal(expected.status, 'ambiguous');
-  assert.match(
-    expected.status === 'ambiguous' ? expected.reason : '',
-    /no expected-work binding writer/,
-  );
-  assert.throws(() => contracts.requireKnownExpectedWorkContract(task));
-  const db = eventlog.openEventLog();
-  assert.equal((db.prepare(`
-    SELECT COUNT(*) AS count FROM accepted_task_authority
-     WHERE session_id = ? AND source_user_seq = ?
-  `).get(task.sessionId, task.sourceUserSeq) as { count: number }).count, 0);
-  assert.equal((db.prepare(`
-    SELECT COUNT(*) AS count FROM physical_dispatches
-     WHERE session_id = ? AND source_user_seq = ?
-  `).get(task.sessionId, task.sourceUserSeq) as { count: number }).count, 0);
+  assert.equal(expected.status, 'ok', JSON.stringify(expected));
+  if (expected.status !== 'ok') return;
+  assert.equal(expected.expectation.workKind, 'conversation',
+    'a binder-less lane must not carry a work-node demand no writer can bind');
+  assert.equal(expected.expectation.workNodeId, undefined);
+  // The graph identity survives untouched for observability.
+  assert.equal(expected.expectation.graphHash.length > 0, true);
 });
 
 test('exact background and cron execution owners retain binding-demanding work', () => {

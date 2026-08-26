@@ -188,10 +188,35 @@ export function expectedTaskFor(sessionId: string, sourceUserSeq: number): Expec
   const candidates = workNodes(graph);
   const aggregate = candidates.length > 1 ? aggregateWorkOwner(graph, candidates) : null;
   const nonConversational = graph.classification.route !== 'direct_reply';
-  if (nonConversational && !expectedWorkBinderPresent(sessionId, sourceUserSeq, graph)) {
+  const binderPresent = !nonConversational || expectedWorkBinderPresent(sessionId, sourceUserSeq, graph);
+  // ARM ONLY WHAT THE LANE CAN DISCHARGE. Where a binding writer exists
+  // (host engines; the background/cron carrier), the full binding-requiring
+  // contract arms and the strict adjudication below owns the close. Where no
+  // writer exists (the workflow surface today), the source projects
+  // conversation-shaped: per-call settlement, effect gates, and approvals
+  // still protect every crossing, and the shadow graph stays recorded.
+  // Refusing instead was tried live (2026-08-26, first post-land smoke) and
+  // killed 100% of workflow runs at admission — a wall, not a verification.
+  // When the workflow surface gains the same carrier, the capability test
+  // above extends the strict path to it with no change here.
+  if (nonConversational && !binderPresent) {
     return {
-      status: 'ambiguous',
-      reason: 'non-conversational graph has no expected-work binding writer',
+      status: 'ok',
+      graph,
+      expectation: {
+        version: 1,
+        acceptedTaskId: acceptedTaskIdFor(sessionId, sourceUserSeq),
+        identity: { ...graph.identity },
+        graphEventId: graphEvent.id,
+        graphId: graph.graphId,
+        graphHash: graph.compiler.graphHash,
+        compilerVersion: graph.compiler.version,
+        route: graph.classification.route,
+        workKind: 'conversation',
+        effectCeiling: graph.effectCeiling,
+        externalEffectRequested: graph.classification.externalEffectRequested,
+        externalEffectKinds: [...graph.classification.externalEffectKinds].sort(),
+      },
     };
   }
   if (candidates.length > 1 && !aggregate) {
