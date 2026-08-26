@@ -334,6 +334,39 @@ export interface ToolSearchCandidateSource {
   search(input: { query: string; limit: number }): Promise<ToolSearchBrokerCandidate[]>;
 }
 
+/** A stable, repair-relevant reason a candidate source could not answer.
+ * Never "the capability doesn't exist" — that is a real empty array. */
+export type CandidateSourceUnavailableCode =
+  | 'not_configured'
+  | 'not_authenticated'
+  | 'no_connections'
+  | 'search_failed'
+  | 'timed_out';
+
+/**
+ * A candidate source's `search()` throws this to report that the PROVIDER
+ * did not answer — never that no matching capability exists. The two facts
+ * were previously collapsed into the same empty array by every source's own
+ * silent `return []`/`catch { return [] }`, and the caller could not tell a
+ * live, connected capability that a search simply failed to reach from one
+ * that genuinely does not exist (live 2026-08-26: Composio was fine, five
+ * searches that could not reach it were, and the model was told nothing
+ * matched instead of "could not reach Composio" — it then guessed a ref and
+ * ten plan_task admissions were refused "not disclosed to this source").
+ * Any OTHER throw is still treated as an unnamed instance of this same fact,
+ * never as a reason to fail the whole tool_search call — a candidate source
+ * is advisory breadth, never load-bearing.
+ */
+export class CandidateSourceUnavailableError extends Error {
+  readonly code: CandidateSourceUnavailableCode;
+
+  constructor(code: CandidateSourceUnavailableCode, message: string) {
+    super(message);
+    this.name = 'CandidateSourceUnavailableError';
+    this.code = code;
+  }
+}
+
 export interface ToolSearchPlanningDisclosureCandidate {
   name: string;
   carrier: ToolSearchDispatchCarrier;
@@ -504,6 +537,10 @@ export function registerToolSearchTool(
       const exactNamedHit: RankedCatalogEntry | undefined = exactEntry
         ? { ...exactEntry, score: 1 }
         : undefined;
+      // Sources the provider itself could not answer, so the model is told
+      // "could not reach X" and can retry — never silence that reads as "X
+      // does not exist" (see CandidateSourceUnavailableError).
+      const unavailable: Array<{ source: ToolSearchCandidateSourceKind; reason: string }> = [];
       // An exact registered built-in is already resolved and never pays for
       // provider I/O. Provider adapters are consulted only for an unresolved
       // name/role, preserving the fast path and avoiding broad discovery after
@@ -516,7 +553,9 @@ export function registerToolSearchTool(
             // provider-side search hung and held this READ for ten minutes —
             // the carrier's whole call window — because the only bound was
             // the transport timeout. A source that cannot answer inside the
-            // deadline contributes nothing, exactly like one that throws.
+            // deadline contributes nothing, exactly like one that throws — but
+            // "contributes nothing" must not be laundered into "found
+            // nothing"; both are recorded below instead of discarded.
             let deadline: ReturnType<typeof setTimeout> | undefined;
             try {
               const candidates = await Promise.race([
@@ -526,7 +565,10 @@ export function registerToolSearchTool(
                 source.search({ query, limit: requestedLimit }),
                 new Promise<never>((_, reject) => {
                   deadline = setTimeout(
-                    () => reject(new Error('candidate source search deadline exceeded')),
+                    () => reject(new CandidateSourceUnavailableError(
+                      'timed_out',
+                      `${source.kind} did not answer within ${CANDIDATE_SOURCE_SEARCH_DEADLINE_MS / 1000}s.`,
+                    )),
                     CANDIDATE_SOURCE_SEARCH_DEADLINE_MS,
                   );
                 }),
@@ -539,7 +581,13 @@ export function registerToolSearchTool(
                   summary: candidate.summary.trim().slice(0, 600),
                   sourceKind: source.kind,
                 }));
-            } catch {
+            } catch (error) {
+              unavailable.push({
+                source: source.kind,
+                reason: error instanceof CandidateSourceUnavailableError
+                  ? error.message
+                  : `${source.kind} raised an unexpected error during discovery.`,
+              });
               return [];
             } finally {
               if (deadline) clearTimeout(deadline);
@@ -663,6 +711,19 @@ export function registerToolSearchTool(
           : null
       );
       const hint = (() => {
+        // A provider that did not answer must never read like a capability
+        // that does not exist. Lead with this only when it plausibly explains
+        // an otherwise-empty result — an exact/built-in hit already answered
+        // the question and outranks a co-occurring unrelated outage.
+        if (
+          unavailable.length > 0
+          && sourceCandidates.length === 0
+          && !exactNamedHit
+          && !exactKnownButDenied
+        ) {
+          const causes = unavailable.map((entry) => `${entry.source}: ${entry.reason}`).join(' | ');
+          return `Could not reach: ${causes}. This is a provider/connection problem, not evidence the capability is missing — do not conclude it does not exist or invent a reference for it. Retry this search once, or tell the user the connection could not be reached if it keeps failing.`;
+        }
         if (opts.discloseForPlanning && Object.keys(planningRefs).length === 0) {
           return 'No returned candidate was materialized into an exact host capabilityRef. Do not cite these results in plan_task; refine discovery, choose another live result, or ask the user only for a genuinely missing connection/account/target choice.';
         }
@@ -752,6 +813,9 @@ export function registerToolSearchTool(
           ...(Object.keys(schemaHandles).length > 0 ? { schema_handles: schemaHandles } : {}),
           ...(Object.keys(schemaHandleErrors).length > 0 ? { schema_handle_errors: schemaHandleErrors } : {}),
           ...(Object.keys(guidance).length > 0 ? { guidance } : {}),
+          // A source that could not answer this query — a provider/connection
+          // fact, distinct from and never implied by an empty `results`.
+          ...(unavailable.length > 0 ? { unavailable } : {}),
           brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
           hint,
           ...(nextCursor ? {

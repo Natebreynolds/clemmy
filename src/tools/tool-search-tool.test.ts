@@ -677,3 +677,84 @@ test('a wedged planning-disclosure stage is dropped at its deadline and the sear
   const body = JSON.parse(result.content[0].text) as { results: Array<{ name: string }> };
   assert.ok(body.results.length > 0, 'candidates still answer without materialized refs');
 });
+
+test('a named candidate-source unavailability reaches the model, never as silent emptiness', async () => {
+  // Regression pin (2026-08-26): "the provider did not answer" and "no such
+  // capability exists" were the same empty array to every caller. A live
+  // Google Sheets connection went unfound this way — five searches Composio
+  // could not reach, reported exactly like five searches that proved nothing
+  // existed — and the model guessed a reference that was never disclosed.
+  const { registerToolSearchTool, CandidateSourceUnavailableError } = await import('./tool-search-tool.js');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'unavailable-pin', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [
+      {
+        kind: 'authorized_composio',
+        search: async () => {
+          throw new CandidateSourceUnavailableError('no_connections', 'No Composio toolkits are connected.');
+        },
+      },
+    ],
+  } as never);
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+  const result = await handler({ query: 'zzz-no-such-builtin-matches-zzz', limit: 8 });
+  const body = JSON.parse(result.content[0].text) as {
+    unavailable?: Array<{ source: string; reason: string }>;
+    hint: string;
+  };
+  assert.deepEqual(body.unavailable, [
+    { source: 'authorized_composio', reason: 'No Composio toolkits are connected.' },
+  ]);
+  assert.match(body.hint, /Could not reach/);
+  assert.doesNotMatch(body.hint, /not disclosed/i);
+});
+
+test('an unexpected candidate-source throw is still a named unavailability, not silence', async () => {
+  const { registerToolSearchTool } = await import('./tool-search-tool.js');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'unavailable-generic-pin', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [
+      { kind: 'authorized_external_mcp', search: async () => { throw new Error('ECONNRESET'); } },
+    ],
+  } as never);
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+  const result = await handler({ query: 'zzz-no-such-builtin-matches-zzz', limit: 8 });
+  const body = JSON.parse(result.content[0].text) as {
+    unavailable?: Array<{ source: string; reason: string }>;
+    hint: string;
+  };
+  assert.equal(body.unavailable?.length, 1);
+  assert.equal(body.unavailable?.[0]?.source, 'authorized_external_mcp');
+  assert.match(body.hint, /Could not reach/);
+});
+
+test('an unavailable source does not shadow a healthy one, and an exact hit outranks a co-occurring outage', async () => {
+  const { registerToolSearchTool, CandidateSourceUnavailableError } = await import('./tool-search-tool.js');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'unavailable-mixed-pin', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [
+      {
+        kind: 'authorized_composio',
+        search: async () => { throw new CandidateSourceUnavailableError('search_failed', 'Composio search failed.'); },
+      },
+      {
+        kind: 'authorized_external_mcp',
+        // A dominant score, so this candidate's rank against an arbitrary
+        // built-in catalog is never what this test is actually about.
+        search: async () => [{ name: 'LIVE_MCP_OP', summary: 'A healthy MCP source answers.', score: 1000 }],
+      },
+    ],
+  } as never);
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+  const result = await handler({ query: 'zzz-no-such-builtin-matches-zzz', limit: 8 });
+  const body = JSON.parse(result.content[0].text) as {
+    results: Array<{ name: string }>;
+    unavailable?: Array<{ source: string; reason: string }>;
+  };
+  assert.equal(body.unavailable?.length, 1);
+  assert.equal(body.unavailable?.[0]?.source, 'authorized_composio');
+  assert.ok(body.results.some((row) => row.name === 'LIVE_MCP_OP'), 'a source that answered is unaffected by a sibling outage');
+});

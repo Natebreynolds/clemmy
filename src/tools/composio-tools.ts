@@ -1,6 +1,7 @@
 import { readHarnessCapabilityHealth, recordHarnessCapabilityHealth } from '../runtime/harness/capability-health.js';
 import { hasActiveStructuralProcedureForIdentifier } from '../memory/procedure-receipts.js';
 import { settleVerifiedComposioRead } from './composio-read-settlement.js';
+import { CandidateSourceUnavailableError } from './tool-search-tool.js';
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
@@ -4599,7 +4600,14 @@ export async function searchComposioBrokerCandidates(
   const credentials = getComposioCredentialStatus();
   if (composioExecutionUsesCliOnlyLane(credentials)) {
     const runtime = await getComposioRuntimeStatus();
-    if (!runtime.cli.installed || !runtime.cli.authenticated) return [];
+    if (!runtime.cli.installed || !runtime.cli.authenticated) {
+      throw new CandidateSourceUnavailableError(
+        !runtime.cli.installed ? 'not_configured' : 'not_authenticated',
+        !runtime.cli.installed
+          ? 'The Composio CLI is not installed.'
+          : 'The Composio CLI is not authenticated.',
+      );
+    }
     const raw = await searchComposioToolsViaCli(query, { limit: maxResults });
     const hydrated = hydrateComposioCliSearchSchemas(
       raw,
@@ -4619,11 +4627,15 @@ export async function searchComposioBrokerCandidates(
         inputParameters: candidate.inputParameters,
       }));
   }
-  if (!credentials.enabled) return [];
+  if (!credentials.enabled) {
+    throw new CandidateSourceUnavailableError('not_configured', 'Composio is not configured for this install.');
+  }
 
   const connections = await listUsableConnectedToolkits();
   const toolkits = [...new Set(connections.map((connection) => connection.slug).filter(Boolean))];
-  if (toolkits.length === 0) return [];
+  if (toolkits.length === 0) {
+    throw new CandidateSourceUnavailableError('no_connections', 'No Composio toolkits are connected.');
+  }
   const queryTerms = tokenize(query);
   let searched;
   try {
@@ -4635,9 +4647,15 @@ export async function searchComposioBrokerCandidates(
   } catch (error) {
     // A failed filtered search is a failed discovery attempt. Falling back to
     // an unfiltered toolkit page both misses large-catalog tails and turns one
-    // bounded role lookup into foreground enumeration.
+    // bounded role lookup into foreground enumeration. A provider contract
+    // violation is a distinct, worse fact than an ordinary unavailability
+    // (the provider answered, but broke its own contract) and stays a bare
+    // throw so it is never mistaken for "retry and it will work".
     if (error instanceof ComposioSearchProviderContractError) throw error;
-    return [];
+    throw new CandidateSourceUnavailableError(
+      'search_failed',
+      `Composio search failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
   for (const candidate of searched) {
     if (candidate.inputParameters === undefined) continue;

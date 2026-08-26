@@ -13,6 +13,7 @@ const composio = await import('../integrations/composio/client.js');
 const providerSources = await import('./tool-search-provider-sources.js');
 const capabilityIndex = await import('../memory/capability-index.js');
 const schemaCache = await import('./composio-schema-cache.js');
+const { CandidateSourceUnavailableError } = await import('./tool-search-tool.js');
 
 const SOURCE_SCHEMA = {
   type: 'object',
@@ -269,8 +270,69 @@ test('a filtered SDK failure never falls back to unfiltered toolkit enumeration'
     maxTools: 0,
   } as never);
   const source = sources.find((candidate) => candidate.kind === 'authorized_composio');
-  assert.deepEqual(await source!.search({ query: 'missing sentinel', limit: 8 }), []);
+  // A failed filtered search is a failed discovery attempt, not proof nothing
+  // matched. Regression pin (2026-08-26): this used to resolve to [], which
+  // read to every caller exactly like "Composio has no such capability" —
+  // the same silent-empty class as the search-string-relaxation bug, one
+  // layer up. It must now surface as a typed, named unavailability instead
+  // of being laundered into an empty result, and it must still never trigger
+  // an unfiltered toolkit-list fallback.
+  await assert.rejects(
+    () => source!.search({ query: 'missing sentinel', limit: 8 }),
+    (error: unknown) => {
+      assert.ok(error instanceof CandidateSourceUnavailableError);
+      assert.equal(error.code, 'search_failed');
+      assert.match(error.message, /filtered provider search unavailable/);
+      return true;
+    },
+  );
   assert.equal(calls, 1, 'failure must not trigger a 200/250-definition list fallback');
+});
+
+test('no connected toolkits is a typed unavailability, never a silent empty result', async () => {
+  composio.resetComposioClient();
+  composio.__test__.setComposioApiKeyOverride('bounded-search-key');
+  composio.__test__.setConnectedAccountsLoader(async () => []);
+  const sources = providerSources.buildAuthorizedToolSearchCandidateSources({
+    reason: 'no connections proof',
+    authority: 'catalog',
+    allowedServerSlugs: [],
+    toolPatterns: [],
+    maxTools: 0,
+  } as never);
+  const source = sources.find((candidate) => candidate.kind === 'authorized_composio');
+  // Nothing connected means the search never meaningfully ran, not that the
+  // requested capability does not exist — the honest repair is "connect a
+  // toolkit", not "guess a reference" or "conclude this cannot be done".
+  await assert.rejects(
+    () => source!.search({ query: 'anything', limit: 8 }),
+    (error: unknown) => {
+      assert.ok(error instanceof CandidateSourceUnavailableError);
+      assert.equal(error.code, 'no_connections');
+      return true;
+    },
+  );
+});
+
+test('Composio not configured for this install is a typed unavailability, never a silent empty result', async () => {
+  composio.resetComposioClient();
+  composio.__test__.setComposioApiKeyOverride(null);
+  const sources = providerSources.buildAuthorizedToolSearchCandidateSources({
+    reason: 'not configured proof',
+    authority: 'catalog',
+    allowedServerSlugs: [],
+    toolPatterns: [],
+    maxTools: 0,
+  } as never);
+  const source = sources.find((candidate) => candidate.kind === 'authorized_composio');
+  await assert.rejects(
+    () => source!.search({ query: 'anything', limit: 8 }),
+    (error: unknown) => {
+      assert.ok(error instanceof CandidateSourceUnavailableError);
+      assert.equal(error.code, 'not_configured');
+      return true;
+    },
+  );
 });
 
 test('an SDK response above the 16-definition contract is refused, never truncated locally', async () => {
