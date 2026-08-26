@@ -24,6 +24,7 @@ const {
   setClaudeHeadlessCliAvailableForTest,
   resolveClaudeCliPath,
   assistantMessage,
+  _setHeadlessFlagSupportForTests,
 } = mod;
 
 const STATE_DIR = path.join(TMP_HOME, 'state');
@@ -87,15 +88,16 @@ test('buildClaudeHeadlessArgs drops optional flags an installed CLI does not sup
   // Live v1.4.0 user report: "Claude Code headless exited 1: error: unknown
   // option '--safe-mode'". Core args must survive with EVERY optional flag off.
   const minimal = buildClaudeHeadlessArgs('claude-opus-4-8', () => false);
-  assert.deepEqual(minimal, ['-p', '--model', 'claude-opus-4-8', '--output-format', 'stream-json', '--verbose']);
+  assert.deepEqual(minimal, [
+    '-p', '--tools', '', '--model', 'claude-opus-4-8', '--output-format', 'stream-json', '--verbose',
+  ]);
   // Selective support keeps exactly the advertised flags.
   const partial = buildClaudeHeadlessArgs('sonnet', (f) => f === '--include-partial-messages');
   assert.equal(partial.includes('--safe-mode'), false);
   assert.equal(partial.includes('--include-partial-messages'), true);
-  // --tools travels with its empty-string operand, both present or both absent.
-  const withTools = buildClaudeHeadlessArgs('sonnet', (f) => f === '--tools');
-  assert.equal(withTools[withTools.indexOf('--tools') + 1], '');
-  assert.equal(minimal.includes('--tools'), false);
+  // --tools is not optional: even the minimal compatibility profile is
+  // text-only and an unsupported CLI must fail rather than regain tools.
+  assert.equal(minimal[minimal.indexOf('--tools') + 1], '');
   const withSystem = buildClaudeHeadlessArgs('sonnet', (f) => f === '--system-prompt');
   assert.match(withSystem[withSystem.indexOf('--system-prompt') + 1] ?? '', /authoritative/);
   assert.equal(minimal.includes('--system-prompt'), false);
@@ -271,6 +273,7 @@ test('ClaudeHeadlessModel spawns the resolved CLAUDE_CLI_PATH override, not a li
   const captured: { cmd?: string; args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv } = {};
   try {
     process.env.CLAUDE_CLI_PATH = overrideBin;
+    _setHeadlessFlagSupportForTests(overrideBin, new Set(['--tools']));
     installSpawnMock([
       { type: 'system', subtype: 'init', session_id: 'session-override' },
       { type: 'result', subtype: 'success', session_id: 'session-override', result: 'ok', usage: { input_tokens: 1, output_tokens: 1 } },
@@ -288,6 +291,33 @@ test('ClaudeHeadlessModel spawns the resolved CLAUDE_CLI_PATH override, not a li
 
     assert.equal(captured.cmd, overrideBin);
   } finally {
+    _setHeadlessFlagSupportForTests(overrideBin, null);
+    if (prevOverride === undefined) delete process.env.CLAUDE_CLI_PATH;
+    else process.env.CLAUDE_CLI_PATH = prevOverride;
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test('ClaudeHeadlessModel refuses before spawn when the CLI cannot guarantee tool isolation', async () => {
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-claude-no-tools-'));
+  const overrideBin = path.join(binDir, 'claude-no-tools');
+  writeFileSync(overrideBin, '#!/bin/sh\necho stub', { mode: 0o755 });
+  const prevOverride = process.env.CLAUDE_CLI_PATH;
+  const captured: { cmd?: string; args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv } = {};
+  try {
+    process.env.CLAUDE_CLI_PATH = overrideBin;
+    _setHeadlessFlagSupportForTests(overrideBin, new Set());
+    installSpawnMock([], captured);
+    const model = new ClaudeHeadlessModel('claude-sonnet-4-6');
+    await assert.rejects(
+      model.getResponse({
+        input: 'Answer once.', modelSettings: {}, tools: [], outputType: 'text', handoffs: [], tracing: false,
+      } as any),
+      /mandatory --tools isolation flag/,
+    );
+    assert.equal(captured.cmd, undefined, 'an unisolated CLI never crosses the process boundary');
+  } finally {
+    _setHeadlessFlagSupportForTests(overrideBin, null);
     if (prevOverride === undefined) delete process.env.CLAUDE_CLI_PATH;
     else process.env.CLAUDE_CLI_PATH = prevOverride;
     rmSync(binDir, { recursive: true, force: true });

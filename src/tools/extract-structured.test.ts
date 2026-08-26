@@ -71,10 +71,11 @@ test('a source that genuinely lacks the field FAILS HONESTLY — never invented'
   assert.match(out, /NEVER invent/, 'the corrective forbids fabrication');
 });
 
-test('a >2MB exact source fails closed before extraction can validate an incomplete prefix', async () => {
+test('a chunked exact source reaches the tail before extraction validates it', async () => {
   let extractorCalls = 0;
-  const handler = capture(async () => {
+  const handler = capture(async (_schema, _fields, focusedSource) => {
     extractorCalls += 1;
+    assert.match(focusedSource, /Email: amy@firm\.example/, 'schema-focused source includes the restored tail');
     return '{"name":"Amy Chen","email":"amy@firm.example"}';
   });
   const sess = createSession({ kind: 'chat' });
@@ -92,11 +93,10 @@ test('a >2MB exact source fails closed before extraction can validate an incompl
 
   const out = textOf(await withToolOutputContext({ sessionId: sess.id }, () =>
     handler({ schema: CONTACT_SCHEMA, call_id: 'call_truncated_extraction_source' })));
-  assert.match(out, /^ERROR:/);
-  assert.match(out, /incomplete/);
-  assert.match(out, /will not validate an object from a prefix/);
-  assert.match(out, /Re-read\/page|stage the full result/);
-  assert.equal(extractorCalls, 0, 'the model extractor must never see known-incomplete authority bytes');
+  const parsed = JSON.parse(out) as { validated: boolean; extracted: { email: string } };
+  assert.equal(parsed.validated, true);
+  assert.equal(parsed.extracted.email, 'amy@firm.example');
+  assert.equal(extractorCalls, 1, 'the extractor receives one complete, reassembled authority value');
 });
 
 test('fenced/prose-wrapped model output is JSON-repaired instead of failing', async () => {

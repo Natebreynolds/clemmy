@@ -102,7 +102,6 @@ export function claudeCliModelArg(modelId: string): string {
 export const CLAUDE_HEADLESS_OPTIONAL_FLAGS: Array<{ flag: string; extra?: string[] }> = [
   { flag: '--safe-mode' },
   { flag: '--disable-slash-commands' },
-  { flag: '--tools', extra: [''] },
   { flag: '--no-session-persistence' },
   { flag: '--include-partial-messages' },
   // Claude Code's default system prompt is a full coding-agent harness even
@@ -119,6 +118,7 @@ export const CLAUDE_HEADLESS_OPTIONAL_FLAGS: Array<{ flag: string; extra?: strin
     ],
   },
 ];
+const CLAUDE_HEADLESS_MANDATORY_FLAGS = ['--tools'] as const;
 
 export function buildClaudeHeadlessArgs(modelId: string, flagSupported?: (flag: string) => boolean): string[] {
   const optional = CLAUDE_HEADLESS_OPTIONAL_FLAGS
@@ -127,6 +127,11 @@ export function buildClaudeHeadlessArgs(modelId: string, flagSupported?: (flag: 
   return [
     '-p',
     ...optional,
+    // This transport is a Model, never an execution owner. Tool isolation is
+    // mandatory rather than a compatibility flag: an older CLI that rejects
+    // it must fail closed and fall over to another text-only wire.
+    '--tools',
+    '',
     '--model',
     claudeCliModelArg(modelId),
     '--output-format',
@@ -163,7 +168,12 @@ async function probeSupportedHeadlessFlags(command: string): Promise<Set<string>
         else reject(err ?? new Error('empty --help output'));
       });
     });
-    const set = new Set(CLAUDE_HEADLESS_OPTIONAL_FLAGS.map((o) => o.flag).filter((f) => help.includes(f)));
+    const set = new Set(
+      [
+        ...CLAUDE_HEADLESS_OPTIONAL_FLAGS.map((o) => o.flag),
+        ...CLAUDE_HEADLESS_MANDATORY_FLAGS,
+      ].filter((flag) => help.includes(flag)),
+    );
     headlessFlagSupportCache.set(command, set);
     headlessProbeFailedAt.delete(command);
     return set;
@@ -529,6 +539,11 @@ async function* runClaudeHeadless(request: ModelRequest, modelId: string): Async
   if (spawnImpl === spawn) assertLiveModelTransportAllowed('Claude Code headless CLI');
   const command = resolveClaudeCliPath() ?? 'claude';
   const support = await probeSupportedHeadlessFlags(command);
+  if (support && !support.has('--tools')) {
+    throw new Error(
+      'Claude Code headless is unavailable: this CLI does not advertise the mandatory --tools isolation flag.',
+    );
+  }
   // Start from the probed set (or every optional flag when the probe failed).
   const active = new Set(support ?? CLAUDE_HEADLESS_OPTIONAL_FLAGS.map((o) => o.flag));
   // Unknown-option exits happen BEFORE any stream output, so dropping only the
@@ -551,6 +566,7 @@ async function* runClaudeHeadless(request: ModelRequest, modelId: string): Async
       const unknown = /unknown option '?(--[a-z-]+)'?/i.exec(message);
       if (emittedAnything || !unknown) throw err;
       const offending = unknown[1];
+      if (offending === '--tools') throw err;
       if (!active.has(offending)) throw err; // not one of ours — real failure
       active.delete(offending);
       logger.warn({ command, offending }, 'claude headless rejected an optional flag — retrying without it');

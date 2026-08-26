@@ -69,6 +69,26 @@ function saveApprovals(items: PendingApproval[]): void {
 }
 
 export class ApprovalStore {
+  /**
+   * Quarantine every pending approval issued by the retired direct runtimes.
+   * The opaque state is deliberately preserved for audit/recovery inspection;
+   * only its executable status changes. Returns the number retired.
+   */
+  retirePending(): number {
+    const approvals = loadApprovals();
+    const retired: Array<{ previous: PendingApproval; next: PendingApproval }> = [];
+    for (const approval of approvals) {
+      if (approval.status !== 'pending') continue;
+      const previous = { ...approval };
+      approval.status = 'rejected';
+      retired.push({ previous, next: { ...approval } });
+    }
+    if (retired.length === 0) return 0;
+    saveApprovals(approvals);
+    for (const { previous, next } of retired) emitIfResolved(previous, next);
+    return retired.length;
+  }
+
   listPending(): PendingApproval[] {
     return loadApprovals().filter((item) => item.status === 'pending');
   }

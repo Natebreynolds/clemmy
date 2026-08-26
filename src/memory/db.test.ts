@@ -19,6 +19,7 @@ const {
   closeMemoryDb,
   openMemoryDb,
   backupMemoryDb,
+  requiredMemoryBackupFreeBytes,
   reapStaleEpisodicPointers,
   MEMORY_BACKUP_DIR,
   MEMORY_DB_PATH,
@@ -140,6 +141,18 @@ test('backupMemoryDb writes a consistent snapshot containing the facts', () => {
   const row = snap.prepare('SELECT COUNT(*) AS c FROM consolidated_facts').get() as { c: number };
   snap.close();
   assert.equal(row.c, 1, 'backed-up db contains the fact');
+});
+
+test('backupMemoryDb refuses before VACUUM when free space cannot hold the source image plus margin', () => {
+  rememberFact({ kind: 'project', content: 'Disk headroom is checked against the source database size.' });
+  const required = requiredMemoryBackupFreeBytes();
+  assert.ok(required > 64 * 1024 * 1024, 'required space includes the source image and safety margin');
+  const result = backupMemoryDb({ retain: 7, _availableBytesForTest: required - 1 });
+  assert.equal(result, null);
+  const snapshots = existsSync(MEMORY_BACKUP_DIR)
+    ? readdirSync(MEMORY_BACKUP_DIR).filter((name) => name.startsWith('memory-') && name.endsWith('.db'))
+    : [];
+  assert.deepEqual(snapshots, [], 'the low-space refusal publishes no partial or final snapshot');
 });
 
 test('backupMemoryDb retains only the newest N snapshots', () => {

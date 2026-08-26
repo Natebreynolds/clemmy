@@ -434,3 +434,83 @@ test('prepared worker completion survives a changed call packet but not a contra
     );
   }
 });
+
+test('success-before-fence keeps the proven worker result and does not re-open the item', () => {
+  const sid = session('manifest-fence-success-first');
+  const prepared = prepareWorkerManifest({
+    sessionId: sid,
+    items: ['item-a'],
+    descriptor: {
+      id: 'fence-order-a',
+      contractVersion: '1',
+      phase: 'work',
+      mode: 'declare',
+      phases: [{ id: 'work' }],
+    },
+  });
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  checkpointPreparedWorker(sid, prepared.binding, 'item-a', 'running', { attemptId: 'attempt-old' });
+  const result = eventlog.appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'system',
+    type: 'worker_result',
+    data: { item: 'item-a', ok: true, packetKey: 'packet-success-first' },
+  });
+  checkpointPreparedWorker(sid, prepared.binding, 'item-a', 'succeeded', {
+    attemptId: 'attempt-old',
+    evidence: [{ kind: 'worker_result', ref: `event:${result.seq}` }],
+  });
+  // Models the exact race: the fence read `attempt-old` while it was running,
+  // but the success append won before the conditional fence append.
+  checkpointPreparedWorker(sid, prepared.binding, 'item-a', 'invalidated', {
+    attemptId: 'fence:generation-new',
+    fencedAttemptId: 'attempt-old',
+    reason: 'prior generation fenced',
+  });
+
+  const summary = summarizeWorkManifest(sid, 'fence-order-a');
+  assert.equal(summary?.items[0]?.phases.work.status, 'succeeded');
+  assert.equal(completedPreparedWorker(sid, prepared.binding, 'item-a')?.packetKeys[0], 'packet-success-first');
+  assert.match(summary?.anomalies.join('\n') ?? '', /Ignored stale generation fence/);
+});
+
+test('fence-before-success rejects the late old terminal checkpoint', () => {
+  const sid = session('manifest-fence-wins-first');
+  const prepared = prepareWorkerManifest({
+    sessionId: sid,
+    items: ['item-a'],
+    descriptor: {
+      id: 'fence-order-b',
+      contractVersion: '1',
+      phase: 'work',
+      mode: 'declare',
+      phases: [{ id: 'work' }],
+    },
+  });
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  checkpointPreparedWorker(sid, prepared.binding, 'item-a', 'running', { attemptId: 'attempt-old' });
+  checkpointPreparedWorker(sid, prepared.binding, 'item-a', 'invalidated', {
+    attemptId: 'fence:generation-new',
+    fencedAttemptId: 'attempt-old',
+    reason: 'prior generation fenced',
+  });
+  const late = eventlog.appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'system',
+    type: 'worker_result',
+    data: { item: 'item-a', ok: true, packetKey: 'packet-too-late' },
+  });
+  checkpointPreparedWorker(sid, prepared.binding, 'item-a', 'succeeded', {
+    attemptId: 'attempt-old',
+    evidence: [{ kind: 'worker_result', ref: `event:${late.seq}` }],
+  });
+
+  const summary = summarizeWorkManifest(sid, 'fence-order-b');
+  assert.equal(summary?.items[0]?.phases.work.status, 'invalidated');
+  assert.equal(completedPreparedWorker(sid, prepared.binding, 'item-a'), null);
+  assert.match(summary?.anomalies.join('\n') ?? '', /Ignored stale terminal checkpoint/);
+});

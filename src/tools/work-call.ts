@@ -16,6 +16,7 @@ import {
   WorkTopologyMemberSchema,
 } from '../runtime/graph/work-topology.js';
 import {
+  actionExpectedWorkRequired,
   admitExpectedWorkInvocation,
   loadExpectedWorkCallBindingState,
   withExpectedWorkBinding,
@@ -902,7 +903,7 @@ function refusalResult(
   );
 }
 
-export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'aroundResolvedDispatch' | 'resolvedRefusalLane'> {
+export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'aroundResolvedDispatch' | 'resolvedRefusalLane' | 'modelVisibility'> {
   /** Adapter attribution only; admission and recovery remain provider-neutral. */
   settlementLane?: SettleToolAttemptInput['lane'];
   /** Host-frozen contract for this exact accepted source, when one exists. */
@@ -912,6 +913,10 @@ export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'around
   /** Fresh host lane: plan_task must freeze the graph-derived contract first,
    * and model-authored work_call proposals are never accepted. */
   requireHostPlan?: boolean;
+  /** Fresh-host model visibility before activation. It becomes true only when
+   * the exact live planning catalog can also expose plan_task, allowing the
+   * sanctioned plan_task + dependency-root work_call frame. */
+  hostPlanningReady?: () => boolean | Promise<boolean>;
 }
 
 export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeContextValue> {
@@ -920,6 +925,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     frozenContract = null,
     catalogIdentifiers,
     requireHostPlan = false,
+    hostPlanningReady,
     ...dispatcherOptions
   } = options;
   const frozenAuthority = formatFrozenWorkCallDescription({
@@ -1327,11 +1333,17 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       // so the primary model can emit the sanctioned plan+root-read frame;
       // host-model-frame-policy refuses it alone before activation, and the
       // execution body still requires the exact durable host plan.
-      return Boolean(
+      const exactIdentityPresent = Boolean(
         context?.sessionId
         && Number.isSafeInteger(context.sourceUserSeq)
         && (context.sourceUserSeq ?? 0) > 0
       );
+      if (!exactIdentityPresent) return false;
+      if (actionExpectedWorkRequired({
+        sessionId: context!.sessionId,
+        sourceUserSeq: context!.sourceUserSeq as number,
+      })) return true;
+      return hostPlanningReady ? Boolean(await hostPlanningReady()) : true;
     },
     errorFunction: (_context, error) => {
       const detail = error instanceof Error ? error.message : String(error);

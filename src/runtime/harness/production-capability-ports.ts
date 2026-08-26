@@ -31,6 +31,12 @@ export interface ProductionPortIdentity {
 
 export interface ProductionCapabilityPort {
   observe?: LiveCapabilityObserver;
+  /** Optional provider-neutral preflight crossing. Native transports use this
+   * to refresh an exact live definition without hiding metadata I/O inside the
+   * following business invocation. The proof is process-opaque and one-shot. */
+  admitPreparation?: () => void;
+  prepareInvocation?: () => Promise<unknown>;
+  invokeWithPreparation?: <T>(proof: unknown, work: () => Promise<T>) => Promise<T>;
   invoke: GraphNodeCapabilityInvoke;
   reconcile?: GraphNodeCapabilityReconcile;
   /** Build-owned digest of the shipped invoke/reconcile adapter. */
@@ -80,6 +86,9 @@ export function registerProductionCapabilityPort(
     && (
       prior.port.invoke !== port.invoke
       || prior.port.reconcile !== port.reconcile
+      || prior.port.prepareInvocation !== port.prepareInvocation
+      || prior.port.invokeWithPreparation !== port.invokeWithPreparation
+      || prior.port.admitPreparation !== port.admitPreparation
     )
   ) {
     return { ok: false, reason: 'identity_exists' };
@@ -102,6 +111,9 @@ export function registerFixtureCapabilityPort(
     && (
       prior.port.invoke !== port.invoke
       || prior.port.reconcile !== port.reconcile
+      || prior.port.prepareInvocation !== port.prepareInvocation
+      || prior.port.invokeWithPreparation !== port.invokeWithPreparation
+      || prior.port.admitPreparation !== port.admitPreparation
     )
   ) {
     return { ok: false, reason: 'identity_exists' };

@@ -59,6 +59,15 @@ test('buildWorkerJobPrompt renders resolved tools as authoritative and blocks re
   assert.match(prompt, /final line must start with ERROR:/);
 });
 
+test('buildWorkerJobPrompt canonicalizes the per-item payload as the final packet field', () => {
+  const prompt = buildWorkerJobPrompt(validPacket);
+  const marker = '\nPacket JSON:\n';
+  const packetJson = prompt.slice(prompt.lastIndexOf(marker) + marker.length);
+  const keys = Object.keys(JSON.parse(packetJson) as Record<string, unknown>);
+  assert.equal(keys.at(-1), 'item', 'shared packet fields remain a stable cache prefix');
+  assert.ok(packetJson.lastIndexOf(validPacket.item) > packetJson.lastIndexOf('expectedOutput'));
+});
+
 test('buildWorkerJobPrompt forbids substituting a different list for the parent-pinned target', () => {
   const prompt = buildWorkerJobPrompt(validPacket);
   assert.match(prompt, /parent-pinned binding target/);

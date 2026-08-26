@@ -174,1273 +174,122 @@ test('ordinary SDK turns do not persist artifact lineage', async () => {
   assert.equal(artifactLedger.getArtifactRootForSourceUserSeq(session.id, source.seq), null);
 });
 
-test('native artifact replay with one durable run scope binds once and blocks a restarted retry', async () => {
+test('foreign MCP namespaces are denied before direct provider execution while clementine-local remains callable', async () => {
   const session = eventlog.createSession({ kind: 'chat' });
-  const trackerScopeId = `${session.id}::brain:external-run-42`;
-  artifactLedger._resetArtifactLedgerForTests();
-  let queryCount = 0;
-  let providerDispatches = 0;
-  const permissionVerdicts: string[] = [];
-  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
-
-  setClaudeAgentSdkQueryForTest(((params: any) => {
-    queryCount += 1;
-    const callId = `toolu_create_${queryCount}`;
-    const gen = (async function* () {
-      yield {
-        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: `sdk-${queryCount}`,
-        uuid: `init-${queryCount}`, apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
-        tools: ['mcp__googledocs__create_document'], mcp_servers: [{ name: 'googledocs', status: 'connected' }],
-        permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
-      } as any;
-      const verdict = await params.options.canUseTool(
-        'mcp__googledocs__create_document',
-        { title: 'Firm brief' },
-        { signal: new AbortController().signal, toolUseID: callId },
-      );
-      permissionVerdicts.push(verdict.behavior);
-      if (verdict.behavior === 'allow') {
-        providerDispatches += 1;
-        yield {
-          type: 'assistant', session_id: `sdk-${queryCount}`, uuid: `assistant-${queryCount}`,
-          parent_tool_use_id: null,
-          message: { content: [{ type: 'tool_use', id: callId, name: 'mcp__googledocs__create_document', input: { title: 'Firm brief' } }] },
-        } as any;
-        yield {
-          type: 'user', session_id: `sdk-${queryCount}`, uuid: `result-${queryCount}`,
-          parent_tool_use_id: null,
-          message: { content: [{ type: 'tool_result', tool_use_id: callId, content: '{"documentId":"doc_durable_123456789"}' }] },
-        } as any;
-      }
-      yield {
-        type: 'result', subtype: 'success', session_id: `sdk-${queryCount}`, uuid: `done-${queryCount}`,
-        result: verdict.behavior === 'allow' ? 'Created the document.' : 'Reused the existing document.',
-        duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn',
-        total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
-      } as any;
-    })();
-    return Object.assign(gen, {
-      close() {}, interrupt: async () => {}, setPermissionMode: async () => {}, setModel: async () => {},
-      setMcpServers: async () => ({ added: [], removed: [], errors: {} }), streamInput: async () => {},
-      stopTask: async () => false, backgroundTasks: async () => false,
-    }) as Query;
-  }) as any);
-
-  const options = {
-    prompt: 'Create a Google Doc about the firm.',
-    sessionId: session.id,
-    modelId: 'claude-sonnet-4-6',
-    trackerScopeId,
-    allowedLocalMcpTools: ['mcp__googledocs__create_document'],
-  };
-  try {
-    await runClaudeAgentSdk(options);
-    // A second SDK process/query is the replay boundary. No in-memory claim is
-    // shared; only the durable run scope + SQLite artifact row can stop it.
-    await runClaudeAgentSdk(options);
-    assert.deepEqual(permissionVerdicts, ['allow', 'deny']);
-    assert.equal(providerDispatches, 1, 'the replay never crosses the provider boundary');
-    const [artifact] = artifactLedger.listRunArtifacts(session.id, trackerScopeId);
-    const [reservation] = eventlog.listEvents(session.id, { types: ['external_write'] });
-    const [settlement] = eventlog.listEvents(session.id, { types: ['external_write_succeeded'] });
-    assert.equal(artifact?.status, 'bound');
-    assert.equal(artifact?.externalWriteEventId, reservation?.id, 'artifact is bound to the exact pre-dispatch reservation');
-    assert.equal(reservation?.data.preDispatch, true, 'native mutation is durable before dispatch');
-    assert.equal(settlement?.parentEventId, reservation?.id);
-    assert.equal(settlement?.data.settlementKey, `external-write:${reservation?.id}`);
-  } finally {
-    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
-  }
-});
-
-test('native duplicate admission is replay-safe and leaves economy, ceiling, approval, and grind untouched', async () => {
-  const saved = {
-    CLEMMY_SDK_TOOL_CEILING: process.env.CLEMMY_SDK_TOOL_CEILING,
-    CLEMMY_SDK_MUTATING_CALL_CEILING: process.env.CLEMMY_SDK_MUTATING_CALL_CEILING,
-    CLEMMY_CLAUDE_SDK_REFLECTION: process.env.CLEMMY_CLAUDE_SDK_REFLECTION,
-  };
-  process.env.CLEMMY_SDK_TOOL_CEILING = 'on';
-  process.env.CLEMMY_SDK_MUTATING_CALL_CEILING = '1';
-  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
-  const approvalRegistry = await import('./approval-registry.js');
-  const toolGuardrail = await import('./tool-guardrail.js');
-  const session = eventlog.createSession({ kind: 'chat' });
-  const trackerScopeId = `${session.id}::native-duplicate-admission`;
-  const intent = {
-    kind: 'google_doc',
-    provider: 'Google Docs',
-    slotKey: 'google_doc:primary',
-    title: 'Existing brief',
-    createShape: 'GOOGLEDOCS_CREATE_DOCUMENT',
-  } as const;
-  const seeded = artifactLedger.claimArtifactSlot(session.id, intent, 'seed-existing-doc', trackerScopeId);
-  artifactLedger.bindClaimedArtifact(seeded.artifact.id, 'seed-existing-doc', {
-    resourceId: 'doc_existing_provider_123456',
-    uri: 'https://docs.google.com/document/d/doc_existing_provider_123456/edit',
-  });
-  toolGuardrail._resetAllTrackersForTests();
-  const economyState = toolEconomy.createToolEconomyState({
-    kind: 'single_deliverable', softLimit: 10, hardLimit: 15,
-  });
-  const duplicateVerdicts: Array<{ behavior?: string; message?: string }> = [];
-  let sendVerdict: { behavior?: string; message?: string; interrupt?: boolean } | undefined;
-
-  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
-    yield initOnlyMessage();
-    const canUse = params.options.canUseTool as (
-      name: string,
-      input: unknown,
-      options: { signal: AbortSignal; toolUseID: string },
-    ) => Promise<{ behavior?: string; message?: string; interrupt?: boolean }>;
-    const duplicateInput = { title: 'Existing brief' };
-    // The SDK may replay a permission callback while the first one is still in
-    // flight, then replay it again after resolution. All three are one provider
-    // call and must share one denial without touching downstream accounting.
-    const duplicateOptions = { signal: new AbortController().signal, toolUseID: 'toolu_duplicate_existing_doc' };
-    duplicateVerdicts.push(...await Promise.all([
-      canUse('mcp__googledocs__create_document', duplicateInput, duplicateOptions),
-      canUse('mcp__googledocs__create_document', duplicateInput, duplicateOptions),
-    ]));
-    duplicateVerdicts.push(await canUse(
-      'mcp__googledocs__create_document', duplicateInput, duplicateOptions,
-    ));
-    assert.equal(
-      approvalRegistry.listPending({ sessionId: session.id, status: 'any' }).length,
-      0,
-      'artifact reuse never surfaces an approval card',
-    );
-
-    // With a mutating ceiling of one, this distinct send reaches the approval
-    // boundary only if the duplicate consumed zero ceiling slots.
-    sendVerdict = await canUse(
-      'mcp__outlook__send_email',
-      { to: 'client@example.com', subject: 'Hello', body: 'Test' },
-      { signal: new AbortController().signal, toolUseID: 'toolu_distinct_send' },
-    );
-    yield successResultMessage('permission checks complete');
-  })())) as any);
-
-  try {
-    await assert.rejects(
-      runClaudeAgentSdk({
-        prompt: 'Reuse the existing document, then send the separate approved note.',
-        sessionId: session.id,
-        modelId: 'claude-sonnet-4-6',
-        trackerScopeId,
-        artifactRunScopeId: trackerScopeId,
-        artifactObjective: 'Create one Google Doc named Existing brief.',
-        agentic: true,
-        approvalMode: 'park',
-        allowedLocalMcpTools: ['read_file', 'memory_search'],
-        readFanoutGuard: true,
-        toolEconomyState: economyState,
-      }),
-      ClaudeAgentSdkApprovalBoundaryError,
-      'the distinct send reaches its real approval boundary instead of tripping a ceiling inflated by the duplicate',
-    );
-    assert.equal(duplicateVerdicts.length, 3);
-    for (const verdict of duplicateVerdicts) {
-      assert.equal(verdict.behavior, 'deny');
-      assert.match(verdict.message ?? '', /already bound|do not create another/i);
-    }
-    assert.equal(sendVerdict?.behavior, 'deny');
-    assert.match(sendVerdict?.message ?? '', /Approval .* pending/i);
-    assert.doesNotMatch(sendVerdict?.message ?? '', /stopped myself/i);
-    assert.equal(economyState.attempts, 1, 'only the distinct send is a canonical economy attempt');
-    assert.equal(economyState.allowed, 1);
-    assert.equal(economyState.callDecisions.size, 1, 'duplicate callback/replays mint no economy decisions');
-    assert.equal(
-      toolGuardrail._peekTracker(trackerScopeId).recentCount,
-      1,
-      'only the distinct send enters grind tracking',
-    );
-    const approvals = approvalRegistry.listPending({ sessionId: session.id, status: 'any' });
-    assert.equal(approvals.length, 1, 'only the distinct send creates an approval');
-    assert.match(approvals[0]?.tool ?? '', /send_email/i);
-    assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 0, 'neither denied action is recorded as dispatched');
-    assert.equal(artifactLedger.listRunArtifacts(session.id, trackerScopeId).length, 1, 'the existing artifact remains the only slot');
-  } finally {
-    for (const [key, value] of Object.entries(saved)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-});
-
-test('native artifact admission releases an exact pending claim when a later approval gate denies', async () => {
-  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
-  const session = eventlog.createSession({ kind: 'chat' });
-  const trackerScopeId = `${session.id}::native-release-before-dispatch`;
-  const toolName = 'mcp__googledocs__create_document';
-  const input = { title: 'Approval-gated brief' };
-  let phase: 'denied' | 'allowed' = 'denied';
-  let firstVerdict: { behavior?: string; message?: string } | undefined;
-  let retryVerdict: { behavior?: string; message?: string } | undefined;
-
-  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
-    yield initOnlyMessage();
-    const canUse = params.options.canUseTool as (
-      name: string,
-      args: unknown,
-      options: { signal: AbortSignal; toolUseID: string },
-    ) => Promise<{ behavior?: string; message?: string }>;
-    if (phase === 'denied') {
-      firstVerdict = await canUse(toolName, input, {
-        signal: new AbortController().signal,
-        toolUseID: 'toolu_create_denied_before_dispatch',
-      });
-      yield successResultMessage('approval parked');
-      return;
-    }
-    retryVerdict = await canUse(toolName, input, {
-      signal: new AbortController().signal,
-      toolUseID: 'toolu_create_authorized_retry',
-    });
-    if (retryVerdict.behavior === 'allow') {
-      yield {
-        type: 'assistant', session_id: 's', uuid: 'use-authorized-retry', parent_tool_use_id: null,
-        message: { content: [{ type: 'tool_use', id: 'toolu_create_authorized_retry', name: toolName, input }] },
-      } as any;
-      yield {
-        type: 'user', session_id: 's', uuid: 'result-authorized-retry', parent_tool_use_id: null,
-        message: { content: [{
-          type: 'tool_result', tool_use_id: 'toolu_create_authorized_retry', is_error: false,
-          content: JSON.stringify({ documentId: 'doc_authorized_retry_123456' }),
-        }] },
-      } as any;
-    }
-    yield successResultMessage('authorized retry complete');
-  })())) as any);
-
-  const shared = {
-    prompt: 'Create one Google Doc named Approval-gated brief.',
-    sessionId: session.id,
-    modelId: 'claude-sonnet-4-6',
-    trackerScopeId,
-    artifactRunScopeId: trackerScopeId,
-    artifactObjective: 'Create one Google Doc named Approval-gated brief.',
-  };
-  try {
-    await assert.rejects(
-      runClaudeAgentSdk({
-        ...shared,
-        agentic: true,
-        approvalMode: 'park',
-        allowedLocalMcpTools: ['read_file'],
-      }),
-      ClaudeAgentSdkApprovalBoundaryError,
-    );
-    assert.equal(firstVerdict?.behavior, 'deny');
-    assert.match(firstVerdict?.message ?? '', /Approval .* pending/i);
-    assert.equal(
-      artifactLedger.listRunArtifacts(session.id, trackerScopeId).length,
-      0,
-      'a provider-denied call leaves no stranded pending artifact row',
-    );
-
-    phase = 'allowed';
-    await runClaudeAgentSdk({
-      ...shared,
-      allowedLocalMcpTools: [toolName],
-    });
-    assert.equal(retryVerdict?.behavior, 'allow', 'the authorized retry reacquires the released slot');
-    const [artifact] = artifactLedger.listRunArtifacts(session.id, trackerScopeId);
-    assert.equal(artifact?.status, 'bound');
-    assert.equal(artifact?.resourceId, 'doc_authorized_retry_123456');
-    assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 1);
-  } finally {
-    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
-  }
-});
-
-test('concurrent native MCP sends reserve one same-target write without blocking independent recipients', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const toolName = 'mcp__outlook__send_email';
-  const input = { to: 'race@example.com', subject: 'One message', body: 'Send this once.' };
-  let verdicts: Array<{ behavior?: string; message?: string }> = [];
-  let independentVerdicts: Array<{ behavior?: string; message?: string }> = [];
-  let bulkVerdicts: Array<{ behavior?: string; message?: string }> = [];
-  let reservedAfterRace = 0;
-
-  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
-    yield {
-      type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 'sdk-native-race',
-      uuid: 'init-native-race', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
-      tools: [toolName], mcp_servers: [{ name: 'outlook', status: 'connected' }],
-      permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
-    } as any;
-    const canUse = params.options.canUseTool as (
-      name: string,
-      args: unknown,
-      options: { signal: AbortSignal; toolUseID: string },
-    ) => Promise<{ behavior?: string; message?: string }>;
-    verdicts = await Promise.all([
-      canUse(toolName, input, {
-        signal: new AbortController().signal,
-        toolUseID: 'toolu_native_race_a',
-      }),
-      canUse(toolName, input, {
-        signal: new AbortController().signal,
-        toolUseID: 'toolu_native_race_b',
-      }),
-    ]);
-    reservedAfterRace = eventlog.listEvents(session.id, { types: ['external_write'] }).length;
-    independentVerdicts = await Promise.all([
-      canUse(toolName, { ...input, to: 'left@example.com' }, {
-        signal: new AbortController().signal,
-        toolUseID: 'toolu_native_independent_left',
-      }),
-      canUse(toolName, { ...input, to: 'right@example.com' }, {
-        signal: new AbortController().signal,
-        toolUseID: 'toolu_native_independent_right',
-      }),
-    ]);
-    const recipients = Array.from({ length: 10 }, (_, index) => `bulk-${index + 1}@example.com`);
-    bulkVerdicts = [
-      await canUse(toolName, { ...input, to: recipients }, {
-        signal: new AbortController().signal,
-        toolUseID: 'toolu_native_bulk_ten',
-      }),
-      await canUse(toolName, { ...input, to: recipients[8] }, {
-        signal: new AbortController().signal,
-        toolUseID: 'toolu_native_bulk_ninth_retry',
-      }),
-    ];
-    yield successResultMessage('permission race settled');
-  })())) as any);
-
-  await runClaudeAgentSdk({
-    prompt: 'Send this exact email once.',
-    sessionId: session.id,
-    modelId: 'claude-sonnet-4-6',
-    allowedLocalMcpTools: [toolName],
-    sourceUserSeq: 91,
-  });
-
-  assert.deepEqual(
-    verdicts.map((verdict) => verdict.behavior).sort(),
-    ['allow', 'deny'],
-    'the durable reservation makes the second distinct provider id a duplicate',
-  );
-  assert.match(verdicts.find((verdict) => verdict.behavior === 'deny')?.message ?? '', /duplicate|already sent/i);
-  assert.equal(reservedAfterRace, 1, 'the second same-target callback is denied before unrelated work starts');
-  assert.deepEqual(
-    independentVerdicts.map((verdict) => verdict.behavior),
-    ['allow', 'allow'],
-    'the short shared reservation lock does not refuse independent recipients',
-  );
-  assert.deepEqual(
-    bulkVerdicts.map((verdict) => verdict.behavior),
-    ['allow', 'deny'],
-    'recipient nine remains protected after a ten-recipient send',
-  );
-  assert.equal(
-    eventlog.listEvents(session.id, { types: ['external_write'] }).length,
-    4,
-    'one raced target, two independent recipients, and the ten-recipient action reserve once each',
-  );
-});
-
-test('native MCP provider failures remain ambiguous regardless of returned prose', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  let run = 0;
-  setClaudeAgentSdkQueryForTest(((params: any) => {
-    run += 1;
-    const callId = run === 1
-      ? 'toolu_native_failed'
-      : run === 2
-        ? 'toolu_native_orphan'
-        : run === 3
-          ? 'toolu_native_structured_failed'
-          : run === 4
-            ? 'toolu_native_structured_ambiguous'
-            : run === 5
-              ? 'toolu_native_accepted_timeout'
-              : run === 6
-                ? 'toolu_native_auth_rejected'
-                : run === 7
-                  ? 'toolu_native_not_found'
-                  : 'toolu_native_invalid_response_after_commit';
-    const gen = (async function* () {
-      yield {
-        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: `sdk-write-${run}`,
-        uuid: `init-write-${run}`, apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
-        tools: ['mcp__outlook__send_email'], mcp_servers: [{ name: 'outlook', status: 'connected' }],
-        permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
-      } as any;
-      const input = {
-        to: `client-${run}@example.com`,
-        subject: 'Hello',
-        body: 'Test',
-      };
-      const verdict = await params.options.canUseTool(
-        'mcp__outlook__send_email', input,
-        { signal: new AbortController().signal, toolUseID: callId },
-      );
-      assert.equal(verdict.behavior, 'allow');
-      if (run !== 2) {
-        yield {
-          type: 'assistant', session_id: `sdk-write-${run}`, uuid: `use-${run}`, parent_tool_use_id: null,
-          message: { content: [{ type: 'tool_use', id: callId, name: 'mcp__outlook__send_email', input }] },
-        } as any;
-        yield {
-          type: 'user', session_id: `sdk-write-${run}`, uuid: `result-${run}`, parent_tool_use_id: null,
-          message: {
-            content: [{
-              type: 'tool_result',
-              tool_use_id: callId,
-              is_error: run === 1 || run >= 5,
-              content: run === 1
-                ? '[provider-dispatch:not-started:invalid-args]\nHTTP 400 validation failed: recipient is required'
-                : run === 3
-                  ? '[provider-dispatch:not-started:invalid-args]\n'
-                    + JSON.stringify({ successful: false, error: 'invalid required field: recipient' })
-                  : run === 4
-                    ? JSON.stringify({ successful: false, error: 'provider rejected request after dispatch' })
-                    : run === 5
-                      ? 'HTTP 504 Gateway Timeout after provider accepted the request; final outcome is unknown'
-                      : run === 6
-                        ? 'HTTP 401 Unauthorized: provider rejected the request'
-                        : run === 7
-                          ? 'HTTP 404 Not Found: recipient resource does not exist'
-                          : 'Invalid response envelope after provider accepted and committed the request',
-            }],
-          },
-        } as any;
-      }
-      yield {
-        type: 'result', subtype: 'success', session_id: `sdk-write-${run}`, uuid: `done-write-${run}`,
-        result: 'done', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1,
-        stop_reason: 'end_turn', total_cost_usd: 0,
-        usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
-      } as any;
-    })();
-    return Object.assign(gen, {
-      close() {}, interrupt: async () => {}, setPermissionMode: async () => {}, setModel: async () => {},
-      setMcpServers: async () => ({ added: [], removed: [], errors: {} }), streamInput: async () => {},
-      stopTask: async () => false, backgroundTasks: async () => false,
-    }) as Query;
-  }) as any);
-
-  const options = {
-    prompt: 'Send the email.', sessionId: session.id, modelId: 'claude-sonnet-4-6',
-    allowedLocalMcpTools: ['mcp__outlook__send_email'],
-  };
-  for (let index = 0; index < 8; index += 1) {
-    await runClaudeAgentSdk({
-      ...options,
-      trackerScopeId: `native-write-truth-${index + 1}`,
-      sourceUserSeq: 42,
-    });
-  }
-  const writes = eventlog.listEvents(session.id, { types: ['external_write'] });
-  const failed = eventlog.listEvents(session.id, { types: ['external_write_failed'] });
-  const orphaned = eventlog.listEvents(session.id, { types: ['external_write_orphaned'] });
-  assert.deepEqual(writes.map((event) => (event.data as any).callId), [
-    'toolu_native_failed',
-    'toolu_native_orphan',
-    'toolu_native_structured_failed',
-    'toolu_native_structured_ambiguous',
-    'toolu_native_accepted_timeout',
-    'toolu_native_auth_rejected',
-    'toolu_native_not_found',
-    'toolu_native_invalid_response_after_commit',
-  ]);
-  assert.deepEqual(failed.map((event) => (event.data as any).callId), []);
-  assert.deepEqual(orphaned.map((event) => (event.data as any).callId), [
-    'toolu_native_failed',
-    'toolu_native_orphan',
-    'toolu_native_structured_failed',
-    'toolu_native_structured_ambiguous',
-    'toolu_native_accepted_timeout',
-    'toolu_native_auth_rejected',
-    'toolu_native_not_found',
-    'toolu_native_invalid_response_after_commit',
-  ]);
-  assert.equal(
-    orphaned.filter((event) => (event.data as any).callId === 'toolu_native_accepted_timeout').length,
-    1,
-  );
-  assert.equal(
-    failed.filter((event) => (event.data as any).callId === 'toolu_native_accepted_timeout').length,
-    0,
-  );
-  assert.equal(
-    failed.filter((event) => (event.data as any).callId === 'toolu_native_invalid_response_after_commit').length,
-    0,
-  );
-  assert.ok(
-    [...writes, ...failed, ...orphaned].every((event) => event.data.sourceUserSeq === 42),
-    'native SDK write attempts and resolutions retain exact request ownership',
-  );
-});
-
-test('native external writes settle only from a clean positive acknowledgement', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const cases = [
-    { id: 'toolu_plain_invalid', output: 'Invalid JSON input', success: false },
-    { id: 'toolu_plain_401', output: 'HTTP 401 Unauthorized: provider rejected the request', success: false },
-    { id: 'toolu_empty_object', output: '{}', success: false },
-    { id: 'toolu_nested_invalid', output: JSON.stringify({ detail: 'Invalid JSON input' }), success: false },
-    { id: 'toolu_clean_ack', output: JSON.stringify({ successful: true, data: { id: 'msg-clean-1' } }), success: true },
-  ];
-  let run = 0;
-  setClaudeAgentSdkQueryForTest(((params: any) => {
-    const current = cases[run++]!;
-    return stubsFor((async function* () {
-      yield {
-        ...initOnlyMessage(),
-        tools: ['mcp__outlook__send_email'],
-        mcp_servers: [{ name: 'outlook', status: 'connected' }],
-      } as any;
-      const input = {
-        to: `${current.id}@example.com`,
-        subject: 'Acknowledgement test',
-        body: 'Hello',
-      };
-      const verdict = await params.options.canUseTool(
-        'mcp__outlook__send_email',
-        input,
-        { signal: new AbortController().signal, toolUseID: current.id },
-      );
-      assert.equal(verdict.behavior, 'allow');
-      yield {
-        type: 'assistant',
-        session_id: `sdk-ack-${current.id}`,
-        uuid: `use-${current.id}`,
-        parent_tool_use_id: null,
-        message: {
-          content: [{
-            type: 'tool_use',
-            id: current.id,
-            name: 'mcp__outlook__send_email',
-            input,
-          }],
-        },
-      } as any;
-      yield {
-        type: 'user',
-        session_id: `sdk-ack-${current.id}`,
-        uuid: `result-${current.id}`,
-        parent_tool_use_id: null,
-        message: {
-          content: [{
-            type: 'tool_result',
-            tool_use_id: current.id,
-            is_error: false,
-            content: current.output,
-          }],
-        },
-      } as any;
-      yield successResultMessage(current.success ? 'clean acknowledgement observed' : 'ambiguous acknowledgement observed');
-    })());
-  }) as any);
-
-  for (const current of cases) {
-    await runClaudeAgentSdk({
-      prompt: 'Send one test email.',
-      sessionId: session.id,
-      modelId: 'claude-sonnet-4-6',
-      allowedLocalMcpTools: ['mcp__outlook__send_email'],
-      sourceUserSeq: 84,
-      trackerScopeId: `native-ack-${current.id}`,
-    });
-  }
-
-  assert.deepEqual(
-    eventlog.listEvents(session.id, { types: ['external_write_orphaned'] })
-      .map((event) => event.data.callId),
-    cases.filter((entry) => !entry.success).map((entry) => entry.id),
-  );
-  assert.deepEqual(
-    eventlog.listEvents(session.id, { types: ['external_write_succeeded'] })
-      .map((event) => event.data.callId),
-    ['toolu_clean_ack'],
-  );
-});
-
-test('native targetless writes require call ids, race by payload, and keep malformed results ambiguous', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const toolName = 'mcp__linkedin__create_post';
-  const input = { text: 'Clementine launch note', visibility: 'PUBLIC' };
-  let queryRun = 0;
-  let idlessVerdict: { behavior?: string; message?: string; interrupt?: boolean } | undefined;
-  let raceVerdicts: Array<{ behavior?: string; message?: string }> = [];
-  let allowedCallId = '';
-
-  setClaudeAgentSdkQueryForTest(((params: any) => {
-    queryRun += 1;
-    const thisRun = queryRun;
-    return stubsFor((async function* () {
-      yield {
-        ...initOnlyMessage(),
-        tools: [toolName],
-        mcp_servers: [{ name: 'linkedin', status: 'connected' }],
-      } as any;
-      const canUse = params.options.canUseTool as (
-        name: string,
-        args: unknown,
-        options: { signal: AbortSignal; toolUseID: string },
-      ) => Promise<{ behavior?: string; message?: string; interrupt?: boolean }>;
-      if (thisRun === 1) {
-        idlessVerdict = await canUse(toolName, input, {
-          signal: new AbortController().signal,
-          toolUseID: '',
-        });
-        yield successResultMessage('correlation refusal observed');
-        return;
-      }
-
-      const calls = ['toolu_targetless_a', 'toolu_targetless_b'];
-      raceVerdicts = await Promise.all(calls.map((callId) => canUse(toolName, input, {
-        signal: new AbortController().signal,
-        toolUseID: callId,
-      })));
-      const allowedIndex = raceVerdicts.findIndex((verdict) => verdict.behavior === 'allow');
-      allowedCallId = calls[allowedIndex] ?? '';
-      yield {
-        type: 'assistant', session_id: 'sdk-targetless', uuid: 'use-targetless', parent_tool_use_id: null,
-        message: {
-          content: [{
-            type: 'tool_use',
-            id: allowedCallId,
-            name: toolName,
-            input,
-          }],
-        },
-      } as any;
-      yield {
-        type: 'user', session_id: 'sdk-targetless', uuid: 'result-targetless', parent_tool_use_id: null,
-        message: {
-          content: [{
-            type: 'tool_result',
-            tool_use_id: allowedCallId,
-            is_error: false,
-            content: [{ type: 'text' }],
-          }],
-        },
-      } as any;
-      yield successResultMessage('malformed result observed');
-    })());
-  }) as any);
-
-  const options = {
-    prompt: 'Publish this exact LinkedIn post once.',
-    sessionId: session.id,
-    modelId: 'claude-sonnet-4-6',
-    allowedLocalMcpTools: [toolName],
-    sourceUserSeq: 77,
-  };
-  await runClaudeAgentSdk({ ...options, trackerScopeId: 'targetless-idless' });
-  await runClaudeAgentSdk({ ...options, trackerScopeId: 'targetless-race' });
-
-  assert.equal(idlessVerdict?.behavior, 'deny');
-  assert.equal(idlessVerdict?.interrupt, true);
-  assert.match(idlessVerdict?.message ?? '', /correlation|required|tool-use id/i);
-  assert.deepEqual(
-    raceVerdicts.map((verdict) => verdict.behavior).sort(),
-    ['allow', 'deny'],
-    'the exact payload fingerprint serializes a recipient-less publish race',
-  );
-  const [reservation] = eventlog.listEvents(session.id, { types: ['external_write'] });
-  assert.equal(reservation?.data.callId, allowedCallId);
-  assert.ok(
-    (reservation?.data.duplicateIdentityKeys as string[] | undefined)?.every(
-      (key) => key.startsWith('payload:'),
-    ),
-  );
-  const [orphan] = eventlog.listEvents(session.id, { types: ['external_write_orphaned'] });
-  assert.equal(orphan?.data.callId, allowedCallId);
-  assert.equal(orphan?.data.malformedResult, true);
-  assert.equal(eventlog.listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
-  assert.equal(eventlog.listEvents(session.id, { types: ['external_write_failed'] }).length, 0);
-});
-
-test('a resolved native-write permission cannot be replayed under the same provider call id', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const toolName = 'mcp__linkedin__create_post';
-  const input = { text: `call-id reuse guard ${session.id}`, visibility: 'PUBLIC' };
-  const callId = 'toolu_native_write_permission_reuse';
-  const verdicts: Array<{ behavior?: string; interrupt?: boolean; message?: string }> = [];
-  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
-    yield {
-      ...initOnlyMessage(),
-      tools: [toolName],
-      mcp_servers: [{ name: 'linkedin', status: 'connected' }],
-    } as any;
-    const canUse = params.options.canUseTool as (
-      name: string,
-      args: unknown,
-      options: { signal: AbortSignal; toolUseID: string },
-    ) => Promise<{ behavior?: string; interrupt?: boolean; message?: string }>;
-    const permissionOptions = { signal: new AbortController().signal, toolUseID: callId };
-    verdicts.push(await canUse(toolName, input, permissionOptions));
-    verdicts.push(await canUse(toolName, input, permissionOptions));
-    yield successResultMessage('permission reuse checked');
-  })())) as any);
-
-  await runClaudeAgentSdk({
-    prompt: 'Publish this post once.',
-    sessionId: session.id,
-    modelId: 'claude-sonnet-4-6',
-    trackerScopeId: `${session.id}::native-write-permission-reuse`,
-    allowedLocalMcpTools: [toolName],
-  });
-
-  assert.deepEqual(verdicts.map((verdict) => verdict.behavior), ['allow', 'deny']);
-  assert.equal(verdicts[1]?.interrupt, true);
-  assert.match(verdicts[1]?.message ?? '', /reused|another dispatch|reservation/i);
-  assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 1);
-  assert.equal(eventlog.listEvents(session.id, { types: ['external_write_orphaned'] }).length, 1);
-});
-
-test('explicit multi-document objective permits distinct native creates and settles reversed results by call id', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const trackerScopeId = `${session.id}::multi-doc-root`;
-  const calls = [
-    { id: 'toolu_client_brief', title: 'Client brief', documentId: 'doc_client_brief_123456' },
-    { id: 'toolu_appendix', title: 'Technical appendix', documentId: 'doc_appendix_123456' },
-  ];
-  const verdicts: string[] = [];
-  setClaudeAgentSdkQueryForTest(((params: any) => {
-    const gen = (async function* () {
-      yield {
-        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 'sdk-multi-doc',
-        uuid: 'init-multi-doc', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
-        tools: ['mcp__googledocs__create_document'], mcp_servers: [{ name: 'googledocs', status: 'connected' }],
-        permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
-      } as any;
-      for (const call of calls) {
-        const verdict = await params.options.canUseTool(
-          'mcp__googledocs__create_document', { title: call.title },
-          { signal: new AbortController().signal, toolUseID: call.id },
-        );
-        verdicts.push(verdict.behavior);
-      }
-      yield {
-        type: 'assistant', session_id: 'sdk-multi-doc', uuid: 'uses-multi-doc', parent_tool_use_id: null,
-        message: { content: calls.map((call) => ({
-          type: 'tool_use', id: call.id, name: 'mcp__googledocs__create_document', input: { title: call.title },
-        })) },
-      } as any;
-      yield {
-        type: 'user', session_id: 'sdk-multi-doc', uuid: 'results-multi-doc', parent_tool_use_id: null,
-        message: { content: [...calls].reverse().map((call) => ({
-          type: 'tool_result', tool_use_id: call.id, is_error: false,
-          content: JSON.stringify({ documentId: call.documentId }),
-        })) },
-      } as any;
-      yield {
-        type: 'result', subtype: 'success', session_id: 'sdk-multi-doc', uuid: 'done-multi-doc',
-        result: 'Created both documents.', duration_ms: 1, duration_api_ms: 1, is_error: false,
-        num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0,
-        usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
-      } as any;
-    })();
-    return Object.assign(gen, {
-      close() {}, interrupt: async () => {}, setPermissionMode: async () => {}, setModel: async () => {},
-      setMcpServers: async () => ({ added: [], removed: [], errors: {} }), streamInput: async () => {},
-      stopTask: async () => false, backgroundTasks: async () => false,
-    }) as Query;
-  }) as any);
-  await runClaudeAgentSdk({
-    prompt: 'Create two separate Google Docs: a client brief and a technical appendix.',
-    artifactObjective: 'Create two separate Google Docs: a client brief and a technical appendix.',
-    sessionId: session.id,
-    trackerScopeId,
-    artifactRunScopeId: trackerScopeId,
-    modelId: 'claude-sonnet-4-6',
-    allowedLocalMcpTools: ['mcp__googledocs__create_document'],
-  });
-  assert.deepEqual(verdicts, ['allow', 'allow']);
-  const artifacts = artifactLedger.listRunArtifacts(session.id, trackerScopeId);
-  assert.deepEqual(
-    artifacts.map((artifact) => [artifact.slotKey, artifact.resourceId]),
-    [
-      ['google_doc:client-brief', 'doc_client_brief_123456'],
-      ['google_doc:technical-appendix', 'doc_appendix_123456'],
-    ],
-  );
-});
-
-test('artifact verification repair gate enforces exact-id read-back and denies every mutation/exploration call', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const documentId = 'doc_enforced_verify_123456789';
-  const verdicts: string[] = [];
-  setClaudeAgentSdkQueryForTest(((params: any) => {
-    const gen = (async function* () {
-      yield {
-        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 'sdk-verify-gate',
-        uuid: 'init-verify-gate', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
-        tools: [], mcp_servers: [], permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
-      } as any;
-      const calls = [
-        ['mcp__googledocs__create_document', { title: 'Duplicate' }, 'create'],
-        ['mcp__googledocs__search_documents', { query: 'Firm' }, 'search'],
-        ['mcp__googledocs__get_document', { document_id: 'wrong-doc' }, 'wrong'],
-        ['mcp__googledocs__get_document', { document_id: documentId }, 'exact'],
-      ] as const;
-      for (const [name, input, id] of calls) {
-        const verdict = await params.options.canUseTool(name, input, {
-          signal: new AbortController().signal, toolUseID: `toolu_${id}`,
-        });
-        verdicts.push(verdict.behavior);
-      }
-      yield {
-        type: 'result', subtype: 'success', session_id: 'sdk-verify-gate', uuid: 'done-verify-gate',
-        result: 'checked', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1,
-        stop_reason: 'end_turn', total_cost_usd: 0,
-        usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
-      } as any;
-    })();
-    return Object.assign(gen, {
-      close() {}, interrupt: async () => {}, setPermissionMode: async () => {}, setModel: async () => {},
-      setMcpServers: async () => ({ added: [], removed: [], errors: {} }), streamInput: async () => {},
-      stopTask: async () => false, backgroundTasks: async () => false,
-    }) as Query;
-  }) as any);
-  await runClaudeAgentSdk({
-    prompt: 'Verify only.', sessionId: session.id, modelId: 'claude-sonnet-4-6',
-    allowedLocalMcpTools: ['mcp__googledocs__get_document'],
-    artifactVerificationOnly: [{ kind: 'google_doc', resourceId: documentId }],
-  });
-  assert.deepEqual(verdicts, ['deny', 'deny', 'deny', 'allow']);
-  assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 0);
-});
-
-test('native MCP scope classifies by exact server identity even when server or tool names contain clement', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const outOfLease = [
-    'mcp__leased-server__read_clement_history',
+  const trackerScopeId = `${session.id}::foreign-mcp-denial`;
+  const foreignNames = [
+    'mcp__googledocs__create_document',
+    'mcp__outlook__send_email',
+    'mcp__foreign__ping',
     'mcp__clement-data-provider__read_record',
+    'mcp__clementine-local-shadow__ping',
   ];
-  const verdicts: Array<{ behavior?: string; message?: string }> = [];
-  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
-    yield {
-      ...initOnlyMessage(),
-      tools: outOfLease,
-      mcp_servers: [
-        { name: 'leased-server', status: 'connected' },
-        { name: 'clement-data-provider', status: 'connected' },
-      ],
-    } as any;
-    for (const [index, toolName] of outOfLease.entries()) {
-      verdicts.push(await params.options.canUseTool(
-        toolName,
-        { query: 'private' },
-        { signal: new AbortController().signal, toolUseID: `toolu_scope_clement_${index}` },
-      ));
-    }
-    yield successResultMessage('scope checks complete');
-  })())) as any);
+  const verdicts: Array<{ name: string; behavior?: string; interrupt?: boolean; message?: string }> = [];
+  let localVerdict: { behavior?: string; updatedInput?: unknown } | undefined;
+  let simulatedProviderBodies = 0;
+  let finalQueryMcpKeys: string[] = [];
+
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    finalQueryMcpKeys = Object.keys(params.options.mcpServers ?? {}).sort();
+    const query = (async function* () {
+      yield {
+        type: 'system',
+        subtype: 'init',
+        model: 'claude-sonnet-4-6',
+        session_id: 'sdk-foreign-mcp-denial',
+        uuid: 'foreign-init',
+        apiKeySource: 'none',
+        claude_code_version: '2.1.181',
+        cwd: process.cwd(),
+        tools: ['mcp__clementine-local__ping'],
+        mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+        permissionMode: 'default',
+        slash_commands: [],
+        output_style: 'default',
+        skills: [],
+        plugins: [],
+      } as any;
+      for (const [index, name] of foreignNames.entries()) {
+        const verdict = await params.options.canUseTool(
+          name,
+          name.includes('send_email')
+            ? { to: 'client@example.com', subject: 'Hello', body: 'Test' }
+            : { probe: index },
+          {
+            signal: new AbortController().signal,
+            toolUseID: `toolu_foreign_${index}`,
+          },
+        );
+        verdicts.push({ name, ...verdict });
+        if (verdict.behavior === 'allow') simulatedProviderBodies += 1;
+      }
+      localVerdict = await params.options.canUseTool(
+        'mcp__clementine-local__ping',
+        { probe: 'local' },
+        {
+          signal: new AbortController().signal,
+          toolUseID: 'toolu_local_ping',
+        },
+      );
+      yield {
+        type: 'result',
+        subtype: 'success',
+        session_id: 'sdk-foreign-mcp-denial',
+        uuid: 'foreign-result',
+        result: 'Foreign MCP denied.',
+        duration_ms: 1,
+        duration_api_ms: 1,
+        is_error: false,
+        num_turns: 1,
+        stop_reason: 'end_turn',
+        total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 },
+        modelUsage: {},
+        permission_denials: [],
+      } as any;
+    })();
+    return Object.assign(query, {
+      close() {},
+      interrupt: async () => {},
+      setPermissionMode: async () => {},
+      setModel: async () => {},
+      setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
+      streamInput: async () => {},
+      stopTask: async () => false,
+      backgroundTasks: async () => false,
+    }) as Query;
+  }) as any);
 
   await runClaudeAgentSdk({
-    prompt: 'Use only the leased exact read.',
+    prompt: 'Attempt foreign MCP calls, then use the local ping.',
     sessionId: session.id,
     modelId: 'claude-sonnet-4-6',
-    trackerScopeId: `${session.id}::native-structural-scope`,
-    allowedLocalMcpTools: outOfLease,
+    trackerScopeId,
+    agentic: true,
+    allowedLocalMcpTools: ['ping'],
     nativeMcpToolScope: {
-      reason: 'exact structural classifier test',
-      allowedServerSlugs: ['leased-server'],
-      allowedToolNames: ['leased-server__read_record'],
-      maxTools: 1,
+      reason: 'even an explicit legacy native scope cannot reopen SDK execution',
+      authority: 'exact',
+      allowedToolNames: foreignNames,
+      maxTools: foreignNames.length,
     },
   });
 
-  assert.equal(verdicts.length, 2);
+  assert.deepEqual(finalQueryMcpKeys, ['clementine-local']);
+  assert.equal(simulatedProviderBodies, 0, 'foreign permission denial keeps every direct provider body at zero');
+  assert.equal(verdicts.length, foreignNames.length);
   for (const verdict of verdicts) {
-    assert.equal(verdict.behavior, 'deny');
-    assert.match(verdict.message ?? '', /MCP_SCOPE_DENIED/);
+    assert.equal(verdict.behavior, 'deny', verdict.name);
+    assert.equal(verdict.interrupt, false, verdict.name);
+    assert.match(verdict.message ?? '', /FOREIGN_MCP_DIRECT_EXECUTION_DENIED/);
+    assert.match(verdict.message ?? '', /call_tool\/work_call carrier/);
   }
-});
-
-test('native MCP getter result independently verifies the exact bound Google Doc', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const trackerScopeId = `${session.id}::brain:verify-native-doc`;
-  const documentId = 'doc_native_verify_123456789';
-  const intent = {
-    kind: 'google_doc', provider: 'Google Docs', slotKey: 'google_doc:primary',
-    title: 'Native brief', createShape: 'GOOGLEDOCS_CREATE_DOCUMENT',
-  } as const;
-  artifactLedger.claimArtifactSlot(session.id, intent, 'native-create', trackerScopeId);
-  artifactLedger.bindArtifactSlot(session.id, intent.slotKey, {
-    resourceId: documentId,
-    uri: `https://docs.google.com/document/d/${documentId}/edit`,
-  }, 'native-create', trackerScopeId);
-
-  const messages: SDKMessage[] = [
-    {
-      type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 'sdk-native-verify',
-      uuid: 'init-native-verify', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
-      tools: ['mcp__googledocs__get_document'], mcp_servers: [{ name: 'googledocs', status: 'connected' }],
-      permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
-    } as any,
-    {
-      type: 'assistant', session_id: 'sdk-native-verify', uuid: 'use-native-verify', parent_tool_use_id: null,
-      message: { content: [{
-        type: 'tool_use', id: 'toolu_native_readback', name: 'mcp__googledocs__get_document',
-        input: { document_id: documentId },
-      }] },
-    } as any,
-    {
-      type: 'user', session_id: 'sdk-native-verify', uuid: 'result-native-verify', parent_tool_use_id: null,
-      message: { content: [{
-        type: 'tool_result', tool_use_id: 'toolu_native_readback', is_error: false,
-        content: JSON.stringify({ data: {
-          document_id: documentId,
-          display_url: `https://docs.google.com/document/d/${documentId}/edit`,
-          plain_text: 'Verified brief',
-        } }),
-      }] },
-    } as any,
-    {
-      type: 'result', subtype: 'success', session_id: 'sdk-native-verify', uuid: 'done-native-verify',
-      result: 'Verified the document.', duration_ms: 1, duration_api_ms: 1, is_error: false,
-      num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0,
-      usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
-    } as any,
-  ];
-  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
-  setClaudeAgentSdkQueryForTest((() => queryFromMessages(messages, {})) as any);
-  try {
-    await runClaudeAgentSdk({
-      prompt: 'Verify the document.', sessionId: session.id, trackerScopeId,
-      modelId: 'claude-sonnet-4-6', allowedLocalMcpTools: [],
-    });
-    const [verified] = artifactLedger.listRunArtifacts(session.id, trackerScopeId);
-    assert.ok(verified?.bindingVerifiedAt);
-    assert.equal(verified?.verificationCallId, 'toolu_native_readback');
-    assert.equal(verified?.verificationShape, 'GOOGLEDOCS_GET_DOCUMENT');
-  } finally {
-    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
-  }
-});
-
-test('Claude-native result parking mints one exact invocation row per physical reused call id', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const callId = 'toolu_native_reused_exact';
-  const outputs = [
-    JSON.stringify({ rows: Array.from({ length: 8 }, (_, index) => ({ id: index + 1 })) }),
-    JSON.stringify({ rows: [{ id: 9 }] }),
-  ];
-  let run = 0;
-  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
-  setClaudeAgentSdkQueryForTest((() => {
-    const output = outputs[run++]!;
-    return queryFromMessages([
-      {
-        ...initOnlyMessage(),
-        tools: ['mcp__records__query_rows'],
-        mcp_servers: [{ name: 'records', status: 'connected' }],
-      } as any,
-      {
-        type: 'assistant', session_id: `sdk-native-reused-${run}`, uuid: `use-native-reused-${run}`,
-        parent_tool_use_id: null,
-        message: { content: [{
-          type: 'tool_use', id: callId, name: 'mcp__records__query_rows', input: { limit: run === 1 ? 8 : 1 },
-        }] },
-      } as any,
-      {
-        type: 'user', session_id: `sdk-native-reused-${run}`, uuid: `return-native-reused-${run}`,
-        parent_tool_use_id: null,
-        message: { content: [{ type: 'tool_result', tool_use_id: callId, is_error: false, content: output }] },
-      } as any,
-      successResultMessage(`physical invocation ${run}`),
-    ], {});
-  }) as any);
-
-  try {
-    for (let index = 0; index < outputs.length; index += 1) {
-      await runClaudeAgentSdk({
-        prompt: 'Read the exact current rows.',
-        sessionId: session.id,
-        modelId: 'claude-sonnet-4-6',
-        trackerScopeId: `${session.id}::native-reused-${index + 1}`,
-        allowedLocalMcpTools: [],
-      });
-      if (index === 0) {
-        const exact = eventlog.resolveToolOutputForAuthority(session.id, callId);
-        assert.equal(exact.status, 'ok', 'one parented native occurrence is exact authority');
-        if (exact.status === 'ok') assert.equal(exact.record.output, outputs[0]);
-      }
-    }
-    const invocations = eventlog.listToolOutputInvocations(session.id, callId);
-    assert.equal(invocations.length, 2);
-    assert.equal(new Set(invocations.map((row: any) => row.invocationNonce)).size, 2);
-    assert.deepEqual(invocations.map((row: any) => row.output), outputs);
-    assert.equal(
-      eventlog.resolveToolOutputForAuthority(session.id, callId).status,
-      'ambiguous',
-      'reusing the provider id never silently selects one physical result',
-    );
-  } finally {
-    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
-  }
-});
-
-test('same-run Claude-native call-id reuse keeps differing results and inputs as ambiguous occurrences', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const callId = 'toolu_native_reused_same_run';
-  const toolName = 'mcp__records__query_rows';
-  const input = { table: 'sales', limit: 8 };
-  const firstOutput = JSON.stringify({ rows: [{ id: 1 }, { id: 2 }] });
-  const secondOutput = JSON.stringify({ rows: [{ id: 9 }] });
-  const thirdOutput = JSON.stringify({ rows: [{ id: 17 }] });
-  const use = {
-    type: 'assistant', session_id: 'sdk-native-reused-same-run', parent_tool_use_id: null,
-    message: { content: [{ type: 'tool_use', id: callId, name: toolName, input }] },
-  };
-  const returned = (uuid: string, content: string) => ({
-    type: 'user', session_id: 'sdk-native-reused-same-run', uuid, parent_tool_use_id: null,
-    message: { content: [{ type: 'tool_result', tool_use_id: callId, is_error: false, content }] },
-  });
-  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
-  setClaudeAgentSdkQueryForTest((() => queryFromMessages([
-    {
-      ...initOnlyMessage(),
-      tools: [toolName],
-      mcp_servers: [{ name: 'records', status: 'connected' }],
-    } as any,
-    { ...use, uuid: 'use-native-reused-same-run-1' } as any,
-    { ...use, uuid: 'use-native-reused-same-run-replay' } as any,
-    returned('return-native-reused-same-run-1', firstOutput) as any,
-    returned('return-native-reused-same-run-replay', firstOutput) as any,
-    { ...use, uuid: 'use-native-reused-same-run-2' } as any,
-    returned('return-native-reused-same-run-2', secondOutput) as any,
-    {
-      ...use,
-      uuid: 'use-native-reused-same-run-3',
-      message: {
-        content: [{ type: 'tool_use', id: callId, name: toolName, input: { table: 'customers', limit: 2 } }],
-      },
-    } as any,
-    returned('return-native-reused-same-run-3', thirdOutput) as any,
-    successResultMessage('read both physical occurrences'),
-  ], {})) as any);
-
-  try {
-    const result = await runClaudeAgentSdk({
-      prompt: 'Read the exact current rows.',
-      sessionId: session.id,
-      modelId: 'claude-sonnet-4-6',
-      trackerScopeId: `${session.id}::native-reused-same-run`,
-      allowedLocalMcpTools: [],
-    });
-    const invocations = eventlog.listToolOutputInvocations(session.id, callId);
-    assert.equal(invocations.length, 3, 'exact frame replay coalesces while differing result bytes or inputs remain physical occurrences');
-    assert.equal(new Set(invocations.map((row: any) => row.invocationNonce)).size, 3);
-    assert.deepEqual(
-      new Set(invocations.map((row: any) => row.output)),
-      new Set([firstOutput, secondOutput, thirdOutput]),
-      'the invocation store preserves every physical result; equal-millisecond writes need not sort by stream order',
-    );
-    assert.equal(result.toolCallLedger?.length, 3);
-    assert.deepEqual(result.toolUses, [toolName, toolName, toolName]);
-    const called = eventlog.listEvents(session.id, { types: ['tool_called'] });
-    const returnedEvents = eventlog.listEvents(session.id, { types: ['tool_returned'] });
-    assert.equal(called.length, 3);
-    assert.equal(returnedEvents.length, 3);
-    assert.deepEqual(returnedEvents.map((event) => event.parentEventId), called.map((event) => event.id));
-    assert.equal(
-      eventlog.resolveToolOutputForAuthority(session.id, callId).status,
-      'ambiguous',
-      'a reused provider id cannot silently select the first same-run result',
-    );
-  } finally {
-    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
-  }
-});
-
-test('later exact native readback idempotently settles the original reservation after the verification crash window', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const trackerScopeId = `${session.id}::native-artifact-crash-window`;
-  const documentId = 'doc_native_crash_recovery_123456789';
-  const createCallId = 'toolu_native_crash_create';
-  const lostVerificationCallId = 'toolu_native_lost_verification';
-  const createTool = 'mcp__googledocs__create_document';
-  const readTool = 'mcp__googledocs__get_document';
-  let run = 0;
-  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
-  setClaudeAgentSdkQueryForTest(((params: any) => {
-    run += 1;
-    if (run === 1) {
-      return stubsFor((async function* () {
-        yield {
-          ...initOnlyMessage(),
-          tools: [createTool],
-          mcp_servers: [{ name: 'googledocs', status: 'connected' }],
-        } as any;
-        const input = { title: 'Crash-safe native brief' };
-        const verdict = await params.options.canUseTool(
-          createTool,
-          input,
-          { signal: new AbortController().signal, toolUseID: createCallId },
-        );
-        assert.equal(verdict.behavior, 'allow');
-        yield {
-          type: 'assistant', session_id: 'sdk-native-crash-create', uuid: 'use-native-crash-create',
-          parent_tool_use_id: null,
-          message: { content: [{ type: 'tool_use', id: createCallId, name: createTool, input }] },
-        } as any;
-        yield {
-          type: 'user', session_id: 'sdk-native-crash-create', uuid: 'return-native-crash-create',
-          parent_tool_use_id: null,
-          message: { content: [{
-            type: 'tool_result', tool_use_id: createCallId, is_error: false,
-            content: `[provider-dispatch:uncertain]\n{"documentId":"${documentId}","url":"https://docs.google.com/document/d/${documentId}/edit"}`,
-          }] },
-        } as any;
-        yield successResultMessage('create outcome is ambiguous');
-      })());
-    }
-    const readCallId = `toolu_native_recovery_read_${run}`;
-    return queryFromMessages([
-      {
-        ...initOnlyMessage(),
-        tools: [readTool],
-        mcp_servers: [{ name: 'googledocs', status: 'connected' }],
-      } as any,
-      {
-        type: 'assistant', session_id: `sdk-native-recovery-${run}`, uuid: `use-native-recovery-${run}`,
-        parent_tool_use_id: null,
-        message: { content: [{
-          type: 'tool_use', id: readCallId, name: readTool, input: { document_id: documentId },
-        }] },
-      } as any,
-      {
-        type: 'user', session_id: `sdk-native-recovery-${run}`, uuid: `return-native-recovery-${run}`,
-        parent_tool_use_id: null,
-        message: { content: [{
-          type: 'tool_result', tool_use_id: readCallId, is_error: false,
-          content: JSON.stringify({ data: {
-            document_id: documentId,
-            display_url: `https://docs.google.com/document/d/${documentId}/edit`,
-            plain_text: 'Durable provider readback',
-          } }),
-        }] },
-      } as any,
-      successResultMessage('readback observed'),
-    ], {});
-  }) as any);
-
-  try {
-    const shared = {
-      prompt: 'Create and verify one crash-safe native brief.',
-      sessionId: session.id,
-      modelId: 'claude-sonnet-4-6',
-      trackerScopeId,
-      artifactRunScopeId: trackerScopeId,
-      artifactObjective: 'Create one Google Doc named Crash-safe native brief.',
-    };
-    await runClaudeAgentSdk({ ...shared, allowedLocalMcpTools: [createTool] });
-
-    const [reservation] = eventlog.listEvents(session.id, { types: ['external_write'] });
-    const [orphan] = eventlog.listEvents(session.id, { types: ['external_write_orphaned'] });
-    const [boundBeforeRead] = artifactLedger.listRunArtifacts(session.id, trackerScopeId);
-    assert.equal(boundBeforeRead?.externalWriteEventId, reservation?.id);
-    assert.equal(orphan?.parentEventId, reservation?.id);
-    assert.equal(eventlog.listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
-
-    const verifiedBeforeCrash = artifactLedger.verifyArtifactBindingFromToolResult(
-      session.id,
-      trackerScopeId,
-      readTool,
-      { document_id: documentId },
-      { data: {
-        document_id: documentId,
-        display_url: `https://docs.google.com/document/d/${documentId}/edit`,
-        plain_text: 'Verified before the bridge ran',
-      } },
-      lostVerificationCallId,
-      true,
-    );
-    assert.ok(verifiedBeforeCrash?.bindingVerifiedAt, 'verification commits before the simulated crash');
-    assert.equal(eventlog.listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
-
-    await runClaudeAgentSdk({ ...shared, allowedLocalMcpTools: [readTool] });
-    await runClaudeAgentSdk({ ...shared, allowedLocalMcpTools: [readTool] });
-    const settlements = eventlog.listEvents(session.id, { types: ['external_write_succeeded'] });
-    assert.equal(settlements.length, 1, 'repeated exact reads cannot duplicate the success settlement');
-    assert.equal(settlements[0]?.parentEventId, reservation?.id);
-    assert.equal(settlements[0]?.data.settlementKey, `external-write:${reservation?.id}`);
-    assert.equal(settlements[0]?.data.evidenceCallId, lostVerificationCallId);
-    assert.equal(settlements[0]?.data.reason, 'artifact_readback_verified');
-  } finally {
-    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
-    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
-  }
-});
-
-test('native artifact/write binding refusal closes the reservation with a parented pre-dispatch failure', async () => {
-  const session = eventlog.createSession({ kind: 'chat' });
-  const trackerScopeId = `${session.id}::native-artifact-bind-failure`;
-  const toolName = 'mcp__googledocs__create_document';
-  const callId = 'toolu_native_bind_failure';
-  let verdict: { behavior?: string; message?: string; interrupt?: boolean } | undefined;
-  artifactLedger.listRunArtifacts(session.id, trackerScopeId);
-  const db = eventlog.openEventLog();
-  db.exec(`
-    DROP TRIGGER IF EXISTS force_native_artifact_binding_conflict;
-    CREATE TRIGGER force_native_artifact_binding_conflict
-    AFTER INSERT ON events
-    WHEN NEW.type = 'external_write'
-      AND json_extract(NEW.data_json, '$.callId') = '${callId}'
-    BEGIN
-      UPDATE run_artifacts
-         SET external_write_event_id = 'forced-conflicting-reservation'
-       WHERE session_id = NEW.session_id
-         AND source_call_id = '${callId}';
-    END;
-  `);
-  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
-    yield {
-      ...initOnlyMessage(),
-      tools: [toolName],
-      mcp_servers: [{ name: 'googledocs', status: 'connected' }],
-    } as any;
-    verdict = await params.options.canUseTool(
-      toolName,
-      { title: 'Binding failure brief' },
-      { signal: new AbortController().signal, toolUseID: callId },
-    );
-    yield successResultMessage('binding refusal observed');
-  })())) as any);
-
-  try {
-    await runClaudeAgentSdk({
-      prompt: 'Create one Google Doc named Binding failure brief.',
-      sessionId: session.id,
-      modelId: 'claude-sonnet-4-6',
-      trackerScopeId,
-      artifactRunScopeId: trackerScopeId,
-      artifactObjective: 'Create one Google Doc named Binding failure brief.',
-      allowedLocalMcpTools: [toolName],
-    });
-    assert.equal(verdict?.behavior, 'deny');
-    assert.equal(verdict?.interrupt, true);
-    assert.match(verdict?.message ?? '', /ARTIFACT_WRITE_BINDING_FAILED/);
-    const [reservation] = eventlog.listEvents(session.id, { types: ['external_write'] });
-    const [failure] = eventlog.listEvents(session.id, { types: ['external_write_failed'] });
-    assert.equal(failure?.parentEventId, reservation?.id);
-    assert.equal(failure?.data.dispatch, 'not_started');
-    assert.equal(failure?.data.effect, 'none');
-    assert.equal(failure?.data.preDispatch, true);
-    assert.equal(artifactLedger.listRunArtifacts(session.id, trackerScopeId).length, 0);
-  } finally {
-    db.exec('DROP TRIGGER IF EXISTS force_native_artifact_binding_conflict');
-  }
+  assert.equal(localVerdict?.behavior, 'allow', 'the owned local Clementine proxy remains callable');
+  assert.deepEqual(localVerdict?.updatedInput, { probe: 'local' });
+  assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 0);
+  assert.equal(eventlog.listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
+  assert.equal(eventlog.listEvents(session.id, { types: ['external_write_failed'] }).length, 0);
+  assert.equal(artifactLedger.listRunArtifacts(session.id, trackerScopeId).length, 0);
 });
 
 test('buildClaudeAgentSdkLocalMcpServers exposes the local Clementine MCP in-process SDK server by default', () => {
@@ -1811,7 +660,7 @@ test('agentic schema-on-demand keeps local-runtime-only tools deferred even when
   assert.equal(acquired?.bound.includes('workspace_roots'), true);
 });
 
-test('Claude direct discovery keeps one task claim while admitting a second broad search', async () => {
+test('Claude direct discovery permits one provider body and denies same/distinct replay ids', async () => {
   const { discoveryGovernor } = await import('./discovery-governor.js');
   const session = eventlog.createSession({ kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -1822,6 +671,7 @@ test('Claude direct discovery keeps one task claim while admitting a second broa
     data: { text: 'Find the right built-in workspace inspection capability.' },
   });
   const verdicts: Array<{ id: string; behavior: string; message?: string }> = [];
+  let simulatedProviderBodies = 0;
   setClaudeAgentSdkQueryForTest(((params: any) => {
     const firstId = 'toolu_discovery_first';
     const secondId = 'toolu_discovery_second';
@@ -1836,13 +686,28 @@ test('Claude direct discovery keeps one task claim while admitting a second broa
         mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
         permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
       } as any;
-      const first = await params.options.canUseTool(
+      const firstPermission = params.options.canUseTool(
         'mcp__clementine-local__tool_search',
         firstInput,
         { signal: new AbortController().signal, toolUseID: firstId },
       );
+      const concurrentReplayPermission = params.options.canUseTool(
+        'mcp__clementine-local__tool_search',
+        firstInput,
+        { signal: new AbortController().signal, toolUseID: firstId },
+      );
+      const [first, concurrentReplay] = await Promise.all([
+        firstPermission,
+        concurrentReplayPermission,
+      ]);
       verdicts.push({ id: firstId, behavior: first.behavior, message: first.message });
+      verdicts.push({
+        id: firstId,
+        behavior: concurrentReplay.behavior,
+        message: concurrentReplay.message,
+      });
       if (first.behavior === 'allow') {
+        simulatedProviderBodies += 1;
         yield {
           type: 'assistant', session_id: 'sdk-discovery-budget', uuid: 'discovery-use',
           parent_tool_use_id: null,
@@ -1860,6 +725,13 @@ test('Claude direct discovery keeps one task claim while admitting a second broa
           }] },
         } as any;
       }
+      const exactReplay = await params.options.canUseTool(
+        'mcp__clementine-local__tool_search',
+        firstInput,
+        { signal: new AbortController().signal, toolUseID: firstId },
+      );
+      verdicts.push({ id: firstId, behavior: exactReplay.behavior, message: exactReplay.message });
+      if (exactReplay.behavior === 'allow') simulatedProviderBodies += 1;
       const second = await params.options.canUseTool(
         'mcp__clementine-local__tool_search',
         secondInput,
@@ -1881,7 +753,7 @@ test('Claude direct discovery keeps one task claim while admitting a second broa
     }) as Query;
   }) as any);
 
-  await runClaudeAgentSdk({
+  const runOptions = {
     prompt: 'Find the correct workspace inspection capability.',
     sessionId: session.id,
     sourceUserSeq: source.seq,
@@ -1890,12 +762,21 @@ test('Claude direct discovery keeps one task claim while admitting a second broa
     allowedLocalMcpTools: ['tool_search'],
     mcpToolAllowlist: ['tool_search'],
     localMcpToolUniverse: ['tool_search', 'workspace_roots'],
-  });
+  };
+  await runClaudeAgentSdk(runOptions);
+  // A fresh SDK query owns fresh in-memory permission maps, so this is the
+  // restart boundary for the wrapper. Durable governor state must still keep
+  // every replay at zero provider bodies.
+  await runClaudeAgentSdk(runOptions);
 
-  // The Claude lane behaves like every other lane: a second broad search is
-  // admitted and rides the claim the task already owns. Refusing it never
-  // recovered the model call that had already been spent.
-  assert.deepEqual(verdicts.map((verdict) => verdict.behavior), ['allow', 'allow']);
+  assert.deepEqual(
+    verdicts.map((verdict) => verdict.behavior),
+    ['allow', 'deny', 'deny', 'deny', 'deny', 'deny', 'deny', 'deny'],
+  );
+  assert.match(verdicts[1]?.message ?? '', /same_call_replay/);
+  assert.match(verdicts[2]?.message ?? '', /same_call_replay/);
+  assert.match(verdicts[3]?.message ?? '', /new_call_requires_retry_epoch/);
+  assert.equal(simulatedProviderBodies, 1, 'neither same-id nor distinct-id replay reaches provider code');
   const state = discoveryGovernor.getTaskState({
     sessionId: session.id,
     sourceUserSeq: source.seq,
@@ -1904,14 +785,15 @@ test('Claude direct discovery keeps one task claim while admitting a second broa
   assert.equal(state?.claims.broad_discovery?.outcome, 'succeeded');
   assert.equal(
     eventlog.listEvents(session.id, { types: ['discovery_governor_decision'] }).length,
-    2,
+    4,
+    'the same-id permission-cache denial does not pretend to be a second governor occurrence',
   );
-  // Both searches now do real work and settle, against the ONE claim the task
-  // owns — that shared claim, not a refusal, is what bounds discovery.
-  assert.equal(
-    eventlog.listEvents(session.id, { types: ['discovery_governor_outcome'] }).length,
-    2,
-  );
+  const decisions = eventlog.listEvents(session.id, { types: ['discovery_governor_decision'] });
+  assert.equal(decisions.filter((event) => event.data.decision === 'admitted').length, 1);
+  const outcomes = eventlog.listEvents(session.id, { types: ['discovery_governor_outcome'] });
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0]?.data.callId, 'toolu_discovery_first');
+  assert.equal(outcomes[0]?.data.recorded, true, 'the only admitted provider body settles exactly');
 });
 
 test('runClaudeAgentSdk fails before model work when required local MCP tools are absent from SDK init', async () => {
@@ -4336,146 +3218,27 @@ test('retries are bounded and then the overload surfaces', async () => {
   assert.equal(calls, 3, '1 initial + 2 retries (default cap), then throws');
 });
 
-test('buildScopedNativeMcpServers: an SEO turn attaches the native dataforseo MCP (scoped), kill-switch off yields none', async () => {
-  const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
-  const mcpDir = path.join(TMP_HOME, 'mcp');
-  mkdirSync(mcpDir, { recursive: true });
-  writeFileSync(path.join(mcpDir, 'servers.json'), JSON.stringify({
-    dataforseo: { type: 'stdio', command: 'npx', args: ['dataforseo-mcp-server'], env: { DATAFORSEO_USERNAME: 'x', DATAFORSEO_PASSWORD: 'y' }, description: 'SEO', enabled: true },
-    supabase: { type: 'stdio', command: 'npx', args: ['supabase-mcp'], description: 'db', enabled: true },
-  }), 'utf-8');
-  invalidateMcpServerDiscoveryCache();
-
-  const prev = process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
-  const prevScope = process.env.CLEMMY_SCOPED_MCP_TOOLS;
-  try {
-    delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; // default on
-    process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on'; // ensure scoping engages
-    const seo = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
-    assert.ok(seo.dataforseo, 'the dataforseo native MCP attaches for an SEO turn');
-    assert.equal((seo.dataforseo as any).type, 'stdio');
-    assert.equal((seo.dataforseo as any).command, 'npx');
-    assert.ok((seo.dataforseo as any).env.DATAFORSEO_USERNAME, 'the server env is carried through');
-    assert.equal(seo.supabase, undefined, 'an unrelated native server is scoped OUT of an SEO turn');
-
-    process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = 'off';
-    assert.deepEqual(buildScopedNativeMcpServers('get SEO rankings'), {}, 'kill-switch off ⇒ no native attach');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
-    if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;
-    invalidateMcpServerDiscoveryCache();
-  }
-});
-
-test('buildScopedNativeMcpServers: tool-search DEFAULT-ON defers external servers (alwaysLoad:false); =off keeps them loaded', async () => {
-  const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
-  const mcpDir = path.join(TMP_HOME, 'mcp');
-  mkdirSync(mcpDir, { recursive: true });
-  writeFileSync(path.join(mcpDir, 'servers.json'), JSON.stringify({
-    dataforseo: { type: 'stdio', command: 'npx', args: ['dataforseo-mcp-server'], env: { DATAFORSEO_USERNAME: 'x', DATAFORSEO_PASSWORD: 'y' }, description: 'SEO', enabled: true },
-  }), 'utf-8');
-  invalidateMcpServerDiscoveryCache();
-
-  const prev = process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
-  const prevScope = process.env.CLEMMY_SCOPED_MCP_TOOLS;
-  const prevTS = process.env.CLEMMY_CLAUDE_TOOL_SEARCH;
-  try {
-    delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
-    process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on';
-
-    // DEFAULT (v1.0 = ON): the external server is deferred behind tool search
-    // (surfaced by name, schema on demand) — still attaches, discoverable.
-    delete process.env.CLEMMY_CLAUDE_TOOL_SEARCH;
-    const deferred = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
-    assert.ok(deferred.dataforseo, 'still attaches (discoverable by name)');
-    assert.equal((deferred.dataforseo as any).alwaysLoad, false, 'default-on ⇒ schema deferred / loaded on demand');
-    assert.equal((deferred.dataforseo as any).command, 'npx', 'the rest of the config is preserved');
-
-    // Kill-switch =off: external server loads normally (no forced defer).
-    process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'off';
-    const loaded = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
-    assert.ok(loaded.dataforseo, 'attaches for an SEO turn');
-    assert.equal((loaded.dataforseo as any).alwaysLoad, undefined, '=off ⇒ not forced to defer');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
-    if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;
-    if (prevTS === undefined) delete process.env.CLEMMY_CLAUDE_TOOL_SEARCH; else process.env.CLEMMY_CLAUDE_TOOL_SEARCH = prevTS;
-    invalidateMcpServerDiscoveryCache();
-  }
-});
-
-test('buildScopedNativeMcpServers: an EMPTY scope attaches NO external servers (no allowAll over-attach)', async () => {
-  const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
-  const mcpDir = path.join(TMP_HOME, 'mcp');
-  mkdirSync(mcpDir, { recursive: true });
-  writeFileSync(path.join(mcpDir, 'servers.json'), JSON.stringify({
-    dataforseo: { type: 'stdio', command: 'npx', args: ['dataforseo-mcp-server'], env: { DATAFORSEO_USERNAME: 'x', DATAFORSEO_PASSWORD: 'y' }, description: 'SEO', enabled: true },
-    supabase: { type: 'stdio', command: 'npx', args: ['supabase-mcp'], description: 'db', enabled: true },
-  }), 'utf-8');
-  invalidateMcpServerDiscoveryCache();
-
-  const prev = process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
-  const prevScope = process.env.CLEMMY_SCOPED_MCP_TOOLS;
-  try {
-    delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; // default on
-    process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on';
-    // The regression this guards: an unscoped native-lane call (run_worker /
-    // workflow-step used to pass nothing) must NOT fall through to allowAll and
-    // cold-start every external MCP child. Empty, whitespace, and undefined all
-    // yield {} — a concrete scope still attaches its server (asserted above).
-    assert.deepEqual(buildScopedNativeMcpServers(''), {}, 'empty string ⇒ no external servers');
-    assert.deepEqual(buildScopedNativeMcpServers('   '), {}, 'whitespace ⇒ no external servers');
-    assert.deepEqual(buildScopedNativeMcpServers(undefined), {}, 'undefined ⇒ no external servers');
+test('buildScopedNativeMcpServers is permanently zero-width for every native MCP scope', () => {
+  const scopes = [
+    undefined,
+    '',
+    'get google organic SEO keyword rankings for a domain',
+    'dataforseo__serp_organic_live_advanced',
+  ];
+  for (const scope of scopes) {
+    assert.deepEqual(buildScopedNativeMcpServers(scope), {}, String(scope));
     assert.deepEqual(
-      buildScopedNativeMcpServers(
-        'Use only Clementine local memory. Do not call any external connector. Return names only, no emails.',
-      ),
+      buildScopedNativeMcpServers(scope, { mode: 'resolved_tools' }),
       {},
-      'a concrete local-only boundary ⇒ no external servers',
+      `resolved:${String(scope)}`,
     );
     assert.deepEqual(
-      buildScopedNativeMcpServers('write a local markdown file with a project checklist'),
+      buildScopedNativeMcpServers(scope, {
+        scope: { reason: 'exact', allowedServerSlugs: ['dataforseo'], maxTools: 1 },
+      }),
       {},
-      'an ordinary local-file turn ⇒ no external servers',
+      `explicit:${String(scope)}`,
     );
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
-    if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;
-    invalidateMcpServerDiscoveryCache();
-  }
-});
-
-test('buildScopedNativeMcpServers: resolved_tools mode never fail-opens worker packets', async () => {
-  const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
-  const mcpDir = path.join(TMP_HOME, 'mcp');
-  mkdirSync(mcpDir, { recursive: true });
-  writeFileSync(path.join(mcpDir, 'servers.json'), JSON.stringify({
-    dataforseo: { type: 'stdio', command: 'npx', args: ['dataforseo-mcp-server'], env: { DATAFORSEO_USERNAME: 'x', DATAFORSEO_PASSWORD: 'y' }, description: 'SEO', enabled: true },
-    supabase: { type: 'stdio', command: 'npx', args: ['supabase-mcp'], description: 'db', enabled: true },
-  }), 'utf-8');
-  invalidateMcpServerDiscoveryCache();
-
-  const prev = process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
-  const prevScope = process.env.CLEMMY_SCOPED_MCP_TOOLS;
-  try {
-    delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
-    process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on';
-
-    assert.deepEqual(buildScopedNativeMcpServers('none needed', { mode: 'resolved_tools' }), {});
-    assert.deepEqual(buildScopedNativeMcpServers('skill_read read_file', { mode: 'resolved_tools' }), {});
-    assert.deepEqual(
-      buildScopedNativeMcpServers('DATAFORSEO_GET_GOOGLE_HIST_BULK_TRAFFIC_EST_LIVE', { mode: 'resolved_tools' }),
-      {},
-      'Composio tool slugs stay on composio_execute_tool, not native MCP',
-    );
-
-    const exact = buildScopedNativeMcpServers('dataforseo__serp_organic_live_advanced', { mode: 'resolved_tools' });
-    assert.ok(exact.dataforseo, 'exact native MCP tool slug attaches its server');
-    assert.equal(exact.supabase, undefined, 'resolved_tools mode does not attach unrelated servers');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
-    if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;
-    invalidateMcpServerDiscoveryCache();
   }
 });
 

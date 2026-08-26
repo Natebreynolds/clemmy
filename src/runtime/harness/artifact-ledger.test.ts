@@ -1321,6 +1321,33 @@ test('effect-anchored generic classifier: any CLI create and any root provider c
   ok(bound?.uri?.includes('vercel.app'));
 });
 
+test('host-sealed graph artifacts retain the exact id and non-HTTP provider handle', () => {
+  const intent: ledger.ArtifactIntent = {
+    kind: 'resource',
+    provider: 'host-sealed-graph',
+    slotKey: 'expected-work:create_resource',
+    createShape: 'HOST_SEALED_EXPECTED_WORK_CREATE',
+  };
+  const envelope = {
+    data: {
+      id: 'resource-1',
+      handle: 'competitive://resources/resource-1',
+      receipt: 'provider-receipt-1',
+    },
+    error: null,
+    successful: true,
+  };
+  assert.deepEqual(ledger.extractArtifactResource(intent, JSON.stringify(envelope)), {
+    resourceId: 'resource-1',
+    uri: 'competitive://resources/resource-1',
+    title: undefined,
+  });
+  assert.equal(ledger.extractArtifactResource(intent, {
+    ...envelope,
+    request: { id: 'resource-1' },
+  }), null, 'an envelope with an ambient request echo is not exact provider authority');
+});
+
 test('an unresolved artifact denial carries the exact repair claim id', () => {
   const sid = session();
   const intent = ledger.artifactIntentForTool('run_shell_command', {

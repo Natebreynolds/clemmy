@@ -57,6 +57,7 @@ import { registerVaultTools } from './vault-tools.js';
 import { ensureToolDirectories, textResult } from './shared.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { toolOutputContextFromSdk, withToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
 
 type LocalToolHandler = (input: Record<string, unknown>) => Promise<unknown> | unknown;
 
@@ -72,7 +73,11 @@ interface CapturedLocalTool {
 // agents/tool-taxonomy.ts. `workspace_config` is mixed-mode there:
 // list is read-only, add/remove are admin.
 
-function resultToText(result: unknown): string {
+function resultToText(result: unknown): string | ExternalWritePreDispatchResult {
+  // Preserve nominal pre-dispatch truth through the local Tool adapter. Turning
+  // this into its model-facing string here would make the outer harness see a
+  // normal returned local execution and could incorrectly settle it succeeded.
+  if (result instanceof ExternalWritePreDispatchResult) return result;
   if (typeof result === 'string') return formatRecallableToolText(result);
   if (result && typeof result === 'object') {
     const content = (result as { content?: unknown }).content;

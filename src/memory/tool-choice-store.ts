@@ -96,7 +96,11 @@ export interface ToolChoiceRecordChoice {
   // don't. Reset when the identifier changes (a different tool earns its own
   // record). All optional → absent on legacy/never-measured choices.
   successCount?: number;
+  /** Lifetime negative evidence used by ranking. Never reset by a later win. */
   failureCount?: number;
+  /** Consecutive failures since the last successful re-proof. This, rather
+   * than the lifetime counter, owns the three-strike retirement policy. */
+  failureStreak?: number;
   approvalCount?: number;
   rejectionCount?: number;
   lastSuccessAt?: string;
@@ -405,6 +409,7 @@ function parseChoice(raw: unknown): ToolChoiceRecordChoice | null {
     // byte-identically until an outcome is recorded.
     successCount: numOrUndef(r.successCount),
     failureCount: numOrUndef(r.failureCount),
+    failureStreak: numOrUndef(r.failureStreak),
     approvalCount: numOrUndef(r.approvalCount),
     rejectionCount: numOrUndef(r.rejectionCount),
     lastSuccessAt: typeof r.lastSuccessAt === 'string' ? r.lastSuccessAt : undefined,
@@ -694,6 +699,7 @@ function mergeProcedureChoice(
     testEvidence: preferred.testEvidence ?? current.testEvidence ?? incoming.testEvidence,
     successCount: Math.max(current.successCount ?? 0, incoming.successCount ?? 0) || undefined,
     failureCount: Math.max(current.failureCount ?? 0, incoming.failureCount ?? 0) || undefined,
+    failureStreak: Math.max(current.failureStreak ?? 0, incoming.failureStreak ?? 0) || undefined,
     approvalCount: Math.max(current.approvalCount ?? 0, incoming.approvalCount ?? 0) || undefined,
     rejectionCount: Math.max(current.rejectionCount ?? 0, incoming.rejectionCount ?? 0) || undefined,
     lastSuccessAt: laterIso(current.lastSuccessAt, incoming.lastSuccessAt),
@@ -1310,6 +1316,7 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
     ...(samePath ? {
       successCount: prev.successCount,
       failureCount: prev.failureCount,
+      failureStreak: prev.failureStreak,
       approvalCount: prev.approvalCount,
       rejectionCount: prev.rejectionCount,
       lastSuccessAt: prev.lastSuccessAt,
@@ -2553,8 +2560,26 @@ export function computeChoiceScore(choice: ToolChoiceRecordChoice | null | undef
 function applyOutcome(choice: ToolChoiceRecordChoice, outcome: ProceduralOutcome, nowIso: string): ToolChoiceRecordChoice {
   const next = { ...choice };
   switch (outcome) {
-    case 'success': next.successCount = (next.successCount ?? 0) + 1; next.lastSuccessAt = nowIso; break;
-    case 'failure': next.failureCount = (next.failureCount ?? 0) + 1; next.lastFailureAt = nowIso; break;
+    case 'success':
+      next.successCount = (next.successCount ?? 0) + 1;
+      next.failureStreak = 0;
+      next.lastSuccessAt = nowIso;
+      break;
+    case 'failure': {
+      next.failureCount = (next.failureCount ?? 0) + 1;
+      // Legacy rows have only a lifetime failure counter. If they have ever
+      // succeeded, that counter cannot reveal how many failures occurred
+      // after the last win, so begin a fresh conservative streak instead of
+      // instantly retiring a highly proven procedure. With no lifetime win,
+      // all recorded failures are consecutive and can be carried forward.
+      const priorStreak = next.failureStreak
+        ?? (next.lastSuccessAt || (next.successCount ?? 0) > 0
+          ? 0
+          : Math.max(0, (next.failureCount ?? 1) - 1));
+      next.failureStreak = priorStreak + 1;
+      next.lastFailureAt = nowIso;
+      break;
+    }
     case 'approved': next.approvalCount = (next.approvalCount ?? 0) + 1; break;
     case 'rejected': next.rejectionCount = (next.rejectionCount ?? 0) + 1; break;
   }
@@ -2604,11 +2629,8 @@ function recordOutcomeOnProcedure(
   // Auto-invalidate a path that's failing repeatedly with no later win, so the
   // next run rediscovers instead of re-treading a broken procedure.
   if (outcome === 'failure') {
-    const failures = nextChoice.failureCount ?? 0;
-    const winAfterLoss = nextChoice.lastSuccessAt && nextChoice.lastFailureAt
-      ? nextChoice.lastSuccessAt > nextChoice.lastFailureAt
-      : Boolean(nextChoice.lastSuccessAt);
-    if (failures >= AUTO_INVALIDATE_FAILURE_STREAK && !winAfterLoss) {
+    const failures = nextChoice.failureStreak ?? 0;
+    if (failures >= AUTO_INVALIDATE_FAILURE_STREAK) {
       const aliasIntent = preferredProcedureAlias(saved)?.intent;
       const reason = `auto-invalidated after ${failures} failures with no later success`;
       const invalidated = aliasIntent ? invalidateToolChoice(

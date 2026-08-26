@@ -1,6 +1,9 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { tool } from '@openai/agents';
@@ -51,6 +54,77 @@ function acceptedTask(label: string, knownCapability = false): { sessionId: stri
     knownCapability,
   });
   return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+
+async function invokeWrappedDiscoveryInFreshProcess(input: {
+  key: { sessionId: string; sourceUserSeq: number };
+  callId: string;
+  markerPath: string;
+}): Promise<{ callId: string; providerRan: boolean; result: string }> {
+  const code = `
+    const { appendFileSync } = await import('node:fs');
+    const { tool } = await import('@openai/agents');
+    const { z } = await import('zod');
+    const { ToolCallsCounter, withHarnessRunContext, wrapToolForHarness } =
+      await import(process.env.CLEM_BRACKETS_MODULE_URL);
+    const eventlog = await import(process.env.CLEM_EVENTLOG_MODULE_URL);
+    const key = JSON.parse(process.env.CLEM_DISCOVERY_TASK_KEY);
+    const callId = process.env.CLEM_DISCOVERY_CALL_ID;
+    let providerRan = false;
+    const wrapped = wrapToolForHarness(tool({
+      name: 'tool_search',
+      description: 'cross-process discovery authority fixture',
+      parameters: z.object({
+        query: z.string().min(1),
+        role_key: z.string().min(1),
+      }),
+      execute: async () => {
+        providerRan = true;
+        appendFileSync(process.env.CLEM_PROVIDER_MARKER, callId + '\\n', 'utf8');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return 'provider-result:' + callId;
+      },
+    }));
+    let result;
+    try {
+      result = await withHarnessRunContext(
+        { ...key, turn: 1, counter: new ToolCallsCounter(20) },
+        () => wrapped.invoke(
+          undefined,
+          JSON.stringify({ query: 'find the source records', role_key: 'clause-0:read' }),
+          { toolCall: { callId } },
+        ),
+      );
+    } catch (error) {
+      result = 'threw:' + (error?.name ?? 'Error') + ':' + (error?.message ?? String(error));
+    }
+    eventlog.closeEventLog();
+    process.stdout.write(JSON.stringify({ callId, providerRan, result: String(result) }));
+  `;
+  const child = spawn(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '--eval', code],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        CLEMENTINE_HOME: TMP_HOME,
+        CLEM_BRACKETS_MODULE_URL: pathToFileURL(path.resolve('src/runtime/harness/brackets.ts')).href,
+        CLEM_EVENTLOG_MODULE_URL: pathToFileURL(path.resolve('src/runtime/harness/eventlog.ts')).href,
+        CLEM_DISCOVERY_TASK_KEY: JSON.stringify(input.key),
+        CLEM_DISCOVERY_CALL_ID: input.callId,
+        CLEM_PROVIDER_MARKER: input.markerPath,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+  child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+  const [exitCode] = await once(child, 'close') as [number | null];
+  assert.equal(exitCode, 0, stderr);
+  return JSON.parse(stdout) as { callId: string; providerRan: boolean; result: string };
 }
 
 test('classifies broad discovery across provider and MCP transport spellings', () => {
@@ -120,7 +194,7 @@ test('boundary bypasses legacy callers without accepted task identity', () => {
   }), null);
 });
 
-test('one physical broad call is admitted, settled, replay-safe, and a second is softly denied', () => {
+test('one physical broad call settles; repeat ids are typed pre-dispatch denials', () => {
   const key = acceptedTask('novel');
   const first = admitDiscoveryBoundary({
     ...key,
@@ -141,25 +215,27 @@ test('one physical broad call is admitted, settled, replay-safe, and a second is
   assert.equal(settled?.data.recorded, true);
   assert.equal(settled?.data.reason, 'outcome_recorded');
 
-  const replay = admitDiscoveryBoundary({
-    ...key,
-    toolName: 'composio_search_tools',
-    input: { query: 'outlook list unread mail' },
-    callId: 'provider-broad-1',
-  });
-  assert.equal(replay?.replay, true);
+  assert.throws(
+    () => admitDiscoveryBoundary({
+      ...key,
+      toolName: 'composio_search_tools',
+      input: { query: 'outlook list unread mail' },
+      callId: 'provider-broad-1',
+    }),
+    (error: unknown) => error instanceof DiscoveryBudgetDeniedError
+      && error.reason === 'same_call_replay',
+  );
 
-  // A second broad look through another surface rides the same claim. It is
-  // admitted rather than softly denied — the caller already paid for the call,
-  // and the refusal only bought a retry through yet another door.
-  const secondSurface = admitDiscoveryBoundary({
-    ...key,
-    toolName: 'local_cli_list',
-    input: { filter: 'gh' },
-    callId: 'provider-broad-2',
-  });
-  assert.ok(secondSurface, 'a second surface rides the claim already held');
-  assert.equal(secondSurface.replay, true, 'and spends no additional claim');
+  assert.throws(
+    () => admitDiscoveryBoundary({
+      ...key,
+      toolName: 'local_cli_list',
+      input: { filter: 'gh' },
+      callId: 'provider-broad-2',
+    }),
+    (error: unknown) => error instanceof DiscoveryBudgetDeniedError
+      && error.reason === 'new_call_requires_retry_epoch',
+  );
 
   assert.equal(
     discoveryGovernor.getTaskState(key)?.claims.broad_discovery?.outcome,
@@ -193,17 +269,21 @@ test('known tasks retain one bounded broad discovery and one exact schema refres
     state?.allClaims.find((claim) => claim.category === 'exact_schema_refresh')?.outcome,
     'timed_out',
   );
-  // A timeout is transient: the right recovery is to retry THIS call, not to
-  // conclude the candidate was wrong and go looking for another one. So the
-  // epoch is unchanged and the identical call may replay.
+  // A timeout alone does not prove the candidate wrong or authorize another
+  // provider body. The epoch stays closed until typed host evidence opens it;
+  // an upstream durable-result cache may still answer the old id without I/O.
   assert.equal(state?.policy.epoch, 0);
-  const retry = admitDiscoveryBoundary({
-    ...key,
-    toolName: 'tool_search',
-    input: { query: 'workspace_roots' },
-    callId: 'known-exact',
-  });
-  assert.equal(retry?.replay, true, 'a timed-out call is retryable as itself');
+  assert.throws(
+    () => admitDiscoveryBoundary({
+      ...key,
+      toolName: 'tool_search',
+      input: { query: 'workspace_roots' },
+      callId: 'known-exact',
+    }),
+    (error: unknown) => error instanceof DiscoveryBudgetDeniedError
+      && error.reason === 'same_call_replay',
+    'a retry cannot re-enter the provider unless an upstream cache returns first',
+  );
 });
 
 test('execute-only discovery stays conservatively charged and denies before a second provider call', async () => {
@@ -225,16 +305,11 @@ test('execute-only discovery stays conservatively charged and denies before a se
   const first = await withHarnessRunContext(ctx, () => wrapped.execute!({ query: 'outlook unread mail' }));
   assert.equal(first, 'provider result');
   assert.equal(claimObservedInsideExecute, true);
-  // THE DELIBERATE TRADE. A second, DIFFERENT search now reaches the provider
-  // instead of being refused. It costs one provider call; refusing it cost a
-  // model call that had already been paid for, returned nothing usable, and
-  // left the second subject ('gmail') permanently unsearchable — so the model
-  // reformulated and asked again. Measured across the real home, that loop is
-  // where the discovery budget spent most of its tokens.
+  // A second, different physical id is a new provider authorization even when
+  // it maps to the same durable subject. It is refused before execute.
   const second = await withHarnessRunContext(ctx, () => wrapped.execute!({ query: 'gmail unread mail' }));
-  assert.equal(providerCalls, 2, 'the second search actually runs');
-  assert.equal(second, 'provider result');
-  assert.doesNotMatch(String(second), /refused by harness/);
+  assert.equal(providerCalls, 1, 'the second search must not re-enter provider code');
+  assert.match(String(second), /new_call_requires_retry_epoch/);
   assert.equal(
     discoveryGovernor.getTaskState(key)?.claims.broad_discovery?.outcome,
     'succeeded',
@@ -285,14 +360,102 @@ test('SDK-local validation is free, then the first validated discovery is atomic
     'succeeded',
   );
 
-  // The test's real subject is the ORDER — invalid input never charges a claim,
-  // and the claim exists before provider code runs. Both still hold above. A
-  // further valid search is no longer refused for being the second one.
+  await assert.rejects(
+    () => invoke(JSON.stringify({ query: 'outlook unread mail' }), 'sdk-valid'),
+    /logical call is already settled/i,
+  );
+  assert.equal(providerCalls, 1, 'the exact same call id cannot re-enter provider code');
+
+  // A further valid search under a different id also lacks provider authority
+  // until the runtime opens a typed evidence epoch.
   const extra = await invoke(JSON.stringify({ query: 'gmail unread mail' }), 'sdk-extra');
-  assert.equal(extra, 'provider result for gmail unread mail');
-  assert.doesNotMatch(String(extra), /refused by harness/);
-  assert.equal(providerCalls, 2, 'both validated searches reach provider code; the invalid ones never did');
-  assert.equal(ctx.counter.calls, 4, 'ordinary tool-attempt accounting is unchanged');
+  assert.match(String(extra), /new_call_requires_retry_epoch/);
+  assert.equal(providerCalls, 1, 'only the first validated search reaches provider code');
+  assert.equal(ctx.counter.calls, 4, 'the earlier logical replay denial does not spend a tool attempt');
+});
+
+test('wrapped discovery elects one provider body across processes and restart until a typed epoch opens', async () => {
+  const key = acceptedTask('cross-process-provider-body');
+  discoveryGovernor.initializeRoles({
+    ...key,
+    requirements: [{
+      roleKey: 'clause-0:read',
+      clauseIndex: 0,
+      text: 'find the source records',
+      resolved: false,
+    }],
+    brokerCoverage: 'authorized_external_v1',
+  });
+  const markerPath = path.join(TMP_HOME, 'discovery-provider-bodies.log');
+  const racedCallIds = [
+    'cross-process-shared',
+    'cross-process-shared',
+    'cross-process-distinct-1',
+    'cross-process-distinct-2',
+    'cross-process-distinct-3',
+    'cross-process-distinct-4',
+  ];
+  const raced = await Promise.all(
+    racedCallIds.map((callId) => invokeWrappedDiscoveryInFreshProcess({
+      key,
+      callId,
+      markerPath,
+    })),
+  );
+  const winner = raced.find((result) => result.providerRan);
+  assert.ok(winner, 'one process must own provider authority');
+  assert.equal(raced.filter((result) => result.providerRan).length, 1);
+  assert.equal(
+    readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean).length,
+    1,
+    'the shared provider body ran exactly once',
+  );
+  assert.equal(
+    raced.filter((result) => !result.providerRan)
+      .every((result) => /same_call_replay|new_call_requires_retry_epoch|logical call is already settled/i.test(result.result)),
+    true,
+  );
+
+  const sameIdAfterRestart = await invokeWrappedDiscoveryInFreshProcess({
+    key,
+    callId: winner.callId,
+    markerPath,
+  });
+  const newIdAfterRestart = await invokeWrappedDiscoveryInFreshProcess({
+    key,
+    callId: 'post-restart-distinct',
+    markerPath,
+  });
+  assert.equal(sameIdAfterRestart.providerRan, false);
+  assert.match(sameIdAfterRestart.result, /logical call is already settled/i);
+  assert.equal(newIdAfterRestart.providerRan, false);
+  assert.match(newIdAfterRestart.result, /new_call_requires_retry_epoch/);
+  assert.equal(readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean).length, 1);
+
+  assert.equal(discoveryGovernor.recordEvidence({
+    ...key,
+    kind: 'candidate_unsupported',
+    detail: 'typed execution settlement rejected the selected candidate',
+  }).outcome, 'epoch_opened');
+  const authorizedRetry = await invokeWrappedDiscoveryInFreshProcess({
+    key,
+    callId: 'typed-epoch-1',
+    markerPath,
+  });
+  assert.equal(authorizedRetry.providerRan, true);
+  assert.equal(readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean).length, 2);
+
+  const state = discoveryGovernor.getTaskState(key);
+  assert.deepEqual(state?.allClaims.map((claim) => claim.outcome), ['succeeded', 'succeeded']);
+  const recordedOutcomes = eventlog.listEvents(key.sessionId, {
+    types: ['discovery_governor_outcome'],
+  }).filter((event) => event.data.recorded === true);
+  assert.deepEqual(
+    recordedOutcomes.map((event) => event.data.callId).sort(),
+    [winner.callId, 'typed-epoch-1'].sort(),
+    'every admitted provider body has one exact durable settlement',
+  );
+  assert.equal(existsSync(markerPath), true);
 });
 
 test('wrapped discovery timeout settles the durable claim as timed_out', async () => {
@@ -312,7 +475,7 @@ test('wrapped discovery timeout settles the durable claim as timed_out', async (
     state?.allClaims.find((claim) => claim.category === 'broad_discovery')?.outcome,
     'timed_out',
   );
-  // Transient, so the slot stays where it is and the same call can be retried.
+  // Timeout alone does not open a new provider-authority epoch.
   assert.equal(state?.policy.epoch, 0);
 });
 

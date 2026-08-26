@@ -120,10 +120,9 @@ export type DiscoveryAdmissionReason =
   | 'novel_discovery_admitted'
   | 'schema_refresh_admitted'
   | 'same_call_replay'
-  /** A second look at a subject already claimed this epoch. Admitted: the model
-   *  has already paid for the call, and refusing only buys a reformulated
-   *  retry. */
-  | 'subject_replay'
+  /** A different physical call cannot borrow a subject's already-spent claim.
+   *  Only host-observed evidence may open a new epoch and authorize a retry. */
+  | 'new_call_requires_retry_epoch'
   /** The caller named no role, an unknown one, or an already-resolved one. The
    *  search is admitted against a HOST-OWNED subject and the caller is told. */
   | 'role_coerced'
@@ -196,8 +195,6 @@ export interface DiscoveryAdmittedDecision extends DiscoveryDecisionBase {
   reason:
     | 'novel_discovery_admitted'
     | 'schema_refresh_admitted'
-    | 'same_call_replay'
-    | 'subject_replay'
     | 'role_coerced';
 }
 
@@ -208,6 +205,8 @@ export interface DiscoveryDeniedDecision extends DiscoveryDecisionBase {
     | 'role_required'
     | 'role_not_unresolved'
     | 'role_resolved'
+    | 'same_call_replay'
+    | 'new_call_requires_retry_epoch'
     | 'turn_discovery_ceiling';
 }
 
@@ -1242,28 +1241,22 @@ export class DiscoveryGovernor {
       ) as RawClaimRow | undefined;
       const existing = rawExisting ? rowToClaim(rawExisting) : null;
       if (existing) {
-        // A REPEAT IS A REPLAY, NOT A REFUSAL.
-        //
-        // A second look at the same subject used to be denied
-        // (category_budget_exhausted). The denial does not save the call — the
-        // model already paid full input tokens to make it — and it does not end
-        // the search: the model reformulates and asks again. Measured on the
-        // real home, that loop is the thrash the budget existed to prevent.
-        // One turn issued 41 discovery calls of which 37 were denied; another
-        // 16 with 14 denied. Across every turn since 08-10: 610 attempts, 266
-        // denied, and 66% of turns wanted more than the single look the
-        // non-role-scoped cap allowed.
-        //
-        // So the repeat is admitted and marked as a replay of the claim that
-        // already exists. The ledger is unchanged — one claim per subject, same
-        // epoch, same role accounting — only the refusal is gone.
+        // The durable claim authorizes one exact physical invocation identity.
+        // A distinct call id is not a replay of that invocation: admitting it
+        // would execute another provider body while settlement still belongs
+        // to `existing.callId`. If an upstream physical/result layer can replay
+        // the exact same id's bytes, it returns before reaching this boundary;
+        // reaching the governor again proves there is no such cached path, so
+        // even the same id is denied here rather than re-entering provider code.
         return buildDecision({
           key,
           category: input.category,
           subject,
           callId,
-          admitted: true,
-          reason: existing.callId === callId ? 'same_call_replay' : 'subject_replay',
+          admitted: false,
+          reason: existing.callId === callId
+            ? 'same_call_replay'
+            : 'new_call_requires_retry_epoch',
           replay: true,
           consumedBudget: false,
           policy,
@@ -1291,15 +1284,18 @@ export class DiscoveryGovernor {
       const claim = rowToClaim(rawClaim);
       if (inserted.changes !== 1) {
         // Lost the insert race: another call claimed this subject concurrently.
-        // Same reasoning as the repeat above — the caller has already paid for
-        // this call, so hand it the existing claim rather than refusing it.
+        // Only the winner owns provider authority. Returning an admitted
+        // "replay" to a different id here would turn the atomic ledger race
+        // into concurrent provider fan-out.
         return buildDecision({
           key,
           category: input.category,
           subject,
           callId,
-          admitted: true,
-          reason: claim.callId === callId ? 'same_call_replay' : 'subject_replay',
+          admitted: false,
+          reason: claim.callId === callId
+            ? 'same_call_replay'
+            : 'new_call_requires_retry_epoch',
           replay: true,
           consumedBudget: false,
           policy,
@@ -1514,21 +1510,18 @@ export class DiscoveryGovernor {
  * ledger key model-controlled free text, where `clause-1:read`, `Clause-1:read`
  * and `[role:sheets]` are three distinct claims and three live provider
  * searches — and a model GUESSING an identifier produces distinct strings by
- * construction. Coercing instead of refusing keeps admission unconditional and
- * the key host-owned.
+ * construction. Coercion keeps the first subject key host-owned; the ordinary
+ * one-physical-owner rule then denies further ids for that subject.
  */
 export const HOST_UNSCOPED_DISCOVERY_SUBJECT = 'host:unscoped_role';
 
 /**
  * Runaway backstop, not a policy gate.
  *
- * Per-call refusal was removed because it never saved the call it refused and
- * bought a reformulated retry instead. That leaves nothing bounding a model
- * that loops, and every admitted discovery is a live provider round trip. The
- * shape here is deliberately the one the reference harness settled on after
- * removing its own turn ceilings: a single high, turn-scoped, always-on cap
- * that stops the turn cleanly, rather than many low per-call refusals the
- * caller must recover from.
+ * Per-subject physical ownership is the primary bound. This higher task-wide
+ * cap remains defense in depth for accepted requests with many frozen roles,
+ * exact-schema subjects, or evidence epochs: even legitimate distinct keys
+ * cannot turn one model turn into unbounded provider round trips.
  *
  * High enough that no observed real turn reaches it: the busiest measured turn
  * on the production home issued 43 discovery attempts.

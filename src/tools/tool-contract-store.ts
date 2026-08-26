@@ -40,6 +40,7 @@ const CONTRACTS_ROOT = path.join(BASE_DIR, 'memory', 'tool-contracts');
  *  local check; the cost of expiry is a full discovery round trip. */
 const CONTRACT_TTL_MS = 30 * 24 * 60 * 60_000;
 const MAX_CONTRACTS = 2_000;
+const MAX_CONTRACT_CACHE_BYTES = 64 * 1024 * 1024;
 
 export interface ToolContract {
   identifier: string;
@@ -79,6 +80,116 @@ export interface ToolContract {
   exampleArgs?: Record<string, unknown>;
   savedAt: string;
   lastUsedAt?: string;
+}
+
+interface ContractFileIdentity {
+  cacheable: boolean;
+  key?: string;
+  sizeBytes?: number;
+}
+
+interface CachedContractFile {
+  identity: string;
+  record: ToolContract | null;
+  estimatedBytes: number;
+}
+
+type CachedContractValidation =
+  | { status: 'valid'; savedAtMs: number; expiresAtMs: number }
+  | { status: 'invalid' }
+  | { status: 'future'; savedAtMs: number }
+  | { status: 'expired'; expiresAtMs: number };
+
+// Admission can inspect the full 2,000-contract store several times in one
+// process. Cache only immutable parsed records, never authority inferred from
+// a filename. Every lookup first compares nanosecond filesystem identity, so
+// another process's save/delete/replacement invalidates before bytes return.
+// Insertion order is LRU order; entry and byte ceilings bound retained data.
+const contractFileCache = new Map<string, CachedContractFile>();
+const contractValidationCache = new WeakMap<object, CachedContractValidation>();
+let contractCacheHits = 0;
+let contractCacheMisses = 0;
+let contractCacheParses = 0;
+let contractCacheValidations = 0;
+let contractCacheBytes = 0;
+let contractCacheByteBudget = MAX_CONTRACT_CACHE_BYTES;
+
+function contractFileIdentity(file: string): ContractFileIdentity | null {
+  try {
+    const stat = statSync(file, { bigint: true });
+    if (!stat.isFile()) return null;
+    // BigIntStats on supported Node/filesystems carries nanosecond timestamps.
+    // If a platform cannot provide them, never fall back to mtimeMs/size: an
+    // external same-size rewrite with restored mtime would reuse stale bytes.
+    const fields = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs];
+    if (fields.some((field) => typeof field !== 'bigint')) return { cacheable: false };
+    const sizeBytes = stat.size > BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number.MAX_SAFE_INTEGER
+      : Number(stat.size);
+    return { cacheable: true, key: fields.map(String).join(':'), sizeBytes };
+  } catch {
+    // A runtime that rejects bigint stat may still read the file. Mark it
+    // uncacheable so correctness degrades to the historical reparse path.
+    try { return existsSync(file) ? { cacheable: false } : null; } catch { return null; }
+  }
+}
+
+function deepFreezeContractValue<T>(value: T, seen = new WeakSet<object>()): T {
+  if (!value || typeof value !== 'object') return value;
+  const object = value as object;
+  if (seen.has(object)) return value;
+  seen.add(object);
+  for (const nested of Object.values(value as Record<string, unknown>)) {
+    deepFreezeContractValue(nested, seen);
+  }
+  return Object.freeze(value);
+}
+
+function immutableContract(record: ToolContract): ToolContract {
+  return deepFreezeContractValue(structuredClone(record));
+}
+
+function invalidateContractFileCache(file: string): void {
+  const cached = contractFileCache.get(file);
+  if (cached) contractCacheBytes = Math.max(0, contractCacheBytes - cached.estimatedBytes);
+  contractFileCache.delete(file);
+}
+
+function conservativeContractCacheBytes(sizeBytes: number): number {
+  if (!Number.isFinite(sizeBytes) || sizeBytes < 0) return contractCacheByteBudget + 1;
+  // Parsed JSON strings/keys are UTF-16 and object graphs add allocation
+  // overhead. Four times serialized bytes is deliberately conservative.
+  return Math.max(512, Math.ceil(sizeBytes * 4));
+}
+
+function cacheContractFile(
+  file: string,
+  identity: string,
+  sizeBytes: number,
+  record: ToolContract | null,
+): void {
+  invalidateContractFileCache(file);
+  const estimatedBytes = conservativeContractCacheBytes(sizeBytes);
+  if (estimatedBytes > contractCacheByteBudget) return;
+  contractFileCache.set(file, { identity, record, estimatedBytes });
+  contractCacheBytes += estimatedBytes;
+  while (
+    contractFileCache.size > MAX_CONTRACTS
+    || contractCacheBytes > contractCacheByteBudget
+  ) {
+    const oldest = contractFileCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    invalidateContractFileCache(oldest);
+  }
+}
+
+function primeWrittenContract(file: string, record: ToolContract): void {
+  const identity = contractFileIdentity(file);
+  if (!identity?.cacheable || !identity.key || identity.sizeBytes === undefined) {
+    invalidateContractFileCache(file);
+    return;
+  }
+  cacheContractFile(file, identity.key, identity.sizeBytes, immutableContract(record));
 }
 
 function machineDir(): string {
@@ -388,12 +499,58 @@ function providerObservation(record: ToolContract | null): {
   return { observedAt, observedMs: Date.parse(observedAt) };
 }
 
-function readContractFile(file: string): ToolContract | null {
+function readContractFile(file: string, attempt = 0): ToolContract | null {
+  const before = contractFileIdentity(file);
+  if (!before) {
+    invalidateContractFileCache(file);
+    return null;
+  }
+  if (before.cacheable && before.key) {
+    const cached = contractFileCache.get(file);
+    if (cached?.identity === before.key) {
+      // LRU touch. Records (including nested schema/output objects) are frozen,
+      // so returning this reference cannot let a caller mutate cached authority.
+      contractFileCache.delete(file);
+      contractFileCache.set(file, cached);
+      contractCacheHits += 1;
+      return cached.record;
+    }
+    invalidateContractFileCache(file);
+  }
+
+  contractCacheMisses += 1;
+  let record: ToolContract | null = null;
   try {
-    if (!existsSync(file)) return null;
+    contractCacheParses += 1;
     const parsed = JSON.parse(readFileSync(file, 'utf-8')) as ToolContract;
-    return parsed && typeof parsed === 'object' && parsed.identifier ? parsed : null;
-  } catch { return null; }
+    record = parsed && typeof parsed === 'object' && typeof parsed.identifier === 'string' && parsed.identifier
+      // JSON.parse already produced an unaliased object: freeze it in place.
+      // Local save priming clones because its source record belongs to caller.
+      ? deepFreezeContractValue(parsed)
+      : null;
+  } catch {
+    record = null;
+  }
+
+  if (!before.cacheable || !before.key) {
+    // No nanosecond identity: return this freshly parsed immutable value but
+    // deliberately retain nothing for the next call.
+    invalidateContractFileCache(file);
+    return record;
+  }
+  const after = contractFileIdentity(file);
+  if (!after?.cacheable || !after.key || after.key !== before.key) {
+    // The pathname changed while bytes were read. Retry once against the new
+    // identity; continuous churn degrades to no opinion, never mixed/stale.
+    invalidateContractFileCache(file);
+    return attempt < 1 ? readContractFile(file, attempt + 1) : null;
+  }
+  if (after.sizeBytes === undefined) {
+    invalidateContractFileCache(file);
+    return record;
+  }
+  cacheContractFile(file, after.key, after.sizeBytes, record);
+  return record;
 }
 
 function validateToolContractRecord(
@@ -401,10 +558,46 @@ function validateToolContractRecord(
   expectedIdentifier: string,
 ): ToolContract | null {
   if (!record || record.identifier !== expectedIdentifier) return null;
-  const age = Date.now() - Date.parse(record.savedAt);
-  if (!Number.isFinite(age) || age < 0 || age > CONTRACT_TTL_MS) return null;
-  if (!record.schema || typeof record.schema !== 'object' || Array.isArray(record.schema)) return null;
-  if (fingerprintSchema(record.schema) !== record.fingerprint) return null;
+  const now = Date.now();
+  const cachedValidation = contractValidationCache.get(record);
+  if (cachedValidation) {
+    if (cachedValidation.status === 'invalid') return null;
+    if (cachedValidation.status === 'future') {
+      if (now < cachedValidation.savedAtMs) return null;
+      contractValidationCache.delete(record);
+    } else if (cachedValidation.status === 'expired') {
+      if (now > cachedValidation.expiresAtMs) return null;
+      // Wall clock moved back into the record's possible validity window.
+      contractValidationCache.delete(record);
+    } else {
+      return now >= cachedValidation.savedAtMs && now <= cachedValidation.expiresAtMs
+        ? record
+        : null;
+    }
+  }
+  contractCacheValidations += 1;
+  const savedAtMs = Date.parse(record.savedAt);
+  if (!Number.isFinite(savedAtMs)) {
+    contractValidationCache.set(record, { status: 'invalid' });
+    return null;
+  }
+  const expiresAtMs = savedAtMs + CONTRACT_TTL_MS;
+  if (now < savedAtMs) {
+    contractValidationCache.set(record, { status: 'future', savedAtMs });
+    return null;
+  }
+  if (now > expiresAtMs) {
+    contractValidationCache.set(record, { status: 'expired', expiresAtMs });
+    return null;
+  }
+  const permanentlyInvalid = (): null => {
+    contractValidationCache.set(record, { status: 'invalid' });
+    return null;
+  };
+  if (!record.schema || typeof record.schema !== 'object' || Array.isArray(record.schema)) {
+    return permanentlyInvalid();
+  }
+  if (fingerprintSchema(record.schema) !== record.fingerprint) return permanentlyInvalid();
   const outputFields = [
     record.providerOutputSchema,
     record.providerOutputSchemaDigest,
@@ -413,9 +606,9 @@ function validateToolContractRecord(
   const hasAnyOutputField = outputFields.some((value) => value !== undefined);
   const hasAllOutputFields = outputFields.every((value) => value !== undefined);
   if (record.providerOutputSchemaObserved !== undefined
-    && record.providerOutputSchemaObserved !== true) return null;
+    && record.providerOutputSchemaObserved !== true) return permanentlyInvalid();
   if (hasAnyOutputField && (!hasAllOutputFields || record.providerOutputSchemaObserved !== true)) {
-    return null;
+    return permanentlyInvalid();
   }
   if (hasAllOutputFields) {
     if (
@@ -424,8 +617,13 @@ function validateToolContractRecord(
       || Array.isArray(record.providerOutputSchema)
       || digestSchema(record.providerOutputSchema) !== record.providerOutputSchemaDigest
       || fingerprintSchema(record.providerOutputSchema) !== record.providerOutputSchemaFingerprint
-    ) return null;
+    ) return permanentlyInvalid();
   }
+  contractValidationCache.set(record, {
+    status: 'valid',
+    savedAtMs,
+    expiresAtMs,
+  });
   return record;
 }
 
@@ -476,6 +674,10 @@ function atomicWrite(file: string, record: ToolContract): void {
   const temporary = `${file}.${randomUUID()}.tmp`;
   writeFileSync(temporary, JSON.stringify(record, null, 2), 'utf-8');
   renameSync(temporary, file);
+  // A local save is authoritative only through the bytes just atomically
+  // published. Prime an immutable clone under the new inode/ctime identity;
+  // an external writer still invalidates it on the next lookup.
+  primeWrittenContract(file, record);
 }
 
 function pruneIfNeeded(dir: string): void {
@@ -486,20 +688,67 @@ function pruneIfNeeded(dir: string): void {
       .map((f) => ({ f, at: statSync(path.join(dir, f)).mtimeMs }))
       .sort((a, b) => a.at - b.at);
     for (const { f } of byAge.slice(0, files.length - MAX_CONTRACTS)) {
-      try { unlinkSync(path.join(dir, f)); } catch { /* best effort */ }
+      const file = path.join(dir, f);
+      try {
+        unlinkSync(file);
+        invalidateContractFileCache(file);
+      } catch { /* best effort */ }
     }
   } catch { /* pruning is hygiene, never correctness */ }
 }
 
 /** Test seam — the store is per-machine on disk, so tests need a clean slate. */
 export function _clearToolContractsForTests(): void {
+  _resetToolContractFileCacheForTests();
   try {
     const dir = machineDir();
     if (!existsSync(dir)) return;
     for (const f of readdirSync(dir)) {
-      if (f.endsWith('.json') || f.endsWith('.tmp')) unlinkSync(path.join(dir, f));
+      if (f.endsWith('.json') || f.endsWith('.tmp')) {
+        const file = path.join(dir, f);
+        unlinkSync(file);
+        invalidateContractFileCache(file);
+      }
     }
   } catch { /* best effort */ }
+}
+
+/** Bounded observability seam for the cache regression/measurement tests. */
+export function _toolContractFileCacheStatsForTests(): {
+  entries: number;
+  bytes: number;
+  maxBytes: number;
+  hits: number;
+  misses: number;
+  parses: number;
+  validations: number;
+} {
+  return {
+    entries: contractFileCache.size,
+    bytes: contractCacheBytes,
+    maxBytes: contractCacheByteBudget,
+    hits: contractCacheHits,
+    misses: contractCacheMisses,
+    parses: contractCacheParses,
+    validations: contractCacheValidations,
+  };
+}
+
+/** Test-only reset. Production invalidation is exclusively metadata-driven. */
+export function _resetToolContractFileCacheForTests(): void {
+  contractFileCache.clear();
+  contractCacheBytes = 0;
+  contractCacheHits = 0;
+  contractCacheMisses = 0;
+  contractCacheParses = 0;
+  contractCacheValidations = 0;
+  contractCacheByteBudget = MAX_CONTRACT_CACHE_BYTES;
+}
+
+/** Test-only byte-budget override for deterministic LRU eviction coverage. */
+export function _setToolContractFileCacheByteBudgetForTests(bytes: number): void {
+  _resetToolContractFileCacheForTests();
+  contractCacheByteBudget = Math.max(1, Math.floor(bytes));
 }
 
 /**
@@ -537,11 +786,8 @@ export function readToolContractFile(fileName: string): ToolContract | null {
   try {
     const file = path.join(machineDir(), fileName);
     const record = readContractFile(file);
-    if (!record || typeof record !== 'object') return null;
-    const contract = record as ToolContract;
-    if (typeof contract.identifier !== 'string' || !contract.identifier) return null;
-    if (!contract.schema || typeof contract.schema !== 'object') return null;
-    return contract;
+    if (!record || typeof record.identifier !== 'string' || !record.identifier) return null;
+    return validateToolContractRecord(record, record.identifier);
   } catch {
     return null;
   }

@@ -765,6 +765,10 @@ test('isHarnessInjectedInput: recognizes harness re-prompts incl. the outcome ma
     'CONVERGE — your previous turn asked the user a clarifying question. EXECUTE the work this turn.\n\nUse the exact roster.',
     'Continue with the next step of your plan.',
     '[background bg-completed-fixture just finished — continue from here.]',
+    'A workflow run you started from this conversation needs your input (see the latest [workflow run wf-need#input-1] NEEDS INPUT note in context). Ask the user for the required input now.',
+    'A workflow run you started from this conversation FAILED (see the latest [workflow run wf-failed] FAILED note in context). Relay it now.',
+    "A background task you started from this conversation NEEDS ATTENTION (see the latest [background task bg-blocked] note in context). Relay the note's substance now.",
+    'A project run you started from this conversation just finished (see the latest [project run project-done] note in context). Relay the outcome now.',
   ]) {
     assert.equal(isHarnessInjectedInput(t), true, `should flag harness input: ${t.slice(0, 40)}`);
   }
@@ -791,6 +795,19 @@ test('extractAutoMemoryCandidates: harness re-prompts produce ZERO candidates (n
     extractAutoMemoryCandidates('Before you deliver this: the figure does not match your captured tool results; recompute it.'),
     [],
   );
+  for (const directive of [
+    'A workflow run you started from this conversation needs your input (see the latest [workflow run wf-need#input-1] NEEDS INPUT note in context). Ask the user for the required input now.',
+    'A workflow run you started from this conversation FAILED (see the latest [workflow run wf-failed] FAILED note in context). Relay it now.',
+    "A background task you started from this conversation NEEDS ATTENTION (see the latest [background task bg-blocked] note in context). Relay the note's substance now.",
+    'A project run you started from this conversation just finished (see the latest [project run project-done] note in context). Relay the outcome now.',
+  ]) {
+    assert.deepEqual(extractAutoMemoryCandidates(directive), []);
+  }
+  // Current synthetic approval carriers are deliberately terse. They are not
+  // durable user statements even though they are recorded as user-role audit
+  // edges by mobile_approval / approval_resume.
+  assert.deepEqual(extractAutoMemoryCandidates('Approve apr-fixture.'), []);
+  assert.deepEqual(extractAutoMemoryCandidates('Reject apr-fixture.'), []);
   // A genuine standing prohibition from the USER still captures.
   const real = extractAutoMemoryCandidates('Never email the test distribution list.');
   assert.ok(real.length > 0, 'a real user prohibition is still captured');

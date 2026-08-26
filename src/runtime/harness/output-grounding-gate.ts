@@ -42,7 +42,11 @@
  * false-positive bounces). Until then `=off` is the kill-switch.
  */
 import { getRuntimeEnv } from '../../config.js';
-import { searchToolOutputs, recentToolOutputs, resolveToolOutputsForAuthority } from './eventlog.js';
+import {
+  searchToolOutputs,
+  recentToolOutputs,
+  resolveToolOutputEvidenceExcerptsForAuthority,
+} from './eventlog.js';
 import { rankSources, type GroundingSource } from './grounding-gate.js';
 import { searchFactsByText } from '../../memory/facts.js';
 
@@ -536,10 +540,11 @@ export async function evaluateOutputGrounding(
           .filter((value): value is number => Number.isSafeInteger(value) && (value ?? 0) > 0)
       : undefined;
     sources = rankSources(
-      resolveToolOutputsForAuthority(sessionId, [...merged.values()], {
+      resolveToolOutputEvidenceExcerptsForAuthority(sessionId, [...merged.values()], {
         readOrComputeOnly: true,
+        excerptChars: 5_000,
         ...(allowedSourceUserSeqs ? { allowedSourceUserSeqs } : {}),
-      }),
+      }).filter((row) => row.output.trim().length > 0),
       { limit: 8 },
     );
   } catch {

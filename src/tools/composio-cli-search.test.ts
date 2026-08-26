@@ -4,7 +4,7 @@
  * Product seam: a CLI-only install can perform the same schema-grounded
  * composio_search_tools discovery as an SDK/API-key install.
  */
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -76,7 +76,7 @@ function anchoredCtx(sessionId: string, ask: string): {
   };
 }
 
-test('CLI-only composio_search_tools returns the live slug and deposits its schema', async () => {
+test('CLI-only discovery deposits the live schema but prepared execution stays zero-body', async () => {
   invalidateComposioCliStatusCache();
   const runtimeTools = getComposioRuntimeTools();
   const search = runtimeTools.find((candidate) => (
@@ -173,11 +173,18 @@ test('CLI-only composio_search_tools returns the live slug and deposits its sche
   const executedText = typeof executed === 'string'
     ? executed
     : (executed as { content?: Array<{ text?: string }> } | null)?.content?.[0]?.text ?? JSON.stringify(executed);
-  assert.match(executedText, /PROOF_RELEASE_QUEUE:LOCAL_ONLY/);
-  assert.deepEqual(
-    readFileSync(path.join(HOME, 'proof-composio-dispatches.log'), 'utf8').trim().split('\n'),
-    ['PROOF_LIST_TASKS'],
-    'a stringified absent account reaches one CLI default-account dispatch',
+  const refusedExecution = JSON.parse(executedText) as {
+    reason?: unknown;
+    provenNoDispatch?: unknown;
+    output?: unknown;
+  };
+  assert.equal(refusedExecution.reason, 'provider-dispatch:not-started:invalid-args');
+  assert.equal(refusedExecution.provenNoDispatch, true);
+  assert.match(String(refusedExecution.output), /exact SDK no-retry transport/);
+  assert.equal(
+    existsSync(path.join(HOME, 'proof-composio-dispatches.log')),
+    false,
+    'CLI discovery never authorizes a CLI business dispatch',
   );
 
   // The CLI may recommend related slugs while only materializing schemas for

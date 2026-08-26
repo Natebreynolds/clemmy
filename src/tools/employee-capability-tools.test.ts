@@ -106,7 +106,7 @@ test('file_query tool reads a text file and returns ranked passages; corrective 
   assert.match(miss.note, /lexical/);
 });
 
-test('file_query refuses a >2MB parked prefix instead of falsely missing a tail passage', async () => {
+test('file_query finds a tail passage in a chunked parked source', async () => {
   const handler = capture(registerFileQueryTools as never);
   const sess = createSession({ kind: 'chat' });
   const marker = 'TAIL_SECRET_NEEDLE_9Q8Z';
@@ -123,12 +123,9 @@ test('file_query refuses a >2MB parked prefix instead of falsely missing a tail 
   });
 
   const out = textOf(await withToolOutputContext({ sessionId: sess.id }, () =>
-    handler({ query: 'TAIL SECRET NEEDLE 9Q8Z', call_id: 'call_truncated_document' })));
-  assert.match(out, /^ERROR:/);
-  assert.match(out, /incomplete/);
-  assert.match(out, /will not report matches or misses from a prefix/);
-  assert.match(out, /Re-read\/page|stage the full result/);
-  assert.doesNotMatch(out, /No passage matched/, 'a known-incomplete source must never produce a definitive miss');
+    handler({ query: marker, call_id: 'call_truncated_document' })));
+  const parsed = JSON.parse(out) as { hits: Array<{ text: string }> };
+  assert.ok(parsed.hits.some((hit) => hit.text.includes(marker)));
 });
 
 // ── time_slots ───────────────────────────────────────────────────────

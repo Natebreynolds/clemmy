@@ -286,10 +286,9 @@ test('expander: all entries malformed → keep the original synthetic call so ne
 // tools. The Workflow Architect chat relies on it to hide workflow_*
 // mutation tools so the model is forced into the diff-card flow.
 
-test('createCodexToolDefinitions exposes workflow_create by default', async () => {
+test('createCodexToolDefinitions exposes no tools from the retired direct runtime', async () => {
   const tools = await createCodexToolDefinitions();
-  const names = new Set(tools.map((t) => t.name));
-  assert.ok(names.has('workflow_create'), 'workflow_create should be in the default surface');
+  assert.deepEqual(tools, []);
 });
 
 test('retired native runtime cannot enumerate or dispatch MCP outside the shared host kernel', async () => {
@@ -299,17 +298,10 @@ test('retired native runtime cannot enumerate or dispatch MCP outside the shared
   assert.equal(tools.some((tool) => tool.name.includes('__')), false);
 });
 
-test('createCodexToolDefinitions hides excluded tool names', async () => {
+test('createCodexToolDefinitions remains empty regardless of legacy exclusions', async () => {
   const exclude = ['workflow_create', 'workflow_update', 'workflow_set_enabled', 'workflow_delete', 'workflow_run'];
   const tools = await createCodexToolDefinitions(exclude);
-  const names = new Set(tools.map((t) => t.name));
-  for (const name of exclude) {
-    assert.ok(!names.has(name), `${name} should be hidden when excluded`);
-  }
-  // Read-only workflow tools stay available — the architect can still
-  // inspect existing workflows for context.
-  assert.ok(names.has('workflow_list'), 'workflow_list (read) should still be available');
-  assert.ok(names.has('workflow_get'), 'workflow_get (read) should still be available');
+  assert.deepEqual(tools, []);
 });
 
 test('createCodexToolDefinitions: empty exclude list is a no-op', async () => {

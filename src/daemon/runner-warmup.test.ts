@@ -243,6 +243,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
 
   const canonicalToolMigration = callsNamed(startDaemon, 'migrateToolChoicesToCanonicalProcedures');
   const orphanFence = callsNamed(startDaemon, 'interruptOrphanedRunAttemptsAtBoot');
+  const workerBatchFence = callsNamed(startDaemon, 'reconcileWorkerBatchDurableOwnershipAtBoot');
   const runnerTrustRecovery = callsNamed(startDaemon, 'recoverResolvedRunnerTrustApprovals');
   const approvalDrain = callsNamed(startDaemon, 'startChatApprovalResume');
   const closedDispatchRecovery = callsNamed(startDaemon, 'reconcileClosedWorkflowDispatchBatches')
@@ -254,6 +255,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   for (const [label, calls] of [
     ['canonical tool-memory migration', canonicalToolMigration],
     ['orphan fencing', orphanFence],
+    ['worker-batch ownership fencing', workerBatchFence],
     ['runner-trust approval recovery', runnerTrustRecovery],
     ['approval drain', approvalDrain],
     ['closed workflow dispatch recovery', closedDispatchRecovery],
@@ -279,6 +281,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   const orderedBootNodes = [
     canonicalToolMigration[0],
     orphanFence[0],
+    workerBatchFence[0],
     runnerTrustRecovery[0],
     approvalDrain[0],
     closedDispatchRecovery[0],
@@ -291,7 +294,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   assert.deepEqual(
     [...orderedBootNodes].sort((left, right) => left.getStart() - right.getStart()),
     orderedBootNodes,
-    'boot must migrate, fence, drain approvals, settle workflow dispatch, recover generic chats, arm report-back, register lanes, then release ingress',
+    'boot must migrate, terminalize orphan attempts, fence their worker batches, drain approvals, settle workflow dispatch, recover generic chats, arm report-back, register lanes, then release ingress',
   );
 
   const cliWarmCalls = callsNamed(startDaemon, 'warmCliScan');

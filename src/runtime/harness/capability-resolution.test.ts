@@ -53,6 +53,8 @@ const {
   resolveTurnCapabilities,
   renderCapabilityResolutionForContext,
   recordCapabilityResolution,
+  recordAdmissionCapabilityResolution,
+  markAdmissionCapabilityResolutionSuperseded,
   provenComposioSlugForTurn,
   selectWarmableContractIdentifiers,
 } = await import('./capability-resolution.js');
@@ -274,6 +276,72 @@ test('recordCapabilityResolution persists a typed event; empty resolutions persi
     discoveryGovernor.getTaskState({ sessionId: sess.id, sourceUserSeq: novelSource.seq })?.policy.broadDiscoveryAllowance,
     1,
     'an empty resolution still initializes one broad-discovery slot for the accepted task',
+  );
+});
+
+test('513 still-pending superseded resolution legs cannot evict source one and publish late authority', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const releases: Array<() => void> = [];
+  let firstSourceSeq = 0;
+
+  try {
+    for (let index = 0; index < 513; index += 1) {
+      const source = appendEvent({
+        sessionId: sess.id,
+        turn: index + 1,
+        role: 'user',
+        type: 'user_input_received',
+        data: { text: `late capability source ${index + 1}` },
+      });
+      if (index === 0) firstSourceSeq = source.seq;
+      let release!: () => void;
+      const pending = new Promise<void>((resolve) => { release = resolve; });
+      releases.push(release);
+      markAdmissionCapabilityResolutionSuperseded(sess.id, source.seq, pending);
+    }
+
+    recordAdmissionCapabilityResolution({
+      sessionId: sess.id,
+      sourceUserSeq: firstSourceSeq,
+      acceptedInput: 'late capability source 1',
+      entries: [{
+        intent: 'late source must stay non-authoritative',
+        kind: 'composio',
+        identifier: 'LATE_SOURCE_ONE_SEARCH',
+        status: 'proven',
+        connection: 'active',
+        effectClass: 'read',
+      }],
+    });
+
+    assert.equal(
+      listEvents(sess.id, { types: ['capability_resolution'] }).length,
+      0,
+      'a still-running abandoned leg remains suppressed regardless of how many newer legs timed out',
+    );
+  } finally {
+    for (const release of releases) release();
+    await Promise.resolve();
+  }
+
+  recordAdmissionCapabilityResolution({
+    sessionId: sess.id,
+    sourceUserSeq: firstSourceSeq,
+    acceptedInput: 'late capability source 1',
+    entries: [{
+      intent: 'a separate completed-path publication',
+      kind: 'composio',
+      identifier: 'COMPLETED_SOURCE_ONE_SEARCH',
+      status: 'proven',
+      connection: 'active',
+      effectClass: 'read',
+    }],
+  });
+  assert.equal(
+    listEvents(sess.id, { types: ['capability_resolution'] }).length,
+    1,
+    'settled abandoned legs release their lifecycle tokens instead of leaving completed tombstones',
   );
 });
 

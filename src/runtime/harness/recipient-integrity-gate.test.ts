@@ -126,6 +126,43 @@ test('a failed provider read cannot authorize recipients echoed from its request
   assert.notEqual(result.sourceId, 'failed-roster');
 });
 
+test('a successful plain-text request echo cannot authorize its own recipient set', () => {
+  const session = createSession({ kind: 'chat' });
+  const echoed = ['echo-one@example.com', 'echo-two@example.com'];
+  const called = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: {
+      tool: 'provider_search',
+      callId: 'plain-request-echo',
+      effect: 'read',
+      arguments: { recipients: echoed },
+    },
+  });
+  writeToolOutput({
+    sessionId: session.id,
+    callId: 'plain-request-echo',
+    invocationNonce: 'nonce-plain-request-echo',
+    tool: 'provider_search',
+    output: `Request accepted: ${echoed.join(', ')}`,
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool: 'provider_search', callId: 'plain-request-echo', effect: 'read', ok: true },
+  });
+
+  const result = evaluateRecipientSetIntegrity(session.id, outgoing(echoed));
+  assert.equal(result.action, 'block');
+  assert.deepEqual(result.unsupportedRecipients, [...echoed].sort());
+  assert.notEqual(result.sourceId, 'plain-request-echo');
+});
+
 test('does not let a pending-action echo validate its own recipient payload', () => {
   const session = createSession({ kind: 'chat' });
   addReadSource(session.id, 'pending-echo', 'pending_action_get', wrong);
@@ -196,4 +233,74 @@ test('fabrication still blocks: an address in NO trusted source refuses the batc
   const result = evaluateRecipientSetIntegrity(session.id, outgoing(stitched));
   assert.equal(result.action, 'block');
   assert.deepEqual(result.unsupportedRecipients, ['phantom@nowhere.example']);
+});
+
+test('a middle-chunk roster grounds recipients without laundering a large request echo', async () => {
+  const { TOOL_OUTPUT_MAX_BYTES } = await import('./eventlog.js');
+  const session = createSession({ kind: 'chat' });
+  const called = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: {
+      tool: 'provider_roster',
+      callId: 'large-roster',
+      effect: 'read',
+      arguments: { query: 'active team' },
+    },
+  });
+  writeToolOutput({
+    sessionId: session.id,
+    callId: 'large-roster',
+    invocationNonce: 'nonce-large-roster',
+    tool: 'provider_roster',
+    output: JSON.stringify({
+      successful: true,
+      data: { padding: 'x'.repeat(TOOL_OUTPUT_MAX_BYTES), members: correct.map((email) => ({ email })) },
+    }),
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: { tool: 'provider_roster', callId: 'large-roster', effect: 'read', ok: true },
+  });
+  assert.equal(evaluateRecipientSetIntegrity(session.id, outgoing(correct)).action, 'allow');
+
+  const echoSession = createSession({ kind: 'chat' });
+  const echoCall = appendEvent({
+    sessionId: echoSession.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_called',
+    data: {
+      tool: 'provider_roster',
+      callId: 'large-request-echo',
+      effect: 'read',
+      arguments: { recipients: correct },
+    },
+  });
+  writeToolOutput({
+    sessionId: echoSession.id,
+    callId: 'large-request-echo',
+    invocationNonce: 'nonce-large-request-echo',
+    tool: 'provider_roster',
+    output: JSON.stringify({
+      successful: true,
+      request: { recipients: correct },
+      data: { padding: 'x'.repeat(TOOL_OUTPUT_MAX_BYTES), members: [] },
+    }),
+  });
+  appendEvent({
+    sessionId: echoSession.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    parentEventId: echoCall.id,
+    data: { tool: 'provider_roster', callId: 'large-request-echo', effect: 'read', ok: true },
+  });
+  assert.equal(evaluateRecipientSetIntegrity(echoSession.id, outgoing(correct)).action, 'block');
 });

@@ -21,14 +21,10 @@ import {
   terminalAuthoringResultIsProven,
 } from '../../tools/tool-registry.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
-import { discoverMcpServers } from '../mcp-config.js';
-import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
+import type { McpToolScope } from '../mcp-tool-scope.js';
 import {
-  mcpServerAliasMatches,
   mcpToolAllowedByScope,
 } from '../mcp-tool-authority.js';
-import { pinnedCalendarRuleLabels } from './constraint-guard.js';
-import type { ManagedMcpServer } from '../../types.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
 import {
   buildGatedToolPermission,
@@ -40,7 +36,7 @@ import { estimateTokens } from './budget.js';
 import { recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
-import { appendEvent, listEvents, listToolOutputInvocations, writeToolOutput } from './eventlog.js';
+import { appendEvent, listEvents, listToolOutputInvocationNonces, writeToolOutput } from './eventlog.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { assertConversationProtocolAtProviderBoundary } from './conversation-protocol-boundary.js';
 import { isAuthRecoverableError } from '../../execution/transient-error.js';
@@ -116,7 +112,6 @@ import {
   toolOutputProvesExternalWriteAcknowledgement,
 } from './tool-evidence.js';
 import { classifyToolError, detectStructuredToolFailure } from './tool-error-corrective.js';
-import { externalMcpScopeFromResolvedTools } from '../../agents/external-mcp-scope-lock.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
 import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
 import {
@@ -664,14 +659,6 @@ function normalizeToolName(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
-/** DEFAULT ON. Attach the user's NATIVE external MCP servers (dataforseo, browsermcp,
- *  supabase, …) to the Claude SDK brain in agentic mode, so it has parity with the
- *  Codex lane instead of being blind to them (a skill saying "use the dataforseo MCP"
- *  used to dead-end on Claude). Off ⇒ prior behavior (local server only). */
-function claudeSdkNativeMcpEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NATIVE_MCP', 'on') ?? 'on').trim().toLowerCase() !== 'off';
-}
-
 /**
  * ToolSearch/schema-on-demand adoption (SOTA 2026,
  * [[project_2026_harness_sota_gap]]). DEFAULT ON. The user's EXTERNAL native MCP
@@ -692,81 +679,20 @@ export function claudeToolSearchEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_TOOL_SEARCH', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
-/** Match a server name against the scope's allowed slugs (mirrors mcp-servers.ts
- *  serverMatchesAllowedSlugs). Empty/undefined slugs ⇒ match all. */
-function nativeServerMatchesScope(serverName: string, allowedServerSlugs?: string[]): boolean {
-  if (!allowedServerSlugs || allowedServerSlugs.length === 0) return true;
-  return allowedServerSlugs.some((slug) => mcpServerAliasMatches(serverName, slug));
-}
-
-function toClaudeSdkMcpConfig(s: ManagedMcpServer): McpServerConfig | null {
-  if (s.type === 'stdio' && s.command) {
-    return { type: 'stdio', command: s.command, args: s.args ?? [], env: mergedSpawnEnv(s.env ?? {}), timeout: 10 * 60 * 1000 } as McpServerConfig;
-  }
-  if ((s.type === 'http' || s.type === 'sse') && s.url) {
-    return { type: s.type, url: s.url, ...(s.headers ? { headers: s.headers } : {}) } as McpServerConfig;
-  }
-  return null;
-}
-
 /**
- * The user's NATIVE external MCP servers, SCOPED by the turn's intent (reuses
- * resolveMcpToolScope so an SEO turn attaches dataforseo, a browser turn attaches
- * browsermcp/playwright, etc. — never all of them at once = no bloat). Only used in
- * agentic mode: the SDK's canUseTool gate (buildGatedToolPermission) then covers every
- * native call — dataforseo__* etc. classify as READ (auto-allow) and any native
- * write/unknown classifies as write (approval), so no gate is bypassed. Fail-open → {}.
+ * Retired executable-native MCP surface. The model SDK receives only the
+ * local Clementine server; third-party discovery is metadata and every exact
+ * call returns through call_tool/work_call so the host owns its physical
+ * attempt and terminal settlement. Keep this zero-width export while old
+ * callers/configuration drain; a scope can never become execution authority.
  */
 export function buildScopedNativeMcpServers(
   scopeInput?: string,
   opts: { mode?: 'prompt' | 'resolved_tools'; scope?: McpToolScope | null } = {},
 ): Record<string, McpServerConfig> {
-  if (!claudeSdkNativeMcpEnabled()) return {};
-  // Empty/absent scope ⇒ we don't know what THIS query needs. For the SDK native
-  // lane attach ZERO external servers rather than inheriting resolveMcpToolScope's
-  // allowAll default — allowAll cold-starts EVERY external MCP child per query and
-  // injects all their tool schemas into the input context (the run_worker /
-  // workflow-step over-attach). Callers that need servers pass a concrete scope
-  // (brain: request.message; worker: objective+tools; step: prompt). Scoped to
-  // this function only — the shared resolveMcpToolScope default is untouched, and
-  // the LOCAL in-process clementine server is spread separately (unaffected).
-  const explicitScope = Object.prototype.hasOwnProperty.call(opts, 'scope');
-  if ((!scopeInput || !scopeInput.trim()) && !explicitScope) return {};
-  try {
-    const all = discoverMcpServers().filter((s) => s.enabled);
-    if (all.length === 0) return {};
-    const scope = explicitScope
-      ? opts.scope
-      : opts.mode === 'resolved_tools'
-        ? externalMcpScopeFromResolvedTools(scopeInput, all.map((server) => server.name))
-        : resolveMcpToolScope({ userInput: scopeInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
-    if (!scope) return {};
-    // A deliberate zero-tool prompt scope is represented by maxTools:0 + an
-    // empty slug list (allowAll is intentionally undefined), while the bounded
-    // unrecognized-intent fallback is the only empty-slug scope allowed to
-    // reach the user's own servers. Resolved worker packets intentionally omit
-    // maxTools, so only an EXPLICIT zero carries denial authority.
-    if (
-      !scope.allowAll
-      && !scope.failOpenCandidate
-      && (scope.maxTools === 0 || (scope.allowedServerSlugs ?? []).length === 0)
-    ) return {};
-    const deferExternal = claudeToolSearchEnabled();
-    const out: Record<string, McpServerConfig> = {};
-    for (const s of all) {
-      if (!scope.allowAll && !nativeServerMatchesScope(s.name, scope.allowedServerSlugs)) continue;
-      const cfg = toClaudeSdkMcpConfig(s);
-      if (!cfg) continue;
-      // ToolSearch: defer external server schemas (surface by name, load on demand)
-      // → smaller prompt + the server doesn't block the child's startup. The local
-      // clementine-local core (built separately) stays alwaysLoad, so acquisition
-      // hatches are always present. Default off until live-smoked.
-      out[s.name] = deferExternal ? { ...cfg, alwaysLoad: false } as McpServerConfig : cfg;
-    }
-    return out;
-  } catch {
-    return {};
-  }
+  void scopeInput;
+  void opts;
+  return {};
 }
 
 export function buildAllowOnlyToolsPermission(allowedTools: string[]): CanUseTool {
@@ -1479,6 +1405,9 @@ export interface ClaudeAgentSdkRunOptions {
   approvalMode?: 'wait' | 'park';
   /** Caller-driven cancellation hook (background task cancel/deadline). */
   shouldCancel?: () => boolean | Promise<boolean>;
+  /** Immediate caller abort. Unlike shouldCancel polling, this interrupts a
+   * quiet SDK iterator at the exact cancellation edge. */
+  abortSignal?: AbortSignal;
   /** Optional logical-run economy shared by every corrective/limit
    * continuation of an interactive brain turn. Provider toolUseID values make
    * permission replays free; background/workflow callers intentionally omit it. */
@@ -2354,13 +2283,46 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         });
       } catch { /* a refusal must never become a second failure */ }
     };
+    // Provider SDKs are model transports, never an external-MCP execution
+    // owner. Only the exact clementine-local MCP server may reach the ordinary
+    // permission/gate path below; every foreign namespace must return through
+    // call_tool/work_call, where the host owns the logical call, physical
+    // crossing, approval, and terminal settlement. Keep this boundary ahead of
+    // permission caches, discovery/artifact/economy gates, approval, and write
+    // reservation so none of those mechanisms can accidentally mint authority
+    // for a provider body the SDK itself would execute.
+    const foreignMcpIdentity = nativeExternalMcpTool(toolName);
+    if (foreignMcpIdentity) {
+      const corrective =
+        `FOREIGN_MCP_DIRECT_EXECUTION_DENIED: ${foreignMcpIdentity.namespacedToolName} was not started. `
+        + 'Invoke the exact external capability through Clementine\'s local call_tool/work_call carrier.';
+      settleRefusedPreDispatchCall(foreignMcpIdentity.namespacedToolName, corrective);
+      return {
+        behavior: 'deny',
+        interrupt: false,
+        message: corrective,
+      } as PermissionResult;
+    }
     const claudeParentDiscovery = isClaudeParentDiscoverySurface(toolName, input);
+    const denyClaudeDiscoveryPermissionReplay = (): PermissionResult => ({
+      behavior: 'deny',
+      interrupt: false,
+      message: 'Tool call refused by harness: discovery budget denied (same_call_replay) on Claude direct discovery. This exact provider tool-use id already owns the permission/claim. Clementine will not reuse a cached allow or re-enter provider code; consume the original durable result, or use a fresh id only after host-observed evidence opens a new retry epoch.',
+    });
     let permissionSignature = '';
     try { permissionSignature = `${toolName}\0${JSON.stringify(input ?? {})}`; } catch { permissionSignature = `${toolName}\0${String(input)}`; }
     if (providerCallId) {
       const cached = nativePermissionResults.get(providerCallId);
       if (cached) {
         if (cached.signature === permissionSignature) {
+          // A cached ALLOW is a verdict, not provider-dispatch idempotency.
+          // Returning it again for direct discovery authorizes the SDK to run
+          // the provider body again under the already-settled claim. Reads are
+          // not harmless here: paid searches fan out and their second result
+          // cannot settle against the original physical assertion.
+          if (cached.result?.behavior === 'allow' && claudeParentDiscovery) {
+            return denyClaudeDiscoveryPermissionReplay();
+          }
           // A repeated permission callback for a read or a denial can safely
           // reuse the first verdict. Replaying an ALLOW for a native mutation
           // would authorize a second provider dispatch under the first durable
@@ -2387,7 +2349,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       }
       const inFlight = nativePermissionInFlight.get(providerCallId);
       if (inFlight) {
-        if (inFlight.signature === permissionSignature) return inFlight.promise;
+        if (inFlight.signature === permissionSignature) {
+          // Sharing an in-flight ALLOW promise lets two concurrent callbacks
+          // leave for the provider under one tool-use id. The first callback
+          // owns the one discovery decision; the duplicate is not a second
+          // logical occurrence and therefore must not settle over its owner.
+          if (claudeParentDiscovery) return denyClaudeDiscoveryPermissionReplay();
+          return inFlight.promise;
+        }
         return {
           behavior: 'deny',
           interrupt: true,
@@ -2869,18 +2838,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     };
   }
   const runScopeId = trackerScopeId;
-  const nativeMcpServers = agentic && !actionExpectedWork
-    ? buildScopedNativeMcpServers(options.nativeMcpScopeInput, {
-        mode: options.nativeMcpScopeMode,
-        ...(options.nativeMcpToolScope !== undefined
-          ? { scope: options.nativeMcpToolScope }
-          : {}),
-      })
-    : {};
   const buildMcpServersForDispatchLease = (
     dispatchLease: DispatchLeaseRef | undefined,
-  ): Record<string, McpServerConfig> => ({
-    ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, localMcpToolAllowlist, {
+  ): Record<string, McpServerConfig> => buildClaudeAgentSdkLocalMcpServers(
+    options.sessionId,
+    agentic,
+    localMcpToolAllowlist,
+    {
       workflowRunId: options.workflowRunId,
       workflowName: options.workflowName,
       stepId: options.stepId,
@@ -2891,11 +2855,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       workerScope: options.workerScope === true,
       mcpToolScope: options.nativeMcpToolScope,
       dispatchLease,
-    }, localMcpLoading),
-    // Native external MCP servers (scoped by intent), ONLY in agentic mode —
-    // the per-query canUseTool closure below carries this query generation.
-    ...nativeMcpServers,
-  });
+    },
+    localMcpLoading,
+  );
   const sdkOptions: ClaudeAgentOptions = {
     env,
     ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
@@ -3154,6 +3116,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       queryClosed = true;
       try { stream?.close?.(); } catch { /* ignore */ }
     };
+    let onAbort: (() => void) | undefined;
     try {
       if (effectiveShouldCancel && await effectiveShouldCancel()) {
         throw new AgentRuntimeCancelledError('Run cancelled by caller.');
@@ -3169,6 +3132,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         { role: 'user', content: options.prompt } as AgentInputItem,
       ], 'claude.agent_sdk');
       stream = queryImpl({ prompt: effectivePrompt, options: querySdkOptions }) as Query;
+      onAbort = (): void => { void interruptQuery(); };
+      options.abortSignal?.addEventListener('abort', onAbort, { once: true });
+      if (options.abortSignal?.aborted) {
+        await interruptQuery();
+        throw options.abortSignal.reason ?? new AgentRuntimeCancelledError('Run cancelled by caller.');
+      }
       const iterator = (stream as AsyncIterable<SDKMessage>)[Symbol.asyncIterator]();
       while (true) {
         const heartbeatIntervalMs = Math.max(1, options.livenessHeartbeatMs ?? 60_000);
@@ -3480,12 +3449,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             : null;
           const locallyCorrelatedCanonical = occurrence.preauthoredLocalCanonical
             || claimedCanonicalAtResult?.id === occurrence.calledEventId;
-          const locallyParkedInvocations = options.sessionId
+          const locallyParkedInvocationNonces = options.sessionId
             && locallyCorrelatedCanonical
             && source
             && isClaudeLocalCorrelatableSdkTool(source.name)
             ? (() => {
-                try { return listToolOutputInvocations(options.sessionId as string, tr.callId); }
+                try { return listToolOutputInvocationNonces(options.sessionId as string, tr.callId, 2); }
                 catch { return []; }
               })()
             : [];
@@ -3500,14 +3469,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             && !settledReadReplay
           ) {
             try {
-              if (locallyParkedInvocations.length === 1) {
+              if (locallyParkedInvocationNonces.length === 1) {
                 // The correlated local bracket already parked the physical
                 // provider bytes under this outer call id. Reuse its nonce;
                 // writing again here would create a second exact invocation
                 // and make authority resolution correctly (but needlessly)
                 // ambiguous.
-                invocationNonce = locallyParkedInvocations[0]!.invocationNonce;
-              } else if (locallyParkedInvocations.length === 0) {
+                invocationNonce = locallyParkedInvocationNonces[0]!;
+              } else if (locallyParkedInvocationNonces.length === 0) {
                 invocationNonce = randomUUID();
                 writeToolOutput({
                   sessionId: options.sessionId,
@@ -3772,6 +3741,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         throw err;
       }
     } finally {
+      if (onAbort) options.abortSignal?.removeEventListener('abort', onAbort);
       await closeQuery();
     }
     // A self-imposed stop (ceiling/wall-clock) that ended the stream WITHOUT a

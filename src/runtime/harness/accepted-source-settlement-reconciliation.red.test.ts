@@ -27,6 +27,7 @@ const dispatch = await import('./dispatch-ledger.js');
 const outcomes = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
+const { recordSemanticParticipation } = await import('../semantic-boundary/semantic-disposition.js');
 const { resolveWriteEvidence } = await import('./work-report.js');
 
 test.after(() => {
@@ -106,6 +107,7 @@ test('a later accepted source with no business evidence cannot erase an older or
     type: 'user_input_received',
     data: { text: 'Read the records.' },
   });
+  recordSemanticParticipation(sessionId, failedSource.seq, 'participated');
   assert.ok(shadow.recordTurnGraphShadow({
     identity: { sessionId, turn: failedSource.turn, sourceUserSeq: failedSource.seq },
   }));
@@ -184,6 +186,7 @@ test('a worked-around read failure does not block a source that completed other 
     type: 'user_input_received',
     data: { text: 'Pull the team activity.' },
   });
+  recordSemanticParticipation(sessionId, source.seq, 'participated');
   assert.ok(shadow.recordTurnGraphShadow({
     identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
   }));
@@ -308,7 +311,7 @@ function ambiguousWriteFixture(input: {
   return source.seq;
 }
 
-test('an ambiguous REVERSIBLE write is reported but does not veto the terminal', () => {
+test('an ambiguous REVERSIBLE write still vetoes until exact readback reconciliation', () => {
   const sessionId = 'workflow:reversible-ambiguous-write:main';
   const seq = ambiguousWriteFixture({
     sessionId,
@@ -318,17 +321,17 @@ test('an ambiguous REVERSIBLE write is reported but does not veto the terminal',
   });
 
   const audit = auditAcceptedSourceSettlementTruth({ sessionId, sourceUserSeq: seq });
-  assert.notEqual(
+  assert.equal(
     audit.status,
     'uncertain_write',
-    `a reversible ambiguity withheld an entire completed review: ${JSON.stringify(audit)}`,
+    `reversibility alone cannot prove whether the write landed: ${JSON.stringify(audit)}`,
   );
   assert.equal(
     audit.facts.uncertainWrites,
     1,
     'the ambiguity stays visible in the facts so the work report can disclose it',
   );
-  assert.equal(audit.facts.blockingUncertainWrites, 0);
+  assert.equal(audit.facts.blockingUncertainWrites, 1);
 });
 
 test('an ambiguous IRREVERSIBLE write still blocks the terminal', () => {
@@ -390,8 +393,9 @@ function repairFixture(input: {
     type: 'user_input_received',
     data: { text: 'Update the tracker.' },
   });
+  recordSemanticParticipation(input.sessionId, source.seq, 'participated');
   const reserve = (callId: string, spec: { shapeKey: string; targets: string[]; irreversible: boolean }) => {
-    eventlog.appendEvent({
+    return eventlog.appendEvent({
       sessionId: input.sessionId,
       turn: 1,
       role: 'system',
@@ -409,7 +413,13 @@ function repairFixture(input: {
     identity: { sessionId: input.sessionId, turn: source.turn, sourceUserSeq: source.seq },
   }));
   const acceptedTaskId = identities.acceptedTaskIdFor(input.sessionId, source.seq);
-  const settle = (callId: string, tool: string, args: unknown, ok: boolean) => {
+  const settle = (
+    callId: string,
+    tool: string,
+    args: unknown,
+    ok: boolean,
+    reservation: ReturnType<typeof reserve>,
+  ) => {
     const begun = dispatch.beginPhysicalDispatch({
       identity: {
         sessionId: input.sessionId,
@@ -447,18 +457,31 @@ function repairFixture(input: {
       recovery: { businessCall: true, mutating: true },
       observer: { lane: 'agents_runner', turn: source.turn },
     });
+    eventlog.appendEvent({
+      sessionId: input.sessionId,
+      turn: 1,
+      role: 'system',
+      type: ok ? 'external_write_succeeded' : 'external_write_failed',
+      parentEventId: reservation.id,
+      data: {
+        shapeKey: reservation.data.shapeKey,
+        canonicalCallId: callId,
+        targets: reservation.data.targets,
+        reason: ok ? 'provider_acknowledged' : 'provider_rejected_before_effect',
+      },
+    });
   };
   const tool = input.failed.shapeKey.toLowerCase();
   if (input.repairFirst) {
-    reserve('call-repair', input.repaired);
-    settle('call-repair', input.repaired.shapeKey.toLowerCase(), { row: 9 }, true);
-    reserve('call-broken', input.failed);
-    settle('call-broken', tool, { row: 'NaN' }, false);
+    const repaired = reserve('call-repair', input.repaired);
+    settle('call-repair', input.repaired.shapeKey.toLowerCase(), { row: 9 }, true, repaired);
+    const failed = reserve('call-broken', input.failed);
+    settle('call-broken', tool, { row: 'NaN' }, false, failed);
   } else {
-    reserve('call-broken', input.failed);
-    settle('call-broken', tool, { row: 'NaN' }, false);
-    reserve('call-repair', input.repaired);
-    settle('call-repair', input.repaired.shapeKey.toLowerCase(), { row: 9 }, true);
+    const failed = reserve('call-broken', input.failed);
+    settle('call-broken', tool, { row: 'NaN' }, false, failed);
+    const repaired = reserve('call-repair', input.repaired);
+    settle('call-repair', input.repaired.shapeKey.toLowerCase(), { row: 9 }, true, repaired);
   }
   return source.seq;
 }

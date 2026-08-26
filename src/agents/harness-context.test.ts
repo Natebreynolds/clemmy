@@ -50,6 +50,28 @@ test('query-driven recall: no query ⇒ no per-request recall section (byte-iden
   assert.doesNotMatch(renderHarnessMemoryContext({ sessionId: 's' }), /## Relevant To Your Request/);
 });
 
+test('one accepted-turn instruction function freezes its memory snapshot across model cycles', () => {
+  resetMemoryDb();
+  rememberFact({ kind: 'project', content: 'Snapshot fact present before this accepted turn begins.' });
+  const acceptedTurnInstructions = harnessInstructions('SNAPSHOT ROLE', {
+    sessionId: 'accepted-turn-snapshot-session',
+    focusInput: 'snapshot memory for this request',
+  });
+  const firstCycle = acceptedTurnInstructions();
+  assert.match(firstCycle, /Snapshot fact present before this accepted turn begins/);
+
+  rememberFact({ kind: 'project', content: 'Fact learned during a later model cycle in the same turn.' });
+  assert.equal(acceptedTurnInstructions(), firstCycle,
+    'a later model cycle must receive byte-identical accepted-turn context');
+
+  const nextTurn = harnessInstructions('SNAPSHOT ROLE', {
+    sessionId: 'accepted-turn-snapshot-session',
+    focusInput: 'snapshot memory for this request',
+  })();
+  assert.match(nextTurn, /Fact learned during a later model cycle in the same turn/,
+    'a newly constructed turn receives the latest consolidated memory');
+});
+
 test('same-session completed external actions are visible in shared harness context', () => {
   const session = createSession({ kind: 'chat', channel: 'test' });
   appendEvent({

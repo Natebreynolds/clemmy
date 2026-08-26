@@ -15,7 +15,10 @@ import {
   parseCanonicalOwnerFence,
 } from './canonical-graph-node-lease.js';
 import type { ResolvedCallAuthorityV1 } from './resolved-call-authority.js';
-import { workflowReadOnlyPhysicalClaimAttestationMatches } from './accepted-turn-call-authority.js';
+import {
+  workflowReadOnlyPhysicalClaimAttestationMatches,
+  workflowV3PhysicalClaimAttestationMatches,
+} from './accepted-turn-call-authority.js';
 import { workflowReadPagePhysicalClaimAttestationMatches } from './workflow-paginated-read-authority.js';
 
 export interface PhysicalIoClaimIdentity {
@@ -180,7 +183,7 @@ export function claimWorkflowPhysicalIo(input: {
   toolName: string;
 }): PhysicalIoClaimResult {
   const { identity } = input;
-  if (!workflowReadOnlyPhysicalClaimAttestationMatches({
+  const attestationInput = {
     sessionId: identity.sessionId,
     sourceEventSeq: identity.sourceUserSeq,
     authorityRootId: identity.authorityRootId,
@@ -190,7 +193,11 @@ export function claimWorkflowPhysicalIo(input: {
     authorityRevision: input.authorityRevision,
     logicalCallId: identity.logicalCallId,
     physicalToolName: input.toolName,
-  })) return { claimed: false, reason: 'authority_mismatch' };
+  };
+  if (
+    !workflowReadOnlyPhysicalClaimAttestationMatches(attestationInput)
+    && !workflowV3PhysicalClaimAttestationMatches(attestationInput)
+  ) return { claimed: false, reason: 'authority_mismatch' };
 
   const db = openEventLog();
   const claimedAt = new Date().toISOString();
@@ -236,7 +243,7 @@ export function claimWorkflowPhysicalIo(input: {
     if (row.io_claimed_at) return { claimed: false, reason: 'already_claimed' };
     if (
       row.physical_state !== 'started'
-      || row.authority_kind !== 'workflow_v1_read_only'
+      || !['workflow_v1_read_only', 'workflow_v3_call'].includes(row.authority_kind)
       || row.authority_state !== 'open'
       || row.accepted_task_id !== identity.authorityRootId
       || row.authority_root_id !== identity.authorityRootId

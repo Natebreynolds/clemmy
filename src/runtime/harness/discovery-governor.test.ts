@@ -106,7 +106,7 @@ test('known capability ranks candidates but never withholds the one bounded broa
   );
 });
 
-test('novel task receives one broad discovery and a separate one-shot schema refresh', () => {
+test('novel task receives one physical broad discovery and a separate one-shot schema refresh', () => {
   const key = acceptedTask('novel');
   const governor = new DiscoveryGovernor();
   governor.initializeTask({ ...key, knownCapability: false });
@@ -120,17 +120,16 @@ test('novel task receives one broad discovery and a separate one-shot schema ref
   assert.equal(broad.reason, 'novel_discovery_admitted');
   assert.equal(broad.consumedBudget, true);
 
-  // A second look is ADMITTED and spends no additional budget. Refusing it
-  // never saved the call — the model had already paid for it — and only bought
-  // a reformulated retry, which is the thrash the cap existed to prevent.
+  // A different physical id cannot borrow the claim. Otherwise it reaches the
+  // provider while its settlement still points at broad-1.
   const extraBroad = governor.admit({
     ...key,
     category: 'broad_discovery',
     callId: 'broad-2',
   });
-  assert.equal(extraBroad.admitted, true);
-  assert.equal(extraBroad.reason, 'subject_replay');
-  assert.equal(extraBroad.consumedBudget, false, 'a replay must not spend a second claim');
+  assert.equal(extraBroad.admitted, false);
+  assert.equal(extraBroad.reason, 'new_call_requires_retry_epoch');
+  assert.equal(extraBroad.consumedBudget, false, 'a denial must not spend a second claim');
 
   const refresh = governor.admit({
     ...key,
@@ -141,19 +140,19 @@ test('novel task receives one broad discovery and a separate one-shot schema ref
   assert.equal(refresh.reason, 'schema_refresh_admitted');
   assert.equal(refresh.telemetry.eventData.allowance, 1);
 
-  // Same for a repeated schema refresh: the allowance is spent once, and the
-  // repeat replays it instead of being refused.
+  // Same for a repeated schema refresh: the allowance authorizes one physical
+  // call identity, not an unbounded series of new ids.
   const extraRefresh = governor.admit({
     ...key,
     category: 'exact_schema_refresh',
     callId: 'refresh-2',
   });
-  assert.equal(extraRefresh.admitted, true);
-  assert.equal(extraRefresh.reason, 'subject_replay');
+  assert.equal(extraRefresh.admitted, false);
+  assert.equal(extraRefresh.reason, 'new_call_requires_retry_epoch');
   assert.equal(extraRefresh.consumedBudget, false);
 });
 
-test('same call-id replay is free and a failed claim remains spent after daemon restart', () => {
+test('restart denies both a settled call id and a new id until an explicit retry epoch', () => {
   const key = acceptedTask('restart-failure');
   const governor = new DiscoveryGovernor();
   governor.initializeTask({ ...key, knownCapability: false });
@@ -183,26 +182,37 @@ test('same call-id replay is free and a failed claim remains spent after daemon 
     category: 'broad_discovery',
     callId: 'provider-call-1',
   });
-  assert.equal(replay.admitted, true);
+  assert.equal(replay.admitted, false);
   assert.equal(replay.reason, 'same_call_replay');
   assert.equal(replay.replay, true);
   assert.equal(replay.consumedBudget, false);
   assert.equal(replay.claim?.outcome, 'failed');
   assert.equal(replay.telemetry.eventData.priorOutcome, 'failed');
 
-  // A FAILED claim no longer forecloses the retry. A provider failure is
-  // exactly when another attempt is legitimate, and refusing it does not save
-  // the call the model already made — it only forces a reformulated one. The
-  // claim keeps its recorded failure; the retry simply replays it for free.
+  // Failure alone does not let a caller mint a new physical identity. The
+  // runtime must classify host-observed evidence and explicitly open an epoch.
   const retryWithNewCall = restarted.admit({
     ...key,
     category: 'broad_discovery',
     callId: 'provider-call-2',
   });
-  assert.equal(retryWithNewCall.admitted, true);
-  assert.equal(retryWithNewCall.reason, 'subject_replay');
+  assert.equal(retryWithNewCall.admitted, false);
+  assert.equal(retryWithNewCall.reason, 'new_call_requires_retry_epoch');
   assert.equal(retryWithNewCall.consumedBudget, false, 'the claim is still spent exactly once');
   assert.equal(retryWithNewCall.claim?.outcome, 'failed', 'the failure stays on the record');
+
+  assert.equal(restarted.recordEvidence({
+    ...key,
+    kind: 'candidate_unsupported',
+    detail: 'settled provider failure classified by the host',
+  }).outcome, 'epoch_opened');
+  const authorizedRetry = restarted.admit({
+    ...key,
+    category: 'broad_discovery',
+    callId: 'provider-call-2',
+  });
+  assert.equal(authorizedRetry.admitted, true);
+  assert.equal(authorizedRetry.reason, 'new_evidence_admitted');
 
   const settlementReplay = restarted.settle({
     ...key,
@@ -215,7 +225,7 @@ test('same call-id replay is free and a failed claim remains spent after daemon 
   assert.equal(settlementReplay.reason, 'same_outcome_replay');
 });
 
-test('known tasks may spend the independent exact-schema-refresh slot once', () => {
+test('known tasks cannot re-enter an exact-schema timeout without a new retry epoch', () => {
   const key = acceptedTask('known-schema-drift');
   const governor = new DiscoveryGovernor();
   governor.initializeTask({ ...key, knownCapability: true });
@@ -237,18 +247,25 @@ test('known tasks may spend the independent exact-schema-refresh slot once', () 
   });
   assert.equal(timedOut.recorded, true);
 
-  // A timeout is the canonical retryable outcome; refusing the second attempt
-  // stranded the task on a transient provider failure. The slot is still spent
-  // once and the timeout stays on the record.
+  // Neither a new id nor an uncached re-entry of the old one gets provider
+  // authority. A host-classified retry epoch must authorize a fresh attempt.
   const second = governor.admit({
     ...key,
     category: 'exact_schema_refresh',
     callId: 'schema-drift-2',
   });
-  assert.equal(second.admitted, true);
-  assert.equal(second.reason, 'subject_replay');
+  assert.equal(second.admitted, false);
+  assert.equal(second.reason, 'new_call_requires_retry_epoch');
   assert.equal(second.consumedBudget, false);
   assert.equal(second.claim?.outcome, 'timed_out');
+
+  const samePhysicalRetry = governor.admit({
+    ...key,
+    category: 'exact_schema_refresh',
+    callId: 'schema-drift-1',
+  });
+  assert.equal(samePhysicalRetry.admitted, false);
+  assert.equal(samePhysicalRetry.reason, 'same_call_replay');
 });
 
 async function childAdmission(
@@ -290,7 +307,7 @@ async function childAdmission(
   return JSON.parse(stdout) as { admitted: boolean; consumedBudget: boolean; reason: string };
 }
 
-test('concurrent daemon processes atomically elect one broad-discovery winner', async () => {
+test('concurrent daemon processes atomically authorize one broad-discovery call id', async () => {
   const key = acceptedTask('cross-process-race');
   const governor = new DiscoveryGovernor();
   governor.initializeTask({ ...key, knownCapability: false });
@@ -299,17 +316,17 @@ test('concurrent daemon processes atomically elect one broad-discovery winner', 
   const decisions = await Promise.all(
     Array.from({ length: 6 }, (_, index) => childAdmission(moduleUrl, key, `race-${index}`)),
   );
-  // THE INVARIANT IS ATOMICITY, NOT REFUSAL: exactly one process may create the
-  // claim. The losers of that race are handed the existing claim rather than
-  // refused — they have already paid for their call.
+  // Exactly one process may create the claim and own provider authority. The
+  // other physical ids are denied; a zero-cost ledger replay must not mean a
+  // second provider invocation.
   assert.equal(
     decisions.filter((decision) => decision.consumedBudget).length,
     1,
     'exactly one process may spend the claim',
   );
-  assert.equal(decisions.filter((decision) => decision.admitted).length, 6);
+  assert.equal(decisions.filter((decision) => decision.admitted).length, 1);
   assert.equal(
-    decisions.filter((decision) => decision.reason === 'subject_replay').length,
+    decisions.filter((decision) => decision.reason === 'new_call_requires_retry_epoch').length,
     5,
   );
   assert.equal(governor.getTaskState(key)?.claims.broad_discovery?.outcome, 'pending');

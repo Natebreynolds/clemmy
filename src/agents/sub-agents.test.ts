@@ -126,11 +126,11 @@ test('buildWorkerAgent attaches no external MCP servers without an explicit pare
   assert.equal(worker.mcpServers.length, 0);
 });
 
-test('buildWorkerAgent preserves an explicit parent MCP scope', async () => {
+test('buildWorkerAgent keeps an explicit parent MCP scope behind its local carrier', async () => {
   const worker = await buildWorkerAgent({
     mcpToolScope: { reason: 'parent scoped data work', allowedServerSlugs: ['dataforseo'], maxTools: 8 },
   });
-  assert.equal(worker.mcpServers.length, 1);
+  assert.equal(worker.mcpServers.length, 0, 'a scoped server is not executable inside the model SDK');
 });
 
 test('worker resolvedTools derive external MCP only from exact native MCP slugs/server names', () => {

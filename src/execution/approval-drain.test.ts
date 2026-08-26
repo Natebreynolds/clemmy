@@ -24,7 +24,7 @@ function makeRegistry(row?: { sessionId: string; status: string; resolution?: st
   };
 }
 
-test('registry miss falls back to the legacy runtime store', async () => {
+test('registry miss retires the legacy approval without invoking its runtime executor', async () => {
   const registry = makeRegistry(undefined);
   let legacyCalled = 0;
   const result = await resolveDrainApproval({
@@ -34,8 +34,10 @@ test('registry miss falls back to the legacy runtime store', async () => {
     legacyResolve: async () => { legacyCalled += 1; return { approvalId: 'apr-legacy', status: 'approved', text: 'legacy ok', sessionId: 'sess-l' }; },
     resumeForTest: async () => { throw new Error('resume must not run on a registry miss'); },
   });
-  assert.equal(legacyCalled, 1);
-  assert.equal(result.text, 'legacy ok');
+  assert.equal(legacyCalled, 0);
+  assert.equal(result.status, 'blocked');
+  assert.match(result.text, /retired/i);
+  assert.match(result.status === 'blocked' ? result.reason : '', /not executed/i);
 });
 
 test('pending registry row + approve → resolves the row then resumes the parked run', async () => {

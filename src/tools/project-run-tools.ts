@@ -1,24 +1,16 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { textResult } from './shared.js';
-import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 
 /**
- * `project_run` — drive the user's REAL Claude Code / Codex CLI as a full
- * agent inside one of their local projects.
+ * `project_run` — inspect and stop historical Claude Code / Codex guest runs.
  *
- * Why a guest harness instead of doing the work in-loop: the output the
- * user wants from a project (their /seo-audit, /build-brief, …) is produced
- * by that project's whole stack — slash commands, skills, CLAUDE.md /
- * AGENTS.md, .mcp.json servers with their creds — running under the CLI the
- * user built it for, on the user's own subscription auth. Reproducing the
- * command in-loop yields a lookalike, not the real deliverable.
- *
- * Contract (mirrors cli_setup): the SPAWN is the effect — offer → one user
- * approval → start → poll with status → deliver the result and the changed
- * files. Runs outlive a single turn (audits take 10–30 min); never block on
- * one. Projects come from the user's workspace roster ONLY; discover them
- * (and their slash commands) with workspace_list.
+ * The former `start` implementation launched a raw child CLI after the local
+ * tool returned. That child had no durable logical/physical execution owner,
+ * and exit-zero prose was promoted directly to success. Until a delegated
+ * execution root can own the child, its effects, and its terminal receipt,
+ * `start` is a typed pre-spawn unavailable result. Historical status, runs,
+ * and kill controls remain reachable.
  */
 
 const ACTION = z.enum(['start', 'status', 'kill', 'runs']);
@@ -27,13 +19,12 @@ export function registerProjectRunTools(server: McpServer): void {
   server.tool(
     'project_run',
     [
-      'Run a prompt or slash command through the user\'s own Claude Code or Codex CLI inside one of their local projects (the project\'s slash commands, skills, MCP servers, and instructions all apply). Actions:',
-      '- start: launch a run. Pass project (name or path from workspace_list), prompt (e.g. "/seo-audit https://example.com" or free text), harness ("claude" | "codex").',
+      'Inspect or stop historical Claude Code or Codex guest runs. Starting a new raw guest process is unavailable until a durable delegated-execution root owns its effects and terminal receipt. Actions:',
+      '- start: returns a typed unavailable result without spawning a process or creating a run record.',
       '- status: poll a run by runId — recent narration, final message, and files it created/changed.',
       '- kill: stop a running guest run.',
       '- runs: list recent guest runs.',
-      'Ask the user before start (one approval per run); status/runs are read-only.',
-      'Use this when the user asks for something a project\'s own commands already produce — never rebuild a project\'s deliverable by hand in-loop.',
+      'status/runs are read-only; kill remains available for an already-running historical process.',
     ].join('\n'),
     {
       action: ACTION.describe('What to do: start | status | kill | runs.'),
@@ -62,46 +53,19 @@ export function registerProjectRunTools(server: McpServer): void {
 }
 
 async function startAction(
-  project: string | undefined,
-  prompt: string | undefined,
-  harness: 'claude' | 'codex' | undefined,
-  model: string | undefined,
+  _project: string | undefined,
+  _prompt: string | undefined,
+  _harness: 'claude' | 'codex' | undefined,
+  _model: string | undefined,
 ): Promise<ReturnType<typeof textResult>> {
-  if (!project || !prompt) {
-    return textResult('project_run start needs both project and prompt. Find projects (and their slash commands) with workspace_list.');
-  }
-  const { guestHarnessAvailable } = await import('../execution/guest-harness.js');
-  const chosen = harness ?? 'claude';
-  if (!guestHarnessAvailable(chosen)) {
-    const catalogId = chosen === 'claude' ? 'claude-code' : 'codex';
-    return textResult(
-      `The ${chosen} CLI is not installed. Offer to install it: cli_setup {"action":"install","catalogId":"${catalogId}"} (ask the user first).`,
-    );
-  }
-  const { startGuestRun } = await import('../execution/guest-run-jobs.js');
-  const context = harnessRunContextStorage.getStore();
-  const sessionId = context?.sessionId;
-  const job = startGuestRun({
-    harness: chosen,
-    project,
-    prompt,
-    model,
-    sessionId,
-    sourceUserSeq: context?.sourceUserSeq,
-    attemptId: context?.runAttemptId,
-  });
-  return textResult(
-    `Started ${job.harness} in ${job.projectName} (${job.projectPath}) — runId ${job.id}, running in the background.\n`
-    + `Prompt: ${job.prompt}\n`
-    + (job.originSessionId
-      ? 'When it finishes, the result is reported back into this conversation AUTOMATICALLY — you do not need to '
-        + 'poll or wait. Reply to the user NOW in your own words: what is running, where, roughly how long it '
-        + 'usually takes (often 10–30 minutes), that they can ask for a progress check or say stop at any time, '
-        + 'and that you will report back the moment it completes. Then END your reply. Use '
-        + 'project_run {"action":"status","runId":"' + job.id + '"} only if the user asks for a progress check.'
-      : 'This can take many minutes. Poll with project_run {"action":"status","runId":"' + job.id + '"} '
-        + 'and tell the user it is underway; deliver the final message and changed files when it completes.'),
-  );
+  return textResult(JSON.stringify({
+    ok: false,
+    status: 'unavailable',
+    code: 'durable_delegated_execution_root_required',
+    processStarted: false,
+    runRecordCreated: false,
+    reason: 'project_run start cannot launch an unowned guest process. A durable delegated-execution root must own the child process, physical effects, and terminal receipt before new starts can be enabled. Historical status, runs, and kill actions remain available.',
+  }), { isError: true });
 }
 
 async function statusAction(runId: string | undefined): Promise<ReturnType<typeof textResult>> {

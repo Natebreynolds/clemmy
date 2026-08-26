@@ -76,7 +76,10 @@ export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agen
     '',
     ...boundary,
     '',
-    `Worker item: ${input.item}`,
+    // The exact item is already the final field of buildWorkerJobPrompt's
+    // Packet JSON. Repeating it in the shared system prefix made otherwise
+    // identical batch wires diverge before the prompt cache could help.
+    'The exact worker item is the final field of the attached Packet JSON.',
     input.intent ? `Worker intent: ${input.intent}` : '',
   ].filter(Boolean).join('\n');
 }
@@ -97,6 +100,7 @@ export async function runClaudeAgentSdkWorker(
   sourceUserSeq?: number,
   parentMcpToolScope?: McpToolScope | null,
   dispatchLease?: DispatchLeaseRef,
+  abortSignal?: AbortSignal,
 ): Promise<ClaudeAgentSdkWorkerResult> {
   // Agentic only with the PARENT session id — the gates + plan-scope + execution
   // lane aggregate across the worker fan-out via the shared session (one batch
@@ -142,6 +146,13 @@ export async function runClaudeAgentSdkWorker(
     // continues to own kill, approval, execution, and event records.
     trackerScopeId,
     ...(dispatchLease ? { dispatchLease } : {}),
+    ...(abortSignal ? {
+      abortSignal,
+      shouldCancel: () => abortSignal.aborted,
+      // Cancellation must interrupt a quiet worker stream promptly enough to
+      // drain before run_worker's unchanged outer deadline.
+      livenessHeartbeatMs: 50,
+    } : {}),
     ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
   });
   // Cap-visibility: on a turn-cap the SDK returns limitHit:true + FRIENDLY "say

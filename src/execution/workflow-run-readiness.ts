@@ -1,5 +1,4 @@
 import { existsSync, readdirSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
@@ -7,7 +6,6 @@ import { listSkills } from '../memory/skill-store.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { listWorkspaceProjects } from '../tools/shared.js';
 import { readCachedScan } from '../runtime/cli-discovery.js';
-import { mergedSpawnEnv } from '../runtime/spawn-env.js';
 import { getSavedClis } from '../runtime/saved-clis.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
 import { listMcpServerHealth, slugifyServerName } from '../runtime/mcp-namespace-shim.js';
@@ -20,6 +18,10 @@ import {
   type WorkflowToolReadinessItem,
   type WorkflowToolReadinessKind,
 } from '../dashboard/workflow-execution-plan.js';
+import {
+  workflowRawSubprocessDeclarations,
+  workflowRawSubprocessRetirementReason,
+} from './workflow-raw-subprocess-policy.js';
 
 // Only capabilities we can authoritatively verify from LOCAL state hard-block a
 // run: a `usesSkill` whose skill is not installed, a `deterministic.runner`
@@ -64,29 +66,9 @@ export interface WorkflowRunReadinessCheck {
   plan: WorkflowExecutionPlan;
 }
 
-interface WorkflowResourceProbeRequest {
-  command: string;
-  args: readonly string[];
-  timeoutMs: number;
-}
-
-interface WorkflowResourceProbeResult {
-  status: number | null;
-  stdout?: string;
-  stderr?: string;
-  error?: Error;
-}
-
-type WorkflowResourceProbeRunner = (
-  request: WorkflowResourceProbeRequest,
-) => WorkflowResourceProbeResult;
-
 interface WorkflowRunReadinessOptions
   extends Omit<WorkflowExecutionPlanOptions, 'workflowAllowedTools' | 'readiness'> {
   targetStepId?: string;
-  /** Test seam for fresh, read-only account probes. Production uses spawnSync
-   *  with shell:false and a bounded timeout. */
-  resourceProbeRunner?: WorkflowResourceProbeRunner;
 }
 
 export function buildWorkflowReadinessInventory(workflowSlug?: string): WorkflowToolReadinessInventory {
@@ -124,14 +106,36 @@ export function checkWorkflowRunReadiness(
   workflowSlug?: string,
   options: WorkflowRunReadinessOptions = {},
 ): WorkflowRunReadinessCheck {
-  const { targetStepId, resourceProbeRunner, ...planOptions } = options;
+  const { targetStepId, ...planOptions } = options;
   const plan = buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, planOptions);
   const capabilityReadiness = partitionWorkflowReadiness(plan.toolReadiness.items, targetStepId);
-  const resourceReadiness = requiredResourceReadiness(
-    def,
-    resourceProbeRunner ?? runWorkflowResourceProbe,
-  );
-  const blockers = [...capabilityReadiness.blockers, ...resourceReadiness.blockers];
+  const rawSubprocessBlockers: WorkflowToolReadinessItem[] = def.steps
+    .flatMap((step) => workflowRawSubprocessDeclarations(step))
+    .filter((declaration) => !targetStepId || declaration.stepId === targetStepId)
+    .map((declaration) => ({
+      kind: 'script' as const,
+      name: declaration.runner,
+      status: 'missing' as const,
+      reason: workflowRawSubprocessRetirementReason(declaration),
+      stepIds: [declaration.stepId],
+      sources: [declaration.kind === 'deterministic.runner'
+        ? 'deterministic_runner' as const
+        : 'loop_probe_runner' as const],
+      evidence: [{
+        kind: 'script' as const,
+        name: declaration.runner,
+        status: 'missing' as const,
+        detail: 'execution authority unavailable; script body was not admitted',
+      }],
+    }));
+  const resourceReadiness = requiredResourceReadiness(def);
+  const blockers = [
+    ...rawSubprocessBlockers,
+    ...capabilityReadiness.blockers.filter((item) => !item.sources?.some((source) => (
+      source === 'deterministic_runner' || source === 'loop_probe_runner'
+    ))),
+    ...resourceReadiness.blockers,
+  ];
   const warnings = [...capabilityReadiness.warnings, ...resourceReadiness.warnings];
   return {
     ok: blockers.length === 0,
@@ -142,49 +146,10 @@ export function checkWorkflowRunReadiness(
   };
 }
 
-const RESOURCE_PROBE_TIMEOUT_MS = 8_000;
 const SAFE_ACCOUNT_SELECTOR = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}$/;
-const ACCOUNT_AUTH_MISSING = /namedorgnotfounderror|orgnotfounderror|noauthinfo(?:found)?error|no authorization information found|no authorization found|not authenticated|authorize (?:this|an|the) org|authentication (?:has )?(?:expired|is invalid|was revoked)|(?:access|refresh) token (?:has )?(?:expired|is invalid|was revoked)|invalid_grant/i;
-
-/**
- * A local credential STORE refused to release a credential that exists. This is
- * not the same failure as "no credential on this machine", and it does not have
- * the same remedy: signing in again cannot fix a store the process cannot read.
- */
-const ACCOUNT_CREDENTIAL_STORE_UNREADABLE = /keychain|keyring|secretservice|libsecret|wincred|credential (?:store|manager)|passphrase|could not (?:be )?decrypt|decryption failed|auth file .{0,40}(?:is )?invalid/i;
-
-/**
- * Read-only account probes, one entry per CLI.
- *
- * Authentication is irreducibly vendor-shaped — there is no generic way to ask
- * an arbitrary binary "is this account usable". What CAN be kept out of the
- * kernel is the CONTROL FLOW: this table is data, the loop below is vendor-free,
- * and adding a CLI never edits readiness logic or user-facing copy.
- */
-interface AccountProbeAdapter {
-  /** Per-account read. Must not mutate anything. */
-  probeArgs: (account: string) => string[];
-  /**
-   * Read-only enumeration consulted ONLY when the per-account probe comes back
-   * negative. Some CLIs report a per-account lookup as "not found" whether the
-   * credential is absent or merely unreadable; the enumeration is where the
-   * distinguishing evidence surfaces.
-   */
-  disambiguateArgs?: () => string[];
-}
-
-const ACCOUNT_PROBE_ADAPTERS: Record<string, AccountProbeAdapter> = {
-  sf: {
-    probeArgs: (account) => ['org', 'display', '--target-org', account, '--json'],
-    disambiguateArgs: () => ['org', 'list', '--json'],
-  },
-};
-
-type AccountProbeVerdict = 'authenticated' | 'not_authenticated' | 'credential_unreadable' | 'unknown';
 
 function requiredResourceReadiness(
   def: WorkflowDefinition,
-  runner: WorkflowResourceProbeRunner,
 ): { blockers: WorkflowToolReadinessItem[]; warnings: WorkflowToolReadinessItem[] } {
   const blockers: WorkflowToolReadinessItem[] = [];
   const warnings: WorkflowToolReadinessItem[] = [];
@@ -195,14 +160,13 @@ function requiredResourceReadiness(
     const cli = resource.cli?.trim().toLowerCase();
     if (!cli) continue;
     const resourceId = resource.id?.trim() || fallbackId;
-    const adapter = ACCOUNT_PROBE_ADAPTERS[cli];
-    if (!adapter) {
+    if (cli !== 'sf') {
       warnings.push(resourceProbeItem({
         resourceId,
         cli,
         status: 'unknown',
-        reason: `Required account resource "${resourceId}" uses CLI "${cli}"; no authoritative read-only account probe is available for it yet.`,
-        detail: 'unsupported account CLI; execution will verify at runtime',
+        reason: `Required account resource "${resourceId}" uses CLI "${cli}"; no authoritative local account snapshot is available for it yet.`,
+        detail: 'unsupported account CLI; execution must verify through its admitted transport',
         stepIds,
       }));
       continue;
@@ -210,125 +174,34 @@ function requiredResourceReadiness(
 
     const account = resource.account?.trim();
     if (!account || !SAFE_ACCOUNT_SELECTOR.test(account)) {
-      warnings.push(resourceProbeItem({
+      blockers.push(resourceProbeItem({
         resourceId,
         cli,
         status: 'unknown',
-        reason: `Required account "${resourceId}" (${cli}) cannot be safely probed because its account selector is missing or invalid.`,
-        detail: 'account selector was not passed to the CLI',
+        reason: `Required account "${resourceId}" (${cli}) cannot be verified because its durable account selector is missing or invalid.`,
+        detail: 'workflow readiness performed zero provider or CLI process calls',
         stepIds,
       }));
       continue;
     }
 
-    let probe: WorkflowResourceProbeResult;
-    try {
-      probe = runner({
-        command: cli,
-        args: adapter.probeArgs(account),
-        timeoutMs: RESOURCE_PROBE_TIMEOUT_MS,
-      });
-    } catch (error) {
-      warnings.push(resourceProbeItem({
-        resourceId,
-        cli,
-        status: 'unknown',
-        reason: `Required account "${account}" (${cli}) could not be confirmed before the run.`,
-        detail: conciseProbeDetail(error instanceof Error ? error.message : String(error)),
-        stepIds,
-      }));
-      continue;
-    }
-
-    const payload = parseJsonObject(probe.stdout) ?? parseJsonObject(probe.stderr);
-    if (
-      probe.status === 0
-      && payload?.status === 0
-      && payload.result !== null
-      && typeof payload.result === 'object'
-    ) continue;
-    const payloadMessage = payload
-      ? [payload.name, payload.message, payload.error]
-        .filter((value): value is string => typeof value === 'string' && Boolean(value.trim()))
-        .join(': ')
-      : '';
-    let detail = conciseProbeDetail(
-      probe.error?.message
-        ?? (payloadMessage
-          || probe.stderr
-          || probe.stdout
-          || `${cli} exited ${String(probe.status)}`),
-    );
-
-    // A negative per-account probe is ambiguous on some CLIs: an absent
-    // credential and one the local store refuses to decrypt produce the SAME
-    // "not found" error. Asserting "signed out" from that is a guess, and a
-    // confident wrong remedy is worse than an honest unknown — the user is sent
-    // to re-authorize something that was never signed out, and the real cause
-    // (an unreadable credential store) goes unmentioned. Consult the
-    // enumeration, which is where the distinguishing evidence lives.
-    let verdict: AccountProbeVerdict = ACCOUNT_AUTH_MISSING.test(payloadMessage)
-      ? 'not_authenticated'
-      : 'unknown';
-    if (ACCOUNT_CREDENTIAL_STORE_UNREADABLE.test(`${payloadMessage} ${probe.stderr}`)) {
-      verdict = 'credential_unreadable';
-    } else if (verdict === 'not_authenticated' && adapter.disambiguateArgs) {
-      try {
-        const enumeration = runner({
-          command: cli,
-          args: adapter.disambiguateArgs(),
-          timeoutMs: RESOURCE_PROBE_TIMEOUT_MS,
-        });
-        const haystack = `${enumeration.stdout} ${enumeration.stderr}`;
-        if (
-          haystack.includes(account)
-          && ACCOUNT_CREDENTIAL_STORE_UNREADABLE.test(haystack)
-        ) {
-          verdict = 'credential_unreadable';
-          detail = conciseProbeDetail(
-            storeFailureEvidence(haystack, account) ?? detail,
-          );
-        }
-      } catch {
-        // The enumeration is corroboration only. If it cannot run, keep the
-        // per-account verdict rather than downgrading a real block to unknown.
-      }
-    }
-
-    const item = resourceProbeItem({
+    // connected-clis.json proves only that the binary was registered, while
+    // cli-auth-health.json is a generic, staleable cache and the Salesforce
+    // catalog has no exact-org auth probe. Neither can attest this selector.
+    // Readiness also owns no physical provider/CLI authority, so it must not
+    // execute `sf org display` or `sf org list`. Fail closed until an admitted
+    // carrier can provide a bounded, exact-account snapshot.
+    blockers.push(resourceProbeItem({
       resourceId,
       cli,
-      status: verdict === 'unknown' ? 'unknown' : 'missing',
-      reason: verdict === 'credential_unreadable'
-        ? `Required account "${account}" (${cli}) is stored on this machine but its credential store refused to release it. Signing in again will not help until the store can be read.`
-        : verdict === 'not_authenticated'
-          ? `Required account "${account}" (${cli}) is signed out or missing.`
-          : `Required account "${account}" (${cli}) could not be confirmed before the run.`,
-      detail,
+      status: 'unknown',
+      reason: `Required account "${account}" (${cli}) cannot be verified without an admitted exact-account read; workflow readiness has no provider or CLI execution authority.`,
+      detail: 'zero provider or CLI process calls were attempted',
       stepIds,
-    });
-    if (verdict === 'unknown') warnings.push(item);
-    else blockers.push(item);
+    }));
   }
 
   return { blockers, warnings };
-}
-
-/**
- * Pull the store-level failure line out of a CLI enumeration so the user reads
- * the real cause rather than the per-account lookup's misleading "not found".
- */
-function storeFailureEvidence(haystack: string, account: string): string | undefined {
-  for (const line of haystack.split(/\r?\n/)) {
-    const text = line.trim();
-    if (!text) continue;
-    if (text.includes(account) && ACCOUNT_CREDENTIAL_STORE_UNREADABLE.test(text)) return text;
-  }
-  const fallback = haystack
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => ACCOUNT_CREDENTIAL_STORE_UNREADABLE.test(line));
-  return fallback || undefined;
 }
 
 function resourceProbeItem(input: {
@@ -356,40 +229,6 @@ function resourceProbeItem(input: {
   };
 }
 
-function runWorkflowResourceProbe(request: WorkflowResourceProbeRequest): WorkflowResourceProbeResult {
-  // The readiness probe MUST run a CLI in the same environment the executor
-  // will use. Discovery (cli-discovery) and execution (computer-tools) both
-  // spawn through mergedSpawnEnv; this seam did not, so a probe could resolve
-  // a different binary — or none — than the run it is gating, and report a
-  // reachable capability as missing.
-  const result = spawnSync(request.command, [...request.args], {
-    encoding: 'utf8',
-    shell: false,
-    timeout: request.timeoutMs,
-    maxBuffer: 1024 * 1024,
-    windowsHide: true,
-    env: mergedSpawnEnv(),
-  });
-  return {
-    status: result.status,
-    stdout: result.stdout ?? '',
-    stderr: result.stderr ?? '',
-    ...(result.error ? { error: result.error } : {}),
-  };
-}
-
-function parseJsonObject(raw: string | undefined): Record<string, unknown> | undefined {
-  const text = raw?.trim();
-  if (!text) return undefined;
-  try {
-    const parsed = JSON.parse(text) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 function conciseProbeDetail(value: string): string {
   const compact = value.replace(/\s+/g, ' ').trim();

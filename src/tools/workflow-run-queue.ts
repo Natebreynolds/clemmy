@@ -77,6 +77,7 @@ import {
   readWorkflowChatDispatchAdmissions,
   readWorkflowOriginGroup,
   readWorkflowOriginGroupClosedBatch,
+  requestWorkflowRunDrainKick,
   workflowChatDispatchQueueRequestDigest,
   workflowOriginGroupAdmissionForRequest,
   workflowOriginSourceGroupId,
@@ -2731,10 +2732,15 @@ function queueWorkflowRunUnlocked(
   if (originObserver && queueRequestDigest && !chatDispatchPreparation) {
     throw new Error('workflow chat dispatch admission completed without a prepared receipt');
   }
+  const resultStatus = originObserver && exactAdmission && !exactAdmission.installed
+    ? 'duplicate'
+    : catchupHold || originObserver ? 'held' : 'queued';
+  // The run record and any trigger receipt are durable at this point. Wake the
+  // daemon immediately for fresh executable work; the 15-second timer remains
+  // the crash/failure recovery path. Held and duplicate records do not kick.
+  if (resultStatus === 'queued') requestWorkflowRunDrainKick([id]);
   return {
-    status: originObserver && exactAdmission && !exactAdmission.installed
-      ? 'duplicate'
-      : catchupHold || originObserver ? 'held' : 'queued',
+    status: resultStatus,
     id,
     ...(chatDispatchPreparation ? { chatDispatchPreparation } : {}),
     ...(readiness ? { readiness } : {}),

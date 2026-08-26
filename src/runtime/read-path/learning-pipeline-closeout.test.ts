@@ -608,7 +608,7 @@ test('empty-args settlement from a superseded source remains capability-only', a
 
 // ─── warm turn shape (guard) ─────────────────────────────────────────────────
 
-test('a warm paraphrase turn crosses the real host capability node, dispatches once, and commits one terminal', async () => {
+test('a warm paraphrase crosses the real host plan/work carrier, dispatches once, and commits one terminal', async () => {
   const teachSession = freshSession('sess-warm-teach');
   acceptSource(teachSession, "what's on my calendar tomorrow?");
   await governedRead(teachSession, CAL_SLUG, { successful: true, data: { items: [{ id: 'e1' }] } });
@@ -616,23 +616,56 @@ test('a warm paraphrase turn crosses the real host capability node, dispatches o
   assert.equal(await candidates.warmCapabilityRetrieval(), true);
 
   const { respondPreferHarness, _setBridgeImplsForTests } = await import('../harness/respond-bridge.js');
+  const composioClient = await import('../../integrations/composio/client.js');
+  const composioProviderIdentity = await import('../../integrations/composio/provider-definition-identity.js');
+  const toolContracts = await import('../../tools/tool-contract-store.js');
+  const capabilityManifestStores = await import('../harness/capability-manifest-store.js');
+  const productionAdapters = await import('../harness/production-capability-adapters.js');
   const sessionId = freshSession('sess-warm-turn');
-  schemaCache.rememberToolSchema(CAL_SLUG, CAL_SCHEMA, Date.now());
+  const providerOperationVersion = 'fixture-scheduler-v1';
+  const accountId = 'conn-scheduler';
+  const invokePortId = 'port:cap:test:schedulerco-list-events';
+  schemaCache.rememberToolSchema(
+    CAL_SLUG,
+    CAL_SCHEMA,
+    Date.now(),
+    providerOperationVersion,
+    null,
+  );
   const schemaFingerprint = schemaCache.liveComposioSchemaFingerprint(CAL_SLUG);
   assert.ok(schemaFingerprint);
+  const definitionFingerprint = composioProviderIdentity.fingerprintComposioProviderDefinition({
+    operationId: CAL_SLUG,
+    operationVersion: providerOperationVersion,
+    accountId,
+    invokePortId,
+    inputSchema: CAL_SCHEMA,
+    outputSchema: null,
+  });
+  assert.ok(definitionFingerprint);
   const manifest = capabilityManifests.attachSemanticContract({
     version: 1,
     manifestId: 'cap:test:schedulerco-list-events',
     providerKind: 'composio',
     operationId: CAL_SLUG,
-    providerIdentity: 'fixture:schedulerco',
-    providerVersion: '2026-08-22',
-    operationVersion: '1',
-    // The learned Composio cache uses its own compact validation fingerprint;
-    // the production manifest independently seals a full SHA-256 definition.
-    definitionFingerprint: 'a'.repeat(64),
+    providerIdentity: 'composio',
+    providerVersion: composioProviderIdentity.COMPOSIO_PROVIDER_SURFACE_VERSION,
+    operationVersion: providerOperationVersion,
+    definitionFingerprint,
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: toolContracts.digestSchema(CAL_SCHEMA),
+      providerOutputSchemaObserved: true,
+      semanticName: CAL_SLUG,
+      behaviorHints: {
+        readOnly: true,
+        destructive: false,
+        idempotent: null,
+        openWorld: null,
+      },
+    },
     effect: 'read',
-    accountId: 'schedulerco:test-account',
+    accountId,
     idempotency: { required: false, policy: 'none' },
     reconciliation: { supported: false, policy: 'none' },
     outputContract: { kind: 'calendar_events' },
@@ -643,20 +676,26 @@ test('a warm paraphrase turn crosses the real host capability node, dispatches o
       trusted: true,
     },
     lifecycle: { state: 'current' },
-    advisoryRoles: ['lookup'],
+    advisoryRoles: ['source', 'lookup'],
+    argumentCompiler: { id: 'compile:test-schedulerco-v1', version: '1' },
+    invokePortId,
+    acceptedInputKinds: ['query'],
+    producedOutputKinds: ['calendar_events'],
+    applicableDeliverableKinds: ['calendar_events'],
   });
   const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorManifestStore = capabilityManifestStores.peekCapabilityManifestStore();
   const priorPorts = productionPorts.listProductionCapabilityPorts();
   const priorToolSearch = process.env.CLEMMY_CODEX_TOOL_SEARCH;
   const priorToolJit = process.env.CLEMMY_TOOL_JIT;
   process.env.CLEMMY_CODEX_TOOL_SEARCH = 'off';
   process.env.CLEMMY_TOOL_JIT = 'on';
   let dispatches = 0;
-  const invoke = async (input: { payload?: unknown }) => {
-    dispatches += 1;
-    assert.deepEqual(input.payload, { timeMin: '2026-08-07' },
-      'the host replayed historical arguments instead of the current turn payload');
-    return { successful: true, data: { items: [{ id: 'e2' }] } };
+  let directPortBodies = 0;
+  let directTransportBodies = 0;
+  const invoke = async () => {
+    directPortBodies += 1;
+    throw new Error('the exact host must retain work_call and the Composio gateway carrier');
   };
   const factory = capabilityCatalogs.createHostCapabilityCatalogFactory([{
     capabilityId: manifest.manifestId,
@@ -667,16 +706,58 @@ test('a warm paraphrase turn crosses the real host capability node, dispatches o
     account: manifest.accountId,
     manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
     providerKind: manifest.providerKind,
+    providerInputSchemaDigest: manifest.externalDefinition.providerInputSchemaDigest,
     liveFingerprint: manifest.definitionFingerprint,
     manifest,
     invoke: invoke as never,
   }]);
   capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+  capabilityManifestStores.installCapabilityManifestStore(
+    capabilityManifestStores.createCapabilityManifestStore([manifest]),
+  );
   productionPorts.clearProductionCapabilityPorts();
   assert.deepEqual(productionPorts.registerFixtureCapabilityPort(
     productionPorts.productionPortIdentityFromManifest(manifest),
     { invoke: invoke as never },
   ), { ok: true });
+  composioClient.__test__.setComposioApiKeyOverride('fixture-scheduler-key');
+  productionAdapters.installProductionTransport(async () => {
+    directTransportBodies += 1;
+    throw new Error('the shared work_call/Composio gateway must own the provider crossing');
+  });
+  schemaCache._setToolSchemaLoaderForTests(async (slug) => {
+    assert.equal(slug, CAL_SLUG);
+    return {
+      inputParameters: CAL_SCHEMA,
+      outputParameters: null,
+      providerObservedAt: Date.now(),
+      providerOperationVersion,
+    };
+  });
+  composioClient.__test__.setConnectedAccountsLoader(async () => [{
+    id: accountId,
+    status: 'ACTIVE',
+    user_id: 'fixture-user',
+    toolkit: { slug: 'schedulerco' },
+  }]);
+  await composioClient.listUsableConnectedToolkits({ requireFresh: true });
+  composioClient.__test__.setComposioClient({
+    getClient: () => ({
+      withOptions: () => ({
+        tools: {
+          execute: async (operationId: string, body: Record<string, unknown>) => {
+            dispatches += 1;
+            assert.equal(operationId, CAL_SLUG);
+            assert.deepEqual(body.arguments, { timeMin: '2026-08-07' },
+              'the host replayed historical arguments instead of the current turn payload');
+            assert.equal(body.connected_account_id, accountId);
+            assert.equal(body.version, providerOperationVersion);
+            return { successful: true, error: null, data: { items: [{ id: 'e2' }] } };
+          },
+        },
+      }),
+    }),
+  });
 
   const textMessage = (text: string) => ({
     type: 'message', role: 'assistant', status: 'completed',
@@ -686,18 +767,69 @@ test('a warm paraphrase turn crosses the real host capability node, dispatches o
     type: 'function_call', callId, name, arguments: JSON.stringify(args),
   });
   let modelSteps = 0;
+  const observedToolResults: Array<{ callId: string; output: string }> = [];
   const model = {
-    async getResponse(request: { tools?: Array<{ name?: string }> }) {
+    async getResponse(request: { input?: unknown; tools?: Array<{ name?: string }> }) {
       modelSteps += 1;
+      if (Array.isArray(request.input)) {
+        observedToolResults.push(...(request.input as Array<Record<string, unknown>>)
+          .filter((item) => item.type === 'function_call_result')
+          .map((item) => ({
+            callId: String(item.callId ?? ''),
+            output: JSON.stringify(item.output ?? '').slice(0, 2_000),
+          })));
+      }
       const toolNames = new Set((request.tools ?? []).map((tool) => tool.name));
       const output = modelSteps === 1
         ? (() => {
-            assert.equal(toolNames.has('composio_execute_tool'), true,
-              'the host capability node did not pin the proven connected-app carrier');
-            return [toolCall('warm-calendar-read', 'composio_execute_tool', {
-              tool_slug: CAL_SLUG,
-              arguments: JSON.stringify({ timeMin: '2026-08-07' }),
-            })];
+            assert.equal(toolNames.has('work_call'), true,
+              `the host capability node did not expose its shared action carrier: ${JSON.stringify([...toolNames])}`);
+            assert.equal(toolNames.has('composio_execute_tool'), false,
+              'the stale direct connected-app carrier remained first-class beside work_call');
+            assert.equal(toolNames.has('plan_task'), true,
+              'the current exact connected-app definition did not reach fresh host planning');
+            return [
+              toolCall('warm-calendar-plan', 'plan_task', {
+                preamble: 'I’ll check the current calendar for tomorrow.',
+                draft: {
+                  criteria: ['Return the current calendar events for tomorrow.'],
+                  cardinality: null,
+                  destination: null,
+                  topology: {
+                    version: 1,
+                    operations: [{
+                      id: 'read_calendar',
+                      effect: 'read',
+                      coverage: 'complete_set',
+                      dependsOn: [],
+                      dataFrom: [],
+                      cardinality: { kind: 'once' },
+                    }],
+                    universes: [],
+                  },
+                  bindings: [{
+                    operationId: 'read_calendar',
+                    role: 'source',
+                    capabilityRef: manifest.manifestId,
+                    evidence: ['payload'],
+                  }],
+                  deliverables: [],
+                  evidenceRequirements: ['payload'],
+                },
+              }),
+              toolCall('warm-calendar-read', 'work_call', {
+                requirement_id: 'read_calendar',
+                universe_item_id: null,
+                universe_selector: null,
+                seal_amendment: null,
+                name: 'composio_execute_tool',
+                args_json: JSON.stringify({
+                  tool_slug: CAL_SLUG,
+                  arguments: JSON.stringify({ timeMin: '2026-08-07' }),
+                  connected_account_id: accountId,
+                }),
+              }),
+            ];
           })()
         : [textMessage(JSON.stringify({
             summary: 'Returned the current calendar events',
@@ -756,8 +888,27 @@ test('a warm paraphrase turn crosses the real host capability node, dispatches o
     }) as never,
   });
   let responses = 0;
+  let preambleDeliveries = 0;
   try {
-    const res = await respondPreferHarness('home', { message: 'anything on deck tomorrow?', sessionId },
+    const res = await respondPreferHarness('home', {
+      message: 'anything on deck tomorrow?',
+      sessionId,
+      onConversationPreamble: async (request) => {
+        preambleDeliveries += 1;
+        assert.equal(request.text, 'I’ll check the current calendar for tomorrow.');
+        return {
+          status: 'delivered',
+          receipt: {
+            version: 1,
+            deliveryKey: request.deliveryKey,
+            eventId: request.eventId,
+            eventDigest: request.eventDigest,
+            surface: 'channel_message',
+            target: 'learning-pipeline-closeout:home',
+          },
+        };
+      },
+    },
       async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
     responses += 1;
     assert.notEqual(res.stoppedReason, 'error', `the warm host turn failed: ${JSON.stringify(res)}`);
@@ -770,6 +921,12 @@ test('a warm paraphrase turn crosses the real host capability node, dispatches o
       assert.equal(restored.ok, true, 'the prior production port fixture could not be restored');
     }
     capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    capabilityManifestStores.installCapabilityManifestStore(priorManifestStore);
+    productionAdapters.installProductionTransport(null);
+    schemaCache._setToolSchemaLoaderForTests(null);
+    composioClient.__test__.setConnectedAccountsLoader(null);
+    composioClient.__test__.setComposioApiKeyOverride(null);
+    composioClient.resetComposioClient();
     if (priorToolSearch === undefined) delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
     else process.env.CLEMMY_CODEX_TOOL_SEARCH = priorToolSearch;
     if (priorToolJit === undefined) delete process.env.CLEMMY_TOOL_JIT;
@@ -780,8 +937,15 @@ test('a warm paraphrase turn crosses the real host capability node, dispatches o
   const discovery = events.filter((e) => e.type === 'tool_called'
     && /composio_search|composio_list_tools|get_raw_tool_details|tool_search/.test(String((e.data as { tool?: string }).tool ?? '')));
   assert.equal(discovery.length, 0, 'the warm turn paid discovery');
-  assert.equal(dispatches, 1, 'the warm turn did not make exactly one provider dispatch');
+  assert.equal(dispatches, 1,
+    `the warm turn did not make exactly one provider dispatch: ${JSON.stringify(observedToolResults)}`);
+  assert.equal(directPortBodies, 0,
+    'the exact catalog port bypassed the shared work_call/Composio carrier');
+  assert.equal(directTransportBodies, 0,
+    'the provider-neutral catalog transport bypassed the shared work_call/Composio carrier');
   assert.equal(modelSteps, 2, 'the host did not own exactly one call/result model cycle');
+  assert.equal(preambleDeliveries, 1,
+    'the one fresh plan preamble did not cross its awaited presentation port exactly once');
   assert.equal(events.filter((event) => event.type === 'conversation_completed').length, 1,
     'the host turn published more than one terminal');
   assert.equal(events.filter((event) => event.type === 'turn_graph_shadow').length, 0,
@@ -791,19 +955,25 @@ test('a warm paraphrase turn crosses the real host capability node, dispatches o
     SELECT logical_tool_call_id, tool_name, state
       FROM logical_tool_calls
      WHERE session_id = ?
+     ORDER BY rowid
   `).all(sessionId), [{
+    logical_tool_call_id: 'warm-calendar-plan',
+    tool_name: 'plan_task',
+    state: 'settled',
+  }, {
     logical_tool_call_id: 'warm-calendar-read',
     tool_name: CAL_SLUG.toLowerCase(),
     state: 'settled',
-  }], 'the direct carrier must remain one logical business call');
+  }], 'the exact plan control must precede one logical business call');
   assert.deepEqual(db.prepare(`
-    SELECT state FROM physical_dispatches WHERE session_id = ?
+    SELECT state FROM physical_dispatches
+     WHERE session_id = ? AND logical_tool_call_id = 'warm-calendar-read'
   `).all(sessionId), [{ state: 'returned' }],
   'the host must own exactly one returned provider crossing');
   assert.deepEqual(db.prepare(`
     SELECT execution_kind, outcome_kind, physical_crossing_count
       FROM logical_call_settlements
-     WHERE session_id = ?
+     WHERE session_id = ? AND logical_tool_call_id = 'warm-calendar-read'
   `).all(sessionId), [{
     execution_kind: 'provider_execution',
     outcome_kind: 'succeeded',

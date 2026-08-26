@@ -2,8 +2,8 @@
  * Run: npx tsx --test src/execution/guest-harness.test.ts
  *
  * Pins the guest-harness contract: arg profiles for both harnesses (Claude
- * agent-mode must NEVER carry skip-permissions and must inherit the
- * project's own MCP servers into --allowedTools; Codex must run sandboxed
+ * agent-mode must NEVER carry skip-permissions or raw project MCP servers;
+ * Codex must ignore inherited config/MCP and run sandboxed
  * in the project dir), stream-json parsing to a final message + narration
  * events, changed-file collection, and the live-model guard on the real
  * spawn edge. Offline, deterministic — every run goes through the spawn
@@ -67,7 +67,8 @@ test('claude args: agent profile — stream-json, explicit allows, never skip-pe
   assert.deepEqual(args.slice(0, 2), ['-p', '/seo-audit example.com']);
   assert.ok(args.includes('stream-json') && args.includes('--verbose'), 'print-mode stream-json requires --verbose');
   assert.ok(args.includes('--allowedTools'));
-  assert.ok(args.includes('mcp__dataforseo') && args.includes('mcp__chart'), 'project .mcp.json servers must be allowed');
+  assert.ok(!args.some((arg) => arg.startsWith('mcp__')), 'project .mcp.json cannot become child execution authority');
+  assert.ok(args.includes('--strict-mcp-config'), 'Claude must ignore every non-explicit MCP configuration');
   assert.ok(!args.some((a) => /dangerously|bypassPermissions/.test(a)), 'guest runs must never skip permissions');
 });
 
@@ -91,6 +92,8 @@ test('codex args: sandboxed exec in the project dir with JSONL + last-message ca
   assert.deepEqual(args.slice(args.indexOf('-C'), args.indexOf('-C') + 2), ['-C', project]);
   assert.equal(args[args.length - 1], 'summarize this repo');
   assert.ok(!args.includes('--dangerously-bypass-approvals-and-sandbox'));
+  assert.ok(args.includes('--ignore-user-config'), 'user plugins/MCP config must not enter the guest child');
+  assert.deepEqual(args.slice(args.indexOf('-c'), args.indexOf('-c') + 2), ['-c', 'mcp_servers={}']);
   // Long flag only — the -o alias is missing from older codex versions
   // (0.36.0 rejected it live) and regressing this re-breaks them.
   assert.ok(args.includes('--output-last-message'));

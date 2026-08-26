@@ -61,6 +61,9 @@ export interface WorkerSlotOptions {
    * before Stop from opening a provider request after capacity becomes free.
    */
   assertCanStart?: () => void;
+  /** Abort a queued acquire immediately instead of waiting for every earlier
+   * worker to hand a slot through after the owning batch has parked. */
+  signal?: AbortSignal;
 }
 
 function envDisabled(value: string | undefined): boolean {
@@ -117,7 +120,12 @@ function effectiveGlobalCap(opts: WorkerSlotOptions | undefined, sessionCap: num
 interface Gate {
   active: number;
   /** FIFO queue of waiters; resolving one HANDS OVER a slot (active stays constant). */
-  queue: Array<() => void>;
+  queue: Array<{
+    resolve: () => void;
+    reject: (error: unknown) => void;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+  }>;
 }
 
 const gates = new Map<string, Gate>();
@@ -125,19 +133,46 @@ const globalGate: Gate = { active: 0, queue: [] };
 const providerGates = new Map<string, Gate>();
 
 /** Acquire one slot on a gate (FIFO). Returns an idempotent per-gate release. */
-async function acquireOnGate(gate: Gate, max: number): Promise<() => void> {
+function signalAbortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new Error('worker slot acquire cancelled');
+}
+
+async function acquireOnGate(gate: Gate, max: number, signal?: AbortSignal): Promise<() => void> {
+  if (signal?.aborted) throw signalAbortReason(signal);
   if (gate.active < max) {
     gate.active += 1;
   } else {
-    await new Promise<void>((resolve) => gate.queue.push(resolve));
+    await new Promise<void>((resolve, reject) => {
+      const waiter: Gate['queue'][number] = { resolve, reject, ...(signal ? { signal } : {}) };
+      if (signal) {
+        waiter.onAbort = () => {
+          const index = gate.queue.indexOf(waiter);
+          if (index >= 0) gate.queue.splice(index, 1);
+          reject(signalAbortReason(signal));
+        };
+        signal.addEventListener('abort', waiter.onAbort, { once: true });
+      }
+      gate.queue.push(waiter);
+    });
   }
   let released = false;
   return () => {
     if (released) return; // idempotent — a double-release must not corrupt the count
     released = true;
-    const next = gate.queue.shift();
-    if (next) next(); // hand our slot to the next waiter — active stays the same
-    else gate.active -= 1;
+    while (true) {
+      const next = gate.queue.shift();
+      if (!next) {
+        gate.active -= 1;
+        return;
+      }
+      if (next.signal && next.onAbort) next.signal.removeEventListener('abort', next.onAbort);
+      if (next.signal?.aborted) {
+        next.reject(signalAbortReason(next.signal));
+        continue;
+      }
+      next.resolve(); // hand our slot to the next waiter — active stays the same
+      return;
+    }
   };
 }
 
@@ -158,6 +193,13 @@ export function _activeProviderWorkerSlots(provider: string): number {
 
 /** For tests: reset all gate state. */
 export function _resetWorkerConcurrencyForTest(): void {
+  for (const gate of gates.values()) {
+    for (const waiter of gate.queue) waiter.reject(new Error('worker concurrency test reset'));
+  }
+  for (const waiter of globalGate.queue) waiter.reject(new Error('worker concurrency test reset'));
+  for (const gate of providerGates.values()) {
+    for (const waiter of gate.queue) waiter.reject(new Error('worker concurrency test reset'));
+  }
   gates.clear();
   globalGate.active = 0;
   globalGate.queue = [];
@@ -215,11 +257,11 @@ export async function acquireWorkerSlot(
   let releaseProvider: (() => void) | null = null;
   let releaseGlobal: (() => void) | null = null;
   try {
-    releaseSession = await acquireOnGate(gate, perSessionCap);
+    releaseSession = await acquireOnGate(gate, perSessionCap, opts?.signal);
     opts?.assertCanStart?.();
-    releaseProvider = providerGate ? await acquireOnGate(providerGate, globalCap) : () => {};
+    releaseProvider = providerGate ? await acquireOnGate(providerGate, globalCap, opts?.signal) : () => {};
     opts?.assertCanStart?.();
-    releaseGlobal = globalGateDisabled() ? () => {} : await acquireOnGate(globalGate, maxGlobalConcurrency());
+    releaseGlobal = globalGateDisabled() ? () => {} : await acquireOnGate(globalGate, maxGlobalConcurrency(), opts?.signal);
     opts?.assertCanStart?.();
   } catch (err) {
     // If Stop arrived while this worker was queued at any layer, hand every
@@ -243,4 +285,11 @@ export async function acquireWorkerSlot(
     if (provider && providerGate && providerGate.active <= 0 && providerGate.queue.length === 0) providerGates.delete(provider);
     if (g.active <= 0 && g.queue.length === 0) gates.delete(key); // GC the drained gate
   };
+}
+
+/** Scheduler width that matches the effective per-session provider cap. The
+ * semaphore remains the final authority (global contention can still narrow it). */
+export function workerBatchPoolWidth(opts?: WorkerSlotOptions): number {
+  if (gateDisabled()) return 16;
+  return Math.max(1, Math.min(16, effectiveSessionCap(opts)));
 }

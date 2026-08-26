@@ -1837,7 +1837,7 @@ test('cancellation after approval continuation starts wins before the approved m
 
 test('an approved continuation with no cancellation dispatches the mutation exactly once (finding D lock)', async () => {
   // Finding D is already mitigated: between the dispatch-boundary re-read and
-  // resolveApproval there is no await, so no cancellation can interleave; the
+  // the shared approval continuation there is no await, so no cancellation can interleave; the
   // cancel-wins test above locks the fail-closed side. This locks the other
   // side — the re-read guard must still let a LEGITIMATE approved dispatch
   // through exactly once (no spurious fail-closed).
@@ -1851,6 +1851,7 @@ test('an approved continuation with no cancellation dispatches the mutation exac
   assert.equal(queueBackgroundTaskApprovalResolution(approvalId, true)?.status, 'pending');
 
   let dispatchCalls = 0;
+  let legacyCalls = 0;
   let hookCalls = 0;
   _setBackgroundTaskApprovalDispatchCheckHookForTests(() => {
     hookCalls += 1;
@@ -1858,31 +1859,35 @@ test('an approved continuation with no cancellation dispatches the mutation exac
     // No cancellation — the task is genuinely still running at the boundary.
     assert.equal(getBackgroundTask(task.id)?.status, 'running', 'processor won pending->running');
   });
+  _setDrainApprovalResolverForTests((async (input: { approvalId: string; approved: boolean }) => {
+    dispatchCalls += 1;
+    assert.equal(input.approvalId, approvalId);
+    assert.equal(input.approved, true);
+    appendEvent({
+      sessionId: task.runSessionId,
+      turn: 1,
+      role: 'system',
+      type: 'external_write',
+      data: {
+        callId: 'approved-send-1',
+        shapeKey: 'OUTLOOK_SEND_EMAIL',
+        targets: ['casey@example.com'],
+      },
+    });
+    return {
+      approvalId,
+      status: 'approved' as const,
+      text: 'Sent the approved follow-up to casey@example.com (message m-1).',
+      sessionId: task.runSessionId,
+    };
+  }) as never);
   try {
     const processed = await processBackgroundTasks({
       getRuntime() {
         return {
-          async resolveApproval(id: string, approved: boolean) {
-            dispatchCalls += 1;
-            assert.equal(id, approvalId);
-            assert.equal(approved, true);
-            appendEvent({
-              sessionId: task.runSessionId,
-              turn: 1,
-              role: 'system',
-              type: 'external_write',
-              data: {
-                callId: 'approved-send-1',
-                shapeKey: 'OUTLOOK_SEND_EMAIL',
-                targets: ['casey@example.com'],
-              },
-            });
-            return {
-              approvalId: id,
-              status: 'approved' as const,
-              text: 'Sent the approved follow-up to casey@example.com (message m-1).',
-              sessionId: task.runSessionId,
-            };
+          async resolveApproval() {
+            legacyCalls += 1;
+            throw new Error('legacy runtime approval must not execute');
           },
         };
       },
@@ -1894,11 +1899,13 @@ test('an approved continuation with no cancellation dispatches the mutation exac
     assert.equal(processed, 1);
     assert.equal(hookCalls, 1);
     assert.equal(dispatchCalls, 1, 'the approved mutation dispatched exactly once');
+    assert.equal(legacyCalls, 0, 'the legacy runtime approval executor stayed retired');
     assert.equal(getBackgroundTask(task.id)?.status, 'done');
     const tracked = listRuns(40).find((candidate) => candidate.sessionId === task.runSessionId);
     assert.equal(tracked?.status, 'completed');
   } finally {
     _setBackgroundTaskApprovalDispatchCheckHookForTests(null);
+    _setDrainApprovalResolverForTests(null);
   }
 });
 
@@ -2531,17 +2538,19 @@ test('processBackgroundTasks accepts a completed manifest despite a future condi
   assert.equal(updated?.error, undefined);
 });
 
-test('processBackgroundTasks requires a committed send receipt after approval, without a delivery judge', async () => {
+test('processBackgroundTasks blocks a registry-less legacy approval without invoking its runtime', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const task = createBackgroundTask({ title: 'Finish approved send', prompt: 'Send the approved follow-up email' });
   updateBackgroundTask(task.id, {
     approvalResolution: { approvalId: 'approval-bg-1', approved: true, queuedAt: new Date().toISOString() },
   });
 
+  let legacyCalls = 0;
   const stubAssistant = {
     getRuntime() {
       return {
         async resolveApproval(approvalId: string, approved: boolean) {
+          legacyCalls += 1;
           return {
             approvalId,
             status: approved ? 'approved' as const : 'rejected' as const,
@@ -2561,7 +2570,8 @@ test('processBackgroundTasks requires a committed send receipt after approval, w
   assert.equal(processed, 1);
   const updated = getBackgroundTask(task.id);
   assert.equal(updated?.status, 'blocked');
-  assert.match(updated?.error ?? '', /no committed external-write receipt/);
+  assert.match(updated?.error ?? '', /retired.*not executed/i);
+  assert.equal(legacyCalls, 0);
 });
 
 test('background completion evidence reduces committed, compensated, and ambiguous writes without a model verdict', () => {

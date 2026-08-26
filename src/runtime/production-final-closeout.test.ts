@@ -34,21 +34,26 @@ function filesContaining(pattern: RegExp, prefix = 'src'): string[] {
   return matches;
 }
 
-// ─── Finding 31: the read lane must have a production caller ─────────────────
+// ─── Finding 31: the retired read lane must have no production caller ────────
 
-test('F31: runColdToWarmRead is production-connected — a non-test caller exists outside the read-path directory', () => {
+test('F31: accepted-turn read execution is dormant until it has shared-kernel physical authority', () => {
   const callers = filesContaining(/runColdToWarmRead|resolveAcceptedTurnRead/)
     .filter((file) => !file.includes('.test.') && !file.startsWith('src/runtime/read-path/'));
-  assert.ok(callers.length > 0,
-    'the release\'s principal feature is dormant: no production file consumes the read lane');
+  assert.deepEqual(callers, [],
+    `unsafe accepted-turn read production callers remain: ${callers.join(', ')}`);
 });
 
-// ─── Finding 32: both brains share one accepted-turn resolver ────────────────
+// ─── Finding 32: the bridge must not own pre-harness read execution ──────────
 
-test('F32: the shared brain boundary (respond-bridge) routes both brains through one accepted-turn read resolver', () => {
+test('F32: respond-bridge has no accepted-turn read executor but preserves durable terminal replay', () => {
   const bridge = readFileSync(path.join(ROOT, 'src', 'runtime', 'harness', 'respond-bridge.ts'), 'utf-8');
-  assert.match(bridge, /acceptedTurnRead|readLaneResolver|resolveAcceptedTurnRead/,
-    'respond-bridge.ts never consults the read resolver — wiring only loop.ts misses the Claude SDK/bridge brain split');
+  assert.doesNotMatch(bridge,
+    /acceptedTurnReadPorts|tryServeAcceptedTurnRead|serveAcceptedTurnReadUnderAuthority|resolveAcceptedTurnRead/,
+    'respond-bridge still owns the retired raw pre-harness read execution lane');
+  assert.match(bridge, /exactTerminalReplayForRequest/,
+    'read-lane retirement removed exact durable terminal replay');
+  assert.match(bridge, /exactWarmProviderSpentForRequest/,
+    'read-lane retirement removed paid-read no-retry replay');
 });
 
 // ─── Finding 33: hard continuation, not history-reading instructions ─────────

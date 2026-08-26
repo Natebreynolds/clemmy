@@ -550,7 +550,14 @@ test('130 ordinary chats and direct generations use one foreground request with 
     },
   });
 
-  const hostOverheads: Array<{ caseId: string; ms: number }> = [];
+  const hostOverheads: Array<{
+    caseId: string;
+    ms: number;
+    cpuMs: number;
+    wallMinusCpuMs: number;
+    voluntaryContextSwitches: number;
+    involuntaryContextSwitches: number;
+  }> = [];
   for (const [index, caseInfo] of conversations.entries()) {
     activeCase = caseInfo;
     const sessionId = `${TRUE_SESSION_PREFIX}${index + 1}`;
@@ -562,6 +569,8 @@ test('130 ordinary chats and direct generations use one foreground request with 
     const delivery = recordingTransport();
     let acceptedSource: { seq: number; turn: number } | null = null;
     const modelStartIndex = modelRequests.length;
+    const cpuStarted = process.cpuUsage();
+    const usageStarted = process.resourceUsage();
     const startedAt = performance.now();
     await discord.runDiscordHarnessConversation({
       prompt: caseInfo.prompt,
@@ -579,12 +588,22 @@ test('130 ordinary chats and direct generations use one foreground request with 
       },
     });
     const elapsedMs = performance.now() - startedAt;
+    const cpuElapsed = process.cpuUsage(cpuStarted);
+    const usageElapsed = process.resourceUsage();
     const requests = modelRequests.slice(modelStartIndex);
     assert.equal(requests.length, 1, `${caseInfo.id} has exactly one primary model request`);
     assert.equal(requests[0]!.caseId, caseInfo.id);
+    const hostMs = Math.max(0, elapsedMs - requests[0]!.wireMs);
+    const cpuMs = (cpuElapsed.user + cpuElapsed.system) / 1_000;
     hostOverheads.push({
       caseId: caseInfo.id,
-      ms: Math.max(0, elapsedMs - requests[0]!.wireMs),
+      ms: hostMs,
+      cpuMs,
+      wallMinusCpuMs: Math.max(0, hostMs - cpuMs),
+      voluntaryContextSwitches:
+        usageElapsed.voluntaryContextSwitches - usageStarted.voluntaryContextSwitches,
+      involuntaryContextSwitches:
+        usageElapsed.involuntaryContextSwitches - usageStarted.involuntaryContextSwitches,
     });
 
     assert.ok(acceptedSource, `${caseInfo.id} has one durable accepted source`);
@@ -628,6 +647,65 @@ test('130 ordinary chats and direct generations use one foreground request with 
     directGenerationMedianMs: fixed(percentile(generationSorted, 0.50)),
     directGenerationP95Ms: fixed(percentile(generationSorted, 0.95)),
   })}`);
+  const cohortPrefix = (caseId: string): string => caseId.split('-', 1)[0] ?? caseId;
+  const cohortTiming = Object.fromEntries(
+    [...new Set(hostOverheads.map((entry) => cohortPrefix(entry.caseId)))].map((cohort) => {
+      const entries = hostOverheads.filter((entry) => cohortPrefix(entry.caseId) === cohort);
+      const wall = entries.map((entry) => entry.ms).sort((left, right) => left - right);
+      const cpu = entries.map((entry) => entry.cpuMs).sort((left, right) => left - right);
+      const wait = entries.map((entry) => entry.wallMinusCpuMs).sort((left, right) => left - right);
+      return [cohort, {
+        samples: entries.length,
+        wallMedianMs: fixed(percentile(wall, 0.50)),
+        wallP95Ms: fixed(percentile(wall, 0.95)),
+        cpuMedianMs: fixed(percentile(cpu, 0.50)),
+        cpuP95Ms: fixed(percentile(cpu, 0.95)),
+        wallMinusCpuMedianMs: fixed(percentile(wait, 0.50)),
+        wallMinusCpuP95Ms: fixed(percentile(wait, 0.95)),
+      }];
+    }),
+  );
+  const slowest = [...hostOverheads]
+    .sort((left, right) => right.ms - left.ms)
+    .slice(0, 12)
+    .map((entry) => ({
+      ...entry,
+      ms: fixed(entry.ms),
+      cpuMs: fixed(entry.cpuMs),
+      wallMinusCpuMs: fixed(entry.wallMinusCpuMs),
+    }));
+  const cpuSorted = hostOverheads.map((entry) => entry.cpuMs).sort((left, right) => left - right);
+  const wallMinusCpuSorted = hostOverheads
+    .map((entry) => entry.wallMinusCpuMs)
+    .sort((left, right) => left - right);
+  const involuntarySorted = hostOverheads
+    .map((entry) => entry.involuntaryContextSwitches)
+    .sort((left, right) => left - right);
+  const temporalWindows = Array.from(
+    { length: Math.ceil(hostOverheads.length / 10) },
+    (_, windowIndex) => {
+      const entries = hostOverheads.slice(windowIndex * 10, (windowIndex + 1) * 10);
+      const wall = entries.map((entry) => entry.ms).sort((left, right) => left - right);
+      const cpu = entries.map((entry) => entry.cpuMs).sort((left, right) => left - right);
+      const wait = entries.map((entry) => entry.wallMinusCpuMs).sort((left, right) => left - right);
+      return {
+        samples: `${windowIndex * 10 + 1}-${windowIndex * 10 + entries.length}`,
+        wallP95Ms: fixed(percentile(wall, 0.95)),
+        cpuP95Ms: fixed(percentile(cpu, 0.95)),
+        wallMinusCpuP95Ms: fixed(percentile(wait, 0.95)),
+      };
+    },
+  );
+  t.diagnostic(`ordinary host timing cohorts: ${JSON.stringify(cohortTiming)}`);
+  t.diagnostic(`ordinary host paired wall/process-CPU control: ${JSON.stringify({
+    cpuMedianMs: fixed(percentile(cpuSorted, 0.50)),
+    cpuP95Ms: fixed(percentile(cpuSorted, 0.95)),
+    wallMinusCpuMedianMs: fixed(percentile(wallMinusCpuSorted, 0.50)),
+    wallMinusCpuP95Ms: fixed(percentile(wallMinusCpuSorted, 0.95)),
+    involuntaryContextSwitchP95: percentile(involuntarySorted, 0.95),
+    temporalWindows,
+  })}`);
+  t.diagnostic(`ordinary host slowest samples: ${JSON.stringify(slowest)}`);
   const violations: Array<{ gate: string; detail: unknown }> = [];
   if (overhead.p95Ms > 50) {
     violations.push({ gate: 'positive_host_overhead_p95_le_50ms', detail: overhead });
@@ -755,9 +833,12 @@ test('130 ordinary chats and direct generations use one foreground request with 
   if (negativeSurfaceOffenders.length > 0) {
     violations.push({ gate: 'negative_full_action_surface', detail: negativeSurfaceOffenders });
   }
-  const negativePlanOffenders = negativeRequests.filter((request) => !request.toolNames.includes('plan_task'));
+  // The cold action surface is search-first. plan_task becomes reachable only
+  // after tool_search discloses an exact citable capability; advertising it on
+  // this empty-catalog first frame would invite an unsealable draft.
+  const negativePlanOffenders = negativeRequests.filter((request) => request.toolNames.includes('plan_task'));
   if (negativePlanOffenders.length > 0) {
-    violations.push({ gate: 'negative_plan_task_reachable', detail: negativePlanOffenders });
+    violations.push({ gate: 'negative_plan_task_hidden_until_discovery', detail: negativePlanOffenders });
   }
   const negativeSearchOffenders = negativeRequests.filter((request) => !request.toolNames.includes('tool_search'));
   if (negativeSearchOffenders.length > 0) {

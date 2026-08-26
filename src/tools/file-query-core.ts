@@ -44,6 +44,28 @@ export function chunkText(text: string, opts: { chunkChars?: number } = {}): Tex
     size = current.reduce((n, p) => n + p.length, 0);
   };
 
+  const emitOversizedParagraph = (paragraph: string): void => {
+    flush(false);
+    const overlap = Math.max(0, Math.min(200, Math.floor(target / 5)));
+    let start = 0;
+    while (start < paragraph.length) {
+      let end = Math.min(paragraph.length, start + target);
+      if (end < paragraph.length) {
+        const newline = paragraph.lastIndexOf('\n', end - 1);
+        const space = paragraph.lastIndexOf(' ', end - 1);
+        const boundary = Math.max(newline, space);
+        if (boundary >= start + Math.floor(target / 2)) end = boundary + 1;
+      }
+      const segment = paragraph.slice(start, end).trim();
+      if (segment) chunks.push({ index: chunks.length, heading: currentHeading, text: segment });
+      if (end >= paragraph.length) break;
+      const next = Math.max(start + 1, end - overlap);
+      start = next;
+    }
+    current = [];
+    size = 0;
+  };
+
   for (const paragraph of paragraphs) {
     const headingMatch = /^#{1,6}\s+(.+)$/.exec(paragraph.split('\n')[0] ?? '');
     if (headingMatch) {
@@ -51,6 +73,10 @@ export function chunkText(text: string, opts: { chunkChars?: number } = {}): Tex
       currentHeading = headingMatch[1].trim();
     } else if (size + paragraph.length > target && current.length > 0) {
       flush(true); // size split inside a long section — keep continuity
+    }
+    if (paragraph.length > target) {
+      emitOversizedParagraph(paragraph);
+      continue;
     }
     current.push(paragraph);
     size += paragraph.length;

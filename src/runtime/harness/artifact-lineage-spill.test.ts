@@ -93,7 +93,8 @@ test('oversized settled lineage authorizes exact artifact binding and fails clos
     operations: [
       {
         id: IDS.lineage,
-        effect: 'compute',
+        effect: 'read',
+        coverage: 'single',
         dependsOn: [],
         dataFrom: [],
         cardinality: { kind: 'once' },
@@ -134,7 +135,7 @@ test('oversized settled lineage authorizes exact artifact binding and fails clos
   if (frozen.status !== 'fixed' && frozen.status !== 'replayed') return;
 
   const bindings = {
-    lineage: binding({ nodeId: IDS.lineage, toolName: 'fixture_transform', effect: 'host_only' }),
+    lineage: binding({ nodeId: IDS.lineage, toolName: 'FIXTURE_LIST_RECORDS', effect: 'read' }),
     create: binding({ nodeId: IDS.create, toolName: 'fixture_create', effect: 'external_write' }),
     readback: binding({ nodeId: IDS.readback, toolName: 'fixture_readback', effect: 'read' }),
   };
@@ -152,7 +153,7 @@ test('oversized settled lineage authorizes exact artifact binding and fails clos
     nodeId: string;
     toolName: string;
     args: Record<string, unknown>;
-    effect: 'compute' | 'external_write';
+    effect: 'read' | 'compute' | 'external_write';
     payload: unknown;
   }) => {
     const logicalToolCallId = `logical:${input.nodeId}`;
@@ -209,7 +210,13 @@ test('oversized settled lineage authorizes exact artifact binding and fails clos
     assert.equal(committed.status, 'committed', JSON.stringify(committed));
   };
 
-  const records = [{ id: 'row-1', content: 'x'.repeat(8_000_100) }];
+  // Cross the spill threshold with bounded production-shaped records; a
+  // single multi-megabyte JSON scalar is rejected by canonical authority.
+  const records = Array.from({ length: 12 }, (_, index) => ({
+    id: `row-${index + 1}`,
+    content: 'x'.repeat(700_000),
+  }));
+  const sourceEnvelope = { data: { records }, error: null, successful: true };
   const lineageArgs = {
     nodeId: IDS.lineage,
     capabilityId: bindings.lineage.capabilityId,
@@ -220,8 +227,8 @@ test('oversized settled lineage authorizes exact artifact binding and fails clos
     nodeId: IDS.lineage,
     toolName: bindings.lineage.toolName,
     args: lineageArgs,
-    effect: 'compute',
-    payload: records,
+    effect: 'read',
+    payload: sourceEnvelope,
   });
 
   const createArgs = {
@@ -229,6 +236,7 @@ test('oversized settled lineage authorizes exact artifact binding and fails clos
     capabilityId: bindings.create.capabilityId,
     schemaVersion: bindings.create.schemaVersion,
     schemaDigest: bindings.create.schemaDigest,
+    records,
   };
   const resourceId = 'fixture-artifact-1';
   const contentDigest = ledger.hostArtifactContentDigest(records);
@@ -310,7 +318,7 @@ test('oversized settled lineage authorizes exact artifact binding and fails clos
   assert.equal(authorize().status, 'unavailable', 'a missing spill cannot authorize artifact lineage');
   writeFileSync(spillPath, '{"tampered":true}', { mode: 0o600 });
   assert.equal(authorize().status, 'unavailable', 'replacement bytes cannot inherit artifact lineage authority');
-  writeFileSync(spillPath, JSON.stringify(records), { mode: 0o600 });
+  writeFileSync(spillPath, JSON.stringify(sourceEnvelope), { mode: 0o600 });
   assert.equal(authorize().status, 'authorized', 'restoring the exact bytes restores only their existing authority');
 
   const hydrationLogicalToolCallId = `logical:${IDS.readback}`;

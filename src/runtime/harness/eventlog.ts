@@ -14,6 +14,7 @@ import {
   publicConversationPreambleData,
 } from './public-presentation.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
+import { pruneProviderRequestEchoes } from './provider-read-evidence.js';
 import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
 import { isSettledReadReplayReturnData } from './settled-read-replay-semantics.js';
 import {
@@ -430,10 +431,13 @@ export const EVENT_TYPES = [
   // {reason, kind, toModel, attempt}). Telemetry + the visible parity twin of the
   // workflow runner's step_advisory{reason:'brain_fallover'}.
   'brain_fallover',
-  // Unattended infra self-heal: a workflow/background run hit a transient infra
-  // error (5xx / timeout / tool-timeout) and, having no human to answer the
-  // "retry/switch/stop" ask, auto-retried the same failed call instead. Carries
-  // {kind, attempt, max}. Bounded — after the budget the run fails honestly.
+  // Bounded infra self-heal: an attended run quietly retries one transient
+  // blip, while a workflow/background run retries twice because no human is
+  // present to answer the "retry/switch/stop" ask. Carries
+  // {kind, attempt, max, sourceUserSeq, logicalErrorEpisodeId}. The accepted
+  // source + stable episode id is the durable retry-budget key across daemon
+  // restarts; a genuinely new source retains its full allowance. Bounded —
+  // after the budget the run fails honestly.
   'infra_auto_recover',
   // Stranded-tool reunification: a turn DIED on an infra error while a tool
   // (e.g. a run_batch) was still IN FLIGHT. `orphaned_tool_inflight` {callId,
@@ -5099,10 +5103,11 @@ export function clearKill(
   tx();
 }
 
-// Lossless side-store cap for a single tool result. This bounds ONLY what's
-// parked for recall_tool_result / tool_output_query — it NEVER enters the model
-// context (that's gated separately by the ~8KB event-log clip + ~12KB digest +
-// the per-turn recall budget), so a generous value costs disk, not tokens.
+// Inline segment size for a single tool result. This is NOT a durability cap:
+// bytes beyond this boundary are stored in ordered, hashed v65 chunks and are
+// reassembled by every public reader. It bounds the hot canonical row and keeps
+// ordinary SQL/event-log work cheap; prompt context remains independently
+// gated by the ~8KB event clip, ~12KB digest, and per-turn recall budget.
 // Raised 200KB → 2MB (2026-06-25): a 200KB ceiling tail-dropped the back of
 // large-but-legitimate results (Apify dataset items, DataForSEO reports), and
 // since tool_output_query pages from THIS store, dropped rows became
@@ -5115,10 +5120,321 @@ export function clearKill(
 // paginates IN CODE against this store, so a 10MB record set stays fully
 // queryable and only matching rows ever reach the model. Costs disk + an
 // occasional ~100-300ms JSON.parse on query — the 14-day retention sweep
-// below bounds aggregate disk. The tail-truncate + truncated_at_write marker
-// (surfaced to the model by recall_tool_result) stays as the backstop for the
-// pathological >16MB case.
+// below bounds aggregate disk. v65 turns this former hard ceiling into an
+// inline/chunk boundary; truncated_at_write remains only for legacy rows or a
+// detected missing/corrupt chunk, neither of which may count as full evidence.
 export const TOOL_OUTPUT_MAX_BYTES = 16_000_000;
+const TOOL_OUTPUT_CHUNK_BYTES = 4_000_000;
+
+/** Durable local continuations minted by one admitted `tool_search`. These are
+ * deliberately much smaller than general tool outputs: a page is bounded by
+ * the intact result envelope and one schema is bounded by the provider schema
+ * ceiling. Per-session LRU limits prevent a long-lived chat from becoming an
+ * unbounded discovery cache. */
+export const TOOL_SEARCH_CONTINUATION_MAX_ENTRY_BYTES = 1_048_576;
+export const TOOL_SEARCH_CONTINUATION_MAX_ENTRIES = 128;
+export const TOOL_SEARCH_CONTINUATION_MAX_SESSION_BYTES = 32 * 1_048_576;
+
+export type ToolSearchContinuationKind = 'page' | 'schema';
+
+interface StoredToolSearchContinuationRow {
+  content_text: string;
+  content_bytes: number;
+  content_sha256: string;
+}
+
+function validToolSearchContinuationDigest(digest: string): boolean {
+  return /^[a-f0-9]{64}$/.test(digest);
+}
+
+/** Store exact already-discovered bytes under their issuing durable session.
+ * The upsert and deterministic LRU reap share one IMMEDIATE transaction so
+ * concurrent MCP/daemon processes cannot transiently exceed either ceiling. */
+export function writeToolSearchContinuation(input: {
+  sessionId: string;
+  kind: ToolSearchContinuationKind;
+  text: string;
+}): string | null {
+  const sessionId = input.sessionId.trim();
+  const bytes = Buffer.byteLength(input.text, 'utf8');
+  if (
+    !sessionId
+    || !input.text
+    || bytes < 1
+    || bytes > TOOL_SEARCH_CONTINUATION_MAX_ENTRY_BYTES
+  ) return null;
+
+  const digest = createHash('sha256').update(input.text, 'utf8').digest('hex');
+  const db = openEventLog();
+  const write = db.transaction((): boolean => {
+    // Some isolated unit callers carry a synthetic ambient session without a
+    // session spine. Let the broker retain its bounded in-process fallback
+    // instead of throwing a foreign-key error; production durable sessions
+    // always take this branch.
+    const session = db.prepare('SELECT 1 AS present FROM sessions WHERE id = ?')
+      .get(sessionId) as { present: number } | undefined;
+    if (!session) return false;
+
+    const timestamp = nowIso();
+    const accessSeq = (db.prepare(
+      `SELECT COALESCE(MAX(access_seq), 0) + 1 AS next_seq
+         FROM tool_search_continuations
+        WHERE session_id = ?`,
+    ).get(sessionId) as { next_seq: number }).next_seq;
+    db.prepare(
+      `INSERT INTO tool_search_continuations
+         (session_id, kind, content_sha256, content_text, content_bytes,
+          created_at, accessed_at, access_seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id, kind, content_sha256) DO UPDATE SET
+         content_text = excluded.content_text,
+         content_bytes = excluded.content_bytes,
+         accessed_at = excluded.accessed_at,
+         access_seq = excluded.access_seq`,
+    ).run(sessionId, input.kind, digest, input.text, bytes, timestamp, timestamp, accessSeq);
+
+    const aggregate = (): { entries: number; bytes: number } => {
+      const row = db.prepare(
+        `SELECT COUNT(*) AS entries, COALESCE(SUM(content_bytes), 0) AS bytes
+           FROM tool_search_continuations
+          WHERE session_id = ?`,
+      ).get(sessionId) as { entries: number; bytes: number };
+      return row;
+    };
+    let retained = aggregate();
+    while (
+      retained.entries > TOOL_SEARCH_CONTINUATION_MAX_ENTRIES
+      || retained.bytes > TOOL_SEARCH_CONTINUATION_MAX_SESSION_BYTES
+    ) {
+      const oldest = db.prepare(
+        `SELECT kind, content_sha256
+          FROM tool_search_continuations
+          WHERE session_id = ?
+          ORDER BY access_seq ASC, kind ASC, content_sha256 ASC
+          LIMIT 1`,
+      ).get(sessionId) as { kind: ToolSearchContinuationKind; content_sha256: string } | undefined;
+      if (!oldest) break;
+      db.prepare(
+        `DELETE FROM tool_search_continuations
+          WHERE session_id = ? AND kind = ? AND content_sha256 = ?`,
+      ).run(sessionId, oldest.kind, oldest.content_sha256);
+      retained = aggregate();
+    }
+
+    return Boolean(db.prepare(
+      `SELECT 1 AS present FROM tool_search_continuations
+        WHERE session_id = ? AND kind = ? AND content_sha256 = ?`,
+    ).get(sessionId, input.kind, digest));
+  });
+  return write.immediate() ? digest : null;
+}
+
+/** Redeem one session-owned continuation without provider fallback. Selection,
+ * byte/hash verification, corrupt-row removal, and LRU refresh are atomic.
+ * A missing, forged, cross-session, or corrupt address is simply absent to the
+ * broker, which returns its typed local cursor error. */
+export function readToolSearchContinuation(input: {
+  sessionId: string;
+  kind: ToolSearchContinuationKind;
+  digest: string;
+}): string | null {
+  const sessionId = input.sessionId.trim();
+  if (!sessionId || !validToolSearchContinuationDigest(input.digest)) return null;
+  const db = openEventLog();
+  const read = db.transaction((): string | null => {
+    const row = db.prepare(
+      `SELECT content_text, content_bytes, content_sha256
+         FROM tool_search_continuations
+        WHERE session_id = ? AND kind = ? AND content_sha256 = ?`,
+    ).get(sessionId, input.kind, input.digest) as StoredToolSearchContinuationRow | undefined;
+    if (!row) return null;
+
+    const bytes = Buffer.byteLength(row.content_text, 'utf8');
+    const valid = row.content_sha256 === input.digest
+      && bytes === row.content_bytes
+      && bytes >= 1
+      && bytes <= TOOL_SEARCH_CONTINUATION_MAX_ENTRY_BYTES
+      && createHash('sha256').update(row.content_text, 'utf8').digest('hex') === input.digest;
+    if (!valid) {
+      db.prepare(
+        `DELETE FROM tool_search_continuations
+          WHERE session_id = ? AND kind = ? AND content_sha256 = ?`,
+      ).run(sessionId, input.kind, input.digest);
+      return null;
+    }
+    const accessSeq = (db.prepare(
+      `SELECT COALESCE(MAX(access_seq), 0) + 1 AS next_seq
+         FROM tool_search_continuations
+        WHERE session_id = ?`,
+    ).get(sessionId) as { next_seq: number }).next_seq;
+    db.prepare(
+      `UPDATE tool_search_continuations SET accessed_at = ?, access_seq = ?
+        WHERE session_id = ? AND kind = ? AND content_sha256 = ?`,
+    ).run(nowIso(), accessSeq, sessionId, input.kind, input.digest);
+    return row.content_text;
+  });
+  return read.immediate();
+}
+
+interface ToolOutputStorageParts {
+  inline: string;
+  chunks: Array<{
+    bytes: Buffer;
+    charStart: number;
+    charCount: number;
+  }>;
+  contentBytes: number;
+  outputChars: number;
+  outputSha256: string;
+  inlineBytes: number;
+  inlineChars: number;
+  inlineSha256: string;
+}
+
+function splitToolOutputForStorage(output: string): ToolOutputStorageParts {
+  const bytes = Buffer.from(output, 'utf8');
+  if (bytes.length <= TOOL_OUTPUT_MAX_BYTES) {
+    return {
+      inline: output,
+      chunks: [],
+      contentBytes: bytes.length,
+      outputChars: output.length,
+      outputSha256: createHash('sha256').update(bytes).digest('hex'),
+      inlineBytes: bytes.length,
+      inlineChars: output.length,
+      inlineSha256: createHash('sha256').update(bytes).digest('hex'),
+    };
+  }
+
+  // Do not cut the inline TEXT value through a UTF-8 code point. Remaining
+  // chunks are independently pageable, so every boundary also stays between
+  // UTF-8 code points. That lets persisted UTF-16 offsets match String.slice
+  // without reconstructing preceding chunks.
+  let inlineEnd = TOOL_OUTPUT_MAX_BYTES;
+  while (inlineEnd > 0 && (bytes[inlineEnd]! & 0xc0) === 0x80) inlineEnd -= 1;
+  const inline = bytes.subarray(0, inlineEnd).toString('utf8');
+  const chunks: ToolOutputStorageParts['chunks'] = [];
+  let charStart = inline.length;
+  for (let offset = inlineEnd; offset < bytes.length;) {
+    let end = Math.min(bytes.length, offset + TOOL_OUTPUT_CHUNK_BYTES);
+    while (end < bytes.length && end > offset && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+    if (end === offset) {
+      end = Math.min(bytes.length, offset + TOOL_OUTPUT_CHUNK_BYTES);
+      while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end += 1;
+    }
+    const chunkBytes = Buffer.from(bytes.subarray(offset, end));
+    const chunkText = chunkBytes.toString('utf8');
+    if (!Buffer.from(chunkText, 'utf8').equals(chunkBytes)) {
+      throw new Error('tool output chunk boundary is not valid UTF-8');
+    }
+    chunks.push({ bytes: chunkBytes, charStart, charCount: chunkText.length });
+    charStart += chunkText.length;
+    offset = end;
+  }
+  return {
+    inline,
+    chunks,
+    contentBytes: bytes.length,
+    outputChars: output.length,
+    outputSha256: createHash('sha256').update(bytes).digest('hex'),
+    inlineBytes: inlineEnd,
+    inlineChars: inline.length,
+    inlineSha256: createHash('sha256').update(bytes.subarray(0, inlineEnd)).digest('hex'),
+  };
+}
+
+interface StoredToolOutputRow {
+  output_full: string;
+  content_bytes: number;
+  truncated_at_write: number;
+  output_sha256: string | null;
+  chunk_count: number;
+  output_chars: number | null;
+  inline_sha256: string | null;
+  inline_bytes: number | null;
+  inline_chars: number | null;
+  tool: string | null;
+  created_at: string;
+}
+
+type StoredToolOutputManifestRow = Omit<StoredToolOutputRow, 'output_full'>;
+
+interface StoredOutputChunkRow {
+  chunk_index: number;
+  chunk_bytes: Buffer;
+  content_bytes: number;
+  char_start: number;
+  char_count: number;
+  chunk_sha256: string;
+}
+
+function hydrateStoredToolOutput(
+  row: StoredToolOutputRow,
+  chunks: StoredOutputChunkRow[],
+): ToolOutputRecord {
+  const incomplete = (): ToolOutputRecord => ({
+    output: row.output_full,
+    contentBytes: row.content_bytes,
+    truncatedAtWrite: true,
+    tool: row.tool,
+    createdAt: row.created_at,
+  });
+  if (row.truncated_at_write === 1) return incomplete();
+  if (!Number.isSafeInteger(row.chunk_count) || row.chunk_count < 0 || chunks.length !== row.chunk_count) {
+    return incomplete();
+  }
+
+  const inlineBytes = Buffer.from(row.output_full, 'utf8');
+  if (
+    row.output_sha256 === null
+    || !/^[a-f0-9]{64}$/.test(row.output_sha256)
+    || row.output_chars === null
+    || !Number.isSafeInteger(row.output_chars)
+    || row.output_chars < 0
+    || row.inline_bytes === null
+    || row.inline_chars === null
+    || row.inline_sha256 === null
+    || inlineBytes.length !== row.inline_bytes
+    || row.output_full.length !== row.inline_chars
+    || createHash('sha256').update(inlineBytes).digest('hex') !== row.inline_sha256
+  ) return incomplete();
+  const pieces: string[] = [row.output_full];
+  const wholeHash = createHash('sha256').update(inlineBytes);
+  let totalBytes = inlineBytes.length;
+  let nextChar = row.output_full.length;
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index]!;
+    const bytes = Buffer.from(chunk.chunk_bytes);
+    const text = bytes.toString('utf8');
+    if (
+      chunk.chunk_index !== index
+      || chunk.content_bytes !== bytes.length
+      || chunk.char_start !== nextChar
+      || chunk.char_count !== text.length
+      || !Buffer.from(text, 'utf8').equals(bytes)
+      || createHash('sha256').update(bytes).digest('hex') !== chunk.chunk_sha256
+    ) {
+      return incomplete();
+    }
+    pieces.push(text);
+    wholeHash.update(bytes);
+    totalBytes += bytes.length;
+    nextChar += text.length;
+  }
+  if (totalBytes !== row.content_bytes) return incomplete();
+  if (nextChar !== row.output_chars) return incomplete();
+  if (wholeHash.digest('hex') !== row.output_sha256) {
+    return incomplete();
+  }
+  const output = pieces.join('');
+  return {
+    output,
+    contentBytes: row.content_bytes,
+    truncatedAtWrite: false,
+    tool: row.tool,
+    createdAt: row.created_at,
+  };
+}
 
 export interface ToolOutputRecord {
   output: string;
@@ -5141,9 +5457,9 @@ export interface WriteToolOutputInput {
 /**
  * Persist the full tool output keyed by (session_id, call_id) so the
  * recall_tool_result tool can retrieve it after the event-log copy is
- * clipped. Capped at TOOL_OUTPUT_MAX_BYTES with an explicit
- * truncated_at_write marker — distinct from the per-turn `[clipped: ...]`
- * stub Layer 1 emits.
+ * clipped. Values above TOOL_OUTPUT_MAX_BYTES use content-addressed chunks;
+ * truncated_at_write is reserved for legacy/incomplete storage and remains
+ * distinct from the per-turn `[clipped: ...]` stub Layer 1 emits.
  *
  * Idempotent on conflict: `(session_id, call_id)` remains the legacy recall key
  * and keeps the longest representation. Nonce-bearing formatter writes also
@@ -5152,64 +5468,336 @@ export interface WriteToolOutputInput {
  */
 export function writeToolOutput(input: WriteToolOutputInput): void {
   const db = openEventLog();
-  const original = input.output;
-  const originalBytes = Buffer.byteLength(original, 'utf8');
+  const stored = splitToolOutputForStorage(input.output);
   const invocationNonce = input.invocationNonce?.trim() || null;
-
-  let stored = original;
-  let truncated = false;
-  if (originalBytes > TOOL_OUTPUT_MAX_BYTES) {
-    // Tail-truncate by char count, then re-check bytes (multi-byte
-    // chars can still push us over; clamp again if needed).
-    stored = original.slice(0, TOOL_OUTPUT_MAX_BYTES);
-    while (Buffer.byteLength(stored, 'utf8') > TOOL_OUTPUT_MAX_BYTES) {
-      stored = stored.slice(0, stored.length - 1);
-    }
-    truncated = true;
-  }
   const createdAt = nowIso();
   const tx = db.transaction(() => {
     // Keep the canonical recall row's longest representation with one SQLite
     // conflict decision. A read-before-write check races across daemon/worker
     // processes and can let a later compact hook overwrite a larger result.
-    db.prepare(
+    const canonicalWrite = db.prepare(
       `INSERT INTO tool_outputs
-         (session_id, call_id, tool, output_full, content_bytes, truncated_at_write, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+         (session_id, call_id, tool, output_full, content_bytes, truncated_at_write,
+          created_at, output_sha256, chunk_count, output_chars,
+          inline_sha256, inline_bytes, inline_chars)
+       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id, call_id) DO UPDATE SET
          tool = excluded.tool,
          output_full = excluded.output_full,
          content_bytes = excluded.content_bytes,
          truncated_at_write = excluded.truncated_at_write,
-         created_at = excluded.created_at
+         created_at = excluded.created_at,
+         output_sha256 = excluded.output_sha256,
+         chunk_count = excluded.chunk_count,
+         output_chars = excluded.output_chars,
+         inline_sha256 = excluded.inline_sha256,
+         inline_bytes = excluded.inline_bytes,
+         inline_chars = excluded.inline_chars
        WHERE excluded.content_bytes >= tool_outputs.content_bytes`,
     ).run(
       input.sessionId,
       input.callId,
       input.tool ?? null,
-      stored,
-      originalBytes,
-      truncated ? 1 : 0,
+      stored.inline,
+      stored.contentBytes,
       createdAt,
+      stored.outputSha256,
+      stored.chunks.length,
+      stored.outputChars,
+      stored.inlineSha256,
+      stored.inlineBytes,
+      stored.inlineChars,
     );
+    if (canonicalWrite.changes > 0) {
+      db.prepare('DELETE FROM tool_output_chunks WHERE session_id = ? AND call_id = ?')
+        .run(input.sessionId, input.callId);
+      const insertChunk = db.prepare(
+        `INSERT INTO tool_output_chunks
+           (session_id, call_id, chunk_index, chunk_bytes, content_bytes,
+            char_start, char_count, chunk_sha256)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      stored.chunks.forEach((chunk, index) => {
+        insertChunk.run(
+          input.sessionId,
+          input.callId,
+          index,
+          chunk.bytes,
+          chunk.bytes.length,
+          chunk.charStart,
+          chunk.charCount,
+          createHash('sha256').update(chunk.bytes).digest('hex'),
+        );
+      });
+    }
     if (invocationNonce) {
       db.prepare(
         `INSERT OR REPLACE INTO tool_output_invocations
-           (session_id, call_id, invocation_nonce, tool, output_full, content_bytes, truncated_at_write, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           (session_id, call_id, invocation_nonce, tool, output_full, content_bytes,
+            truncated_at_write, created_at, output_sha256, chunk_count, output_chars,
+            inline_sha256, inline_bytes, inline_chars)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         input.sessionId,
         input.callId,
         invocationNonce,
         input.tool ?? null,
-        stored,
-        originalBytes,
-        truncated ? 1 : 0,
+        stored.inline,
+        stored.contentBytes,
         createdAt,
+        stored.outputSha256,
+        stored.chunks.length,
+        stored.outputChars,
+        stored.inlineSha256,
+        stored.inlineBytes,
+        stored.inlineChars,
       );
+      const insertInvocationChunk = db.prepare(
+        `INSERT INTO tool_output_invocation_chunks
+           (session_id, call_id, invocation_nonce, chunk_index, chunk_bytes, content_bytes,
+            char_start, char_count, chunk_sha256)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      stored.chunks.forEach((chunk, index) => {
+        insertInvocationChunk.run(
+          input.sessionId,
+          input.callId,
+          invocationNonce,
+          index,
+          chunk.bytes,
+          chunk.bytes.length,
+          chunk.charStart,
+          chunk.charCount,
+          createHash('sha256').update(chunk.bytes).digest('hex'),
+        );
+      });
     }
   });
   tx();
+}
+
+function canonicalOutputChunks(
+  db: Database.Database,
+  sessionId: string,
+  callId: string,
+): StoredOutputChunkRow[] {
+  return db.prepare(
+    `SELECT chunk_index, chunk_bytes, content_bytes, char_start, char_count, chunk_sha256
+       FROM tool_output_chunks
+      WHERE session_id = ? AND call_id = ?
+      ORDER BY chunk_index ASC`,
+  ).all(sessionId, callId) as StoredOutputChunkRow[];
+}
+
+/** Resolve an already-parked complete payload by its exact content identity.
+ * This is a read-only alias target for evidence-backed worker replays: the new
+ * logical replay may point at the original bytes without writing a second full
+ * copy. Hash/length are only an index; hydration and byte equality remain the
+ * authority, so corruption or a theoretical digest collision falls through. */
+export function findExactToolOutputCallId(input: {
+  sessionId: string;
+  tool: string;
+  output: string;
+}): string | null {
+  const sessionId = input.sessionId.trim();
+  const tool = input.tool.trim();
+  if (!sessionId || !tool) return null;
+  const bytes = Buffer.from(input.output, 'utf8');
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  const db = openEventLog();
+  return db.transaction((): string | null => {
+    const rows = db.prepare(
+      `SELECT call_id, output_full, content_bytes, truncated_at_write,
+              output_sha256, chunk_count, output_chars,
+              inline_sha256, inline_bytes, inline_chars, tool, created_at
+         FROM tool_outputs
+        WHERE session_id = ? AND tool = ?
+          AND content_bytes = ? AND output_sha256 = ?
+        ORDER BY created_at ASC, call_id ASC
+        LIMIT 16`,
+    ).all(sessionId, tool, bytes.length, digest) as Array<StoredToolOutputRow & { call_id: string }>;
+    for (const row of rows) {
+      const hydrated = hydrateStoredToolOutput(
+        row,
+        canonicalOutputChunks(db, sessionId, row.call_id),
+      );
+      if (!hydrated.truncatedAtWrite && hydrated.output === input.output) return row.call_id;
+    }
+    return null;
+  })();
+}
+
+function invocationOutputChunks(
+  db: Database.Database,
+  sessionId: string,
+  callId: string,
+  invocationNonce: string,
+): StoredOutputChunkRow[] {
+  return db.prepare(
+    `SELECT chunk_index, chunk_bytes, content_bytes, char_start, char_count, chunk_sha256
+       FROM tool_output_invocation_chunks
+      WHERE session_id = ? AND call_id = ? AND invocation_nonce = ?
+      ORDER BY chunk_index ASC`,
+  ).all(sessionId, callId, invocationNonce) as StoredOutputChunkRow[];
+}
+
+function canonicalOutputRow(
+  db: Database.Database,
+  sessionId: string,
+  callId: string,
+): StoredToolOutputRow | null {
+  return (db.prepare(
+    `SELECT output_full, content_bytes, truncated_at_write, output_sha256,
+            chunk_count, output_chars, inline_sha256, inline_bytes, inline_chars,
+            tool, created_at
+       FROM tool_outputs
+      WHERE session_id = ? AND call_id = ?`,
+  ).get(sessionId, callId) as StoredToolOutputRow | undefined) ?? null;
+}
+
+function canonicalOutputManifestRow(
+  db: Database.Database,
+  sessionId: string,
+  callId: string,
+): StoredToolOutputManifestRow | null {
+  return (db.prepare(
+    `SELECT content_bytes, truncated_at_write, output_sha256, chunk_count,
+            output_chars, inline_sha256, inline_bytes, inline_chars, tool, created_at
+       FROM tool_outputs
+      WHERE session_id = ? AND call_id = ?`,
+  ).get(sessionId, callId) as StoredToolOutputManifestRow | undefined) ?? null;
+}
+
+function invocationOutputRow(
+  db: Database.Database,
+  sessionId: string,
+  callId: string,
+  invocationNonce: string,
+): StoredToolOutputRow | null {
+  return (db.prepare(
+    `SELECT output_full, content_bytes, truncated_at_write, output_sha256,
+            chunk_count, output_chars, inline_sha256, inline_bytes, inline_chars,
+            tool, created_at
+       FROM tool_output_invocations
+      WHERE session_id = ? AND call_id = ? AND invocation_nonce = ?`,
+  ).get(sessionId, callId, invocationNonce) as StoredToolOutputRow | undefined) ?? null;
+}
+
+function readCanonicalOutput(
+  db: Database.Database,
+  sessionId: string,
+  callId: string,
+): ToolOutputRecord | null {
+  const row = canonicalOutputRow(db, sessionId, callId);
+  return row ? hydrateStoredToolOutput(row, canonicalOutputChunks(db, sessionId, callId)) : null;
+}
+
+function readInvocationOutput(
+  db: Database.Database,
+  sessionId: string,
+  callId: string,
+  invocationNonce: string,
+): ToolOutputRecord | null {
+  const row = invocationOutputRow(db, sessionId, callId, invocationNonce);
+  return row
+    ? hydrateStoredToolOutput(row, invocationOutputChunks(db, sessionId, callId, invocationNonce))
+    : null;
+}
+
+/** Verify one manifest/chunk spine while looking for a term, without retaining
+ * the full output in JS. A small rolling overlap catches a needle split at the
+ * inline/chunk or chunk/chunk boundary. The caller hydrates only rows that
+ * match, and the surrounding read transaction pins one WAL snapshot. */
+function verifiedCanonicalOutputContains(
+  db: Database.Database,
+  sessionId: string,
+  callId: string,
+  row: StoredToolOutputRow,
+  rawNeedles: string[],
+): { complete: boolean; matched: boolean; preview: string } {
+  if (row.truncated_at_write === 1 || row.chunk_count < 0) {
+    return { complete: false, matched: false, preview: '' };
+  }
+  const needles = rawNeedles.map((needle) => needle.toLowerCase());
+  const maxNeedleChars = rawNeedles.length === 0 ? 1 : Math.max(
+    ...rawNeedles.map((needle) => Math.max(needle.length, needle.toLowerCase().length)),
+  );
+  const keepOverlap = Math.max(0, maxNeedleChars - 1);
+  let rawOverlap = '';
+  let matched = rawNeedles.length === 0;
+  const previewLimit = 10_000;
+  const previewSide = previewLimit / 2;
+  let head = '';
+  let tail = '';
+  let smallParts: string[] | null = [];
+  let smallChars = 0;
+  const inspect = (text: string): void => {
+    // Case folding can depend on the character that follows a boundary (for
+    // example Greek final sigma). Fold the joined RAW overlap/window so a
+    // term spanning inline/chunk or chunk/chunk has whole-string semantics.
+    const rawSearchable = rawOverlap + text;
+    const searchable = rawSearchable.toLowerCase();
+    if (!matched && needles.some((needle) => searchable.includes(needle))) matched = true;
+    rawOverlap = keepOverlap > 0 ? rawSearchable.slice(-keepOverlap) : '';
+    if (head.length < previewSide) head += text.slice(0, previewSide - head.length);
+    tail = `${tail}${text}`.slice(-previewSide);
+    if (smallParts) {
+      smallChars += text.length;
+      if (smallChars <= previewLimit) smallParts.push(text);
+      else smallParts = null;
+    }
+  };
+
+  const inlineBytes = Buffer.from(row.output_full, 'utf8');
+  if (
+    row.output_sha256 === null
+    || !/^[a-f0-9]{64}$/.test(row.output_sha256)
+    || row.output_chars === null
+    || !Number.isSafeInteger(row.output_chars)
+    || row.output_chars < 0
+    || row.inline_bytes === null
+    || row.inline_chars === null
+    || row.inline_sha256 === null
+    || inlineBytes.length !== row.inline_bytes
+    || row.output_full.length !== row.inline_chars
+    || createHash('sha256').update(inlineBytes).digest('hex') !== row.inline_sha256
+  ) return { complete: false, matched: false, preview: '' };
+  const hash = createHash('sha256').update(inlineBytes);
+  let totalBytes = inlineBytes.length;
+  let nextChar = row.output_full.length;
+  let chunkCount = 0;
+  inspect(row.output_full);
+  const statement = db.prepare(
+    `SELECT chunk_index, chunk_bytes, content_bytes, char_start, char_count, chunk_sha256
+       FROM tool_output_chunks
+      WHERE session_id = ? AND call_id = ?
+      ORDER BY chunk_index ASC`,
+  );
+  for (const raw of statement.iterate(sessionId, callId) as IterableIterator<StoredOutputChunkRow>) {
+    const bytes = Buffer.from(raw.chunk_bytes);
+    const text = bytes.toString('utf8');
+    if (
+      raw.chunk_index !== chunkCount
+      || raw.content_bytes !== bytes.length
+      || raw.char_start !== nextChar
+      || raw.char_count !== text.length
+      || !Buffer.from(text, 'utf8').equals(bytes)
+      || createHash('sha256').update(bytes).digest('hex') !== raw.chunk_sha256
+    ) return { complete: false, matched: false, preview: '' };
+    hash.update(bytes);
+    totalBytes += bytes.length;
+    nextChar += text.length;
+    chunkCount += 1;
+    inspect(text);
+  }
+  const complete = chunkCount === row.chunk_count
+    && totalBytes === row.content_bytes
+    && nextChar === row.output_chars
+    && hash.digest('hex') === row.output_sha256;
+  const preview = smallParts
+    ? smallParts.join('')
+    : `${head}\n…[bounded stored-output preview; middle omitted]…\n${tail}`;
+  return { complete, matched: complete && matched, preview: complete ? preview : '' };
 }
 
 /**
@@ -5228,17 +5816,48 @@ export function searchToolOutputs(
   const cleaned = terms.map((t) => t.trim()).filter((t) => t.length >= 3);
   if (cleaned.length === 0) return [];
   const db = openEventLog();
-  const likes = cleaned.map(() => 'output_full LIKE ?').join(' OR ');
-  const rows = db.prepare(
-    `SELECT call_id, tool, output_full, created_at
-       FROM tool_outputs
-      WHERE session_id = ? AND (${likes})
-      ORDER BY created_at DESC
-      LIMIT ?`,
-  ).all(sessionId, ...cleaned.map((t) => `%${t}%`), Math.max(1, Math.min(opts.limit ?? 6, 20))) as Array<{
-    call_id: string; tool: string | null; output_full: string; created_at: string;
-  }>;
-  return rows.map((r) => ({ callId: r.call_id, tool: r.tool, output: r.output_full, createdAt: r.created_at }));
+  const limit = Math.max(1, Math.min(opts.limit ?? 6, 20));
+  const read = db.transaction(() => {
+    const found: Array<{ callId: string; tool: string | null; output: string; createdAt: string }> = [];
+    const pageSize = 32;
+    let cursorCreatedAt: string | null = null;
+    let cursorCallId: string | null = null;
+    while (found.length < limit) {
+      const rows = cursorCreatedAt === null
+        ? db.prepare(
+            `SELECT call_id, created_at FROM tool_outputs
+              WHERE session_id = ?
+              ORDER BY created_at DESC, call_id ASC LIMIT ?`,
+          ).all(sessionId, pageSize)
+        : db.prepare(
+            `SELECT call_id, created_at FROM tool_outputs
+              WHERE session_id = ?
+                AND (created_at < ? OR (created_at = ? AND call_id > ?))
+              ORDER BY created_at DESC, call_id ASC LIMIT ?`,
+          ).all(sessionId, cursorCreatedAt, cursorCreatedAt, cursorCallId, pageSize);
+      const page = rows as Array<{ call_id: string; created_at: string }>;
+      if (page.length === 0) break;
+      for (const candidate of page) {
+        const row = canonicalOutputRow(db, sessionId, candidate.call_id);
+        if (!row) continue;
+        const scan = verifiedCanonicalOutputContains(db, sessionId, candidate.call_id, row, cleaned);
+        if (!scan.matched) continue;
+        found.push({
+          callId: candidate.call_id,
+          tool: row.tool,
+          output: scan.preview,
+          createdAt: row.created_at,
+        });
+        if (found.length >= limit) break;
+      }
+      const last = page.at(-1)!;
+      cursorCreatedAt = last.created_at;
+      cursorCallId = last.call_id;
+      if (page.length < pageSize) break;
+    }
+    return found;
+  });
+  return read();
 }
 
 /**
@@ -5254,16 +5873,48 @@ export function recentToolOutputs(
   opts: { limit?: number } = {},
 ): Array<{ callId: string; tool: string | null; output: string; createdAt: string }> {
   const db = openEventLog();
-  const rows = db.prepare(
-    `SELECT call_id, tool, output_full, created_at
-       FROM tool_outputs
-      WHERE session_id = ?
-      ORDER BY created_at DESC
-      LIMIT ?`,
-  ).all(sessionId, Math.max(1, Math.min(opts.limit ?? 8, 40))) as Array<{
-    call_id: string; tool: string | null; output_full: string; created_at: string;
-  }>;
-  return rows.map((r) => ({ callId: r.call_id, tool: r.tool, output: r.output_full, createdAt: r.created_at }));
+  const limit = Math.max(1, Math.min(opts.limit ?? 8, 40));
+  const read = db.transaction(() => {
+    const recent: Array<{ callId: string; tool: string | null; output: string; createdAt: string }> = [];
+    const pageSize = Math.max(8, limit);
+    let cursorCreatedAt: string | null = null;
+    let cursorCallId: string | null = null;
+    while (recent.length < limit) {
+      const rows = cursorCreatedAt === null
+        ? db.prepare(
+            `SELECT call_id, created_at FROM tool_outputs
+              WHERE session_id = ?
+              ORDER BY created_at DESC, call_id ASC LIMIT ?`,
+          ).all(sessionId, pageSize)
+        : db.prepare(
+            `SELECT call_id, created_at FROM tool_outputs
+              WHERE session_id = ?
+                AND (created_at < ? OR (created_at = ? AND call_id > ?))
+              ORDER BY created_at DESC, call_id ASC LIMIT ?`,
+          ).all(sessionId, cursorCreatedAt, cursorCreatedAt, cursorCallId, pageSize);
+      const page = rows as Array<{ call_id: string; created_at: string }>;
+      if (page.length === 0) break;
+      for (const candidate of page) {
+        const row = canonicalOutputRow(db, sessionId, candidate.call_id);
+        if (!row) continue;
+        const scan = verifiedCanonicalOutputContains(db, sessionId, candidate.call_id, row, []);
+        if (!scan.complete) continue;
+        recent.push({
+          callId: candidate.call_id,
+          tool: row.tool,
+          output: scan.preview,
+          createdAt: row.created_at,
+        });
+        if (recent.length >= limit) break;
+      }
+      const last = page.at(-1)!;
+      cursorCreatedAt = last.created_at;
+      cursorCallId = last.call_id;
+      if (page.length < pageSize) break;
+    }
+    return recent;
+  });
+  return read();
 }
 
 /**
@@ -5318,6 +5969,13 @@ export function reapStaleToolOutputs(maxAgeDays?: number): number {
             WHERE reserved.session_id = tool_output_invocations.session_id
               AND reserved.type = 'external_write'
               AND json_extract(reserved.data_json, '$.callId') = tool_output_invocations.call_id
+              AND (
+                NULLIF(TRIM(COALESCE(
+                  json_extract(reserved.data_json, '$.invocationNonce'), ''
+                )), '') IS NULL
+                OR json_extract(reserved.data_json, '$.invocationNonce')
+                     = tool_output_invocations.invocation_nonce
+              )
               AND NOT EXISTS (
                 SELECT 1
                   FROM events AS settled
@@ -5473,29 +6131,7 @@ export function reapStaleSessions(maxAgeDays?: number): number {
 
 export function getToolOutput(sessionId: string, callId: string): ToolOutputRecord | null {
   const db = openEventLog();
-  const row = db
-    .prepare(
-      `SELECT output_full, content_bytes, truncated_at_write, tool, created_at
-       FROM tool_outputs
-       WHERE session_id = ? AND call_id = ?`,
-    )
-    .get(sessionId, callId) as
-    | {
-        output_full: string;
-        content_bytes: number;
-        truncated_at_write: number;
-        tool: string | null;
-        created_at: string;
-      }
-    | undefined;
-  if (!row) return null;
-  return {
-    output: row.output_full,
-    contentBytes: row.content_bytes,
-    truncatedAtWrite: row.truncated_at_write === 1,
-    tool: row.tool,
-    createdAt: row.created_at,
-  };
+  return db.transaction(() => readCanonicalOutput(db, sessionId, callId))();
 }
 
 export function getToolOutputForInvocation(
@@ -5503,25 +6139,150 @@ export function getToolOutputForInvocation(
   callId: string,
   invocationNonce: string,
 ): ToolOutputRecord | null {
-  const row = openEventLog().prepare(
-    `SELECT output_full, content_bytes, truncated_at_write, tool, created_at
-       FROM tool_output_invocations
-      WHERE session_id = ? AND call_id = ? AND invocation_nonce = ?`,
-  ).get(sessionId, callId, invocationNonce) as {
-    output_full: string;
-    content_bytes: number;
-    truncated_at_write: number;
-    tool: string | null;
-    created_at: string;
-  } | undefined;
-  if (!row) return null;
-  return {
-    output: row.output_full,
-    contentBytes: row.content_bytes,
-    truncatedAtWrite: row.truncated_at_write === 1,
-    tool: row.tool,
-    createdAt: row.created_at,
-  };
+  const db = openEventLog();
+  return db.transaction(() => readInvocationOutput(db, sessionId, callId, invocationNonce))();
+}
+
+export interface ToolOutputSliceRecord {
+  output: string;
+  start: number;
+  end: number;
+  totalChars: number;
+  contentBytes: number;
+  truncatedAtWrite: boolean;
+  tool: string | null;
+  createdAt: string;
+}
+
+/** Read one UTF-16 character range without hydrating unrelated chunk BLOBs.
+ * The manifest metadata is checked end-to-end; only chunks intersecting the
+ * requested range are loaded and hash-verified. This keeps raw recall O(page)
+ * in payload bytes while preserving String.slice-compatible offsets. */
+export function getToolOutputSlice(
+  sessionId: string,
+  callId: string,
+  offset: number,
+  maxChars: number,
+): ToolOutputSliceRecord | null {
+  const db = openEventLog();
+  return db.transaction((): ToolOutputSliceRecord | null => {
+    const row = canonicalOutputManifestRow(db, sessionId, callId);
+    if (!row) return null;
+    const incomplete = (): ToolOutputSliceRecord => ({
+      output: '',
+      start: 0,
+      end: 0,
+      totalChars: row.output_chars ?? row.inline_chars ?? 0,
+      contentBytes: row.content_bytes,
+      truncatedAtWrite: true,
+      tool: row.tool,
+      createdAt: row.created_at,
+    });
+    if (
+      row.truncated_at_write === 1
+      || !Number.isSafeInteger(row.chunk_count)
+      || row.chunk_count < 0
+      || !Number.isSafeInteger(row.inline_bytes)
+      || (row.inline_bytes ?? -1) < 0
+      || !Number.isSafeInteger(row.inline_chars)
+      || (row.inline_chars ?? -1) < 0
+      || !row.inline_sha256
+      || !/^[a-f0-9]{64}$/.test(row.inline_sha256)
+      || row.output_sha256 === null
+      || !/^[a-f0-9]{64}$/.test(row.output_sha256)
+      || row.output_chars === null
+      || !Number.isSafeInteger(row.output_chars)
+      || row.output_chars < 0
+    ) return incomplete();
+
+    const metadata = db.prepare(
+      `SELECT chunk_index, content_bytes, char_start, char_count, chunk_sha256
+         FROM tool_output_chunks
+        WHERE session_id = ? AND call_id = ?
+        ORDER BY chunk_index ASC`,
+    ).all(sessionId, callId) as Array<Omit<StoredOutputChunkRow, 'chunk_bytes'>>;
+    if (metadata.length !== row.chunk_count) return incomplete();
+    let totalBytes = row.inline_bytes!;
+    let nextChar = row.inline_chars!;
+    for (let index = 0; index < metadata.length; index += 1) {
+      const chunk = metadata[index]!;
+      if (
+        chunk.chunk_index !== index
+        || !Number.isSafeInteger(chunk.content_bytes)
+        || chunk.content_bytes <= 0
+        || chunk.char_start !== nextChar
+        || !Number.isSafeInteger(chunk.char_count)
+        || chunk.char_count <= 0
+        || !/^[a-f0-9]{64}$/.test(chunk.chunk_sha256)
+      ) return incomplete();
+      totalBytes += chunk.content_bytes;
+      nextChar += chunk.char_count;
+    }
+    const totalChars = row.output_chars;
+    if (totalBytes !== row.content_bytes || nextChar !== totalChars) return incomplete();
+
+    const start = Math.min(Math.max(0, Math.trunc(offset)), totalChars);
+    const end = Math.min(totalChars, start + Math.max(0, Math.trunc(maxChars)));
+    const parts: string[] = [];
+    const inlineEnd = row.inline_chars!;
+    // Loading the 16 MiB inline segment is necessary only for a page that
+    // overlaps it (or for the sole segment of an inline-only output). Tail
+    // pages stay O(requested chunks) in payload bytes.
+    if ((start < inlineEnd && end > 0) || row.chunk_count === 0) {
+      const inline = (db.prepare(
+        `SELECT output_full FROM tool_outputs WHERE session_id = ? AND call_id = ?`,
+      ).get(sessionId, callId) as { output_full: string } | undefined)?.output_full;
+      if (inline === undefined) return incomplete();
+      const inlineBytes = Buffer.from(inline, 'utf8');
+      if (
+        inlineBytes.length !== row.inline_bytes
+        || inline.length !== row.inline_chars
+        || createHash('sha256').update(inlineBytes).digest('hex') !== row.inline_sha256
+      ) return incomplete();
+      if (start < inlineEnd && end > 0) {
+        parts.push(inline.slice(start, Math.min(end, inlineEnd)));
+      }
+    }
+    if (end > inlineEnd) {
+      const chunks = db.prepare(
+        `SELECT chunk_index, chunk_bytes, content_bytes, char_start, char_count, chunk_sha256
+           FROM tool_output_chunks
+          WHERE session_id = ? AND call_id = ?
+            AND char_start < ? AND (char_start + char_count) > ?
+          ORDER BY chunk_index ASC`,
+      ).all(sessionId, callId, end, start) as StoredOutputChunkRow[];
+      for (const chunk of chunks) {
+        const bytes = Buffer.from(chunk.chunk_bytes);
+        const text = bytes.toString('utf8');
+        const expected = metadata[chunk.chunk_index];
+        if (
+          !expected
+          || chunk.content_bytes !== bytes.length
+          || chunk.char_start !== expected.char_start
+          || chunk.char_count !== expected.char_count
+          || chunk.chunk_sha256 !== expected.chunk_sha256
+          || text.length !== chunk.char_count
+          || !Buffer.from(text, 'utf8').equals(bytes)
+          || createHash('sha256').update(bytes).digest('hex') !== chunk.chunk_sha256
+        ) return incomplete();
+        const localStart = Math.max(0, start - chunk.char_start);
+        const localEnd = Math.min(chunk.char_count, end - chunk.char_start);
+        if (localEnd > localStart) parts.push(text.slice(localStart, localEnd));
+      }
+    }
+    const output = parts.join('');
+    if (output.length !== end - start) return incomplete();
+    return {
+      output,
+      start,
+      end,
+      totalChars,
+      contentBytes: row.content_bytes,
+      truncatedAtWrite: false,
+      tool: row.tool,
+      createdAt: row.created_at,
+    };
+  })();
 }
 
 export interface ToolOutputInvocationRecord extends ToolOutputRecord {
@@ -5535,27 +6296,43 @@ export function listToolOutputInvocations(
   sessionId: string,
   callId: string,
 ): ToolOutputInvocationRecord[] {
-  const rows = openEventLog().prepare(
-    `SELECT invocation_nonce, output_full, content_bytes, truncated_at_write, tool, created_at
+  const db = openEventLog();
+  return db.transaction(() => {
+    const rows = db.prepare(
+      `SELECT invocation_nonce, output_full, content_bytes, truncated_at_write,
+              output_sha256, chunk_count, output_chars,
+              inline_sha256, inline_bytes, inline_chars, tool, created_at
+         FROM tool_output_invocations
+        WHERE session_id = ? AND call_id = ?
+        ORDER BY created_at ASC, invocation_nonce ASC`,
+    ).all(sessionId, callId) as Array<StoredToolOutputRow & { invocation_nonce: string }>;
+    return rows.map((row) => ({
+      invocationNonce: row.invocation_nonce,
+      ...hydrateStoredToolOutput(
+        row,
+        invocationOutputChunks(db, sessionId, callId, row.invocation_nonce),
+      ),
+    }));
+  })();
+}
+
+/** Bounded identity-only probe for callers deciding whether an SDK result may
+ * reuse one already-parked invocation. It never hydrates output BLOBs. */
+export function listToolOutputInvocationNonces(
+  sessionId: string,
+  callId: string,
+  limit = 2,
+): string[] {
+  const bounded = Math.max(1, Math.min(2, Math.trunc(limit)));
+  const db = openEventLog();
+  return (db.prepare(
+    `SELECT invocation_nonce
        FROM tool_output_invocations
       WHERE session_id = ? AND call_id = ?
-      ORDER BY created_at ASC, invocation_nonce ASC`,
-  ).all(sessionId, callId) as Array<{
-    invocation_nonce: string;
-    output_full: string;
-    content_bytes: number;
-    truncated_at_write: number;
-    tool: string | null;
-    created_at: string;
-  }>;
-  return rows.map((row) => ({
-    invocationNonce: row.invocation_nonce,
-    output: row.output_full,
-    contentBytes: row.content_bytes,
-    truncatedAtWrite: row.truncated_at_write === 1,
-    tool: row.tool,
-    createdAt: row.created_at,
-  }));
+      ORDER BY created_at ASC, invocation_nonce ASC
+      LIMIT ?`,
+  ).all(sessionId, callId, bounded) as Array<{ invocation_nonce: string }>)
+    .map((row) => row.invocation_nonce);
 }
 
 export type AuthorityToolOutputResolution =
@@ -5704,6 +6481,9 @@ function authorityOutputFailureReason(
   record: ToolOutputRecord,
   occurrence: DurableToolOutputOccurrence | null,
 ): string | null {
+  if (record.truncatedAtWrite) {
+    return 'stored tool output is incomplete (legacy truncation or missing/corrupt durable chunks)';
+  }
   if (occurrence?.explicitOk === false) return 'durable tool lifecycle explicitly failed';
   if (!toolOutputLooksSuccessful(record.output, occurrence?.explicitOk ?? undefined)) {
     return 'stored tool output is failure-shaped';
@@ -5718,6 +6498,7 @@ function authorityOutputFailureReason(
  * identity: retries may reuse it. `parent_event_id` is therefore part of the
  * proof, not optional telemetry. */
 function durableToolOutputOccurrence(
+  db: Database.Database,
   sessionId: string,
   callId: string,
 ): {
@@ -5730,7 +6511,7 @@ function durableToolOutputOccurrence(
   // return and validates their seq relationship below. Ordering here makes
   // SQLite choose the broad session/seq index instead of the existing
   // call-lifecycle expression index on long sessions.
-  const events = openEventLog().prepare(`
+  const events = db.prepare(`
     SELECT seq, id, session_id, turn, role, type, parent_event_id, data_json, created_at
       FROM events
      WHERE session_id = ?
@@ -5812,6 +6593,539 @@ function outputFallsWithinOccurrence(
     && record.createdAt <= occurrence.returned.createdAt;
 }
 
+export interface AuthorityToolOutputExcerptRecord {
+  callId: string;
+  tool: string | null;
+  effect: string | null;
+  sourceUserSeq: number | null;
+  output: string;
+  excerpted: boolean;
+  contentBytes: number;
+  createdAt: string;
+  /** Internal bounded matcher projection; absent for ordinary excerpt reads. */
+  matchedTerms?: string[];
+  /** Matched terms already present on the durable tool-call request. Automatic
+   * evidence gates must not treat an echoed request value as an observation. */
+  requestMatchedTerms?: string[];
+  /** A complete plain-text result repeated at least one scalar from its own
+   * durable request. Generic automatic judges cannot distinguish an observed
+   * response from a prose request echo, so they must not use that prose. */
+  requestEchoDetected?: boolean;
+  /** Generic prose projection was deliberately withheld. The exact source
+   * identity may still be used by a purpose-built streaming term consumer. */
+  automaticEvidenceSuppressed?: boolean;
+}
+
+interface VerifiedToolOutputExcerpt {
+  output: string;
+  excerpted: boolean;
+  contentBytes: number;
+  truncatedAtWrite: boolean;
+  tool: string | null;
+  createdAt: string;
+}
+
+function storedToolOutputParentManifestValid(row: StoredToolOutputRow): boolean {
+  if (
+    row.truncated_at_write === 1
+    || !Number.isSafeInteger(row.chunk_count)
+    || row.chunk_count < 0
+    || row.output_sha256 === null
+    || !/^[a-f0-9]{64}$/.test(row.output_sha256)
+    || row.output_chars === null
+    || !Number.isSafeInteger(row.output_chars)
+    || row.output_chars < 0
+    || row.inline_bytes === null
+    || row.inline_chars === null
+    || row.inline_sha256 === null
+  ) return false;
+  const inlineBytes = Buffer.from(row.output_full, 'utf8');
+  return inlineBytes.length === row.inline_bytes
+    && row.output_full.length === row.inline_chars
+    && createHash('sha256').update(inlineBytes).digest('hex') === row.inline_sha256;
+}
+
+/** Verify a complete chunk spine while retaining only a bounded prefix. This
+ * is for automatic integrity judges, whose prompt renderer already discards
+ * everything after its excerpt ceiling. Standard recall/reference authority
+ * continues to use the lossless resolver below. */
+function verifyStoredToolOutputExcerpt(
+  row: StoredToolOutputRow,
+  chunks: Iterable<StoredOutputChunkRow>,
+  excerptChars: number,
+  observeSegment?: (text: string) => void,
+): VerifiedToolOutputExcerpt {
+  const incomplete = (): VerifiedToolOutputExcerpt => ({
+    output: '',
+    excerpted: false,
+    contentBytes: row.content_bytes,
+    truncatedAtWrite: true,
+    tool: row.tool,
+    createdAt: row.created_at,
+  });
+  if (!storedToolOutputParentManifestValid(row)) return incomplete();
+  const inlineBytes = Buffer.from(row.output_full, 'utf8');
+
+  const limit = Math.max(1, Math.min(100_000, Math.trunc(excerptChars)));
+  let output = row.output_full.slice(0, limit);
+  observeSegment?.(row.output_full);
+  const wholeHash = createHash('sha256').update(inlineBytes);
+  let totalBytes = inlineBytes.length;
+  let nextChar = row.output_full.length;
+  let chunkCount = 0;
+  for (const chunk of chunks) {
+    const bytes = Buffer.from(chunk.chunk_bytes);
+    const text = bytes.toString('utf8');
+    if (
+      chunk.chunk_index !== chunkCount
+      || chunk.content_bytes !== bytes.length
+      || chunk.char_start !== nextChar
+      || chunk.char_count !== text.length
+      || !Buffer.from(text, 'utf8').equals(bytes)
+      || createHash('sha256').update(bytes).digest('hex') !== chunk.chunk_sha256
+    ) return incomplete();
+    observeSegment?.(text);
+    if (output.length < limit) output += text.slice(0, limit - output.length);
+    wholeHash.update(bytes);
+    totalBytes += bytes.length;
+    nextChar += text.length;
+    chunkCount += 1;
+  }
+  if (
+    chunkCount !== row.chunk_count
+    || totalBytes !== row.content_bytes
+    || nextChar !== row.output_chars
+    || wholeHash.digest('hex') !== row.output_sha256
+  ) return incomplete();
+  return {
+    output,
+    excerpted: nextChar > output.length,
+    contentBytes: row.content_bytes,
+    truncatedAtWrite: false,
+    tool: row.tool,
+    createdAt: row.created_at,
+  };
+}
+
+function authorityExcerptFailureReason(
+  record: VerifiedToolOutputExcerpt,
+  occurrence: DurableToolOutputOccurrence | null,
+): string | null {
+  if (record.truncatedAtWrite) {
+    return 'stored tool output is incomplete (legacy truncation or missing/corrupt durable chunks)';
+  }
+  if (occurrence?.explicitOk === false) return 'durable tool lifecycle explicitly failed';
+  if (record.excerpted && occurrence?.explicitOk !== true) {
+    return 'large stored output lacks an explicit durable success disposition';
+  }
+  if (!toolOutputLooksSuccessful(record.output, occurrence?.explicitOk ?? undefined)) {
+    return 'stored tool output is failure-shaped';
+  }
+  const derivedReaderReason = derivedToolOutputReaderFailureReason({
+    output: record.output,
+    contentBytes: record.contentBytes,
+    truncatedAtWrite: record.truncatedAtWrite,
+    tool: record.tool,
+    createdAt: record.createdAt,
+  }, occurrence);
+  return derivedReaderReason;
+}
+
+function authorityCallRequestPreviewWasTruncated(call: EventRow): boolean {
+  if (call.data.argumentsTruncated === true || call.data.argsTruncated === true) return true;
+  const truncatedString = (value: unknown, threshold: number): boolean => (
+    typeof value === 'string'
+    && (
+      value.length >= threshold
+      || /…(?:\[\+\d+ chars\])?$/.test(value)
+    )
+  );
+  if (truncatedString(call.data.arguments, 8_000)) return true;
+  if (truncatedString(call.data.args, 300)) return true;
+  try {
+    return JSON.stringify(call.data.arguments ?? call.data.args ?? '').includes('…');
+  } catch {
+    return true;
+  }
+}
+
+function outputEchoesCallRequest(output: string, call: EventRow): boolean {
+  const trimmed = output.trim();
+  if (!trimmed) return false;
+  if (authorityCallRequestPreviewWasTruncated(call)) return true;
+  let request: unknown = call.data.arguments ?? call.data.args;
+  if (typeof request === 'string') {
+    const candidate = request.trim();
+    if (candidate.startsWith('{') || candidate.startsWith('[')) {
+      try {
+        request = JSON.parse(candidate) as unknown;
+      } catch {
+        // Keep the exact string as the only available bounded request value.
+      }
+    }
+  }
+  const scalars: string[] = [];
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 8 || scalars.length >= 512 || value === null || value === undefined) return;
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (normalized.length >= 3 || /^[$€£]?[+-]?(?:\d+(?:\.\d+)?|\.\d+)%?$/.test(normalized)) {
+        scalars.push(normalized);
+      }
+      return;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      const normalized = String(value).toLowerCase();
+      scalars.push(normalized);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const child of value) visit(child, depth + 1);
+      return;
+    }
+    if (typeof value === 'object') {
+      for (const child of Object.values(value as Record<string, unknown>)) visit(child, depth + 1);
+    }
+  };
+  visit(request, 0);
+  const folded = output.toLowerCase();
+  return scalars.some((scalar) => folded.includes(scalar));
+}
+
+export interface AutomaticToolOutputProjection {
+  status: 'ok' | 'unavailable';
+  value?: unknown;
+  reason?: string;
+}
+
+/** Remove request values from a complete provider result before it can
+ * authorize a later field. Key-name pruning alone is insufficient because
+ * providers often echo request values under arbitrary names such as `query`.
+ * Unstructured results with a request are withheld: there is no safe way to
+ * distinguish response prose from a request echo. */
+export function projectToolOutputValueForAutomaticAuthority(
+  sessionId: string,
+  callId: string,
+  value: unknown,
+): AutomaticToolOutputProjection {
+  const db = openEventLog();
+  return db.transaction((): AutomaticToolOutputProjection => {
+    const lifecycle = durableToolOutputOccurrence(db, sessionId, callId);
+    const call = lifecycle.occurrence?.call;
+    if (!call) return { status: 'unavailable', reason: 'exact durable tool-call request is unavailable' };
+    let request: unknown = call.data.arguments ?? call.data.args;
+    const pruned = pruneProviderRequestEchoes(value);
+    if (request === undefined || request === null) return { status: 'ok', value: pruned };
+    if (authorityCallRequestPreviewWasTruncated(call)) {
+      return { status: 'unavailable', reason: 'durable tool-call request preview is incomplete' };
+    }
+    if (typeof request === 'string') {
+      const candidate = request.trim();
+      if (candidate.startsWith('{') || candidate.startsWith('[')) {
+        try {
+          request = JSON.parse(candidate) as unknown;
+        } catch {
+          // Preserve the complete string as the request value below.
+        }
+      }
+    }
+    if (typeof pruned === 'string') {
+      return { status: 'unavailable', reason: 'unstructured provider output cannot separate request echo from response' };
+    }
+
+    const requestTokens = new Set<string>();
+    const collect = (candidate: unknown, depth: number): void => {
+      if (depth > 8 || requestTokens.size >= 2_048 || candidate === null || candidate === undefined) return;
+      if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+        requestTokens.add(String(candidate).toLowerCase());
+        return;
+      }
+      if (typeof candidate === 'string') {
+        const normalized = candidate.trim().toLowerCase();
+        if (normalized) requestTokens.add(normalized);
+        for (const match of normalized.matchAll(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}|[$€£]?[+-]?(?:\d+(?:\.\d+)?|\.\d+)%?/gi)) {
+          if (match[0]) requestTokens.add(match[0].toLowerCase());
+        }
+        return;
+      }
+      if (Array.isArray(candidate)) {
+        for (const child of candidate) collect(child, depth + 1);
+        return;
+      }
+      if (typeof candidate === 'object') {
+        for (const child of Object.values(candidate as Record<string, unknown>)) collect(child, depth + 1);
+      }
+    };
+    collect(request, 0);
+
+    const OMIT = Symbol('request-echo');
+    const strip = (candidate: unknown, depth: number): unknown | typeof OMIT => {
+      if (depth > 32) return OMIT;
+      if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+        return requestTokens.has(String(candidate).toLowerCase()) ? OMIT : candidate;
+      }
+      if (typeof candidate === 'string') {
+        const normalized = candidate.trim().toLowerCase();
+        return [...requestTokens].some((token) => token && normalized.includes(token)) ? OMIT : candidate;
+      }
+      if (Array.isArray(candidate)) {
+        return candidate.map((child) => strip(child, depth + 1)).filter((child) => child !== OMIT);
+      }
+      if (candidate && typeof candidate === 'object') {
+        const entries: Array<[string, unknown]> = [];
+        for (const [key, child] of Object.entries(candidate as Record<string, unknown>)) {
+          const stripped = strip(child, depth + 1);
+          if (stripped !== OMIT) entries.push([key, stripped]);
+        }
+        return Object.fromEntries(entries);
+      }
+      return candidate;
+    };
+    const projected = strip(pruned, 0);
+    return projected === OMIT
+      ? { status: 'unavailable', reason: 'provider output contains only request echo' }
+      : { status: 'ok', value: projected };
+  })();
+}
+
+/** Bounded evidence resolver for automatic grounding judges. It applies the
+ * same exact occurrence/reuse doctrine as resolveToolOutputForAuthority, hashes
+ * every stored byte, and retains at most excerptChars in memory per candidate. */
+export function resolveToolOutputExcerptsForAuthority(
+  sessionId: string,
+  candidates: readonly { callId: string }[],
+  options: {
+    readOrComputeOnly?: boolean;
+    allowedSourceUserSeqs?: readonly number[];
+    excerptChars?: number;
+    matchTerms?: readonly string[];
+  } = {},
+): AuthorityToolOutputExcerptRecord[] {
+  const db = openEventLog();
+  return db.transaction(() => {
+    const resolved: AuthorityToolOutputExcerptRecord[] = [];
+    const seen = new Set<string>();
+    const allowedSources = options.allowedSourceUserSeqs === undefined
+      ? null
+      : new Set(options.allowedSourceUserSeqs.filter((value) => Number.isSafeInteger(value) && value > 0));
+    const excerptChars = options.excerptChars ?? 5_000;
+    const matchTerms = [...new Set((options.matchTerms ?? [])
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => value.length > 0 && value.length <= 4_096))]
+      .slice(0, 2_048);
+    const maxMatchOverlap = matchTerms.length > 0
+      ? Math.max(...matchTerms.map((value) => value.length), 1) + 16
+      : 0;
+    for (const candidate of candidates) {
+      const callId = candidate.callId.trim();
+      if (!callId || seen.has(callId)) continue;
+      seen.add(callId);
+      const count = (db.prepare(
+        `SELECT COUNT(*) AS count FROM tool_output_invocations
+          WHERE session_id = ? AND call_id = ?`,
+      ).get(sessionId, callId) as { count: number }).count;
+      if (count > 1) continue;
+      const lifecycle = durableToolOutputOccurrence(db, sessionId, callId);
+      let record: VerifiedToolOutputExcerpt | null = null;
+      let source: 'exact' | 'legacy' | null = null;
+      let occurrence: DurableToolOutputOccurrence | null = null;
+      const matchedTerms = new Set<string>();
+      let rawMatchOverlap = '';
+      const observeSegment = matchTerms.length === 0 ? undefined : (segment: string): void => {
+        const rawWindow = rawMatchOverlap + segment;
+        const folded = rawWindow.toLowerCase();
+        for (const term of matchTerms) {
+          if (!matchedTerms.has(term) && folded.includes(term)) matchedTerms.add(term);
+        }
+        rawMatchOverlap = rawWindow.slice(-maxMatchOverlap);
+      };
+      if (count === 1) {
+        const nonce = (db.prepare(
+          `SELECT invocation_nonce FROM tool_output_invocations
+            WHERE session_id = ? AND call_id = ? LIMIT 1`,
+        ).get(sessionId, callId) as { invocation_nonce: string }).invocation_nonce;
+        const row = invocationOutputRow(db, sessionId, callId, nonce);
+        if (!row || !storedToolOutputParentManifestValid(row)) continue;
+        record = verifyStoredToolOutputExcerpt(
+          row,
+          db.prepare(
+            `SELECT chunk_index, chunk_bytes, content_bytes, char_start, char_count, chunk_sha256
+               FROM tool_output_invocation_chunks
+              WHERE session_id = ? AND call_id = ? AND invocation_nonce = ?
+              ORDER BY chunk_index ASC`,
+          ).iterate(sessionId, callId, nonce) as Iterable<StoredOutputChunkRow>,
+          excerptChars,
+          observeSegment,
+        );
+        source = 'exact';
+        if (lifecycle.callCount === 0 && lifecycle.returnCount === 0) {
+          occurrence = null;
+        } else if (lifecycle.occurrence && outputFallsWithinOccurrence({
+          output: record.output,
+          contentBytes: record.contentBytes,
+          truncatedAtWrite: record.truncatedAtWrite,
+          tool: record.tool,
+          createdAt: record.createdAt,
+        }, lifecycle.occurrence)) {
+          occurrence = lifecycle.occurrence;
+        } else {
+          continue;
+        }
+      } else {
+        const row = canonicalOutputRow(db, sessionId, callId);
+        if (
+          !row
+          || !storedToolOutputParentManifestValid(row)
+          || !lifecycle.occurrence
+          || (lifecycle.occurrence.effect !== 'read' && lifecycle.occurrence.effect !== 'compute')
+        ) continue;
+        record = verifyStoredToolOutputExcerpt(
+          row,
+          db.prepare(
+            `SELECT chunk_index, chunk_bytes, content_bytes, char_start, char_count, chunk_sha256
+               FROM tool_output_chunks
+              WHERE session_id = ? AND call_id = ? ORDER BY chunk_index ASC`,
+          ).iterate(sessionId, callId) as Iterable<StoredOutputChunkRow>,
+          excerptChars,
+          observeSegment,
+        );
+        if (!outputFallsWithinOccurrence({
+          output: record.output,
+          contentBytes: record.contentBytes,
+          truncatedAtWrite: record.truncatedAtWrite,
+          tool: record.tool,
+          createdAt: record.createdAt,
+        }, lifecycle.occurrence)) continue;
+        source = 'legacy';
+        occurrence = lifecycle.occurrence;
+      }
+      if (!record || !source) continue;
+      if (authorityExcerptFailureReason(record, occurrence)) continue;
+      const effect = occurrence?.effect ?? null;
+      const sourceUserSeq = occurrence?.sourceUserSeq ?? null;
+      if (options.readOrComputeOnly && effect !== 'read' && effect !== 'compute') continue;
+      if (allowedSources && (sourceUserSeq === null || !allowedSources.has(sourceUserSeq))) continue;
+      resolved.push({
+        callId,
+        tool: record.tool,
+        effect,
+        sourceUserSeq,
+        output: record.output,
+        excerpted: record.excerpted,
+        contentBytes: record.contentBytes,
+        createdAt: record.createdAt,
+        ...(matchTerms.length > 0 ? { matchedTerms: [...matchedTerms] } : {}),
+        ...(matchTerms.length > 0 ? {
+          requestMatchedTerms: occurrence
+            ? authorityCallRequestPreviewWasTruncated(occurrence.call)
+              ? [...matchTerms]
+              : matchTerms.filter((term) => {
+              try {
+                return JSON.stringify(occurrence.call.data).toLowerCase().includes(term);
+              } catch {
+                return true;
+              }
+            })
+            : [],
+        } : {}),
+        ...(occurrence && outputEchoesCallRequest(record.output, occurrence.call)
+          ? { requestEchoDetected: true }
+          : {}),
+      });
+    }
+    return resolved;
+  })();
+}
+
+/** Generic automatic-judge projection. Complete JSON is stripped of request
+ * and input echo fields before it can support a later write or published
+ * figure. A chunked prefix cannot be parsed structurally, so it contributes no
+ * generic prose; callers needing exact middle identifiers use the term matcher
+ * above instead. */
+export function resolveToolOutputEvidenceExcerptsForAuthority(
+  sessionId: string,
+  candidates: readonly { callId: string }[],
+  options: {
+    readOrComputeOnly?: boolean;
+    allowedSourceUserSeqs?: readonly number[];
+    excerptChars?: number;
+  } = {},
+): AuthorityToolOutputExcerptRecord[] {
+  return resolveToolOutputExcerptsForAuthority(sessionId, candidates, options)
+    .map((record) => {
+      if (record.excerpted) return { ...record, output: '', automaticEvidenceSuppressed: true };
+      const trimmed = record.output.trim();
+      let parsed: unknown = record.output;
+      try {
+        if (trimmed.startsWith('{') || trimmed.startsWith('[')) parsed = JSON.parse(trimmed) as unknown;
+      } catch {
+        return { ...record, output: '', automaticEvidenceSuppressed: true };
+      }
+      const projected = projectToolOutputValueForAutomaticAuthority(sessionId, record.callId, parsed);
+      if (projected.status !== 'ok') return { ...record, output: '', automaticEvidenceSuppressed: true };
+      return {
+        ...record,
+        output: typeof projected.value === 'string'
+          ? projected.value
+          : JSON.stringify(projected.value),
+      };
+    });
+}
+
+export interface AuthorityToolOutputTermMatchRecord {
+  callId: string;
+  tool: string | null;
+  effect: string | null;
+  sourceUserSeq: number | null;
+  /** Lower-cased exact terms observed anywhere in the verified output. */
+  matchedTerms: string[];
+  requestMatchedTerms: string[];
+  contentBytes: number;
+  createdAt: string;
+}
+
+/**
+ * Bounded exact-term projection for automatic integrity gates. The complete
+ * durable output is streamed and hash-verified, including bytes that are not
+ * retained. Only the caller-supplied terms are kept, so a large result cannot
+ * turn a recipient/memory/claim check into an unbounded heap allocation.
+ *
+ * Terms are deliberately literal and case-insensitive. This is not a search
+ * API: callers first select a small candidate set, then use this function to
+ * prove that exact identifiers/pointers occur in the authoritative invocation.
+ */
+export function resolveToolOutputTermMatchesForAuthority(
+  sessionId: string,
+  candidates: readonly { callId: string }[],
+  terms: readonly string[],
+  options: {
+    readOrComputeOnly?: boolean;
+    allowedSourceUserSeqs?: readonly number[];
+  } = {},
+): AuthorityToolOutputTermMatchRecord[] {
+  const normalizedTerms = [...new Set(terms
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => value.length > 0 && value.length <= 4_096))]
+    .slice(0, 2_048);
+  if (normalizedTerms.length === 0) return [];
+  return resolveToolOutputExcerptsForAuthority(sessionId, candidates, {
+    ...options,
+    excerptChars: 5_000,
+    matchTerms: normalizedTerms,
+  }).map((candidate) => ({
+    callId: candidate.callId,
+    tool: candidate.tool,
+    effect: candidate.effect,
+    sourceUserSeq: candidate.sourceUserSeq,
+    matchedTerms: candidate.matchedTerms ?? [],
+    requestMatchedTerms: candidate.requestMatchedTerms ?? [],
+    contentBytes: candidate.contentBytes,
+    createdAt: candidate.createdAt,
+  }));
+}
+
 /** Resolve bytes for a value that may authorize a later action. Reporting and
  * recall may intentionally use the canonical longest row; authority consumers
  * must use this function so a reused call id can never select stale bytes. */
@@ -5819,34 +7133,72 @@ export function resolveToolOutputForAuthority(
   sessionId: string,
   callId: string,
 ): AuthorityToolOutputResolution {
-  const invocations = listToolOutputInvocations(sessionId, callId);
-  if (invocations.length > 1) {
-      return { status: 'ambiguous', invocationCount: invocations.length };
-  }
-  const lifecycle = durableToolOutputOccurrence(sessionId, callId);
-  if (invocations.length === 1) {
-    // Detached/internal formatter paths do not always have SDK lifecycle events.
-    // One nonce row is still exact in that case. But once ANY durable lifecycle
-    // exists, it must prove precisely one matching occurrence. Otherwise a later
-    // hook-only invocation may have reused the call id without writing a nonce,
-    // and the lone row can be stale authority from the earlier call.
-    if (lifecycle.callCount === 0 && lifecycle.returnCount === 0) {
-      const failureReason = authorityOutputFailureReason(invocations[0], null);
-      if (failureReason) return { status: 'failed', reason: failureReason };
+  const db = openEventLog();
+  return db.transaction((): AuthorityToolOutputResolution => {
+    const count = (db.prepare(
+      `SELECT COUNT(*) AS count FROM tool_output_invocations
+        WHERE session_id = ? AND call_id = ?`,
+    ).get(sessionId, callId) as { count: number }).count;
+    if (count > 1) {
+      return { status: 'ambiguous', invocationCount: count };
+    }
+    const lifecycle = durableToolOutputOccurrence(db, sessionId, callId);
+    if (count === 1) {
+      const nonce = (db.prepare(
+        `SELECT invocation_nonce FROM tool_output_invocations
+          WHERE session_id = ? AND call_id = ? LIMIT 1`,
+      ).get(sessionId, callId) as { invocation_nonce: string }).invocation_nonce;
+      const invocation = readInvocationOutput(db, sessionId, callId, nonce);
+      if (!invocation) return { status: 'missing' };
+      // Detached/internal formatter paths do not always have SDK lifecycle events.
+      // One nonce row is still exact in that case. But once ANY durable lifecycle
+      // exists, it must prove precisely one matching occurrence. Otherwise a later
+      // hook-only invocation may have reused the call id without writing a nonce,
+      // and the lone row can be stale authority from the earlier call.
+      if (lifecycle.callCount === 0 && lifecycle.returnCount === 0) {
+        const failureReason = authorityOutputFailureReason(invocation, null);
+        if (failureReason) return { status: 'failed', reason: failureReason };
+        return {
+          status: 'ok', record: invocation, source: 'exact', effect: null, sourceUserSeq: null,
+        };
+      }
+      if (
+        lifecycle.occurrence
+        && outputFallsWithinOccurrence(invocation, lifecycle.occurrence)
+      ) {
+        const failureReason = authorityOutputFailureReason(invocation, lifecycle.occurrence);
+        if (failureReason) return { status: 'failed', reason: failureReason };
+        return {
+          status: 'ok',
+          record: invocation,
+          source: 'exact',
+          effect: lifecycle.occurrence.effect,
+          sourceUserSeq: lifecycle.occurrence.sourceUserSeq,
+        };
+      }
       return {
-        status: 'ok', record: invocations[0], source: 'exact', effect: null, sourceUserSeq: null,
+        status: 'ambiguous',
+        invocationCount: Math.max(1, lifecycle.callCount, lifecycle.returnCount),
+        reason: lifecycle.reason ?? 'exact output does not match the sole durable invocation',
       };
     }
+    const legacy = readCanonicalOutput(db, sessionId, callId);
+    if (!legacy) return { status: 'missing' };
+    // Migrated pre-v19 rows have no nonce. They retain authority only when one
+    // parented lifecycle pair proves the producer was the same READ/COMPUTE tool
+    // and the longest-wins row was actually written inside that occurrence.
+    // Anything less would let a reused id promote stale provider bytes.
     if (
       lifecycle.occurrence
-      && outputFallsWithinOccurrence(invocations[0], lifecycle.occurrence)
+      && (lifecycle.occurrence.effect === 'read' || lifecycle.occurrence.effect === 'compute')
+      && outputFallsWithinOccurrence(legacy, lifecycle.occurrence)
     ) {
-      const failureReason = authorityOutputFailureReason(invocations[0], lifecycle.occurrence);
+      const failureReason = authorityOutputFailureReason(legacy, lifecycle.occurrence);
       if (failureReason) return { status: 'failed', reason: failureReason };
       return {
         status: 'ok',
-        record: invocations[0],
-        source: 'exact',
+        record: legacy,
+        source: 'legacy',
         effect: lifecycle.occurrence.effect,
         sourceUserSeq: lifecycle.occurrence.sourceUserSeq,
       };
@@ -5854,35 +7206,9 @@ export function resolveToolOutputForAuthority(
     return {
       status: 'ambiguous',
       invocationCount: Math.max(1, lifecycle.callCount, lifecycle.returnCount),
-      reason: lifecycle.reason ?? 'exact output does not match the sole durable invocation',
+      reason: lifecycle.reason ?? 'legacy output lacks one matching read/compute lifecycle occurrence',
     };
-  }
-  const legacy = getToolOutput(sessionId, callId);
-  if (!legacy) return { status: 'missing' };
-  // Migrated pre-v19 rows have no nonce. They retain authority only when one
-  // parented lifecycle pair proves the producer was the same READ/COMPUTE tool
-  // and the longest-wins row was actually written inside that occurrence.
-  // Anything less would let a reused id promote stale provider bytes.
-  if (
-    lifecycle.occurrence
-    && (lifecycle.occurrence.effect === 'read' || lifecycle.occurrence.effect === 'compute')
-    && outputFallsWithinOccurrence(legacy, lifecycle.occurrence)
-  ) {
-    const failureReason = authorityOutputFailureReason(legacy, lifecycle.occurrence);
-    if (failureReason) return { status: 'failed', reason: failureReason };
-    return {
-      status: 'ok',
-      record: legacy,
-      source: 'legacy',
-      effect: lifecycle.occurrence.effect,
-      sourceUserSeq: lifecycle.occurrence.sourceUserSeq,
-    };
-  }
-  return {
-    status: 'ambiguous',
-    invocationCount: Math.max(1, lifecycle.callCount, lifecycle.returnCount),
-    reason: lifecycle.reason ?? 'legacy output lacks one matching read/compute lifecycle occurrence',
-  };
+  })();
 }
 
 export interface AuthorityToolOutputRecord extends ToolOutputRecord {

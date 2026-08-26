@@ -604,6 +604,35 @@ test('three failures with no win auto-invalidates the choice (→ rediscovery)',
   }
 });
 
+test('a success resets the failure streak so lifetime failures cannot retire a proven choice', () => {
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+  try {
+    rememberToolChoice({ intent: 't2 consecutive streak', choice: { kind: 'composio', identifier: 'PROVEN_TOOL' } });
+    for (let i = 0; i < 5; i += 1) updateToolChoiceOutcome('t2 consecutive streak', 'success');
+    updateToolChoiceOutcome('t2 consecutive streak', 'failure');
+    updateToolChoiceOutcome('t2 consecutive streak', 'failure');
+    assert.equal(peekToolChoice('t2 consecutive streak')?.choice?.failureCount, 2);
+    assert.equal(peekToolChoice('t2 consecutive streak')?.choice?.failureStreak, 2);
+
+    updateToolChoiceOutcome('t2 consecutive streak', 'success');
+    let rec = peekToolChoice('t2 consecutive streak');
+    assert.equal(rec?.choice?.successCount, 6, 'wins remain cumulative');
+    assert.equal(rec?.choice?.failureCount, 2, 'lifetime negative evidence remains available to ranking');
+    assert.equal(rec?.choice?.failureStreak, 0, 'the successful re-proof clears only the consecutive streak');
+
+    updateToolChoiceOutcome('t2 consecutive streak', 'failure');
+    updateToolChoiceOutcome('t2 consecutive streak', 'failure');
+    assert.ok(peekToolChoice('t2 consecutive streak')?.choice, 'two post-success failures do not retire it');
+    assert.equal(peekToolChoice('t2 consecutive streak')?.choice?.failureCount, 4);
+    assert.equal(peekToolChoice('t2 consecutive streak')?.choice?.failureStreak, 2);
+    updateToolChoiceOutcome('t2 consecutive streak', 'failure');
+    rec = peekToolChoice('t2 consecutive streak');
+    assert.equal(rec?.choice, null, 'three consecutive post-success failures still retire the broken path');
+  } finally {
+    delete process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  }
+});
+
 test('P3 render: with the kill-switch off the block is unchanged (no track annotation)', () => {
   // Fresh machine so listToolChoices only sees this test's choices.
   writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-p3-off\n');

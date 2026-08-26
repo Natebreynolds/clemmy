@@ -22,7 +22,7 @@ export function registerFileQueryTools(server: McpServer): void {
     'file_query',
     [
       'Ask a question against a BIG document or a prior tool result and get back only the most relevant passages — instead of reading a byte-clipped preview. Deterministic retrieval (no model call): heading-aware chunks ranked by term relevance.',
-      'Sources (pass exactly one): `file` — a local path; PDFs/DOCX/PPTX/etc are converted to text automatically; or `call_id` — a prior tool call whose lossless parked output is searched even though your model-visible copy was clipped. A provider result that exceeded the durable cap fails closed; page/re-read it or stage the full result as a file.',
+      'Sources (pass exactly one): `file` — a local path; PDFs/DOCX/PPTX/etc are converted to text automatically; or `call_id` — a prior tool call whose lossless parked output is searched even though your model-visible copy was clipped. A legacy-truncated or corrupt/missing chunked result fails closed; page/re-read it or stage the full result as a file.',
       'Use for: "what does the 200-page agreement say about termination", "find the rows mentioning refunds in that big export", "which section covers X".',
     ].join(' '),
     {
@@ -58,7 +58,7 @@ export function registerFileQueryTools(server: McpServer): void {
           if (resolution.status === 'failed') return textResult(`ERROR: stored output for call id "${call_id}" cannot be used because ${resolution.reason}. Re-run the source read.`);
           if (resolution.record.truncatedAtWrite) {
             return textResult(
-              `ERROR: stored output for call id "${call_id}" is incomplete (${resolution.record.contentBytes} original bytes exceeded the durable output cap), so file_query will not report matches or misses from a prefix. `
+              `ERROR: stored output for call id "${call_id}" is incomplete (${resolution.record.contentBytes} original bytes; legacy truncation or missing/corrupt chunks), so file_query will not report matches or misses from a prefix. `
               + 'Re-read/page the provider source until every page is present, or stage the full result as a file and query that file.',
             );
           }

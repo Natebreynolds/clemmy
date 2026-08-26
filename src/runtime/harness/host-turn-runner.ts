@@ -151,6 +151,10 @@ import {
   type HostInteractiveConsentSubjectV1,
 } from './host-interactive-consent.js';
 import { settledPlanTaskActivationWinner } from './plan-task-post-settlement.js';
+import {
+  evaluateQuantifiedWorkManifestGate,
+  type QuantifiedWorkManifestGateInput,
+} from './quantified-work-manifest.js';
 const HOST_STATE_VERSION = 3;
 const HOST_STATE_KEY = '__clemHostInterrupt';
 const HOST_READ_ONLY_SURFACE_VERSION = 'configured_harness_function_surface_v1';
@@ -440,7 +444,29 @@ interface HostCallInvocationObservation {
 
 type HostCallExecutionAttempt<R> =
   | { status: 'returned'; value: R; invocationEntered: boolean }
+  | { status: 'tool_calls_limit'; error: ToolCallsLimitExceeded; invocationEntered: false }
   | { status: 'failed'; error: unknown; invocationEntered: boolean };
+
+export interface HostToolCallsLimitCheckpoint {
+  history: AgentInputItem[];
+  lastResponseId?: string;
+}
+
+const hostToolCallsLimitCheckpoints = new WeakMap<
+  ToolCallsLimitExceeded,
+  HostToolCallsLimitCheckpoint
+>();
+
+/** Exact partial host history associated with a propagated tool-call ceiling.
+ * The exception object is the authority: arbitrary error text can never mint a
+ * checkpoint or enter the resumable budget path. */
+export function hostToolCallsLimitCheckpointFor(
+  error: unknown,
+): HostToolCallsLimitCheckpoint | null {
+  return error instanceof ToolCallsLimitExceeded
+    ? hostToolCallsLimitCheckpoints.get(error) ?? null
+    : null;
+}
 
 /**
  * Execute deterministic waves while retaining every started call's outcome.
@@ -470,7 +496,7 @@ async function mapHostCallAttemptsWithBarriersInOrder<T, R>(
       attempt = { status: 'failed', error, invocationEntered: true };
     }
     attempts[entry.index] = attempt;
-    if (attempt.status === 'failed') stopped = true;
+    if (attempt.status !== 'returned') stopped = true;
   };
 
   const flushParallelWave = async (): Promise<void> => {
@@ -1441,6 +1467,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // reports the identity this host last ACCEPTED. Only an admitted response
   // may replace it; a rejected one leaves it exactly as it was.
   let lastResponseId: string | undefined = resumedResponseId ?? hostPreviousResponseId;
+  const propagateToolCallsLimit = (error: ToolCallsLimitExceeded): never => {
+    hostToolCallsLimitCheckpoints.set(error, {
+      history: [...history],
+      ...(lastResponseId !== undefined ? { lastResponseId } : {}),
+    });
+    throw error;
+  };
   const blockedOutcome = (
     text = HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT,
     reason = 'durable_stop_and_explain',
@@ -1799,19 +1832,28 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           : {}),
       });
       const sourcePurpose = classifyMaterialSourceManifestPurpose(manifest.purpose);
-      const preserveWorkCallCarrier = isPlainOrClementineLocalTool(name, 'work_call');
+      // Native MCP must cross the local exact carrier for both accepted
+      // work_call and direct call_tool. Bypassing call_tool here would skip its
+      // fresh, separately-accounted metadata proof and invoke the port body
+      // without the exact last-edge revalidation.
+      const preserveExternalCarrier = isPlainOrClementineLocalTool(name, 'work_call')
+        || (
+          manifest.providerKind === 'native_mcp'
+          && manifest.provenance.issuer === 'host:native-mcp-live-materializer:v1'
+          && isPlainOrClementineLocalTool(name, 'call_tool')
+        );
       const attestation = { ...common, ...binding, bindingDigest };
       return {
         attestation,
         manifest,
         effect: decision.effect,
-        boundary: preserveWorkCallCarrier ? 'nested_owned' : 'host_owned_external',
+        boundary: preserveExternalCarrier ? 'nested_owned' : 'host_owned_external',
         logicalToolName: manifest.operationId,
         logicalArgs: effectiveArgs,
         ...(sourceCapability ? { sourceCapability } : {}),
         sourcePurpose,
         trustedEffectCarrier: trustedRuntimeEffectCarrier(name, args),
-        invoke: preserveWorkCallCarrier
+        invoke: preserveExternalCarrier
           ? async (callSignal) => {
               const invokeCarrier = () => tool.invoke!(
                 runContextForCall,
@@ -2014,6 +2056,42 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       };
     } catch {
       return { status: 'refused', reason: 'material_source_authority_unreadable' };
+    }
+  };
+
+  /** A large direct run_worker call is graph-neutral coordination, but it is
+   * not unplanned when the existing quantified-work gate proves that the
+   * packet covers this accepted request's exact full item contract and carries
+   * the required durable manifest. This check grants only host-side fan-out
+   * admission; the worker body re-runs the same gate and its children remain
+   * compose-only. Small/ad-hoc worker calls keep the ordinary uncovered-
+   * mutation repair path. */
+  const exactQuantifiedWorkerControl = (input: {
+    name: string;
+    args: Record<string, unknown>;
+    sessionId: string;
+    sourceUserSeq: number;
+  }): boolean => {
+    if (!isPlainOrClementineLocalTool(input.name, 'run_worker')) return false;
+    const items = Array.isArray(input.args.items)
+      ? input.args.items.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : typeof input.args.item === 'string' && input.args.item.trim()
+        ? [input.args.item]
+        : [];
+    if (items.length === 0) return false;
+    const workManifest = input.args.workManifest;
+    if (!workManifest || typeof workManifest !== 'object' || Array.isArray(workManifest)) return false;
+    try {
+      const gateInput: QuantifiedWorkManifestGateInput = {
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        items,
+        workManifest: workManifest as QuantifiedWorkManifestGateInput['workManifest'],
+      };
+      const gate = evaluateQuantifiedWorkManifestGate(gateInput);
+      return gate.ok && gate.required && gate.expectedCount === items.length;
+    } catch {
+      return false;
     }
   };
 
@@ -2434,6 +2512,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         invocationEntered: observation.invocationEntered,
       };
     } catch (error) {
+      // A host/lifecycle counter trip before invoke is turn control, not a tool
+      // failure. Keep it typed so the scheduler can stop assigning work, drain
+      // already-started siblings, and pair their exact results before the
+      // original exception reaches loop.ts. A same-named error thrown after
+      // invoke remains ordinary crossing-state evidence and is never softened.
+      if (error instanceof ToolCallsLimitExceeded && !observation.invocationEntered) {
+        return {
+          status: 'tool_calls_limit',
+          error,
+          invocationEntered: false,
+        };
+      }
       // The terminal a user sees for this path says the technical details are
       // in the activity log. They were not: the error was carried on the
       // attempt, used to choose a disposition, and then dropped. A turn could
@@ -2565,6 +2655,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     frameDigest: string;
     zeroCrossingRefusal: boolean;
     effectUnknown: boolean;
+    toolCallsLimit?: ToolCallsLimitExceeded;
   }
 
   const pairCallAttempts = (
@@ -2578,6 +2669,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         ? failedCallCrossingDisposition(call, attempt)
         : null;
     });
+    const toolCallsLimit = attempts.find(
+      (attempt): attempt is Extract<HostCallExecutionAttempt<ExecutedHostCall>, { status: 'tool_calls_limit' }> =>
+        attempt?.status === 'tool_calls_limit',
+    )?.error;
     const effectUnknown = crossings.some((crossing) => crossing === 'effect_may_have_started');
     const zeroCrossingRefusal = !effectUnknown
       && crossings.some((crossing) => crossing === 'zero_crossing');
@@ -2589,7 +2684,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         returned.push(attempt.value);
         return attempt.value.historyItem;
       }
-      if (!attempt) {
+      if (!attempt || attempt.status === 'tool_calls_limit') {
         return dispositionResult({
           call,
           disposition: 'not_started',
@@ -2625,6 +2720,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       frameDigest,
       zeroCrossingRefusal,
       effectUnknown,
+      ...(toolCallsLimit ? { toolCallsLimit } : {}),
     };
   };
 
@@ -2801,7 +2897,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (!planReady) return pairLocallyRefusedFrame(calls);
 
     const planAttempt = await executeCallAttempt(frame.plan);
-    if (planAttempt.status === 'failed') {
+    if (planAttempt.status !== 'returned') {
       return pairCallAttempts(calls, [planAttempt, undefined]);
     }
 
@@ -3144,6 +3240,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (paired.effectUnknown) {
         return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
       }
+      if (paired.toolCallsLimit) propagateToolCallsLimit(paired.toolCallsLimit);
       if (paired.zeroCrossingRefusal) recordZeroCrossingRefusal(paired.frameDigest);
       const finalOutput = !paired.zeroCrossingRefusal
         ? await finalOutputFromToolBehavior(paired.returned)
@@ -3382,6 +3479,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (frame.effectUnknown) {
         return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
       }
+      if (frame.toolCallsLimit) propagateToolCallsLimit(frame.toolCallsLimit);
       if (frame.zeroCrossingRefusal) {
         recordZeroCrossingRefusal(frame.frameDigest);
         continue;
@@ -3464,15 +3562,30 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const runtimeEffect = parsedArguments
         ? classifyRuntimeToolEffect(call.name, parsedArguments).effect
         : 'unknown';
+      const quantifiedWorkerControl = Boolean(
+        !canaryRefusal
+        && hostProduction
+        && parsedArguments
+        && (() => {
+          const identity = exactHostIdentity();
+          return exactQuantifiedWorkerControl({
+            name: call.name,
+            args: parsedArguments,
+            sessionId: identity.sessionId,
+            sourceUserSeq: identity.sourceUserSeq,
+          });
+        })(),
+      );
       const mutation = Boolean(
         !canaryRefusal
         && hostProduction
         && parsedArguments
         && approvalExactProduction
+        && !quantifiedWorkerControl
         && ['local_write', 'external_write', 'admin'].includes(runtimeEffect),
       );
       let needs = false;
-      let consentOwned = false;
+      let consentOwned = quantifiedWorkerControl;
       let consentSubject: HostInteractiveConsentSubjectV1 | undefined;
       if (mutation && parsedArguments && tool && approvalExactProduction) {
         consentOwned = true;
@@ -3624,6 +3737,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (frame.effectUnknown) {
       return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
     }
+    if (frame.toolCallsLimit) propagateToolCallsLimit(frame.toolCallsLimit);
     if (frame.zeroCrossingRefusal) {
       recordZeroCrossingRefusal(frame.frameDigest);
       continue;

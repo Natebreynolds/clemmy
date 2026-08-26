@@ -15,7 +15,8 @@
  * else the chat sessionId. Best-effort + fail-open: a store error never breaks the
  * worker (the durable trace is a convenience, not the critical path).
  */
-import { existsSync, mkdirSync, appendFileSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, appendFileSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync, renameSync } from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 
@@ -46,15 +47,27 @@ export interface SubagentRunRecord {
   outputPreview: string;
   /** Relative filename of the persisted full work-product, if any. */
   outputRef?: string;
+  /** UTF-8 byte count + digest of the complete outputRef payload. New records
+   *  always carry all three integrity fields together. Legacy records carry
+   *  none and are accepted only when they do not have the old truncation
+   *  marker. A mismatch is typed as unavailable by readSubagentOutput. */
+  outputBytes?: number;
+  outputSha256?: string;
+  outputComplete?: boolean;
   startedAt: string;
   finishedAt: string;
 }
 
 const PREVIEW_MAX = 600;
-/** Cap on the persisted work-product per run — a runaway worker can emit MBs; the
- *  panel only ever renders a preview + on-demand full read, so a hard ceiling keeps
- *  the store from ballooning. */
-const OUTPUT_MAX_CHARS = 64 * 1024;
+/** Bound auxiliary-store disk per worker without ever storing a successful
+ * prefix. Ordinary outputs through this ceiling get a lossless handle; a
+ * larger output records only its byte count/hash with outputComplete=false,
+ * so resume callers get null and re-execute/use durable manifest evidence. */
+export const SUBAGENT_OUTPUT_MAX_BYTES = 16 * 1024 * 1024;
+/** Marker written by builds before the lossless output handle. A legacy file
+ *  ending in it is known incomplete and can be displayed only via its ledger
+ *  preview; it must never be promoted to a reusable successful result. */
+const LEGACY_TRUNCATED_SUFFIX = '\n…(truncated)';
 /** Prune persisted runs older than this on an opportunistic sweep. */
 const RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 /** At most one retention sweep per process-lifetime-hour. */
@@ -109,28 +122,65 @@ function outputPath(parentRunId: string, id: string): string {
   return path.join(subagentDir(parentRunId), 'outputs', `${safeSegment(id, 'agent')}.txt`);
 }
 
+function outputSha256(bytes: Buffer): string {
+  return crypto.createHash('sha256').update(bytes).digest('hex');
+}
+
+/** Write the result handle before its ledger row. The rename means a crash can
+ *  leave an unreferenced temp file, but never a ledger row pointing at a
+ *  half-written successful payload. Byte count + hash catch later corruption. */
+function writeCompleteOutput(parentRunId: string, id: string, bytes: Buffer): {
+  outputRef: string;
+  outputBytes: number;
+  outputSha256: string;
+  outputComplete: true;
+} {
+  const finalPath = outputPath(parentRunId, id);
+  const tempPath = `${finalPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    writeFileSync(tempPath, bytes);
+    renameSync(tempPath, finalPath);
+  } catch (error) {
+    try { rmSync(tempPath, { force: true }); } catch { /* best effort */ }
+    throw error;
+  }
+  return {
+    outputRef: path.join('outputs', `${safeSegment(id, 'agent')}.txt`),
+    outputBytes: bytes.byteLength,
+    outputSha256: outputSha256(bytes),
+    outputComplete: true,
+  };
+}
+
 /**
  * Persist one subagent run + its full work-product. Returns the stored record
  * (or null on a store error — fail-open, never throws into the worker path).
  */
 export function recordSubagentRun(
-  input: Omit<SubagentRunRecord, 'outputPreview' | 'outputRef'> & { output?: string },
+  input: Omit<SubagentRunRecord, 'outputPreview' | 'outputRef' | 'outputBytes' | 'outputSha256' | 'outputComplete'> & { output?: string },
 ): SubagentRunRecord | null {
   try {
     sweepOldSubagentRuns(); // opportunistic, self-throttled to once an hour
     const dir = subagentDir(input.parentRunId);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     const output = input.output ?? '';
-    let outputRef: string | undefined;
+    let outputHandle: Pick<SubagentRunRecord, 'outputRef' | 'outputBytes' | 'outputSha256' | 'outputComplete'> = {};
     if (output.trim()) {
-      const outDir = path.join(dir, 'outputs');
-      if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
-      // Cap the persisted work-product so a runaway worker can't write MBs to disk.
-      const persisted = output.length > OUTPUT_MAX_CHARS
-        ? output.slice(0, OUTPUT_MAX_CHARS) + '\n…(truncated)'
-        : output;
-      writeFileSync(outputPath(input.parentRunId, input.id), persisted, 'utf-8');
-      outputRef = path.join('outputs', `${safeSegment(input.id, 'agent')}.txt`);
+      const bytes = Buffer.from(output, 'utf8');
+      if (bytes.byteLength > SUBAGENT_OUTPUT_MAX_BYTES) {
+        // Typed incomplete, never a stored prefix masquerading as success.
+        outputHandle = {
+          outputBytes: bytes.byteLength,
+          outputSha256: outputSha256(bytes),
+          outputComplete: false,
+        };
+      } else {
+        const outDir = path.join(dir, 'outputs');
+        if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
+        // A reusable result handle is lossless. Prompt-size bounds belong at
+        // consumption boundaries (fanout-reduce), never in durable truth.
+        outputHandle = writeCompleteOutput(input.parentRunId, input.id, bytes);
+      }
     }
     const record: SubagentRunRecord = {
       id: input.id,
@@ -145,7 +195,7 @@ export function recordSubagentRun(
       ...(input.packetKey ? { packetKey: input.packetKey } : {}),
       status: input.status,
       outputPreview: output.slice(0, PREVIEW_MAX).replace(/\s+/g, ' ').trim(),
-      ...(outputRef ? { outputRef } : {}),
+      ...outputHandle,
       startedAt: input.startedAt,
       finishedAt: input.finishedAt,
     };
@@ -170,10 +220,46 @@ export function listSubagentRuns(parentRunId: string): SubagentRunRecord[] {
   }
 }
 
-/** The full persisted work-product for one subagent run, or null. */
+function safeOutputPath(parentRunId: string, outputRef: string): string | null {
+  const outputsDir = path.resolve(subagentDir(parentRunId), 'outputs');
+  const candidate = path.resolve(subagentDir(parentRunId), outputRef);
+  return candidate.startsWith(`${outputsDir}${path.sep}`) ? candidate : null;
+}
+
+/** Integrity-checked read for one ledger row. New records require a complete
+ *  byte-count/hash tuple. Legacy rows are readable unless they carry the exact
+ *  marker used by the old 64KiB prefix writer. */
+function readOutputForRecord(parentRunId: string, record: SubagentRunRecord): string | null {
+  try {
+    if (record.parentRunId !== parentRunId) return null;
+    if (!record.outputRef) return null;
+    const resolved = safeOutputPath(parentRunId, record.outputRef);
+    if (!resolved) return null;
+    const bytes = readFileSync(resolved);
+    const hasIntegrityMetadata = record.outputComplete !== undefined
+      || record.outputBytes !== undefined
+      || record.outputSha256 !== undefined;
+    if (hasIntegrityMetadata) {
+      if (record.outputComplete !== true) return null;
+      if (!Number.isSafeInteger(record.outputBytes) || (record.outputBytes ?? -1) < 0) return null;
+      if (!/^[a-f0-9]{64}$/.test(record.outputSha256 ?? '')) return null;
+      if (bytes.byteLength !== record.outputBytes) return null;
+      if (outputSha256(bytes) !== record.outputSha256) return null;
+    }
+    const text = bytes.toString('utf8');
+    if (!hasIntegrityMetadata && text.endsWith(LEGACY_TRUNCATED_SUFFIX)) return null;
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+/** The full, integrity-checked persisted work-product for one subagent run, or
+ * null when missing, incomplete, corrupt, or a known-truncated legacy prefix. */
 export function readSubagentOutput(parentRunId: string, id: string): string | null {
   try {
-    return readFileSync(outputPath(parentRunId, id), 'utf-8');
+    const record = [...listSubagentRuns(parentRunId)].reverse().find((candidate) => candidate.id === id);
+    return record ? readOutputForRecord(parentRunId, record) : null;
   } catch {
     return null;
   }
@@ -213,7 +299,7 @@ export function findCompletedSubagentOutput(parentRunId: string, item: string, p
         : !r.packetKey && !!target && ((r.task ?? '').trim() === target
             || (r.task ?? '').trim().toLowerCase().replace(/\s+/g, ' ') === targetFold);
       if (!matches) continue;
-      const full = r.outputRef ? readSubagentOutput(parentRunId, r.id) : null;
+      const full = readOutputForRecord(parentRunId, r);
       return full && full.trim() ? full : null;
     }
     return null;

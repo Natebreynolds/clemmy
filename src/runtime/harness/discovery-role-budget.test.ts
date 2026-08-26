@@ -101,7 +101,7 @@ function assertDeniedAttemptTerminal(
   }]);
 }
 
-test('distinct unresolved roles each get one slot while synonyms and carriers share the role claim', () => {
+test('distinct unresolved roles each get one provider slot while synonyms and carriers share its denial key', () => {
   const sourceRole = 'clause-0:read';
   const destinationRole = 'clause-1:write';
   const deliveryRole = 'clause-2:write';
@@ -122,17 +122,17 @@ test('distinct unresolved roles each get one slot while synonyms and carriers sh
   settleDiscoveryBoundary(first, 'succeeded');
 
   // A synonym carrier for the SAME role shares that role's claim instead of
-  // minting a second one. It is admitted rather than refused: the caller has
-  // already paid for the call, and refusing it only bought a retry through a
-  // different door.
-  const synonym = admitDiscoveryBoundary({
-    ...key,
-    toolName: 'ToolSearch',
-    input: { query: `[role:${sourceRole}] locate something that retrieves the records` },
-    callId: 'source-search-synonym',
-  });
-  assert.ok(synonym, 'a synonym carrier rides the claim its role already owns');
-  assert.equal(synonym.subject, sourceRole, 'synonyms share one role claim');
+  // minting a second one or reaching provider code under a new physical id.
+  assert.throws(
+    () => admitDiscoveryBoundary({
+      ...key,
+      toolName: 'ToolSearch',
+      input: { query: `[role:${sourceRole}] locate something that retrieves the records` },
+      callId: 'source-search-synonym',
+    }),
+    (error: unknown) => error instanceof DiscoveryBudgetDeniedError
+      && error.reason === 'new_call_requires_retry_epoch',
+  );
 
   const second = admitDiscoveryBoundary({
     ...key,
@@ -165,14 +165,16 @@ test('distinct unresolved roles each get one slot while synonyms and carriers sh
   );
   assert.match(String(spoofed.advisory ?? ''), /not a requirement role/i, 'and is told so');
 
-  const alreadyResolved = admitDiscoveryBoundary({
-    ...key,
-    toolName: 'tool_search',
-    input: { query: 'find a delivery tool', role_key: deliveryRole },
-    callId: 'resolved-role',
-  });
-  assert.equal(alreadyResolved.subject, HOST_UNSCOPED_DISCOVERY_SUBJECT);
-  assert.match(String(alreadyResolved.advisory ?? ''), /already resolved/i);
+  assert.throws(
+    () => admitDiscoveryBoundary({
+      ...key,
+      toolName: 'tool_search',
+      input: { query: 'find a delivery tool', role_key: deliveryRole },
+      callId: 'resolved-role',
+    }),
+    (error: unknown) => error instanceof DiscoveryBudgetDeniedError
+      && error.reason === 'new_call_requires_retry_epoch',
+  );
 
   // Alternate broad surfaces are not extra brokers. Their schemas carry no
   // role_key, so the central boundary refuses them before provider I/O.
@@ -183,18 +185,19 @@ test('distinct unresolved roles each get one slot while synonyms and carriers sh
     ['local_cli_list', { filter: 'anything' }],
     ['clem.listTools', undefined],
   ] as const) {
-    // Alternate broad surfaces carry no role_key. They are no longer refused for
-    // it — every one of them collapses onto the SAME host-owned subject, so
-    // they cannot become extra brokers or extra claims, which is what the
-    // refusal was really protecting.
-    const alternate = admitDiscoveryBoundary({
-      ...key,
-      toolName,
-      input,
-      callId: `alternate-${toolName}`,
-    });
-    assert.ok(alternate, `${toolName} still gets its search`);
-    assert.equal(alternate.subject, HOST_UNSCOPED_DISCOVERY_SUBJECT, `${toolName} cannot mint a claim`);
+    // Every alternate collapses onto the SAME already-owned host subject and is
+    // denied before provider I/O.
+    assert.throws(
+      () => admitDiscoveryBoundary({
+        ...key,
+        toolName,
+        input,
+        callId: `alternate-${toolName}`,
+      }),
+      (error: unknown) => error instanceof DiscoveryBudgetDeniedError
+        && error.reason === 'new_call_requires_retry_epoch',
+      `${toolName} cannot mint or execute another claim`,
+    );
   }
 
   const exact = admitDiscoveryBoundary({
@@ -221,16 +224,15 @@ test('distinct unresolved roles each get one slot while synonyms and carriers sh
     // however many times they were tried.
     [destinationRole, sourceRole, HOST_UNSCOPED_DISCOVERY_SUBJECT].sort(),
   );
-  // A restart replays the claim this role already owns; it never mints a second
-  // one. "Does not repay" is the invariant, not "is refused".
+  // Restart cannot mint either another claim or another provider body.
   const afterRestart = restarted.admit({
     ...key,
     category: 'broad_discovery',
     subject: sourceRole,
     callId: 'source-after-restart',
   });
-  assert.equal(afterRestart.admitted, true);
-  assert.equal(afterRestart.reason, 'subject_replay');
+  assert.equal(afterRestart.admitted, false);
+  assert.equal(afterRestart.reason, 'new_call_requires_retry_epoch');
   assert.equal(afterRestart.consumedBudget, false, 'a restart must not repay discovery');
 });
 
@@ -467,14 +469,12 @@ test('a builtins-only broker leaves the legacy discovery path reachable', () => 
     subject: 'model-invented-before-role-policy',
     callId: 'legacy-external-search-2',
   });
-  // The protection is that invented role-shaped text cannot mint an EXTRA
-  // claim: a legacy task forces every broad subject to the same empty key, so
-  // the second call rides the claim already held. It is admitted — refusing it
-  // never saved the call — but it spends nothing and adds no slot.
+  // A legacy task forces every broad subject to the same empty key. The second
+  // physical id therefore mints no slot and receives no provider authority.
   assert.equal(sameTaskSecondRole.subject, '', 'legacy role-shaped text cannot mint another slot');
   assert.equal(sameTaskSecondRole.consumedBudget, false, 'no second slot is spent');
-  assert.equal(sameTaskSecondRole.admitted, true);
-  assert.equal(sameTaskSecondRole.reason, 'subject_replay');
+  assert.equal(sameTaskSecondRole.admitted, false);
+  assert.equal(sameTaskSecondRole.reason, 'new_call_requires_retry_epoch');
 });
 
 test('missing requirement projection never masquerades as all-resolved', () => {

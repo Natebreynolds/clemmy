@@ -41,7 +41,7 @@ export class TruncatedToolOutputResult {
     readonly result_handle: string,
     readonly content_bytes: number,
   ) {
-    this.error = `Tool result "${this.result_handle}" is incomplete (${this.content_bytes} original bytes exceeded the durable output cap), so the stored prefix cannot be used as evidence. Re-read/page the source with a narrower scope, or stage the full result as a file and read that artifact.`;
+    this.error = `Tool result "${this.result_handle}" is incomplete (${this.content_bytes} original bytes; legacy truncation or missing/corrupt durable chunks), so the stored prefix cannot be used as evidence. Re-read/page the source with a narrower scope, or stage the full result as a file and read that artifact.`;
   }
 }
 

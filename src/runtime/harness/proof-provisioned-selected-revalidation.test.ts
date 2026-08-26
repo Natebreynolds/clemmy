@@ -16,9 +16,11 @@ const observations = await import('./independent-capability-observation.js');
 const provisioning = await import('./proof-provisioned-catalog.js');
 const production = await import('./production-capability-adapters.js');
 const typedRuntime = await import('../semantic-boundary/configure-typed-execution-runtime.js');
+const semantic = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
 const schemas = await import('../../tools/composio-schema-cache.js');
 const { digestSchema } = await import('../../tools/tool-contract-store.js');
 const composio = await import('../../integrations/composio/client.js');
+const providerIdentity = await import('../../integrations/composio/provider-definition-identity.js');
 
 const CONNECTION_ID = 'connection-mega-selected';
 const SELECTED_A = 'MEGA_SELECTED_SOURCE';
@@ -40,8 +42,20 @@ const DRIFTED_B = {
   required: ['records'],
   properties: { records: { type: 'array' } },
 };
+const OUTPUT_A = {
+  type: 'object',
+  properties: { rows: { type: 'array' } },
+};
+const OUTPUT_B = {
+  type: 'object',
+  properties: { records: { type: 'array' } },
+};
 
-function proofTurn(id: string, identifiers: readonly string[]) {
+function proofTurn(
+  id: string,
+  identifiers: readonly string[],
+  accountIdentity = CONNECTION_ID,
+) {
   const session = eventlog.createSession({ id, kind: 'chat' });
   const source = eventlog.appendEvent({
     sessionId: session.id,
@@ -64,7 +78,7 @@ function proofTurn(id: string, identifiers: readonly string[]) {
         identifier,
         status: 'proven',
         connection: 'connected',
-        accountIdentity: CONNECTION_ID,
+        accountIdentity,
         effectClass: identifier === SELECTED_B ? 'write' : 'read',
       })),
     },
@@ -159,6 +173,124 @@ test('only selected refs receive one exact refresh before all-or-nothing publica
   }
 });
 
+test('the full 8/9/32-operation plan set revalidates with bounded concurrency', async (t) => {
+  for (const count of [8, 9, 32]) {
+    await t.test(`${count} selected definitions`, async () => {
+      const identifiers = Array.from(
+        { length: count },
+        (_, index) => `MEGA_SCALE_${String(index + 1).padStart(2, '0')}`,
+      );
+      composio.__test__.setConnectedAccountsLoader(async () => [{
+        id: CONNECTION_ID,
+        status: 'ACTIVE',
+        user_id: 'selected-user',
+        toolkit: { slug: 'mega' },
+      }]);
+      const factory = catalogs.createHostCapabilityCatalogFactory();
+      catalogs.installHostCapabilityCatalogFactory(factory);
+      let businessCalls = 0;
+      production.installProductionTransport(async () => {
+        businessCalls += 1;
+        return {};
+      });
+      schemas.resetToolSchemaCache();
+      let exactReads = 0;
+      let activeReads = 0;
+      let maxActiveReads = 0;
+      schemas._setToolSchemaLoaderForTests(async () => {
+        exactReads += 1;
+        activeReads += 1;
+        maxActiveReads = Math.max(maxActiveReads, activeReads);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        activeReads -= 1;
+        return {
+          inputParameters: SCHEMA_A,
+          outputParameters: null,
+          providerObservedAt: Date.now(),
+          providerOperationVersion: '20260824_scale',
+        };
+      });
+
+      const result = await provisioning.registerProofProvisionedCapabilities(
+        proofTurn(`selected-definition-scale-${count}`, identifiers),
+        {
+          allowedIdentifiers: identifiers,
+          expectedSchemaDigests: identifiers.map((identifier) => ({
+            identifier,
+            schemaDigest: digestSchema(SCHEMA_A),
+          })),
+        },
+      );
+
+      assert.equal(result.refusal, undefined, JSON.stringify(result.refusal));
+      assert.equal(exactReads, count);
+      assert.equal(businessCalls, 0);
+      assert.ok(maxActiveReads <= 4, `provider metadata concurrency was ${maxActiveReads}`);
+      if (count > 1) assert.ok(maxActiveReads > 1, 'independent selected definitions revalidate concurrently');
+      for (const identifier of identifiers) {
+        assert.ok(factory.get(`cap:resolved:${identifier.toLowerCase()}`), identifier);
+      }
+    });
+  }
+});
+
+test('a second-batch definition failure publishes none of a nine-operation plan', async () => {
+  const identifiers = Array.from(
+    { length: 9 },
+    (_, index) => `MEGA_BATCH_${String(index + 1).padStart(2, '0')}`,
+  );
+  const failedIdentifier = identifiers[5]!;
+  composio.__test__.setConnectedAccountsLoader(async () => [{
+    id: CONNECTION_ID,
+    status: 'ACTIVE',
+    user_id: 'selected-user',
+    toolkit: { slug: 'mega' },
+  }]);
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  let businessCalls = 0;
+  production.installProductionTransport(async () => {
+    businessCalls += 1;
+    return {};
+  });
+  schemas.resetToolSchemaCache();
+  const exactReads: string[] = [];
+  schemas._setToolSchemaLoaderForTests(async (identifier) => {
+    exactReads.push(identifier);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (identifier === failedIdentifier) return null;
+    return {
+      inputParameters: SCHEMA_A,
+      outputParameters: null,
+      providerObservedAt: Date.now(),
+      providerOperationVersion: '20260824_batch',
+    };
+  });
+
+  const result = await provisioning.registerProofProvisionedCapabilities(
+    proofTurn('selected-definition-second-batch-failure', identifiers),
+    {
+      allowedIdentifiers: identifiers,
+      expectedSchemaDigests: identifiers.map((identifier) => ({
+        identifier,
+        schemaDigest: digestSchema(SCHEMA_A),
+      })),
+    },
+  );
+
+  assert.deepEqual(result, {
+    registered: [],
+    refusal: {
+      code: 'selected_definition_exact_refresh_unavailable',
+      identifier: failedIdentifier,
+    },
+  });
+  assert.deepEqual(new Set(exactReads), new Set(identifiers.slice(0, 8)),
+    'the failed second batch completes, but the third batch never starts');
+  assert.deepEqual(factory.snapshot(), [], 'no earlier matching definition is published');
+  assert.equal(businessCalls, 0);
+});
+
 test('a later selected schema drift refuses before any selected capability is published', async () => {
   composio.__test__.setConnectedAccountsLoader(async () => [{
     id: CONNECTION_ID,
@@ -197,6 +329,187 @@ test('a later selected schema drift refuses before any selected capability is pu
     refusal: { code: 'selected_definition_schema_drift', identifier: SELECTED_B },
   });
   assert.deepEqual(factory.snapshot(), [], 'phase one cannot partially publish a prior matching ref');
+});
+
+test('selected provider output, version, full fingerprint, and invoke port drift fail exact', async (t) => {
+  const liveOperationVersion = '20260824_02';
+  const canonicalInvokePort = `port:cap:resolved:${SELECTED_A.toLowerCase()}:${SELECTED_A}`;
+  const canonicalFingerprint = providerIdentity.fingerprintComposioProviderDefinition({
+    operationId: SELECTED_A,
+    operationVersion: liveOperationVersion,
+    accountId: CONNECTION_ID,
+    invokePortId: canonicalInvokePort,
+    inputSchema: SCHEMA_A,
+    outputSchema: OUTPUT_A,
+  });
+  assert.ok(canonicalFingerprint);
+  const cases = [
+    {
+      label: 'provider output schema',
+      selection: {
+        outputSchemaDigest: digestSchema(OUTPUT_B),
+        providerOperationVersion: liveOperationVersion,
+        invokePortId: canonicalInvokePort,
+        definitionFingerprint: canonicalFingerprint,
+      },
+      code: 'selected_definition_output_schema_drift',
+    },
+    {
+      label: 'provider operation version',
+      selection: {
+        outputSchemaDigest: digestSchema(OUTPUT_A),
+        providerOperationVersion: '20260824_01',
+        invokePortId: canonicalInvokePort,
+        definitionFingerprint: canonicalFingerprint,
+      },
+      code: 'selected_definition_operation_version_drift',
+    },
+    {
+      label: 'full definition fingerprint',
+      selection: {
+        outputSchemaDigest: digestSchema(OUTPUT_A),
+        providerOperationVersion: liveOperationVersion,
+        invokePortId: canonicalInvokePort,
+        definitionFingerprint: 'a'.repeat(64),
+      },
+      code: 'selected_definition_fingerprint_drift',
+    },
+    {
+      label: 'invoke port identity',
+      selection: {
+        outputSchemaDigest: digestSchema(OUTPUT_A),
+        providerOperationVersion: liveOperationVersion,
+        invokePortId: `${canonicalInvokePort}:changed`,
+        definitionFingerprint: canonicalFingerprint,
+      },
+      code: 'selected_definition_fingerprint_drift',
+    },
+  ] as const;
+
+  for (const [index, fixture] of cases.entries()) {
+    await t.test(fixture.label, async () => {
+      composio.__test__.setConnectedAccountsLoader(async () => [{
+        id: CONNECTION_ID,
+        status: 'ACTIVE',
+        user_id: 'selected-user',
+        toolkit: { slug: 'mega' },
+      }]);
+      const factory = catalogs.createHostCapabilityCatalogFactory();
+      catalogs.installHostCapabilityCatalogFactory(factory);
+      schemas.resetToolSchemaCache();
+      let exactReads = 0;
+      schemas._setToolSchemaLoaderForTests(async () => {
+        exactReads += 1;
+        return {
+          inputParameters: SCHEMA_A,
+          outputParameters: OUTPUT_A,
+          providerObservedAt: Date.now(),
+          providerOperationVersion: liveOperationVersion,
+        };
+      });
+
+      const result = await provisioning.registerProofProvisionedCapabilities(
+        proofTurn(`selected-definition-field-drift-${index}`, [SELECTED_A]),
+        {
+          allowedIdentifiers: [SELECTED_A],
+          selectedDefinitions: [{
+            identifier: SELECTED_A,
+            schemaDigest: digestSchema(SCHEMA_A),
+            accountIdentity: CONNECTION_ID,
+            ...fixture.selection,
+          }],
+        },
+      );
+      assert.deepEqual(result, {
+        registered: [],
+        refusal: { code: fixture.code, identifier: SELECTED_A },
+      });
+      assert.equal(exactReads, 1);
+      assert.deepEqual(factory.snapshot(), []);
+    });
+  }
+});
+
+test('legacy disclosure from account A cannot replay against a current account B definition', async () => {
+  const currentAccount = 'connection-account-b';
+  const staleAccount = 'connection-account-a';
+  const identifiers = [
+    ...Array.from({ length: 7 }, (_, index) => `MEGA_A${index}_ACCOUNT_PADDING`),
+    'MEGA_ZZZ_ACCOUNT_TARGET',
+  ];
+  const target = identifiers.at(-1)!;
+  composio.__test__.setConnectedAccountsLoader(async () => [{
+    id: currentAccount,
+    status: 'ACTIVE',
+    user_id: 'selected-user',
+    toolkit: { slug: 'mega' },
+  }]);
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  schemas.resetToolSchemaCache();
+  schemas._setToolSchemaLoaderForTests(async () => ({
+    inputParameters: SCHEMA_A,
+    outputParameters: null,
+    providerObservedAt: Date.now(),
+    providerOperationVersion: '20260824_account_b',
+  }));
+  const currentTurn = proofTurn('legacy-account-current-catalog', identifiers, currentAccount);
+  const published = await provisioning.registerProofProvisionedCapabilities(currentTurn, {
+    allowedIdentifiers: identifiers,
+    expectedSchemaDigests: identifiers.map((identifier) => ({
+      identifier,
+      schemaDigest: digestSchema(SCHEMA_A),
+    })),
+  });
+  assert.equal(published.refusal, undefined, JSON.stringify(published.refusal));
+  const targetEntry = factory.get(`cap:resolved:${target.toLowerCase()}`);
+  assert.ok(targetEntry);
+  const targetDescriptor = semantic.hostDescriptorFromRegistered(targetEntry!);
+  assert.ok(targetDescriptor);
+
+  const replaySession = eventlog.createSession({
+    id: 'legacy-account-a-to-b-replay',
+    kind: 'chat',
+  });
+  const source = eventlog.appendEvent({
+    sessionId: replaySession.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'quux wibble frobnicator' },
+  });
+  eventlog.appendEvent({
+    sessionId: replaySession.id,
+    turn: 1,
+    role: 'system',
+    type: 'capability_discovered',
+    data: {
+      sourceUserSeq: source.seq,
+      capabilities: [{
+        kind: 'composio',
+        providerKind: 'composio',
+        identifier: target,
+        effectClass: 'read',
+        capabilityRef: targetDescriptor!.id,
+        manifestDigest: targetDescriptor!.manifestDigest,
+        accountIdentity: staleAccount,
+        descriptor: { ...targetDescriptor!, accountScope: staleAccount },
+        schemaFingerprint: digestSchema(SCHEMA_A),
+      }],
+    },
+  });
+
+  const primed = await semantic.primePrimaryModelPlanningCatalog({
+    sessionId: replaySession.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) throw new Error(primed.reason);
+  assert.equal(
+    primed.planning.capabilities.some((descriptor) => descriptor.id === targetDescriptor!.id),
+    false,
+    'the legacy input digest cannot upgrade across an account-identity change',
+  );
 });
 
 test('invalid disclosure digests and removed exact slugs refuse before publication', async () => {

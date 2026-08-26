@@ -179,33 +179,31 @@ test('long horizon: restart and continuations do not repay discovery; a new acce
   assert.deepEqual(restarted, {
     initializationStatus: 'existing',
     broadReplay: {
-      admitted: true,
+      admitted: false,
       replay: true,
       consumedBudget: false,
       reason: 'same_call_replay',
     },
-    // THE INVARIANT IS "DOES NOT REPAY", NOT "IS REFUSED": consumedBudget stays
-    // false across restarts and continuations, so a long horizon can never mint
-    // itself a fresh allowance. The continuation is now admitted as a replay of
-    // the claim it already owns — refusing it never saved the call, and only
-    // bought a reformulated retry.
+    // A durable claim is provider authority for its one physical owner, not an
+    // unlimited replay license. Restart cannot mint either a fresh allowance
+    // or another provider body.
     broadContinuation: {
-      admitted: true,
+      admitted: false,
       replay: true,
       consumedBudget: false,
-      reason: 'subject_replay',
+      reason: 'new_call_requires_retry_epoch',
     },
     exactReplay: {
-      admitted: true,
+      admitted: false,
       replay: true,
       consumedBudget: false,
       reason: 'same_call_replay',
     },
     exactContinuation: {
-      admitted: true,
+      admitted: false,
       replay: true,
       consumedBudget: false,
-      reason: 'subject_replay',
+      reason: 'new_call_requires_retry_epoch',
     },
     claimCount: 2,
     broadOutcome: 'succeeded',

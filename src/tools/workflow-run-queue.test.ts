@@ -42,6 +42,7 @@ const {
   workflowRunOriginObserverId,
   workflowChatDispatchQueueRequestDigest,
   workflowOriginSourceGroupId,
+  registerWorkflowRunDrainKick,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
 } = await import('./workflow-run-queue.js');
 const { describeTurnScopedHold } = await import('./workflow-turn-scoped-hold.js');
@@ -330,10 +331,31 @@ function launchReaperChild(
 }
 
 beforeEach(() => {
+  registerWorkflowRunDrainKick(null);
   durablePreparationReceipts.clear();
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
   rmSync(path.join(TMP_HOME, 'state', 'executions.json'), { force: true });
+});
+
+test('queueWorkflowRun: a fresh durable queued run kicks the daemon drain immediately', () => {
+  writeAuditWorkflow();
+  const kicks: string[][] = [];
+  registerWorkflowRunDrainKick((runIds) => kicks.push([...runIds]));
+
+  const queued = queueWorkflowRun('audit-brief', { url: 'https://kick.example' });
+
+  assert.equal(queued.status, 'queued');
+  assert.deepEqual(kicks, [[queued.id]]);
+  assert.equal(
+    (JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), 'utf-8')) as { status?: string }).status,
+    'queued',
+    'the callback runs only after the executable queue record is durable',
+  );
+
+  const duplicate = queueWorkflowRun('audit-brief', { url: 'https://kick.example' });
+  assert.equal(duplicate.status, 'duplicate');
+  assert.deepEqual(kicks, [[queued.id]], 'a duplicate does not create drain churn');
 });
 
 test('queueCompiledWorkflowRun: requires the immutable ExecutionStore admission', () => {
@@ -1878,7 +1900,7 @@ test('queueWorkflowRun: blocks production runs when required workflow capabiliti
   assert.equal(result.readiness?.blockers[0]?.name, 'missing.py');
 });
 
-test('queueWorkflowRun: readiness-blocked trigger receipts remain unbound and later each recover exactly once', () => {
+test('queueWorkflowRun: retired raw subprocess receipts remain unbound until a sanctioned body recovers each once', () => {
   writeWorkflow('pending-trigger-flow', {
     name: 'pending-trigger-flow',
     description: 'Waits for its deterministic helper.',
@@ -1898,6 +1920,22 @@ test('queueWorkflowRun: readiness-blocked trigger receipts remain unbound and la
   const scriptsDir = path.join(WORKFLOWS_DIR, 'pending-trigger-flow', 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(path.join(scriptsDir, 'missing.py'), 'print("ready")\n', 'utf-8');
+
+  const installedButUnauthorized = queueWorkflowRun('pending-trigger-flow', {}, {
+    triggerReceiptId: 'pending-receipt-a',
+  });
+  assert.equal(installedButUnauthorized.status, 'blocked_readiness');
+  assert.match(installedButUnauthorized.message, /workflow_raw_subprocess_authority_unrepresented/);
+  assert.equal(readWorkflowTriggerReceiptAcceptance('pending-receipt-a'), null);
+  assert.equal(runFiles().length, 0);
+
+  writeWorkflow('pending-trigger-flow', {
+    name: 'pending-trigger-flow',
+    description: 'Uses a sanctioned model body.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'merge', prompt: 'Merge evidence.', sideEffect: 'read' }],
+  });
 
   const first = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-a' });
   const second = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-b' });

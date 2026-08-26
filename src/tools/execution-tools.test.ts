@@ -39,6 +39,7 @@ const {
   appendEvent,
   createSession,
   listEvents,
+  openEventLog,
   resetEventLog,
   TOOL_OUTPUT_MAX_BYTES,
   writeToolOutput,
@@ -1120,6 +1121,10 @@ test('execution_reconcile_write accepts only one exact parented provider-read li
     callId: 'truncated-read',
     output: `${absenceOutput}\n${'x'.repeat(TOOL_OUTPUT_MAX_BYTES)}`,
   });
+  openEventLog().prepare(
+    `DELETE FROM tool_output_invocation_chunks
+      WHERE session_id = ? AND call_id = ? AND invocation_nonce = ? AND chunk_index = 0`,
+  ).run(sessionId, 'truncated-read', 'nonce-truncated-read');
   assert.match((await settleAbsent('truncated-read')).content[0].text, /no complete exact output/i);
 
   writeToolOutput({

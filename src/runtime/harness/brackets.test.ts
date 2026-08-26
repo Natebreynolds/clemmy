@@ -29,6 +29,11 @@ const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 const { formatRecallableToolText } = await import('./tool-output-format.js');
 const { getToolOutputContext } = await import('./tool-output-context.js');
 const {
+  currentToolAbortDeadlineAt,
+  currentToolAbortSignal,
+  runWithToolAbortSignal,
+} = await import('../tool-abort-context.js');
+const {
   assertNotKilled,
   KillRequested,
   ToolCallsCounter,
@@ -4092,7 +4097,7 @@ test('a RESOLVED typed refusal (SDK-built tool path) settles failed — the 2026
   let dispatches = 0;
   const wrapped = wrapToolForHarness({
     name: 'composio_execute_tool',
-    invoke: async () => {
+    invoke: async (_runContext: unknown, _input: unknown, details?: { toolCall?: { callId?: string } }) => {
       if (!accountPinned) {
         // What runComposioExecute now RETURNS for an ambiguous-account block —
         // the exact live shape, marker included.
@@ -4102,7 +4107,15 @@ test('a RESOLVED typed refusal (SDK-built tool path) settles failed — the 2026
         ) as unknown as string;
       }
       dispatches += 1;
-      return JSON.stringify({ successful: true, data: { id: 'draft-1', webLink: 'https://outlook.example/draft-1' } });
+      const exact = JSON.stringify({
+        successful: true,
+        data: { id: 'draft-1', webLink: 'https://outlook.example/draft-1' },
+      });
+      return formatRecallableToolText(exact, {
+        sessionId: session.id,
+        callId: details?.toolCall?.callId,
+        toolName: 'composio_execute_tool',
+      });
     },
   });
   const input = JSON.stringify({
@@ -4128,11 +4141,26 @@ test('a RESOLVED typed refusal (SDK-built tool path) settles failed — the 2026
     assert.match(String(failed[0]?.data.reason ?? ''), /ambiguous-account/, 'machine class survives to the ledger');
     assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0,
       'ZERO orphans — the ambiguity factory is closed');
+    const reservation = listEvents(session.id, { types: ['external_write'] })[0];
+    assert.equal(typeof reservation?.data.invocationNonce, 'string',
+      'the pre-dispatch reservation persists its locally minted nonce even when no result bytes are parked');
 
     // The corrected retry (account pinned) is NOT orphan-blocked and dispatches.
     accountPinned = true;
     const ok = String(await invoke('draft-corrected'));
     assert.match(ok, /draft-1/);
+    const correctedReservation = listEvents(session.id, { types: ['external_write'] })
+      .find((event) => event.data.callId === 'draft-corrected');
+    const exactOutput = openEventLog().prepare(
+      `SELECT invocation_nonce FROM tool_output_invocations
+        WHERE session_id = ? AND call_id = ?`,
+    ).get(session.id, 'draft-corrected') as { invocation_nonce: string } | undefined;
+    assert.ok(exactOutput?.invocation_nonce, 'the successful wrapper parked exact invocation bytes');
+    assert.equal(
+      correctedReservation?.data.invocationNonce,
+      exactOutput.invocation_nonce,
+      'reservation and exact output row share the locally minted nonce',
+    );
     assert.equal(dispatches, 1, 'the corrected retry reached the provider exactly once');
   });
 });
@@ -4297,6 +4325,63 @@ test('a timed-out job-starting call is NOT cancelled, so its late result can sel
   await new Promise((resolve) => setTimeout(resolve, 400));
   assert.equal(settledLate, true, 'the provider call was never cancelled — its result can still park');
   assert.equal(aborted, false);
+});
+
+test('legacy execute exposes run_worker its exact bracket-owned absolute deadline', async (context) => {
+  setEnvForTest(context, 'CLEMMY_EXECUTION_GATE', 'off');
+  let observedDeadline: number | undefined;
+  let observedSignal: AbortSignal | undefined;
+  const wrapped = wrapToolForHarness({
+    name: 'run_worker',
+    execute: async () => {
+      observedDeadline = currentToolAbortDeadlineAt();
+      observedSignal = currentToolAbortSignal();
+      return 'worker execute surface reached';
+    },
+  }, { timeoutMs: 5_000 });
+  const session = createSession({ id: 'sess-worker-execute-deadline', kind: 'chat' });
+  const anchor = anchorAcceptedTask(session.id, 'Run this worker batch.');
+  const before = Date.now();
+  const output = await withHarnessRunContext(
+    {
+      sessionId: session.id,
+      sourceUserSeq: anchor.sourceUserSeq,
+      behaviorScopeId: `${session.id}::turn`,
+      counter: new ToolCallsCounter(10),
+    },
+    () => wrapped.execute!({ items: ['a', 'b'] }),
+  );
+  const after = Date.now();
+  assert.equal(output, 'worker execute surface reached');
+  assert.ok(observedSignal, 'execute carries an abort signal into the body');
+  assert.ok(
+    observedDeadline !== undefined
+      && observedDeadline >= before + 4_900
+      && observedDeadline <= after + 5_100,
+    `execute deadline ${observedDeadline} must be the absolute 5s bracket edge`,
+  );
+
+  const hostController = new AbortController();
+  const hostDeadline = Date.now() + 45_000;
+  observedDeadline = undefined;
+  observedSignal = undefined;
+  const hostOutput = await runWithToolAbortSignal(
+    hostController.signal,
+    () => withHarnessRunContext(
+      {
+        sessionId: session.id,
+        sourceUserSeq: anchor.sourceUserSeq,
+        behaviorScopeId: `${session.id}::host-owned`,
+        counter: new ToolCallsCounter(10),
+        hostOwnsToolDeadlineAndSettlement: true,
+      },
+      () => wrapped.execute!({ items: ['a', 'b'] }),
+    ),
+    hostDeadline,
+  );
+  assert.equal(hostOutput, 'worker execute surface reached');
+  assert.equal(observedSignal, hostController.signal, 'host-owned execute inherits the one caller signal');
+  assert.equal(observedDeadline, hostDeadline, 'host-owned execute inherits the one caller deadline');
 });
 
 // ── Knowing what it already built this run (2026-08-07 double table) ──

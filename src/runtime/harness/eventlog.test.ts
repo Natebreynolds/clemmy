@@ -80,6 +80,21 @@ test.after(() => {
   }
 });
 
+function removeV65StructuresFromHistoricalMigrationFixture(db: Database.Database): void {
+  // These tests start from today's schema and rewind only the version ledger to
+  // exercise an older migration boundary. v65 deliberately rejects these
+  // table names when its version row is absent, because they had no sanctioned
+  // predecessor. Make the synthetic historical store honest by removing the
+  // v65-only structures before replaying migrations; additive parent columns
+  // are restart-safe and may legitimately remain.
+  db.exec(`
+    DROP INDEX IF EXISTS idx_tool_outputs_session_created_call;
+    DROP TABLE IF EXISTS tool_output_chunks;
+    DROP TABLE IF EXISTS tool_output_invocation_chunks;
+    DROP TABLE IF EXISTS tool_search_continuations;
+  `);
+}
+
 test('latest schema upgrades an existing v4 approval table without losing rows', () => {
   resetEventLog();
   closeEventLog();
@@ -816,6 +831,7 @@ test('schema v32 installs immutable action bindings and removes only rows whose 
 
   const raw = new Database(HARNESS_DB_PATH);
   raw.pragma('foreign_keys = OFF');
+  removeV65StructuresFromHistoricalMigrationFixture(raw);
   raw.exec(`
     DELETE FROM schema_version WHERE version >= 32; -- runner resumes from MAX(version): every later version must go too
     INSERT INTO run_attempts
@@ -917,6 +933,7 @@ test('schema v40 installs generated-Sheet authority on fresh and v39 stores with
 
   closeEventLog();
   const raw = new Database(HARNESS_DB_PATH);
+  removeV65StructuresFromHistoricalMigrationFixture(raw);
   raw.prepare('DELETE FROM schema_version WHERE version >= 40').run();
   for (const table of requiredTables) raw.exec(`DROP TABLE IF EXISTS ${table}`);
   raw.close();
@@ -2650,7 +2667,7 @@ test('writeToolOutput stores a 300KB result in FULL (was tail-dropped under the 
   assert.equal(row.contentBytes, 300_000);
 });
 
-test('writeToolOutput still tail-truncates + marks beyond the cap (backstop)', () => {
+test('writeToolOutput chunks and restores bytes beyond the inline boundary', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const overBy = 100_000;
@@ -2658,9 +2675,10 @@ test('writeToolOutput still tail-truncates + marks beyond the cap (backstop)', (
   writeToolOutput({ sessionId: sess.id, callId: 'call_huge', tool: 'composio_execute_tool', output: huge });
   const row = getToolOutput(sess.id, 'call_huge');
   assert.ok(row);
-  assert.equal(row.truncatedAtWrite, true, 'overflow is marked');
+  assert.equal(row.truncatedAtWrite, false, 'overflow is losslessly chunked');
   assert.equal(row.contentBytes, TOOL_OUTPUT_MAX_BYTES + overBy, 'original byte count preserved for the header');
-  assert.equal(row.output.length, TOOL_OUTPUT_MAX_BYTES, 'stored body clamped to the cap');
+  assert.equal(row.output.length, TOOL_OUTPUT_MAX_BYTES + overBy, 'full body is reassembled');
+  assert.equal(row.output.at(-1), 'H');
 });
 
 test('reapStaleToolOutputs bounds exact rows while preserving an uncompensated write', () => {
@@ -2702,6 +2720,53 @@ test('reapStaleToolOutputs bounds exact rows while preserving an uncompensated w
     db.prepare('SELECT call_id FROM tool_output_invocations').all(),
     [{ call_id: 'unresolved-write' }],
     'uncertain write evidence survives until its reservation is compensated',
+  );
+});
+
+test('reapStaleToolOutputs retains only the exact nonce named by a current uncertain write', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const callId = 'reused-write-call';
+  writeToolOutput({
+    sessionId: sess.id,
+    callId,
+    invocationNonce: 'old-unrelated',
+    tool: 'provider_create',
+    output: 'O'.repeat(TOOL_OUTPUT_MAX_BYTES + 8),
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId,
+    invocationNonce: 'current-uncertain',
+    tool: 'provider_create',
+    output: '{"attempt":"current"}',
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      callId,
+      invocationNonce: 'current-uncertain',
+      toolName: 'provider_create',
+      shapeKey: 'CREATE',
+      irreversible: true,
+    },
+  });
+  const db = openEventLog();
+  db.prepare(`UPDATE tool_outputs SET created_at = '2020-01-01T00:00:00.000Z'`).run();
+  db.prepare(`UPDATE tool_output_invocations SET created_at = '2020-01-01T00:00:00.000Z'`).run();
+
+  assert.equal(reapStaleToolOutputs(1), 2, 'canonical and unrelated exact bytes are reaped');
+  assert.deepEqual(
+    db.prepare(`SELECT invocation_nonce FROM tool_output_invocations`).all(),
+    [{ invocation_nonce: 'current-uncertain' }],
+  );
+  assert.equal(
+    (db.prepare(`SELECT COUNT(*) AS n FROM tool_output_invocation_chunks`).get() as { n: number }).n,
+    0,
+    'chunks owned only by the unrelated nonce cascade away',
   );
 });
 

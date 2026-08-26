@@ -135,7 +135,7 @@ test('spaceActionNeedsApproval: every opaque runner action gates regardless of i
   assert.equal(gate.spaceActionNeedsApproval({ id: 'wipe', label: 'Wipe', runner: 'r.mjs', confirm: true }), true);
 });
 
-test('executeApprovedSpaceAction runs the action and records an "Approved and ran" note', async () => {
+test('executeApprovedSpaceAction records a zero-body failure without shared durable authority', async () => {
   const slug = 'gate-exec';
   store.spaceStore.save({
     id: slug, title: 'Exec',
@@ -151,7 +151,7 @@ test('executeApprovedSpaceAction runs the action and records an "Approved and ra
   const { approvalId } = gate.enqueueSpaceActionApproval(rec, rec.actions[0], { to: 'lead@acme' });
   await gate.executeApprovedSpaceAction(resolveApproval(approvalId));
   const notes = dataStore.listNotes(slug);
-  assert.ok(notes.some((n) => /Approved and ran/.test(n.text) && n.meta?.ok === true));
+  assert.ok(notes.some((n) => /was not run after approval.*no shared durable call authority/i.test(n.text) && n.meta?.ok === false));
 });
 
 test('executeApprovedSpaceAction refuses malformed hand-written action JSON after approval', async () => {
@@ -248,53 +248,35 @@ test('enqueueSpaceActionApproval registers an approval + a pending note', () => 
   assert.ok(inlineCard, 'the exact action card is visible inside Workspace chat');
 });
 
-test('runner action approval discloses pinned-entrypoint scope and executes the snapshotted bytes', async () => {
+test('runner action approval discloses pinned-entrypoint scope but remains zero-process', async () => {
   const slug = 'gate-runner-entrypoint-snapshot';
   const rec = store.spaceStore.save({
     id: slug,
     title: 'Runner Entrypoint Snapshot',
     actions: [{ id: 'sync', label: 'Sync record', runner: 'act.mjs' }],
   });
-  const target = writeCountingRunner(slug);
+  writeCountingRunner(slug);
   const callerArgs = { recordId: 'row-pinned' };
   const { approvalId } = gate.enqueueSpaceActionApproval(rec, rec.actions[0], callerArgs);
   const pending = approvalRow(approvalId);
   assert.match(String(pending.args?.reason ?? ''), /pinned entrypoint/i);
   assert.match(String(pending.args?.reason ?? ''), /helpers.*packages.*CLIs.*local files.*auth.*network/i);
   assert.match(String(pending.args?.reason ?? ''), /not.*read-only sandbox/i);
-  let snapshotPath = '';
-  runner._setRunnerEntrypointSnapshotHookForTests((snapshot) => {
-    snapshotPath = snapshot.snapshotPath;
-    writeFileSync(
-      target,
-      [
-        "import { writeFileSync } from 'node:fs';",
-        "writeFileSync(new URL('./unapproved-action.txt', import.meta.url), 'yes');",
-        "process.stdout.write(JSON.stringify({ unapproved: true }));",
-      ].join('\n'),
-      'utf-8',
-    );
-  });
-  try {
-    const result = await runner.runSpaceAction(
-      slug,
-      rec.actions[0],
-      callerArgs,
-      { approvalId: resolveApproval(approvalId).approvalId },
-    );
-    assert.equal(result.ok, true, result.ok ? '' : result.error);
-  } finally {
-    runner._setRunnerEntrypointSnapshotHookForTests(null);
-  }
-
-  assert.equal(dispatchCount(slug), 1, 'the approved entrypoint bytes, not the raced replacement, execute');
+  const result = await runner.runSpaceAction(
+    slug,
+    rec.actions[0],
+    callerArgs,
+    { approvalId: resolveApproval(approvalId).approvalId },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.ok ? undefined : result.provenNoDispatch, true);
+  assert.match(result.ok ? '' : result.error, /no shared durable call authority/i);
+  assert.equal(dispatchCount(slug), 0);
   assert.equal(
     existsSync(store.resolveInSpace(slug, 'data/unapproved-action.txt')),
     false,
-    'replacement bytes never cross the spawn boundary',
+    'no bytes cross the process boundary',
   );
-  assert.ok(snapshotPath);
-  assert.equal(existsSync(snapshotPath), false, 'action snapshot is cleaned after execution');
 });
 
 test('identical pending Workspace action retries converge on one approval, note, and audit projection', async () => {
@@ -362,7 +344,7 @@ test('identical pending Workspace action retries converge on one approval, note,
   assert.notEqual(differentAction.approvalId, differentArgs.approvalId);
 });
 
-test('duplicate Workspace clicks cannot mint two dispatch slots, while a completed rerun can', async () => {
+test('duplicate Workspace clicks converge on one approval while contained reruns stay zero-process', async () => {
   const slug = 'gate-dispatch-dedupe';
   const rec = store.spaceStore.save({
     id: slug,
@@ -380,18 +362,18 @@ test('duplicate Workspace clicks cannot mint two dispatch slots, while a complet
   }
 
   assert.deepEqual(pendingIds, [first.approvalId], 'double-click exposes only one approvable mutation slot');
-  assert.equal(dispatchCount(slug), 1, 'approving the shared card dispatches once');
-  assert.deepEqual(mutationPhaseCounts(first.approvalId), { receipts: 1, commits: 1 });
+  assert.equal(dispatchCount(slug), 0);
+  assert.deepEqual(mutationPhaseCounts(first.approvalId), { receipts: 0, commits: 0 });
 
   const deliberateRerun = gate.enqueueSpaceActionApproval(rec, rec.actions[0], exactArgs);
   assert.notEqual(
     deliberateRerun.approvalId,
     first.approvalId,
-    'after the first card is terminal and executed, a deliberate rerun gets fresh authority',
+    'after the first card is terminal, a deliberate rerun gets a fresh decision record',
   );
   await gate.executeApprovedSpaceAction(resolveApproval(deliberateRerun.approvalId));
-  assert.equal(dispatchCount(slug), 2, 'the separately approved future rerun may execute once');
-  assert.deepEqual(mutationPhaseCounts(deliberateRerun.approvalId), { receipts: 1, commits: 1 });
+  assert.equal(dispatchCount(slug), 0);
+  assert.deepEqual(mutationPhaseCounts(deliberateRerun.approvalId), { receipts: 0, commits: 0 });
 });
 
 test('a pending or rejected Space approval is zero-write even if the executor is called directly or recovery runs', async () => {
@@ -480,11 +462,13 @@ test('runSpaceAction rejects fabricated, pending, wrong-action, and wrong-args a
     callerArgs,
     { approvalId },
   );
-  assert.equal(exact.ok, true, exact.ok ? '' : exact.error);
-  assert.equal(dispatchCount(slug), 1, 'the exact resolved approval dispatches once');
+  assert.equal(exact.ok, false);
+  assert.equal(exact.ok ? undefined : exact.provenNoDispatch, true);
+  assert.match(exact.ok ? '' : exact.error, /no shared durable call authority/i);
+  assert.equal(dispatchCount(slug), 0, 'an exact legacy approval still cannot dispatch');
 });
 
-test('approved Space action recovers after restart and replays one durable receipt/commit without duplicate dispatch', async () => {
+test('approved Space action recovery never treats the legacy wrapper as authority', async () => {
   const slug = 'gate-restart-recovery';
   const rec = store.spaceStore.save({
     id: slug,
@@ -496,16 +480,17 @@ test('approved Space action recovers after restart and replays one durable recei
   const { approvalId } = gate.enqueueSpaceActionApproval(rec, rec.actions[0], callerArgs);
   resolveApproval(approvalId);
 
-  // Simulate the process reaching the durable provider boundary and committing,
-  // then dying before executeApprovedSpaceAction could append its UI outcome.
+  // The exact approval is still missing shared-kernel logical/physical
+  // authority, so it cannot create a legacy mutation receipt.
   const first = await runner.runSpaceAction(
     slug,
     rec.actions[0],
     callerArgs,
     { approvalId },
   );
-  assert.equal(first.ok, true);
-  assert.equal(dispatchCount(slug), 1);
+  assert.equal(first.ok, false);
+  assert.equal(first.ok ? undefined : first.provenNoDispatch, true);
+  assert.equal(dispatchCount(slug), 0);
   assert.equal(
     dataStore.listNotes(slug).filter((note) => note.meta?.approvalId === approvalId && note.meta?.status === 'executed').length,
     0,
@@ -517,16 +502,16 @@ test('approved Space action recovers after restart and replays one durable recei
   await gate.recoverApprovedSpaceActions();
   await gate.recoverApprovedSpaceActions();
 
-  assert.equal(dispatchCount(slug), 1, 'boot recovery replays the committed receipt before mutable archive/action checks');
-  assert.deepEqual(mutationPhaseCounts(approvalId), { receipts: 1, commits: 1 });
+  assert.equal(dispatchCount(slug), 0);
+  assert.deepEqual(mutationPhaseCounts(approvalId), { receipts: 0, commits: 0 });
   assert.equal(
-    dataStore.listNotes(slug).filter((note) => note.meta?.approvalId === approvalId && note.meta?.status === 'executed').length,
+    dataStore.listNotes(slug).filter((note) => note.meta?.approvalId === approvalId && note.meta?.status === 'failed').length,
     1,
-    'completion is projected once even when recovery is invoked repeatedly',
+    'zero-body failure is projected once even when recovery is invoked repeatedly',
   );
 });
 
-test('approved Composio Space action crosses one durable gateway boundary and replays its exact receipt', async () => {
+test('approved Composio Space action remains zero-body without shared durable call authority', async () => {
   const slug = 'gate-composio-receipt';
   const action = {
     id: 'publish',
@@ -579,16 +564,21 @@ test('approved Composio Space action crosses one durable gateway boundary and re
       { approvalId },
     );
 
-    assert.equal(first.ok, true);
+    assert.equal(first.ok, false);
+    assert.match(first.ok ? '' : first.error, /no shared durable call authority/i);
     assert.deepEqual(replay, first);
-    assert.equal(providerDispatches, 1, 'committed Space action never re-enters the provider gateway');
-    assert.deepEqual(mutationPhaseCounts(approvalId), { receipts: 1, commits: 1 });
+    assert.equal(providerDispatches, 0, 'legacy approval never becomes provider authority');
+    assert.deepEqual(
+      mutationPhaseCounts(approvalId),
+      { receipts: 0, commits: 0 },
+      'the retired workflow mutation wrapper cannot manufacture Space Composio authority',
+    );
   } finally {
     runner._setSpaceComposioDispatchForTests(null);
   }
 });
 
-test('runner-controlled no-dispatch wording cannot make an ambiguous action replayable', async () => {
+test('runner-controlled ambiguity wording is unreachable at the zero-process boundary', async () => {
   const slug = 'gate-ambiguous';
   const rec = store.spaceStore.save({
     id: slug,
@@ -615,17 +605,18 @@ test('runner-controlled no-dispatch wording cannot make an ambiguous action repl
   await gate.recoverApprovedSpaceActions();
 
   assert.equal(retry.ok, false);
-  assert.match(retry.ok ? '' : retry.error, /may already have committed|outcome.*uncertain|NOT dispatched again/i);
-  assert.equal(dispatchCount(slug), 1, 'neither direct retry nor restart recovery re-dispatches ambiguity');
+  assert.equal(retry.ok ? undefined : retry.provenNoDispatch, true);
+  assert.match(retry.ok ? '' : retry.error, /no shared durable call authority/i);
+  assert.equal(dispatchCount(slug), 0);
   assert.deepEqual(mutationPhaseCounts(approvalId), { receipts: 0, commits: 0 });
-  const uncertain = dataStore.listNotes(slug).filter((note) => (
-    note.meta?.approvalId === approvalId && note.meta?.status === 'uncertain'
+  const failed = dataStore.listNotes(slug).filter((note) => (
+    note.meta?.approvalId === approvalId && note.meta?.status === 'failed'
   ));
-  assert.equal(uncertain.length, 1, 'ambiguous execution projects one durable uncertain outcome');
-  assert.match(uncertain[0]?.text ?? '', /may already have run|outcome is uncertain|verify the destination/i);
+  assert.equal(failed.length, 1, 'containment projects one deterministic not-run outcome');
+  assert.doesNotMatch(failed[0]?.text ?? '', /runner failed to launch after provider dispatch/i);
 });
 
-test('resolving a gated approval as approved triggers execution via the listener', async () => {
+test('resolving a gated approval triggers a prompt zero-body failure via the listener', async () => {
   gate.initSpaceActionApprovals();
   const captured: Array<Record<string, unknown>> = [];
   gate._setWorkspaceActionMemoryCaptureForTests(async (signal) => {
@@ -644,25 +635,25 @@ test('resolving a gated approval as approved triggers execution via the listener
   try {
     const { approvalId } = gate.enqueueSpaceActionApproval(rec, rec.actions[0], { to: 'x@y' });
     registry.resolve(approvalId, 'approved', 'test');
-    // Execution is fire-and-forget on resolve and spawns a runner subprocess —
-    // POLL for the note rather than sleeping a fixed delay (a fixed wait flaked
-    // under full-suite load when the subprocess was delayed by other test files).
-    let ran = false;
+    // Resolution is fire-and-forget; poll for its deterministic not-run note.
+    let contained = false;
     let lastNotes = dataStore.listNotes(slug);
-    const deadline = Date.now() + 15_000;
-    while (Date.now() < deadline && !ran) {
-      await new Promise((r) => setTimeout(r, 50));
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline && !contained) {
+      await new Promise((r) => setTimeout(r, 20));
       lastNotes = dataStore.listNotes(slug);
-      ran = lastNotes.some((n) => /Approved and ran/.test(n.text));
+      contained = lastNotes.some((n) => (
+        n.meta?.approvalId === approvalId
+        && n.meta?.status === 'failed'
+        && /no shared durable call authority/i.test(n.text)
+      ));
     }
     assert.ok(
-      ran,
-      `expected the approved action to run and record an "Approved and ran" note; notes=${JSON.stringify(lastNotes)}`,
+      contained,
+      `expected the approved action to record a zero-body failure; notes=${JSON.stringify(lastNotes)}`,
     );
     const matching = captured.filter((signal) => signal.observationId === approvalId);
-    assert.equal(matching.length, 1);
-    assert.equal(matching[0]?.kind, 'effect_outcome');
-    assert.equal(matching[0]?.decision, 'approved');
+    assert.equal(matching.length, 0, 'a not-run effect is not learned as a completed approved effect');
   } finally {
     gate._setWorkspaceActionMemoryCaptureForTests(null);
   }
@@ -734,7 +725,7 @@ test('boot recovery re-projects an authoritative rejection when the first memory
   }
 });
 
-test('standing trust: approve a non-outbound runner ONCE — later identical clicks run without a new card', async () => {
+test('standing trust can cover a decision but cannot mint local process authority', async () => {
   // Live complaint 2026-07-30: "I was simply updating the Salesforce data" —
   // a hash-pinned read runner re-asked on every refresh click.
   const slug = 'gate-standing';
@@ -761,10 +752,10 @@ test('standing trust: approve a non-outbound runner ONCE — later identical cli
   assert.match(String(row.args?.reason ?? ''), /STANDING trust/i, 'the card DISCLOSES that approval grants standing trust');
   assert.ok(Date.parse(row.expiresAt) - Date.now() > 80 * 24 * 60 * 60 * 1000, 'grant window ≈ 90 days, not the 24h decision default');
   await gate.executeApprovedSpaceAction(resolveApproval(approvalId));
-  assert.equal(dispatchCount(slug), 1);
+  assert.equal(dispatchCount(slug), 0);
 
-  // Second click: covered — runs directly under the SAME approval, and the
-  // per-invocation execution nonce prevents replaying run #1's receipt.
+  // Second click is decision-covered under the same approval, but still has no
+  // shared-kernel activation/plan and therefore remains zero-process.
   const standing = gate.standingSpaceActionAuthority(rec, action, {});
   assert.ok(standing?.ok, 'the prior approval covers an identical invocation');
   assert.equal(standing!.approvalId, approvalId);
@@ -772,8 +763,10 @@ test('standing trust: approve a non-outbound runner ONCE — later identical cli
     approvalId: standing!.approvalId,
     executionNonce: 'nonce-2',
   });
-  assert.equal(second.ok, true, JSON.stringify(second));
-  assert.equal(dispatchCount(slug), 2, 'the covered click EXECUTES — never replays the first receipt');
+  assert.equal(second.ok, false);
+  assert.equal(second.ok ? undefined : second.provenNoDispatch, true);
+  assert.match(second.ok ? '' : second.error, /no shared durable call authority/i);
+  assert.equal(dispatchCount(slug), 0);
 
   // Different caller args = a different question — not covered.
   assert.equal(gate.standingSpaceActionAuthority(rec, action, { window: '180d' }), null);

@@ -68,6 +68,10 @@ const dispatchLeases = await import('../runtime/harness/dispatch-lease.js');
 const callAuthority = await import('../runtime/harness/accepted-turn-call-authority.js');
 const hostBindings = await import('../runtime/harness/host-call-capability-binding.js');
 const hostInvocation = await import('../runtime/harness/host-tool-invocation.js');
+const manifests = await import('../runtime/harness/capability-manifest.js');
+const manifestStores = await import('../runtime/harness/capability-manifest-store.js');
+const providerIdentity = await import('../integrations/composio/provider-definition-identity.js');
+const { digestSchema } = await import('./tool-contract-store.js');
 
 type ToolLike = { invoke?: (ctx: unknown, input: string, details: unknown) => Promise<unknown> };
 
@@ -80,6 +84,71 @@ const FIRECRAWL_SCHEMA = {
   },
 };
 const PROVIDER_OPERATION_VERSION = '20260824_01';
+const FIRECRAWL_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: { results: { type: 'array' } },
+};
+const FIRECRAWL_ACCOUNT_ID = 'ca_firecrawl_test';
+const FIRECRAWL_INVOKE_PORT_ID = 'composio:execute';
+
+/** The production gateway admits a prepared host call only when its attestation
+ * names a capability manifest that is INSTALLED, current, and digest-identical
+ * in the manifest store — an attestation cannot vouch for itself. So the host
+ * fixture below mints the same sealed identity connect-time provisioning mints
+ * (capabilityId === manifestId, definition fingerprint closed over the exact
+ * input schema, output schema, operation version, account, and invoke port). */
+function firecrawlSearchManifest() {
+  const definitionFingerprint = providerIdentity.fingerprintComposioProviderDefinition({
+    operationId: 'FIRECRAWL_SEARCH',
+    operationVersion: PROVIDER_OPERATION_VERSION,
+    accountId: FIRECRAWL_ACCOUNT_ID,
+    invokePortId: FIRECRAWL_INVOKE_PORT_ID,
+    inputSchema: FIRECRAWL_SCHEMA,
+    outputSchema: FIRECRAWL_OUTPUT_SCHEMA,
+  });
+  assert.ok(definitionFingerprint, 'the fixture provider definition is fully observed');
+  return manifests.attachSemanticContract({
+    version: 1,
+    manifestId: 'cap:resolved:firecrawl_search',
+    providerKind: 'composio',
+    operationId: 'FIRECRAWL_SEARCH',
+    providerIdentity: 'composio',
+    providerVersion: providerIdentity.COMPOSIO_PROVIDER_SURFACE_VERSION,
+    operationVersion: PROVIDER_OPERATION_VERSION,
+    definitionFingerprint,
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: digestSchema(FIRECRAWL_SCHEMA),
+      providerOutputSchemaObserved: true,
+      providerOutputSchemaDigest: digestSchema(FIRECRAWL_OUTPUT_SCHEMA),
+      semanticName: 'FIRECRAWL_SEARCH',
+      behaviorHints: {
+        readOnly: true,
+        destructive: null,
+        idempotent: null,
+        openWorld: null,
+      },
+    },
+    effect: 'read',
+    accountId: FIRECRAWL_ACCOUNT_ID,
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: {
+      issuer: 'host:composio-contract-single-owner-test',
+      issuedAt: '2026-08-25T00:00:00.000Z',
+      trusted: true,
+    },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['source'],
+    argumentCompiler: { id: 'compile:composio-contract-single-owner-test', version: '1' },
+    invokePortId: FIRECRAWL_INVOKE_PORT_ID,
+    acceptedInputKinds: ['evidence'],
+    producedOutputKinds: ['evidence'],
+    applicableDeliverableKinds: ['evidence'],
+  });
+}
 
 test.after(() => {
   _setInnerDispatchToolsForTests(null);
@@ -284,6 +353,11 @@ test('nested host reservation waits for the production Composio gateway to finis
   assert.equal(root.status, 'ok');
   if (root.status !== 'ok' || !logical) throw new Error('host fixture authority unavailable');
   const callId = 'call-production-nested-reservation';
+  const manifest = firecrawlSearchManifest();
+  const priorManifestStore = manifestStores.peekCapabilityManifestStore();
+  manifestStores.installCapabilityManifestStore(
+    manifestStores.createCapabilityManifestStore([manifest]),
+  );
   const attestationBase = {
     sessionId,
     sourceUserSeq: source.seq,
@@ -295,13 +369,14 @@ test('nested host reservation waits for the production Composio gateway to finis
     argumentDigest: logical.argumentDigest,
     effect: 'read' as const,
     bindingKind: 'catalog_manifest' as const,
-    capabilityId: 'cap:firecrawl-search',
-    schemaFingerprint: digest('schema:firecrawl-search'),
-    accountId: 'ca_firecrawl_test',
-    invokePortId: 'composio:execute',
-    operationId: 'FIRECRAWL_SEARCH',
-    manifestId: 'manifest:firecrawl-search',
-    manifestDigest: digest('manifest:firecrawl-search'),
+    capabilityId: manifest.manifestId,
+    providerInputSchemaDigest: manifest.externalDefinition!.providerInputSchemaDigest,
+    schemaFingerprint: manifest.definitionFingerprint,
+    accountId: manifest.accountId,
+    invokePortId: manifest.invokePortId,
+    operationId: manifest.operationId,
+    manifestId: manifest.manifestId,
+    manifestDigest: manifests.capabilityManifestDigest(manifest),
     engineVersion: root.authority.engineVersion,
     surfaceVersion: root.authority.surfaceVersion,
     authorityDigest: root.authority.authorityDigest,
@@ -351,7 +426,16 @@ test('nested host reservation waits for the production Composio gateway to finis
       execute: async () => assert.fail('core execute would hide schema/modifier crossings'),
     },
   });
-  rememberToolSchema('FIRECRAWL_SEARCH', FIRECRAWL_SCHEMA, Date.now(), PROVIDER_OPERATION_VERSION);
+  // The sealed identity closes over the provider's OUTPUT definition too, so
+  // the observation the gateway re-derives has to carry it — a live schema with
+  // an unobserved output can never match a manifest that names one.
+  rememberToolSchema(
+    'FIRECRAWL_SEARCH',
+    FIRECRAWL_SCHEMA,
+    Date.now(),
+    PROVIDER_OPERATION_VERSION,
+    FIRECRAWL_OUTPUT_SCHEMA,
+  );
   const composioExecute = getComposioRuntimeTools()
     .find((tool) => tool.name === 'composio_execute_tool');
   assert.ok(composioExecute?.invoke, 'production composio_execute_tool is invokable');
@@ -416,6 +500,7 @@ test('nested host reservation waits for the production Composio gateway to finis
       'one provider-owned crossing starts after refinement; the outer carrier mints none');
   } finally {
     dispatchLeases.revokeDispatchLease(parentLease);
+    manifestStores.installCapabilityManifestStore(priorManifestStore);
   }
 });
 

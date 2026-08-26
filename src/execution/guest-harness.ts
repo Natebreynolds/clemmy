@@ -7,9 +7,10 @@
  * down to a text-only reasoning boundary (slash commands off, tools off,
  * replacement system prompt) so Clem's own harness stays in charge. Here the
  * point is the opposite — the project's slash commands, skills, CLAUDE.md /
- * AGENTS.md, and .mcp.json wiring are exactly what produce the output the
- * user built that project for, so the guest harness runs COMPLETE, in the
- * project directory, on the user's own subscription auth. Clem orchestrates
+ * AGENTS.md are what produce the output the user built that project for, so
+ * the guest harness runs in the project directory on the user's subscription
+ * auth. Project/user MCP configuration is deliberately excluded: connector
+ * calls must return through Clementine's owned carrier. Clem orchestrates
  * (picks the project, writes the prompt, watches the stream, collects the
  * artifacts); the guest does the work.
  *
@@ -128,30 +129,18 @@ export function guestHarnessAvailable(harness: GuestHarnessId): boolean {
   return resolveGuestHarnessBinary(harness) !== null;
 }
 
-/** Baseline Claude Code profile for a project run: the file/search/web tools
- *  plus Bash and the project's OWN MCP servers (read from its .mcp.json).
- *  Broad on purpose — the user approved the run and it executes as them, in
- *  their project — but always explicit, never skip-permissions: an unlisted
- *  tool fails visibly instead of running silently. */
+/** Baseline Claude Code profile for a project run. Broad built-ins are
+ *  explicit because the user approved this project agent, but provider-backed
+ *  MCP tools are never included: those must cross Clementine's carrier. */
 export function defaultClaudeAllowedTools(projectPath: string): string[] {
+  void projectPath;
   const tools = [
     'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
     'Glob', 'Grep', 'Bash',
     'WebFetch', 'WebSearch',
     'Task', 'TodoWrite', 'Skill',
   ];
-  for (const server of readProjectMcpServers(projectPath)) tools.push(`mcp__${server}`);
   return tools;
-}
-
-export function readProjectMcpServers(projectPath: string): string[] {
-  try {
-    const raw = readFileSync(path.join(projectPath, '.mcp.json'), 'utf-8');
-    const parsed = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
-    return Object.keys(parsed.mcpServers ?? {});
-  } catch {
-    return [];
-  }
 }
 
 export function buildGuestArgs(opts: {
@@ -168,6 +157,7 @@ export function buildGuestArgs(opts: {
       '-p', opts.prompt,
       // stream-json in print mode requires --verbose (CLI enforces it).
       '--output-format', 'stream-json', '--verbose',
+      '--strict-mcp-config',
       '--permission-mode', 'acceptEdits',
       '--allowedTools', ...allowed,
     ];
@@ -176,6 +166,11 @@ export function buildGuestArgs(opts: {
   }
   const args = [
     'exec', '--json',
+    // Keep subscription auth in CODEX_HOME but ignore its executable MCP,
+    // plugin, and config surface. The explicit empty override also prevents a
+    // project config from widening the MCP table back during this invocation.
+    '--ignore-user-config',
+    '-c', 'mcp_servers={}',
     '--sandbox', 'workspace-write',
     '--skip-git-repo-check',
     '-C', opts.projectPath,

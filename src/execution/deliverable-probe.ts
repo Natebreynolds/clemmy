@@ -27,6 +27,9 @@ export interface Deliverable {
   kind: DeliverableKind;
   /** Spreadsheet id, absolute file path, or space view path. */
   ref: string;
+  /** Exact accepted user source that owned the producing tool call. The
+   * default remote readback refuses when this durable attribution is absent. */
+  sourceUserSeq?: number;
   /** The tool call that produced it (telemetry). */
   callId?: string;
   tool?: string;
@@ -117,7 +120,14 @@ export function extractDeliverables(sessionId: string, deps: DeliverableProbeDep
     out.push(d);
   };
   for (const ev of events) {
-    const data = (ev.data ?? {}) as { tool?: string; ok?: boolean; callId?: string };
+    const data = (ev.data ?? {}) as {
+      tool?: string;
+      ok?: boolean;
+      callId?: string;
+      sourceUserSeq?: number;
+      accounting?: string;
+    };
+    if (data.accounting === 'transport_mirror') continue;
     if (data.ok === false) continue; // a failed call produced no deliverable
     const tool = (data.tool ?? '').toString();
     const text = resultTextFor(sessionId, ev, deps);
@@ -126,7 +136,15 @@ export function extractDeliverables(sessionId: string, deps: DeliverableProbeDep
     // Google Sheet — a composio GOOGLESHEETS_* result carrying a spreadsheet id/URL.
     if (/GOOGLESHEETS|google.?sheets|spreadsheet/i.test(tool + text)) {
       const id = SHEET_ID_RE.exec(text)?.[1] ?? SHEET_URL_RE.exec(text)?.[1];
-      if (id) add({ kind: 'google_sheet', ref: id, callId: data.callId, tool });
+      if (id) add({
+        kind: 'google_sheet',
+        ref: id,
+        ...(Number.isSafeInteger(data.sourceUserSeq) && (data.sourceUserSeq ?? 0) > 0
+          ? { sourceUserSeq: data.sourceUserSeq }
+          : {}),
+        callId: data.callId,
+        tool,
+      });
     }
     // Local file — a write_file result names the absolute path it wrote.
     if (tool === 'write_file' || WROTE_FILE_RE.test(text)) {
@@ -162,6 +180,18 @@ export function countSheetRows(result: unknown): number {
   const walk = (v: unknown): void => {
     if (Array.isArray(v)) { for (const x of v) walk(x); return; }
     if (v && typeof v === 'object') {
+      const record = v as Record<string, unknown>;
+      const grid = record.grid;
+      if (grid && typeof grid === 'object' && !Array.isArray(grid)) {
+        const header = (grid as Record<string, unknown>).header;
+        const rows = (grid as Record<string, unknown>).rows;
+        if (Array.isArray(rows)) {
+          // The exact production Sheet adapter separates the header from data
+          // rows. Preserve the historical row-count contract: a header-only
+          // sheet is 1, and a populated sheet is greater than 1.
+          max = Math.max(max, rows.length + (Array.isArray(header) && header.length > 0 ? 1 : 0));
+        }
+      }
       for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
         if (k === 'values' && Array.isArray(val)) max = Math.max(max, val.length);
         walk(val);
@@ -172,23 +202,26 @@ export function countSheetRows(result: unknown): number {
   return max;
 }
 
-/** Default sheet reader: a composio GOOGLESHEETS_BATCH_GET readback through the
- *  gated dispatch path. Any error/unknown shape returns -1 so the caller can
- *  distinguish "known empty" from "required population remains unverified." Lazily
- *  imported to keep composio/harness off this module's static graph. */
-async function defaultSheetRowCount(spreadsheetId: string, sessionId: string): Promise<number> {
+/** Default sheet reader redeems a readback that the originating accepted
+ * source already executed through the shared exact kernel. The background
+ * verifier runs after that source's host authority has closed, so it must never
+ * invent a new call or recover source seq 0. Missing identity/settlement/live
+ * binding returns -1 and blocks population readiness with zero provider I/O.
+ * Lazily imported to keep the harness off this module's static graph. */
+async function defaultSheetRowCount(deliverable: Deliverable, sessionId: string): Promise<number> {
   try {
-    const [{ dispatchBatchItemTool }, { ToolCallsCounter }] = await Promise.all([
-      import('../tools/inner-dispatch.js'),
-      import('../runtime/harness/brackets.js'),
-    ]);
-    const out = await dispatchBatchItemTool(
-      'composio_execute_tool',
-      { tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: JSON.stringify({ spreadsheet_id: spreadsheetId }) },
-      sessionId,
-      new ToolCallsCounter(100),
+    if (!Number.isSafeInteger(deliverable.sourceUserSeq) || (deliverable.sourceUserSeq ?? 0) <= 0) {
+      return -1;
+    }
+    const { redeemAcceptedSourceReadback } = await import(
+      '../runtime/harness/accepted-source-readback.js'
     );
-    return countSheetRows(out);
+    const redeemed = redeemAcceptedSourceReadback({
+      sessionId,
+      sourceUserSeq: deliverable.sourceUserSeq!,
+      resourceId: deliverable.ref,
+    });
+    return redeemed.status === 'ok' ? countSheetRows(redeemed.payload) : -1;
   } catch {
     return -1;
   }
@@ -217,10 +250,11 @@ async function probeOne(
   if (!objectiveImpliesPopulation(objective)) {
     return { deliverable: d, pass: true, method: 'skipped', detail: `sheet ${d.ref}: objective does not imply population — existence not readback-checked` };
   }
-  const reader = deps.readSheetRowCount ?? defaultSheetRowCount;
   let rows: number;
   try {
-    rows = await reader(d.ref, sessionId);
+    rows = deps.readSheetRowCount
+      ? await deps.readSheetRowCount(d.ref, sessionId)
+      : await defaultSheetRowCount(d, sessionId);
   } catch {
     rows = -1;
   }

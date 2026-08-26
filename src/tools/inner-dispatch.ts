@@ -1,7 +1,7 @@
 /**
  * inner-dispatch — the nested tool-dispatch lane shared by `run_batch`,
  * `call_tool`, `work_call`, and the pending-action executor: one gated path
- * that resolves a named inner tool (local wrapped tool or namespaced MCP shim)
+ * that resolves a named inner tool (local wrapped tool or exact native-MCP port)
  * and dispatches it with full gate parity to a discrete call.
  *
  * This module is deliberately a transport primitive, not a model-visible
@@ -31,6 +31,10 @@ import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope, stripMcpToolCarrier } from '../runtime/mcp-tool-authority.js';
 import { toolOutputLooksSuccessful } from '../runtime/harness/tool-evidence.js';
 import type { PendingActionExecutionCapability } from '../runtime/harness/pending-actions.js';
+import {
+  invokeAcceptedExactMcpCarrier,
+} from '../runtime/harness/accepted-mcp-carrier.js';
+import { isolatedTestContractActive } from '../runtime/harness/isolated-test-contract.js';
 import {
   consumeAcceptedTaskNestedApprovalAdmission,
   consumeNestedCallAdmission,
@@ -175,7 +179,7 @@ export function normalizeInnerDispatchToolResult(
     return {
       ok: false,
       error_kind: 'truncated_tool_output',
-      error: `Tool result "${opts.callId}" is incomplete (${parked.contentBytes} original bytes exceeded the durable output cap), so nested dispatch will not consume the parked prefix. Re-read/page the provider source until every page is present, or stage the full result as a file and read that artifact.`,
+      error: `Tool result "${opts.callId}" is incomplete (${parked.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks), so nested dispatch will not consume the parked prefix. Re-read/page the provider source until every page is present, or stage the full result as a file and read that artifact.`,
       truncated_at_write: true,
       ...(opts.callId ? { result_handle: opts.callId } : {}),
     };
@@ -215,13 +219,11 @@ export function _setInnerDispatchToolsForTests(map: Map<string, InvokableTool> |
 }
 
 /**
- * An external MCP tool routed through the namespaced shim, e.g.
+ * Shape recognition for an external MCP operation, e.g.
  * "dataforseo__serp_organic_live_advanced". Shape check only (a `<server>__<tool>`
- * with non-empty halves; no local tool name contains a double underscore). These
- * are dispatched through the SAME shim the SDK Runner uses, so they inherit its
- * `decideToolApproval` gating — a destructive/admin MCP tool throws
- * `mcp.approval_blocked`; a read passes — i.e. full gate-parity with a discrete
- * MCP call. The shim gate is the safety boundary for MCP.
+ * with non-empty halves; no local tool name contains a double underscore).
+ * Shape grants nothing: accepted execution reopens the host's exact immutable
+ * manifest/catalog/account/schema/port binding at the final edge.
  */
 export function isMcpNamespacedTool(method: string): boolean {
   const i = method.indexOf('__');
@@ -235,12 +237,18 @@ type ExternalMcpShim = {
 let externalMcpResolverForTest:
   | ((toolName: string, scope: McpToolScope | null | undefined) => ExternalMcpShim | null)
   | null = null;
-/** Test seam: prove an authority refusal happens before provider resolution,
- * listTools, or callTool. Production always uses the lazy runtime resolver. */
+/** Isolated compatibility seam for older gate-parity fixtures. Production
+ * ignores it completely and has no shim/listTools execution fallback. */
 export function _setInnerDispatchMcpResolverForTests(
   fn: ((toolName: string, scope: McpToolScope | null | undefined) => ExternalMcpShim | null) | null,
 ): void {
   externalMcpResolverForTest = fn;
+}
+
+/** Compatibility only for isolated unit/vertical fixtures.  Production never
+ * treats this resolver as execution authority. */
+export function _innerDispatchLegacyMcpTestResolverActive(): boolean {
+  return isolatedTestContractActive() && externalMcpResolverForTest !== null;
 }
 
 export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
@@ -399,15 +407,13 @@ function coerceJsonStringParams(method: string, args: unknown): unknown {
   return out;
 }
 
-/** An external MCP tool: route through the SAME namespaced shim the SDK Runner
- *  uses, so it inherits the shim's `decideToolApproval` gating + server-health
- *  checks — gate-parity with a discrete MCP call (a destructive/admin tool throws
- *  `mcp.approval_blocked`; a read passes). The shim is loaded lazily to keep the
- *  MCP/SDK module graph off the nested dispatcher's static surface.
+/** An external MCP tool: redeem the host-prepared exact admission and invoke
+ *  the immutable native-MCP port registered for that manifest.  Metadata
+ *  enumeration and the namespace shim are discovery surfaces, never execution
+ *  authority at this edge.
  *
- *  Runs under `nestedDispatch: true` harness context (mirroring the local lane
- *  above) so the shim's read-fanout guardrail mount does not double-count the
- *  carrier and its child call. `certifiedBatch` rides along for the batch lane. */
+ *  Runs under `nestedDispatch: true` harness context (mirroring the local lane)
+ *  so the carrier and its child retain one logical identity. */
 async function dispatchInnerMcpTool(
   method: string,
   args: unknown,
@@ -418,46 +424,19 @@ async function dispatchInnerMcpTool(
   batchItem?: boolean,
   scopeOverride?: McpToolScope | null,
   pendingActionExecution?: PendingActionExecutionCapability,
+  exactMcpRequiresNestedAdmission = false,
 ): Promise<unknown> {
   const executableMethod = stripMcpToolCarrier(method);
   const scope = scopeOverride !== undefined
     ? scopeOverride
     : harnessRunContextStorage.getStore()?.mcpToolScope;
-  // Check BEFORE importing mcp-servers or resolving a shim. A remembered or
-  // guessed namespaced tool on a local-only turn must cause zero child-process
-  // construction, zero listTools, and zero dispatch.
-  if (!mcpToolAllowedByScope(method, scope)) {
-    throw new Error(`MCP_SCOPE_DENIED: inner-dispatch tool "${method}" is outside this turn's external MCP scope`);
-  }
-  let shim: ExternalMcpShim | null;
-  if (externalMcpResolverForTest) {
-    shim = externalMcpResolverForTest(executableMethod, scope);
-  } else {
-    const {
-      getOrCreateExternalMcpServerForTool,
-      getOrCreateExternalMcpServers,
-    } = await import('../runtime/mcp-servers.js');
-    shim = (scope === undefined
-      ? getOrCreateExternalMcpServerForTool(executableMethod)
-      : getOrCreateExternalMcpServers(scope ?? {
-          reason: 'explicit no-external-tools scope',
-          authority: 'none',
-          allowedServerSlugs: [],
-          maxTools: 0,
-        })) as unknown as ExternalMcpShim;
-  }
-  if (!shim || typeof shim.callTool !== 'function') {
-    throw new Error(`inner-dispatch: no MCP servers are configured (cannot call "${method}")`);
-  }
-  // The SDK Runner always lists before it calls; mirror that so the shim's
-  // tool→server routing map exists before callTool resolves the name.
-  if (typeof shim.listTools === 'function') { try { await shim.listTools(); } catch { /* routing rebuilds on call */ } }
   const argObj = args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+  const activeCounter = counter ?? new ToolCallsCounter(1000);
   return withHarnessRunContext(
     {
       ...inheritedNestedHarnessContext(sessionId),
       sessionId,
-      counter: counter ?? new ToolCallsCounter(1000),
+      counter: activeCounter,
       nestedDispatch: true,
       ...(certifiedBatch ? { certifiedBatch } : {}),
       ...(pendingActionExecution ? { pendingActionExecution } : {}),
@@ -468,19 +447,43 @@ async function dispatchInnerMcpTool(
     },
     () => withToolOutputContext(
       { sessionId, callId, toolName: executableMethod },
-      () => shim.callTool(executableMethod, argObj),
+      async () => {
+        // Existing isolated tests inject a fake shim to exercise the surrounding
+        // call_tool gates. Keep that explicit fixture seam, but make it inert in
+        // every non-test process. It is not a production fallback.
+        if (_innerDispatchLegacyMcpTestResolverActive()) {
+          if (!mcpToolAllowedByScope(method, scope)) {
+            throw new Error(`MCP_SCOPE_DENIED: inner-dispatch tool "${method}" is outside this turn's external MCP scope`);
+          }
+          const shim = externalMcpResolverForTest!(executableMethod, scope);
+          if (!shim || typeof shim.callTool !== 'function') {
+            throw new Error(`inner-dispatch: no isolated MCP fixture is configured (cannot call "${method}")`);
+          }
+          if (typeof shim.listTools === 'function') {
+            try { await shim.listTools(); } catch { /* isolated compatibility */ }
+          }
+          return shim.callTool(executableMethod, argObj);
+        }
+        return invokeAcceptedExactMcpCarrier({
+          requestedOperationId: executableMethod,
+          args: argObj,
+          sessionId,
+          counter: activeCounter,
+          requiresNestedAdmission: exactMcpRequiresNestedAdmission,
+        });
+      },
     ),
   );
 }
 
 /**
  * Batch-runner dispatch: the same two gated lanes (local wrapped tool /
- * namespaced MCP shim), WITHOUT the nested-dispatch allowlist. The batch runner's
+ * exact native-MCP carrier), WITHOUT the nested-dispatch allowlist. The batch runner's
  * authority model is different: a READ plan may call read tools freely, and a
  * WRITE plan only executes after its exact payloads were certified and approved
  * as ONE pending action — so no writes flag governs it. Every per-call runtime gate still fires: local tools route
  * through wrapToolForHarness (write boundary, guardrails, telemetry) and MCP
- * tools through the shim's decideToolApproval. Telemetry parity via the same
+ * tools through their exact host-bound port. Telemetry parity via the same
  * tool_called/tool_returned events with batchMode:true.
  */
 export async function dispatchBatchItemTool(
@@ -492,6 +495,7 @@ export async function dispatchBatchItemTool(
   telemetry?: { accounting?: 'transport_mirror'; canonicalCallId?: string },
   mcpToolScopeOverride?: McpToolScope | null,
   pendingActionExecution?: PendingActionExecutionCapability,
+  exactMcpRequiresNestedAdmission = false,
 ): Promise<unknown> {
   // `call_tool` is a transport mirror of the model's existing invocation, so
   // its inner bracket must carry the same logical id.  A real batch item has no
@@ -516,7 +520,18 @@ export async function dispatchBatchItemTool(
   try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, batchMode: batchItem, ...telemetryData, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
   try {
     const out = isMcpNamespacedTool(method)
-      ? await dispatchInnerMcpTool(method, args, sessionId, callId, counter, certifiedBatch, batchItem, mcpToolScopeOverride, pendingActionExecution)
+      ? await dispatchInnerMcpTool(
+          method,
+          args,
+          sessionId,
+          callId,
+          counter,
+          certifiedBatch,
+          batchItem,
+          mcpToolScopeOverride,
+          pendingActionExecution,
+          exactMcpRequiresNestedAdmission,
+        )
       : await dispatchInnerLocalTool(method, args, sessionId, callId, counter, certifiedBatch, batchItem);
     const ok = toolOutputLooksSuccessful(out);
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok, batchMode: batchItem, ...telemetryData, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }

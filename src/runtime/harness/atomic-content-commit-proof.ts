@@ -108,7 +108,13 @@ function parseWorkOperations(contractJson: string): WorkOperation[] | null {
 function recordsPayload(value: unknown): unknown[] | null {
   if (Array.isArray(value)) return value;
   if (!plainRecord(value)) return null;
-  return Array.isArray(value.records) ? value.records : null;
+  if (Array.isArray(value.records)) return value.records;
+  // The exact no-retry Composio transport preserves the provider SDK's
+  // canonical success envelope. Follow only that one declared wrapper: an
+  // arbitrary nested `data.records` object without `successful:true` is not
+  // settled source evidence and cannot authorize an atomic create.
+  if (value.successful !== true || !plainRecord(value.data)) return null;
+  return Array.isArray(value.data.records) ? value.data.records : null;
 }
 
 function sameExactAtomicOperation(left: string, right: string): boolean {

@@ -6,7 +6,7 @@
  * though terminal events are already durable; those should stop counting as
  * active work. Parked states must remain visible.
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -19,10 +19,15 @@ import assert from 'node:assert/strict';
 
 const {
   appendEvent,
+  beginRunAttempt,
   createSession,
+  finishRunAttempt,
   getSession,
+  openEventLog,
   resetEventLog,
 } = await import('./eventlog.js');
+const { activateDispatchLease } = await import('./dispatch-lease.js');
+const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
 const approvalRegistry = await import('./approval-registry.js');
 const {
   isIgnorableActiveWorkSession,
@@ -160,6 +165,178 @@ test('active-work visibility ignores empty and stale orphan sessions without mut
   assert.equal(isIgnorableActiveWorkSession(staleTool, { pendingSessionIds: pendingIds, nowMs: Date.now() + 10_000, staleMs: 1 }), true);
   assert.equal(getSession(empty.id)?.status, 'active', 'visibility filtering does not rewrite history');
   assert.equal(getSession(staleTool.id)?.status, 'active', 'stale orphan filtering does not rewrite history');
+});
+
+test('retention-aged non-chat orphan is failed only after its durable attempt owner has finished', () => {
+  resetEventLog();
+  const db = openEventLog();
+  const backdate = (id: string) => db.prepare(
+    'UPDATE sessions SET updated_at = ? WHERE id = ?',
+  ).run('2020-01-01T00:00:00.000Z', id);
+
+  const orphan = createSession({
+    id: 'workflow:retention-aged-interrupted:s1',
+    kind: 'workflow',
+    channel: 'workflow',
+    metadata: {
+      workflowRunId: 'retention-aged-interrupted-run',
+      __run_in_flight: '2020-01-01T00:00:00.000Z',
+      __run_in_flight_owner: {
+        attemptId: 'attempt:retention-aged-interrupted',
+        sourceUserSeq: 1,
+        armedAt: '2020-01-01T00:00:00.000Z',
+      },
+    },
+  });
+  appendEvent({
+    sessionId: orphan.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'read_file', ok: true },
+  });
+  const interrupted = beginRunAttempt(orphan.id, { attemptId: 'attempt:retention-aged-interrupted' });
+  activateDispatchLease({
+    sessionId: orphan.id,
+    scopeId: `${orphan.id}::runner`,
+    runAttemptId: interrupted.attemptId,
+  });
+  finishRunAttempt(interrupted, 'interrupted');
+  backdate(orphan.id);
+
+  const externalOwner = createSession({
+    id: 'workflow:retention-aged-external-owner:s1',
+    kind: 'workflow',
+    channel: 'workflow',
+    metadata: { workflowRunId: 'retention-aged-external-owner-run' },
+  });
+  appendEvent({
+    sessionId: externalOwner.id,
+    turn: 1,
+    role: 'system',
+    type: 'turn_started',
+    data: {},
+  });
+  backdate(externalOwner.id);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, 'retention-aged-external-owner-run.json'),
+    JSON.stringify({
+      id: 'retention-aged-external-owner-run',
+      status: 'queued',
+      workflowName: 'offline-owner',
+    }),
+    'utf8',
+  );
+
+  const owned = createSession({
+    id: 'workflow:retention-aged-live-owner:s1',
+    kind: 'workflow',
+    channel: 'workflow',
+    metadata: {
+      __run_in_flight: '2020-01-01T00:00:00.000Z',
+      __run_in_flight_owner: {
+        attemptId: 'attempt:retention-aged-live-owner',
+        sourceUserSeq: 1,
+        armedAt: '2020-01-01T00:00:00.000Z',
+      },
+    },
+  });
+  appendEvent({
+    sessionId: owned.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'read_file', ok: true },
+  });
+  beginRunAttempt(owned.id, { attemptId: 'attempt:retention-aged-live-owner' });
+  backdate(owned.id);
+
+  const fresh = createSession({
+    id: 'workflow:fresh-ownerless:s1',
+    kind: 'workflow',
+    channel: 'workflow',
+  });
+  appendEvent({
+    sessionId: fresh.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'read_file', ok: true },
+  });
+
+  const approvalOwned = createSession({
+    id: 'workflow:retention-aged-pending-approval:s1',
+    kind: 'workflow',
+    channel: 'workflow',
+  });
+  appendEvent({
+    sessionId: approvalOwned.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'draft_email', ok: true },
+  });
+  approvalRegistry.register({
+    sessionId: approvalOwned.id,
+    subject: 'Approve the draft send',
+    tool: 'send_email',
+  });
+  backdate(approvalOwned.id);
+
+  const awaitingInput = createSession({
+    id: 'workflow:retention-aged-awaiting-input:s1',
+    kind: 'workflow',
+    channel: 'workflow',
+  });
+  appendEvent({
+    sessionId: awaitingInput.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reason: 'awaiting_user_input', reply: 'Which account should I use?' },
+  });
+  backdate(awaitingInput.id);
+
+  const reusableChat = createSession({
+    id: 'chat:retention-aged-completed-turn',
+    kind: 'chat',
+    channel: 'desktop',
+  });
+  appendEvent({
+    sessionId: reusableChat.id,
+    turn: 1,
+    role: 'assistant',
+    type: 'conversation_completed',
+    data: { reason: 'success', reply: 'Done.' },
+  });
+  backdate(reusableChat.id);
+
+  const result = reconcileDormantTerminalWorkSessions();
+  assert.ok(result.ids.includes(orphan.id), 'finished interrupted attempt is no longer a live owner');
+  assert.equal(getSession(orphan.id)?.status, 'failed', 'aged ownerless work becomes retention-eligible');
+  assert.equal(getSession(externalOwner.id)?.status, 'active',
+    'a nonterminal canonical workflow record remains the durable resume owner');
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(getSession(orphan.id)?.metadata ?? {}, '__run_in_flight'),
+    false,
+    'a crash-left marker bound to the finished attempt is cleared with the orphan',
+  );
+  assert.ok(
+    (db.prepare('SELECT revoked_at FROM run_dispatch_leases WHERE scope_id = ?')
+      .get(`${orphan.id}::runner`) as { revoked_at: string | null }).revoked_at,
+    'the provably invalid lease is closed before the orphan is failed',
+  );
+  assert.equal(getSession(owned.id)?.status, 'active', 'an unfinished attempt keeps resumable work active');
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(getSession(owned.id)?.metadata ?? {}, '__run_in_flight'),
+    true,
+    'the matching live attempt retains its restart marker',
+  );
+  assert.equal(getSession(approvalOwned.id)?.status, 'active', 'a pending approval remains a durable owner');
+  assert.equal(getSession(awaitingInput.id)?.status, 'active', 'explicit awaiting-input lifecycle remains resumable');
+  assert.equal(getSession(reusableChat.id)?.status, 'active', 'chat turn completion does not close a reusable conversation');
+  assert.equal(getSession(fresh.id)?.status, 'active', 'fresh ownerless work is not aged out');
 });
 
 test('terminal detector treats only plain completions and run terminal events as terminal', () => {

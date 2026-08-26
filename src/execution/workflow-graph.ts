@@ -8,6 +8,7 @@ import {
 import type {
   WorkflowStepInput,
   WorkflowStepInputBinding,
+  WorkflowStepCall,
   WorkflowStepOutputContract,
 } from '../memory/workflow-store.js';
 import {
@@ -43,6 +44,7 @@ export interface WorkflowGraphNode {
   maxTurns?: number;
   forEach?: string;
   deterministic?: { runner: string };
+  call?: WorkflowStepCall;
   invocationPlan?: WorkflowNodeInvocationPlanV1;
   allowedTools?: string[];
   sideEffect?: 'read' | 'write' | 'send';
@@ -294,29 +296,54 @@ export function validateWorkflowGraph(graph: WorkflowGraphDefinition): WorkflowG
     if (node.type === 'side_effect' && !node.sideEffect) {
       errors.push(`Side-effect node "${id}" must declare sideEffect.`);
     }
+    if (node.call !== undefined && node.invocationPlan === undefined) {
+      errors.push(`Node "${id}" structured call is missing its exact invocation plan.`);
+    }
     if (node.invocationPlan !== undefined) {
       const parsed = parseWorkflowNodeInvocationPlan(node.invocationPlan);
+      const exactCallPair = node.call !== undefined;
       if (!parsed.ok) {
         errors.push(`Node "${id}" has an invalid invocation plan: ${parsed.errors.join(' ')}`);
+      } else if (exactCallPair) {
+        const effect = parsed.plan.binding.effect;
+        if (effect === 'compute') {
+          errors.push(`Node "${id}" exact call cannot use a compute invocation plan.`);
+        }
+        if (node.call?.tool !== parsed.plan.binding.operationId) {
+          errors.push(`Node "${id}" call tool differs from its exact invocation plan operation.`);
+        }
+        const sideEffectMatches = effect === 'read' || effect === 'host_only'
+          ? node.sideEffect === 'read'
+          : effect === 'external_write'
+            ? node.sideEffect === 'write' || node.sideEffect === 'send'
+            : node.sideEffect === 'write';
+        if (!sideEffectMatches) {
+          errors.push(`Node "${id}" side-effect class differs from its exact invocation plan effect "${effect}".`);
+        }
+        if (node.forEach) {
+          errors.push(`Node "${id}" exact call cannot fan out until per-item occurrence identity is represented.`);
+        }
       } else if (parsed.plan.binding.effect !== 'read') {
-        errors.push(`Node "${id}" invocation plan effect must be read; compute purity is not represented yet.`);
+        errors.push(`Node "${id}" standalone invocation plan effect must be read; compute purity is not represented yet.`);
       }
       if (node.type !== 'step') {
         errors.push(`Node "${id}" invocation plan must remain a first-class step node.`);
       }
-      if (node.sideEffect !== 'read') {
+      if (!exactCallPair && node.sideEffect !== 'read') {
         errors.push(`Node "${id}" invocation plan must remain read-class in workflow graph v1.`);
       }
       if (
         node.deterministic
         || node.loopUntil
-        || node.requiresApproval
         || (node.allowedTools?.length ?? 0) > 0
       ) {
-        errors.push(`Node "${id}" invocation plan cannot combine with script, loop, generic approval, or name-based tool authority.`);
+        errors.push(`Node "${id}" invocation plan cannot combine with script, loop, or name-based tool authority.`);
+      }
+      if (!exactCallPair && node.requiresApproval) {
+        errors.push(`Node "${id}" standalone invocation plan cannot combine with generic approval authority.`);
       }
     }
-    if (node.sideEffect === 'send' && node.requiresApproval !== true) {
+    if (node.sideEffect === 'send' && node.invocationPlan === undefined && node.requiresApproval !== true) {
       warnings.push(`Send-class node "${id}" has no declarative approval gate.`);
     }
     if (node.forEach && !nodeIds.has(node.forEach) && !nodes.some((candidate) => candidate.id === node.forEach)) {
@@ -503,6 +530,7 @@ function stepToGraphNode(step: WorkflowStepInput): WorkflowGraphNode {
     ...(step.maxTurns !== undefined ? { maxTurns: step.maxTurns } : {}),
     ...(!isReducer && step.forEach !== undefined ? { forEach: step.forEach } : {}),
     ...(!isReducer && step.deterministic !== undefined ? { deterministic: step.deterministic } : {}),
+    ...(!isReducer && step.call !== undefined ? { call: step.call } : {}),
     ...(!isReducer && step.invocationPlan !== undefined ? { invocationPlan: step.invocationPlan } : {}),
     ...(isReducer
       ? { allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS] }
@@ -582,6 +610,9 @@ function cloneNode(node: WorkflowGraphNode): WorkflowGraphNode {
   return {
     ...node,
     deterministic: node.deterministic ? { ...node.deterministic } : undefined,
+    call: node.call
+      ? { tool: node.call.tool, ...(node.call.args ? { args: structuredClone(node.call.args) } : {}) }
+      : undefined,
     invocationPlan: node.invocationPlan
       ? structuredClone(node.invocationPlan)
       : undefined,

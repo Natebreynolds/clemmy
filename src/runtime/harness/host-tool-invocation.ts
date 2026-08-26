@@ -1107,6 +1107,7 @@ export async function invokeHostToolCall<T>(
         let deadlineTimer: NodeJS.Timeout | undefined;
         let killTimer: NodeJS.Timeout | undefined;
 
+        const absoluteDeadlineAt = Date.now() + input.deadlineMs;
         return new Promise<HostToolInvocationResult<T>>((resolve, reject) => {
           const cleanup = (): void => {
             if (deadlineTimer) clearTimeout(deadlineTimer);
@@ -1332,6 +1333,7 @@ export async function invokeHostToolCall<T>(
           Promise.resolve().then(() => runWithToolAbortSignal(
             controller.signal,
             () => input.invoke({ signal: controller.signal, lease: childLease }),
+            absoluteDeadlineAt,
           )).then(
             (value) => {
               if (state !== 'pending') return;

@@ -157,11 +157,14 @@ interface LogicalAuthorityRow {
     | 'host_v1'
     | 'host_v1_read_only'
     | 'workflow_v1_read_only'
-    | 'workflow_v2_paginated_read';
+    | 'workflow_v2_paginated_read'
+    | 'workflow_v3_call';
   authority_state: 'open' | 'closed' | 'conflict';
   authority_accepted_task_id: string;
   resolution_state: 'open' | 'finalized' | 'legacy_ambiguous' | null;
   resolution_accepted_task_id: string | null;
+  workflow_requirement_id: string | null;
+  workflow_effect: string | null;
 }
 
 interface CrossingRow {
@@ -662,7 +665,9 @@ export function commitLogicalCallSettlement(
                a.authority_kind, a.state AS authority_state,
                a.accepted_task_id AS authority_accepted_task_id,
                r.state AS resolution_state,
-               r.accepted_task_id AS resolution_accepted_task_id
+               r.accepted_task_id AS resolution_accepted_task_id,
+               v3.requirement_id AS workflow_requirement_id,
+               v3.effect AS workflow_effect
           FROM logical_tool_calls l
           JOIN accepted_turn_call_authorities a
             ON a.session_id = l.session_id
@@ -670,6 +675,8 @@ export function commitLogicalCallSettlement(
           LEFT JOIN accepted_task_resolutions r
             ON r.session_id = l.session_id
            AND r.source_user_seq = l.source_user_seq
+          LEFT JOIN workflow_v3_call_activation_bindings v3
+            ON v3.activation_id = a.workflow_activation_id
          WHERE l.session_id = ? AND l.source_user_seq = ? AND l.logical_tool_call_id = ?
       `).get(
         identity.sessionId,
@@ -720,9 +727,18 @@ export function commitLogicalCallSettlement(
       ) {
         return conflict(db, identity, 'logical call belongs to a different accepted task');
       }
+      if (logical.authority_kind === 'workflow_v3_call' && (
+        !logical.workflow_requirement_id
+        || logical.workflow_requirement_id !== recovery.requirementId
+        || !logical.workflow_effect
+        || (logical.workflow_effect === 'host_only') !== (recovery.mutating === false)
+      )) {
+        return conflict(db, identity, 'workflow v3 settlement differs from its requirement/effect binding');
+      }
       if (
         logical.authority_kind !== 'turn_graph'
         && logical.authority_kind !== 'host_v1'
+        && logical.authority_kind !== 'workflow_v3_call'
         && recovery.mutating
       ) {
         return conflict(db, identity, 'read-only settlement cannot claim mutation');

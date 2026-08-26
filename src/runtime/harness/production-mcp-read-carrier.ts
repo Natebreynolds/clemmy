@@ -5,10 +5,13 @@
  * sources. The capability index is populated only as a retrieval aid. A
  * manifest and immutable invoke port are installed after a second live list,
  * an independent observer agrees, and the exact definition remains unchanged.
- * The shipped transport performs one more live list immediately before
- * `tools/call`, so stale catalog or memory rows can never dispatch.
+ * Accepted execution performs one separately-accounted live list immediately
+ * before `tools/call`. Its opaque observation proof is consumed by exactly one
+ * immutable port invocation, so stale catalog or memory rows can never dispatch
+ * and metadata I/O is never hidden inside the business crossing.
  */
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { MCPServer } from '@openai/agents';
 
 import type { ManagedMcpServer } from '../../types.js';
@@ -49,6 +52,7 @@ import {
 } from './shipped-implementation-identity.js';
 import { isolatedTestContractActive } from './isolated-test-contract.js';
 import {
+  capabilityManifestDigest,
   validateCapabilityManifestV1,
   type CapabilityManifestV1,
 } from './capability-manifest.js';
@@ -127,6 +131,26 @@ interface McpSnapshot {
   server: Pick<MCPServer, 'listTools' | 'callTool' | 'invalidateToolsCache'>;
   definitions: readonly ObservedMcpDefinition[];
 }
+
+/** Opaque hand-off from one separately-accounted live-definition probe to the
+ * immediately following exact business call. Object shape is never authority. */
+export interface PreparedProductionMcpInvocationV1 {
+  readonly version: 1;
+}
+
+interface PreparedProductionMcpInvocationState {
+  runtime: ProductionMcpRuntime;
+  snapshot: McpSnapshot;
+  manifestDigest: string;
+  operationId: string;
+  accountId: string;
+  entered: boolean;
+  used: boolean;
+}
+
+const runtimeByManifestDigest = new Map<string, ProductionMcpRuntime>();
+const preparedInvocations = new WeakMap<object, PreparedProductionMcpInvocationState>();
+const preparedInvocationStorage = new AsyncLocalStorage<PreparedProductionMcpInvocationState>();
 
 export interface ProductionMcpReadCarrier {
   carrier: LiveCapabilityCarrier;
@@ -436,9 +460,9 @@ async function freshSnapshot(input: {
   operationId?: string;
 }): Promise<McpSnapshot> {
   const config = exactConfiguredServer(input.runtime, input.serverSlug);
-  const server = input.operationId
-    ? input.runtime.serverForOperation(input.operationId)
-    : input.runtime.serverForEnumeration(input.serverSlug);
+  // Metadata preparation is scoped by the exact manifest server slug. It may
+  // never re-select a server from an operation name at this last edge.
+  const server = input.runtime.serverForEnumeration(input.serverSlug);
   await server.invalidateToolsCache();
   const rawTools = await server.listTools();
   const tools = parseClosedToolList(rawTools, input.serverSlug);
@@ -603,6 +627,118 @@ function definitionMatchesAttestation(input: {
     : { ok: false };
 }
 
+function snapshotMatchesManifest(
+  snapshot: McpSnapshot,
+  manifest: CapabilityManifestV1,
+): boolean {
+  const parsed = parseNamespacedTool(manifest.operationId);
+  if (!parsed || manifest.providerKind !== 'native_mcp' || !manifest.externalDefinition) return false;
+  const live = observeFromSnapshot(snapshot, {
+    identifier: manifest.operationId,
+    accountId: manifest.accountId,
+  });
+  const attested = attestLiveExternalCapabilityDefinition({
+    carrier: { kind: 'mcp', name: parsed.serverSlug },
+    reference: { identifier: manifest.operationId, accountId: manifest.accountId },
+    definition: live,
+    now: Date.now(),
+  });
+  if (!attested.ok) return false;
+  const actual = attested.attestation;
+  return actual.providerIdentity === manifest.providerIdentity
+    && actual.providerVersion === manifest.providerVersion
+    && actual.operationVersion === manifest.operationVersion
+    && actual.definitionFingerprint === manifest.definitionFingerprint
+    && actual.accountId === manifest.accountId
+    && actual.invoke.portId === manifest.invokePortId
+    && actual.invoke.argumentCompiler.id === manifest.argumentCompiler.id
+    && actual.invoke.argumentCompiler.version === manifest.argumentCompiler.version
+    && JSON.stringify(actual.externalDefinition ?? null)
+      === JSON.stringify(manifest.externalDefinition);
+}
+
+/**
+ * Perform the network/stdio tools/list freshness probe as its own provider
+ * crossing. The caller owns physical admission/settlement around this method;
+ * the returned opaque proof can authorize exactly one following callTool.
+ */
+export async function prepareProductionMcpInvocation(
+  manifest: CapabilityManifestV1,
+): Promise<PreparedProductionMcpInvocationV1> {
+  const current = validateCapabilityManifestV1(manifest);
+  if (!current.ok || current.manifest.providerKind !== 'native_mcp') {
+    throw new Error('native MCP preparation requires one current exact manifest');
+  }
+  const parsed = parseNamespacedTool(current.manifest.operationId);
+  if (!parsed) throw new Error('native MCP preparation operation is malformed');
+  const manifestDigest = capabilityManifestDigest(current.manifest);
+  const runtime = runtimeByManifestDigest.get(manifestDigest) ?? productionRuntime();
+  const snapshot = await freshSnapshot({
+    runtime,
+    serverSlug: parsed.serverSlug,
+    operationId: current.manifest.operationId,
+  });
+  if (!snapshotMatchesManifest(snapshot, current.manifest)) {
+    throw new Error('native MCP preparation refused: live definition drifted');
+  }
+  const proof = Object.freeze({ version: 1 as const });
+  preparedInvocations.set(proof, {
+    runtime,
+    snapshot,
+    manifestDigest,
+    operationId: current.manifest.operationId,
+    accountId: current.manifest.accountId,
+    entered: false,
+    used: false,
+  });
+  return proof;
+}
+
+function assertProductionMcpPreparationLocally(
+  manifest: CapabilityManifestV1,
+  runtime: ProductionMcpRuntime,
+): void {
+  const current = validateCapabilityManifestV1(manifest);
+  if (!current.ok || current.manifest.providerKind !== 'native_mcp') {
+    throw new Error('native MCP local preparation requires one current exact manifest');
+  }
+  const parsed = parseNamespacedTool(current.manifest.operationId);
+  if (!parsed) throw new Error('native MCP local preparation operation is malformed');
+  const config = exactConfiguredServer(runtime, parsed.serverSlug);
+  const providerIdentity = `mcp-config:${parsed.serverSlug}:${config.digest}`;
+  const accountId = `native_mcp:${parsed.serverSlug}:${config.digest}`;
+  const invoke = portIdentity(runtime);
+  if (
+    current.manifest.providerIdentity !== providerIdentity
+    || current.manifest.accountId !== accountId
+    || current.manifest.invokePortId !== invoke.portId
+    || current.manifest.argumentCompiler.id !== invoke.compiler.id
+    || current.manifest.argumentCompiler.version !== invoke.compiler.version
+  ) {
+    throw new Error('native MCP configured server/account/invoke identity changed before preparation');
+  }
+}
+
+/** Bind an authentic fresh probe to one immutable port invocation. */
+export async function withPreparedProductionMcpInvocation<T>(
+  proof: PreparedProductionMcpInvocationV1,
+  work: () => Promise<T>,
+): Promise<T> {
+  const prepared = preparedInvocations.get(proof as object);
+  preparedInvocations.delete(proof as object);
+  if (!prepared || prepared.entered) {
+    throw new Error('native MCP preparation proof is absent, consumed, or inauthentic');
+  }
+  prepared.entered = true;
+  return preparedInvocationStorage.run(prepared, async () => {
+    const result = await work();
+    if (!prepared.used) {
+      throw new Error('native MCP immutable port did not consume its exact preparation proof');
+    }
+    return result;
+  });
+}
+
 async function executeWithRuntime(
   runtime: ProductionMcpRuntime,
   call: AttestedTransportCall,
@@ -613,34 +749,33 @@ async function executeWithRuntime(
   }
   const parsed = parseNamespacedTool(call.operationId);
   if (!parsed) throw new Error(`${call.operationId} is not a namespaced MCP operation`);
-  const snapshot = await freshSnapshot({
-    runtime,
-    serverSlug: parsed.serverSlug,
-    operationId: call.operationId,
-  });
-  const live = observeFromSnapshot(snapshot, {
-    identifier: call.operationId,
-    accountId: call.accountId,
-  });
-  const attested = attestLiveExternalCapabilityDefinition({
-    carrier: { kind: 'mcp', name: parsed.serverSlug },
-    reference: { identifier: call.operationId, accountId: call.accountId },
-    definition: live,
-    now: Date.now(),
-  });
-  if (!attested.ok) throw new Error(`native MCP crossing refused: ${attested.reason}`);
-  const actual = attested.attestation;
-  if (
-    actual.providerIdentity !== expected.providerIdentity
-    || actual.providerVersion !== expected.providerVersion
-    || actual.operationVersion !== expected.operationVersion
-    || actual.definitionFingerprint !== expected.definitionFingerprint
-    || actual.invoke.portId !== expected.invokePortId
-    || actual.invoke.argumentCompiler.id !== expected.argumentCompiler.id
-    || actual.invoke.argumentCompiler.version !== expected.argumentCompiler.version
-    || actual.accountId !== call.accountId
-  ) throw new Error('native MCP crossing refused: live definition drifted');
-  const result = await snapshot.server.callTool(call.operationId, call.args);
+  const prepared = preparedInvocationStorage.getStore();
+  if (!prepared) throw new Error('native MCP crossing refused: exact preparation proof is missing');
+  if (prepared.used) throw new Error('native MCP crossing refused: exact preparation proof is consumed');
+  if (prepared.operationId !== call.operationId) {
+    throw new Error('native MCP crossing refused: prepared operation identity mismatched');
+  }
+  if (prepared.accountId !== call.accountId) {
+    throw new Error('native MCP crossing refused: prepared account identity mismatched');
+  }
+  if (prepared.manifestDigest !== expected.manifestDigest) {
+    throw new Error('native MCP crossing refused: prepared manifest digest mismatched');
+  }
+  if (prepared.snapshot.providerIdentity !== expected.providerIdentity) {
+    throw new Error('native MCP crossing refused: prepared provider identity mismatched');
+  }
+  if (prepared.snapshot.providerVersion !== expected.providerVersion) {
+    throw new Error('native MCP crossing refused: prepared provider version mismatched');
+  }
+  // Re-read only the local closed configuration bytes between probe and body.
+  // No server metadata call is hidden inside this business crossing.
+  const config = exactConfiguredServer(prepared.runtime, parsed.serverSlug);
+  if (`mcp-config:${parsed.serverSlug}:${config.digest}` !== expected.providerIdentity) {
+    throw new Error('native MCP crossing refused: configured server changed after preparation');
+  }
+  prepared.used = true;
+  void runtime;
+  const result = await prepared.snapshot.server.callTool(call.operationId, call.args);
   const metadata = result as unknown as { isError?: unknown };
   if (metadata?.isError === true) throw new Error('native MCP operation returned isError');
   return result;
@@ -818,11 +953,23 @@ export function createProductionMcpReadCarrier(input: {
     attestation: AttestedLiveExternalCapability;
   }): { ok: true } | { ok: false; reason: string } => {
     expectedByOperation.set(`${attestation.reference.identifier}\0${attestation.accountId}`, attestation);
+    const manifestDigest = capabilityManifestDigest(manifest);
     const existing = resolveProductionPortsForManifest(manifest);
     if (existing) {
-      return isShippedInvoke(existing.invoke)
-        ? { ok: true }
-        : { ok: false, reason: 'the exact port is not a shipped implementation' };
+      if (
+        !isShippedInvoke(existing.invoke)
+        || typeof existing.admitPreparation !== 'function'
+        || typeof existing.prepareInvocation !== 'function'
+        || typeof existing.invokeWithPreparation !== 'function'
+      ) {
+        return { ok: false, reason: 'the exact port is not a shipped implementation' };
+      }
+      // The first exact materializer to register this immutable port owns its
+      // runtime. Never let a later same-digest carrier silently retarget it.
+      if (!runtimeByManifestDigest.has(manifestDigest)) {
+        runtimeByManifestDigest.set(manifestDigest, runtime);
+      }
+      return { ok: true };
     }
     let shipped: ReturnType<typeof loadShippedImplementations>;
     try {
@@ -837,6 +984,12 @@ export function createProductionMcpReadCarrier(input: {
     const registered = registerProductionCapabilityPort(
       productionPortIdentityFromManifest(manifest),
       {
+        admitPreparation: () => assertProductionMcpPreparationLocally(manifest, runtime),
+        prepareInvocation: () => prepareProductionMcpInvocation(manifest),
+        invokeWithPreparation: (proof, work) => withPreparedProductionMcpInvocation(
+          proof as PreparedProductionMcpInvocationV1,
+          work,
+        ),
         invoke,
         observe: () => {
           const live = observeFromSnapshot(snapshot, attestation.reference);
@@ -857,7 +1010,11 @@ export function createProductionMcpReadCarrier(input: {
         },
       },
     );
-    return registered.ok ? { ok: true } : { ok: false, reason: registered.reason };
+    if (!registered.ok) return { ok: false, reason: registered.reason };
+    if (!runtimeByManifestDigest.has(manifestDigest)) {
+      runtimeByManifestDigest.set(manifestDigest, runtime);
+    }
+    return { ok: true };
   };
 
   const refreshIndependentObservation = async (expected: {

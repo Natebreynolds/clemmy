@@ -2,6 +2,7 @@ import { readHarnessCapabilityHealth, recordHarnessCapabilityHealth } from '../r
 import { hasActiveStructuralProcedureForIdentifier } from '../memory/procedure-receipts.js';
 import { settleVerifiedComposioRead } from './composio-read-settlement.js';
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 import {
   describeCarrierRefusal,
@@ -10,7 +11,7 @@ import {
 import { existsSync, writeFileSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { tool, type Tool } from '@openai/agents';
+import { ModelBehaviorError, tool, type Tool } from '@openai/agents';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
@@ -28,6 +29,7 @@ import {
   searchComposioToolsViaCli,
   composioToolSchemaObservedAt,
   composioToolOperationVersion,
+  ComposioPreDispatchError,
   ComposioSearchProviderContractError,
   COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT,
   COMPOSIO_LIVE_SEARCH_RETURN_LIMIT,
@@ -75,6 +77,7 @@ import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
 import { discoveryGovernor } from '../runtime/harness/discovery-governor.js';
 import {
+  InvalidArgumentsPreDispatchResult,
   settleToolAttempt,
   ToolAttemptSettlementAuthorityError,
 } from '../runtime/harness/attempt-settlement.js';
@@ -108,9 +111,10 @@ import {
   rememberToolSchema,
   getCachedToolSchema,
   ensureToolSchema,
+  refreshExactComposioSchemaFromProvider,
   liveComposioSchemaFingerprint,
   liveComposioOperationVersion,
-  refreshExactComposioSchemaFromProvider,
+  liveComposioOutputSchema,
 } from './composio-schema-cache.js';
 import {
   digestSchema,
@@ -129,6 +133,15 @@ import {
   documentedComposioOperationSemantic,
 } from '../integrations/composio/operation-semantics.js';
 import { currentHostCallAttestation } from '../runtime/harness/accepted-turn-call-authority.js';
+import {
+  capabilityManifestDigest,
+  currentCapabilityManifest,
+} from '../runtime/harness/capability-manifest.js';
+import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
+import {
+  COMPOSIO_PROVIDER_SURFACE_VERSION,
+  fingerprintComposioProviderDefinition,
+} from '../integrations/composio/provider-definition-identity.js';
 import { currentExpectedWorkBinding } from '../runtime/harness/expected-work-admission.js';
 import { durableLogicalCallContract } from '../runtime/harness/logical-call-contract.js';
 import {
@@ -1967,8 +1980,15 @@ export interface ComposioGatewayResolved {
   providerInputSchemaDigest?: string;
   /** Exact provider operation version observed with the schema lease. */
   providerOperationVersion?: string;
+  /** Complete provider-definition identity, present only when it was
+   * re-derived from the exact current registered manifest that owns the
+   * in-process host attestation. These fields are never accepted from model
+   * or gateway arguments. */
+  definitionFingerprint?: string;
+  providerOutputSchemaDigest?: string | null;
+  invokePortId?: string;
   /** Opaque terminal one-shot prepared before the physical row opens. */
-  preparedDispatch?: PreparedComposioOneShotDispatch;
+  preparedDispatch?: PreparedComposioGatewayOneShotDispatch;
   /** Final addressable owner↔stable-identity proof from the same gateway
    * snapshot. Absent means learning must remain unbound/non-executable. */
   accountIdentityProof?: { connectionId: string; identity: string };
@@ -2001,6 +2021,299 @@ function exactProviderInputSchemaIdentity(
   }
 }
 
+interface ExactComposioTerminalDefinitionIdentity {
+  manifestId: string;
+  manifestDigest: string;
+  operationId: string;
+  accountId: string;
+  providerIdentity: 'composio';
+  providerVersion: string;
+  providerOperationVersion: string;
+  providerInputSchemaDigest: string;
+  providerOutputSchemaDigest: string | null;
+  definitionFingerprint: string;
+  invokePortId: string;
+}
+
+export interface RegisteredComposioTerminalManifestExpectation {
+  manifestId: string;
+  manifestDigest: string;
+  providerKind: 'composio';
+  operationId: string;
+  accountId: string;
+  providerIdentity: 'composio';
+  providerVersion: string;
+  providerOperationVersion: string;
+  providerInputSchemaDigest: string;
+  providerOutputSchemaDigest: string | null;
+  definitionFingerprint: string;
+  invokePortId: string;
+}
+
+type AttestedTerminalDefinitionResolution =
+  | { status: 'not_attested' }
+  | { status: 'refused'; reason: string }
+  | { status: 'exact'; identity: ExactComposioTerminalDefinitionIdentity };
+
+/** Opaque gateway-owned one-shot. The public client one-shot proves request
+ * cardinality; this outer token additionally binds it to the exact registered
+ * manifest selected by the host. A serialized/model-authored lookalike has no
+ * WeakMap state and cannot enter the provider body. */
+export interface PreparedComposioGatewayOneShotDispatch {
+  readonly __preparedComposioGatewayOneShotDispatch: unique symbol;
+}
+
+interface PreparedComposioGatewayOneShotState {
+  clientPrepared: PreparedComposioOneShotDispatch;
+  exactDefinition?: ExactComposioTerminalDefinitionIdentity;
+  consumed: boolean;
+}
+
+const preparedComposioGatewayOneShots = new WeakMap<object, PreparedComposioGatewayOneShotState>();
+const registeredComposioTerminalIdentityStorage =
+  new AsyncLocalStorage<Readonly<ExactComposioTerminalDefinitionIdentity>>();
+
+function exactRegisteredComposioIdentity(
+  expected: RegisteredComposioTerminalManifestExpectation,
+): ExactComposioTerminalDefinitionIdentity | null {
+  const installed = peekCapabilityManifestStore()?.get(expected.manifestId);
+  const manifest = currentCapabilityManifest(installed?.manifest);
+  const external = manifest?.externalDefinition;
+  if (!installed || !manifest || !external) return null;
+  const manifestDigest = capabilityManifestDigest(manifest);
+  if (
+    installed.digest !== manifestDigest
+    || expected.manifestDigest !== manifestDigest
+    || expected.providerKind !== 'composio'
+    || manifest.providerKind !== expected.providerKind
+    || manifest.providerIdentity !== expected.providerIdentity
+    || manifest.providerVersion !== expected.providerVersion
+    || manifest.operationId !== expected.operationId
+    || manifest.accountId !== expected.accountId
+    || manifest.operationVersion !== expected.providerOperationVersion
+    || manifest.definitionFingerprint !== expected.definitionFingerprint
+    || manifest.invokePortId !== expected.invokePortId
+    || external.version !== 1
+    || external.providerOutputSchemaObserved !== true
+    || external.providerInputSchemaDigest !== expected.providerInputSchemaDigest
+    || (external.providerOutputSchemaDigest ?? null) !== expected.providerOutputSchemaDigest
+  ) return null;
+  return Object.freeze({
+    manifestId: manifest.manifestId,
+    manifestDigest,
+    operationId: manifest.operationId,
+    accountId: manifest.accountId,
+    providerIdentity: 'composio' as const,
+    providerVersion: manifest.providerVersion,
+    providerOperationVersion: manifest.operationVersion,
+    providerInputSchemaDigest: external.providerInputSchemaDigest,
+    providerOutputSchemaDigest: external.providerOutputSchemaDigest ?? null,
+    definitionFingerprint: manifest.definitionFingerprint,
+    invokePortId: manifest.invokePortId,
+  });
+}
+
+/** Attested-transport bridge. Copyable expected bytes do not grant authority:
+ * this reopens the exact current registered manifest and carries only the
+ * resulting process-local identity through ALS into the gateway. */
+export function withRegisteredComposioTerminalManifest<T>(
+  expected: RegisteredComposioTerminalManifestExpectation,
+  work: () => T,
+): T {
+  const exact = exactRegisteredComposioIdentity(expected);
+  if (!exact) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      `${expected.operationId} sealed provider identity is absent, stale, or mismatched.`,
+    );
+  }
+  return registeredComposioTerminalIdentityStorage.run(exact, work);
+}
+
+function exactRegisteredComposioIdentityForCurrentHostCall(
+  toolSlug: string,
+): AttestedTerminalDefinitionResolution {
+  const attestation = currentHostCallAttestation();
+  const carried = registeredComposioTerminalIdentityStorage.getStore();
+  if (!attestation) {
+    if (!carried) return { status: 'not_attested' };
+    return carried.operationId === toolSlug
+      ? { status: 'exact', identity: carried }
+      : { status: 'refused', reason: 'the sealed transport operation changed before gateway preparation' };
+  }
+  if (attestation.bindingKind !== 'catalog_manifest') {
+    return { status: 'refused', reason: 'the host call is not bound to a catalog manifest' };
+  }
+  if (attestation.operationId !== toolSlug || attestation.capabilityId !== attestation.manifestId) {
+    return { status: 'refused', reason: 'the host operation does not match its selected manifest' };
+  }
+  const installed = peekCapabilityManifestStore()?.get(attestation.manifestId);
+  const manifest = currentCapabilityManifest(installed?.manifest);
+  if (!installed || !manifest) {
+    return { status: 'refused', reason: 'the selected provider manifest is absent or no longer current' };
+  }
+  const external = manifest.externalDefinition;
+  const manifestDigest = capabilityManifestDigest(manifest);
+  if (
+    installed.digest !== manifestDigest
+    || attestation.manifestDigest !== manifestDigest
+    || manifest.providerKind !== 'composio'
+    || manifest.providerIdentity !== 'composio'
+    || manifest.providerVersion !== COMPOSIO_PROVIDER_SURFACE_VERSION
+    || manifest.operationId !== attestation.operationId
+    || manifest.manifestId !== attestation.manifestId
+    || manifest.accountId !== attestation.accountId
+    || manifest.definitionFingerprint !== attestation.schemaFingerprint
+    || manifest.invokePortId !== attestation.invokePortId
+    || !external
+    || external.version !== 1
+    || external.providerOutputSchemaObserved !== true
+    || external.providerInputSchemaDigest !== attestation.providerInputSchemaDigest
+  ) {
+    return { status: 'refused', reason: 'the selected provider manifest conflicts with the host attestation' };
+  }
+  const exact: ExactComposioTerminalDefinitionIdentity = Object.freeze({
+    manifestId: manifest.manifestId,
+    manifestDigest,
+    operationId: manifest.operationId,
+    accountId: manifest.accountId,
+    providerIdentity: 'composio' as const,
+    providerVersion: manifest.providerVersion,
+    providerOperationVersion: manifest.operationVersion,
+    providerInputSchemaDigest: external.providerInputSchemaDigest,
+    providerOutputSchemaDigest: external.providerOutputSchemaDigest ?? null,
+    definitionFingerprint: manifest.definitionFingerprint,
+    invokePortId: manifest.invokePortId,
+  });
+  if (carried && (
+    carried.manifestDigest !== exact.manifestDigest
+    || carried.operationId !== exact.operationId
+    || carried.accountId !== exact.accountId
+    || carried.providerOperationVersion !== exact.providerOperationVersion
+    || carried.providerInputSchemaDigest !== exact.providerInputSchemaDigest
+    || carried.providerOutputSchemaDigest !== exact.providerOutputSchemaDigest
+    || carried.definitionFingerprint !== exact.definitionFingerprint
+    || carried.invokePortId !== exact.invokePortId
+  )) {
+    return { status: 'refused', reason: 'the sealed transport identity conflicts with the host attestation' };
+  }
+  return {
+    status: 'exact',
+    identity: exact,
+  };
+}
+
+function currentProviderDefinitionMatches(
+  expected: ExactComposioTerminalDefinitionIdentity,
+  input: {
+    toolSlug: string;
+    accountId?: string;
+    schema: unknown;
+    providerOperationVersion?: string;
+  },
+): boolean {
+  if (
+    input.toolSlug !== expected.operationId
+    || input.accountId !== expected.accountId
+    || input.providerOperationVersion !== expected.providerOperationVersion
+    || !input.schema
+    || typeof input.schema !== 'object'
+    || Array.isArray(input.schema)
+  ) return false;
+  let providerInputSchemaDigest: string;
+  try { providerInputSchemaDigest = digestSchema(input.schema); }
+  catch { return false; }
+  if (providerInputSchemaDigest !== expected.providerInputSchemaDigest) return false;
+  const outputSchema = liveComposioOutputSchema(input.toolSlug);
+  if (outputSchema === undefined) return false;
+  let providerOutputSchemaDigest: string | null;
+  try { providerOutputSchemaDigest = outputSchema ? digestSchema(outputSchema) : null; }
+  catch { return false; }
+  if (providerOutputSchemaDigest !== expected.providerOutputSchemaDigest) return false;
+  const definitionFingerprint = fingerprintComposioProviderDefinition({
+    operationId: input.toolSlug,
+    operationVersion: input.providerOperationVersion,
+    accountId: input.accountId,
+    invokePortId: expected.invokePortId,
+    inputSchema: input.schema as Record<string, unknown>,
+    outputSchema,
+  });
+  return definitionFingerprint === expected.definitionFingerprint;
+}
+
+function prepareComposioGatewayOneShot(input: {
+  toolSlug: string;
+  args: Record<string, unknown>;
+  connectedAccountId?: string;
+  providerOperationVersion?: string;
+  schema: unknown;
+  exactDefinition?: ExactComposioTerminalDefinitionIdentity;
+}): PreparedComposioGatewayOneShotDispatch {
+  if (input.exactDefinition && !currentProviderDefinitionMatches(input.exactDefinition, {
+    toolSlug: input.toolSlug,
+    accountId: input.connectedAccountId,
+    schema: input.schema,
+    providerOperationVersion: input.providerOperationVersion,
+  })) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      `${input.toolSlug} current provider definition no longer matches the selected manifest.`,
+    );
+  }
+  const clientPrepared = prepareComposioOneShotDispatch({
+    toolSlug: input.toolSlug,
+    args: input.args,
+    connectedAccountId: input.connectedAccountId,
+    providerOperationVersion: input.providerOperationVersion,
+  });
+  const prepared = Object.freeze(Object.create(null)) as PreparedComposioGatewayOneShotDispatch;
+  preparedComposioGatewayOneShots.set(prepared as object, {
+    clientPrepared,
+    ...(input.exactDefinition ? { exactDefinition: input.exactDefinition } : {}),
+    consumed: false,
+  });
+  return prepared;
+}
+
+export async function executePreparedComposioGatewayTool(
+  prepared: PreparedComposioGatewayOneShotDispatch,
+): Promise<unknown> {
+  const state = preparedComposioGatewayOneShots.get(prepared as object);
+  if (!state || state.consumed) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      'Composio gateway dispatch requires an unused opaque prepared one-shot.',
+    );
+  }
+  state.consumed = true;
+  return executePreparedComposioTool(state.clientPrepared);
+}
+
+function reprepareComposioGatewayOneShot(input: {
+  prior: PreparedComposioGatewayOneShotDispatch;
+  toolSlug: string;
+  args: Record<string, unknown>;
+  connectedAccountId?: string;
+  providerOperationVersion?: string;
+  schema: unknown;
+}): PreparedComposioGatewayOneShotDispatch {
+  const prior = preparedComposioGatewayOneShots.get(input.prior as object);
+  if (!prior || !prior.consumed) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      `${input.toolSlug} retry does not own a consumed gateway one-shot.`,
+    );
+  }
+  return prepareComposioGatewayOneShot({
+    toolSlug: input.toolSlug,
+    args: input.args,
+    connectedAccountId: input.connectedAccountId,
+    providerOperationVersion: input.providerOperationVersion,
+    schema: input.schema,
+    ...(prior.exactDefinition ? { exactDefinition: prior.exactDefinition } : {}),
+  });
+}
+
 /** An action on the platform's own catalog/connection plane — the same
  * toolkit classification meta-action owner inheritance uses, never a slug
  * list. These operations are the instruments preparation itself prescribes:
@@ -2011,7 +2324,11 @@ function composioPlatformPlaneOperation(toolSlug: string): boolean {
   // The execute wrapper carries a NESTED business action — platform namespace,
   // business effect. It must never inherit the instrument bypass: a cold
   // business write would dispatch without its one-shot preparation.
-  return !/execute/i.test(toolSlug);
+  if (/execute/i.test(toolSlug)) return false;
+  // Only platform READS are preparation instruments. A platform-plane
+  // MUTATION (deleting a connected account, rewriting a trigger) is not the
+  // remedy for anything — cold, it refuses exactly like a business write.
+  return classifyComposioSlugEffect(toolSlug) === 'read';
 }
 
 function schemaRequiresComposioFileUpload(schema: unknown): boolean {
@@ -2180,6 +2497,10 @@ export interface ComposioDispatchBoundaryContext {
   identity?: string;
   schemaFingerprint?: string;
   providerInputSchemaDigest?: string;
+  definitionFingerprint?: string;
+  providerOperationVersion?: string;
+  providerOutputSchemaDigest?: string | null;
+  invokePortId?: string;
 }
 
 export type ComposioDispatchBoundary = (
@@ -2272,6 +2593,24 @@ function stickyRunAccount(
 }
 
 
+function workerComposeOnlyComposioBlock(
+  toolSlug: string,
+  sessionId: string | undefined,
+): ComposioGatewayBlocked | null {
+  const activeRun = harnessRunContextStorage.getStore();
+  if (activeRun?.workerScope !== true || classifyComposioSlugEffect(toolSlug) === 'read') return null;
+  const toolkit = registeredToolkitOfSlug(toolSlug);
+  const message = [
+    `WORKER_COMPOSE_ONLY: ${toolSlug} is a mutating Composio action, so this worker did not dispatch it.`,
+    'No provider dispatch was started. Finish any required reads/reasoning, then return the parent one exact per-item payload shaped as {"id":"<stable item id>","composioSlug":"<exact slug>","args":{...},"account_alias":"<stable email or saved alias, only when supplied>"}.',
+    'The parent must validate and aggregate the worker payloads, call run_batch action="propose" once, and execute that one immutable pending batch only after its single approval. Do not call run_batch or pending-action commit tools from the worker.',
+  ].join(' ');
+  emitComposioGatewayBlock(sessionId, toolSlug, 'worker-compose-only', {
+    guard: 'worker-compose-then-parent-commit',
+  });
+  return { ok: false, reason: 'worker-compose-only', message, toolkit };
+}
+
 export async function resolveComposioDispatch(
   toolSlug: string,
   rawArgs: Record<string, unknown>,
@@ -2287,18 +2626,8 @@ export async function resolveComposioDispatch(
   // @openai/agents lane and Claude SDK's in-process/stdio MCP transport; it is
   // deliberately independent of the optional thrash-guard scope and does not
   // conflate workflow steps with workers.
-  if (activeRun?.workerScope === true && classifyComposioSlugEffect(toolSlug) !== 'read') {
-    const toolkit = registeredToolkitOfSlug(toolSlug);
-    const message = [
-      `WORKER_COMPOSE_ONLY: ${toolSlug} is a mutating Composio action, so this worker did not dispatch it.`,
-      'No provider dispatch was started. Finish any required reads/reasoning, then return the parent one exact per-item payload shaped as {"id":"<stable item id>","composioSlug":"<exact slug>","args":{...},"account_alias":"<stable email or saved alias, only when supplied>"}.',
-      'The parent must validate and aggregate the worker payloads, call run_batch action="propose" once, and execute that one immutable pending batch only after its single approval. Do not call run_batch or pending-action commit tools from the worker.',
-    ].join(' ');
-    emitComposioGatewayBlock(sid, toolSlug, 'worker-compose-only', {
-      guard: 'worker-compose-then-parent-commit',
-    });
-    return { ok: false, reason: 'worker-compose-only', message, toolkit };
-  }
+  const workerBlock = workerComposeOnlyComposioBlock(toolSlug, sid);
+  if (workerBlock) return workerBlock;
   revalidateStaleSuppressionsOnce();
   const toolkit = registeredToolkitOfSlug(toolSlug);
   const normalized = normalizeInlineConnectedAccountId(rawArgs, connectedAccountId);
@@ -2410,37 +2739,15 @@ export async function resolveComposioDispatch(
     notes.push(formatComposioCliDefaultReadAccountRoute(toolkit));
   }
 
-  // Execution consumes the exact provider observations prepared by discovery
-  // or plan publication. It must never hide an account-list request inside the
-  // business logical call before that call owns a physical provider attempt.
-  //
-  // RE-VALIDATION IS NOT DISCOVERY (live 2026-08-25, scorpion-facebook-trends):
-  // the observation is current for 60 seconds, and on a day of 3-30s provider
-  // latencies the model's read→dispatch cycle routinely lost the race — every
-  // Apify call refused "no current connected-account observation", the model
-  // ran the prescribed preparation reads, and the observation aged out again
-  // before the next dispatch. When a PRIOR observation exists (last-good
-  // registry non-empty — so this is never a hidden first look at the account
-  // list), a stale observation is refreshed here once, bounded, before the
-  // gate reads it. A machine that has never observed accounts still refuses
-  // and prescribes the explicit read.
-  let preparedConnectionSnapshot = opts.preparedExecution
+  // Execution consumes only the exact CURRENT observation published by the
+  // discovery/plan preparation phase. Last-good remains available to status
+  // and recovery surfaces, but it cannot silently become execution authority.
+  // In particular, do not start a raw/SDK account refresh here: the fallback
+  // SDK listing is not abortable, and any provider read hidden between logical
+  // admission and the business physical row has no honest row of its own.
+  const preparedConnectionSnapshot = opts.preparedExecution
     ? peekCurrentConnectedToolkits()
     : undefined;
-  if (
-    opts.preparedExecution
-    && preparedConnectionSnapshot === null
-    && peekConnectedToolkits().length > 0
-  ) {
-    try {
-      let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        listConnectedToolkits({ requireFresh: true }),
-        new Promise((resolve) => { refreshTimer = setTimeout(resolve, 12_000); }),
-      ]).finally(() => { if (refreshTimer) clearTimeout(refreshTimer); });
-    } catch { /* the gate below still owns the refusal */ }
-    preparedConnectionSnapshot = peekCurrentConnectedToolkits();
-  }
   let conns: ConnectedToolkit[] = [];
   if (opts.preparedExecution) {
     conns = preparedConnectionSnapshot === null
@@ -2934,11 +3241,11 @@ export async function resolveComposioDispatch(
   let dispatchSchema = opts.preparedExecution
     ? getCachedToolSchema(toolSlug)
     : await ensureToolSchema(toolSlug);
-  const preparationInstrument = composioPlatformPlaneOperation(toolSlug);
   let preparedSchemaIdentity = exactProviderInputSchemaIdentity(toolSlug, dispatchSchema);
   let preparedOperationVersion = opts.preparedExecution && !cliOnlyLane
     ? liveComposioOperationVersion(toolSlug)
     : undefined;
+  const preparationInstrument = composioPlatformPlaneOperation(toolSlug);
   // Every leg the refusal below demands, so the remedy and the gate read the
   // SAME predicate — a remedy that discharges less than the demand deadlocks.
   const preparedDefinitionCold = (): boolean =>
@@ -2946,20 +3253,16 @@ export async function resolveComposioDispatch(
     || !preparedSchemaIdentity.schemaFingerprint
     || !preparedSchemaIdentity.providerInputSchemaDigest
     || (!cliOnlyLane && !preparedOperationVersion);
-  if (opts.preparedExecution && preparedDefinitionCold()) {
-    // RE-VALIDATION IS NOT DISCOVERY (live 2026-08-25, second gate of the
-    // same class): fetching the provider's input definition for an ALREADY
-    // ACCEPTED call is preparation of that exact call, not a hidden look at
-    // the catalog. Refusing here deadlocked live — the prescribed remediation
-    // reads (describe/search) transit this same gateway and were refused by
-    // this same gate, so "run the preparation read, then retry" could never
-    // terminate. Only the STRONG exact-slug provider observation discharges
-    // the demand: it stamps providerObservedAt and the operation version, so
-    // every leg re-derives. ensureToolSchema cannot — its cached return never
-    // moves the authority lease, and its once-per-process latch would let one
-    // transient failure poison the slug for the daemon's lifetime. Bounded to
-    // one fetch; the gate below still owns refusal when the definition is
-    // genuinely unavailable.
+  if (opts.preparedExecution && !preparationInstrument && preparedDefinitionCold()) {
+    // Only the STRONG exact-slug provider observation discharges the demand:
+    // it stamps providerObservedAt and the operation version, so every leg
+    // re-derives. ensureToolSchema cannot — its cached return never moves the
+    // authority lease, and its once-per-process latch would let one transient
+    // failure poison the slug for the daemon's lifetime. Bounded to one
+    // fetch; the gate below still owns refusal when the definition is
+    // genuinely unavailable. (Restored 2026-08-26: a parallel rewrite dropped
+    // this remedy and the live PREPARATION-REQUIRED wall returned — the pin
+    // caught it the same day.)
     try {
       let refreshTimer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
@@ -2978,6 +3281,44 @@ export async function resolveComposioDispatch(
       + 'for this action, rebuild the arguments from that returned schema, then retry. No provider dispatch was started.';
     emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
       guard: 'current-provider-definition-required',
+    });
+    return { ok: false, reason: 'invalid-args', message, toolkit };
+  }
+  const attestedRawDefinition = opts.preparedExecution
+    ? exactRegisteredComposioIdentityForCurrentHostCall(toolSlug)
+    : { status: 'not_attested' as const };
+  // A preparation instrument degrades a REFUSAL to unattested instead of
+  // dying on it — the identity this gate demands is what the instrument
+  // exists to build. A warm manifest still resolves 'exact', so instruments
+  // keep the full prepared path (raw no-retry body, opaque one-shot token)
+  // whenever it is available; the bypass only breaks the cold deadlock.
+  const attestedTerminalDefinition = attestedRawDefinition.status === 'refused' && preparationInstrument
+    ? { status: 'not_attested' as const }
+    : attestedRawDefinition;
+  if (attestedTerminalDefinition.status === 'refused') {
+    const message =
+      `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started because ${attestedTerminalDefinition.reason}. `
+      + 'Refresh and select the exact current provider definition, then retry. No provider dispatch was started.';
+    emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+      guard: 'terminal-provider-identity-required',
+    });
+    return { ok: false, reason: 'invalid-args', message, toolkit };
+  }
+  if (
+    attestedTerminalDefinition.status === 'exact'
+    && !currentProviderDefinitionMatches(attestedTerminalDefinition.identity, {
+      toolSlug,
+      accountId: owner,
+      schema: dispatchSchema,
+      providerOperationVersion: preparedOperationVersion,
+    })
+  ) {
+    const message =
+      `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started because its current input/output definition, `
+      + 'operation version, account, fingerprint, or invoke port no longer matches the selected manifest. '
+      + 'Refresh and select the exact current provider definition, then retry. No provider dispatch was started.';
+    emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+      guard: 'terminal-provider-identity-drift',
     });
     return { ok: false, reason: 'invalid-args', message, toolkit };
   }
@@ -3048,14 +3389,18 @@ export async function resolveComposioDispatch(
   const schemaIdentity = opts.preparedExecution
     ? preparedSchemaIdentity
     : exactProviderInputSchemaIdentity(toolSlug, dispatchSchema);
-  let preparedDispatch: PreparedComposioOneShotDispatch | undefined;
+  let preparedDispatch: PreparedComposioGatewayOneShotDispatch | undefined;
   if (opts.preparedExecution) {
     try {
-      preparedDispatch = prepareComposioOneShotDispatch({
+      preparedDispatch = prepareComposioGatewayOneShot({
         toolSlug,
         args,
         connectedAccountId: owner,
         providerOperationVersion: preparedOperationVersion,
+        schema: dispatchSchema,
+        ...(attestedTerminalDefinition.status === 'exact'
+          ? { exactDefinition: attestedTerminalDefinition.identity }
+          : {}),
       });
     } catch (error) {
       // A preparation instrument stays dispatchable without the one-shot: the
@@ -3081,6 +3426,14 @@ export async function resolveComposioDispatch(
     identity,
     ...schemaIdentity,
     ...(preparedOperationVersion ? { providerOperationVersion: preparedOperationVersion } : {}),
+    ...(attestedTerminalDefinition.status === 'exact'
+      ? {
+          definitionFingerprint: attestedTerminalDefinition.identity.definitionFingerprint,
+          providerOutputSchemaDigest:
+            attestedTerminalDefinition.identity.providerOutputSchemaDigest,
+          invokePortId: attestedTerminalDefinition.identity.invokePortId,
+        }
+      : {}),
     ...(preparedDispatch ? { preparedDispatch } : {}),
     ...(accountIdentityProof ? { accountIdentityProof } : {}),
     senderVerified,
@@ -3104,6 +3457,12 @@ export async function dispatchComposioTool(
   } = {},
 ): Promise<{ ok: true; result: unknown; connectionId?: string; identity?: string } | ComposioGatewayBlocked> {
   const run = harnessRunContextStorage.getStore();
+  // The expected-work logical wall lives outside provider resolution. Reject a
+  // worker mutation before opening that wall so the stronger compose-only
+  // invariant remains the first and final disposition even on an accepted
+  // action turn whose parent owns a frozen business contract.
+  const workerBlock = workerComposeOnlyComposioBlock(toolSlug, opts.sessionId ?? run?.sessionId);
+  if (workerBlock) return workerBlock;
   const dispatchOnce = async (): Promise<{
     ok: true; result: unknown; connectionId?: string; identity?: string;
   } | ComposioGatewayBlocked> => {
@@ -3141,12 +3500,15 @@ export async function dispatchComposioTool(
     }
     let providerOutcomeSettled = false;
     try {
-      // Resolution withholds the one-shot only for a platform-plane
-      // preparation instrument whose exact definition could not be observed;
-      // that instrument still runs, on the compatibility lane.
-      const providerBody = (): Promise<unknown> => resolved.preparedDispatch
-        ? executePreparedComposioTool(resolved.preparedDispatch)
-        : executeComposioTool(toolSlug, resolved.args, resolved.connectionId);
+      const providerBody = (): Promise<unknown> => {
+        if (!resolved.preparedDispatch) {
+          throw new ComposioPreDispatchError(
+            'preparation-required',
+            `${toolSlug} terminal one-shot preparation is absent.`,
+          );
+        }
+        return executePreparedComposioGatewayTool(resolved.preparedDispatch);
+      };
       const providerDispatch = (): Promise<unknown> => {
         if (run?.sessionId && Number.isSafeInteger(run.sourceUserSeq) && (run.sourceUserSeq ?? 0) > 0) {
           return withPhysicalDispatch(
@@ -3180,6 +3542,16 @@ export async function dispatchComposioTool(
           identity: resolved.identity,
           schemaFingerprint: resolved.schemaFingerprint,
           providerInputSchemaDigest: resolved.providerInputSchemaDigest,
+          ...(resolved.definitionFingerprint
+            ? { definitionFingerprint: resolved.definitionFingerprint }
+            : {}),
+          ...(resolved.providerOperationVersion
+            ? { providerOperationVersion: resolved.providerOperationVersion }
+            : {}),
+          ...(Object.prototype.hasOwnProperty.call(resolved, 'providerOutputSchemaDigest')
+            ? { providerOutputSchemaDigest: resolved.providerOutputSchemaDigest ?? null }
+            : {}),
+          ...(resolved.invokePortId ? { invokePortId: resolved.invokePortId } : {}),
         }, providerDispatch)
         : await providerDispatch();
       const failure = detectComposioFailure(result);
@@ -3520,19 +3892,17 @@ async function runComposioExecuteInner(
     attemptStartedAt = Date.now();
     try {
       hooks.beforePhysicalDispatchForTest?.();
-      // A resolution WITHOUT a one-shot is the gateway's deliberate verdict
-      // for exactly one class — a platform-plane preparation instrument whose
-      // exact definition could not be observed. That class dispatches on the
-      // compatibility lane; every other absence is a broken contract.
       const preparedAttempt = hooks.execute || !resolved.preparedDispatch
         ? undefined
         : attempt === 1
           ? resolved.preparedDispatch
-          : prepareComposioOneShotDispatch({
+          : reprepareComposioGatewayOneShot({
+              prior: resolved.preparedDispatch,
               toolSlug,
               args,
               connectedAccountId: effectiveConnectionId,
               providerOperationVersion: resolved.providerOperationVersion,
+              schema: getCachedToolSchema(toolSlug),
             });
       if (!hooks.execute && !preparedAttempt && !composioPlatformPlaneOperation(toolSlug)) {
         throw new Error(`${toolSlug} terminal one-shot preparation is absent.`);
@@ -3562,9 +3932,21 @@ async function runComposioExecuteInner(
         async (crossing) => {
           priorDispatchId = crossing.physicalDispatchId;
           if (hooks.execute) return hooks.execute(toolSlug, args, effectiveConnectionId);
-          return preparedAttempt
-            ? executePreparedComposioTool(preparedAttempt)
-            : executeComposioTool(toolSlug, args, effectiveConnectionId);
+          // A resolution WITHOUT a one-shot is the gateway's deliberate
+          // verdict for exactly one class — a platform-plane preparation
+          // instrument whose exact definition could not be observed. That
+          // class dispatches on the compatibility lane; every other absence
+          // is a broken contract.
+          if (!preparedAttempt) {
+            if (composioPlatformPlaneOperation(toolSlug)) {
+              return executeComposioTool(toolSlug, args, effectiveConnectionId);
+            }
+            throw new ComposioPreDispatchError(
+              'preparation-required',
+              `${toolSlug} terminal one-shot preparation is absent.`,
+            );
+          }
+          return executePreparedComposioGatewayTool(preparedAttempt);
         },
       );
       let output = formatComposioExecuteOutput(result, { ...options, toolSlug });
@@ -3892,6 +4274,48 @@ function parseArgumentsJson(value: string | null | undefined): Record<string, un
   return normalized.args;
 }
 
+type SdkToolInputValidationError = ModelBehaviorError & {
+  originalError?: unknown;
+  toolInvocation?: {
+    input?: unknown;
+  };
+};
+
+/**
+ * The SDK's InvalidToolInputError is intentionally not exported from its
+ * package root. Identify that private subtype by its exported nominal base and
+ * the two own fields its constructor assigns, never by constructor/message
+ * spelling. This guard is used only at the SDK errorFunction boundary where
+ * validation ran before execute.
+ */
+function isSdkToolInputValidationError(error: unknown): error is SdkToolInputValidationError {
+  if (!(error instanceof ModelBehaviorError)) return false;
+  if (
+    !Object.prototype.hasOwnProperty.call(error, 'originalError')
+    || !Object.prototype.hasOwnProperty.call(error, 'toolInvocation')
+  ) return false;
+  const invocation = (error as SdkToolInputValidationError).toolInvocation;
+  return Boolean(
+    invocation
+    && typeof invocation === 'object'
+    && Object.prototype.hasOwnProperty.call(invocation, 'input'),
+  );
+}
+
+/** Keep presentation and authority separate: the model gets repair guidance,
+ * while only the nominal result instance proves no provider dispatch began. */
+function invalidComposioArgumentsPreDispatchResult(error: unknown): InvalidArgumentsPreDispatchResult {
+  const detail = (error instanceof Error ? error.message : String(error))
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240) || 'the callable schema rejected the input';
+  return new InvalidArgumentsPreDispatchResult([
+    'composio_execute_tool arguments were rejected locally before provider dispatch.',
+    `Validation detail: ${detail}`,
+    'Expected input: tool_slug is a non-empty string; arguments is a JSON object encoded as a string (or null); connected_account_id is a string (or null).',
+  ].join('\n'));
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
@@ -4164,9 +4588,13 @@ export async function searchComposioBrokerCandidates(
   query: string,
   limit = DEFAULT_SEARCH_TOTAL_LIMIT,
 ): Promise<ComposioBrokerCandidate[]> {
+  // The public broker can page twenty rows from one admitted discovery. Keep
+  // that whole bounded window on CLI, and the SDK's separately bounded
+  // sixteen-row oversample on SDK; the legacy composio_search_tools surface
+  // retains its own eight-row presentation cap below.
   const maxResults = Math.max(1, Math.min(
     limit,
-    COMPOSIO_LIVE_SEARCH_RETURN_LIMIT,
+    20,
   ));
   const credentials = getComposioCredentialStatus();
   if (composioExecutionUsesCliOnlyLane(credentials)) {
@@ -4314,6 +4742,9 @@ export async function getDynamicComposioRuntimeTools(options: {
         // Same typed-refusal safety net as composio_execute_tool.
         errorFunction: (_context, error) => {
           if (error instanceof ExternalWritePreDispatchError) throw error;
+          if (isSdkToolInputValidationError(error)) {
+            return invalidComposioArgumentsPreDispatchResult(error) as unknown as string;
+          }
           const details = error instanceof Error ? error.toString() : String(error);
           return `An error occurred while running the tool. Please try again. Error: ${details}`;
         },
@@ -4735,6 +5166,9 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     // `orphaned`. Ordinary errors keep the SDK's exact default prose.
     errorFunction: (_context, error) => {
       if (error instanceof ExternalWritePreDispatchError) throw error;
+      if (isSdkToolInputValidationError(error)) {
+        return invalidComposioArgumentsPreDispatchResult(error) as unknown as string;
+      }
       const details = error instanceof Error ? error.toString() : String(error);
       return `An error occurred while running the tool. Please try again. Error: ${details}`;
     },
@@ -4743,9 +5177,11 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       try {
         parsedArgs = parseArgumentsJson(args);
       } catch (err) {
-        // Malformed JSON args is its own retry-inviting failure — make it a
-        // corrective so the model fixes the JSON instead of resending it.
-        return composioThrownErrorOutput(err, { context, details, toolName: 'composio_execute_tool', toolSlug: tool_slug });
+        // The outer SDK schema succeeded, but the gateway's inner JSON did
+        // not. Preserve the same nominal pre-dispatch outcome as an outer
+        // schema rejection; plain corrective prose used to settle as a local
+        // success with a result handle despite zero provider rows.
+        return invalidComposioArgumentsPreDispatchResult(err);
       }
 
       // Standing-constraint enforcement (incl. the hard sender gate) lives in

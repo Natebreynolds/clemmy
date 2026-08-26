@@ -234,6 +234,26 @@ export function clearRunInFlightAfterTerminal(
 ): boolean {
   if (!enabled()) return false;
   try {
+    // Typed terminal publication already settles the exact recovery owner in
+    // the SAME SQLite transaction as the public edge. In the normal success
+    // path there is therefore no marker left for this compatibility finally
+    // to clear. Prove that cheap local fact before opening the workflow-origin
+    // group: the latter is a cross-store, fsynced ownership check whose answer
+    // cannot matter when there is no recovery owner to erase.
+    //
+    // A concurrent newer turn may arm a marker immediately after this read.
+    // Returning without a write is the safe outcome in that race: this older
+    // terminal must not erase the newer owner. When a marker does exist, the
+    // full pending-workflow check and exact CAS below remain unchanged.
+    const marker = openEventLog().prepare(
+      `SELECT 1
+         FROM sessions
+        WHERE id = ?
+          AND kind = 'chat'
+          AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
+        LIMIT 1`,
+    ).get(sessionId);
+    if (!marker) return false;
     // A terminal candidate must never erase the only coarse owner of a queue
     // admission that has not reached immutable source-group activation. The
     // loop supplies the exact accepted source; missing/corrupt queue evidence

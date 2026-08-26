@@ -47,6 +47,10 @@ import {
   type WorkflowNodeArgumentSourceV1,
   type WorkflowNodeInvocationPlanV1,
 } from '../memory/workflow-node-invocation-plan.js';
+import {
+  workflowRawSubprocessDeclarations,
+  workflowRawSubprocessRetirementReason,
+} from './workflow-raw-subprocess-policy.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -874,11 +878,9 @@ function outputContractProvesReferenceNonEmpty(step: WorkflowStepShape, path: st
 
 function hostOwnsExactTemplateSource(step: WorkflowStepShape): boolean {
   if (step.optional === true) return false;
-  // A sandboxed deterministic runner's output is host-captured even when the
-  // runner also performs a governed local write (for example, atomically
-  // advancing a baseline). Side-effect class and output provenance are
-  // separate facts; this predicate proves only the latter.
-  if (step.deterministic?.runner?.trim()) return true;
+  // Raw deterministic subprocess output has no production accepted-source or
+  // logical/physical owner, so it cannot authorize a downstream exact send.
+  if (step.deterministic?.runner?.trim()) return false;
   if (!step.call?.tool) return false;
   const declared = step.sideEffect ?? step.side_effect;
   return structuredCallSideEffectClass({ ...step, sideEffect: declared }) === 'read';
@@ -1150,28 +1152,58 @@ export function validateWorkflowDefinition(
     }
     if (stepHasInvocationPlan) {
       const parsedPlan = parseWorkflowNodeInvocationPlan(rawInvocationPlan);
+      const exactCallPair = step.call !== undefined;
       if (!parsedPlan.ok) {
         errors.push(
           `Step "${step.id ?? '?'}" has an invalid invocation plan: ${parsedPlan.errors.join(' ')}`,
         );
-      } else if (parsedPlan.plan.binding.effect !== 'read') {
-        errors.push(
-          `Step "${step.id ?? '?'}" invocationPlan effect must be read; provider-neutral compute purity is not represented yet.`,
-        );
+      } else if (exactCallPair) {
+        const effect = parsedPlan.plan.binding.effect;
+        const declaredEffect = step.sideEffect ?? step.side_effect;
+        if (effect === 'compute') {
+          errors.push(
+            `Step "${step.id ?? '?'}" exact call cannot use a compute invocationPlan; provider-neutral compute purity is not represented yet.`,
+          );
+        }
+        if (step.call?.tool !== parsedPlan.plan.binding.operationId) {
+          errors.push(
+            `Step "${step.id ?? '?'}" call.tool must exactly match invocationPlan binding.operationId.`,
+          );
+        }
+        const sideEffectMatches = effect === 'read' || effect === 'host_only'
+          ? declaredEffect === 'read'
+          : effect === 'external_write'
+            ? declaredEffect === 'write' || declaredEffect === 'send'
+            : declaredEffect === 'write';
+        if (!sideEffectMatches) {
+          errors.push(
+            `Step "${step.id ?? '?'}" sideEffect does not match exact invocationPlan effect "${effect}".`,
+          );
+        }
+        if (step.forEach) {
+          errors.push(
+            `Step "${step.id ?? '?'}" exact call cannot use forEach until per-item occurrence/attempt identity is represented.`,
+          );
+        }
+      } else {
+        if (parsedPlan.plan.binding.effect !== 'read') {
+          errors.push(
+            `Step "${step.id ?? '?'}" standalone invocationPlan effect must be read; provider-neutral compute purity is not represented and mutation authority belongs to an exact call+plan pair.`,
+          );
+        }
       }
       if (
-        step.call !== undefined
-        || step.deterministic !== undefined
+        step.deterministic !== undefined
         || step.subgraph !== undefined
         || step.loopUntil !== undefined
         || step.loop_until !== undefined
       ) {
         errors.push(
-          `Step "${step.id ?? '?'}" invocationPlan is mutually exclusive with call, deterministic, subgraph, and loop executors.`,
+          `Step "${step.id ?? '?'}" invocationPlan is mutually exclusive with deterministic, subgraph, and loop executors.`,
         );
       }
       const declaredEffect = step.sideEffect ?? step.side_effect;
-      if (declaredEffect !== 'read') {
+      if (!exactCallPair && declaredEffect !== 'read') {
         errors.push(
           `Step "${step.id ?? '?'}" invocationPlan must declare sideEffect: read; v1 refuses write and send authority.`,
         );
@@ -1181,12 +1213,12 @@ export function validateWorkflowDefinition(
           `Step "${step.id ?? '?'}" invocationPlan cannot also expose name-based allowedTools.`,
         );
       }
-      if (step.requiresApproval === true || step.requires_approval === true) {
+      if (!exactCallPair && (step.requiresApproval === true || step.requires_approval === true)) {
         errors.push(
           `Step "${step.id ?? '?'}" invocationPlan cannot use generic step approval as pilot authority; consent must bind the exact compiled plan lineage.`,
         );
       }
-      if (data.enabled !== false && data.trigger?.interval === undefined) {
+      if (!exactCallPair && data.enabled !== false && data.trigger?.interval === undefined) {
         errors.push(
           `Step "${step.id ?? '?'}" invocationPlan can only be enabled as an interval definition; runtime still requires exact standing recurrence consent and per-occurrence admission.`,
         );
@@ -1197,14 +1229,17 @@ export function validateWorkflowDefinition(
       if (!stepHasCall) {
         errors.push(`Step "${step.id ?? '?'}" declares call but no tool. Set call.tool to the tool slug, or remove call.`);
       }
+      if (!stepHasInvocationPlan) {
+        errors.push(
+          `Step "${step.id ?? '?'}" structured call is missing its exact invocationPlan; name/args-only calls have no production dispatch authority.`,
+        );
+      }
       if (step.deterministic) {
         errors.push(`Step "${step.id ?? '?'}" declares both call and deterministic — pick one non-LLM executor.`);
       }
-      // CALL-2b: a per-item structured call is allowed ONLY for a READ-class call
-      // (idempotent — safe to retry/resume). A send/write per-item call can
-      // double-fire on retry/crash-resume (a direct call records no external_write
-      // for the guards to see), so it stays blocked until idempotency tracking
-      // lands and is live-tested.
+      // Per-item exact occurrence/attempt identity is not represented yet.
+      // The exact-pair branch above refuses every forEach; this legacy check
+      // retains the conservative diagnostic for malformed name-only drafts.
       if (step.forEach && structuredCallSideEffectClass(step) !== 'read') {
         errors.push(`Step "${step.id ?? '?'}" declares a ${structuredCallSideEffectClass(step)}-class call with forEach — a per-item send/write call is not supported yet (double-act risk without per-call idempotency). Use a plain forEach step for the mutating action, or declare sideEffect: read only if the call truly is read-only.`);
       }
@@ -1220,7 +1255,7 @@ export function validateWorkflowDefinition(
       // refuses disabled definitions, so autonomous authority is granted only
       // when the persisted definition is enabled and satisfies every exact-call
       // condition below.
-      if (!callRequiresApproval && structuredCallSideEffectClass(step) === 'send') {
+      if (!stepHasInvocationPlan && !callRequiresApproval && structuredCallSideEffectClass(step) === 'send') {
         const disabledExactDraft = data.enabled === false
           && opts.allowDisabledExactSendDraft === true;
         // The authoring-only draft seam exempts only provider-observed schema
@@ -1540,7 +1575,13 @@ export function validateWorkflowDefinition(
     if (missingSkill) warnings.push(missingSkill);
 
     const deterministicIssue = checkDeterministicRunner(step);
-    if (deterministicIssue) warnings.push(deterministicIssue);
+    if (deterministicIssue) {
+      if (step.deterministic?.runner?.trim()) errors.push(deterministicIssue);
+      else warnings.push(deterministicIssue);
+    }
+    for (const declaration of workflowRawSubprocessDeclarations(step)) {
+      errors.push(workflowRawSubprocessRetirementReason(declaration));
+    }
 
     const parallelismIssue = checkParallelismHint(step);
     if (parallelismIssue) warnings.push(parallelismIssue);

@@ -303,7 +303,7 @@ async function visibleToolNames(
   });
 }
 
-test('GATE surface: fresh plan has no worker/business I/O; admitted plan swaps plan_task for run_worker in the same agent', async () => {
+test('GATE surface: fresh discovery has no worker/business I/O; admitted plan swaps discovery controls for run_worker in the same agent', async () => {
   const text = 'Find the top 5 widgets based on ratings and add them to a new workbook for me.';
   const session = eventlog.createSession({ id: 'long-task-surface', kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -329,7 +329,9 @@ test('GATE surface: fresh plan has no worker/business I/O; admitted plan swaps p
   const turnIdentity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
   const before = await visibleToolNames(agent, turnIdentity);
   const prePlanWorkCall = (agent.tools ?? []).find((entry) => entry.name === 'work_call');
-  assert.equal(before.includes('plan_task'), true);
+  assert.equal(before.includes('tool_search'), true);
+  assert.equal(before.includes('plan_task'), false,
+    'an empty planning catalog cannot expose plan_task before exact capability disclosure');
   assert.equal(before.includes('run_worker'), false);
   assert.equal(before.includes('write_file'), false);
   assert.equal(before.includes('composio_execute_tool'), false);

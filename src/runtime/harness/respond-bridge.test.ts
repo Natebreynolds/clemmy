@@ -329,10 +329,9 @@ test('harnessSurfaceEnabled: ALL surfaces default ON (FORK-collapse complete); k
   delete process.env.CLEMMY_HARNESS_DASHBOARD;
 });
 
-test('host chat freezes engine ownership before eager read or semantic graph work', async () => {
-  process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+test('host chat freezes engine ownership before semantic graph work', async () => {
+  process.env.CLEMMY_TURN_ENGINE = 'host_v1_read_only';
   const sessionId = 'bridge-host-engine-entry';
-  let readPortCalls = 0;
   let runCalls = 0;
   let selectedEngine: string | undefined;
   let selectedMaxTurns: number | undefined;
@@ -341,7 +340,6 @@ test('host chat freezes engine ownership before eager read or semantic graph wor
   let acceptedRoute: string | undefined;
   _setBridgeImplsForTests({
     configure: okConfigure,
-    acceptedTurnReadPorts: (async () => { readPortCalls += 1; return null; }) as never,
     buildAgent: (async (input: { acceptedRoute?: string }) => {
       acceptedRoute = input.acceptedRoute;
       return FAKE_AGENT;
@@ -381,7 +379,6 @@ test('host chat freezes engine ownership before eager read or semantic graph wor
   }, { maxTurns: 7, maxSteps: 9 });
 
   assert.equal(response.text, 'HOST ENGINE READY');
-  assert.equal(readPortCalls, 0, 'the eager warm executor cannot consume a host-owned turn');
   assert.equal(runCalls, 1);
   assert.equal(selectedEngine, 'host_v1_read_only');
   assert.equal(selectedMaxTurns, 7);
@@ -642,12 +639,10 @@ test('a resolver-returned fresh source binding is ignored without creating a che
 test('production host_v1 owns fresh chat at the bridge before legacy semantics or SDK execution', async () => {
   process.env.CLEMMY_TURN_ENGINE = 'host_v1';
   const sessionId = 'bridge-production-host-engine-entry';
-  let readPortCalls = 0;
   let selectedEngine: string | undefined;
   let legacyCalls = 0;
   _setBridgeImplsForTests({
     configure: okConfigure,
-    acceptedTurnReadPorts: (async () => { readPortCalls += 1; return null; }) as never,
     buildAgent: (async () => FAKE_AGENT) as never,
     runConversation: (async (options: {
       sessionId: string;
@@ -680,7 +675,6 @@ test('production host_v1 owns fresh chat at the bridge before legacy semantics o
 
   assert.equal(response.text, 'PRODUCTION HOST READY');
   assert.equal(selectedEngine, 'host_v1');
-  assert.equal(readPortCalls, 0);
   assert.equal(legacyCalls, 0);
   assert.equal(listEvents(sessionId, { types: ['turn_graph_shadow'] }).length, 0);
   assert.equal(listEvents(sessionId, { types: ['accepted_task_authority_armed'] }).length, 0);
@@ -707,14 +701,12 @@ test('explicit completed-answer replay is provider-neutral, zero-model, typed, a
     let buildCalls = 0;
     let runCalls = 0;
     let claudeCalls = 0;
-    let readPortCalls = 0;
     let legacyCalls = 0;
     _setBridgeImplsForTests({
       configure: (async () => { configureCalls += 1; return { ok: true }; }) as never,
       buildAgent: (async () => { buildCalls += 1; return FAKE_AGENT; }) as never,
       runConversation: (async () => { runCalls += 1; throw new Error('model lane must not run'); }) as never,
       claudeAgentBrain: (async () => { claudeCalls += 1; throw new Error('Claude must not run'); }) as never,
-      acceptedTurnReadPorts: (async () => { readPortCalls += 1; return null; }) as never,
       completedAnswerReplayProtection: () => [],
     });
     const request = {
@@ -741,9 +733,9 @@ test('explicit completed-answer replay is provider-neutral, zero-model, typed, a
     assert.equal(first.route?.effectiveModel, undefined);
     assert.equal(second.route?.transport, 'completed_answer_replay');
     assert.deepEqual(
-      { configureCalls, buildCalls, runCalls, claudeCalls, readPortCalls, legacyCalls },
-      { configureCalls: 0, buildCalls: 0, runCalls: 0, claudeCalls: 0, readPortCalls: 0, legacyCalls: 0 },
-      `${provider.label}: no runtime, brain, read-provider, or legacy work ran`,
+      { configureCalls, buildCalls, runCalls, claudeCalls, legacyCalls },
+      { configureCalls: 0, buildCalls: 0, runCalls: 0, claudeCalls: 0, legacyCalls: 0 },
+      `${provider.label}: no runtime, brain, or legacy work ran`,
     );
 
     const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
@@ -815,14 +807,12 @@ test('exact bridge replay treats legacy and corrupt terminal claims as blocked a
       let buildCalls = 0;
       let runCalls = 0;
       let claudeCalls = 0;
-      let readPortCalls = 0;
       let legacyCalls = 0;
       _setBridgeImplsForTests({
         configure: (async () => { configureCalls += 1; return { ok: true }; }) as never,
         buildAgent: (async () => { buildCalls += 1; return FAKE_AGENT; }) as never,
         runConversation: (async () => { runCalls += 1; throw new Error('model lane must not run'); }) as never,
         claudeAgentBrain: (async () => { claudeCalls += 1; throw new Error('Claude lane must not run'); }) as never,
-        acceptedTurnReadPorts: (async () => { readPortCalls += 1; return null; }) as never,
       });
 
       const response = await respondPreferHarness('home', {
@@ -838,8 +828,8 @@ test('exact bridge replay treats legacy and corrupt terminal claims as blocked a
       assert.equal(response.stoppedReason, 'blocked', JSON.stringify(response));
       assert.match(response.text, /cannot verify safely/i);
       assert.deepEqual(
-        { configureCalls, buildCalls, runCalls, claudeCalls, readPortCalls, legacyCalls },
-        { configureCalls: 0, buildCalls: 0, runCalls: 0, claudeCalls: 0, readPortCalls: 0, legacyCalls: 0 },
+        { configureCalls, buildCalls, runCalls, claudeCalls, legacyCalls },
+        { configureCalls: 0, buildCalls: 0, runCalls: 0, claudeCalls: 0, legacyCalls: 0 },
       );
       assert.ok(getLatestRunAttempt(sessionId)?.finishedAt, 'the exact replay settles its physical request attempt');
       assert.equal(
@@ -919,7 +909,6 @@ test('Continue, Resume, and Keep going after a completed answer reach ordinary b
           },
         };
       }) as never,
-      acceptedTurnReadPorts: () => null,
       completedAnswerReplayProtection: () => {
         replayProtectionCalls += 1;
         return [];

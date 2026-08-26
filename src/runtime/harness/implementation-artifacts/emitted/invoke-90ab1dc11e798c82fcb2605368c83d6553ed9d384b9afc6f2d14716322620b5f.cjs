@@ -280,8 +280,11 @@ function contractFileName(identifier) {
   const digest = (0, import_node_crypto2.createHash)("sha256").update(identifier).digest("hex").slice(0, 12);
   return `${safe}.${digest}.json`;
 }
+function digestSchema(schema) {
+  return (0, import_node_crypto2.createHash)("sha256").update(stableStringify(schema)).digest("hex");
+}
 function fingerprintSchema(schema) {
-  return (0, import_node_crypto2.createHash)("sha256").update(stableStringify(schema)).digest("hex").slice(0, 32);
+  return digestSchema(schema).slice(0, 32);
 }
 function stableStringify(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
@@ -304,6 +307,20 @@ function validateToolContractRecord(record, expectedIdentifier) {
   if (!Number.isFinite(age) || age < 0 || age > CONTRACT_TTL_MS) return null;
   if (!record.schema || typeof record.schema !== "object" || Array.isArray(record.schema)) return null;
   if (fingerprintSchema(record.schema) !== record.fingerprint) return null;
+  const outputFields = [
+    record.providerOutputSchema,
+    record.providerOutputSchemaDigest,
+    record.providerOutputSchemaFingerprint
+  ];
+  const hasAnyOutputField = outputFields.some((value) => value !== void 0);
+  const hasAllOutputFields = outputFields.every((value) => value !== void 0);
+  if (record.providerOutputSchemaObserved !== void 0 && record.providerOutputSchemaObserved !== true) return null;
+  if (hasAnyOutputField && (!hasAllOutputFields || record.providerOutputSchemaObserved !== true)) {
+    return null;
+  }
+  if (hasAllOutputFields) {
+    if (!record.providerOutputSchema || typeof record.providerOutputSchema !== "object" || Array.isArray(record.providerOutputSchema) || digestSchema(record.providerOutputSchema) !== record.providerOutputSchemaDigest || fingerprintSchema(record.providerOutputSchema) !== record.providerOutputSchemaFingerprint) return null;
+  }
   return record;
 }
 function caseTwinIdentifier(identifier) {
@@ -375,9 +392,61 @@ var init_capability_live_identity = __esm({
 });
 
 // src/runtime/harness/capability-manifest.ts
+function canonicalManifestBytes(manifest) {
+  return JSON.stringify({
+    version: manifest.version,
+    manifestId: manifest.manifestId,
+    providerKind: manifest.providerKind,
+    operationId: manifest.operationId,
+    providerIdentity: manifest.providerIdentity,
+    providerVersion: manifest.providerVersion,
+    operationVersion: manifest.operationVersion,
+    definitionFingerprint: manifest.definitionFingerprint,
+    // Preserve byte compatibility for already-installed manifests: absence is
+    // omitted rather than encoded as null. New external manifests bind these
+    // facts into their digest.
+    ...manifest.externalDefinition ? {
+      externalDefinition: {
+        version: manifest.externalDefinition.version,
+        providerInputSchemaDigest: manifest.externalDefinition.providerInputSchemaDigest,
+        ...manifest.externalDefinition.providerOutputSchemaObserved === true ? { providerOutputSchemaObserved: true } : {},
+        ...manifest.externalDefinition.providerOutputSchemaDigest ? { providerOutputSchemaDigest: manifest.externalDefinition.providerOutputSchemaDigest } : {},
+        semanticName: manifest.externalDefinition.semanticName,
+        behaviorHints: { ...manifest.externalDefinition.behaviorHints }
+      }
+    } : {},
+    effect: manifest.effect,
+    destination: manifest.destination ?? null,
+    accountId: manifest.accountId,
+    idempotency: manifest.idempotency,
+    reconciliation: manifest.reconciliation,
+    outputContract: manifest.outputContract,
+    purpose: manifest.purpose,
+    acceptedInputKinds: [...manifest.acceptedInputKinds],
+    producedOutputKinds: [...manifest.producedOutputKinds],
+    applicableDeliverableKinds: [...manifest.applicableDeliverableKinds],
+    evidenceContract: {
+      kinds: [...manifest.evidenceContract.kinds],
+      readbackRequired: manifest.evidenceContract.readbackRequired
+    },
+    continuationContract: manifest.continuationContract ?? null,
+    readbackContract: manifest.readbackContract ?? null,
+    provenance: manifest.provenance,
+    lifecycle: manifest.lifecycle,
+    delegatedFrom: manifest.delegatedFrom ?? null,
+    argumentCompiler: manifest.argumentCompiler,
+    invokePortId: manifest.invokePortId,
+    reconcilePortId: manifest.reconcilePortId ?? null
+  });
+}
+function capabilityManifestDigest(manifest) {
+  return (0, import_node_crypto3.createHash)("sha256").update(canonicalManifestBytes(manifest), "utf8").digest("hex");
+}
+var import_node_crypto3;
 var init_capability_manifest = __esm({
   "src/runtime/harness/capability-manifest.ts"() {
     "use strict";
+    import_node_crypto3 = require("node:crypto");
   }
 });
 
@@ -582,9 +651,30 @@ async function executeSealed(operationId, args, accountId, expected) {
     return attested.execute({ operationId, args, accountId, ...expected ? { expected } : {} });
   }
   if (isolatedTestContractActive() && installedTransport) {
-    return installedTransport({ operationId, args, accountId });
+    return installedTransport({ operationId, args, accountId, ...expected ? { expected } : {} });
   }
   throw new Error(`${operationId} transport unavailable`);
+}
+function attestedExpectationForManifest(manifest) {
+  const external = manifest.externalDefinition;
+  return {
+    manifestId: manifest.manifestId,
+    manifestDigest: capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    providerIdentity: manifest.providerIdentity,
+    providerVersion: manifest.providerVersion,
+    operationVersion: manifest.operationVersion,
+    definitionFingerprint: manifest.definitionFingerprint,
+    ...external ? {
+      providerInputSchemaDigest: external.providerInputSchemaDigest,
+      ...external.providerOutputSchemaObserved === true ? {
+        providerOutputSchemaObserved: true,
+        providerOutputSchemaDigest: external.providerOutputSchemaDigest ?? null
+      } : {}
+    } : {},
+    invokePortId: manifest.invokePortId,
+    argumentCompiler: { ...manifest.argumentCompiler }
+  };
 }
 function refuseRoleSwitch(role, sealedPurpose) {
   if (role === "readback" && sealedPurpose === "locate_source") {
@@ -649,6 +739,7 @@ function invokeForSealedManifest(manifest) {
     acceptedInputKinds: Object.freeze([...manifest.acceptedInputKinds]),
     producedOutputKinds: Object.freeze([...manifest.producedOutputKinds])
   });
+  const expectedTransport = () => Object.freeze(attestedExpectationForManifest(manifest));
   return async ({ payload, role, envelope, binding, authority }) => {
     refuseRoleSwitch(role, sealed.purpose);
     if (binding.capabilityId && binding.capabilityId !== sealed.manifestId) {
@@ -691,7 +782,7 @@ function invokeForSealedManifest(manifest) {
         query: query.query,
         fields: [...query.fields],
         count: query.count
-      }, accountId);
+      }, accountId, expectedTransport());
       const record = asRecord(result);
       const locator = firstString(record, ["locator"]) || query.locator;
       return { locator, query: firstString(record, ["query"]) || query.query, fields: query.fields, count: query.count };
@@ -701,7 +792,7 @@ function invokeForSealedManifest(manifest) {
       const result = await executeSealed(sealed.operationId, {
         locator: compiled.locator,
         query: compiled.query ?? ""
-      }, accountId);
+      }, accountId, expectedTransport());
       const records = asRecords(result);
       assertDistinctReadyRecords(records, envelope?.cardinality);
       return { records };
@@ -723,7 +814,7 @@ function invokeForSealedManifest(manifest) {
           throw new Error(`create missing required field ${field}`);
         }
       }
-      const result = await executeSealed(sealed.operationId, createArgs, accountId);
+      const result = await executeSealed(sealed.operationId, createArgs, accountId, expectedTransport());
       const artifact = sheetArtifactFromProvider(result);
       return {
         ...artifact,
@@ -743,7 +834,7 @@ function invokeForSealedManifest(manifest) {
         const result = await executeSealed(sealed.operationId, {
           spreadsheet_id: id,
           ranges: [range]
-        }, accountId);
+        }, accountId, expectedTransport());
         const record = asRecord(result);
         const returnedId = firstString(record, ["spreadsheet_id", "spreadsheetId", "id"]) || id;
         if (returnedId !== id) throw new Error("readback spreadsheet id does not match the created id");
@@ -767,16 +858,13 @@ function invokeForSealedManifest(manifest) {
     if (sealed.purpose === "invoke_live_read" && sealed.effect === "read") {
       const compiled = authority?.canonicalArgs ?? (payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null);
       if (!compiled) throw new Error("live read requires canonical object arguments");
-      const result = await executeSealed(sealed.operationId, compiled, accountId, {
-        providerKind: sealed.providerKind,
-        providerIdentity: sealed.providerIdentity,
-        providerVersion: sealed.providerVersion,
-        operationVersion: sealed.operationVersion,
-        definitionFingerprint: sealed.definitionFingerprint,
-        invokePortId: sealed.invokePortId,
-        argumentCompiler: { ...sealed.argumentCompiler }
-      });
+      const result = await executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
       return { result, complete: true };
+    }
+    if (sealed.providerKind === "native_mcp") {
+      const compiled = authority?.canonicalArgs ?? (payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null);
+      if (!compiled) throw new Error("native MCP invoke requires canonical object arguments");
+      return executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
     }
     throw new Error(`no sealed invoke for exact operation ${sealed.operationId}`);
   };

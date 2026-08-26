@@ -451,7 +451,7 @@ test('tool_outputs table — round-trips 200KB losslessly', () => {
   assert.equal(row.truncatedAtWrite, false);
 });
 
-test('tool_outputs — stores large sub-cap results in full, tail-truncates + marks only beyond the cap', () => {
+test('tool_outputs — stores sub-boundary results inline and larger results in lossless chunks', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   // 300KB exceeded the OLD 200KB ceiling (tail-dropped); under the 2MB cap it is now kept whole.
@@ -461,14 +461,14 @@ test('tool_outputs — stores large sub-cap results in full, tail-truncates + ma
   assert.ok(bigRow);
   assert.equal(bigRow.output.length, 300_000, 'sub-cap result stored in full — no tail loss');
   assert.equal(bigRow.truncatedAtWrite, false);
-  // Beyond the cap: tail-truncate + mark (backstop).
+  // Beyond the inline boundary: ordered chunks retain the complete value.
   const oversized = 'y'.repeat(TOOL_OUTPUT_MAX_BYTES + 100_000);
   writeToolOutput({ sessionId: sess.id, callId: 'call_huge', tool: 'composio.huge', output: oversized });
   const row = getToolOutput(sess.id, 'call_huge');
   assert.ok(row);
   assert.equal(row.contentBytes, TOOL_OUTPUT_MAX_BYTES + 100_000, 'original byte count preserved on the row');
-  assert.equal(row.truncatedAtWrite, true);
-  assert.ok(row.output.length <= TOOL_OUTPUT_MAX_BYTES, 'stored payload is bounded by the cap');
+  assert.equal(row.truncatedAtWrite, false);
+  assert.equal(row.output.length, TOOL_OUTPUT_MAX_BYTES + 100_000, 'stored payload reassembles losslessly');
 });
 
 test('tool_outputs — call_id is scoped per session (no cross-session leakage)', () => {

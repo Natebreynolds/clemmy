@@ -17,11 +17,31 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-space-smo
 const smoke = await import('./space-smoke.js');
 const store = await import('./store.js');
 const runner = await import('./runner.js');
+const approvals = await import('../runtime/harness/approval-registry.js');
+const eventlog = await import('../runtime/harness/eventlog.js');
 
 function writeRunner(slug: string, file: string, body: string) {
   const dir = store.resolveInSpace(slug, 'data');
   mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, file), body, 'utf-8');
+}
+
+async function approveInstalledRunnerFixture(
+  slug: string,
+  source: Parameters<typeof runner.runSpaceDataSource>[1],
+): Promise<void> {
+  const blocked = await runner.runSpaceDataSource(slug, source);
+  assert.equal(blocked.ok, false);
+  const card = approvals.listPending({
+    sessionId: `space-${slug}`,
+    status: 'pending',
+  }).find((row) => row.args?.sourceId === source.id);
+  assert.ok(card);
+  eventlog.openEventLog().prepare(`
+    UPDATE pending_approvals
+       SET status = 'resolved', resolution = 'approved', resolver = ?, resolved_at = ?
+     WHERE approval_id = ? AND status = 'pending'
+  `).run('smoke-runner-fixture', new Date().toISOString(), card.approvalId);
 }
 
 test('looksEmpty: empties vs data', () => {
@@ -40,19 +60,16 @@ test('toolkitSlugForTool derives the toolkit', () => {
   assert.equal(smoke.toolkitSlugForTool('SALESFORCE_QUERY'), 'salesforce');
 });
 
-test('smoke: a source returning rows passes (active, no failures, not empty)', async () => {
+test('smoke: an approved local source is a contained failure before its rows execute', async () => {
   const slug = 'smoke-ok';
-  store.spaceStore.save({ id: slug, title: 'OK', dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }] });
-  runner._setSpaceComposioDispatchForTests(async () => ({
-    ok: true as const, result: { rows: [{ a: 1 }] }, connectionId: 'ca-proof', identity: 'proof@example.test',
-  }));
-  try {
-    const res = await smoke.runSpaceCreationSmoke(slug);
-    assert.equal(res.failed.length, 0);
-    assert.equal(res.empty.length, 0);
-  } finally {
-    runner._setSpaceComposioDispatchForTests(null);
-  }
+  const source = { id: 'pull', runner: 'pull.mjs' };
+  store.spaceStore.save({ id: slug, title: 'OK', dataSources: [source] });
+  writeRunner(slug, source.runner, `process.stdout.write(JSON.stringify({rows:[{a:1}]}));`);
+  await approveInstalledRunnerFixture(slug, source);
+  const res = await smoke.runSpaceCreationSmoke(slug);
+  assert.equal(res.failed.length, 1);
+  assert.match(res.failed[0]?.error ?? '', /no shared durable call authority/i);
+  assert.equal(res.empty.length, 0);
 });
 
 test('smoke: an installed legacy runner waits for pinned-entrypoint approval without being mislabeled broken', async () => {
@@ -66,39 +83,34 @@ test('smoke: an installed legacy runner waits for pinned-entrypoint approval wit
   assert.match(res.awaitingApproval[0]?.approvalId ?? '', /^apr-/);
 });
 
-test('smoke: a source returning [] is flagged empty (stays active, becomes a gap)', async () => {
+test('smoke: contained local source cannot be classified from fabricated empty output', async () => {
   const slug = 'smoke-empty';
-  store.spaceStore.save({ id: slug, title: 'Empty', dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }] });
-  runner._setSpaceComposioDispatchForTests(async () => ({
-    ok: true as const, result: { rows: [] }, connectionId: 'ca-proof', identity: 'proof@example.test',
-  }));
-  try {
-    const res = await smoke.runSpaceCreationSmoke(slug);
-    assert.equal(res.failed.length, 0);
-    assert.deepEqual(res.empty, ['pull']);
-  } finally {
-    runner._setSpaceComposioDispatchForTests(null);
-  }
+  const source = { id: 'pull', runner: 'pull.mjs' };
+  store.spaceStore.save({ id: slug, title: 'Empty', dataSources: [source] });
+  writeRunner(slug, source.runner, `process.stdout.write(JSON.stringify({rows:[]}));`);
+  await approveInstalledRunnerFixture(slug, source);
+  const res = await smoke.runSpaceCreationSmoke(slug);
+  assert.equal(res.failed.length, 1);
+  assert.match(res.failed[0]?.error ?? '', /no shared durable call authority/i);
+  assert.deepEqual(res.empty, []);
 });
 
-test('smoke: an explicitly allowed empty source is healthy and idempotent', async () => {
+test('smoke: allowEmpty cannot waive local execution authority', async () => {
   const slug = 'smoke-expected-empty';
+  const source = { id: 'drafts', runner: 'drafts.mjs', allowEmpty: true };
   store.spaceStore.save({
     id: slug,
     title: 'New content calendar',
-    dataSources: [{ id: 'drafts', composioSlug: 'SALESFORCE_GET_DRAFTS', allowEmpty: true }],
+    dataSources: [source],
   });
-  runner._setSpaceComposioDispatchForTests(async () => ({
-    ok: true as const, result: { rows: [] }, connectionId: 'ca-proof', identity: 'proof@example.test',
-  }));
-  try {
-    const first = await smoke.runSpaceCreationSmoke(slug);
-    const second = await smoke.runSpaceCreationSmoke(slug);
-    assert.deepEqual(first.failed, []);
-    assert.deepEqual(first.empty, []);
-    assert.deepEqual(second.failed, []);
-    assert.deepEqual(second.empty, []);
-  } finally {
-    runner._setSpaceComposioDispatchForTests(null);
-  }
+  writeRunner(slug, source.runner, `process.stdout.write(JSON.stringify({rows:[]}));`);
+  await approveInstalledRunnerFixture(slug, source);
+  const first = await smoke.runSpaceCreationSmoke(slug);
+  const second = await smoke.runSpaceCreationSmoke(slug);
+  assert.equal(first.failed.length, 1);
+  assert.match(first.failed[0]?.error ?? '', /no shared durable call authority/i);
+  assert.deepEqual(first.empty, []);
+  assert.equal(second.failed.length, 1);
+  assert.match(second.failed[0]?.error ?? '', /no shared durable call authority/i);
+  assert.deepEqual(second.empty, []);
 });

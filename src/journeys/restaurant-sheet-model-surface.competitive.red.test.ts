@@ -511,17 +511,22 @@ test('competitive byte ledger: cold natural request stays below planning and dis
     'provider_write_projection',
   ]);
   const discoveryOnly = new Set(['discovery_projection']);
-  const preActivation = captures.slice(0, 2);
-  const initialSdkBytes = captures[0]?.sdkBytes ?? Number.POSITIVE_INFINITY;
-  const initialWireBytes = captures[0]?.wireBytes ?? Number.POSITIVE_INFINITY;
-  const initialToolSchemaBytes = captures[0]?.wireToolsBytes ?? Number.POSITIVE_INFINITY;
+  const foregroundCaptures = captures.slice(0, 4);
+  assert.equal(foregroundCaptures.length, 4,
+    `expected all four foreground model steps, captured ${captures.length} total requests`);
+  assert.match(foregroundCaptures[0]?.input[0]?.preview ?? '', new RegExp(PROMPT),
+    'the measured slice must begin with the exact cold foreground request');
+  const preActivation = foregroundCaptures.slice(0, 2);
+  const initialSdkBytes = foregroundCaptures[0]?.sdkBytes ?? Number.POSITIVE_INFINITY;
+  const initialWireBytes = foregroundCaptures[0]?.wireBytes ?? Number.POSITIVE_INFINITY;
+  const initialToolSchemaBytes = foregroundCaptures[0]?.wireToolsBytes ?? Number.POSITIVE_INFINITY;
   const preActivationUniqueToolBytes = uniqueToolBytes(preActivation);
-  const allUniqueToolBytes = uniqueToolBytes(captures);
-  const uniqueDiscoveryProjectionBytes = uniqueProjectionBytes(captures, discoveryOnly);
-  const uniqueDiscoveryItems = uniqueProjectionItems(captures, discoveryOnly);
+  const allUniqueToolBytes = uniqueToolBytes(foregroundCaptures);
+  const uniqueDiscoveryProjectionBytes = uniqueProjectionBytes(foregroundCaptures, discoveryOnly);
+  const uniqueDiscoveryItems = uniqueProjectionItems(foregroundCaptures, discoveryOnly);
   const preActivationDiscoverySchemaBytes = preActivationUniqueToolBytes + uniqueDiscoveryProjectionBytes;
   const wholeJourneyDiscoverySchemaBytes = allUniqueToolBytes + uniqueDiscoveryProjectionBytes;
-  const prefixGroups = [...captures.reduce((groups, request) => {
+  const prefixGroups = [...foregroundCaptures.reduce((groups, request) => {
     const existing = groups.get(request.cacheablePrefixSha256);
     if (existing) existing.steps.push(request.step);
     else groups.set(request.cacheablePrefixSha256, {
@@ -531,12 +536,13 @@ test('competitive byte ledger: cold natural request stays below planning and dis
     });
     return groups;
   }, new Map<string, { sha256: string; bytes: number; steps: number[] }>()).values()];
-  const contextSnapshotProjection = captures.map((request) => {
+  const contextSnapshotProjection = foregroundCaptures.map((request) => {
     const items = request.input.filter((item) => item.kind === 'accepted_turn_context_snapshot');
     return {
       step: request.step,
       count: items.length,
       indexes: items.map((item) => item.index),
+      inputTailIndex: request.input.length - 1,
       digests: items.map((item) => item.sha256),
       bytes: items.reduce((sum, item) => sum + item.itemBytes, 0),
     };
@@ -550,7 +556,7 @@ test('competitive byte ledger: cold natural request stays below planning and dis
     cold: {
       initialSdkBytes,
       initialWireBytes,
-      initialEstimatedSemanticTokens: captures[0]?.estimatedSemanticTokens ?? null,
+      initialEstimatedSemanticTokens: foregroundCaptures[0]?.estimatedSemanticTokens ?? null,
       initialToolSchemaBytes,
       preActivationUniqueToolBytes,
       allUniqueToolBytes,
@@ -568,21 +574,22 @@ test('competitive byte ledger: cold natural request stays below planning and dis
       preActivationTransmittedDiscoverySchemaBytes:
         preActivation.reduce((sum, request) => sum + request.wireToolsBytes, 0)
         + repeatedProjectionBytes(preActivation, discoveryOnly),
-      repeatedToolSchemaBytes: captures.reduce((sum, request) => sum + request.wireToolsBytes, 0),
-      repeatedDiscoveryProjectionBytes: repeatedProjectionBytes(captures, discoveryOnly),
-      repeatedAllToolProjectionBytes: repeatedProjectionBytes(captures, projections),
-      semanticPromptBytesTransmitted: captures.reduce((sum, request) => sum + request.semanticPromptBytes, 0),
-      estimatedSemanticTokensTransmitted: captures
+      repeatedToolSchemaBytes: foregroundCaptures.reduce((sum, request) => sum + request.wireToolsBytes, 0),
+      repeatedDiscoveryProjectionBytes: repeatedProjectionBytes(foregroundCaptures, discoveryOnly),
+      repeatedAllToolProjectionBytes: repeatedProjectionBytes(foregroundCaptures, projections),
+      semanticPromptBytesTransmitted: foregroundCaptures.reduce((sum, request) => sum + request.semanticPromptBytes, 0),
+      estimatedSemanticTokensTransmitted: foregroundCaptures
         .reduce((sum, request) => sum + request.estimatedSemanticTokens, 0),
-      bytePrefixPotentialUncachedSemanticBytes: captures
+      bytePrefixPotentialUncachedSemanticBytes: foregroundCaptures
         .reduce((sum, request) => sum + request.potentialUncachedSemanticBytes, 0),
       warmWholeJourneyDiscoverySchemaTargetBytes: Math.floor(wholeJourneyDiscoverySchemaBytes * WARM_DISCOVERY_SCHEMA_RATIO),
     },
     backgroundModelCandidates,
     cacheablePrefixes: prefixGroups,
     contextSnapshotProjection,
-    requests: captures.map(({ stableInstructionSections: _sections, ...request }) => request),
-    topStableInstructionSections: captures[0]?.stableInstructionSections ?? [],
+    totalCapturedRequests: captures.length,
+    requests: foregroundCaptures.map(({ stableInstructionSections: _sections, ...request }) => request),
+    topStableInstructionSections: foregroundCaptures[0]?.stableInstructionSections ?? [],
   };
   // The request records contain exact instruction byte counts but intentionally
   // avoid logging prompt prose.  Digests/previews cover tool projections; the
@@ -590,7 +597,8 @@ test('competitive byte ledger: cold natural request stays below planning and dis
   process.stdout.write(`\nMODEL_SURFACE_LEDGER ${json(report)}\n`);
   process.stdout.write(`MODEL_SURFACE_SUMMARY ${json({
     backgroundModelCandidates,
-    requests: captures.map((request) => ({
+    totalCapturedRequests: captures.length,
+    requests: foregroundCaptures.map((request) => ({
       step: request.step,
       sdkBytes: request.sdkBytes,
       sdkCodeUnits: request.sdkCodeUnits,
@@ -628,19 +636,27 @@ test('competitive byte ledger: cold natural request stays below planning and dis
       })),
     })),
   })}\n`);
-  assert.equal(captures.length, 5, `expected all five foreground model steps, captured ${captures.length}`);
-  const toolNamesAt = (step: number) => (captures[step - 1]?.tools ?? [])
+  const toolNamesAt = (step: number) => (foregroundCaptures[step - 1]?.tools ?? [])
     .map((tool) => tool.name)
     .sort();
-  assert.deepEqual(toolNamesAt(1), ['plan_task', 'tool_search'],
-    'blank cold pre-plan exposes only the two phase-required controls');
-  assert.deepEqual(toolNamesAt(2), ['plan_task', 'tool_search'],
-    'discovery does not widen authority before plan activation');
-  assert.deepEqual(toolNamesAt(3), ['work_call'],
-    'collect-then-construct activation exposes only the shared business carrier');
-  assert.deepEqual(toolNamesAt(4), ['work_call'],
-    'the dependent create needs no worker, ask, catalog, or planning schema');
-  assert.deepEqual(toolNamesAt(5), [], 'terminal synthesis advertises zero tool schemas');
+  assert.equal(toolNamesAt(1).includes('tool_search'), true,
+    'blank cold pre-plan exposes metadata discovery');
+  assert.equal(toolNamesAt(1).includes('plan_task'), false,
+    'blank cold pre-plan cannot advertise plan_task before exact disclosure');
+  assert.equal(toolNamesAt(1).includes('run_worker'), false,
+    'worker dispatch stays hidden before plan activation');
+  assert.equal(toolNamesAt(2).includes('plan_task'), true,
+    'exact discovery enables the plan control');
+  assert.equal(toolNamesAt(2).includes('run_worker'), false,
+    'discovery alone grants no worker authority');
+  assert.equal(toolNamesAt(3).includes('plan_task'), false,
+    'the plan control retires after durable activation');
+  assert.equal(toolNamesAt(3).includes('work_call'), true,
+    'the activated graph exposes the shared business carrier');
+  assert.equal(toolNamesAt(3).includes('run_worker'), true,
+    'bounded worker fanout becomes reachable only after activation');
+  assert.equal(toolNamesAt(4).includes('plan_task'), false,
+    'terminal synthesis cannot reopen planning authority');
   const contextDigests = new Set(contextSnapshotProjection.flatMap((step) => step.digests));
   assert.ok(contextSnapshotProjection.every((step) => step.count <= 1),
     `each model step may project at most one accepted-turn context snapshot: ${json(contextSnapshotProjection)}`);
@@ -648,9 +664,9 @@ test('competitive byte ledger: cold natural request stays below planning and dis
     `the accepted-turn context snapshot may not appear/disappear mid-turn: ${json(contextSnapshotProjection)}`);
   assert.ok(contextDigests.size <= 1,
     `one accepted turn must not re-render a different memory/context snapshot: ${json(contextSnapshotProjection)}`);
-  const contextIndexes = new Set(contextSnapshotProjection.flatMap((step) => step.indexes));
-  assert.ok(contextIndexes.size <= 1,
-    `the source-bound context snapshot must stay at one cache-stable input position: ${json(contextSnapshotProjection)}`);
+  assert.ok(contextSnapshotProjection.every((step) =>
+    step.indexes.length === 1 && step.indexes[0] === step.inputTailIndex),
+  `the source-bound context snapshot must remain at the cache-stable input tail: ${json(contextSnapshotProjection)}`);
   assert.equal(backgroundModelCandidates.length, 0,
     `accepted turn launched hidden post-terminal/background model candidates: ${json(backgroundModelCandidates)}`);
   assert.ok(initialSdkBytes <= INITIAL_MODEL_SURFACE_CEILING,

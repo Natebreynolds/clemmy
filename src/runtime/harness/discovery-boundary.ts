@@ -179,6 +179,16 @@ export function classifyDiscoveryCall(
   const scoped = queryAndRole(args);
 
   if (name === 'toolsearch' || name === 'tool_search') {
+    // These opaque prefixes are issued only after an admitted tool_search has
+    // already retained a bounded local result/schema snapshot. Their handler
+    // branch either redeems those exact content-addressed bytes or fails
+    // locally; it can never fall through to provider code. Do not charge a
+    // second physical-discovery claim for reading the first call's cursor.
+    const cursor = typeof args.cursor === 'string' ? args.cursor.trim() : '';
+    if (
+      cursor.startsWith('tool_search_page:v1:')
+      || cursor.startsWith('tool_search_schema:v1:')
+    ) return null;
     const query = scoped.query;
     const exact = explicitlyNamesBuiltinTool(query) || exactToolIdentifierQuery(query);
     return {
@@ -326,7 +336,11 @@ export class DiscoveryBudgetDeniedError extends Error {
     // carry. The gate is unchanged; only what the caller is told changes.
     const roleBroker = surface === 'tool_search';
     const corrective = category === 'broad_discovery'
-      ? reason === 'role_required'
+      ? reason === 'same_call_replay'
+        ? 'This exact physical discovery call already owns the current claim. Clementine will not re-enter provider code here; consume its durable result, or wait for host-observed evidence to authorize a new retry epoch.'
+        : reason === 'new_call_requires_retry_epoch'
+        ? 'This subject already has a physical discovery owner in the current evidence epoch. Consume its durable result through the upstream result-replay path, or wait for host-observed evidence to authorize a new retry epoch; neither changing nor re-entering call_id grants provider authority here.'
+        : reason === 'role_required'
         ? roleBroker
           ? 'Use the exact unresolved role_key shown in the current capability card; a broad search without runtime-owned requirement membership is unavailable.'
           : `${surface} cannot carry a requirement role, so no argument to it will satisfy this. Reissue the search through tool_search with the exact unresolved role_key shown in the current capability card; do not retry this tool.`
@@ -335,7 +349,11 @@ export class DiscoveryBudgetDeniedError extends Error {
           : reason === 'role_not_unresolved'
             ? 'That role is not an unresolved requirement of this accepted task. Use a listed unresolved role_key or the already-resolved path.'
             : 'Use the capability or prior search result already resolved for this task; do not issue another broad search.'
-      : 'Use the schema already returned for this task, correct the call from its validation error, or report the specific blocker; do not re-fetch schema again.';
+      : reason === 'same_call_replay'
+        ? 'This exact physical schema call already owns the current claim. Clementine will not re-enter provider code here; consume its durable result, or wait for host-observed evidence to authorize a new retry epoch.'
+        : reason === 'new_call_requires_retry_epoch'
+        ? 'This schema subject already has a physical discovery owner in the current evidence epoch. Consume its durable result through the upstream result-replay path, or wait for host-observed evidence to authorize a new retry epoch; neither changing nor re-entering call_id grants provider authority here.'
+        : 'Use the schema already returned for this task, correct the call from its validation error, or report the specific blocker; do not re-fetch schema again.';
     // Name the admissible keys. The corrective above points at "the current
     // capability card", which is only followable while that card is still in
     // view; a caller that has lost it must guess a host-owned identifier, and

@@ -37,6 +37,8 @@ import {
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
 import { parseWorkflowNodeInvocationPlan } from '../../memory/workflow-node-invocation-plan.js';
+import { canonicalArgumentDigestOf } from './resolved-call-authority.js';
+import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { approvalResolutionWithinLifetime } from './approval-registry.js';
 import {
   HISTORICAL_TERMINAL_COMPLETE_CLOSE_REASON,
@@ -71,13 +73,16 @@ export const WORKFLOW_READ_ONLY_EFFECT_BOUNDS = ['read'] as const;
 const WORKFLOW_READ_ONLY_EFFECT_BOUNDS_JSON = JSON.stringify(WORKFLOW_READ_ONLY_EFFECT_BOUNDS);
 export const WORKFLOW_PAGINATED_READ_AUTHORITY_ENGINE_VERSION = 'workflow_v2_paginated_read' as const;
 export const WORKFLOW_PAGINATED_READ_AUTHORITY_SURFACE_VERSION = 'workflow_paginated_read_plan_v1' as const;
+export const WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION = 'workflow_v3_call' as const;
+export const WORKFLOW_V3_CALL_AUTHORITY_SURFACE_VERSION = 'workflow_node_invocation_plan_v1' as const;
 
 export type AcceptedTurnCallAuthorityKind =
   | 'turn_graph'
   | 'host_v1'
   | 'host_v1_read_only'
   | 'workflow_v1_read_only'
-  | 'workflow_v2_paginated_read';
+  | 'workflow_v2_paginated_read'
+  | 'workflow_v3_call';
 export type HostReadOnlyAdmissibleEffect = typeof HOST_READ_ONLY_EFFECT_BOUNDS[number];
 export type HostAdmissibleEffect = typeof HOST_EFFECT_BOUNDS[number];
 export type CallAdmissionEffect = HostReadOnlyAdmissibleEffect
@@ -223,6 +228,31 @@ interface WorkflowActivationRow {
   one_shot_authorization_resume_key: string | null;
   one_shot_authorization_decision_digest: string | null;
   activation_digest: string;
+  activated_at: string;
+}
+
+interface WorkflowV3ActivationBindingRow {
+  activation_id: string;
+  session_id: string;
+  authority_binding_digest: string;
+  requirement_id: string;
+  logical_capability_id: string;
+  effect: 'host_only' | 'local_write' | 'external_write' | 'admin';
+  canonical_argument_digest: string;
+  source_argument_digest: string;
+  obligation_digest: string;
+  capability_id: string;
+  manifest_id: string;
+  manifest_digest: string;
+  operation_id: string;
+  operation_version: string;
+  schema_digest: string;
+  provider_version: string;
+  live_fingerprint: string;
+  account_id: string;
+  invoke_port_id: string;
+  argument_compiler_id: string;
+  argument_compiler_version: string;
   activated_at: string;
 }
 
@@ -403,7 +433,76 @@ export interface WorkflowReadOnlyCallAttestationProof {
 const workflowReadOnlyProofs = new WeakMap<object, Readonly<WorkflowReadOnlyCallAttestation>>();
 const workflowReadOnlyCallAttestationStorage = new AsyncLocalStorage<Readonly<WorkflowReadOnlyCallAttestation>>();
 
+interface WorkflowV3CallAttestation extends WorkflowReadOnlyCallAttestation {
+  authorityBindingDigest: string;
+  requirementId: string;
+  logicalCapabilityId: string;
+  effect: WorkflowV3DurableCapabilityBinding['effect'];
+  canonicalArgumentDigest: string;
+  sourceArgumentDigest: string;
+  obligationDigest: string;
+}
+
+export interface WorkflowV3CallAttestationProof {
+  readonly kind: 'workflow_v3_call_attestation';
+  readonly activationId: string;
+  readonly authorityRootId: string;
+  readonly logicalCallId: string;
+  readonly authorityBindingDigest: string;
+}
+
+const workflowV3Proofs = new WeakMap<object, Readonly<WorkflowV3CallAttestation>>();
+const workflowV3CallAttestationStorage = new AsyncLocalStorage<Readonly<WorkflowV3CallAttestation>>();
+
 type HarnessDb = ReturnType<typeof openEventLog>;
+
+interface WorkflowV3BindingSqlAdmission {
+  values: readonly unknown[];
+  consumed: boolean;
+}
+
+const workflowV3BindingSqlFunctionInstalled = new WeakSet<object>();
+const activeWorkflowV3BindingSqlAdmissions = new WeakMap<object, WorkflowV3BindingSqlAdmission>();
+
+function installWorkflowV3BindingSqlAdmissionFunction(db: HarnessDb): void {
+  if (workflowV3BindingSqlFunctionInstalled.has(db)) return;
+  db.function(
+    'clementine_workflow_v3_binding_admitted_v1',
+    { varargs: true },
+    (...values: unknown[]): number => {
+      const admission = activeWorkflowV3BindingSqlAdmissions.get(db);
+      if (
+        !admission
+        || admission.consumed
+        || values.length !== admission.values.length
+        || values.some((value, index) => value !== admission.values[index])
+      ) return 0;
+      admission.consumed = true;
+      return 1;
+    },
+  );
+  workflowV3BindingSqlFunctionInstalled.add(db);
+}
+
+export type WorkflowV3ActivationFailurePoint = 'after_activation' | 'after_binding';
+let workflowV3ActivationFailurePoint: WorkflowV3ActivationFailurePoint | null = null;
+
+/** Isolated-test crash seam. A thrown point is inside the one IMMEDIATE
+ * transaction, so activation, consent, binding, event, and root must roll back. */
+export function setWorkflowV3ActivationFailurePointForTests(
+  point: WorkflowV3ActivationFailurePoint | null,
+): void {
+  if (process.env.CLEMMY_TEST_ISOLATED_HOME !== '1') {
+    throw new Error('workflow v3 activation failure injection is test-only');
+  }
+  workflowV3ActivationFailurePoint = point;
+}
+
+function crashWorkflowV3ActivationForTest(point: WorkflowV3ActivationFailurePoint): void {
+  if (workflowV3ActivationFailurePoint === point) {
+    throw new Error(`Injected workflow v3 activation crash ${point}`);
+  }
+}
 
 export type AcceptedTurnCallAuthorityReadResult =
   | { status: 'ok'; authority: AcceptedTurnCallAuthority }
@@ -621,6 +720,22 @@ export function withWorkflowReadOnlyCallAttestation<T>(
   return workflowReadOnlyCallAttestationStorage.run(attestation, work);
 }
 
+export function withWorkflowV3CallAttestation<T>(
+  proof: WorkflowV3CallAttestationProof,
+  work: () => T,
+): T {
+  const attestation = workflowV3Proofs.get(proof as object);
+  if (!attestation) throw new Error('workflow v3 call attestation proof is not authentic');
+  if (
+    proof.kind !== 'workflow_v3_call_attestation'
+    || proof.activationId !== attestation.activationId
+    || proof.authorityRootId !== attestation.authorityRootId
+    || proof.logicalCallId !== attestation.logicalCallId
+    || proof.authorityBindingDigest !== attestation.authorityBindingDigest
+  ) throw new Error('workflow v3 call attestation proof was altered');
+  return workflowV3CallAttestationStorage.run(attestation, work);
+}
+
 function workflowReadOnlyCallAttestationMatches(
   authority: AcceptedTurnCallAuthority,
   input: {
@@ -663,6 +778,68 @@ function workflowReadOnlyCallAttestationMatches(
   );
 }
 
+function workflowV3CallAttestationMatches(
+  authority: AcceptedTurnCallAuthority,
+  input: {
+    acceptedTaskId: string;
+    logicalToolCallId: string;
+    toolName: string;
+    argumentDigest: string;
+    effect: CallAdmissionEffect;
+  },
+): boolean {
+  const workflow = authority.workflow;
+  const attested = workflowV3CallAttestationStorage.getStore();
+  return Boolean(
+    workflow
+    && attested
+    && authority.authorityKind === 'workflow_v3_call'
+    && attested.sessionId === authority.identity.sessionId
+    && attested.sourceEventSeq === authority.identity.sourceUserSeq
+    && attested.authorityRootId === authority.identity.acceptedTaskId
+    && attested.authorityRootId === input.acceptedTaskId
+    && attested.sourceEventId === authority.sourceEventId
+    && attested.sourceEventDigest === authority.sourceEventDigest
+    && attested.activationId === workflow.activationId
+    && attested.activationDigest === workflow.activationDigest
+    && attested.workflowId === workflow.workflowId
+    && attested.workflowRevision === workflow.workflowRevision
+    && attested.workflowDigest === workflow.workflowDigest
+    && attested.runId === workflow.runId
+    && attested.runOccurrenceId === workflow.runOccurrenceId
+    && attested.nodeId === workflow.nodeId
+    && attested.nodeAttempt === workflow.nodeAttempt
+    && attested.invocationPlanDigest === workflow.invocationPlanDigest
+    && attested.bindingSnapshotDigest === workflow.bindingSnapshotDigest
+    && attested.controlDigest === workflow.controlDigest
+    && attested.logicalCallId === workflow.logicalCallId
+    && attested.logicalCallId === input.logicalToolCallId
+    && attested.toolName === input.toolName
+    && attested.argumentDigest === input.argumentDigest
+    && attested.effect === input.effect
+    && attested.authorityBindingDigest === authority.bindingRevisionDigest
+    && attested.authorityDigest === authority.authorityDigest
+    && attested.authorityRevision === authority.revision
+  );
+}
+
+/** Narrow bridge for the shared ledger's independent effect admission. It
+ * exposes only the exact effect already sealed by the ambient opaque v3 proof,
+ * and only for the same root/tool/argument digest. */
+export function workflowV3AttestedEffectForLogicalContract(input: {
+  acceptedTaskId: string;
+  toolName: string;
+  argumentDigest: string;
+}): WorkflowV3DurableCapabilityBinding['effect'] | undefined {
+  const attested = workflowV3CallAttestationStorage.getStore();
+  return attested
+    && attested.authorityRootId === input.acceptedTaskId
+    && attested.toolName === input.toolName
+    && attested.argumentDigest === input.argumentDigest
+    ? attested.effect
+    : undefined;
+}
+
 /** Used only by the physical-I/O CAS after logical/physical reservation. It
  * deliberately exposes a boolean, never the ambient proof bytes. */
 export function workflowReadOnlyPhysicalClaimAttestationMatches(input: {
@@ -677,6 +854,32 @@ export function workflowReadOnlyPhysicalClaimAttestationMatches(input: {
   physicalToolName: string;
 }): boolean {
   const attested = workflowReadOnlyCallAttestationStorage.getStore();
+  return Boolean(
+    attested
+    && attested.sessionId === input.sessionId
+    && attested.sourceEventSeq === input.sourceEventSeq
+    && attested.authorityRootId === input.authorityRootId
+    && attested.activationId === input.activationId
+    && attested.activationDigest === input.activationDigest
+    && attested.authorityDigest === input.authorityDigest
+    && attested.authorityRevision === input.authorityRevision
+    && attested.logicalCallId === input.logicalCallId
+    && attested.toolName === input.physicalToolName
+  );
+}
+
+export function workflowV3PhysicalClaimAttestationMatches(input: {
+  sessionId: string;
+  sourceEventSeq: number;
+  authorityRootId: string;
+  activationId: string;
+  activationDigest: string;
+  authorityDigest: string;
+  authorityRevision: number;
+  logicalCallId: string;
+  physicalToolName: string;
+}): boolean {
+  const attested = workflowV3CallAttestationStorage.getStore();
   return Boolean(
     attested
     && attested.sessionId === input.sessionId
@@ -782,7 +985,7 @@ function project(row: AuthorityRow): AcceptedTurnCallAuthority {
     ...(row.binding_revision_digest ? { bindingRevisionDigest: row.binding_revision_digest } : {}),
     ...(row.graph_event_id ? { graphEventId: row.graph_event_id } : {}),
     ...(row.graph_hash ? { graphHash: row.graph_hash } : {}),
-    ...(row.authority_kind === 'workflow_v1_read_only'
+    ...((row.authority_kind === 'workflow_v1_read_only' || row.authority_kind === 'workflow_v3_call')
       && row.workflow_activation_id
       && row.workflow_activation_digest
       && row.workflow_id
@@ -864,6 +1067,16 @@ function readWorkflowActivationRow(
     SELECT * FROM workflow_node_invocation_activations
      WHERE activation_id = ?
   `).get(activationId) as WorkflowActivationRow | undefined;
+}
+
+function readWorkflowV3ActivationBindingRow(
+  db: HarnessDb,
+  activationId: string,
+): WorkflowV3ActivationBindingRow | undefined {
+  return db.prepare(`
+    SELECT * FROM workflow_v3_call_activation_bindings
+     WHERE activation_id = ?
+  `).get(activationId) as WorkflowV3ActivationBindingRow | undefined;
 }
 
 function readWorkflowPaginatedActivationRow(
@@ -1059,6 +1272,7 @@ function workflowDigestFields(row: AuthorityRow): Pick<
   if (
     row.authority_kind !== 'workflow_v1_read_only'
     && row.authority_kind !== 'workflow_v2_paginated_read'
+    && row.authority_kind !== 'workflow_v3_call'
   ) return {};
   return {
     workflowActivationId: row.workflow_activation_id,
@@ -1084,7 +1298,7 @@ function verifyRow(
   if (
     row.authority_protocol !== 1
     || (
-      !['workflow_v1_read_only', 'workflow_v2_paginated_read'].includes(row.authority_kind)
+      !['workflow_v1_read_only', 'workflow_v2_paginated_read', 'workflow_v3_call'].includes(row.authority_kind)
       && row.accepted_task_id !== acceptedTaskIdFor(row.session_id, row.source_user_seq)
     )
     || !isSha256(row.source_event_digest)
@@ -1096,7 +1310,7 @@ function verifyRow(
     !source
     || source.id !== row.source_event_id
     || source.turn !== row.source_turn
-    || (row.authority_kind === 'workflow_v1_read_only'
+    || ((row.authority_kind === 'workflow_v1_read_only' || row.authority_kind === 'workflow_v3_call')
       ? source.role !== 'system' || source.type !== 'workflow_node_invocation_activated'
       : row.authority_kind === 'workflow_v2_paginated_read'
         ? source.role !== 'system' || source.type !== 'workflow_paginated_read_activated'
@@ -1312,6 +1526,65 @@ function verifyRow(
       || row.graph_hash !== null
       || effectBounds.join('\0') !== WORKFLOW_READ_ONLY_EFFECT_BOUNDS.join('\0')
     ) return { status: 'conflict', reason: 'workflow read-only call authority does not match its exact activation' };
+  } else if (row.authority_kind === 'workflow_v3_call') {
+    const activation = row.workflow_activation_id
+      ? readWorkflowActivationRow(db, row.workflow_activation_id)
+      : undefined;
+    const binding = activation
+      ? readWorkflowV3ActivationBindingRow(db, activation.activation_id)
+      : undefined;
+    const exactInput = activation && binding
+      ? workflowV3InputFromRows(activation, binding)
+      : null;
+    const activationDigest = exactInput ? workflowV3ActivationDigest(exactInput) : '';
+    const authorization = exactInput?.oneShotActivationAuthorization;
+    const authorizationRow = authorization
+      ? exactOneShotAuthorizationRow(db, authorization)
+      : null;
+    const graphResolution = db.prepare(`
+      SELECT 1 FROM accepted_task_resolutions
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(row.session_id, row.source_user_seq);
+    if (
+      !activation
+      || !binding
+      || !exactInput
+      || graphResolution
+      || (binding.effect !== 'host_only' && (!authorizationRow || authorizationRow.consumed_at === null))
+      || activation.activation_digest !== activationDigest
+      || activation.activation_id !== workflowNodeInvocationActivationId(activationDigest)
+      || activation.authority_root_id !== workflowNodeCallAuthorityRootId(activationDigest)
+      || activation.authority_root_id !== row.accepted_task_id
+      || activation.session_id !== row.session_id
+      || binding.session_id !== row.session_id
+      || binding.activated_at !== activation.activated_at
+      || activation.source_event_seq !== row.source_user_seq
+      || activation.source_event_id !== row.source_event_id
+      || activation.source_event_digest !== row.source_event_digest
+      || activation.workflow_id !== row.workflow_id
+      || activation.workflow_revision !== row.workflow_revision
+      || activation.workflow_digest !== row.workflow_digest
+      || activation.run_id !== row.run_id
+      || activation.run_occurrence_id !== row.run_occurrence_id
+      || activation.node_id !== row.workflow_node_id
+      || activation.node_attempt !== row.workflow_node_attempt
+      || activation.invocation_plan_digest !== row.invocation_plan_digest
+      || activation.binding_snapshot_digest !== row.binding_snapshot_digest
+      || activation.control_digest !== row.control_digest
+      || activation.logical_call_id !== row.workflow_logical_call_id
+      || row.engine_version !== WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION
+      || row.surface_version !== WORKFLOW_V3_CALL_AUTHORITY_SURFACE_VERSION
+      || row.effect_ceiling !== binding.effect
+      || row.effect_bounds_json !== JSON.stringify([binding.effect])
+      || row.max_logical_calls !== 1
+      || row.max_parallel_calls !== 1
+      || row.catalog_revision_digest !== row.binding_snapshot_digest
+      || row.binding_revision_digest !== binding.authority_binding_digest
+      || row.graph_event_id !== null
+      || row.graph_hash !== null
+      || effectBounds.length !== 1
+      || effectBounds[0] !== binding.effect
+    ) return { status: 'conflict', reason: 'workflow v3 call authority does not match its exact activation binding' };
   } else {
     const activationId = row.workflow_activation_digest
       ? workflowPaginatedReadActivationId(row.workflow_activation_digest)
@@ -1755,6 +2028,31 @@ export interface ArmWorkflowReadOnlyCallAuthorityInput {
   oneShotActivationAuthorization?: OneShotActivationAuthorization;
 }
 
+export interface WorkflowV3DurableCapabilityBinding {
+  capabilityId: string;
+  manifestId: string;
+  manifestDigest: string;
+  operationId: string;
+  operationVersion: string;
+  schemaDigest: string;
+  providerVersion: string;
+  liveFingerprint: string;
+  accountId: string;
+  effect: 'host_only' | 'local_write' | 'external_write' | 'admin';
+  invokePortId: string;
+  argumentCompiler: { id: string; version: string };
+}
+
+export interface ArmWorkflowV3CallAuthorityInput extends ArmWorkflowReadOnlyCallAuthorityInput {
+  authorityBindingDigest: string;
+  requirementId: string;
+  logicalCapabilityId: string;
+  canonicalArgumentDigest: string;
+  sourceArgumentDigest: string;
+  obligationDigest: string;
+  binding: WorkflowV3DurableCapabilityBinding;
+}
+
 export interface OneShotActivationAuthorization {
   approvalId: string;
   resumeKey: string;
@@ -1915,11 +2213,148 @@ function workflowActivationDigestInput(
   };
 }
 
+function validWorkflowV3ArmInput(
+  input: ArmWorkflowV3CallAuthorityInput,
+): input is ArmWorkflowV3CallAuthorityInput {
+  const binding = input.binding;
+  return validWorkflowArmInput(input)
+    && isSha256(input.authorityBindingDigest)
+    && exactWorkflowId(input.requirementId)
+    && exactWorkflowId(input.logicalCapabilityId)
+    && isSha256(input.canonicalArgumentDigest)
+    && isSha256(input.sourceArgumentDigest)
+    && isSha256(input.obligationDigest)
+    && exactWorkflowId(binding.capabilityId)
+    && exactWorkflowId(binding.manifestId)
+    && isSha256(binding.manifestDigest)
+    && exactWorkflowId(binding.operationId)
+    && exactWorkflowId(binding.operationVersion)
+    && isSha256(binding.schemaDigest)
+    && exactWorkflowId(binding.providerVersion)
+    && isSha256(binding.liveFingerprint)
+    && exactWorkflowId(binding.accountId)
+    && ['host_only', 'local_write', 'external_write', 'admin'].includes(binding.effect)
+    && exactWorkflowId(binding.invokePortId)
+    && exactWorkflowId(binding.argumentCompiler.id)
+    && exactWorkflowId(binding.argumentCompiler.version)
+    && (binding.effect === 'host_only' || input.oneShotActivationAuthorization !== undefined);
+}
+
+function workflowV3ActivationDigest(input: ArmWorkflowV3CallAuthorityInput): string {
+  return createHash('sha256').update(JSON.stringify({
+    protocolVersion: 1,
+    authorityKind: WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION,
+    workflowId: input.workflowId,
+    workflowRevision: input.workflowRevision,
+    workflowDigest: input.workflowDigest,
+    runId: input.runId,
+    runOccurrenceId: input.runOccurrenceId,
+    nodeId: input.nodeId,
+    nodeAttempt: input.nodeAttempt,
+    invocationPlanDigest: input.invocationPlanDigest,
+    bindingSnapshotDigest: input.bindingSnapshotDigest,
+    controlDigest: input.controlDigest,
+    logicalCallId: input.logicalCallId,
+    authorityBindingDigest: input.authorityBindingDigest,
+    requirementId: input.requirementId,
+    logicalCapabilityId: input.logicalCapabilityId,
+    canonicalArgumentDigest: input.canonicalArgumentDigest,
+    sourceArgumentDigest: input.sourceArgumentDigest,
+    obligationDigest: input.obligationDigest,
+    binding: input.binding,
+    ...(input.oneShotActivationAuthorization
+      ? { oneShotActivationAuthorization: input.oneShotActivationAuthorization }
+      : {}),
+  }), 'utf8').digest('hex');
+}
+
+function workflowV3ConsentArgs(input: ArmWorkflowV3CallAuthorityInput): Record<string, unknown> {
+  return {
+    authorityBindingDigest: input.authorityBindingDigest,
+    operationId: input.binding.operationId,
+    accountId: input.binding.accountId,
+    effect: input.binding.effect,
+    canonicalArgumentDigest: input.canonicalArgumentDigest,
+  };
+}
+
+function workflowV3AuthorizationMatchesExactCall(
+  row: OneShotAuthorizationApprovalRow,
+  input: ArmWorkflowV3CallAuthorityInput,
+): boolean {
+  if (
+    row.session_id !== input.sessionId
+    || row.tool !== WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION
+    || !row.args_json
+  ) return false;
+  try {
+    return closedCanonicalJson(JSON.parse(row.args_json))
+      === closedCanonicalJson(workflowV3ConsentArgs(input));
+  } catch {
+    return false;
+  }
+}
+
+function workflowV3InputFromRows(
+  activation: WorkflowActivationRow,
+  binding: WorkflowV3ActivationBindingRow,
+): ArmWorkflowV3CallAuthorityInput | null {
+  const authorization = activation.one_shot_authorization_approval_id
+    && activation.one_shot_authorization_resume_key
+    && activation.one_shot_authorization_decision_digest
+    ? {
+        approvalId: activation.one_shot_authorization_approval_id,
+        resumeKey: activation.one_shot_authorization_resume_key,
+        decisionDigest: activation.one_shot_authorization_decision_digest,
+      }
+    : undefined;
+  const input: ArmWorkflowV3CallAuthorityInput = {
+    sessionId: activation.session_id,
+    workflowId: activation.workflow_id,
+    workflowRevision: activation.workflow_revision,
+    workflowDigest: activation.workflow_digest,
+    runId: activation.run_id,
+    runOccurrenceId: activation.run_occurrence_id,
+    nodeId: activation.node_id,
+    nodeAttempt: activation.node_attempt,
+    invocationPlanDigest: activation.invocation_plan_digest,
+    bindingSnapshotDigest: activation.binding_snapshot_digest,
+    controlDigest: activation.control_digest,
+    logicalCallId: activation.logical_call_id,
+    authorityBindingDigest: binding.authority_binding_digest,
+    requirementId: binding.requirement_id,
+    logicalCapabilityId: binding.logical_capability_id,
+    canonicalArgumentDigest: binding.canonical_argument_digest,
+    sourceArgumentDigest: binding.source_argument_digest,
+    obligationDigest: binding.obligation_digest,
+    binding: {
+      capabilityId: binding.capability_id,
+      manifestId: binding.manifest_id,
+      manifestDigest: binding.manifest_digest,
+      operationId: binding.operation_id,
+      operationVersion: binding.operation_version,
+      schemaDigest: binding.schema_digest,
+      providerVersion: binding.provider_version,
+      liveFingerprint: binding.live_fingerprint,
+      accountId: binding.account_id,
+      effect: binding.effect,
+      invokePortId: binding.invoke_port_id,
+      argumentCompiler: {
+        id: binding.argument_compiler_id,
+        version: binding.argument_compiler_version,
+      },
+    },
+    ...(authorization ? { oneShotActivationAuthorization: authorization } : {}),
+  };
+  return validWorkflowV3ArmInput(input) ? input : null;
+}
+
 function workflowAuthorityRef(
   authority: AcceptedTurnCallAuthority,
+  expectedKind: 'workflow_v1_read_only' | 'workflow_v3_call' = 'workflow_v1_read_only',
 ): WorkflowReadOnlyCallAuthorityRef | null {
   const workflow = authority.workflow;
-  if (authority.authorityKind !== 'workflow_v1_read_only' || !workflow) return null;
+  if (authority.authorityKind !== expectedKind || !workflow) return null;
   return {
     sessionId: authority.identity.sessionId,
     sourceEventSeq: authority.identity.sourceUserSeq,
@@ -2249,6 +2684,523 @@ export function armWorkflowReadOnlyCallAuthority(
     const result = transaction.immediate();
     if (result.status === 'armed' && activationEvent) publishCommittedInternalEvent(activationEvent);
     return result;
+  } catch (error) {
+    return { status: 'storage_error', reason: boundedReason(error) };
+  }
+}
+
+export type ArmWorkflowV3CallAuthorityResult = ArmWorkflowReadOnlyCallAuthorityResult;
+
+function workflowV3BindingSqlValues(input: {
+  activationId: string;
+  sessionId: string;
+  authorityBindingDigest: string;
+  requirementId: string;
+  logicalCapabilityId: string;
+  canonicalArgumentDigest: string;
+  sourceArgumentDigest: string;
+  obligationDigest: string;
+  binding: WorkflowV3DurableCapabilityBinding;
+  activatedAt: string;
+}): readonly unknown[] {
+  return Object.freeze([
+    input.activationId,
+    input.sessionId,
+    input.authorityBindingDigest,
+    input.requirementId,
+    input.logicalCapabilityId,
+    input.binding.effect,
+    input.canonicalArgumentDigest,
+    input.sourceArgumentDigest,
+    input.obligationDigest,
+    input.binding.capabilityId,
+    input.binding.manifestId,
+    input.binding.manifestDigest,
+    input.binding.operationId,
+    input.binding.operationVersion,
+    input.binding.schemaDigest,
+    input.binding.providerVersion,
+    input.binding.liveFingerprint,
+    input.binding.accountId,
+    input.binding.invokePortId,
+    input.binding.argumentCompiler.id,
+    input.binding.argumentCompiler.version,
+    input.activatedAt,
+  ]);
+}
+
+/** Atomically consume exact consent (when required), append the immutable
+ * activation event/base row, persist the complete v3 binding, and open the
+ * shared one-call authority root. No partial row is executable. */
+export function armWorkflowV3CallAuthority(
+  input: ArmWorkflowV3CallAuthorityInput,
+): ArmWorkflowV3CallAuthorityResult {
+  if (!validWorkflowV3ArmInput(input)) {
+    return { status: 'conflict', reason: 'workflow v3 call-authority input is invalid or lacks exact consent' };
+  }
+  const activationDigest = workflowV3ActivationDigest(input);
+  const activationId = workflowNodeInvocationActivationId(activationDigest);
+  const authorityRootId = workflowNodeCallAuthorityRootId(activationDigest);
+  const db = openEventLog();
+  installWorkflowV3BindingSqlAdmissionFunction(db);
+  let activationEvent: EventRow | null = null;
+  try {
+    const transaction = db.transaction((): ArmWorkflowV3CallAuthorityResult => {
+      const session = db.prepare('SELECT kind FROM sessions WHERE id = ?').get(input.sessionId) as {
+        kind: string;
+      } | undefined;
+      if (!session) return { status: 'missing', reason: 'workflow v3 activation session is missing' };
+      if (session.kind !== 'workflow') {
+        return { status: 'conflict', reason: 'workflow v3 activation requires a workflow session' };
+      }
+
+      const existingActivation = readWorkflowActivationRow(db, activationId);
+      if (existingActivation) {
+        const existingBinding = readWorkflowV3ActivationBindingRow(db, activationId);
+        const reconstructed = existingBinding
+          ? workflowV3InputFromRows(existingActivation, existingBinding)
+          : null;
+        if (
+          !existingBinding
+          || !reconstructed
+          || workflowV3ActivationDigest(reconstructed) !== activationDigest
+          || existingBinding.authority_binding_digest !== input.authorityBindingDigest
+          || existingActivation.authority_root_id !== authorityRootId
+        ) return { status: 'conflict', reason: 'workflow v3 activation content address conflicts with its identity' };
+        const loaded = readAcceptedTurnCallAuthorityInTransaction(
+          db,
+          existingActivation.session_id,
+          existingActivation.source_event_seq,
+        );
+        if (loaded.status !== 'ok') return loaded;
+        const ref = workflowAuthorityRef(loaded.authority, 'workflow_v3_call');
+        if (!ref) return { status: 'conflict', reason: 'workflow v3 activation has a different call-authority kind' };
+        return loaded.authority.state === 'open'
+          ? { status: 'existing', authority: loaded.authority, ref }
+          : { status: 'existing_closed', authority: loaded.authority, ref };
+      }
+
+      const foreignOccurrence = db.prepare(`
+        SELECT activation_id FROM workflow_node_invocation_activations
+         WHERE workflow_id = ? AND workflow_revision = ? AND run_id = ?
+           AND run_occurrence_id = ? AND node_id = ? AND node_attempt = ?
+      `).get(
+        input.workflowId,
+        input.workflowRevision,
+        input.runId,
+        input.runOccurrenceId,
+        input.nodeId,
+        input.nodeAttempt,
+      ) as { activation_id: string } | undefined;
+      if (foreignOccurrence) {
+        return { status: 'conflict', reason: 'workflow node attempt already has a different activation' };
+      }
+
+      if (input.oneShotActivationAuthorization) {
+        const exactApproval = exactOneShotAuthorizationRow(db, input.oneShotActivationAuthorization);
+        if (!exactApproval || !workflowV3AuthorizationMatchesExactCall(exactApproval, input)) {
+          return { status: 'conflict', reason: 'workflow v3 authorization does not bind the exact call identity' };
+        }
+        const consumed = consumeOneShotActivationAuthorizationInTransaction(
+          db,
+          input.oneShotActivationAuthorization,
+        );
+        if (!consumed.ok) return { status: 'conflict', reason: consumed.reason };
+      }
+
+      activationEvent = insertInternalEventInTransaction(db, {
+        sessionId: input.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'workflow_node_invocation_activated',
+        data: {
+          protocolVersion: 1,
+          activationId,
+          authorityRootId,
+          activationDigest,
+          workflowId: input.workflowId,
+          workflowRevision: input.workflowRevision,
+          workflowDigest: input.workflowDigest,
+          runId: input.runId,
+          runOccurrenceId: input.runOccurrenceId,
+          nodeId: input.nodeId,
+          nodeAttempt: input.nodeAttempt,
+          invocationPlanDigest: input.invocationPlanDigest,
+          bindingSnapshotDigest: input.bindingSnapshotDigest,
+          controlDigest: input.controlDigest,
+          logicalCallId: input.logicalCallId,
+          ...(input.oneShotActivationAuthorization
+            ? { oneShotActivationAuthorization: { ...input.oneShotActivationAuthorization } }
+            : {}),
+        },
+      });
+      const source = sourceRowInTransaction(db, input.sessionId, activationEvent.seq);
+      if (!source || source.id !== activationEvent.id) throw new Error('workflow v3 activation source event was not readable');
+      const sourceEventDigest = sourceDigest(source);
+      db.prepare(`
+        INSERT INTO workflow_node_invocation_activations (
+          activation_id, authority_root_id, session_id, source_event_seq,
+          source_event_id, source_event_digest, workflow_id, workflow_revision,
+          workflow_digest, run_id, run_occurrence_id, node_id, node_attempt,
+          invocation_plan_digest, binding_snapshot_digest, control_digest,
+          logical_call_id, one_shot_authorization_approval_id,
+          one_shot_authorization_resume_key,
+          one_shot_authorization_decision_digest, activation_digest, activated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        activationId,
+        authorityRootId,
+        input.sessionId,
+        activationEvent.seq,
+        activationEvent.id,
+        sourceEventDigest,
+        input.workflowId,
+        input.workflowRevision,
+        input.workflowDigest,
+        input.runId,
+        input.runOccurrenceId,
+        input.nodeId,
+        input.nodeAttempt,
+        input.invocationPlanDigest,
+        input.bindingSnapshotDigest,
+        input.controlDigest,
+        input.logicalCallId,
+        input.oneShotActivationAuthorization?.approvalId ?? null,
+        input.oneShotActivationAuthorization?.resumeKey ?? null,
+        input.oneShotActivationAuthorization?.decisionDigest ?? null,
+        activationDigest,
+        activationEvent.createdAt,
+      );
+      crashWorkflowV3ActivationForTest('after_activation');
+
+      const bindingValues = workflowV3BindingSqlValues({
+        activationId,
+        sessionId: input.sessionId,
+        authorityBindingDigest: input.authorityBindingDigest,
+        requirementId: input.requirementId,
+        logicalCapabilityId: input.logicalCapabilityId,
+        canonicalArgumentDigest: input.canonicalArgumentDigest,
+        sourceArgumentDigest: input.sourceArgumentDigest,
+        obligationDigest: input.obligationDigest,
+        binding: input.binding,
+        activatedAt: activationEvent.createdAt,
+      });
+      const admission: WorkflowV3BindingSqlAdmission = { values: bindingValues, consumed: false };
+      activeWorkflowV3BindingSqlAdmissions.set(db, admission);
+      try {
+        db.prepare(`
+          INSERT INTO workflow_v3_call_activation_bindings (
+            activation_id, session_id, authority_binding_digest,
+            requirement_id, logical_capability_id, effect,
+            canonical_argument_digest, source_argument_digest, obligation_digest,
+            capability_id, manifest_id, manifest_digest, operation_id,
+            operation_version, schema_digest, provider_version, live_fingerprint,
+            account_id, invoke_port_id, argument_compiler_id,
+            argument_compiler_version, activated_at
+          ) VALUES (${bindingValues.map(() => '?').join(', ')})
+        `).run(...bindingValues);
+      } finally {
+        activeWorkflowV3BindingSqlAdmissions.delete(db);
+      }
+      if (!admission.consumed) throw new Error('workflow v3 binding did not consume its opaque SQL admission');
+      crashWorkflowV3ActivationForTest('after_binding');
+
+      const workflowFields = {
+        workflowActivationId: activationId,
+        workflowActivationDigest: activationDigest,
+        workflowId: input.workflowId,
+        workflowRevision: input.workflowRevision,
+        workflowDigest: input.workflowDigest,
+        runId: input.runId,
+        runOccurrenceId: input.runOccurrenceId,
+        workflowNodeId: input.nodeId,
+        workflowNodeAttempt: input.nodeAttempt,
+        invocationPlanDigest: input.invocationPlanDigest,
+        bindingSnapshotDigest: input.bindingSnapshotDigest,
+        controlDigest: input.controlDigest,
+        workflowLogicalCallId: input.logicalCallId,
+      } as const;
+      const effectBoundsJson = JSON.stringify([input.binding.effect]);
+      const surfaceDigest = acceptedTurnCallSurfaceDigest({
+        authorityKind: 'workflow_v3_call',
+        engineVersion: WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION,
+        surfaceVersion: WORKFLOW_V3_CALL_AUTHORITY_SURFACE_VERSION,
+        effectCeiling: input.binding.effect,
+        effectBoundsJson,
+        maxLogicalCalls: 1,
+        maxParallelCalls: 1,
+        catalogRevisionDigest: input.bindingSnapshotDigest,
+        bindingRevisionDigest: input.authorityBindingDigest,
+        graphEventId: null,
+        graphHash: null,
+        ...workflowFields,
+      });
+      const authorityDigest = acceptedTurnCallAuthorityDigest({
+        authorityKind: 'workflow_v3_call',
+        sessionId: input.sessionId,
+        sourceUserSeq: activationEvent.seq,
+        acceptedTaskId: authorityRootId,
+        sourceEventId: activationEvent.id,
+        sourceEventDigest,
+        sourceTurn: 0,
+        engineVersion: WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION,
+        surfaceVersion: WORKFLOW_V3_CALL_AUTHORITY_SURFACE_VERSION,
+        surfaceDigest,
+        effectCeiling: input.binding.effect,
+        effectBoundsJson,
+        maxLogicalCalls: 1,
+        maxParallelCalls: 1,
+        catalogRevisionDigest: input.bindingSnapshotDigest,
+        bindingRevisionDigest: input.authorityBindingDigest,
+        graphEventId: null,
+        graphHash: null,
+        ...workflowFields,
+      });
+      db.prepare(`
+        INSERT INTO accepted_turn_call_authorities (
+          session_id, source_user_seq, accepted_task_id, authority_protocol,
+          authority_kind, source_event_id, source_event_digest, source_turn,
+          engine_version, surface_version, surface_digest, effect_ceiling,
+          effect_bounds_json, max_logical_calls, max_parallel_calls,
+          catalog_revision_digest, binding_revision_digest, graph_event_id,
+          graph_hash, workflow_activation_id, workflow_activation_digest,
+          workflow_id, workflow_revision, workflow_digest, run_id,
+          run_occurrence_id, workflow_node_id, workflow_node_attempt,
+          invocation_plan_digest, binding_snapshot_digest, control_digest,
+          workflow_logical_call_id, authority_digest, state, revision, opened_at
+        ) VALUES (
+          ?, ?, ?, 1, 'workflow_v3_call', ?, ?, 0,
+          ?, ?, ?, ?, ?, 1, 1, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, 'open', 0, ?
+        )
+      `).run(
+        input.sessionId,
+        activationEvent.seq,
+        authorityRootId,
+        activationEvent.id,
+        sourceEventDigest,
+        WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION,
+        WORKFLOW_V3_CALL_AUTHORITY_SURFACE_VERSION,
+        surfaceDigest,
+        input.binding.effect,
+        effectBoundsJson,
+        input.bindingSnapshotDigest,
+        input.authorityBindingDigest,
+        activationId,
+        activationDigest,
+        input.workflowId,
+        input.workflowRevision,
+        input.workflowDigest,
+        input.runId,
+        input.runOccurrenceId,
+        input.nodeId,
+        input.nodeAttempt,
+        input.invocationPlanDigest,
+        input.bindingSnapshotDigest,
+        input.controlDigest,
+        input.logicalCallId,
+        authorityDigest,
+        activationEvent.createdAt,
+      );
+      const loaded = readAcceptedTurnCallAuthorityInTransaction(db, input.sessionId, activationEvent.seq);
+      if (loaded.status !== 'ok') throw new Error(`armed workflow v3 authority is ${loaded.status}: ${loaded.reason}`);
+      const ref = workflowAuthorityRef(loaded.authority, 'workflow_v3_call');
+      if (!ref) throw new Error('armed workflow v3 authority lost its workflow identity');
+      return { status: 'armed', authority: loaded.authority, ref };
+    });
+    const result = transaction.immediate();
+    if (result.status === 'armed' && activationEvent) publishCommittedInternalEvent(activationEvent);
+    return result;
+  } catch (error) {
+    return { status: 'storage_error', reason: boundedReason(error) };
+  }
+}
+
+export function readWorkflowV3CallAuthority(
+  activationId: string,
+): AcceptedTurnCallAuthorityReadResult {
+  if (!activationId.trim()) return { status: 'missing', reason: 'workflow v3 activation id is missing' };
+  try {
+    const loaded = readWorkflowAuthorityByActivationInTransaction(openEventLog(), activationId);
+    if (loaded.status !== 'ok') return loaded;
+    return loaded.authority.authorityKind === 'workflow_v3_call'
+      ? loaded
+      : { status: 'conflict', reason: 'activation is not owned by workflow v3 authority' };
+  } catch (error) {
+    return { status: 'storage_error', reason: boundedReason(error) };
+  }
+}
+
+export type MintWorkflowV3CallAttestationResult =
+  | {
+      status: 'minted';
+      proof: WorkflowV3CallAttestationProof;
+      ref: WorkflowReadOnlyCallAuthorityRef;
+      toolName: string;
+      argumentDigest: string;
+    }
+  | { status: 'missing' | 'closed' | 'conflict' | 'storage_error'; reason: string };
+
+function workflowV3ObligationDigest(plan: {
+  requirementId: string;
+  binding: { effect: string };
+  evidence: unknown;
+  completeness: unknown;
+  continuation: unknown;
+}): string {
+  return createHash('sha256').update(closedCanonicalJson({
+    domain: 'workflow-v3-call-obligation',
+    version: 1,
+    requirementId: plan.requirementId,
+    effect: plan.binding.effect,
+    evidence: plan.evidence,
+    completeness: plan.completeness,
+    continuation: plan.continuation,
+  }), 'utf8').digest('hex');
+}
+
+/** Last-edge v3 revalidation. Durable bytes select exactly one current
+ * manifest/account/port/compiler and one canonical argument object; the
+ * resulting proof is process-opaque and scoped by ALS during the shared kernel. */
+export function mintWorkflowV3CallAttestation(input: {
+  activationId: string;
+  invocationPlan: unknown;
+  args: Record<string, unknown>;
+}): MintWorkflowV3CallAttestationResult {
+  try {
+    const loaded = readWorkflowV3CallAuthority(input.activationId);
+    if (loaded.status !== 'ok') {
+      return {
+        status: loaded.status === 'conflict' ? 'conflict'
+          : loaded.status === 'storage_error' ? 'storage_error' : 'missing',
+        reason: loaded.reason,
+      };
+    }
+    const authority = loaded.authority;
+    const ref = workflowAuthorityRef(authority, 'workflow_v3_call');
+    if (!ref) return { status: 'conflict', reason: 'activation is not owned by workflow v3 authority' };
+    if (authority.state !== 'open') return { status: 'closed', reason: 'workflow v3 authority is not open' };
+    const durable = readWorkflowV3ActivationBindingRow(openEventLog(), input.activationId);
+    if (!durable) return { status: 'missing', reason: 'workflow v3 durable binding is missing' };
+    const parsed = parseWorkflowNodeInvocationPlan(input.invocationPlan);
+    if (!parsed.ok || parsed.plan.bindingDigest !== ref.invocationPlanDigest) {
+      return { status: 'conflict', reason: 'workflow v3 invocation plan does not match the activation digest' };
+    }
+    const binding = parsed.plan.binding;
+    if (
+      binding.effect === 'read'
+      || binding.effect === 'compute'
+      || parsed.plan.requirementId !== durable.requirement_id
+      || parsed.plan.logicalCapabilityId !== durable.logical_capability_id
+      || workflowV3ObligationDigest(parsed.plan) !== durable.obligation_digest
+      || canonicalArgumentDigestOf(input.args) !== durable.canonical_argument_digest
+      || binding.capabilityId !== durable.capability_id
+      || binding.manifestId !== durable.manifest_id
+      || binding.manifestDigest !== durable.manifest_digest
+      || binding.operationId !== durable.operation_id
+      || binding.operationVersion !== durable.operation_version
+      || binding.schemaDigest !== durable.schema_digest
+      || binding.providerVersion !== durable.provider_version
+      || binding.liveFingerprint !== durable.live_fingerprint
+      || binding.accountId !== durable.account_id
+      || binding.effect !== durable.effect
+      || binding.invokePortId !== durable.invoke_port_id
+      || binding.argumentCompiler.id !== durable.argument_compiler_id
+      || binding.argumentCompiler.version !== durable.argument_compiler_version
+      || authority.bindingRevisionDigest !== durable.authority_binding_digest
+    ) return { status: 'conflict', reason: 'workflow v3 plan/arguments differ from their exact durable binding' };
+
+    const factory = peekHostCapabilityCatalogFactory();
+    const capability = factory?.get(binding.capabilityId);
+    const live = capability ? canonicalCatalogIdentityOf(capability) : null;
+    if (
+      !capability
+      || !live
+      || !capability.manifest
+      || !currentCapabilityManifest(capability.manifest)
+      || capabilityManifestDigest(capability.manifest) !== binding.manifestDigest
+      || live.capabilityId !== binding.capabilityId
+      || live.manifestId !== binding.manifestId
+      || live.manifestDigest !== binding.manifestDigest
+      || live.operationId !== binding.operationId
+      || live.schemaVersion !== binding.operationVersion
+      || live.schemaDigest !== binding.schemaDigest
+      || live.providerVersion !== binding.providerVersion
+      || live.liveFingerprint !== binding.liveFingerprint
+      || live.account !== binding.accountId
+      || live.effect !== binding.effect
+      || live.invokePortId !== binding.invokePortId
+      || live.argumentCompiler.id !== binding.argumentCompiler.id
+      || live.argumentCompiler.version !== binding.argumentCompiler.version
+    ) return { status: 'conflict', reason: 'workflow v3 live binding differs from its exact invocation plan' };
+    if (!resolveProductionPortsForManifest(capability.manifest)) {
+      return { status: 'missing', reason: 'workflow v3 exact immutable invoke port is missing' };
+    }
+    const observation = independentlyObserveCapability(binding.operationId, binding.accountId);
+    if (
+      !observation
+      || observation.origin !== 'independent'
+      || !observationIsFresh(observation)
+      || observation.operationId !== binding.operationId
+      || observation.operationVersion !== binding.operationVersion
+      || observation.providerVersion !== binding.providerVersion
+      || observation.definitionFingerprint !== binding.liveFingerprint
+      || observation.accountId !== binding.accountId
+    ) return { status: 'conflict', reason: 'workflow v3 independent live observation differs from its plan' };
+    const contract = durableLogicalCallContract(ref.authorityRootId, binding.operationId, input.args);
+    if (!contract) return { status: 'conflict', reason: 'workflow v3 arguments do not form a canonical logical contract' };
+    const attestation = Object.freeze<WorkflowV3CallAttestation>({
+      sessionId: ref.sessionId,
+      sourceEventSeq: ref.sourceEventSeq,
+      authorityRootId: ref.authorityRootId,
+      sourceEventId: ref.sourceEventId,
+      sourceEventDigest: ref.sourceEventDigest,
+      activationId: ref.activationId,
+      activationDigest: ref.activationDigest,
+      workflowId: ref.workflowId,
+      workflowRevision: ref.workflowRevision,
+      workflowDigest: ref.workflowDigest,
+      runId: ref.runId,
+      runOccurrenceId: ref.runOccurrenceId,
+      nodeId: ref.nodeId,
+      nodeAttempt: ref.nodeAttempt,
+      invocationPlanDigest: ref.invocationPlanDigest,
+      bindingSnapshotDigest: ref.bindingSnapshotDigest,
+      controlDigest: ref.controlDigest,
+      logicalCallId: ref.logicalCallId,
+      toolName: contract.toolName,
+      operationId: binding.operationId,
+      argumentDigest: contract.argumentDigest,
+      capabilityId: binding.capabilityId,
+      manifestId: binding.manifestId,
+      manifestDigest: binding.manifestDigest,
+      operationVersion: binding.operationVersion,
+      schemaDigest: binding.schemaDigest,
+      providerVersion: binding.providerVersion,
+      liveFingerprint: binding.liveFingerprint,
+      accountId: binding.accountId,
+      invokePortId: binding.invokePortId,
+      argumentCompilerId: binding.argumentCompiler.id,
+      argumentCompilerVersion: binding.argumentCompiler.version,
+      authorityBindingDigest: durable.authority_binding_digest,
+      requirementId: durable.requirement_id,
+      logicalCapabilityId: durable.logical_capability_id,
+      effect: durable.effect,
+      canonicalArgumentDigest: durable.canonical_argument_digest,
+      sourceArgumentDigest: durable.source_argument_digest,
+      obligationDigest: durable.obligation_digest,
+      authorityDigest: ref.authorityDigest,
+      authorityRevision: ref.authorityRevision,
+    });
+    const proof = Object.freeze<WorkflowV3CallAttestationProof>({
+      kind: 'workflow_v3_call_attestation',
+      activationId: ref.activationId,
+      authorityRootId: ref.authorityRootId,
+      logicalCallId: ref.logicalCallId,
+      authorityBindingDigest: durable.authority_binding_digest,
+    });
+    workflowV3Proofs.set(proof as object, attestation);
+    return { status: 'minted', proof, ref, toolName: contract.toolName, argumentDigest: contract.argumentDigest };
   } catch (error) {
     return { status: 'storage_error', reason: boundedReason(error) };
   }
@@ -2679,12 +3631,14 @@ export function admitWorkflowLogicalCallInTransaction(
     };
   }
   const authority = loaded.authority;
+  const workflowV3 = authority.authorityKind === 'workflow_v3_call';
   if (
     authority.authorityKind !== 'workflow_v1_read_only'
+    && !workflowV3
     || authority.identity.acceptedTaskId !== input.authorityRootId
-  ) return { status: 'conflict', reason: 'logical call does not belong to workflow read-only authority' };
+  ) return { status: 'conflict', reason: 'logical call does not belong to workflow authority' };
   if (authority.state !== 'open') {
-    return { status: 'closed', reason: `workflow read-only call authority is ${authority.state}` };
+    return { status: 'closed', reason: `workflow call authority is ${authority.state}` };
   }
   if (authority.workflow?.logicalCallId !== input.logicalToolCallId) {
     poisonAcceptedTurnCallAuthorityInTransaction(db, {
@@ -2697,12 +3651,21 @@ export function admitWorkflowLogicalCallInTransaction(
       reason: 'workflow logical call differs from its activation',
     };
   }
-  if (!workflowReadOnlyCallAttestationMatches(authority, {
+  const attested = workflowV3
+    ? workflowV3CallAttestationMatches(authority, {
+        acceptedTaskId: input.authorityRootId,
+        logicalToolCallId: input.logicalToolCallId,
+        toolName: input.toolName,
+        argumentDigest: input.argumentDigest,
+        effect: input.effect,
+      })
+    : workflowReadOnlyCallAttestationMatches(authority, {
     acceptedTaskId: input.authorityRootId,
     logicalToolCallId: input.logicalToolCallId,
     toolName: input.toolName,
     argumentDigest: input.argumentDigest,
-  })) {
+  });
+  if (!attested) {
     poisonAcceptedTurnCallAuthorityInTransaction(db, {
       sessionId: input.sessionId,
       sourceUserSeq: input.sourceEventSeq,
@@ -2727,10 +3690,10 @@ export type CloseWorkflowReadOnlyCallAuthorityResult =
   | { status: 'closed' | 'replayed'; authority: AcceptedTurnCallAuthority }
   | { status: 'not_ready' | 'missing' | 'conflict' | 'storage_error'; reason: string };
 
-export function closeWorkflowReadOnlyCallAuthority(input: {
+function closeWorkflowCallAuthority(input: {
   activationId: string;
   outcome: WorkflowCallAuthorityCloseOutcome;
-}): CloseWorkflowReadOnlyCallAuthorityResult {
+}, authorityKind: 'workflow_v1_read_only' | 'workflow_v3_call'): CloseWorkflowReadOnlyCallAuthorityResult {
   if (!(['completed', 'failed', 'cancelled', 'blocked'] as const).includes(input.outcome)) {
     return { status: 'conflict', reason: 'workflow call-authority outcome is invalid' };
   }
@@ -2740,7 +3703,7 @@ export function closeWorkflowReadOnlyCallAuthority(input: {
       const activation = readWorkflowActivationRow(db, input.activationId);
       if (!activation) return { status: 'missing', reason: 'workflow activation is missing' };
       const row = readRow(db, activation.session_id, activation.source_event_seq);
-      if (!row || row.authority_kind !== 'workflow_v1_read_only') {
+      if (!row || row.authority_kind !== authorityKind) {
         return { status: 'conflict', reason: 'workflow activation has no exact call-authority root' };
       }
       const closeReason = `workflow_${input.outcome}`;
@@ -2778,13 +3741,14 @@ export function closeWorkflowReadOnlyCallAuthority(input: {
         UPDATE accepted_turn_call_authorities
            SET state = ?, revision = revision + 1, closed_at = ?, close_reason = ?
          WHERE session_id = ? AND source_user_seq = ?
-           AND authority_kind = 'workflow_v1_read_only' AND state = 'open'
+           AND authority_kind = ? AND state = 'open'
       `).run(
         targetState,
         new Date().toISOString(),
         closeReason,
         activation.session_id,
         activation.source_event_seq,
+        authorityKind,
       );
       if (updated.changes !== 1) throw new Error('workflow call-authority close lost its CAS');
       const closed = readRow(db, activation.session_id, activation.source_event_seq);
@@ -2795,6 +3759,20 @@ export function closeWorkflowReadOnlyCallAuthority(input: {
   } catch (error) {
     return { status: 'storage_error', reason: boundedReason(error) };
   }
+}
+
+export function closeWorkflowReadOnlyCallAuthority(input: {
+  activationId: string;
+  outcome: WorkflowCallAuthorityCloseOutcome;
+}): CloseWorkflowReadOnlyCallAuthorityResult {
+  return closeWorkflowCallAuthority(input, 'workflow_v1_read_only');
+}
+
+export function closeWorkflowV3CallAuthority(input: {
+  activationId: string;
+  outcome: WorkflowCallAuthorityCloseOutcome;
+}): CloseWorkflowReadOnlyCallAuthorityResult {
+  return closeWorkflowCallAuthority(input, 'workflow_v3_call');
 }
 
 export function poisonWorkflowReadOnlyCallAuthority(input: {
@@ -2820,6 +3798,19 @@ export function poisonWorkflowReadOnlyCallAuthority(input: {
   } catch (error) {
     return { status: 'storage_error', reason: boundedReason(error) };
   }
+}
+
+export function poisonWorkflowV3CallAuthority(input: {
+  activationId: string;
+  reason: string;
+}): ReturnType<typeof poisonWorkflowReadOnlyCallAuthority> {
+  const loaded = readWorkflowV3CallAuthority(input.activationId);
+  if (loaded.status === 'missing') return { status: 'missing', reason: loaded.reason };
+  if (loaded.status === 'storage_error') return { status: 'storage_error', reason: loaded.reason };
+  if (loaded.status === 'conflict' && !readWorkflowActivationRow(openEventLog(), input.activationId)) {
+    return { status: 'missing', reason: loaded.reason };
+  }
+  return poisonWorkflowReadOnlyCallAuthority(input);
 }
 
 export type HostCallAuthorityCloseOutcome = 'completed' | 'failed' | 'cancelled' | 'blocked';

@@ -18,6 +18,7 @@ const {
   resetEventLog,
 } = await import('./eventlog.js');
 const { _acceptResumeConversationInputForTest } = await import('./loop.js');
+const approvalRegistry = await import('./approval-registry.js');
 
 afterEach(() => resetEventLog());
 after(() => {
@@ -39,23 +40,29 @@ test('explicit approval B mints/reuses only B source and never borrows approval 
       source: 'mobile_approval',
     },
   });
+  const cardB = approvalRegistry.register({
+    sessionId: session.id,
+    subject: 'Exact card B',
+    tool: 'fixture_tool',
+    args: { card: 'b' },
+  });
 
   const sourceBSeq = _acceptResumeConversationInputForTest({
     sessionId: session.id,
-    approvalId: 'apr-card-b',
+    approvalId: cardB.approvalId,
     decision: 'approve',
   });
   assert.notEqual(sourceBSeq, sourceA.seq);
   const sourceB = listEvents(session.id, { types: ['user_input_received'] })
     .find((event) => event.seq === sourceBSeq)!;
-  assert.equal(sourceB.data.approvalId, 'apr-card-b');
+  assert.equal(sourceB.data.approvalId, cardB.approvalId);
   assert.equal(sourceB.data.decision, 'approve');
   assert.equal(sourceB.data.synthetic, true);
 
   assert.equal(_acceptResumeConversationInputForTest({
     sessionId: session.id,
     sourceUserSeq: sourceBSeq,
-    approvalId: 'apr-card-b',
+    approvalId: cardB.approvalId,
     decision: 'approve',
   }), sourceBSeq);
   assert.equal(listEvents(session.id, { types: ['user_input_received'] }).length, 2);
@@ -63,25 +70,41 @@ test('explicit approval B mints/reuses only B source and never borrows approval 
   assert.throws(() => _acceptResumeConversationInputForTest({
     sessionId: session.id,
     sourceUserSeq: sourceA.seq,
-    approvalId: 'apr-card-b',
+    approvalId: cardB.approvalId,
     decision: 'approve',
-  }), /does not own approval apr-card-b/);
+  }), new RegExp(`does not own approval ${cardB.approvalId}`));
+});
+
+test('an unknown explicit approval cannot mint an accepted control source', () => {
+  const session = createSession({ kind: 'chat', channel: 'mobile' });
+  assert.throws(() => _acceptResumeConversationInputForTest({
+    sessionId: session.id,
+    approvalId: 'apr-forged-missing',
+    decision: 'approve',
+  }), /does not belong to this session/);
+  assert.equal(listEvents(session.id, { types: ['user_input_received'] }).length, 0);
 });
 
 test('multiple response rows for one explicit approval fail closed', () => {
   const session = createSession({ kind: 'chat', channel: 'mobile' });
+  const card = approvalRegistry.register({
+    sessionId: session.id,
+    subject: 'Duplicate response fixture',
+    tool: 'fixture_tool',
+    args: { duplicate: true },
+  });
   for (let turn = 1; turn <= 2; turn += 1) {
     appendEvent({
       sessionId: session.id,
       turn,
       role: 'user',
       type: 'user_input_received',
-      data: { text: 'Approve duplicate.', approvalId: 'apr-duplicate', decision: 'approve' },
+      data: { text: 'Approve duplicate.', approvalId: card.approvalId, decision: 'approve' },
     });
   }
   assert.throws(() => _acceptResumeConversationInputForTest({
     sessionId: session.id,
-    approvalId: 'apr-duplicate',
+    approvalId: card.approvalId,
     decision: 'approve',
   }), /ambiguous accepted response ownership/);
 });

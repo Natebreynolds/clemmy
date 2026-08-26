@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { getSession, listEvents, openEventLog, resolveToolOutputForAuthority } from './eventlog.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import {
+  exactProviderDataPayload,
   inspectProviderEnvelope,
   projectProviderResult,
   pruneProviderRequestEchoes,
@@ -1722,11 +1723,53 @@ function hostReadbackResourceId(args: unknown): string | null {
   return boundedHostArtifactId(value) ? value : null;
 }
 
+function exactScalarOccurrences(value: unknown, target: string, depth = 0): number {
+  if (depth > 8) return 0;
+  if (typeof value === 'string') return value === target ? 1 : 0;
+  if (Array.isArray(value)) {
+    return value.reduce((count, child) => count + exactScalarOccurrences(child, target, depth + 1), 0);
+  }
+  if (!value || typeof value !== 'object') return 0;
+  return Object.values(value as Record<string, unknown>)
+    .reduce<number>((count, child) => count + exactScalarOccurrences(child, target, depth + 1), 0);
+}
+
 function hostLineageRecords(value: unknown): unknown[] | null {
-  if (Array.isArray(value)) return value;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const records = (value as { records?: unknown }).records;
+  const providerPayload = exactProviderDataPayload(value);
+  if (Array.isArray(providerPayload)) return providerPayload;
+  if (!providerPayload || typeof providerPayload !== 'object' || Array.isArray(providerPayload)) return null;
+  const records = (providerPayload as { records?: unknown }).records;
   return Array.isArray(records) ? records : null;
+}
+
+function exactSettledExpectedWorkCallId(input: {
+  db: ReturnType<typeof openEventLog>;
+  sessionId: string;
+  sourceUserSeq: number;
+  contractId: string;
+  requirementId: string;
+  effect: string;
+}): string | null {
+  const rows = input.db.prepare(`
+    SELECT b.logical_tool_call_id
+      FROM expected_work_call_bindings b
+      JOIN logical_call_settlements s
+        ON s.session_id = b.session_id
+       AND s.source_user_seq = b.source_user_seq
+       AND s.logical_tool_call_id = b.logical_tool_call_id
+     WHERE b.session_id = ? AND b.source_user_seq = ?
+       AND b.contract_id = ? AND b.requirement_id = ?
+       AND b.effect_kind = ?
+       AND s.outcome_kind = 'succeeded'
+       AND s.continues_requirement = 0
+  `).all(
+    input.sessionId,
+    input.sourceUserSeq,
+    input.contractId,
+    input.requirementId,
+    input.effect,
+  ) as Array<{ logical_tool_call_id: string }>;
+  return rows.length === 1 ? rows[0]!.logical_tool_call_id : null;
 }
 
 /**
@@ -1743,11 +1786,10 @@ export function authorizeHostSealedArtifactReadback(input: {
   verificationRequirementId: string;
   readToolName: string;
   readArgs: unknown;
+  readProviderInputSchemaDigest?: string;
+  readAccountId?: string;
 }): GeneratedArtifactReadbackAdmission {
   const requestedResourceId = hostReadbackResourceId(input.readArgs);
-  if (!requestedResourceId) {
-    return { status: 'unavailable', reason: 'host readback does not name one exact resource id' };
-  }
   try {
     ensureSchema();
     const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
@@ -1765,12 +1807,10 @@ export function authorizeHostSealedArtifactReadback(input: {
         JOIN artifact_content_verifications c ON c.artifact_id = a.id
        WHERE root.session_id = ? AND root.source_user_seq = ?
          AND a.source_call_id = ? AND a.status = 'bound'
-         AND a.resource_id = ?
     `).all(
       input.sessionId,
       input.sourceUserSeq,
       input.createLogicalToolCallId,
-      requestedResourceId,
     ) as Array<{
       artifact_id: string;
       run_scope_id: string;
@@ -1783,18 +1823,33 @@ export function authorizeHostSealedArtifactReadback(input: {
       return { status: 'unavailable', reason: 'host readback target is missing or ambiguous' };
     }
     const row = rows[0]!;
+    if (
+      requestedResourceId
+        ? requestedResourceId !== row.resource_id
+        : exactScalarOccurrences(input.readArgs, row.resource_id) !== 1
+    ) {
+      return { status: 'unavailable', reason: 'host readback does not name the exact created resource once' };
+    }
     let rawContract: unknown;
     try { rawContract = JSON.parse(row.contract_json); } catch {
       return { status: 'unavailable', reason: 'host-sealed content contract is unreadable' };
     }
     const contract = parseHostSealedArtifactContentContract(rawContract);
     if (!contract) return { status: 'unavailable', reason: 'host-sealed content contract is invalid' };
+    const createLogicalToolCallId = exactSettledExpectedWorkCallId({
+      db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      contractId: input.contractId,
+      requirementId: contract.createNodeId,
+      effect: contract.createEffect,
+    });
     if (
       contract.acceptedTaskId !== loaded.contract.acceptedTaskId
       || contract.graphId !== loaded.contract.graphId
       || contract.graphHash !== loaded.contract.graphHash
       || contract.readbackNodeId !== input.verificationRequirementId
-      || `logical:${contract.createNodeId}` !== input.createLogicalToolCallId
+      || createLogicalToolCallId !== input.createLogicalToolCallId
     ) return { status: 'unavailable', reason: 'host-sealed contract contradicts accepted graph identity' };
 
     const createOperation = loaded.contract.operations.find((operation) => operation.id === contract.createNodeId);
@@ -1837,15 +1892,23 @@ export function authorizeHostSealedArtifactReadback(input: {
     const createBinding = JSON.parse(createBindingRow.binding_json) as Record<string, unknown>;
     const readbackBinding = JSON.parse(readbackBindingRow.binding_json) as Record<string, unknown>;
     const readArgs = input.readArgs as Record<string, unknown>;
+    const exactProviderCarrier = Boolean(
+      input.readProviderInputSchemaDigest
+      && input.readAccountId
+      && readbackBinding.providerInputSchemaDigest === input.readProviderInputSchemaDigest
+      && readbackBinding.account === input.readAccountId
+    );
     if (
       createBindingRow.binding_digest !== contract.createBindingDigest
       || readbackBindingRow.binding_digest !== contract.readbackBindingDigest
       || createBinding.effect !== contract.createEffect
       || readbackBinding.effect !== 'read'
       || readbackBinding.toolName !== input.readToolName
-      || readArgs.capabilityId !== readbackBinding.capabilityId
-      || readArgs.schemaVersion !== readbackBinding.schemaVersion
-      || readArgs.schemaDigest !== readbackBinding.schemaDigest
+      || (!exactProviderCarrier && (
+        readArgs.capabilityId !== readbackBinding.capabilityId
+        || readArgs.schemaVersion !== readbackBinding.schemaVersion
+        || readArgs.schemaDigest !== readbackBinding.schemaDigest
+      ))
     ) return { status: 'unavailable', reason: 'host readback capability binding is not exact and read-only' };
 
     const createSettlement = db.prepare(`
@@ -1876,12 +1939,23 @@ export function authorizeHostSealedArtifactReadback(input: {
       || createSettlement.continues_requirement !== 0
     ) return { status: 'unavailable', reason: 'host create predecessor is not durably settled' };
 
+    const lineageLogicalToolCallId = exactSettledExpectedWorkCallId({
+      db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      contractId: input.contractId,
+      requirementId: contract.lineageNodeId,
+      effect: loaded.contract.operations.find((operation) => operation.id === contract.lineageNodeId)?.effect ?? '',
+    });
+    if (!lineageLogicalToolCallId) {
+      return { status: 'unavailable', reason: 'host content lineage call is missing or ambiguous' };
+    }
     const lineage = redeemAuthoritativeResultPayload({
       kind: 'successful_settlement',
       sessionId: input.sessionId,
       sourceUserSeq: input.sourceUserSeq,
       acceptedTaskId: contract.acceptedTaskId,
-      logicalToolCallId: `logical:${contract.lineageNodeId}`,
+      logicalToolCallId: lineageLogicalToolCallId,
     });
     if (lineage.status !== 'ok') {
       return {
@@ -2220,15 +2294,56 @@ export function verifyHostSealedArtifactContentFromReadback(input: {
       return dependency?.effect === 'external_write' || dependency?.effect === 'local_write';
     });
     if (createDependencies.length !== 1) return false;
-    const createLogicalToolCallId = `logical:${createDependencies[0]}`;
+    const createLogicalToolCallId = exactSettledExpectedWorkCallId({
+      db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      contractId: binding.contract_id,
+      requirementId: createDependencies[0]!,
+      effect: loaded.contract.operations.find(
+        (candidate) => candidate.id === createDependencies[0],
+      )?.effect ?? '',
+    });
+    if (!createLogicalToolCallId) return false;
+    const readbackBindingRow = db.prepare(`
+      SELECT binding_json, binding_digest
+        FROM graph_node_bindings
+       WHERE session_id = ? AND source_user_seq = ? AND node_id = ?
+    `).get(
+      input.sessionId,
+      input.sourceUserSeq,
+      binding.requirement_id,
+    ) as { binding_json: string; binding_digest: string } | undefined;
+    if (!readbackBindingRow) return false;
+    let readbackBinding: Record<string, unknown>;
+    try {
+      readbackBinding = JSON.parse(readbackBindingRow.binding_json) as Record<string, unknown>;
+    } catch {
+      return false;
+    }
+    if (
+      readbackBinding.nodeId !== binding.requirement_id
+      || readbackBinding.bindingDigest !== readbackBindingRow.binding_digest
+      || readbackBinding.effect !== 'read'
+      || readbackBinding.toolName !== input.readToolName
+      || typeof readbackBinding.capabilityId !== 'string'
+      || typeof readbackBinding.schemaVersion !== 'string'
+      || typeof readbackBinding.schemaDigest !== 'string'
+      || exactScalarOccurrences(input.readArgs, input.returnedResourceId) !== 1
+    ) return false;
     const authorized = authorizeHostSealedArtifactReadback({
       sessionId: input.sessionId,
       sourceUserSeq: input.sourceUserSeq,
       contractId: binding.contract_id,
       createLogicalToolCallId,
       verificationRequirementId: binding.requirement_id,
-      readToolName: input.readToolName,
-      readArgs: input.readArgs,
+      readToolName: readbackBinding.toolName,
+      readArgs: {
+        resourceId: input.returnedResourceId,
+        capabilityId: readbackBinding.capabilityId,
+        schemaVersion: readbackBinding.schemaVersion,
+        schemaDigest: readbackBinding.schemaDigest,
+      },
     });
     if (authorized.status !== 'authorized' || authorized.resourceId !== input.returnedResourceId) return false;
     const contract = parseHostSealedArtifactContentContract(authorized.contentContract);
@@ -2354,8 +2469,6 @@ export function verifyHostSealedArtifactDerivationForWrite(input: {
     const contract = parseHostSealedArtifactContentContract(rawContract);
     if (
       !contract
-      || `logical:${contract.createNodeId}` !== input.createLogicalToolCallId
-      || `logical:${contract.readbackNodeId}` !== row.verification_logical_call_id
       || contract.intendedContentDigest !== input.intendedContentDigest
       || contract.lineageContentDigest !== input.intendedContentDigest
     ) return { status: 'unavailable', reason: 'sealed derivation contract contradicts the settled write' };
@@ -2382,6 +2495,27 @@ export function verifyHostSealedArtifactDerivationForWrite(input: {
       || !readbackOperation.dependsOn.includes(contract.createNodeId)
     ) return { status: 'unavailable', reason: 'sealed derivation DAG edge is not exact' };
 
+    const createLogicalToolCallId = exactSettledExpectedWorkCallId({
+      db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      contractId: loaded.contract.contractId,
+      requirementId: contract.createNodeId,
+      effect: contract.createEffect,
+    });
+    const readbackLogicalToolCallId = exactSettledExpectedWorkCallId({
+      db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      contractId: loaded.contract.contractId,
+      requirementId: contract.readbackNodeId,
+      effect: 'read',
+    });
+    if (
+      createLogicalToolCallId !== input.createLogicalToolCallId
+      || readbackLogicalToolCallId !== row.verification_logical_call_id
+    ) return { status: 'unavailable', reason: 'sealed derivation logical bindings are not exact' };
+
     const ancestors = new Set<string>();
     const pending = [contract.lineageNodeId];
     while (pending.length > 0) {
@@ -2405,7 +2539,17 @@ export function verifyHostSealedArtifactDerivationForWrite(input: {
 
     for (const nodeId of ancestors) {
       const operation = operations.get(nodeId)!;
-      const logicalToolCallId = `logical:${nodeId}`;
+      const logicalToolCallId = exactSettledExpectedWorkCallId({
+        db,
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        contractId: loaded.contract.contractId,
+        requirementId: nodeId,
+        effect: operation.effect,
+      });
+      if (!logicalToolCallId) {
+        return { status: 'unavailable', reason: `sealed derivation ancestor ${nodeId} is missing or ambiguous` };
+      }
       const authority = db.prepare(`
         SELECT b.requirement_id, b.effect_kind, b.tool_name, b.argument_digest,
                s.outcome_kind, s.continues_requirement,
@@ -2522,7 +2666,7 @@ export function verifyHostSealedArtifactDerivationForWrite(input: {
     if (readback.status !== 'ok') {
       return { status: 'unavailable', reason: 'sealed derivation readback result is unavailable' };
     }
-    const raw = readback.value.rawPayload;
+    const raw = exactProviderDataPayload(readback.value.rawPayload);
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       return { status: 'unavailable', reason: 'sealed derivation readback result is malformed' };
     }
@@ -2685,6 +2829,24 @@ export function generatedArtifactReadContentVerified(input: {
 export function extractArtifactResource(intent: ArtifactIntent, output: unknown): ArtifactResource | null {
   const parsed = parseLooseResult(output);
   const commonTitle = walkForKey(parsed, new Set(['title', 'name']));
+  // Host-sealed graph creates have a stronger result contract than the generic
+  // effect classifier: an exact clean provider envelope must return both the
+  // durable id and provider handle later sealed into the write receipt. Keep
+  // that handle on the artifact row so terminal proof can bind the ledger row
+  // to the same exact CREATE identity instead of discarding non-HTTP handles.
+  if (intent.kind === 'resource' && intent.provider === 'host-sealed-graph') {
+    const payload = exactProviderDataPayload(output);
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    const direct = payload as Record<string, unknown>;
+    const created = direct.created && typeof direct.created === 'object' && !Array.isArray(direct.created)
+      ? direct.created as Record<string, unknown>
+      : direct;
+    const resourceId = stringField(created, ['id']);
+    const handle = stringField(created, ['handle']);
+    return resourceId && handle
+      ? { resourceId, uri: handle, title: commonTitle ?? intent.title }
+      : null;
+  }
   if (intent.kind === 'google_doc') {
     const uri = walkForKey(parsed, new Set(['display_url', 'documenturl', 'document_url', 'url', 'uri']))
       ?? (typeof output === 'string'

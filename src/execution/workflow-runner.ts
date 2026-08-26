@@ -36,6 +36,7 @@ import {
   type AcceptedSourceSettlementRecoveryIdentity,
 } from '../runtime/harness/accepted-source-settlement-audit.js';
 import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
+import { explicitlyOptsOutOfAutomaticMemoryRecall } from '../memory/automatic-recall-opt-out.js';
 import {
   loadPriorSuccessfulStepOutputs,
   resolveCertifiedStepOutput,
@@ -117,9 +118,17 @@ import {
 } from './workflow-events.js';
 import { sumUsageTokensForSource, sumUsageTokensForRun } from '../runtime/usage-log.js';
 import { HarnessSession } from '../runtime/harness/session.js';
+import { HostInterruptState } from '../runtime/harness/host-turn-runner.js';
+import { approvalAuthorityMatchesToolCall } from '../runtime/harness/approval-authority.js';
+import {
+  oneShotActivationAuthorizationDecisionDigest,
+  type OneShotActivationAuthorization,
+} from '../runtime/harness/accepted-turn-call-authority.js';
 import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
 import { uncompensatedExternalWriteEvents } from '../runtime/harness/external-write-admission.js';
 import {
+  deferredToolCallsLimitSourceUserSeq,
+  finalizeDeferredToolCallsLimitTerminal,
   runConversation,
   runConversationFromResume,
   type RunConversationResult,
@@ -197,6 +206,7 @@ import {
 } from './workflow-failure-ledger.js';
 import { clearStepContract, registerStepContract, takeStepResult } from '../tools/step-result-tool.js';
 import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
+import { buildWorkflowMemoryPrimerQuery } from './workflow-memory-primer.js';
 import { fixSignature, recordPendingFix, confirmPendingFix, discardPendingFix, recallConfirmedFix } from './workflow-fix-memory-store.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
@@ -241,7 +251,17 @@ import {
   type FinalizeCanonicalEntityWorkflowCompletionResultV1,
 } from '../spaces/canonical-entity-workflow-finalizer.js';
 import { parseWorkflowNodeInvocationPlan } from '../memory/workflow-node-invocation-plan.js';
-import { executeWorkflowNodeRead } from './workflow-node-invocation-executor.js';
+import {
+  activatePreparedWorkflowNodeCall,
+  executeActivatedWorkflowNodeCall,
+  executeWorkflowNodeRead,
+  prepareWorkflowNodeCall,
+  workflowV3CallConsentRequest,
+  type PreparedWorkflowNodeCallV1,
+  type WorkflowNodeCallExecutionIdentityV1,
+  type WorkflowNodeCallAuthorityProof,
+} from './workflow-node-invocation-executor.js';
+import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
 import {
   produceCanonicalEntityWorkflowLineage,
   type CanonicalEntityWorkflowResultRootV1,
@@ -290,11 +310,7 @@ import type { WorkflowAwaitingInputState } from './workflow-awaiting-input.js';
 import { reconcileAwaitingInputWorkflowRunProjections } from './workflow-awaiting-input-projection.js';
 import {
   assessWorkflowRunMutationRequeue,
-  executeWorkflowCallMutation,
-  readCommittedWorkflowCallMutationOutput,
   redeemExactScheduledSendStepOutput,
-  replayWorkflowCallMutationSlot,
-  workflowCallExpectedArgsDigest,
   workflowCallMutationSlotHasLedger,
   workflowCallMutationSlotHasCommittedReplayAuthority,
   workflowCallMutationSlotHasCommittedResult,
@@ -306,6 +322,10 @@ import {
   exactScheduledSendDefinitionEligibility,
   structuredCallSideEffectClass,
 } from './workflow-validator.js';
+import {
+  workflowRawSubprocessDeclarations,
+  workflowRawSubprocessRetirementReason,
+} from './workflow-raw-subprocess-policy.js';
 import {
   recallWorkflowPatterns,
   recordSuccessfulWorkflowPattern,
@@ -366,11 +386,16 @@ export function _setWorkflowHarnessLoopImplsForTests(input: {
   runConversation?: typeof runConversation;
   runConversationFromResume?: typeof runConversationFromResume;
   configureRuntime?: typeof configureHarnessRuntime;
+  stepWallClockMs?: number;
 } = {}): void {
   buildWorkflowOrchestratorAgentImpl = input.buildAgent ?? buildOrchestratorAgent;
   runWorkflowConversationImpl = input.runConversation ?? runConversation;
   resumeWorkflowConversationImpl = input.runConversationFromResume ?? runConversationFromResume;
   configureWorkflowHarnessRuntimeImpl = input.configureRuntime ?? configureHarnessRuntime;
+  workflowStepWallClockMsImpl = Number.isSafeInteger(input.stepWallClockMs)
+    && Number(input.stepWallClockMs) > 0
+    ? Number(input.stepWallClockMs)
+    : WORKFLOW_STEP_WALL_CLOCK_MS;
 }
 
 /** Narrow terminal-report seam. Production always uses the real voice pass;
@@ -580,6 +605,7 @@ function forEachMaxItems(): number {
 // abort individual stuck items. Synthesis sees a smaller cap because
 // it should be a tight rollup, not exploration.
 const WORKFLOW_STEP_WALL_CLOCK_MS = parseInt(process.env.CLEMENTINE_WORKFLOW_STEP_WALL_MS ?? `${15 * 60_000}`, 10);
+let workflowStepWallClockMsImpl = WORKFLOW_STEP_WALL_CLOCK_MS;
 const WORKFLOW_SYNTHESIS_WALL_CLOCK_MS = parseInt(process.env.CLEMENTINE_WORKFLOW_SYNTHESIS_WALL_MS ?? `${5 * 60_000}`, 10);
 const WORKFLOW_DETERMINISTIC_TIMEOUT_MS = parseInt(process.env.CLEMENTINE_WORKFLOW_DETERMINISTIC_TIMEOUT_MS ?? `${5 * 60_000}`, 10);
 
@@ -2286,11 +2312,9 @@ export function renderCallArgs(args: Record<string, unknown> | undefined, inputs
   return out;
 }
 
-/** Execute a structured call node directly — zero LLM. v1: composio slug via
- *  the composio dispatch GATEWAY (same owner resolution, sender constraints,
- *  and typed blocks as chat/Space) — a workflow exact-call can never dispatch
- *  under an ambiguous or non-compliant account. Args are rendered against
- *  inputs/upstream/(item). */
+/** Execute a structured call node directly — zero LLM. Production calls must
+ * carry an exact provider-neutral invocation plan and enter the shared
+ * workflow call kernel. A bare name/args call has no dispatch authority. */
 let workflowCallNodeOverrideForTests:
   | ((step: WorkflowStepInput, ctx: StepExecutionContext, item?: unknown) => Promise<unknown>)
   | undefined;
@@ -2301,49 +2325,234 @@ export function _setWorkflowCallNodeForTests(
   workflowCallNodeOverrideForTests = override;
 }
 
-/**
- * The zero-LLM structured-call lane still crosses the settlement spine, and
- * the spine refuses dispatch without an accepted source + persisted turn
- * graph + ambient run context. Mint the step-session identity once per call
- * node (idempotent per step/item): session row → accepted user_input_received
- * (the rendered call IS the step's input) → turn-graph shadow. Without this,
- * every workflow exact-call threw ToolAttemptSettlementAuthorityError
- * post-spine (live class: scheduled workflows dying on their first dispatch).
- */
-async function ensureWorkflowCallIdentity(
-  sessionId: string,
+function workflowExactCallDigest(domain: string, value: unknown): string {
+  return createHash('sha256').update(closedCanonicalJson({ domain, version: 1, value }), 'utf8').digest('hex');
+}
+
+function exactWorkflowCallIdentity(
   step: WorkflowStepInput,
-  toolSlug: string,
-  mutationItemKey?: string,
-): Promise<{ sourceUserSeq: number; turn: number } | null> {
-  try {
-    const { createSession, getSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
-    const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
-    if (!getSession(sessionId)) createSession({ id: sessionId, kind: 'workflow' });
-    const marker = `${step.id}::${mutationItemKey ?? ''}`;
-    const existing = listEvents(sessionId, { types: ['user_input_received'] })
-      .find((event) => event.data.workflowCallNode === marker);
-    const source = existing ?? appendEvent({
-      sessionId,
-      turn: 1,
-      role: 'user',
-      type: 'user_input_received',
-      data: {
-        text: `Workflow step ${step.id}: execute ${toolSlug}`,
-        workflowCallNode: marker,
-      },
-    });
-    recordTurnGraphShadow({
-      identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
-      surface: 'workflow',
-    });
-    return { sourceUserSeq: source.seq, turn: source.turn };
-  } catch {
-    // Identity minting is dispatch ENABLEMENT — a bookkeeping failure here
-    // must surface as the settlement spine's own typed refusal downstream,
-    // never as a silent skip of the call.
-    return null;
+  ctx: StepExecutionContext,
+  invocationPlanDigest: string,
+  binding: unknown,
+): WorkflowNodeCallExecutionIdentityV1 {
+  return {
+    workflowId: ctx.workflowSlug,
+    // Catalog workflows do not yet carry an independent monotonic revision.
+    // Revision 1 is the explicit surface revision; workflowDigest binds every
+    // definition byte. Keeping this stable within a run makes definition/plan
+    // drift collide with the already-owned occurrence instead of opening a
+    // second occurrence under a hash-derived pseudo revision.
+    workflowRevision: 1,
+    workflowDigest: workflowDefinitionHash(ctx.workflow),
+    runId: ctx.runId,
+    runOccurrenceId: ctx.runId,
+    nodeId: step.id,
+    nodeAttempt: 1,
+    invocationPlanDigest,
+    bindingSnapshotDigest: workflowExactCallDigest('workflow-v3-runner-binding', binding),
+    controlDigest: workflowExactCallDigest('workflow-v3-runner-control', {
+      workflowSlug: ctx.workflowSlug,
+      stepId: step.id,
+      dependsOn: step.dependsOn ?? [],
+      sideEffect: step.sideEffect ?? null,
+      requiresApproval: step.requiresApproval === true,
+      forEach: step.forEach ?? null,
+      operationId: step.call?.tool ?? null,
+    }),
+  };
+}
+
+function exactWorkflowCallSession(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+): HarnessSession {
+  const sessionId = `workflow:${ctx.runId}:${step.id}`;
+  const existing = HarnessSession.load(sessionId);
+  if (existing) {
+    if (existing.kind !== 'workflow') {
+      throw new WorkflowHarnessBlockedSignal({
+        stepId: step.id,
+        sessionId,
+        reason: 'workflow_activation_session_invalid: the exact call session has a foreign kind.',
+      });
+    }
+    return existing;
   }
+  return HarnessSession.create({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: `${ctx.workflow.name}::${step.id} (exact call)`,
+    metadata: {
+      source: 'workflow',
+      workflowName: ctx.workflow.name,
+      workflowRunId: ctx.runId,
+      stepId: step.id,
+      exactCallAuthority: 'workflow_v3_call',
+    },
+  });
+}
+
+function exactWorkflowV3Authorization(
+  stepId: string,
+  claim: Exclude<ReturnType<typeof approvalRegistry.inspectResumableApproval>, { state: 'none' | 'pending' | 'rejected' | 'expired' | 'cancelled' | 'pending_action_owned' }>,
+  request: Extract<ReturnType<typeof workflowV3CallConsentRequest>, { ok: true }>['request'],
+  sessionId: string,
+): OneShotActivationAuthorization {
+  const row = claim.row;
+  if (
+    row.sessionId !== sessionId
+    || row.resumeKey !== request.resumeKey
+    || row.resolution !== 'approved'
+    || !row.resolver
+    || !row.resolvedAt
+    || !approvalAuthorityMatchesToolCall(row, request.tool, request.args)
+  ) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId,
+      sessionId,
+      reason: 'workflow_v3_authorization_invalid: the resolved approval does not bind the exact durable call.',
+    });
+  }
+  return {
+    approvalId: row.approvalId,
+    resumeKey: request.resumeKey,
+    decisionDigest: oneShotActivationAuthorizationDecisionDigest({
+      approvalId: row.approvalId,
+      approvalSessionId: row.sessionId,
+      resumeKey: request.resumeKey,
+      requestedAt: row.requestedAt,
+      expiresAt: row.expiresAt,
+      subject: row.subject,
+      tool: row.tool,
+      args: row.args,
+      resolver: row.resolver,
+      resolvedAt: row.resolvedAt,
+    }),
+  };
+}
+
+async function awaitExactWorkflowV3Authorization(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+  sessionId: string,
+  prepared: PreparedWorkflowNodeCallV1,
+  proof: WorkflowNodeCallAuthorityProof,
+): Promise<OneShotActivationAuthorization> {
+  const consent = workflowV3CallConsentRequest({ prepared, proof });
+  if (!consent.ok) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId,
+      reason: `workflow_v3_authorization_unavailable: ${consent.reason}`,
+    });
+  }
+  const request = consent.request;
+  const startedAt = Date.now();
+  while (true) {
+    throwIfWorkflowRunCancelled(ctx.runId);
+    const claim = approvalRegistry.inspectResumableApproval(request.resumeKey);
+    if (claim.state === 'approved' || claim.state === 'consumed') {
+      return exactWorkflowV3Authorization(step.id, claim, request, sessionId);
+    }
+    if (
+      claim.state === 'rejected'
+      || claim.state === 'expired'
+      || claim.state === 'cancelled'
+      || claim.state === 'pending_action_owned'
+    ) {
+      throw new WorkflowStepNotApprovedError(
+        `workflow exact call "${step.id}" was not approved (${claim.state})`,
+      );
+    }
+
+    let approvalId: string;
+    if (claim.state === 'pending') {
+      if (
+        claim.row.sessionId !== sessionId
+        || claim.row.resumeKey !== request.resumeKey
+        || !approvalAuthorityMatchesToolCall(claim.row, request.tool, request.args)
+      ) {
+        throw new WorkflowHarnessBlockedSignal({
+          stepId: step.id,
+          sessionId,
+          reason: 'workflow_v3_authorization_conflict: the resume key belongs to a different call.',
+        });
+      }
+      approvalId = claim.row.approvalId;
+    } else {
+      let registered: ReturnType<typeof approvalRegistry.registerResumable>;
+      try {
+        registered = approvalRegistry.registerResumable({
+          sessionId,
+          subject: step.approvalPreview?.trim()
+            || `Approve exact ${prepared.binding.effect} call ${prepared.operationId} on ${prepared.binding.accountId}`,
+          tool: request.tool,
+          args: { ...request.args },
+          resumeKey: request.resumeKey,
+          ttlMs: WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS,
+        });
+      } catch (error) {
+        throw new WorkflowHarnessBlockedSignal({
+          stepId: step.id,
+          sessionId,
+          reason: `workflow_v3_authorization_registration_failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      approvalId = registered.row.approvalId;
+      if (registered.created) {
+        emitApprovalRequestedCard({
+          sessionId,
+          approvalId,
+          extra: { workflowName: ctx.workflow.name, runId: ctx.runId, stepId: step.id },
+        });
+      }
+    }
+
+    if (parkingEnabled()) {
+      markWorkflowRunPausedForApproval(ctx.runId);
+      throw new ParkRunSignal([{
+        stepId: step.id,
+        kind: 'gate',
+        approvalIds: [approvalId],
+        sessionId,
+      }]);
+    }
+    if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
+      throw new WorkflowStepNotApprovedError(
+        `workflow exact call "${step.id}" exceeded approval wait budget (${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS}ms)`,
+      );
+    }
+    markWorkflowRunPausedForApproval(ctx.runId);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, WORKFLOW_HARNESS_POLL_MS));
+    } finally {
+      clearWorkflowRunPausedForApproval(ctx.runId);
+    }
+  }
+}
+
+function throwExactWorkflowKernelBlock(
+  step: WorkflowStepInput,
+  sessionId: string,
+  reason: string,
+  zeroBody: boolean,
+): never {
+  if (reason === 'prior_crossing_unknown_no_redispatch') {
+    throw new WorkflowHarnessHeldSignal({
+      stepId: step.id,
+      sessionId,
+      observedAt: new Date().toISOString(),
+      sourceStatus: 'dispatched',
+      hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+      recoveredContract: true,
+    });
+  }
+  throw new WorkflowHarnessBlockedSignal({
+    stepId: step.id,
+    sessionId,
+    reason: `workflow_exact_call_blocked${zeroBody ? '_pre_crossing' : '_after_crossing'}: ${reason}`,
+  });
 }
 
 async function executeWorkflowCallNode(
@@ -2356,87 +2565,92 @@ async function executeWorkflowCallNode(
     return workflowCallNodeOverrideForTests(step, ctx, item);
   }
   const call = step.call!;
-  const args = renderCallArgs(call.args, ctx.inputs, ctx.stepOutputs, item, resolveWorkflowStepProjectContext(step, ctx.workflow));
-  const mutationSlot = {
-    workflowSlug: ctx.workflowSlug,
-    runId: ctx.runId,
-    stepId: step.id,
-    ...(mutationItemKey ? { itemKey: mutationItemKey } : {}),
-  };
-  const autonomousStructuredSend = !step.requiresApproval
-    && structuredCallSideEffectClass(step) === 'send';
-  const exactScheduledSendDefinition = exactScheduledSendDefinitionEligibility(ctx.workflow, step);
-  if (autonomousStructuredSend && !exactScheduledSendDefinition.eligible) {
-    throw new Error(
-      `Autonomous structured SEND step "${step.id}" lost exact scheduled-send authority `
-      + `before dispatch (${exactScheduledSendDefinition.reason}); provider call refused.`,
-    );
-  }
-  const exactScheduledSend = autonomousStructuredSend && exactScheduledSendDefinition.eligible;
-  if (exactScheduledSend) {
-    const occurrence = exactScheduleOccurrenceAuthority(ctx.workflowSlug, ctx.runId);
-    if (!occurrence.ok) {
-      throw new Error(
-        `Autonomous structured SEND step "${step.id}" has no accepted schedule occurrence `
-        + `(${occurrence.reason}); provider call refused.`,
-      );
-    }
-  }
-  const withExactCommitEvidence = (result: unknown): unknown => {
-    if (!exactScheduledSend) return result;
-    // The durable ledger is authoritative; `result` is intentionally ignored
-    // after successful dispatch/replay and re-read from its checked commit.
-    void result;
-    return readCommittedWorkflowCallMutationOutput(mutationSlot, call.tool, args);
-  };
-  const durableReplay = replayWorkflowCallMutationSlot(mutationSlot);
-  if (durableReplay.replayed) return withExactCommitEvidence(durableReplay.result);
-  let exactSchemaFingerprint: string | undefined;
-  if (exactScheduledSend) {
-    try {
-      exactSchemaFingerprint = await ensureLiveComposioSchemaFingerprint(call.tool);
-    } catch (error) {
-      throw exactSchemaCapabilityError(
-        step,
-        'exact_schema_refresh_unavailable',
-        `Exact provider schema refresh failed${error instanceof Error && error.message ? `: ${error.message}` : '.'}`,
-      );
-    }
-  }
-  if (exactScheduledSend) {
-    const liveAuthority = exactScheduledSendCallEligibility(ctx.workflow, step);
-    if (!exactSchemaFingerprint || !liveAuthority.eligible) {
-      throw exactSchemaCapabilityError(
-        step,
-        'exact_schema_refresh_unavailable',
-        `Autonomous structured SEND could not refresh exact provider schema authority `
-        + `(${liveAuthority.eligible ? 'live_schema_authority_unavailable' : liveAuthority.reason}).`,
-      );
-    }
-  }
-  const {
-    composioDispatchErrorProvesNoCommit,
-    composioFailureProvesNoCommit,
-    detectComposioFailure,
-    dispatchComposioTool,
-  } = await import('../tools/composio-tools.js');
-  // The slug is an independent safety signal: an author-supplied `read` label
-  // must not disable receipts for an obviously create/update/delete call.
-  const mutatesExternally = structuredCallNeedsMutationReceipt(step);
   const callSessionId = `workflow:${ctx.runId}:${step.id}`;
-  const callIdentity = await ensureWorkflowCallIdentity(callSessionId, step, call.tool, mutationItemKey);
-  const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
-  const dispatchWithIdentity = <T>(work: () => Promise<T>): Promise<T> => (
-    callIdentity
-      ? Promise.resolve(withHarnessRunContext({
-        sessionId: callSessionId,
-        sourceUserSeq: callIdentity.sourceUserSeq,
-        turn: callIdentity.turn,
-        counter: new ToolCallsCounter(1_000),
-        behaviorScopeId: `${callSessionId}::call-node`,
-      }, work))
-      : work()
+  if (!step.invocationPlan) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: callSessionId,
+      reason: 'workflow_exact_call_plan_missing: name/args dispatch has no production authority.',
+    });
+  }
+  if (item !== undefined || mutationItemKey !== undefined || step.forEach) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: callSessionId,
+      reason: 'workflow_exact_call_partition_identity_unrepresented: per-item occurrence identity is not executable in this slice.',
+    });
+  }
+  const parsedPlan = parseWorkflowNodeInvocationPlan(step.invocationPlan);
+  if (!parsedPlan.ok) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: callSessionId,
+      reason: `workflow_exact_call_plan_invalid: ${parsedPlan.errors.join('; ')}`,
+    });
+  }
+  if (call.tool !== parsedPlan.plan.binding.operationId) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: callSessionId,
+      reason: 'workflow_exact_call_operation_drift: call.tool differs from the exact plan operation.',
+    });
+  }
+  const args = renderCallArgs(
+    call.args,
+    ctx.inputs,
+    ctx.stepOutputs,
+    undefined,
+    resolveWorkflowStepProjectContext(step, ctx.workflow),
   );
+  let identity: WorkflowNodeCallExecutionIdentityV1;
+  try {
+    identity = exactWorkflowCallIdentity(
+      step,
+      ctx,
+      parsedPlan.plan.bindingDigest,
+      parsedPlan.plan.binding,
+    );
+  } catch (error) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: callSessionId,
+      reason: `workflow_exact_call_identity_invalid: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
+  const preparation = prepareWorkflowNodeCall({
+    plan: parsedPlan.plan,
+    identity,
+    arguments: {
+      workflowInputs: ctx.inputs,
+      stepOutputs: ctx.stepOutputs,
+    },
+    cancelled: isWorkflowRunCancelled(ctx.runId),
+  });
+  if (preparation.kind === 'blocked') {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: callSessionId,
+      reason: `${preparation.preparation.block.code}: ${preparation.preparation.block.message}`,
+    });
+  }
+  try {
+    if (closedCanonicalJson(args) !== closedCanonicalJson(preparation.prepared.canonicalArgs)) {
+      throw new WorkflowHarnessBlockedSignal({
+        stepId: step.id,
+        sessionId: callSessionId,
+        reason: 'workflow_exact_call_argument_drift: rendered call args differ from the typed plan compiler output.',
+      });
+    }
+  } catch (error) {
+    if (error instanceof WorkflowHarnessBlockedSignal) throw error;
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: callSessionId,
+      reason: `workflow_exact_call_arguments_invalid: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
+
+  const workflowSession = exactWorkflowCallSession(step, ctx);
   if (beforeWorkflowCallGatewayForTests) {
     await beforeWorkflowCallGatewayForTests({
       workflowName: ctx.workflowSlug,
@@ -2445,82 +2659,59 @@ async function executeWorkflowCallNode(
       tool: call.tool,
     });
   }
-  const outcome = await dispatchWithIdentity(() => dispatchComposioTool(call.tool, args, {
-    sessionId: callSessionId,
-    ...(mutatesExternally
-      ? {
-        dispatchBoundary: (resolved, dispatch) => {
-          // The gateway already refused every auth-required-but-unconnected
-          // route (`not-connected`/`identity-absent`/`ambiguous-account`/…) as a
-          // typed block BEFORE this boundary is reached — dispatchComposioTool
-          // only invokes the boundary on an `ok` resolution. An `ok` resolution
-          // with no connectionId is a legitimate no-auth toolkit deferring to
-          // composio's default entity; it must still record intent/started/
-          // receipt (the ledger fingerprints a null account as the provider
-          // default), not be permanently refused with no account to connect.
-          if (exactScheduledSend && (
-            resolved.toolSlug !== call.tool
-            || !resolved.schemaFingerprint
-            || resolved.schemaFingerprint !== exactSchemaFingerprint
-          )) {
-            throw exactSchemaCapabilityError(
-              step,
-              'exact_schema_boundary_mismatch',
-              `Exact scheduled SEND resolved a different tool/schema at the provider boundary.`,
-            );
-          }
-          return executeWorkflowCallMutation({
-            workflowSlug: ctx.workflowSlug,
-            runId: ctx.runId,
-            stepId: step.id,
-            ...(mutationItemKey ? { itemKey: mutationItemKey } : {}),
-            tool: resolved.toolSlug,
-            ...(exactScheduledSend ? {
-              schemaFingerprint: resolved.schemaFingerprint!,
-              expectedArgsDigest: workflowCallExpectedArgsDigest(args),
-            } : {}),
-            account: {
-              ...(resolved.connectionId ? { connectionId: resolved.connectionId } : {}),
-              ...(resolved.identity ? { identity: resolved.identity } : {}),
-            },
-            args: resolved.args,
-          }, dispatch, {
-            classifyFailure: (result) => {
-              const failure = detectComposioFailure(result);
-              return failure.failed
-                ? {
-                  summary: failure.summary || 'provider reported failure',
-                  provenNoCommit: composioFailureProvesNoCommit(result),
-                }
-                : null;
-            },
-            classifyThrownFailure: (error) => (
-              composioDispatchErrorProvesNoCommit(error)
-                ? (error instanceof Error ? error.message : String(error))
-                : null
-            ),
-          });
-        },
-      }
-      : {}),
-  }));
-  if (!outcome.ok) {
-    // Typed gateway block → fail the step VISIBLY with the deterministic
-    // corrective (which account / reconnect / fix args) instead of dispatching.
-    // Connection/identity routing blocks are also PROVEN pre-dispatch, so keep
-    // the run alive and resumable instead of throwing away completed work.
-    if (workflowCapabilityBlockIsRecoverable(outcome.reason)) {
-      throw new WorkflowCapabilityBlockedError({
-        stepId: step.id,
-        tool: call.tool,
-        toolkit: outcome.toolkit,
-        reason: outcome.reason,
-        message: outcome.message,
-      });
+  if (preparation.kind === 'ready') {
+    const result = await executeWorkflowNodeRead({
+      sessionId: workflowSession.id,
+      plan: parsedPlan.plan,
+      identity,
+      arguments: {
+        workflowInputs: ctx.inputs,
+        stepOutputs: ctx.stepOutputs,
+      },
+      cancelled: isWorkflowRunCancelled(ctx.runId),
+    });
+    if (!result.ok) {
+      throwExactWorkflowKernelBlock(
+        step,
+        workflowSession.id,
+        result.block.message,
+        result.provenNoCrossing,
+      );
     }
-    throw new Error(`composio dispatch blocked (${outcome.reason}): ${outcome.message}`);
+    return result.result;
   }
-  return withExactCommitEvidence(outcome.result);
+
+  const oneShotActivationAuthorization = preparation.effect === 'host_only'
+    ? undefined
+    : await awaitExactWorkflowV3Authorization(
+        step,
+        ctx,
+        workflowSession.id,
+        preparation.prepared,
+        preparation.proof,
+      );
+  const activated = activatePreparedWorkflowNodeCall({
+    sessionId: workflowSession.id,
+    prepared: preparation.prepared,
+    proof: preparation.proof,
+    ...(oneShotActivationAuthorization ? { oneShotActivationAuthorization } : {}),
+  });
+  if ('reason' in activated) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: workflowSession.id,
+      reason: `workflow_v3_activation_${activated.status}: ${activated.reason}`,
+    });
+  }
+  const outcome = await executeActivatedWorkflowNodeCall({
+    activationId: activated.activationId,
+    invocationPlan: parsedPlan.plan,
+    args: preparation.prepared.canonicalArgs as Record<string, unknown>,
+  });
+  if ('reason' in outcome) {
+    throwExactWorkflowKernelBlock(step, workflowSession.id, outcome.reason, outcome.zeroBody);
+  }
+  return outcome.result;
 }
 
 /** Redeem every exact scheduled-send projection against the immutable call
@@ -3788,6 +3979,63 @@ function graphContextForInvocation(
   };
 }
 
+function exactWorkflowApprovalResume(input: {
+  sessionId: string;
+  observedApprovalIds: readonly string[];
+}): {
+  approvalId: string;
+  decision: 'approve' | 'reject';
+} {
+  const observedIds = [...new Set(input.observedApprovalIds.filter((id) => id.trim().length > 0))];
+  // The conversation loop persists the pause through its own HarnessSession
+  // instance. Reload here: the step owner's instance predates that write and
+  // intentionally does not mutate itself behind the caller's back.
+  const blob = HarnessSession.load(input.sessionId)?.loadInterruptState() ?? null;
+  const allRows = approvalRegistry.listPending({ sessionId: input.sessionId, status: 'any' });
+  let exactRows: approvalRegistry.PendingApprovalRow[];
+  if (blob && HostInterruptState.isHostState(blob)) {
+    const interruptions = HostInterruptState.fromString(blob).getInterruptions();
+    const exactBindings = interruptions.flatMap((interruption) => allRows.flatMap((row) => {
+      if (row.status === 'pending') return [];
+      if ((row.resumeKey ?? null) !== (interruption.approvalResumeKey ?? null)) return [];
+      return approvalAuthorityMatchesToolCall(
+        row,
+        interruption.rawItem.name,
+        interruption.rawItem.arguments,
+      ) ? [{ row, interruption }] : [];
+    }));
+    // A card matching two sibling interruptions is ambiguous too: one human
+    // decision must never be silently widened to a second serialized call.
+    if (exactBindings.length !== 1) {
+      throw new Error(
+        `workflow approval resume requires one exact resolved card; found ${exactBindings.length} serialized bindings`,
+      );
+    }
+    exactRows = [exactBindings[0]!.row];
+  } else {
+    // Legacy SDK state does not expose a durable host consent subject here.
+    // It may resume only when this activation itself observed one exact card;
+    // restart/ambiguous recovery stays closed instead of guessing from history.
+    exactRows = observedIds.length === 1
+      ? allRows.filter((row) => row.approvalId === observedIds[0] && row.status !== 'pending')
+      : [];
+  }
+
+  if (exactRows.length !== 1) {
+    throw new Error('workflow approval resume has no single exact durable approval authority');
+  }
+  const row = exactRows[0]!;
+  if (row.status !== 'resolved' || (row.resolution !== 'approved' && row.resolution !== 'rejected')) {
+    throw new Error(
+      `workflow approval ${row.approvalId} is ${row.resolution ?? row.status}; the paused action will not resume`,
+    );
+  }
+  return {
+    approvalId: row.approvalId,
+    decision: row.resolution === 'approved' ? 'approve' : 'reject',
+  };
+}
+
 async function runStepViaHarness(
   step: WorkflowStepInput,
   sessionIdSuffix: string,
@@ -3808,6 +4056,9 @@ async function runStepViaHarness(
   admittedWorkflow?: WorkflowDefinition,
   // Exact answer that re-admitted this SAME paused step, if any.
   resumeInput?: WorkflowAwaitingInputState,
+  // Chat that taught/started this workflow. Used only to add a bounded,
+  // topic-overlapping recent-user signal to the existing unified primer query.
+  originSessionId?: string,
 ): Promise<HarnessStepResult> {
   // T-WF-1 — configure the codex OAuth bridge BEFORE the SDK runner
   // touches the model. Discord + chat-dock paths do this at every
@@ -3955,6 +4206,8 @@ async function runStepViaHarness(
     const approvalIds: string[] = [];
     let hadApprovals = false;
     const startedAt = Date.now();
+    const stepDeadlineAt = startedAt + workflowStepWallClockMsImpl;
+    const remainingStepWallClockMs = (): number => Math.max(0, stepDeadlineAt - Date.now());
 
     // Close the race where the board was cancelled after the caller's last
     // step-boundary check but before this child attempt was registered.
@@ -3999,6 +4252,18 @@ async function runStepViaHarness(
       ? `${proseMessage}\n\n${renderedContextBlock}`
       : proseMessage;
     const message = workflowMessageWithAnsweredInput(initialMessage, step.id, sessionIdSuffix, resumeInput);
+    // This is request policy, not retrieval text. Retain it across a tool-limit
+    // checkpoint that starts a fresh runConversation activation; otherwise the
+    // synthetic "pick up where you left off" input could silently re-enable
+    // memory after the authored workflow step explicitly declined it.
+    const suppressAutomaticMemoryForWorkflowRequest =
+      explicitlyOptsOutOfAutomaticMemoryRecall(message);
+    const workflowMemoryPrimerQuery = buildWorkflowMemoryPrimerQuery({
+      workflow: workflowDefForPin ?? { name: workflowName, description: '' },
+      step,
+      renderedPrompt: promptBody,
+      originSessionId,
+    });
     const sourceUserEvent = recordRunAttemptUserInput(stepAttempt, {
       turn: 1,
       role: 'user',
@@ -4010,6 +4275,7 @@ async function runStepViaHarness(
         attemptId: stepAttempt.attemptId,
       },
     });
+    const stepExecutionSourceUserSeqs = new Set<number>([sourceUserEvent.seq]);
     // The pre-model graph persist that used to live here was DELETED
     // (2026-08-25). It compiled a heuristic graph from the step PROSE before
     // any model ran, and that legacy digestless graph then collided with the
@@ -4025,8 +4291,9 @@ async function runStepViaHarness(
     // fails closed BEFORE any provider or tool work; a port-unavailable step
     // falls back to the legacy shadow compile inside admitAndCompileAccepted-
     // Source, so a graph still exists before dispatch; and a model_failed step
-    // dispatches nothing at all. Structured CALL nodes never enter the typed
-    // lane and keep their own writer (ensureWorkflowCallIdentity).
+    // dispatches nothing at all. Structured CALL nodes never enter this model
+    // lane; their exact invocation plan and durable workflow root are the
+    // accepted source, so they never synthesize a chat turn/graph shadow.
     // Flag-gated (WORKFLOW_STEP_AGENT): the constrained step agent emits
     // structured output via workflow_step_result and CANNOT re-trigger
     // workflows (no recursion). Default off → the full orchestrator +
@@ -4124,14 +4391,23 @@ async function runStepViaHarness(
         lastTurn: 0,
       };
     } else {
+      const initialWallClockMs = remainingStepWallClockMs();
+      if (initialWallClockMs <= 0) {
+        throw new Error(`workflow step "${step.id}" exhausted its wall-clock budget before model execution`);
+      }
       result = await runWorkflowConversationImpl({
         agent,
         sessionId: realSessionId,
         input: message,
+        ...(workflowMemoryPrimerQuery ? { memoryPrimerQuery: workflowMemoryPrimerQuery } : {}),
+        ...(suppressAutomaticMemoryForWorkflowRequest
+          ? { suppressAutomaticMemoryForRequest: true as const }
+          : {}),
         sourceUserSeq: sourceUserEvent.seq,
         runAttemptId: stepAttempt.attemptId,
         mcpToolScope: workflowMcpToolScope,
         reuseRecordedUserInput: true,
+        deferToolCallsLimitTerminal: true,
         // Specialist budgets are authored execution semantics. Keep this
         // narrow to graph-runtime nodes so introducing read_parallel_v1 does
         // not silently change legacy workflow-step budgeting.
@@ -4142,7 +4418,7 @@ async function runStepViaHarness(
         // this (see below); without it a harness step fell back to the 120-min
         // chat budget, so a hung/runaway step wasn't bounded at the intended
         // 15 min. Env-tunable via CLEMENTINE_WORKFLOW_STEP_WALL_MS.
-        maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
+        maxWallClockMs: initialWallClockMs,
         // Stage 4: the WORKFLOW lane's token budget is the RUN-level advisory
         // — a per-step park here has no continue affordance and would fail the
         // step hard (a legit heavy fan-out step can exceed the chat preset).
@@ -4157,17 +4433,21 @@ async function runStepViaHarness(
     // work reaching an end: resume with the standard continue directive on
     // the same session, bounded by the chat auto-continue cap, and only
     // while the parked activation actually made progress.
-    {
-      const { chatAutoContinueDecision, chatAutoContinueCap, buildContinueInput } =
-        await import('../runtime/harness/continue-directive.js');
-      const { getHarnessBudgetSettings } = await import('../runtime/harness/budget-settings.js');
-      let continueAttempts = 0;
+    const { chatAutoContinueDecision, chatAutoContinueCap, buildContinueInput } =
+      await import('../runtime/harness/continue-directive.js');
+    const { getHarnessBudgetSettings } = await import('../runtime/harness/budget-settings.js');
+    let continueAttempts = 0;
+    const continuePastToolCallsLimit = async (): Promise<void> => {
       // Resume ONLY on the typed tool-calls marker, never on a step-count
       // heuristic: every live limit park arrives with steps >= 1 (stepIndex
       // increments before runTurn), so a steps>0 gate would also auto-resume
       // the identical-args guardrail escalation — a deliberate spin-stop on
       // mutating tools that must stay stopped. Untyped limit parks terminate.
       while (result.status === 'limit_exceeded' && result.limitKind === 'tool_calls') {
+        const checkpointSourceUserSeq = deferredToolCallsLimitSourceUserSeq(result);
+        if (!checkpointSourceUserSeq) {
+          throw new Error('workflow tool-calls checkpoint is missing its exact continuation authority');
+        }
         const decision = chatAutoContinueDecision({
           autoContinueOnLimit: getHarnessBudgetSettings().autoContinueOnLimit,
           attempts: continueAttempts,
@@ -4180,18 +4460,51 @@ async function runStepViaHarness(
         if (!decision.resume) break;
         continueAttempts += 1;
         if (latchWorkflowRunCancellation(workflowRunId)) throw new WorkflowRunCancelledError();
+        const continuationWallClockMs = remainingStepWallClockMs();
+        if (continuationWallClockMs <= 0) break;
         result = await runWorkflowConversationImpl({
           agent,
           sessionId: realSessionId,
           input: buildContinueInput(result.lastDecision?.summary),
+          ...(workflowMemoryPrimerQuery ? { memoryPrimerQuery: workflowMemoryPrimerQuery } : {}),
+          ...(suppressAutomaticMemoryForWorkflowRequest
+            ? { suppressAutomaticMemoryForRequest: true as const }
+            : {}),
+          sourceUserSeq: checkpointSourceUserSeq,
           runAttemptId: stepAttempt.attemptId,
           mcpToolScope: workflowMcpToolScope,
+          reuseRecordedUserInput: true,
+          deferToolCallsLimitTerminal: true,
           ...(scopedMaxTurns !== undefined ? { maxTurns: scopedMaxTurns } : {}),
-          maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
+          maxWallClockMs: continuationWallClockMs,
           maxRunTokens: 0,
         });
       }
-    }
+    };
+    await continuePastToolCallsLimit();
+
+    const finalizeDeferredToolLimit = (
+      outcome: { kind: 'completed'; text: string } | { kind: 'limit_exceeded' },
+    ): void => {
+      if (result.status !== 'limit_exceeded' || result.limitKind !== 'tool_calls') return;
+      if (result.publicPresentation) {
+        if (outcome.kind === 'completed') {
+          throw new Error(
+            `workflow step "${step.id}" cannot publish success over an existing tool-limit terminal`,
+          );
+        }
+        return;
+      }
+      const checkpointSourceUserSeq = deferredToolCallsLimitSourceUserSeq(result);
+      if (!checkpointSourceUserSeq) {
+        throw new Error('workflow tool-calls checkpoint lost its exact finalization authority');
+      }
+      result = finalizeDeferredToolCallsLimitTerminal({
+        checkpoint: result,
+        sourceUserSeq: checkpointSourceUserSeq,
+        outcome,
+      });
+    };
 
     // Loop until terminal (completed / failed / awaiting_user_input).
     while (result.status === 'awaiting_approval') {
@@ -4270,31 +4583,47 @@ async function runStepViaHarness(
         }
       }
 
-      // At this point at least one approval has been resolved. The most
-      // recent resolution defines whether we approve or reject the SDK
-      // interrupt — if any was rejected/cancelled, we reject; otherwise
-      // approve. Mirror the same channel-side logic from
-      // tryHandleHarnessApprovalReply.
-      const resolved = approvalRegistry.listPending({ sessionId: realSessionId, status: 'any' });
-      const anyRejected = resolved.some((r) => (
-        r.resolution === 'rejected'
-        || r.resolution === 'cancelled_by_user'
-        || r.resolution === 'cancelled_by_system'
-      ));
-      const anyExpired = resolved.some((r) => r.resolution === 'expired');
-      const decision: 'approve' | 'reject' = (anyRejected || anyExpired) ? 'reject' : 'approve';
+      // Bind one exact resolved durable card to one serialized interruption.
+      // Session-wide "any rejected" inference can select a stale/sibling card
+      // and a bare approval id can be copied; both are authority widening.
+      const approvalResume = exactWorkflowApprovalResume({
+        sessionId: realSessionId,
+        observedApprovalIds: approvalIds,
+      });
+      const approvalResumeWallClockMs = remainingStepWallClockMs();
+      if (approvalResumeWallClockMs <= 0) {
+        throw new Error(`workflow step "${step.id}" exhausted its wall-clock budget before approval resume`);
+      }
 
       result = await resumeWorkflowConversationImpl({
         agent,
         sessionId: realSessionId,
+        approvalId: approvalResume.approvalId,
         runAttemptId: stepAttempt.attemptId,
-        decision,
+        deferToolCallsLimitTerminal: true,
+        decision: approvalResume.decision,
         resolver: 'workflow-runner',
+        ...(scopedMaxTurns !== undefined ? { maxTurns: scopedMaxTurns } : {}),
+        maxWallClockMs: approvalResumeWallClockMs,
+        maxRunTokens: 0,
       });
+      const exactControlSources = listHarnessEvents(realSessionId, {
+        types: ['user_input_received'],
+      }).filter((event) => (
+        event.data.approvalId === approvalResume.approvalId
+        && event.data.decision === approvalResume.decision
+      ));
+      if (exactControlSources.length !== 1) {
+        throw new Error(
+          `workflow approval ${approvalResume.approvalId} has ${exactControlSources.length} accepted control sources`,
+        );
+      }
+      stepExecutionSourceUserSeqs.add(exactControlSources[0]!.seq);
       // Resume returned — the run is moving again. Clear the heartbeat
       // gate so the next "still running" interval can fire normally
       // (the loop will re-mark if another approval surfaces).
       clearWorkflowRunPausedForApproval(workflowRunId);
+      await continuePastToolCallsLimit();
     }
 
     const disposition = runConversationDisposition(result);
@@ -4348,7 +4677,6 @@ async function runStepViaHarness(
     // Pull the user-visible output from the most recent
     // conversation_completed event for this session. The harness writes
     // `summary` (or `reply` when present) as the user-facing text.
-    const { listEvents: listHarnessEvents } = await import('../runtime/harness/eventlog.js');
     const completed = listHarnessEvents(realSessionId, { types: ['conversation_completed'] });
     const lastCompletion = completed[completed.length - 1];
     const lastDecision = result.lastDecision;
@@ -4395,16 +4723,47 @@ async function runStepViaHarness(
     // sdkResult.toolUses; here the equivalent ground truth is the step
     // session's tool_called events. workflow_step_result / StructuredOutput
     // are result emission, not action (inert set in isPhantomStepCompletion).
-    const stepToolUses = listHarnessEvents(realSessionId, { types: ['tool_called'] })
+    const stepToolEvents = listHarnessEvents(realSessionId, { types: ['tool_called'] });
+    const stepToolUses = stepToolEvents
       .map((e) => (typeof e.data?.tool === 'string' ? e.data.tool : ''))
       .filter((t) => t.length > 0);
-    const guardStepOutput = (output: unknown): unknown => settlementGuardedStepOutput({
-      step,
-      sessionId: realSessionId,
-      sourceUserSeq: sourceUserEvent.seq,
-      toolUses: stepToolUses,
-      output,
-    });
+    const guardStepOutput = (output: unknown): unknown => {
+      const businessToolsBySource = new Map<number, string[]>();
+      for (const event of stepToolEvents) {
+        const sourceUserSeq = event.data?.sourceUserSeq;
+        const tool = typeof event.data?.tool === 'string' ? event.data.tool : '';
+        const effective = tool.split('__').at(-1) ?? tool;
+        if (
+          !Number.isSafeInteger(sourceUserSeq)
+          || !stepExecutionSourceUserSeqs.has(Number(sourceUserSeq))
+          || !effective
+          || PHANTOM_GUARD_INERT_TOOLS.has(effective)
+          || actionTopologyRoleForRuntimeCall(effective, {}) === 'control'
+        ) continue;
+        const seq = Number(sourceUserSeq);
+        businessToolsBySource.set(seq, [...(businessToolsBySource.get(seq) ?? []), tool]);
+      }
+      if (businessToolsBySource.size === 0) {
+        return settlementGuardedStepOutput({
+          step,
+          sessionId: realSessionId,
+          sourceUserSeq: sourceUserEvent.seq,
+          toolUses: stepToolUses,
+          output,
+        });
+      }
+      for (const [sourceUserSeq, toolUses] of businessToolsBySource) {
+        const guarded = settlementGuardedStepOutput({
+          step,
+          sessionId: realSessionId,
+          sourceUserSeq,
+          toolUses,
+          output,
+        });
+        if (isBlockedStepOutput(guarded)) return guarded;
+      }
+      return output;
+    };
 
     // Fold 3 capture (best-effort, never blocks a step): remember the LAST
     // proven composio call of a step that emitted a real (non-blocked) result,
@@ -4462,10 +4821,28 @@ async function runStepViaHarness(
       );
     }
     if (captured.found) {
+      let guardedOutput: unknown;
+      try {
+        guardedOutput = guardStepOutput(captured.value);
+      } catch (error) {
+        finalizeDeferredToolLimit({ kind: 'limit_exceeded' });
+        throw error;
+      }
+      const capturedText = (() => {
+        try {
+          const rendered = exactWorkflowOutputText(guardedOutput).trim();
+          if (rendered) {
+            return `Workflow step "${step.id}" completed with this structured result: ${rendered.slice(0, 2_000)}`;
+          }
+        } catch { /* use the truthful structural fallback below */ }
+        return `Workflow step "${step.id}" completed with its settlement-guarded structured result.`;
+      })();
+      finalizeDeferredToolLimit({ kind: 'completed', text: capturedText });
       stepAttemptStatus = 'completed';
-      return { output: guardStepOutput(captured.value), hadApprovals, approvalIds, usedStructuredResult: true, sessionId: realSessionId, lane: 'harness', route };
+      return { output: guardedOutput, hadApprovals, approvalIds, usedStructuredResult: true, sessionId: realSessionId, lane: 'harness', route };
     }
     if (result.status !== 'completed') {
+      finalizeDeferredToolLimit({ kind: 'limit_exceeded' });
       throw new Error(
         `workflow step "${step.id}" did not complete (status: ${result.status}): ${describeStepNonCompletion(result.status, result.error)}`,
       );
@@ -5159,63 +5536,22 @@ async function runStepVerifiedAttempt(
   // (no loopUntil, no contract, forEach/deterministic, send, unsafe write)
   // run exactly once: byte-identical to the pre-loopUntil behavior.
   if (!stepLoopUntilEnabled(step)) return runOnce(step);
+  const retiredProbe = workflowRawSubprocessDeclarations(step)
+    .find((declaration) => declaration.kind === 'loopUntil.probe.runner');
+  if (retiredProbe) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: `workflow:${ctx.runId}:${step.id}`,
+      reason: workflowRawSubprocessRetirementReason(retiredProbe),
+    });
+  }
   // T2.3 (external exit): a declared probe runs AFTER each successful attempt —
   // a deterministic scripts/ helper whose output is verified against `until`.
   // Unsatisfied → throw a contract violation so the SAME loop machinery
   // re-runs the step with the probe's evidence folded into the prompt. This is
   // what makes "poll until the job reports done" / "page until nothing
   // unprocessed remains" authorable as typed code instead of prompt hopes.
-  const runAttempt = !stepHasLoopProbe(step)
-    ? runOnce
-    : async (attemptStep: WorkflowStepInput): Promise<unknown> => {
-      let deferredCompletion:
-        | { output: unknown; meta?: Record<string, unknown> }
-        | undefined;
-      const output = await runOnce(attemptStep, {
-        ...ctx,
-        deferStepCompletion: (capturedOutput, capturedMeta) => {
-          deferredCompletion = { output: capturedOutput, meta: capturedMeta };
-        },
-      });
-      const probe = step.loopUntil!.probe!;
-      assertAdmittedWorkflowCodeRevision(ctx);
-      const probeOutput = await runDeterministicWorkflowStep(probe.runner, {
-          workflow: ctx.workflow.name,
-          workflowSlug: ctx.workflowSlug,
-          runId: ctx.runId,
-          stepId: `${step.id}#probe`,
-          inputs: ctx.inputs,
-          stepOutputs: { ...ctx.stepOutputs, [step.id]: output },
-          project: resolveWorkflowStepProjectContext(step, ctx.workflow),
-          occurrenceAt: deterministicOccurrenceAt(ctx.runId, ctx.workflowSlug),
-        });
-        const verdict = verifyStepOutput(step.loopUntil!.until, probeOutput);
-        if (!verdict.ok) {
-          const problems = verdict.problems.map((p) => `loop probe (${probe.runner}): ${p}`);
-          throw new WorkflowContractViolationError(
-            `step "${step.id}" loop probe did not satisfy its until contract: ${problems.join('; ')}`,
-            step.id,
-            problems,
-            'output_contract',
-          );
-        }
-        if (!deferredCompletion) {
-          throw new Error(
-            `Step "${step.id}" passed its loop probe without a deferred completion payload.`,
-          );
-        }
-        // The external exit condition is the commit boundary. A failed probe
-        // owns no step_completed event, so a daemon restart can never skip an
-        // unfinished poll/re-pursuit loop.
-        persistAndPublishStepCompletion({
-          workflowSlug: ctx.workflowSlug,
-          runId: ctx.runId,
-          stepId: step.id,
-          output: deferredCompletion.output,
-          meta: deferredCompletion.meta,
-        });
-        return output;
-      };
+  const runAttempt = runOnce;
   const recordAttempts = attemptRecordsEnabled();
   // STATE pillar: closure tracks the prior attempt's problems so each record
   // reads as a delta. Only allocated when records are on (flag-off ⇒ no I/O).
@@ -6041,7 +6377,18 @@ export async function executeStep(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {
-  if (step.invocationPlan) {
+  const retiredSubprocess = workflowRawSubprocessDeclarations(step)[0];
+  if (retiredSubprocess) {
+    throw new WorkflowHarnessBlockedSignal({
+      stepId: step.id,
+      sessionId: `workflow:${ctx.runId}:${step.id}`,
+      reason: workflowRawSubprocessRetirementReason(retiredSubprocess),
+    });
+  }
+  // Standalone invocation plans retain the explicit pilot/recurrence admission
+  // contract. A structured call carrying the same exact plan is the runner-
+  // owned v3 lane below; it derives and persists its own occurrence identity.
+  if (step.invocationPlan && !step.call) {
     if (ctx.workflowReadPilotAdmission && ctx.workflowRecurringReadAdmission) {
       throw new WorkflowHarnessBlockedSignal({
         stepId: step.id,
@@ -6072,63 +6419,14 @@ export async function executeStep(
   //    of the workflow proceeds autonomously. Declarative + runner-owned,
   //    so the constrained step agent never needs request_approval and a
   //    workflow pauses at most where it explicitly opts in.
-  if (shouldUseDeclarativeStepApproval(ctx.workflow, step)) {
+  if (!step.invocationPlan && shouldUseDeclarativeStepApproval(ctx.workflow, step)) {
     await awaitDeclarativeStepApproval(ctx, step);
   }
 
-  // 1. Deterministic helper — skip the LLM entirely and run a bundled
-  //    script from this workflow's scripts/ directory. The runner
-  //    receives structured JSON on stdin and emits stdout that is
-  //    parsed as JSON when possible.
-  if (step.deterministic?.runner) {
-    assertAdmittedWorkflowCodeRevision(ctx);
-    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-      kind: 'step_started',
-      stepId: step.id,
-      meta: { mode: 'deterministic', runner: step.deterministic.runner },
-    });
-    let detOutput: unknown;
-    try {
-      detOutput = await runDeterministicWorkflowStep(step.deterministic.runner, {
-        workflow: ctx.workflow.name,
-        workflowSlug: ctx.workflowSlug,
-        runId: ctx.runId,
-        stepId: step.id,
-        inputs: ctx.inputs,
-        stepOutputs: ctx.stepOutputs,
-        project: resolveWorkflowStepProjectContext(step, ctx.workflow),
-        occurrenceAt: deterministicOccurrenceAt(ctx.runId, ctx.workflowSlug),
-      });
-    } catch (err) {
-      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-        kind: 'step_failed',
-        stepId: step.id,
-        error: err instanceof Error ? err.message : String(err),
-        meta: {
-          mode: 'deterministic',
-          runner: step.deterministic.runner,
-          ...(err instanceof DeterministicWorkflowStepError ? { failure: err.failure } : {}),
-        },
-      });
-      throw err;
-    }
-    // Route through the SAME verification chokepoint as forEach/plain/synthesis
-    // so a deterministic step's declared output contract is enforced BEFORE
-    // step_completed is recorded — never silently bypassed. (finalizeStepOutput
-    // emits step_failed + throws on a contract violation; the throw is a
-    // deterministic error so the retry wrapper above won't re-run it.)
-    return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, detOutput, {
-      mode: 'deterministic',
-      runner: step.deterministic.runner,
-    });
-  }
-
-  // 1b. CALL-1 — structured tool call: execute the tool DIRECTLY, no LLM. The
-  //     args are fixed in the contract (templated from inputs/upstream), so the
-  //     call is deterministic and free. Routes through the SAME verification
-  //     chokepoint as every other shape. The forEach branch below handles
-  //     read-class call fan-out; validation still rejects call+deterministic and
-  //     send/write-class call fan-out.
+  // 1. Exact structured tool call — zero LLM. The rendered call is accepted
+  //     only when it equals the typed invocation-plan compiler output, then
+  //     enters the durable shared workflow kernel. Per-item calls stay refused
+  //     until their own occurrence/attempt identity is represented.
   if (step.call?.tool && !step.forEach) {
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
       kind: 'step_started',
@@ -6140,12 +6438,27 @@ export async function executeStep(
       callOutput = await executeWorkflowCallNode(step, ctx);
     } catch (err) {
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-        kind: 'step_failed',
+        kind: err instanceof WorkflowHarnessHeldSignal
+          ? 'step_paused'
+          : err instanceof WorkflowHarnessBlockedSignal
+            ? 'step_blocked'
+            : 'step_failed',
         stepId: step.id,
         error: err instanceof Error ? err.message : String(err),
         meta: {
           mode: 'call',
           tool: step.call.tool,
+          ...(err instanceof WorkflowHarnessHeldSignal ? {
+            reason: 'exact_source_held',
+            owner: err.state.hold.owner,
+            wake: err.state.hold.wake,
+            holdReason: err.state.hold.reason,
+            sourceStatus: err.state.sourceStatus,
+          } : {}),
+          ...(err instanceof WorkflowHarnessBlockedSignal ? {
+            reason: 'harness_blocked',
+            sessionId: err.sessionId,
+          } : {}),
           ...(err instanceof WorkflowCallMutationAmbiguousError ? {
             reason: 'parked_on_mutation_ambiguity',
             mutationFingerprint: err.fingerprint,
@@ -6345,6 +6658,7 @@ export async function executeStep(
                   true, // isItemInvocation: object/scalar item contract yes; aggregate array contract no
                   ctx.workflow,
                   ctx.awaitingInput,
+                  ctx.originSessionId,
                 );
                 output = r.output;
                 itemSessionId = r.sessionId;
@@ -6654,6 +6968,7 @@ export async function executeStep(
         false,
         ctx.workflow,
         ctx.awaitingInput,
+        ctx.originSessionId,
       );
       output = result.output;
       stepSessionId = result.sessionId;
@@ -8080,6 +8395,9 @@ function graphAddedNodeSafetyErrors(node: WorkflowGraphNode): string[] {
   if (node.deterministic) {
     errors.push(`Graph-added node "${node.id}" requests script execution, which is outside the release-v3 graph contract.`);
   }
+  if (node.call) {
+    errors.push(`Graph-added node "${node.id}" requests exact-call authority; only an authored, snapshotted call+plan pair may carry it.`);
+  }
   if (node.invocationPlan) {
     errors.push(`Graph-added node "${node.id}" requests invocation authority; only an authored, snapshotted plan may carry it.`);
   }
@@ -8553,6 +8871,24 @@ async function executeWorkflow(
     : undefined;
   const durableMutationProtocolStepIds = new Set<string>();
   for (const step of allExecutionSteps) {
+    const exactPlan = step.call && !step.forEach
+      ? parseWorkflowNodeInvocationPlan(step.invocationPlan)
+      : null;
+    if (
+      exactPlan?.ok
+      && step.call?.tool === exactPlan.plan.binding.operationId
+      && (
+        exactPlan.plan.binding.effect === 'local_write'
+        || exactPlan.plan.binding.effect === 'external_write'
+        || exactPlan.plan.binding.effect === 'admin'
+      )
+    ) {
+      // This step's v3 activation/root/physical claim is the recovery owner.
+      // Re-entering the step is required: the shared kernel alone can decide
+      // not-started resume, exact settlement replay, or claimed-I/O hold.
+      durableMutationProtocolStepIds.add(step.id);
+      continue;
+    }
     if (step.forEach || workflowStepMutationReceiptContract(step) !== 'structured_call_receipt') continue;
     if (
       sourceUsesMutationReceiptProtocol
@@ -9124,6 +9460,7 @@ async function executeWorkflow(
           false,
           executionWorkflow,
           awaitingInput,
+          originSessionId,
         ),
         {
           budget: transientRetryFloor(),

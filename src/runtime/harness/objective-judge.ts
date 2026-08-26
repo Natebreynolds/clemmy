@@ -247,9 +247,19 @@ export const HARNESS_INJECTED_INPUT_PREFIXES = [
   'Resume background task ',
 ] as const;
 
+// Proactive async report-backs use a second, unbracketed carrier. The durable
+// source row is synthetic/source:'outcome', but legacy auto-capture callers
+// classify the text itself, so this shape must be recognized alongside the
+// bracketed passive carrier below. Keep the match structural and bounded:
+// sourceLabel is runtime-authored, the source ref is bracketed, and all four
+// status phrases come from renderProactiveOutcomeDirective in outcome.ts.
+const PROACTIVE_OUTCOME_DIRECTIVE_RE =
+  /^A [^\n]{1,80} you started from this conversation (?:needs your input|FAILED|NEEDS ATTENTION|just finished) \(see the latest \[[^\]\n]{1,180}\](?: NEEDS INPUT| FAILED)? note in context\)\./i;
+
 export function isHarnessInjectedInput(text: string): boolean {
   const t = (text ?? '').trimStart();
   if (HARNESS_INJECTED_INPUT_PREFIXES.some((p) => t.startsWith(p))) return true;
+  if (PROACTIVE_OUTCOME_DIRECTIVE_RE.test(t)) return true;
   // Outcome-relay turns are injected with the durable `[<sourceLabel> <id> …]`
   // marker (outcome.ts outcomePrefix) — a report-back from a background/workflow
   // run, never a user message.

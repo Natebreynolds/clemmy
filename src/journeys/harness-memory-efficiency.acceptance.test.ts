@@ -289,7 +289,7 @@ test('verified warm memory removes one discovery/schema round while minting zero
   });
   assert.ok(
     warmPolicy.policy.broadDiscoveryAllowance < coldPolicy.policy.broadDiscoveryAllowance,
-    'a receipt-backed resolved role consumes no new broad-discovery slot',
+    'receipt-backed resolution narrows the task discovery allowance',
   );
   const warmSourceRole = warm.requirements.find((requirement) => requirement.roleKey === sourceRole);
   assert.equal(warmSourceRole?.resolved, true);
@@ -300,8 +300,23 @@ test('verified warm memory removes one discovery/schema round while minting zero
     subject: sourceRole!,
     callId: 'redundant-warm-source-search',
   });
-  assert.equal(warmSourceSearch.admitted, false);
-  if (!warmSourceSearch.admitted) assert.equal(warmSourceSearch.reason, 'role_resolved');
+  assert.equal(warmSourceSearch.admitted, true);
+  if (warmSourceSearch.admitted) {
+    assert.equal(warmSourceSearch.reason, 'role_coerced');
+    assert.equal(warmSourceSearch.subject, discovery.HOST_UNSCOPED_DISCOVERY_SUBJECT);
+    assert.match(String(warmSourceSearch.advisory ?? ''), /already resolved/i);
+  }
+  const repeatedWarmSourceSearch = warmGovernor.admit({
+    sessionId: warmPolicySession.session.id,
+    sourceUserSeq: warmPolicySession.source.seq,
+    category: 'broad_discovery',
+    subject: sourceRole!,
+    callId: 'redundant-warm-source-search-2',
+  });
+  assert.equal(repeatedWarmSourceSearch.admitted, false);
+  if (!repeatedWarmSourceSearch.admitted) {
+    assert.equal(repeatedWarmSourceSearch.reason, 'new_call_requires_retry_epoch');
+  }
 
   // Quantify the bytes excluded from the next model step. This drives the real
   // broker renderer with the same full provider contract; the warm card keeps

@@ -11,9 +11,9 @@ import { buildCompactToolCatalog } from './tool-catalog.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from './workflow-step-agent.js';
-import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { RuntimeContextValue } from '../types.js';
+import type { DispatchLeaseRef } from '../runtime/harness/dispatch-lease.js';
 import {
   wrapToolForHarness,
   withHarnessRunContext,
@@ -270,7 +270,6 @@ export async function buildWorkerAgent(options: {
       ].join('\n');
     }
   }
-  const externalMcpServers = externalMcpScope === null ? [] : [getOrCreateExternalMcpServers(externalMcpScope)];
   const baseInstructions = [
       'You are a Worker — a stateless, single-task sub-agent inside Clementine.',
       'Your scope is ONE item. The parent agent fans out across N items by calling you N times in parallel; each call is a fresh, isolated context.',
@@ -314,10 +313,8 @@ export async function buildWorkerAgent(options: {
     // the old behavior). The registered provider still routes the resulting id.
     model: options.model ?? resolveRoleModel('worker').modelId,
     tools: wrapTools(tools),
-    // External MCP servers are attached only from an explicit parent scope or
-    // exact worker-packet `resolvedTools`. A worker with "none needed"/local
-    // tools should not cold-start every external MCP child.
-    ...(externalMcpServers.length > 0 ? { mcpServers: externalMcpServers } : {}),
+    // External MCP execution is reachable only through the exact local
+    // call_tool/work_call carrier. Never hand an SDK child a raw server.
   });
   bindAgentMcpToolScope(agent, externalMcpScope);
   // Seal the worker's complete post-blocklist catalog, while revision 1 binds
@@ -413,6 +410,8 @@ export async function runCrossProviderWorker(
   sessionId: string,
   sourceUserSeq?: number,
   mcpToolScope?: McpToolScope | null,
+  abortSignal?: AbortSignal,
+  dispatchLease?: DispatchLeaseRef,
 ): Promise<CrossProviderWorkerResult> {
   const effectiveMcpToolScope = workerPacketMcpToolScope({
     buildScope: mcpToolScope,
@@ -453,8 +452,10 @@ export async function runCrossProviderWorker(
         mcpToolScope: effectiveMcpToolScope,
         ...(guard ? { guardrailScopeId: scopeId } : {}),
         ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
-        ...(parentHarnessContext?.sessionId === sessionId && parentHarnessContext.dispatchLease
-          ? { dispatchLease: parentHarnessContext.dispatchLease }
+        ...(dispatchLease
+          ? { dispatchLease }
+          : parentHarnessContext?.sessionId === sessionId && parentHarnessContext.dispatchLease
+            ? { dispatchLease: parentHarnessContext.dispatchLease }
           : {}),
         ...(parentHarnessContext?.sessionId === sessionId && parentHarnessContext.runAttemptId
           ? { runAttemptId: parentHarnessContext.runAttemptId }
@@ -464,6 +465,7 @@ export async function runCrossProviderWorker(
         runner.run(worker, buildWorkerJobPrompt(input), {
           context: { sessionId, turn: 0 },
           maxTurns,
+          ...(abortSignal ? { signal: abortSignal } : {}),
         }),
     );
     return { text: normalizeWorkerOutput(result), model: modelId, toolUses: [] };

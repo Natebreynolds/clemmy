@@ -24,6 +24,11 @@ import {
 
 export interface ResolvedWriteEvidence {
   confirmed: EventRow[];
+  /** Reservations whose exact call recorded a proved not-applied terminal.
+   * Kept separate from `uncertain` so settlement/finalization can distinguish
+   * a reconciled absence from an effect whose provider outcome is still
+   * unknown. */
+  failed: EventRow[];
   uncertain: EventRow[];
 }
 
@@ -52,14 +57,25 @@ function writeTargets(event: EventRow): string[] {
     .sort();
 }
 
-function sameWriteAttempt(attempt: EventRow, resolution: EventRow): boolean {
+function sameWriteAttempt(
+  attempt: EventRow,
+  resolution: EventRow,
+  options: { allowUnparentedPreDispatch: boolean },
+): boolean {
   const attemptCallId = writeCallId(attempt);
   const resolutionCallId = writeCallId(resolution);
   // A new reservation must settle the exact call it reserved. Falling back to
   // shape/targets can let a terminal event from another invocation settle it.
+  // Reused SDK call ids exist in historical data, so a parented terminal must
+  // also name the exact reservation event. An unparented compatibility receipt
+  // is accepted only while exactly one reservation owns that call id.
   if (attempt.data.preDispatch === true) {
-    return Boolean(attemptCallId && resolutionCallId && attemptCallId === resolutionCallId);
+    if (!attemptCallId || !resolutionCallId || attemptCallId !== resolutionCallId) return false;
+    return resolution.parentEventId
+      ? resolution.parentEventId === attempt.id
+      : options.allowUnparentedPreDispatch;
   }
+  if (resolution.parentEventId && resolution.parentEventId !== attempt.id) return false;
   // Legacy rows predate reliable correlation ids. Preserve their historical
   // shape/target reconciliation when one side lacks an id.
   if (attemptCallId && resolutionCallId) return attemptCallId === resolutionCallId;
@@ -101,10 +117,19 @@ export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWrite
       && event.type !== 'external_write_failed'
       && event.type !== 'external_write_orphaned'
     ) continue;
+    const resolutionCallId = writeCallId(event);
+    const matchingPreDispatchReservations = resolutionCallId
+      ? attempts.filter((attempt) => (
+          attempt.event.data.preDispatch === true
+          && writeCallId(attempt.event) === resolutionCallId
+        )).length
+      : 0;
     let match = -1;
     for (let index = attempts.length - 1; index >= 0; index -= 1) {
       if (attempts[index]?.state === 'failed') continue;
-      if (sameWriteAttempt(attempts[index]!.event, event)) {
+      if (sameWriteAttempt(attempts[index]!.event, event, {
+        allowUnparentedPreDispatch: !event.parentEventId && matchingPreDispatchReservations === 1,
+      })) {
         match = index;
         break;
       }
@@ -123,6 +148,7 @@ export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWrite
   }
   return {
     confirmed: attempts.filter((attempt) => attempt.state === 'confirmed').map((attempt) => attempt.event),
+    failed: attempts.filter((attempt) => attempt.state === 'failed').map((attempt) => attempt.event),
     uncertain: [
       ...attempts
         .filter((attempt) => attempt.state === 'pending' || attempt.state === 'uncertain')

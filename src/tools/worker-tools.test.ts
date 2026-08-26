@@ -11,6 +11,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -107,9 +108,27 @@ const { runClaudeAgentSdkWorker, setClaudeAgentSdkWorkerRunForTest } = await imp
 );
 const { registerWorkerTools } = await import('./worker-tools.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
-const { createSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
+const {
+  appendEvent,
+  beginRunAttempt,
+  createSession,
+  finishRunAttempt,
+  getToolOutput,
+  listEvents,
+} = await import('../runtime/harness/eventlog.js');
 const { reviseWorkContract, summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
 const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+const {
+  activateDispatchLease,
+  revokeDispatchLease,
+  runWithDispatchLease,
+} = await import('../runtime/harness/dispatch-lease.js');
+const { runWithToolAbortSignal } = await import('../runtime/tool-abort-context.js');
+const { _resetWorkerConcurrencyForTest } = await import('../agents/worker-concurrency.js');
+const {
+  _resetWorkerBatchExecutionsForTest,
+  _setWorkerBatchRuntimeForTest,
+} = await import('../agents/worker-batch-execution.js');
 
 // The EXACT ok-gate the run_worker handler applies to a worker's result text
 // (worker-tools.ts): an `ERROR:`-prefixed envelope is a FAILED item.
@@ -228,6 +247,24 @@ test('handler no-session branch: without a live session context the item is a vi
   assert.equal(handlerOkGate(text), false);
 });
 
+test('ordinary no-manifest batch fails closed without accepted-source durable ownership', async () => {
+  const sessionId = 'sess-worker-batch-unowned';
+  createSession({ id: sessionId, kind: 'execution' });
+  const handler = captureRunWorker();
+  const result = await withToolOutputContext({
+    sessionId,
+    callId: 'call_unowned_batch',
+    toolName: 'run_worker',
+  }, () => handler({
+    ...packet('unused'),
+    item: null,
+    items: ['one', 'two'],
+  }));
+  assert.match(result.content[0].text, /^ERROR:/);
+  assert.match(result.content[0].text, /accepted-source dispatch lease/);
+  assert.equal(listEvents(sessionId, { types: ['worker_started'] }).length, 0);
+});
+
 test('SDK-brain handler refuses a quantified successful subset before spawning any worker', async () => {
   const sessionId = 'sess-handler-quantified-subset';
   createSession({ id: sessionId, kind: 'execution' });
@@ -287,6 +324,8 @@ test('SDK-brain handler refuses a quantified successful subset before spawning a
 test('SDK-brain handler reuses a completed logical manifest item when the resumed packet changes', async () => {
   const sessionId = 'sess-handler-manifest-resume';
   const item = 'Account A — account-a.example';
+  const resumeTail = 'FINAL_RESUME_FIELD=account-a-accepted';
+  const largeResult = `${'x'.repeat(65_537 - resumeTail.length)}${resumeTail}`;
   const priorAuthMode = process.env.AUTH_MODE;
   process.env.AUTH_MODE = 'claude_oauth';
   createSession({ id: sessionId, kind: 'chat' });
@@ -306,22 +345,31 @@ test('SDK-brain handler reuses a completed logical manifest item when the resume
     await withInnerSdk(
       async () => {
         dispatches += 1;
-        return { text: 'Account A research result', toolUses: [] };
+        return { text: dispatches === 1 ? largeResult : 'batch research result', toolUses: [] };
       },
       async () => {
-        const first = await withToolOutputContext({ sessionId }, () => handler(initial));
-        assert.equal(first.content[0].text, 'Account A research result');
+        const firstCallId = 'call_sdk_manifest_initial';
+        const first = await withToolOutputContext({
+          sessionId, callId: firstCallId, toolName: 'run_worker', settlementNonce: randomUUID(),
+        }, () => handler(initial));
+        assert.ok(first.content[0].text.length < 65_537, 'model-facing tool context stays bounded');
+        assert.equal(getToolOutput(sessionId, firstCallId)?.output, largeResult, 'the bounded return has a lossless exact-output handle');
 
         const resumed = {
           ...initial,
           instructions: 'A restart occurred. Reconcile prior durable progress before doing any work.',
           workManifest: { ...initial.workManifest, mode: 'reconcile' },
         };
-        const second = await withToolOutputContext({ sessionId }, () => handler(resumed));
+        const resumeCallId = 'call_sdk_manifest_resume';
+        const second = await withToolOutputContext({
+          sessionId, callId: resumeCallId, toolName: 'run_worker', settlementNonce: randomUUID(),
+        }, () => handler(resumed));
         assert.match(second.content[0].text, /Durable receipt: this item was already complete/);
         assert.match(second.content[0].text, /No worker ran and no action was repeated/);
-        assert.match(second.content[0].text, /Account A research result/);
         assert.match(second.content[0].text, /Do not call run_worker again for this phase; synthesize the user-facing result now/);
+        const exactResume = getToolOutput(sessionId, resumeCallId)?.output ?? '';
+        assert.match(exactResume, new RegExp(resumeTail), 'the 65,537-byte result is reused through its load-bearing tail');
+        assert.doesNotMatch(exactResume, /…\(truncated\)/, 'resume never records the legacy successful prefix marker');
 
         const batch = {
           ...packet('unused batch placeholder'),
@@ -605,6 +653,225 @@ test('RESTART-GATE fan-out width: a 3-item batch overlaps at least 2 workers (N�
   } finally {
     if (priorAuthMode === undefined) delete process.env.AUTH_MODE;
     else process.env.AUTH_MODE = priorAuthMode;
+  }
+});
+
+test('P0 gate: cap-6 252/253 deadline boundary parks the remainder without orphaned work', async () => {
+  const priorAuthMode = process.env.AUTH_MODE;
+  const priorSessionCap = process.env.CLEMMY_WORKER_MAX_CONCURRENCY;
+  const priorGlobalCap = process.env.CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL;
+  const priorReduceTier = process.env.CLEMMY_REDUCE_TIER;
+  const priorFanoutDigest = process.env.CLEMMY_CHAT_FANOUT_DIGEST;
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_WORKER_MAX_CONCURRENCY = '6';
+  process.env.CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL = '6';
+  // This gate measures provider-body admission, not the independently tested
+  // fan-out summarizer. Keep post-body reduction deterministic and in-band.
+  process.env.CLEMMY_REDUCE_TIER = 'off';
+  process.env.CLEMMY_CHAT_FANOUT_DIGEST = 'off';
+  _resetWorkerConcurrencyForTest();
+
+  type WorkerWait = {
+    resolve: () => void;
+    reject: (error: unknown) => void;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+  };
+  const waits: WorkerWait[] = [];
+  let logicalNowMs = 0;
+  type LogicalTimer = { at: number; active: boolean; fn: () => void };
+  const logicalTimers: LogicalTimer[] = [];
+  const installLogicalBatchRuntime = (): void => {
+    _setWorkerBatchRuntimeForTest({
+      now: () => logicalNowMs,
+      setTimer: (fn, delayMs) => {
+        const timer: LogicalTimer = { at: logicalNowMs + delayMs, active: true, fn };
+        logicalTimers.push(timer);
+        return timer;
+      },
+      clearTimer: (raw) => { (raw as LogicalTimer).active = false; },
+    });
+  };
+  installLogicalBatchRuntime();
+  let started = 0;
+  let inFlight = 0;
+  let peak = 0;
+  const waitUntil = async (predicate: () => boolean, label: string): Promise<void> => {
+    for (let spin = 0; spin < 50_000; spin += 1) {
+      if (predicate()) return;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    throw new Error(`controllable worker clock did not reach ${label} (started=${started}, inFlight=${inFlight})`);
+  };
+  const advanceRound = async (): Promise<void> => {
+    logicalNowMs += 7_000;
+    const current = waits.splice(0, waits.length);
+    for (const wait of current) {
+      if (wait.signal && wait.onAbort) wait.signal.removeEventListener('abort', wait.onAbort);
+      wait.resolve();
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (const timer of logicalTimers) {
+      if (timer.active && timer.at <= logicalNowMs) {
+        timer.active = false;
+        timer.fn();
+      }
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+  const owners = new Map<string, {
+    sourceUserSeq: number;
+    attempt: ReturnType<typeof beginRunAttempt>;
+    parentLease: ReturnType<typeof activateDispatchLease>;
+  }>();
+  const ownerFor = (sessionId: string) => {
+    const existing = owners.get(sessionId);
+    if (existing) return existing;
+    createSession({ id: sessionId, kind: 'execution' });
+    const source = appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Run this exact ordinary worker batch.' },
+    });
+    const attempt = beginRunAttempt(sessionId, { runId: `${sessionId}:p0-deadline` });
+    const parentLease = activateDispatchLease({
+      sessionId,
+      scopeId: `${sessionId}:p0-deadline-parent`,
+      runAttemptId: attempt.attemptId,
+    });
+    const owner = { sourceUserSeq: source.seq, attempt, parentLease };
+    owners.set(sessionId, owner);
+    return owner;
+  };
+  const runBatch = async (count: number, sessionId: string, controller: AbortController) => {
+    const owner = ownerFor(sessionId);
+    const items = Array.from({ length: count }, (_, index) => `deadline-item-${String(index + 1).padStart(3, '0')}`);
+    const handler = captureRunWorker();
+    const call = {
+      ...packet('unused deadline placeholder'),
+      model: 'claude-sonnet-5',
+      item: null,
+      items,
+    };
+    return runWithDispatchLease(
+      owner.parentLease,
+      () => withHarnessRunContext(
+        {
+          sessionId,
+          sourceUserSeq: owner.sourceUserSeq,
+          counter: new ToolCallsCounter(2_000),
+          dispatchLease: owner.parentLease,
+          runAttemptId: owner.attempt.attemptId,
+        },
+        () => runWithToolAbortSignal(
+          controller.signal,
+          () => withToolOutputContext({
+            sessionId,
+            sourceUserSeq: owner.sourceUserSeq,
+            callId: 'call_deadline_batch',
+            toolName: 'run_worker',
+          }, () => handler(call)),
+          logicalNowMs + 300_000,
+        ),
+      ),
+    );
+  };
+
+  try {
+    await withInnerSdk(
+      async (rawOptions) => {
+        const signal = (rawOptions as { abortSignal?: AbortSignal }).abortSignal;
+        started += 1;
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const wait: WorkerWait = { resolve, reject, ...(signal ? { signal } : {}) };
+            if (signal) {
+              wait.onAbort = () => reject(signal.reason ?? new Error('worker generation aborted'));
+              if (signal.aborted) {
+                wait.onAbort();
+                return;
+              }
+              signal.addEventListener('abort', wait.onAbort, { once: true });
+            }
+            waits.push(wait);
+          });
+          return { text: 'deadline item done', toolUses: [] };
+        } finally {
+          inFlight -= 1;
+        }
+      },
+      async () => {
+        const at252 = new AbortController();
+        const completes252 = runBatch(252, 'sess-deadline-252', at252);
+        await waitUntil(() => started === 6, 'the first cap-6 wave for 252');
+        for (let round = 1; round <= 42; round += 1) {
+          await advanceRound();
+          if (round < 42) await waitUntil(() => started === (round + 1) * 6, `252 round ${round + 1}`);
+        }
+        const complete252Result = await completes252;
+        assert.match(complete252Result.content[0].text, /Batch complete: 252\/252 items succeeded/);
+        assert.equal(logicalNowMs, 294_000, '252 items consume exactly 42 seven-second waves');
+        assert.equal(peak, 6, 'the production semaphore, not the test, owns effective width 6');
+        assert.equal(inFlight, 0);
+
+        logicalNowMs = 0;
+        started = 0;
+        peak = 0;
+        const at253 = new AbortController();
+        const crosses253 = runBatch(253, 'sess-deadline-253', at253);
+        await waitUntil(() => started === 6, 'the first cap-6 wave for 253');
+        for (let round = 1; round <= 42; round += 1) {
+          await advanceRound();
+          if (round < 42) await waitUntil(() => started === (round + 1) * 6, `253 round ${round + 1}`);
+        }
+        const parked253 = await crosses253;
+        assert.equal(logicalNowMs, 294_000);
+        assert.equal(started, 252, 'the 253rd body is not started when only 6s remain for an observed 7s item');
+        assert.equal(inFlight, 0, 'typed park is withheld until every started body settles');
+        assert.match(parked253.content[0].text, /Batch parked safely/);
+        assert.match(parked253.content[0].text, /252\/253 settled; 0 failed; 0 in_flight; 1 pending/);
+        assert.match(parked253.content[0].text, /"pending":\["deadline-item-253"\]/);
+
+        // Same ordinary no-manifest batch, fresh caller budget: the 252 exact
+        // receipts are reused and only the pending body crosses the provider.
+        // Clear every process-local scheduler/semaphore hint first: restart
+        // recovery must come from durable source-bound receipts, never a Map.
+        _resetWorkerBatchExecutionsForTest();
+        _resetWorkerConcurrencyForTest();
+        installLogicalBatchRuntime();
+        const resumed = runBatch(253, 'sess-deadline-253', new AbortController());
+        await waitUntil(() => started === 253 && inFlight === 1, 'only the pending 253rd body on resume');
+        await advanceRound();
+        const resumedResult = await resumed;
+        assert.match(resumedResult.content[0].text, /Batch complete: 253\/253 items succeeded/);
+        assert.equal(started, 253, '252 settled bodies were not executed again');
+        assert.equal(inFlight, 0);
+        assert.equal(waits.length, 0, 'no queued or active worker clock remains orphaned');
+      },
+    );
+  } finally {
+    // Keep a failed assertion from leaving a controllable provider promise.
+    while (waits.length > 0) await advanceRound();
+    for (const owner of owners.values()) {
+      revokeDispatchLease(owner.parentLease);
+      finishRunAttempt(owner.attempt, 'completed');
+    }
+    _resetWorkerBatchExecutionsForTest();
+    _resetWorkerConcurrencyForTest();
+    if (priorAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = priorAuthMode;
+    if (priorSessionCap === undefined) delete process.env.CLEMMY_WORKER_MAX_CONCURRENCY;
+    else process.env.CLEMMY_WORKER_MAX_CONCURRENCY = priorSessionCap;
+    if (priorGlobalCap === undefined) delete process.env.CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL;
+    else process.env.CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL = priorGlobalCap;
+    if (priorReduceTier === undefined) delete process.env.CLEMMY_REDUCE_TIER;
+    else process.env.CLEMMY_REDUCE_TIER = priorReduceTier;
+    if (priorFanoutDigest === undefined) delete process.env.CLEMMY_CHAT_FANOUT_DIGEST;
+    else process.env.CLEMMY_CHAT_FANOUT_DIGEST = priorFanoutDigest;
   }
 });
 

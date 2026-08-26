@@ -500,6 +500,7 @@ async function runRecordedProactiveReportTurn(
     input: input.directive,
     reuseRecordedUserInput: true,
     sourceUserSeq: directiveSource.seq,
+    suppressMemoryCapture: true,
   });
   return directiveSource;
 }

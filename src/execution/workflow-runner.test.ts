@@ -96,6 +96,7 @@ const {
   resolveWorkflowDefinitionForRun,
   WorkflowWatcherMailbox,
   WorkflowCapabilityBlockedError,
+  WorkflowHarnessBlockedSignal,
   workflowCapabilityBlockIsRecoverable,
   workflowCapabilityRetryDelayMs,
   reapCapabilityBlockedRuns,
@@ -227,11 +228,13 @@ const workflowSettlementDispatch = await import('../runtime/harness/dispatch-led
 const workflowSettlementOutcomes = await import('../runtime/harness/attempt-outcome.js');
 const workflowSettlements = await import('../runtime/harness/logical-call-settlement-store.js');
 const workflowSettlementShadow = await import('../runtime/graph/turn-graph-shadow.js');
+const workflowSemanticDisposition = await import('../runtime/semantic-boundary/semantic-disposition.js');
 const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
 const { setClaudeAgentSdkWorkflowStepRunForTest } = await import('../runtime/harness/claude-agent-workflow-step.js');
 const { ClaudeAgentSdkApprovalBoundaryError } = await import('../runtime/harness/claude-agent-sdk.js');
 const { AgentRuntimeCancelledError } = await import('../runtime/provider.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const workflowNotifications = await import('../runtime/notifications.js');
 const runEvents = await import('../runtime/run-events.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
@@ -2121,6 +2124,7 @@ test('a corrupt project execution ledger cannot starve an independently admitted
 
 test('fresh workflow run records a sanitized graph snapshot event', async () => {
   const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const { recordStepResult } = await import('../tools/step-result-tool.js');
   const slug = 'graph-snapshot-runner';
   const workflowName = 'Graph Snapshot Runner';
   const runId = `graph-snapshot-${Date.now()}`;
@@ -2132,26 +2136,15 @@ test('fresh workflow run records a sanitized graph snapshot event', async () => 
     steps: [
       {
         id: 'pull',
-        prompt: 'Pull the source records.',
-        deterministic: { runner: 'emit.mjs' },
-        sideEffect: 'read',
+        prompt: 'Return the first fixture value.',
       },
       {
         id: 'summarize',
-        prompt: 'Summarize the source records.',
+        prompt: 'Return the dependent fixture value.',
         dependsOn: ['pull'],
-        deterministic: { runner: 'emit.mjs' },
-        sideEffect: 'read',
       },
     ],
   });
-  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', slug, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(
-    path.join(scriptsDir, 'emit.mjs'),
-    'process.stdin.resume(); process.stdin.on("end", () => process.stdout.write(JSON.stringify({ ok: true })));',
-    'utf-8',
-  );
 
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
@@ -2163,7 +2156,25 @@ test('fresh workflow run records a sanitized graph snapshot event', async () => 
     createdAt: new Date().toISOString(),
   }), 'utf-8');
 
-  await processWorkflowRuns({} as never);
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (options: { sessionId: string }) => {
+      recordStepResult(options.sessionId, { ok: true });
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { summary: 'done', reply: 'done', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
+  try {
+    await processWorkflowRuns({} as never);
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+  }
 
   const events = readWorkflowEvents(slug, runId);
   const graphEvent = events.find((event) => event.kind === 'workflow_graph_created');
@@ -2181,6 +2192,7 @@ test('fresh workflow run records a sanitized graph snapshot event', async () => 
 
 test('fresh workflow run records ready batch metadata for parallel scheduler lanes', async () => {
   const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const { recordStepResult } = await import('../tools/step-result-tool.js');
   const slug = 'parallel-ready-runner';
   const workflowName = 'Parallel Ready Runner';
   const runId = `parallel-ready-${Date.now()}`;
@@ -2191,18 +2203,9 @@ test('fresh workflow run records ready batch metadata for parallel scheduler lan
     trigger: { manual: true },
     steps: Array.from({ length: 6 }, (_, index) => ({
       id: `root_${index + 1}`,
-      prompt: `Root ${index + 1}`,
-      deterministic: { runner: 'emit.mjs' },
-      sideEffect: 'read' as const,
+      prompt: `Return fixture value ${index + 1}.`,
     })),
   });
-  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', slug, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(
-    path.join(scriptsDir, 'emit.mjs'),
-    'process.stdin.resume(); process.stdin.on("end", () => process.stdout.write(JSON.stringify({ ok: true })));',
-    'utf-8',
-  );
 
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
@@ -2213,7 +2216,25 @@ test('fresh workflow run records ready batch metadata for parallel scheduler lan
     createdAt: new Date().toISOString(),
   }), 'utf-8');
 
-  await processWorkflowRuns({} as never);
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (options: { sessionId: string }) => {
+      recordStepResult(options.sessionId, { ok: true });
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { summary: 'done', reply: 'done', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
+  try {
+    await processWorkflowRuns({} as never);
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+  }
 
   const ready = readWorkflowEvents(slug, runId).filter((event) => event.kind === 'workflow_node_ready');
   // Under the shared graph executor (Clem 4 Stage 3) a ready wave is PACED
@@ -3233,6 +3254,7 @@ test('Tasks-board stop releases a standard workflow step waiting in-place on app
 });
 
 test('standard workflow approval resume retains the exact step attempt identity', async () => {
+  const { _acceptResumeConversationInputForTest } = await import('../runtime/harness/loop.js');
   resetEventLog();
   resetHarnessRuntimeConfig();
   const prev = {
@@ -3255,6 +3277,8 @@ test('standard workflow approval resume retains the exact step attempt identity'
   let resumeOptions: {
     sessionId: string;
     runAttemptId?: string;
+    approvalId?: string;
+    decision?: 'approve' | 'reject';
   } | undefined;
   try {
     const stateDir = path.join(tmp, 'state');
@@ -3295,8 +3319,15 @@ test('standard workflow approval resume retains the exact step attempt identity'
       runConversationFromResume: (async (options: {
         sessionId: string;
         runAttemptId?: string;
+        approvalId?: string;
+        decision?: 'approve' | 'reject';
       }) => {
         resumeOptions = options;
+        _acceptResumeConversationInputForTest({
+          sessionId: options.sessionId,
+          approvalId: options.approvalId,
+          decision: options.decision,
+        });
         return {
           sessionId: options.sessionId,
           status: 'completed',
@@ -3342,6 +3373,28 @@ test('standard workflow approval resume retains the exact step attempt identity'
     assert.equal(initialOptions?.sourceUserSeq, activeAttempt?.sourceUserSeq);
     assert.equal(initialOptions?.runAttemptId, activeAttempt?.attemptId);
 
+    // `enteredPromise` fires inside the model stub, before its
+    // `awaiting_approval` result has returned to the workflow owner. Wait on
+    // that owner's exact card projection so it can enumerate and bind the
+    // pending card before the fixture resolves it. Resolving in the same
+    // microtask incorrectly simulates a decision that predates this
+    // activation's observation authority.
+    let activationObservedCard = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      activationObservedCard = workflowNotifications.loadNotifications().some((row) =>
+        row.id === `approval-${approvalId}`
+        && row.metadata?.workflowName === 'Standard Attempt Identity'
+        && row.metadata?.stepId === step.id,
+      );
+      if (activationObservedCard) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(activationObservedCard, true, 'the workflow owner observed and surfaced the exact card');
+    assert.equal(
+      approvalRegistry.listPending({ sessionId, status: 'pending' })
+        .some((row) => row.approvalId === approvalId),
+      true,
+    );
     approvalRegistry.resolve(approvalId, 'approved', 'unit-test-human');
     await running;
 
@@ -3774,12 +3827,13 @@ test('warning-only stderr is retained as a diagnostic but never promoted to root
   assert.doesNotMatch(failure.message, /Reported reason: .*Warning/i);
 });
 
-test('deterministic structured failure reaches the terminal record unchanged and bypasses the voice model', async () => {
+test('a persisted deterministic workflow is blocked before its body or voice model can run', async () => {
   const { writeWorkflow } = await import('../memory/workflow-store.js');
   const stamp = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const slug = `det-terminal-failure-${stamp}`;
   const workflowName = `Det terminal failure ${stamp}`;
   const runId = `det-terminal-failure-run-${stamp}`;
+  const marker = path.join(tmp, `${runId}-spawned`);
   writeWorkflow(slug, {
     name: workflowName,
     description: 'Pins faithful deterministic failure reporting.',
@@ -3791,6 +3845,7 @@ test('deterministic structured failure reaches the terminal record unchanged and
       deterministic: {
         runner: 'fail.mjs',
         source: [
+          `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned');`,
           'process.stderr.write("Warning: sf CLI update available.\\n");',
           'process.stdout.write(JSON.stringify({ found: false, kind: "deterministic_source_failure", code: "salesforce_provider_error", failedRead: "salesforce-org-readiness", providerErrorId: "INVALID_SESSION_ID", error: "Salesforce target org nathan@example.test is not authenticated." }));',
           'process.exit(1);',
@@ -3821,24 +3876,16 @@ test('deterministic structured failure reaches the terminal record unchanged and
   }
 
   const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
-  assert.equal(terminal.status, 'error');
-  assert.equal(voiceCalls, 0, 'typed deterministic failures cannot be semantically rewritten by a model');
-  assert.equal(terminal.failure?.kind, 'deterministic_runner');
-  assert.equal(terminal.failure?.summary, 'Salesforce target org nathan@example.test is not authenticated.');
-  assert.equal(terminal.failure?.structuredFailureSource, 'stdout');
-  assert.deepEqual(terminal.failure?.sourceFailure, {
-    kind: 'deterministic_source_failure',
-    code: 'salesforce_provider_error',
-    failedRead: 'salesforce-org-readiness',
-    providerErrorId: 'INVALID_SESSION_ID',
-  });
-  assert.equal(terminal.failure?.stdout, undefined);
-  assert.match(terminal.error ?? '', /Reported reason: Salesforce target org nathan@example\.test is not authenticated\./);
-  assert.match(terminal.error ?? '', /stderr diagnostic: Warning: sf CLI update available\./);
-  assert.equal(terminal.reportBack?.detail, terminal.error);
-  assert.doesNotMatch(terminal.reportBack?.detail ?? '', /apply fix <id>/i);
-  const failedEvent = readWorkflowEvents(slug, runId).find((event) => event.kind === 'step_failed');
-  assert.equal((failedEvent?.meta?.failure as Record<string, unknown> | undefined)?.kind, 'deterministic_runner');
+  assert.equal(terminal.status, 'blocked');
+  assert.equal(terminal.terminalOutcome, 'blocked');
+  assert.equal(voiceCalls, 0, 'retired subprocess declarations cannot reach a semantic rewrite');
+  assert.equal(existsSync(marker), false, 'the persisted runner body never starts');
+  assert.match(terminal.error ?? '', /needs edits before it can run|shared exact authority/i);
+  assert.equal(terminal.failure, undefined, 'no fabricated runner failure exists when no body ran');
+  const events = readWorkflowEvents(slug, runId);
+  assert.equal(events.some((event) => event.kind === 'step_started'), false);
+  assert.equal(events.some((event) => event.kind === 'step_failed'), false);
+  assert.equal(events.some((event) => event.kind === 'step_completed'), false);
 });
 
 test('deterministic workflow step now runs a .ts runner via the shared tsx interpreter', async () => {
@@ -3884,12 +3931,14 @@ test('deterministic workflow step rejects runners outside scripts/', async () =>
   );
 });
 
-test('deterministic step ENFORCES its output contract (regression guard: routes through finalizeStepOutput)', async () => {
+test('production deterministic steps refuse before spawn regardless of an output contract', async () => {
   const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-contract-test', 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
+  const marker = path.join(tmp, 'det-contract-test-spawned');
   writeFileSync(
     path.join(scriptsDir, 'emit.mjs'),
     [
+      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned');`,
       'let i = ""; process.stdin.setEncoding("utf-8");',
       'process.stdin.on("data", (c) => i += c);',
       'process.stdin.on("end", () => process.stdout.write(JSON.stringify({ ok: true })));',
@@ -3907,20 +3956,30 @@ test('deterministic step ENFORCES its output contract (regression guard: routes 
     forEachFailures: [],
   } as unknown as Parameters<typeof executeStep>[1]);
 
-  // The script emits { ok: true }; the contract requires a `url` key → the
-  // deterministic step must FAIL its contract (previously this was silently
-  // accepted because the deterministic path bypassed verification).
   const failStep = { id: 'd_fail', prompt: 'x', deterministic: { runner: 'emit.mjs' }, output: { type: 'object', required_keys: ['url'] } } as unknown as Parameters<typeof executeStep>[0];
-  await assert.rejects(() => executeStep(failStep, mkCtx('det-fail')), /failed its contract/);
+  await assert.rejects(
+    () => executeStep(failStep, mkCtx('det-fail')),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowHarnessBlockedSignal);
+      assert.match(error.reason, /deterministic\.runner.*shared exact authority/i);
+      return true;
+    },
+  );
   const failKinds = readWorkflowEvents('det-contract-test', 'det-fail').map((e) => e.kind);
-  assert.ok(failKinds.includes('step_failed'), 'deterministic contract violation → step_failed');
-  assert.ok(!failKinds.includes('step_completed'), 'deterministic contract violation must NOT record step_completed');
+  assert.ok(!failKinds.includes('step_started'));
+  assert.ok(!failKinds.includes('step_completed'));
 
-  // No declared contract → unverified, completes (backward-compatible).
   const okStep = { id: 'd_ok', prompt: 'x', deterministic: { runner: 'emit.mjs' } } as unknown as Parameters<typeof executeStep>[0];
-  const out = await executeStep(okStep, mkCtx('det-ok'));
-  assert.deepEqual(out, { ok: true });
-  assert.ok(readWorkflowEvents('det-contract-test', 'det-ok').map((e) => e.kind).includes('step_completed'));
+  await assert.rejects(
+    () => executeStep(okStep, mkCtx('det-ok')),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowHarnessBlockedSignal);
+      assert.match(error.reason, /deterministic\.runner.*shared exact authority/i);
+      return true;
+    },
+  );
+  assert.equal(existsSync(marker), false);
+  assert.ok(!readWorkflowEvents('det-contract-test', 'det-ok').map((e) => e.kind).includes('step_completed'));
 });
 
 test('forEach batches an oversized fan-out and still attempts every item', async () => {
@@ -4429,7 +4488,7 @@ test('failed-item retry seeding inherits upstream + completed items but not stal
   assert.equal(seededEvent?.meta?.inheritedItems, 2);
 });
 
-test('a failed external loop probe never publishes provisional step completion', async () => {
+test('a retired external loop probe blocks before the primary step or probe body', async () => {
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
   const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
   const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
@@ -4438,11 +4497,12 @@ test('a failed external loop probe never publishes provisional step completion',
   process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   const workflowSlug = 'deferred-probe-completion';
   const runId = 'probe-failed-before-commit';
+  const marker = path.join(tmp, `${runId}-spawned`);
   const scriptsDir = path.join(WORKFLOWS_DIR, workflowSlug, 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(
     path.join(scriptsDir, 'probe.mjs'),
-    'console.log(JSON.stringify({ pending: true }));\n',
+    `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned'); console.log(JSON.stringify({ pending: true }));\n`,
     'utf-8',
   );
   const step = {
@@ -4468,7 +4528,7 @@ test('a failed external loop probe never publishes provisional step completion',
     runId,
     inputs: {},
     stepOutputs: {},
-    assistant: { respond: async () => ({ text: 'candidate output before probe' }) },
+    assistant: { respond: async () => { throw new Error('primary step must not run'); } },
     completedItems: new Map(),
     forEachFailures: [],
     qualityAdvisories: [],
@@ -4476,8 +4536,13 @@ test('a failed external loop probe never publishes provisional step completion',
   try {
     await assert.rejects(
       () => workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx),
-      /loop probe did not satisfy/,
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowHarnessBlockedSignal);
+        assert.match(error.reason, /loopUntil\.probe\.runner.*shared exact authority/i);
+        return true;
+      },
     );
+    assert.equal(existsSync(marker), false);
     const events = readWorkflowEvents(workflowSlug, runId);
     assert.equal(
       events.some((event) => event.kind === 'step_completed' && event.stepId === step.id),
@@ -4492,14 +4557,15 @@ test('a failed external loop probe never publishes provisional step completion',
   }
 });
 
-test('a read-only structured call also defers completion until its external loop probe passes', async () => {
+test('a structured call with a retired loop probe blocks before provider or probe execution', async () => {
   const workflowSlug = 'deferred-call-probe-completion';
   const runId = 'call-probe-failed-before-commit';
+  const marker = path.join(tmp, `${runId}-spawned`);
   const scriptsDir = path.join(WORKFLOWS_DIR, workflowSlug, 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(
     path.join(scriptsDir, 'probe.mjs'),
-    'console.log(JSON.stringify({ pending: true }));\n',
+    `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned'); console.log(JSON.stringify({ pending: true }));\n`,
     'utf-8',
   );
   const step = {
@@ -4530,12 +4596,22 @@ test('a read-only structured call also defers completion until its external loop
     forEachFailures: [],
     qualityAdvisories: [],
   } as unknown as Parameters<typeof executeStep>[1];
-  _setWorkflowCallNodeForTests(async () => ({ exportId: 'exp-1', status: 'pending' }));
+  let providerCalls = 0;
+  _setWorkflowCallNodeForTests(async () => {
+    providerCalls += 1;
+    return { exportId: 'exp-1', status: 'pending' };
+  });
   try {
     await assert.rejects(
       () => workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx),
-      /loop probe did not satisfy/,
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowHarnessBlockedSignal);
+        assert.match(error.reason, /loopUntil\.probe\.runner.*shared exact authority/i);
+        return true;
+      },
     );
+    assert.equal(providerCalls, 0);
+    assert.equal(existsSync(marker), false);
     assert.equal(
       readWorkflowEvents(workflowSlug, runId)
         .some((event) => event.kind === 'step_completed' && event.stepId === step.id),
@@ -6015,6 +6091,7 @@ test('a recovered scrape whose output satisfies the declared contract is complet
     type: 'user_input_received',
     data: { text: 'Scrape the official page and analyze recent posts.' },
   });
+  workflowSemanticDisposition.recordSemanticParticipation(sessionId, source.seq, 'participated');
   assert.ok(workflowSettlementShadow.recordTurnGraphShadow({
     identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
     surface: 'workflow',
@@ -6037,7 +6114,7 @@ test('a recovered scrape whose output satisfies the declared contract is complet
       tool,
       args,
     });
-    assert.equal(begun.status, 'inserted');
+    assert.equal(begun.status, 'inserted', JSON.stringify(begun));
     if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
     assert.equal(workflowSettlementDispatch.settlePhysicalDispatch({
       identity: begun.identity,
@@ -6195,6 +6272,7 @@ test('a local-write source step cannot fabricate complete evidence over a failed
     type: 'user_input_received',
     data: { text: 'Run every required query, save the local baseline, then post the summary.' },
   });
+  workflowSemanticDisposition.recordSemanticParticipation(sessionId, source.seq, 'participated');
   assert.ok(workflowSettlementShadow.recordTurnGraphShadow({
     identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
     surface: 'workflow',
@@ -6217,7 +6295,7 @@ test('a local-write source step cannot fabricate complete evidence over a failed
       tool: 'alpha_records_read',
       args,
     });
-    assert.equal(begun.status, 'inserted');
+    assert.equal(begun.status, 'inserted', JSON.stringify(begun));
     if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
     assert.equal(workflowSettlementDispatch.settlePhysicalDispatch({
       identity: begun.identity,
@@ -6491,6 +6569,7 @@ test('WorkflowWatcherMailbox never waits for the judge and exposes a late verdic
 
 test('workflow watcher: drift at a step boundary records a steer advisory with the right cadence and digest', async () => {
   const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const { recordStepResult } = await import('../tools/step-result-tool.js');
   const { _setWorkflowWatcherForTests: setWatcher } = await import('./workflow-runner.js');
   const slug = 'watcher-steer-runner';
   const workflowName = 'Watcher Steer Runner';
@@ -6501,18 +6580,11 @@ test('workflow watcher: drift at a step boundary records a steer advisory with t
     enabled: true,
     trigger: { manual: true },
     steps: [
-      { id: 'a', prompt: 'Step A.', deterministic: { runner: 'emit.mjs' }, sideEffect: 'read' },
-      { id: 'b', prompt: 'Step B.', dependsOn: ['a'], deterministic: { runner: 'emit.mjs' }, sideEffect: 'read' },
-      { id: 'c', prompt: 'Step C.', dependsOn: ['b'], deterministic: { runner: 'emit.mjs' }, sideEffect: 'read' },
+      { id: 'a', prompt: 'Return fixture A.' },
+      { id: 'b', prompt: 'Return fixture B.', dependsOn: ['a'] },
+      { id: 'c', prompt: 'Return fixture C.', dependsOn: ['b'] },
     ],
   });
-  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', slug, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(
-    path.join(scriptsDir, 'emit.mjs'),
-    'process.stdin.resume(); process.stdin.on("end", () => process.stdout.write(JSON.stringify({ ok: true })));',
-    'utf-8',
-  );
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
     id: runId, workflow: workflowName, status: 'queued', inputs: {}, createdAt: new Date().toISOString(),
@@ -6521,6 +6593,20 @@ test('workflow watcher: drift at a step boundary records a steer advisory with t
   const digestsSeen: Array<{ summary: string; count: number }> = [];
   const previousWorkflowWatcher = process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE;
   process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE = 'on';
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (options: { sessionId: string }) => {
+      recordStepResult(options.sessionId, { ok: true });
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { summary: 'done', reply: 'done', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
   setWatcher(async (input) => {
     digestsSeen.push({ summary: input.toolCallSummary, count: input.toolCallCount });
     return { onTrack: false, miss: 'the enrichment ignored the stated goal', steer: 'Re-anchor on the goal before the final step.' };
@@ -6528,6 +6614,7 @@ test('workflow watcher: drift at a step boundary records a steer advisory with t
   try {
     await processWorkflowRuns({} as never);
   } finally {
+    _setWorkflowHarnessLoopImplsForTests();
     setWatcher(async () => ({ onTrack: true, miss: '', steer: '' }));
     if (previousWorkflowWatcher === undefined) delete process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE;
     else process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE = previousWorkflowWatcher;

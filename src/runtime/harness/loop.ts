@@ -29,7 +29,7 @@ import {
   listPendingAsyncWorkDispatchBatchClosedEvents,
   openEventLog,
   recentToolOutputs,
-  resolveToolOutputsForAuthority,
+  resolveToolOutputTermMatchesForAuthority,
   searchToolOutputs,
   type AppendEventInput,
   type EventRow,
@@ -168,7 +168,10 @@ import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../a
 import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv } from '../../config.js';
-import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import {
+  autoCaptureProvenanceFromAcceptedEvent,
+  captureInteractionSignals,
+} from '../../memory/auto-capture.js';
 import {
   looksLikeHealthyDurableMemoryAcknowledgement,
 } from './durable-memory-receipt.js';
@@ -245,7 +248,11 @@ import {
 import {
   dispatchAdmittedSource,
 } from '../semantic-boundary/typed-source-dispatch.js';
-import { HostInterruptState, hostRunRunner } from './host-turn-runner.js';
+import {
+  HostInterruptState,
+  hostRunRunner,
+  hostToolCallsLimitCheckpointFor,
+} from './host-turn-runner.js';
 import { hostInteractiveConsentApprovalResumeKey } from './host-interactive-consent.js';
 import { isHostTurnEngine, selectTurnEngine, type TurnEngineMode } from './turn-engine-selection.js';
 import {
@@ -266,6 +273,7 @@ import { getProactivityPolicySnapshot } from '../../agents/proactivity-policy.js
 import {
   claimGroundingNudge,
   extractDeliverablePointers,
+  pointerEvidenceForms,
   recallReadCallIdsForSource,
   ungroundedPointers,
 } from './claim-grounding.js';
@@ -637,9 +645,36 @@ type ResumeConversationInput = {
   decision: 'approve' | 'reject' | 'approve_with_edits';
 };
 
+function requireExactDurableResumeApproval(
+  opts: ResumeConversationInput,
+): approvalRegistry.PendingApprovalRow | null {
+  const explicitApprovalId = opts.approvalId?.trim();
+  if (!explicitApprovalId) return null;
+  const approval = approvalRegistry.get(explicitApprovalId);
+  if (!approval || approval.sessionId !== opts.sessionId) {
+    throw new Error(`Approval ${explicitApprovalId} does not belong to this session.`);
+  }
+  const wantedResolution: approvalRegistry.ApprovalResolution =
+    opts.decision === 'reject' ? 'rejected' : 'approved';
+  if (approval.status === 'pending') {
+    if (!approvalRegistry.isActionable(approval)) {
+      throw new Error(`Approval ${explicitApprovalId} is no longer actionable.`);
+    }
+  } else if (
+    approval.status !== 'resolved'
+    || approval.resolution !== wantedResolution
+  ) {
+    throw new Error(
+      `Approval ${explicitApprovalId} is ${approval.resolution ?? approval.status}, not ${wantedResolution}.`,
+    );
+  }
+  return approval;
+}
+
 function existingResumeConversationSource(opts: ResumeConversationInput): EventRow | null {
   const explicitApprovalId = opts.approvalId?.trim();
   if (explicitApprovalId) {
+    requireExactDurableResumeApproval(opts);
     const exact = listEvents(opts.sessionId, {
       types: ['user_input_received'],
       desc: true,
@@ -683,6 +718,8 @@ function acceptResumeConversationInput(opts: ResumeConversationInput): number {
 
   const explicitApprovalId = opts.approvalId?.trim();
   if (explicitApprovalId) {
+    // The durable card was validated before replay/source lookup above;
+    // resumePendingApproval independently matches it to serialized tool bytes.
     const row = getSession(opts.sessionId);
     if (!row) throw new Error(`unknown session: ${opts.sessionId}`);
     return acceptUserInputForRun({
@@ -783,13 +820,55 @@ function exactPendingApprovalForTerminal(input: {
   return rows.length === 1 ? rows[0] : null;
 }
 
+interface DeferredToolCallsLimitAuthority {
+  sessionId: string;
+  sourceUserSeq: number;
+  consumed: boolean;
+}
+
+/** Process-local on purpose: a crash may replay persisted paired history, but
+ * cannot reconstruct authority to declare that a partial checkpoint completed. */
+const deferredToolCallsLimitAuthorities = new WeakMap<
+  RunConversationResult,
+  DeferredToolCallsLimitAuthority
+>();
+
 function reduceStandardConversationTerminal(input: {
   result: RunConversationResult;
   sourceUserSeq: number;
   approvalIdHint?: string;
+  deferToolCallsLimitTerminal?: true;
 }): RunConversationResult {
   const { result, sourceUserSeq } = input;
   if (result.completedReason) return result;
+  // A workflow activation owns its own bounded auto-continuation loop. Its
+  // per-turn tool ceiling is an internal checkpoint under the SAME accepted
+  // source, not that source's immutable public winner. Defer publication until
+  // the owner either completes or reaches a genuine terminal; interactive
+  // callers retain the ordinary continue-shaped presentation.
+  if (
+    input.deferToolCallsLimitTerminal
+    && result.status === 'limit_exceeded'
+    && result.limitKind === 'tool_calls'
+  ) {
+    const existing = deferredToolCallsLimitAuthorities.get(result);
+    if (existing) {
+      if (
+        existing.sessionId !== result.sessionId
+        || existing.sourceUserSeq !== sourceUserSeq
+        || existing.consumed
+      ) {
+        throw new Error('Deferred tool-calls checkpoint authority cannot be rebound.');
+      }
+    } else {
+      deferredToolCallsLimitAuthorities.set(result, {
+        sessionId: result.sessionId,
+        sourceUserSeq,
+        consumed: false,
+      });
+    }
+    return result;
+  }
 
   const identity = standardTurnIdentity({
     sessionId: result.sessionId,
@@ -1030,6 +1109,92 @@ function reduceStandardConversationTerminal(input: {
 }
 
 export const _testOnly_reduceStandardConversationTerminal = reduceStandardConversationTerminal;
+
+/** Read the exact accepted source bound to a still-live deferred checkpoint. */
+export function deferredToolCallsLimitSourceUserSeq(
+  checkpoint: RunConversationResult,
+): number | null {
+  const authority = deferredToolCallsLimitAuthorities.get(checkpoint);
+  return authority && !authority.consumed ? authority.sourceUserSeq : null;
+}
+
+/** Close a workflow-owned tool-ceiling checkpoint without re-entering the
+ * model. The workflow runner alone decides whether a settlement-guarded
+ * structured capture finished the step; every other exhausted checkpoint is
+ * published as the ordinary continue-shaped limit terminal. */
+export function finalizeDeferredToolCallsLimitTerminal(input: {
+  checkpoint: RunConversationResult;
+  sourceUserSeq: number;
+  outcome:
+    | { kind: 'completed'; text: string }
+    | { kind: 'limit_exceeded' };
+}): RunConversationResult {
+  const { checkpoint } = input;
+  const authority = deferredToolCallsLimitAuthorities.get(checkpoint);
+  if (!authority) {
+    throw new Error('Deferred tool-calls checkpoint authority is missing or forged.');
+  }
+  if (authority.consumed) {
+    throw new Error('Deferred tool-calls checkpoint authority was already consumed.');
+  }
+  if (
+    authority.sessionId !== checkpoint.sessionId
+    || authority.sourceUserSeq !== input.sourceUserSeq
+  ) {
+    throw new Error('Deferred tool-calls checkpoint authority does not match this source.');
+  }
+  if (
+    checkpoint.status !== 'limit_exceeded'
+    || checkpoint.limitKind !== 'tool_calls'
+  ) {
+    throw new Error('Only a typed tool-calls checkpoint can enter deferred terminal finalization.');
+  }
+  if (checkpoint.publicPresentation) {
+    throw new Error('A deferred tool-calls checkpoint already has an immutable public terminal.');
+  }
+  const completedText = input.outcome.kind === 'completed'
+    ? publicReplyText(input.outcome.text, '')
+    : null;
+  if (input.outcome.kind === 'completed' && !completedText) {
+    throw new Error('A completed deferred tool-calls checkpoint requires honest presentation text.');
+  }
+  if (input.outcome.kind === 'limit_exceeded') {
+    const finalized = reduceStandardConversationTerminal({
+      result: checkpoint,
+      sourceUserSeq: input.sourceUserSeq,
+    });
+    authority.consumed = true;
+    const session = HarnessSession.load(checkpoint.sessionId);
+    session?.markStatus('failed');
+    emitRuntimeTerminalEvent(checkpoint.sessionId, finalized);
+    refreshTerminalWorkingMemory(checkpoint.sessionId);
+    return finalized;
+  }
+  const finalized = reduceStandardConversationTerminal({
+    result: {
+      sessionId: checkpoint.sessionId,
+      status: 'completed',
+      steps: checkpoint.steps,
+      lastTurn: checkpoint.lastTurn,
+      lastDecision: {
+        summary: completedText!,
+        reply: completedText!,
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    },
+    sourceUserSeq: input.sourceUserSeq,
+  });
+  authority.consumed = true;
+  const session = HarnessSession.load(checkpoint.sessionId);
+  if (session && session.sessionRow.kind !== 'chat' && !approvalRegistry.hasPending(checkpoint.sessionId)) {
+    session.markStatus('completed');
+  }
+  emitRuntimeTerminalEvent(checkpoint.sessionId, finalized);
+  refreshTerminalWorkingMemory(checkpoint.sessionId);
+  return finalized;
+}
 
 function commitStandardNeedsInputTerminal(input: {
   sessionId: string;
@@ -2351,10 +2516,18 @@ export interface RunTurnOptions {
    * query embedding and the visible vault primer. This is a cost optimization
    * only; any uncertain/action-shaped turn omits it and retains full recall. */
   skipAutomaticMemoryPrimer?: true;
+  /** The accepted request opted out of automatic memory for its full logical
+   * continuation/fallover chain. This is policy only and carries no task text. */
+  suppressAutomaticMemoryForRequest?: true;
   /** Runtime-owned semantic context for a verified resumed task. It may steer
    * retrieval/classification, but it never replaces `input` in model-visible
    * user history and never grants tool or approval authority. */
   semanticTaskInput?: string;
+  /** Runtime-owned query used only by automatic memory retrieval. Unlike
+   * `semanticTaskInput`, this must never steer continuation, classification,
+   * confirmation, or task authority. Workflow steps use it to search by their
+   * authored topic without turning synthetic runner prose into task control. */
+  memoryPrimerQuery?: string;
   /** Exact accepted-source continuation classification. A declined answer
    * keeps its parent/question here for conversation continuity, while semantic
    * preflight is deliberately limited to the literal current answer. */
@@ -2396,9 +2569,16 @@ export interface RunTurnOptions {
   reuseRecordedUserInput?: boolean;
   /** Exact accepted source event owned by this logical user request. */
   sourceUserSeq?: number;
+  /** Stable logical infrastructure-error episode retained only while the
+   * runtime is retrying the same failed operation. A successful physical turn
+   * closes it; a crash can recover it from the durable retry event. */
+  infraRecoveryEpisodeId?: string;
   /** Durable outer request attempt. Internal provider retries remain children
    * of this identity and lose authority when it reaches a terminal state. */
   runAttemptId?: string;
+  /** Workflow-owned typed tool ceilings stay nonterminal until the outer
+   * continuation owner either resumes or explicitly finalizes them. */
+  deferToolCallsLimitTerminal?: true;
   /** W1a: when true, a TRANSIENT model/codex error returns `infraTransientKind`
    *  WITHOUT writing the infra-recovery ask, so runConversation can attempt
    *  cross-brain fallover first. Off (default) = today's behavior verbatim. */
@@ -2433,10 +2613,23 @@ export interface RunTurnResult {
   /** The deferred ask's user-facing message, so the exhausted-fallover path emits
    *  the byte-identical ask the direct path would have. */
   infraTransientUserMessage?: string;
-  /** UNATTENDED self-heal (workflow/background): an infra error that would ask an
-   *  absent human instead auto-retries. The outer loop re-runs the SAME step with
-   *  `directive` (bounded by decideInfraRecovery). Never written for attended runs. */
-  infraAutoRetry?: { kind: string; directive: string };
+  /** Bounded infrastructure self-heal: unattended lanes retry twice and
+   *  attended lanes quietly retry once before surfacing policy's terminal.
+   *  The outer loop re-runs the SAME step with `directive`. */
+  infraAutoRetry?: {
+    kind: string;
+    directive: string;
+    /** Exact accepted request charged for this retry. Legacy source-less direct
+     * callers omit it and retain their historical session-scoped fallback. */
+    sourceUserSeq?: number;
+    /** Stable across every physical retry of this one logical error, including
+     * a fresh daemon process reopening the durable event log. */
+    logicalErrorEpisodeId: string;
+    /** One-based durable charge for this exact accepted-source episode. */
+    attempt: number;
+    /** Lane policy ceiling (attended=1, unattended=2). */
+    max: number;
+  };
   /** Nonterminal protocol/restart ownership. No public terminal is authored. */
   hold?: {
     owner: 'host';
@@ -2518,6 +2711,10 @@ export type RunConversationStatus =
  */
 function declinesAutomaticContextWarm(options: RunConversationOptions): boolean {
   if (options.taskContinuation?.disposition === 'declined_with_new_task') return true;
+  if (options.suppressAutomaticMemoryForRequest === true) return true;
+  // Retrieval policy belongs to the accepted task text, never to a
+  // runtime-authored lookup query. A workflow topic must not bypass a literal
+  // request-local "do not use memory" boundary.
   const semantic = options.semanticTaskInput ?? options.input;
   return !semantic.trim() || explicitlyOptsOutOfAutomaticMemoryRecall(semantic);
 }
@@ -2551,6 +2748,14 @@ export interface RunConversationOptions {
   /** See RunTurnOptions.semanticTaskInput. Threaded across internal
    * continuations while the literal accepted user message remains `input`. */
   semanticTaskInput?: string;
+  /** See RunTurnOptions.memoryPrimerQuery. Threaded across internal
+   * continuations exclusively to the automatic memory warm/primer. */
+  memoryPrimerQuery?: string;
+  /** Policy-only latch for a request that explicitly declined automatic memory.
+   * Unlike the lookup query, this survives a new runConversation activation
+   * (for example a workflow tool-ceiling checkpoint) without becoming task
+   * text or semantic steering. */
+  suppressAutomaticMemoryForRequest?: true;
   /** See RunTurnOptions.taskContinuation. Threaded without changing the
    * model-visible user message. */
   taskContinuation?: TaskContinuationContext;
@@ -2565,6 +2770,9 @@ export interface RunConversationOptions {
   maxTurns?: number;
   /** Forwarded to each underlying runTurn(). */
   toolCallsPerTurn?: number;
+  /** Runtime-authored accepted source (for example a proactive outcome
+   * directive). Suppresses automatic memory on the first physical turn too. */
+  suppressMemoryCapture?: true;
   /** Exact external MCP authority, forwarded to every continuation turn. */
   mcpToolScope?: McpToolScope | null;
   /**
@@ -2618,6 +2826,10 @@ export interface RunConversationOptions {
   /** Durable outer request attempt, forwarded through every continuation and
    * cross-brain retry. */
   runAttemptId?: string;
+  /** Internal workflow owner: retain a typed per-turn tool ceiling as a private
+   * checkpoint so the same accepted source/run attempt can resume and publish
+   * exactly one eventual terminal. Other limit kinds are never deferred. */
+  deferToolCallsLimitTerminal?: true;
   /**
    * W1a chat step-boundary brain fallover. When BOTH are provided, a turn that
    * fails on a TRANSIENT model/codex error (and has NOT written externally this
@@ -2922,6 +3134,61 @@ function preparedWorkflowDispatchReceipts(input: {
     receipts.push(receipt);
   }
   return receipts;
+}
+
+interface HostPlainZeroToolTurnAuthority {
+  sessionId: string;
+  sourceUserSeq: number;
+}
+
+/**
+ * Prove that this exact fresh host invocation had no path to prepare a
+ * workflow dispatch. The prompt classifier alone is deliberately
+ * insufficient: the built Agent must have no direct tools, MCP servers, or
+ * handoffs, the completed physical turn must report zero tool calls, and an
+ * older preparation for this same accepted source must not already exist.
+ *
+ * This proof bypasses only the redundant pre-terminal *finalizer*. The shared
+ * delivery committer still takes its strict workflow ownership lock, so a
+ * corrupt/concurrent preparation that appears after this check fails closed
+ * before a public terminal is written.
+ */
+function hostPlainZeroToolTurnAuthority(input: {
+  hostPlainConversation: boolean;
+  sessionId: string;
+  sourceUserSeq: number;
+  agent: Agent<any, any>;
+  toolCalls: number | undefined;
+}): HostPlainZeroToolTurnAuthority | null {
+  if (!input.hostPlainConversation || input.toolCalls !== 0) return null;
+  const surface = input.agent as unknown as {
+    tools?: unknown;
+    mcpServers?: unknown;
+    handoffs?: unknown;
+  };
+  if (
+    !Array.isArray(surface.tools)
+    || surface.tools.length !== 0
+    || !Array.isArray(surface.mcpServers)
+    || surface.mcpServers.length !== 0
+    || !Array.isArray(surface.handoffs)
+    || surface.handoffs.length !== 0
+  ) return null;
+  const source = listEvents(input.sessionId, {
+    sinceSeq: input.sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === input.sourceUserSeq);
+  if (!source || source.role !== 'user' || source.data.synthetic === true) return null;
+  const alreadyPrepared = listEvents(input.sessionId, {
+    types: ['async_work_dispatch_prepared'],
+  }).some((event) => event.data.sourceUserSeq === input.sourceUserSeq);
+  return alreadyPrepared
+    ? null
+    : Object.freeze({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+      });
 }
 
 function activeDispatchMatchesProjection(
@@ -4428,7 +4695,9 @@ export async function runConversation(
     const resolveContext = async (): Promise<void> => {
       if (declinesAutomaticContextWarm(options)) return;
       contextWarmedAtNode = true;
-      void primeTurnRecallVector(options.semanticTaskInput ?? options.input).catch(() => {});
+      void primeTurnRecallVector(
+        options.memoryPrimerQuery ?? options.semanticTaskInput ?? options.input,
+      ).catch(() => {});
     };
     if (hostOwnsFreshTurn) {
       if (hostPlainConversation) {
@@ -4446,6 +4715,9 @@ export async function runConversation(
         input: options.input,
         sourceUserSeq,
         runAttemptId: options.runAttemptId,
+        ...(options.deferToolCallsLimitTerminal
+          ? { deferToolCallsLimitTerminal: true as const }
+          : {}),
         turnEngine: frozenTurnEngine,
         reuseRecordedUserInput: true,
         maxTurns: options.maxTurns,
@@ -4455,12 +4727,25 @@ export async function runConversation(
         onConversationPreamble: options.onConversationPreamble,
         mcpToolScope: options.mcpToolScope,
         ...(options.semanticTaskInput ? { semanticTaskInput: options.semanticTaskInput } : {}),
+        ...(options.memoryPrimerQuery ? { memoryPrimerQuery: options.memoryPrimerQuery } : {}),
+        ...(options.suppressAutomaticMemoryForRequest === true
+          || explicitlyOptsOutOfAutomaticMemoryRecall(options.semanticTaskInput ?? options.input)
+          ? { suppressAutomaticMemoryForRequest: true as const }
+          : {}),
         ...(options.taskContinuation ? { taskContinuation: options.taskContinuation } : {}),
+        ...(options.suppressMemoryCapture ? { suppressMemoryCapture: true as const } : {}),
         ...(contextWarmedAtNode ? { contextWarmedAtNode: true } : {}),
         ...(hostPlainConversation ? { skipAutomaticMemoryPrimer: true as const } : {}),
       });
       const result = hostActivationConversationResult(turnResult);
       if (result.status === 'held') return result;
+      const zeroToolTurnAuthority = hostPlainZeroToolTurnAuthority({
+        hostPlainConversation,
+        sessionId: options.sessionId,
+        sourceUserSeq,
+        agent: activeAgent,
+        toolCalls: turnResult.toolCalls,
+      });
       // A VERIFIED QUEUE RECEIPT TRANSFERS OWNERSHIP TO THE WORKFLOW GRAPH, ON
       // EVERY LANE.
       //
@@ -4477,10 +4762,12 @@ export async function runConversation(
       //
       // Ownership of a queued run belongs to the TURN, not to whichever lane
       // executed it, so it is finalized here exactly as the core does.
-      const hostDispatch = finalizePreparedWorkflowDispatchForSource(
-        options.sessionId,
-        sourceUserSeq,
-      );
+      const hostDispatch = zeroToolTurnAuthority
+        ? null
+        : finalizePreparedWorkflowDispatchForSource(
+            options.sessionId,
+            sourceUserSeq,
+          );
       if (hostDispatch) {
         return recordAsyncWorkflowDispatch({
           sessionId: options.sessionId,
@@ -4491,9 +4778,15 @@ export async function runConversation(
           lastTurn: turnResult.turn,
         });
       }
-      const reduced = reduceStandardConversationTerminal({ result, sourceUserSeq });
-      emitRuntimeTerminalEvent(options.sessionId, reduced);
-      refreshTerminalWorkingMemory(options.sessionId);
+      const reduced = reduceStandardConversationTerminal({
+        result,
+        sourceUserSeq,
+        ...(options.deferToolCallsLimitTerminal ? { deferToolCallsLimitTerminal: true as const } : {}),
+      });
+      if (reduced.publicPresentation) {
+        emitRuntimeTerminalEvent(options.sessionId, reduced);
+        refreshTerminalWorkingMemory(options.sessionId);
+      }
       foregroundRelease = reduced.publicPresentation ? 'terminal' : null;
       return reduced;
     }
@@ -4523,9 +4816,20 @@ export async function runConversation(
           });
           if (result.status === 'dispatched') return { kind: 'dispatched', result };
           if (result.status === 'held') return { kind: 'held', result };
-          return { kind: 'reduced', reduced: reduceStandardConversationTerminal({ result, sourceUserSeq }) };
+          return {
+            kind: 'reduced',
+            reduced: reduceStandardConversationTerminal({
+              result,
+              sourceUserSeq,
+              ...(options.deferToolCallsLimitTerminal
+                ? { deferToolCallsLimitTerminal: true as const }
+                : {}),
+            }),
+          };
         },
-        shouldPublish: (core) => core.kind === 'reduced' && !core.reduced.completedReason,
+        shouldPublish: (core) => core.kind === 'reduced'
+          && !core.reduced.completedReason
+          && Boolean(core.reduced.publicPresentation),
         publish: (core) => {
           if (core.kind !== 'reduced') return;
           emitRuntimeTerminalEvent(options.sessionId, core.reduced);
@@ -4790,6 +5094,12 @@ async function runConversationCore(
   // this step was already recorded (and memory-captured) by the failed attempt,
   // so the re-attempt must not duplicate either.
   let falloverReattempt = false;
+  // One logical infra failure can span several physical model turns. Retain
+  // its durable id only across those exact retries; a successful turn closes
+  // the episode before any later failure under the same accepted source.
+  let infraRecoveryEpisodeId: string | undefined;
+  const suppressAutomaticMemoryForRequest = options.suppressAutomaticMemoryForRequest === true
+    || explicitlyOptsOutOfAutomaticMemoryRecall(options.semanticTaskInput ?? options.input);
 
   // One-way budget elevation (standard → long). Shared by the token-fraction
   // trigger (preflight warn/block) and the step-progress trigger below. Rebinds
@@ -4865,6 +5175,10 @@ async function runConversationCore(
       // continuation turn has its own input and warms itself.
       ...(options.contextWarmedAtNode && stepIndex === 1 ? { contextWarmedAtNode: true } : {}),
       ...(options.semanticTaskInput ? { semanticTaskInput: options.semanticTaskInput } : {}),
+      ...(options.memoryPrimerQuery ? { memoryPrimerQuery: options.memoryPrimerQuery } : {}),
+      ...(suppressAutomaticMemoryForRequest
+        ? { suppressAutomaticMemoryForRequest: true as const }
+        : {}),
       ...(options.taskContinuation ? { taskContinuation: options.taskContinuation } : {}),
       ...(resolvingClarification && (stepIndex === 1 || falloverReattempt)
         ? { continuationSteer: CONVERGENCE_STEER }
@@ -4874,7 +5188,8 @@ async function runConversationCore(
       // harness continuation (judge/stall/grounding re-prompt) → don't learn it.
       // A fallover re-attempt re-runs the SAME step → its input is already
       // recorded + captured, so suppress both regardless of stepIndex.
-      suppressMemoryCapture: stepIndex > 1 || falloverReattempt,
+      suppressMemoryCapture:
+        options.suppressMemoryCapture === true || stepIndex > 1 || falloverReattempt,
       internalContinuation: stepIndex > 1,
       reuseRecordedUserInput: falloverReattempt
         ? true
@@ -4883,6 +5198,10 @@ async function runConversationCore(
       // same accepted user event; a synthetic prompt never becomes authority.
       sourceUserSeq: activeSourceUserSeq,
       runAttemptId: options.runAttemptId,
+      infraRecoveryEpisodeId,
+      ...(options.deferToolCallsLimitTerminal
+        ? { deferToolCallsLimitTerminal: true as const }
+        : {}),
       maxTurns,
       toolCallsPerTurn,
       makeRunner: options.makeRunner,
@@ -4989,16 +5308,26 @@ async function runConversationCore(
       // Brains exhausted / external write already happened / rebuild failed. In an
       // UNATTENDED run there's no one to answer, so self-heal: auto-retry the same
       // step (bounded) or fail honestly — never strand it on an ask.
-      const infraDecision = decideInfraRecovery(options.sessionId);
-      if (infraDecision === 'auto_retry') {
-        emitInfraAutoRecoverEvent(options.sessionId, turnResult.turn, turnResult.infraTransientKind, countInfraAutoRecover(options.sessionId) + 1);
-        nextInput = buildInfraRetryDirective(turnResult.infraTransientKind, settledReadRecovery);
+      const infraRecovery = decideInfraRecovery({
+        sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
+        retainedEpisodeId: infraRecoveryEpisodeId,
+      });
+      if (infraRecovery.decision === 'auto_retry') {
+        const retry = infraAutoRetryPlan(
+          turnResult.infraTransientKind,
+          buildInfraRetryDirective(turnResult.infraTransientKind, settledReadRecovery),
+          infraRecovery,
+        );
+        emitInfraAutoRecoverEvent(options.sessionId, turnResult.turn, retry);
+        infraRecoveryEpisodeId = retry.logicalErrorEpisodeId;
+        nextInput = retry.directive;
         falloverReattempt = false;
         continue;
       }
       // The turn is ENDING here (ask/exhausted) — register any in-flight tool.
       recordOrphanedToolInFlight(options.sessionId, turnResult.turn);
-      if (infraDecision === 'exhausted') {
+      if (infraRecovery.decision === 'exhausted') {
         emitInfraUnrecovered(options.sessionId, turnResult.turn, turnResult.infraTransientKind, turnResult.error ?? '');
         return {
           sessionId: options.sessionId,
@@ -5035,11 +5364,15 @@ async function runConversationCore(
     // spent handleRunError emits run_failed and returns 'failed' (no directive),
     // so this never loops forever.
     if (turnResult.infraAutoRetry) {
-      emitInfraAutoRecoverEvent(options.sessionId, turnResult.turn, turnResult.infraAutoRetry.kind, countInfraAutoRecover(options.sessionId) + 1);
+      emitInfraAutoRecoverEvent(options.sessionId, turnResult.turn, turnResult.infraAutoRetry);
+      infraRecoveryEpisodeId = turnResult.infraAutoRetry.logicalErrorEpisodeId;
       nextInput = turnResult.infraAutoRetry.directive;
       falloverReattempt = false;
       continue;
     }
+    // The retry turn crossed the model boundary successfully. A later failure
+    // under this accepted source is a separate logical error episode.
+    infraRecoveryEpisodeId = undefined;
 
     // v0.5.19 F2 — elevate budget mid-conversation if the preflight
     // gate just emitted warn/block AND we're still on `standard`.
@@ -7080,11 +7413,15 @@ async function runConversationCore(
               }
             }
             candidates.push(...recentCandidates);
-            const evidence = resolveToolOutputsForAuthority(
+            const pointerTerms = pointers.flatMap((pointer) => pointerEvidenceForms(pointer));
+            const evidence = resolveToolOutputTermMatchesForAuthority(
               options.sessionId,
               candidates,
+              pointerTerms,
               { readOrComputeOnly: true },
-            ).map((row) => row.output);
+            ).flatMap((row) => row.matchedTerms.filter(
+              (term) => !row.requestMatchedTerms.includes(term),
+            ));
             // Bytes the model re-read THIS RUN are observed by definition.
             // Recall outputs are presentation-only for authority resolution
             // and would be refused above, but a reply quoting freshly
@@ -7101,7 +7438,7 @@ async function runConversationCore(
                 activeSourceUserSeq as number,
               )) {
                 const recalled = getToolOutput(options.sessionId, recallCallId);
-                if (recalled?.output) evidence.push(recalled.output);
+                if (recalled?.output && !recalled.truncatedAtWrite) evidence.push(recalled.output);
               }
             }
             return claimGroundingNudge(ungroundedPointers(pointers, evidence));
@@ -8231,8 +8568,23 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // Schedule unconditionally at the top so it still fires exactly once per turn
   // on every exit path (the microtask is already queued before any early
   // return); it runs at the first await (compaction) instead of blocking it.
-  const shouldCapture = !options.suppressMemoryCapture && row.kind === 'chat';
-  if (shouldCapture) {
+  let captureSource: EventRow | undefined;
+  if (
+    !options.suppressMemoryCapture
+    && row.kind === 'chat'
+    && Number.isSafeInteger(sourceUserSeq)
+    && (sourceUserSeq ?? 0) > 0
+  ) {
+    try {
+      captureSource = acceptedUserEvent(options.sessionId, Number(sourceUserSeq));
+    } catch {
+      // Automatic memory has no authority without the exact accepted source.
+      // The conversation itself remains available even if that source is
+      // unexpectedly absent.
+    }
+  }
+  const exactCaptureSource = captureSource;
+  if (exactCaptureSource) {
     queueMicrotask(() => {
       try {
         const captureMessage = options.taskContinuation?.disposition === 'declined_with_new_task'
@@ -8250,11 +8602,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           // Durable memory identity follows the exact accepted user source,
           // not this physical loop turn. A whole-turn retry/fallover can run
           // the same source at a later turn number; source ownership must make
-          // that re-drive an idempotent intake replay. Legacy source-less
-          // callers retain the prior stable physical-turn fallback.
-          sourceEventId: Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
-            ? `user-source:${sourceUserSeq}`
-            : `turn:${turn}`,
+          // that re-drive an idempotent intake replay.
+          sourceEventId: `user-source:${exactCaptureSource.seq}`,
+          sourceProvenance: autoCaptureProvenanceFromAcceptedEvent(exactCaptureSource),
         });
         const queuedCandidateCount = captured.queuedCandidateIds?.length ?? 0;
         const hostCompletion = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
@@ -8369,6 +8719,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     if (!anchor) anchor = latestHumanInputForStallRetry(options.sessionId) ?? '';
     if (anchor) semanticInput = anchor;
   }
+  // A dedicated workflow/background query may improve only the automatic
+  // memory lookup. Keep it out of `semanticInput`: that value intentionally
+  // continues to drive task classification, confirmation, convergence, and
+  // post-turn attribution for verified conversational continuations.
+  const memoryPrimerInput = options.memoryPrimerQuery ?? semanticInput;
+  const memoryRecallPolicyInput = options.semanticTaskInput
+    ?? options.authoritativeUserInput
+    ?? options.input;
+  const automaticMemoryOptedOut = options.suppressAutomaticMemoryForRequest === true
+    || explicitlyOptsOutOfAutomaticMemoryRecall(memoryRecallPolicyInput);
   // The recall-vector embed is FIRE-AND-FORGET, not awaited: it stashes into a
   // TTL'd slot that per-turn fact recall reads OPPORTUNISTICALLY (late arrival
   // still helps mid-turn recalls; absence just drops the relevance term). The
@@ -8387,13 +8747,13 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   if (!options.skipAutomaticMemoryPrimer
     && !options.contextWarmedAtNode
     && !declinedContinuation
-    && !explicitlyOptsOutOfAutomaticMemoryRecall(semanticInput)) {
-    void primeTurnRecallVector(semanticInput).catch(() => {});
+    && !automaticMemoryOptedOut) {
+    void primeTurnRecallVector(memoryPrimerInput).catch(() => {});
   }
   const assemblyPromise: Promise<TurnMemoryPrimer | null> = options.skipAutomaticMemoryPrimer
     ? Promise.resolve({
         enabled: true,
-        query: semanticInput.replace(/\s+/g, ' ').trim(),
+        query: memoryPrimerInput.replace(/\s+/g, ' ').trim(),
         hitCount: 0,
         injectedBytes: 0,
         skippedReason: 'plain_conversation_surface',
@@ -8401,13 +8761,21 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     : declinedContinuation
     ? Promise.resolve({
         enabled: true,
-        query: semanticInput.replace(/\s+/g, ' ').trim(),
+        query: memoryPrimerInput.replace(/\s+/g, ' ').trim(),
         hitCount: 0,
         injectedBytes: 0,
         skippedReason: 'declined_continuation',
       })
+    : automaticMemoryOptedOut
+    ? Promise.resolve({
+        enabled: true,
+        query: memoryPrimerInput.replace(/\s+/g, ' ').trim(),
+        hitCount: 0,
+        injectedBytes: 0,
+        skippedReason: EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
+      })
     : Promise.race([
-        buildTurnMemoryPrimer(semanticInput, options.sessionId),
+        buildTurnMemoryPrimer(memoryPrimerInput, options.sessionId),
         new Promise<null>((resolve) => {
           const t = setTimeout(() => resolve(null), 15_000);
           (t as unknown as { unref?: () => void }).unref?.();
@@ -8451,7 +8819,17 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // compactionBudgetForModel). Same value scales the in-flight thresholds below.
   const routedModelIdForBudget = typeof (options.agent as { model?: unknown })?.model === 'string'
     ? (options.agent as { model: string }).model
-    : undefined;
+    // The exact plain-host lane may carry a Model implementation object (the
+    // production Codex adapter and recording acceptance model both do) rather
+    // than repeating its configured id on Agent.model. Its capability route is
+    // still the configured primary model. Keeping `undefined` here resolved an
+    // empty id three times per turn (compaction plus both recall limits), which
+    // emitted three synchronous conservative-fallback warnings on a route that
+    // had already been selected. Other/custom lanes retain the conservative
+    // unknown-model behavior.
+    : options.skipAutomaticMemoryPrimer
+      ? MODELS.primary
+      : undefined;
   const turnInputBudgetTokens = compactionBudgetForModel(routedModelIdForBudget);
   // Idle gap since the last turn (read BEFORE this turn writes back, so it's the
   // previous turn's completion → now). Feeds age/idle-aware compaction so a stale
@@ -8723,9 +9101,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const assemblySettled = await assemblyPromise;
   const turnMemoryPrimer: TurnMemoryPrimer = assemblySettled
     ? assemblySettled
-    : {
+      : {
         enabled: true,
-        query: semanticInput.replace(/\s+/g, ' ').trim().slice(0, 160),
+        query: memoryPrimerInput.replace(/\s+/g, ' ').trim().slice(0, 160),
         hitCount: 0,
         injectedBytes: 0,
         skippedReason: 'assembly_timeout',
@@ -9328,7 +9706,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
             ? { onConversationPreamble: options.onConversationPreamble }
             : {}),
           ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
-          behaviorScopeId: `${options.sessionId}::turn:${turn}`,
+          // Anti-thrash authority belongs to the accepted request, not to one
+          // physical model turn. Synthetic continuations, provider fallover,
+          // and infra retries all retain sourceUserSeq, so they must also
+          // retain the same durable behavior window. A genuinely new user
+          // source gets a new key. Keep the turn fallback only for legacy
+          // source-less callers; accepted production turns always take the
+          // source branch above.
+          behaviorScopeId: Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+            ? `${options.sessionId}::source:${sourceUserSeq}`
+            : `${options.sessionId}::turn:${turn}`,
           recallBudget,
           ...(routedModelIdForBudget ? { routedModelId: routedModelIdForBudget } : {}),
           mcpToolScope: options.mcpToolScope !== undefined
@@ -9472,10 +9859,24 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       toolCalls: toolCounter.currentCount,
     };
   } catch (err) {
+    const checkpoint = hostToolCallsLimitCheckpointFor(err);
+    if (checkpoint) {
+      // The host has already stopped assignment, drained every started sibling,
+      // and paired the admitted frame in model order. Persist that exact partial
+      // turn before the canonical typed limit reducer returns control to the
+      // conversation/workflow continuation owner.
+      session.recordTurnResult({
+        history: checkpoint.history,
+        lastResponseId: checkpoint.lastResponseId,
+        turn,
+      });
+    }
     return handleRunError(options.sessionId, turn, session, err, {
       deferInfraAsk: options.deferInfraAsk,
+      deferToolCallsLimitTerminal: options.deferToolCallsLimitTerminal,
       sourceUserSeq,
       runAttemptId: options.runAttemptId,
+      infraRecoveryEpisodeId: options.infraRecoveryEpisodeId,
     });
   } finally {
     detachLogHooks();
@@ -9494,6 +9895,8 @@ export interface ResumePendingApprovalOptions {
   /** Durable outer request attempt. The resumed SDK state must retain the
    * same authority as the workflow/chat turn that originally parked it. */
   runAttemptId?: string;
+  /** Workflow-owned typed tool ceilings remain a private checkpoint. */
+  deferToolCallsLimitTerminal?: true;
   /** Exact accepted approval-control event for terminal identity. */
   sourceUserSeq?: number;
   /** Exact durable card the human acted on. When supplied, only the SDK
@@ -9577,30 +9980,32 @@ export async function resumePendingApproval(
   const blob = session.loadInterruptState();
   if (!blob) {
     // Session isn't paused — no RunState to resume (typically a daemon restart
-    // dropped the interrupt blob). Before degenerating to a fresh turn (which
-    // would RE-COMPOSE the payload and mint a new approval — the approve→re-ask
-    // treadmill), replay the session's approved unconsumed action verbatim and
-    // stage the result so the next turn continues from it. Fail-open no-op when
-    // there is nothing to replay.
+    // dropped the interrupt blob). A registry approval row alone is NOT an
+    // accepted-source/host-call/physical-dispatch capability. The retired
+    // approval-replay lane consumed a session-wide row and crossed directly
+    // into Composio without those owners. Never claim or dispatch here.
+    //
+    // An exact queued action is recovered by the durable pending-action
+    // executor and its own APPROVED→EXECUTING capability; this no-blob branch
+    // must not race that owner. A legacy row without such an action remains
+    // unconsumed so an operator can recreate it honestly instead of receiving
+    // a false "executed" note.
     if (options.decision === 'approve' || options.decision === 'approve_with_edits') {
-      try {
-        const { replayApprovedActionForSession, renderApprovedReplayNote } = await import('../../execution/approval-replay.js');
-        const replayOutcome = await replayApprovedActionForSession(options.sessionId);
-        if (replayOutcome) {
-          safeAppend({
-            sessionId: options.sessionId,
-            turn: 0,
-            role: 'user',
-            type: 'user_input_received',
-            data: {
-              text: renderApprovedReplayNote(replayOutcome),
-              synthetic: true,
-              source: 'approval-replay',
-              approvalId: replayOutcome.approvalId,
-            },
-          });
-        }
-      } catch { /* replay is best-effort; the caller's fresh turn remains the fallback */ }
+      const selected = options.approvalId ? approvalRegistry.get(options.approvalId) : undefined;
+      safeAppend({
+        sessionId: options.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'legacy_approval_replay_retired',
+          approvalId: selected?.sessionId === options.sessionId ? selected.approvalId : null,
+          pendingActionId: selected?.sessionId === options.sessionId
+            ? pendingActionIdFromArgs(selected.args)
+            : null,
+          reason: 'serialized approval interruption is unavailable; no provider dispatch authority exists',
+        },
+      });
     }
     // Caller can decide to treat the prompt as a fresh user turn instead.
     return { sessionId: options.sessionId, turn: 0, status: 'completed' };
@@ -10026,6 +10431,12 @@ export async function resumePendingApproval(
           ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
           ...(resumeAgentScopeBinding.bound ? { mcpToolScope: resumeAgentScopeBinding.scope } : {}),
           ...(resumeSourceUserSeq ? { sourceUserSeq: resumeSourceUserSeq } : {}),
+          // The approved SDK state and every later harness continuation are
+          // still one accepted request. Do not give the resumed physical turn
+          // a session-global or turn-local anti-thrash reset.
+          behaviorScopeId: resumeSourceUserSeq
+            ? `${options.sessionId}::source:${resumeSourceUserSeq}`
+            : `${options.sessionId}::turn:${turn}`,
         };
         return await withHarnessRunContext(
           resumeCtx,
@@ -10144,7 +10555,16 @@ export async function resumePendingApproval(
       toolCalls: toolCounter.currentCount,
     };
   } catch (err) {
+    const checkpoint = hostToolCallsLimitCheckpointFor(err);
+    if (checkpoint) {
+      session.recordTurnResult({
+        history: checkpoint.history,
+        lastResponseId: checkpoint.lastResponseId,
+        turn,
+      });
+    }
     return handleRunError(options.sessionId, turn, session, err, {
+      deferToolCallsLimitTerminal: options.deferToolCallsLimitTerminal,
       sourceUserSeq: resumeSourceUserSeq,
       runAttemptId: options.runAttemptId,
     });
@@ -10206,6 +10626,8 @@ export async function runConversationFromResume(opts: {
   maxWallClockMs?: number;
   maxTurns?: number;
   toolCallsPerTurn?: number;
+  /** Workflow-owned typed tool ceilings stay private across approval resume. */
+  deferToolCallsLimitTerminal?: true;
   /** Stage 4 — run token ceiling override threaded through the resume family. */
   maxRunTokens?: number;
   makeRunner?: () => Runner;
@@ -10404,10 +10826,15 @@ export async function runConversationFromResume(opts: {
               result,
               sourceUserSeq,
               approvalIdHint: opts.approvalId,
+              ...(opts.deferToolCallsLimitTerminal
+                ? { deferToolCallsLimitTerminal: true as const }
+                : {}),
             }),
           };
         },
-        shouldPublish: (core) => core.kind === 'reduced' && !core.reduced.completedReason,
+        shouldPublish: (core) => core.kind === 'reduced'
+          && !core.reduced.completedReason
+          && Boolean(core.reduced.publicPresentation),
         publish: (core) => {
           if (core.kind !== 'reduced') return;
           emitRuntimeTerminalEvent(opts.sessionId, core.reduced);
@@ -10459,6 +10886,7 @@ async function runConversationFromResumeCore(opts: {
   maxWallClockMs?: number;
   maxTurns?: number;
   toolCallsPerTurn?: number;
+  deferToolCallsLimitTerminal?: true;
   /** Stage 4 — run token ceiling override threaded through the resume family. */
   maxRunTokens?: number;
   makeRunner?: () => Runner;
@@ -10510,6 +10938,7 @@ async function runConversationFromResumeCore(opts: {
   let stallRetriesUsed = 0;
   let missingReplyRetriesUsed = 0;
   let resumeContinuationInput = CONTINUATION_INPUT;
+  let infraRecoveryEpisodeId: string | undefined;
   let terminalJudgeConsecutiveResumes: 0 | 1 = 0;
 
   // Approval resumes are a second entry into the same conversation machine,
@@ -10553,6 +10982,9 @@ async function runConversationFromResumeCore(opts: {
     resolver: opts.resolver,
     maxTurns,
     toolCallsPerTurn,
+    ...(opts.deferToolCallsLimitTerminal
+      ? { deferToolCallsLimitTerminal: true as const }
+      : {}),
     maxRunTokens: opts.maxRunTokens,
     makeRunner: opts.makeRunner,
     runRunner: opts.runRunner,
@@ -10606,6 +11038,7 @@ async function runConversationFromResumeCore(opts: {
       lastDecision,
       lastTurn,
       error: firstResult.error,
+      ...(firstResult.limitKind ? { limitKind: firstResult.limitKind } : {}),
     };
   }
 
@@ -11144,6 +11577,10 @@ async function runConversationFromResumeCore(opts: {
       internalContinuation: true,
       sourceUserSeq: activeSourceUserSeq,
       runAttemptId: opts.runAttemptId,
+      infraRecoveryEpisodeId,
+      ...(opts.deferToolCallsLimitTerminal
+        ? { deferToolCallsLimitTerminal: true as const }
+        : {}),
       maxTurns,
       toolCallsPerTurn,
       makeRunner: opts.makeRunner,
@@ -11175,10 +11612,12 @@ async function runConversationFromResumeCore(opts: {
     // error / tool-timeout on this resumed workflow/background step auto-retries
     // instead of asking an absent human. Budget-bounded in handleRunError.
     if (turnResult.infraAutoRetry) {
-      emitInfraAutoRecoverEvent(opts.sessionId, turnResult.turn, turnResult.infraAutoRetry.kind, countInfraAutoRecover(opts.sessionId) + 1);
+      emitInfraAutoRecoverEvent(opts.sessionId, turnResult.turn, turnResult.infraAutoRetry);
+      infraRecoveryEpisodeId = turnResult.infraAutoRetry.logicalErrorEpisodeId;
       resumeContinuationInput = turnResult.infraAutoRetry.directive;
       continue;
     }
+    infraRecoveryEpisodeId = undefined;
     const completedTurnQuestion = turnResult.status === 'completed'
       ? awaitingUserQuestionThisTurn(opts.sessionId, turnResult.turn)
       : null;
@@ -11461,11 +11900,96 @@ function isUnattendedSession(sessionId: string): boolean {
   } catch { return false; }
 }
 
-function countInfraAutoRecover(sessionId: string): number {
-  try { return listEvents(sessionId, { types: ['infra_auto_recover'] }).length; } catch { return 0; }
+type InfraRecoveryDecision = 'ask' | 'auto_retry' | 'exhausted';
+
+interface InfraRecoveryBudgetState {
+  decision: InfraRecoveryDecision;
+  sourceUserSeq?: number;
+  logicalErrorEpisodeId: string;
+  /** One-based count to persist if this decision re-enters. */
+  attempt: number;
+  max: number;
 }
 
-type InfraRecoveryDecision = 'ask' | 'auto_retry' | 'exhausted';
+function acceptedInfraRecoverySource(sourceUserSeq: number | undefined): number | undefined {
+  return Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+    ? Number(sourceUserSeq)
+    : undefined;
+}
+
+/**
+ * Recover an in-flight episode only when its last durable retry has not been
+ * followed by a successful physical model turn. That makes the event itself
+ * the restart checkpoint without letting a later, separate failure under the
+ * same accepted source inherit a spent budget.
+ */
+function activeInfraRecoveryEpisode(
+  sessionId: string,
+  sourceUserSeq: number,
+): string | undefined {
+  try {
+    const events = listEvents(sessionId);
+    const latest = events
+      .filter((event) => {
+        if (event.type !== 'infra_auto_recover') return false;
+        const data = event.data as {
+          sourceUserSeq?: unknown;
+          logicalErrorEpisodeId?: unknown;
+        };
+        return data.sourceUserSeq === sourceUserSeq
+          && typeof data.logicalErrorEpisodeId === 'string'
+          && data.logicalErrorEpisodeId.length > 0;
+      })
+      .at(-1);
+    if (!latest) return undefined;
+    if (events.some((event) => event.seq > latest.seq && event.type === 'run_completed')) {
+      return undefined;
+    }
+    return String((latest.data as { logicalErrorEpisodeId: string }).logicalErrorEpisodeId);
+  } catch {
+    return undefined;
+  }
+}
+
+function infraRecoveryEpisodeId(
+  sessionId: string,
+  sourceUserSeq: number | undefined,
+  retainedEpisodeId?: string,
+): string {
+  if (retainedEpisodeId?.trim()) return retainedEpisodeId.trim();
+  if (sourceUserSeq) {
+    const recovered = activeInfraRecoveryEpisode(sessionId, sourceUserSeq);
+    if (recovered) return recovered;
+    return `infra-recovery:${sourceUserSeq}:${randomUUID()}`;
+  }
+  // Compatibility for direct legacy callers that cannot name accepted
+  // authority. Production runConversation/runTurn paths always have a source.
+  return `${sessionId}::infra-recovery:legacy`;
+}
+
+function countInfraAutoRecover(
+  sessionId: string,
+  sourceUserSeq: number | undefined,
+  logicalErrorEpisodeId: string,
+): number {
+  try {
+    return listEvents(sessionId, { types: ['infra_auto_recover'] }).filter((event) => {
+      const data = event.data as {
+        sourceUserSeq?: unknown;
+        logicalErrorEpisodeId?: unknown;
+      };
+      if (!sourceUserSeq) {
+        // Old/source-less direct integrations keep the pre-existing session
+        // aggregate. They cannot silently create independent retry windows.
+        return true;
+      }
+      return data.sourceUserSeq === sourceUserSeq
+        && data.logicalErrorEpisodeId === logicalErrorEpisodeId;
+    }).length;
+  } catch {
+    return 0;
+  }
+}
 
 /**
  * For an infra error about to prompt "retry/switch/stop":
@@ -11474,13 +11998,39 @@ type InfraRecoveryDecision = 'ask' | 'auto_retry' | 'exhausted';
  *  - ATTENDED (interactive): ONE silent AUTO_RETRY, then ASK (a human is here).
  *  The unattended lane's auto-retry is gated by its own kill-switch.
  */
-function decideInfraRecovery(sessionId: string): InfraRecoveryDecision {
-  if (isUnattendedSession(sessionId)) {
-    if (!unattendedAutoRecoverEnabled()) return 'ask';
-    return countInfraAutoRecover(sessionId) < MAX_INFRA_AUTO_RECOVER ? 'auto_retry' : 'exhausted';
+function decideInfraRecovery(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  retainedEpisodeId?: string;
+}): InfraRecoveryBudgetState {
+  const sourceUserSeq = acceptedInfraRecoverySource(input.sourceUserSeq);
+  const logicalErrorEpisodeId = infraRecoveryEpisodeId(
+    input.sessionId,
+    sourceUserSeq,
+    input.retainedEpisodeId,
+  );
+  const used = countInfraAutoRecover(
+    input.sessionId,
+    sourceUserSeq,
+    logicalErrorEpisodeId,
+  );
+  const unattended = isUnattendedSession(input.sessionId);
+  const max = unattended ? MAX_INFRA_AUTO_RECOVER : ATTENDED_QUIET_RETRY_BUDGET;
+  let decision: InfraRecoveryDecision;
+  if (unattended) {
+    if (!unattendedAutoRecoverEnabled()) decision = 'ask';
+    else decision = used < max ? 'auto_retry' : 'exhausted';
+  } else {
+    // Attended: quiet-retry once, then ask — never 'exhausted' (the user answers).
+    decision = used < max ? 'auto_retry' : 'ask';
   }
-  // Attended: quiet-retry once, then ask — never 'exhausted' (the user answers).
-  return countInfraAutoRecover(sessionId) < ATTENDED_QUIET_RETRY_BUDGET ? 'auto_retry' : 'ask';
+  return {
+    decision,
+    ...(sourceUserSeq ? { sourceUserSeq } : {}),
+    logicalErrorEpisodeId,
+    attempt: used + 1,
+    max,
+  };
 }
 
 function resolveInfraSettledReadRecovery(input: {
@@ -11524,6 +12074,21 @@ function buildInfraRetryDirective(
     'Re-issue it exactly as before, using your retry_context (the last tool_called before the error). Do NOT ask the user, do NOT restart from the plan top, do NOT switch objective.',
     'If it fails again I will surface the choice.',
   ].join(' ');
+}
+
+function infraAutoRetryPlan(
+  kind: string,
+  directive: string,
+  budget: InfraRecoveryBudgetState,
+): NonNullable<RunTurnResult['infraAutoRetry']> {
+  return {
+    kind,
+    directive,
+    ...(budget.sourceUserSeq ? { sourceUserSeq: budget.sourceUserSeq } : {}),
+    logicalErrorEpisodeId: budget.logicalErrorEpisodeId,
+    attempt: budget.attempt,
+    max: budget.max,
+  };
 }
 
 // ── Stranded-tool reunification ───────────────────────────────────────────────
@@ -11787,12 +12352,24 @@ export function drainOrphanedToolCompletions(sessionId: string): OrphanedToolRep
   return claim.reports;
 }
 
-/** Record the self-heal in the trace (attempt is 1-based). Emitted by the loop
- *  when the retry actually re-enters, so the count reflects real retries. */
-function emitInfraAutoRecoverEvent(sessionId: string, turn: number, kind: string, attempt: number): void {
+/** Record the self-heal in the trace only when the retry actually re-enters.
+ * The durable accepted-source/episode key is both audit identity and the
+ * restart-safe budget ledger; `attempt` is its one-based charged count. */
+function emitInfraAutoRecoverEvent(
+  sessionId: string,
+  turn: number,
+  retry: NonNullable<RunTurnResult['infraAutoRetry']>,
+): void {
   safeAppend({
     sessionId, turn, role: 'system', type: 'infra_auto_recover',
-    data: { kind, attempt, max: MAX_INFRA_AUTO_RECOVER, source: 'infra_auto_recover' },
+    data: {
+      kind: retry.kind,
+      attempt: retry.attempt,
+      max: retry.max,
+      source: 'infra_auto_recover',
+      ...(retry.sourceUserSeq ? { sourceUserSeq: retry.sourceUserSeq } : {}),
+      logicalErrorEpisodeId: retry.logicalErrorEpisodeId,
+    },
   });
 }
 
@@ -11857,7 +12434,13 @@ function handleRunError(
   turn: number,
   session: HarnessSession,
   err: unknown,
-  opts: { deferInfraAsk?: boolean; sourceUserSeq?: number; runAttemptId?: string } = {},
+  opts: {
+    deferInfraAsk?: boolean;
+    deferToolCallsLimitTerminal?: true;
+    sourceUserSeq?: number;
+    runAttemptId?: string;
+    infraRecoveryEpisodeId?: string;
+  } = {},
 ): RunTurnResult {
   // A kill that lands while a tool call is in flight throws KillRequested
   // INSIDE the SDK's tool execution, and the SDK re-wraps it as a plain
@@ -11908,7 +12491,7 @@ function handleRunError(
         ...(err instanceof ToolCallsLimitExceeded ? { limit: err.limit } : {}),
       },
     });
-    session.markStatus('failed');
+    if (!opts.deferToolCallsLimitTerminal) session.markStatus('failed');
     bumpTurnNumber(sessionId, turn);
     return {
       sessionId,
@@ -12026,8 +12609,12 @@ function handleRunError(
     } catch { /* best-effort */ }
     // UNATTENDED self-heal: retry the timed-out call (bounded) or fail honestly
     // instead of asking a human who isn't there.
-    const infraDecision = decideInfraRecovery(sessionId);
-    if (infraDecision === 'auto_retry') {
+    const infraRecovery = decideInfraRecovery({
+      sessionId,
+      sourceUserSeq: opts.sourceUserSeq,
+      retainedEpisodeId: opts.infraRecoveryEpisodeId,
+    });
+    if (infraRecovery.decision === 'auto_retry') {
       bumpTurnNumber(sessionId, turn);
       const settledRead = resolveInfraSettledReadRecovery({
         sessionId,
@@ -12035,10 +12622,20 @@ function handleRunError(
         runAttemptId: opts.runAttemptId,
         failedTurn: turn,
       });
-      return { sessionId, turn, status: 'failed', error: normalizeError(err), infraAutoRetry: { kind: 'tool.timeout', directive: buildInfraRetryDirective('tool.timeout', settledRead) } };
+      return {
+        sessionId,
+        turn,
+        status: 'failed',
+        error: normalizeError(err),
+        infraAutoRetry: infraAutoRetryPlan(
+          'tool.timeout',
+          buildInfraRetryDirective('tool.timeout', settledRead),
+          infraRecovery,
+        ),
+      };
     }
     recordOrphanedToolInFlight(sessionId, turn);
-    if (infraDecision === 'exhausted') {
+    if (infraRecovery.decision === 'exhausted') {
       emitInfraUnrecovered(sessionId, turn, 'tool.timeout', normalizeError(err));
       session.markStatus('failed');
       bumpTurnNumber(sessionId, turn);
@@ -12140,8 +12737,12 @@ function handleRunError(
       }
       // UNATTENDED self-heal: a workflow/background run can't answer an ask, so
       // auto-retry the same call (bounded) or fail honestly instead of stranding.
-      const infraDecision = decideInfraRecovery(sessionId);
-      if (infraDecision === 'auto_retry') {
+      const infraRecovery = decideInfraRecovery({
+        sessionId,
+        sourceUserSeq: opts.sourceUserSeq,
+        retainedEpisodeId: opts.infraRecoveryEpisodeId,
+      });
+      if (infraRecovery.decision === 'auto_retry') {
         bumpTurnNumber(sessionId, turn);
         const settledRead = resolveInfraSettledReadRecovery({
           sessionId,
@@ -12149,12 +12750,22 @@ function handleRunError(
           runAttemptId: opts.runAttemptId,
           failedTurn: turn,
         });
-        return { sessionId, turn, status: 'failed', error: message, infraAutoRetry: { kind: err.kind, directive: buildInfraRetryDirective(err.kind, settledRead) } };
+        return {
+          sessionId,
+          turn,
+          status: 'failed',
+          error: message,
+          infraAutoRetry: infraAutoRetryPlan(
+            err.kind,
+            buildInfraRetryDirective(err.kind, settledRead),
+            infraRecovery,
+          ),
+        };
       }
       // The turn is ENDING (ask/exhausted) — register any tool still in flight so
       // its eventual result is reunified into a report turn (never orphaned).
       recordOrphanedToolInFlight(sessionId, turn);
-      if (infraDecision === 'exhausted') {
+      if (infraRecovery.decision === 'exhausted') {
         emitInfraUnrecovered(sessionId, turn, err.kind, message);
         session.markStatus('failed');
         bumpTurnNumber(sessionId, turn);

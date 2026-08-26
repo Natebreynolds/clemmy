@@ -27,6 +27,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import {
   admitLogicalCall,
+  beginPreparationPhysicalDispatch,
   beginPhysicalDispatch,
   refineLogicalCallContract,
   settlePhysicalDispatch,
@@ -485,6 +486,24 @@ export async function withPhysicalDispatch<T>(
   input: PhysicalDispatchInput,
   work: (identity: PhysicalDispatchIdentity) => Promise<T>,
 ): Promise<T> {
+  return withPhysicalDispatchMode(input, work, false);
+}
+
+/** Account one real provider metadata/preflight crossing distinctly from the
+ * following business call. Ordinary callers cannot mint the probe relation by
+ * passing a string; this trusted entry point owns that ledger assignment. */
+export async function withPhysicalPreparationDispatch<T>(
+  input: Omit<PhysicalDispatchInput, 'relation' | 'retryOf'>,
+  work: (identity: PhysicalDispatchIdentity) => Promise<T>,
+): Promise<T> {
+  return withPhysicalDispatchMode(input, work, true);
+}
+
+async function withPhysicalDispatchMode<T>(
+  input: PhysicalDispatchInput,
+  work: (identity: PhysicalDispatchIdentity) => Promise<T>,
+  preparation: boolean,
+): Promise<T> {
   const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
   const dispatchLease = currentDispatchLease();
   const frame = logicalStorage.getStore();
@@ -523,12 +542,12 @@ export async function withPhysicalDispatch<T>(
   // This INSERT is authority, not best-effort telemetry. Only a newly inserted
   // row permits control to leave for the provider; replaying a start must not
   // repeat a paid call.
-  const admission = beginPhysicalDispatch({
+  const admission = (preparation ? beginPreparationPhysicalDispatch : beginPhysicalDispatch)({
     identity: proposedCrossing,
     tool: input.tool,
     args: input.args,
     turn: input.turn,
-    relation: input.relation,
+    ...(!preparation && input.relation ? { relation: input.relation } : {}),
     trustedEffectCarrier: input.trustedEffectCarrier,
   });
   if (admission.status !== 'inserted') {

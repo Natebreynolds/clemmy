@@ -519,7 +519,7 @@ export function attachEventLogHooks(
       || effectiveToolTail(tool?.name ?? '') !== 'composio_execute_tool'
       ? resultStr
       : stripSettledReadHarnessAdvisory(resultStr);
-    // Lossless write FIRST (up to TOOL_OUTPUT_MAX_BYTES, see eventlog.ts). The event
+    // Lossless write FIRST (inline plus hashed chunks, see eventlog.ts). The event
     // log copy below is intentionally clipped for readability; the
     // recall_tool_result tool reads from tool_outputs to retrieve the
     // verbatim original.

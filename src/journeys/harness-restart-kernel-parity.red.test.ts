@@ -1,7 +1,7 @@
 /**
  * Run: node scripts/run-tests-isolated.mjs src/journeys/harness-restart-kernel-parity.red.test.ts
  *
- * Deliberate release REDs for the shared execution kernel. A settled logical
+ * Durable database-reopen gates for the shared execution kernel. A settled logical
  * success is durable continuation state, not permission to call the provider
  * again. Chat and workflow must also bind every physical crossing to the same
  * exact call-owned run_dispatch_lease machinery; workflow activation rows are
@@ -22,12 +22,13 @@ mkdirSync(path.join(HOME, 'state'), { recursive: true });
 writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-restart-parity\n', 'utf8');
 
 const eventlog = await import('../runtime/harness/eventlog.js');
-const shadow = await import('../runtime/graph/turn-graph-shadow.js');
 const leases = await import('../runtime/harness/dispatch-lease.js');
 const brackets = await import('../runtime/harness/brackets.js');
 const invocation = await import('../runtime/harness/host-tool-invocation.js');
 const identities = await import('../runtime/harness/attempt-identity.js');
 const workflowAuthority = await import('../runtime/harness/accepted-turn-call-authority.js');
+const hostBindings = await import('../runtime/harness/host-call-capability-binding.js');
+const logicalContracts = await import('../runtime/harness/logical-call-contract.js');
 const manifests = await import('../runtime/harness/capability-manifest.js');
 const catalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
 const observations = await import('../runtime/harness/independent-capability-observation.js');
@@ -68,9 +69,15 @@ function acceptedTask(label: string): Task {
       text: 'Find 10 restaurants in Santa Clarita and put them in a new Google Sheet.',
     },
   });
-  assert.ok(shadow.recordTurnGraphShadow({
-    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
-  }));
+  const armed = workflowAuthority.armHostCallAuthority({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    catalogRevisionDigest: digest(`restart-host-catalog:${session.id}`),
+    bindingRevisionDigest: digest(`restart-host-binding:${session.id}`),
+    maxLogicalCalls: 20,
+    maxParallelCalls: 20,
+  });
+  assert.equal(armed.status, 'armed', JSON.stringify(armed));
   return {
     sessionId: session.id,
     sourceUserSeq: source.seq,
@@ -109,8 +116,53 @@ function runHostCall<T>(input: {
   effect: 'read' | 'external_write';
   body: invocation.InvokeHostToolCallInput<T>['invoke'];
 }) {
-  return brackets.withHarnessRunContext(input.owner.context, () =>
-    invocation.invokeHostToolCall({
+  const root = workflowAuthority.acceptedTurnCallAuthorityFor(
+    input.task.sessionId,
+    input.task.sourceUserSeq,
+  );
+  assert.equal(root.status, 'ok', JSON.stringify(root));
+  if (root.status !== 'ok') throw new Error(root.reason);
+  const contract = logicalContracts.durableLogicalCallContract(
+    input.task.acceptedTaskId,
+    input.toolName,
+    input.args,
+  );
+  assert.ok(contract, 'the exact host call contract is safe');
+  if (!contract) throw new Error('host call contract is unsafe');
+  const providerOperation = contract.toolName;
+  const attestationBase = {
+    sessionId: input.task.sessionId,
+    sourceUserSeq: input.task.sourceUserSeq,
+    acceptedTaskId: input.task.acceptedTaskId,
+    sourceEventId: root.authority.sourceEventId,
+    sourceEventDigest: root.authority.sourceEventDigest,
+    logicalToolCallId: input.callId,
+    toolName: contract.toolName,
+    argumentDigest: contract.argumentDigest,
+    effect: input.effect,
+    bindingKind: 'catalog_manifest' as const,
+    capabilityId: `cap:restart:${providerOperation}`,
+    schemaFingerprint: digest(`restart-schema:${providerOperation}`),
+    accountId: 'account.restart.fixture',
+    invokePortId: 'port.restart.fixture',
+    operationId: providerOperation,
+    manifestId: `manifest.restart.${providerOperation}`,
+    manifestDigest: digest(`restart-manifest:${providerOperation}`),
+    engineVersion: root.authority.engineVersion,
+    surfaceVersion: root.authority.surfaceVersion,
+    authorityDigest: root.authority.authorityDigest,
+    authorityRevision: root.authority.revision,
+    surfaceDigest: root.authority.surfaceDigest,
+    catalogRevisionDigest: root.authority.catalogRevisionDigest!,
+    bindingRevisionDigest: root.authority.bindingRevisionDigest!,
+  };
+  const attestation = {
+    ...attestationBase,
+    bindingDigest: hostBindings.hostCallAttestationBindingDigest(attestationBase),
+  };
+  return workflowAuthority.withHostCallAttestation(attestation, () =>
+    brackets.withHarnessRunContext(input.owner.context, () =>
+      invocation.invokeHostToolCall({
       identity: {
         sessionId: input.task.sessionId,
         sourceUserSeq: input.task.sourceUserSeq,
@@ -124,7 +176,7 @@ function runHostCall<T>(input: {
       boundary: 'host_owned_external',
       deadlineMs: 500,
       invoke: input.body,
-    })) as Promise<invocation.HostToolInvocationResult<T>>;
+      }))) as Promise<invocation.HostToolInvocationResult<T>>;
 }
 
 function durableCounts(task: Task, callId: string) {
@@ -157,8 +209,8 @@ function durableCounts(task: Task, callId: string) {
 
 const READ_CALL = Object.freeze({
   callId: 'restaurant-read',
-  toolName: 'restaurant_records_search',
-  args: { location: 'Santa Clarita, CA', limit: 10 },
+  toolName: 'read_file',
+  args: { path: '/fixtures/santa-clarita-restaurants.json' },
 });
 const READ_RESULT = Object.freeze({
   successful: true,
@@ -172,7 +224,7 @@ const READ_RESULT = Object.freeze({
 });
 const CREATE_CALL = Object.freeze({
   callId: 'sheet-create',
-  toolName: 'googlesheets_create_spreadsheet',
+  toolName: 'space_publish',
   args: { title: 'Santa Clarita Restaurants', rows: READ_RESULT.data.records },
 });
 const CREATE_RESULT = Object.freeze({
@@ -184,7 +236,7 @@ const CREATE_RESULT = Object.freeze({
   },
 });
 
-test('restart: crash after settled source read adopts its stored result, then continues create exactly once', async () => {
+test('reopen: a settled source read adopts its stored result, then continues one external write exactly once', async () => {
   const task = acceptedTask('after-read');
   let readBodies = 0;
   let createBodies = 0;
@@ -257,7 +309,7 @@ test('restart: crash after settled source read adopts its stored result, then co
   leases.revokeDispatchLease(resumed.parentLease);
 });
 
-test('restart: crash after settled Sheet create adopts its stored receipt with zero new body, lease, physical, or model work', async () => {
+test('reopen: a settled external write adopts its stored receipt with zero new body, lease, physical, or model work', async () => {
   const task = acceptedTask('after-create');
   let readBodies = 0;
   let createBodies = 0;
@@ -503,8 +555,8 @@ test('chat and workflow reads use the same call-bound lease, physical dispatch, 
     task: chat,
     owner: chatOwner,
     callId: 'logical.chat.parity',
-    toolName: 'restaurant_records_search',
-    args: { location: 'Santa Clarita, CA', limit: 1 },
+    toolName: READ_CALL.toolName,
+    args: { path: '/fixtures/santa-clarita-restaurant-one.json' },
     effect: 'read',
     body: async () => {
       chatBodies += 1;

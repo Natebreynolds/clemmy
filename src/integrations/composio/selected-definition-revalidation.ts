@@ -53,7 +53,11 @@ export type SelectedComposioRevalidationResult =
       };
     };
 
-const MAX_SELECTED_COMPOSIO_DEFINITIONS = 8;
+// The accepted plan contract permits 32 operation bindings. Revalidation must
+// cover that whole immutable set; an operational batch size is not task
+// authority and must never force the model to drop a valid requirement.
+const MAX_SELECTED_COMPOSIO_DEFINITIONS = 32;
+const SELECTED_DEFINITION_REFRESH_CONCURRENCY = 4;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
@@ -167,29 +171,32 @@ export async function revalidateSelectedComposioDefinitions(
   }
 
   const definitions = new Map<string, RevalidatedComposioDefinition>();
-  for (const [key, selection] of selected) {
-    const exact = await refreshExactComposioSchemaFromProvider(selection.identifier);
+  const ordered = [...selected.entries()];
+  for (let offset = 0; offset < ordered.length; offset += SELECTED_DEFINITION_REFRESH_CONCURRENCY) {
+    const batch = ordered.slice(offset, offset + SELECTED_DEFINITION_REFRESH_CONCURRENCY);
+    const outcomes = await Promise.all(batch.map(async ([key, selection]) => {
+    const exact = await refreshExactComposioSchemaFromProvider(selection.identifier).catch(() => null);
     if (!exact || !isRecord(exact.schema)) {
       return {
-        ok: false,
+        ok: false as const,
         refusal: {
-          code: 'selected_definition_exact_refresh_unavailable',
+          code: 'selected_definition_exact_refresh_unavailable' as const,
           identifier: selection.identifier,
         },
       };
     }
     if (digestSchema(exact.schema) !== selection.schemaDigest) {
       return {
-        ok: false,
-        refusal: { code: 'selected_definition_schema_drift', identifier: selection.identifier },
+        ok: false as const,
+        refusal: { code: 'selected_definition_schema_drift' as const, identifier: selection.identifier },
       };
     }
     const operationVersion = exact.providerOperationVersion?.trim();
     if (!operationVersion) {
       return {
-        ok: false,
+        ok: false as const,
         refusal: {
-          code: 'selected_definition_operation_version_unavailable',
+          code: 'selected_definition_operation_version_unavailable' as const,
           identifier: selection.identifier,
         },
       };
@@ -199,18 +206,18 @@ export async function revalidateSelectedComposioDefinitions(
       && selection.providerOperationVersion !== operationVersion
     ) {
       return {
-        ok: false,
+        ok: false as const,
         refusal: {
-          code: 'selected_definition_operation_version_drift',
+          code: 'selected_definition_operation_version_drift' as const,
           identifier: selection.identifier,
         },
       };
     }
     if (!Object.prototype.hasOwnProperty.call(exact, 'outputSchema')) {
       return {
-        ok: false,
+        ok: false as const,
         refusal: {
-          code: 'selected_definition_exact_refresh_unavailable',
+          code: 'selected_definition_exact_refresh_unavailable' as const,
           identifier: selection.identifier,
         },
       };
@@ -222,9 +229,9 @@ export async function revalidateSelectedComposioDefinitions(
       && (selection.outputSchemaDigest ?? null) !== outputSchemaDigest
     ) {
       return {
-        ok: false,
+        ok: false as const,
         refusal: {
-          code: 'selected_definition_output_schema_drift',
+          code: 'selected_definition_output_schema_drift' as const,
           identifier: selection.identifier,
         },
       };
@@ -241,9 +248,9 @@ export async function revalidateSelectedComposioDefinitions(
     });
     if (!definitionFingerprint) {
       return {
-        ok: false,
+        ok: false as const,
         refusal: {
-          code: 'selected_definition_exact_refresh_unavailable',
+          code: 'selected_definition_exact_refresh_unavailable' as const,
           identifier: selection.identifier,
         },
       };
@@ -253,23 +260,38 @@ export async function revalidateSelectedComposioDefinitions(
       && selection.definitionFingerprint !== definitionFingerprint
     ) {
       return {
-        ok: false,
+        ok: false as const,
         refusal: {
-          code: 'selected_definition_fingerprint_drift',
+          code: 'selected_definition_fingerprint_drift' as const,
           identifier: selection.identifier,
         },
       };
     }
-    definitions.set(key, {
-      ...selection,
-      schema: exact.schema,
-      fingerprint: exact.fingerprint,
-      outputSchema,
-      outputSchemaDigest,
-      providerOperationVersion: operationVersion,
-      invokePortId,
-      definitionFingerprint,
-    });
+    return {
+      ok: true as const,
+      key,
+      definition: {
+        ...selection,
+        schema: exact.schema,
+        fingerprint: exact.fingerprint,
+        outputSchema,
+        outputSchemaDigest,
+        providerOperationVersion: operationVersion,
+        invokePortId,
+        definitionFingerprint,
+      } satisfies RevalidatedComposioDefinition,
+    };
+    }));
+    // Inspect in accepted-plan order so concurrent completion cannot change the
+    // typed refusal identity. Publish into the local result only after the
+    // entire batch passes; callers still receive nothing unless every batch
+    // succeeds.
+    for (const outcome of outcomes) {
+      if (!outcome.ok) return outcome;
+    }
+    for (const outcome of outcomes) {
+      if (outcome.ok) definitions.set(outcome.key, outcome.definition);
+    }
   }
   return { ok: true, definitions };
 }

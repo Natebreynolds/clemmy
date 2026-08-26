@@ -19,10 +19,16 @@ import type { HostCapabilityCatalogFactory } from '../runtime/harness/host-capab
 import type { IndependentCapabilityObservation } from '../runtime/harness/independent-capability-observation.js';
 import { canonicalArgumentDigestOf } from '../runtime/harness/resolved-call-authority.js';
 import {
+  armWorkflowV3CallAuthority,
   armWorkflowReadOnlyCallAuthority,
+  WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION,
   type OneShotActivationAuthorization,
 } from '../runtime/harness/accepted-turn-call-authority.js';
-import { executeWorkflowReadOnlyCall } from '../runtime/harness/workflow-read-only-call-kernel.js';
+import {
+  executeWorkflowReadOnlyCall,
+  executeWorkflowV3Call,
+  type ExecuteWorkflowCallKernelResult,
+} from '../runtime/harness/workflow-read-only-call-kernel.js';
 import {
   armWorkflowPaginatedReadAuthority,
   type WorkflowPaginatedAggregateReceipt,
@@ -70,6 +76,59 @@ export interface PreparedWorkflowNodeCallV1 {
 
 /** Read compatibility name retained without changing the prepared bytes. */
 export type PreparedWorkflowNodeReadV1 = PreparedWorkflowNodeCallV1;
+
+/**
+ * Provider-neutral semantic authority bound to one already-prepared workflow
+ * call. This is the first workflow_v3 checkpoint, not a dispatch root: it
+ * carries no invoke callback, canonical argument bytes, approval grant, or
+ * accepted-source terminal authority. The opaque proof below is useful only
+ * with the exact in-process PreparedWorkflowNodeCallV1 object that minted it.
+ */
+export interface WorkflowNodeCallAuthorityBindingV1 {
+  version: 1;
+  authorityKind: typeof PENDING_WORKFLOW_CALL_AUTHORITY_KIND;
+  durability: 'process_checkpoint';
+  executionState: 'not_armed';
+  workflow: Readonly<WorkflowNodeCallExecutionIdentityV1>;
+  call: Readonly<{
+    logicalCallId: string;
+    logicalCapabilityId: string;
+    requirementId: string;
+    invocationPlanDigest: string;
+    canonicalArgumentDigest: string;
+    sourceArgumentDigest: string;
+    argsRedacted: true;
+  }>;
+  capability: Readonly<WorkflowNodeInvocationPlanV1['binding']>;
+  obligation: Readonly<{
+    requirementId: string;
+    effect: WorkflowNodeInvocationEffectV1;
+    evidence: WorkflowNodeInvocationPlanV1['evidence'];
+    completeness: WorkflowNodeInvocationPlanV1['completeness'];
+    continuation: WorkflowNodeInvocationPlanV1['continuation'];
+    obligationDigest: string;
+  }>;
+  authorityBindingDigest: string;
+}
+
+/** Process-opaque proof. Public fields are diagnostics only; a clone, JSON
+ * round trip, or lookalike object has no authority. */
+export interface WorkflowNodeCallAuthorityProof {
+  readonly kind: 'workflow_v3_call_authority_proof';
+  readonly authorityBindingDigest: string;
+  readonly logicalCallId: string;
+}
+
+export type BindPreparedWorkflowNodeCallAuthorityResult =
+  | {
+      ok: true;
+      binding: Readonly<WorkflowNodeCallAuthorityBindingV1>;
+      proof: WorkflowNodeCallAuthorityProof;
+    }
+  | {
+      ok: false;
+      reason: 'prepared_call_not_authentic';
+    };
 
 export type WorkflowNodeReadPreparationBlockCode =
   | WorkflowNodeInvocationBlockCode
@@ -137,11 +196,16 @@ export type PrepareWorkflowNodeCallResult =
       resolved: ResolvedWorkflowNodeInvocationV1;
     }
   | {
-      kind: 'authority_unavailable';
+      kind: 'authority_checkpoint';
       effect: Exclude<WorkflowNodeInvocationEffectV1, 'read' | 'compute'>;
       prepared: PreparedWorkflowNodeCallV1;
       resolved: ResolvedWorkflowNodeInvocationV1;
       requirement: Readonly<WorkflowNodeCallAuthorityRequirementV1>;
+      authority: Readonly<WorkflowNodeCallAuthorityBindingV1>;
+      proof: WorkflowNodeCallAuthorityProof;
+      /** A checkpoint cannot cross a provider port. Runner integration must
+       * first add the durable v3 activation/consent/recovery adapter. */
+      executable: false;
     }
   | {
       kind: 'blocked';
@@ -196,6 +260,18 @@ export type ExecuteWorkflowNodeReadResult =
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const EXACT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,255}$/;
 const MAX_CANONICAL_ARGUMENT_BYTES = 64_000;
+
+const preparedWorkflowNodeCallAuthorities = new WeakMap<
+  object,
+  Readonly<WorkflowNodeCallAuthorityBindingV1>
+>();
+const workflowNodeCallAuthorityProofs = new WeakMap<
+  object,
+  Readonly<{
+    prepared: PreparedWorkflowNodeCallV1;
+    binding: Readonly<WorkflowNodeCallAuthorityBindingV1>;
+  }>
+>();
 
 type CanonicalJson = null | boolean | number | string | CanonicalJson[] | { [key: string]: CanonicalJson };
 
@@ -255,6 +331,266 @@ function freezeClone<T>(value: T): Readonly<T> {
     maxStringBytes: MAX_CANONICAL_ARGUMENT_BYTES,
     maxTotalBytes: MAX_CANONICAL_ARGUMENT_BYTES,
   })) as CanonicalJson) as Readonly<T>;
+}
+
+function canonicalDigest(value: unknown): string {
+  return sha256(closedCanonicalJson(value, {
+    maxDepth: 32,
+    maxNodes: 20_000,
+    maxStringBytes: MAX_CANONICAL_ARGUMENT_BYTES,
+    maxTotalBytes: MAX_CANONICAL_ARGUMENT_BYTES,
+  }));
+}
+
+function workflowNodeCallAuthorityBindingOf(
+  prepared: PreparedWorkflowNodeCallV1,
+): Readonly<WorkflowNodeCallAuthorityBindingV1> {
+  const obligationBase = {
+    requirementId: prepared.requirementId,
+    effect: prepared.binding.effect,
+    evidence: prepared.evidence,
+    completeness: prepared.completeness,
+    continuation: prepared.continuation,
+  };
+  const obligationDigest = canonicalDigest({
+    domain: 'workflow-v3-call-obligation',
+    version: 1,
+    ...obligationBase,
+  });
+  const material = {
+    version: 1 as const,
+    authorityKind: PENDING_WORKFLOW_CALL_AUTHORITY_KIND,
+    durability: 'process_checkpoint' as const,
+    executionState: 'not_armed' as const,
+    workflow: prepared.identity,
+    call: {
+      logicalCallId: prepared.logicalCallId,
+      logicalCapabilityId: prepared.logicalCapabilityId,
+      requirementId: prepared.requirementId,
+      invocationPlanDigest: prepared.invocationPlanDigest,
+      canonicalArgumentDigest: prepared.canonicalArgumentDigest,
+      sourceArgumentDigest: prepared.sourceArgumentDigest,
+      argsRedacted: true as const,
+    },
+    capability: prepared.binding,
+    obligation: {
+      ...obligationBase,
+      obligationDigest,
+    },
+  };
+  const authorityBindingDigest = canonicalDigest({
+    domain: 'workflow-v3-call-authority-binding',
+    ...material,
+  });
+  return freezeClone({ ...material, authorityBindingDigest }) as Readonly<WorkflowNodeCallAuthorityBindingV1>;
+}
+
+function rememberPreparedWorkflowNodeCall(prepared: PreparedWorkflowNodeCallV1): void {
+  preparedWorkflowNodeCallAuthorities.set(
+    prepared as object,
+    workflowNodeCallAuthorityBindingOf(prepared),
+  );
+}
+
+/** Mint a process-opaque workflow_v3 checkpoint for one authentic prepared
+ * call. This never arms durable execution and never calls a capability port. */
+export function bindPreparedWorkflowNodeCallAuthority(
+  prepared: PreparedWorkflowNodeCallV1,
+): BindPreparedWorkflowNodeCallAuthorityResult {
+  const binding = prepared && typeof prepared === 'object'
+    ? preparedWorkflowNodeCallAuthorities.get(prepared as object)
+    : undefined;
+  if (!binding) return { ok: false, reason: 'prepared_call_not_authentic' };
+  const proof = Object.freeze<WorkflowNodeCallAuthorityProof>({
+    kind: 'workflow_v3_call_authority_proof',
+    authorityBindingDigest: binding.authorityBindingDigest,
+    logicalCallId: binding.call.logicalCallId,
+  });
+  workflowNodeCallAuthorityProofs.set(proof as object, Object.freeze({ prepared, binding }));
+  return { ok: true, binding, proof };
+}
+
+/** Narrow authenticity probe for the future durable authority adapter. It
+ * intentionally reveals no argument bytes or invoke handle. */
+export function workflowNodeCallAuthorityProofOwnsPrepared(
+  proof: WorkflowNodeCallAuthorityProof,
+  prepared: PreparedWorkflowNodeCallV1,
+): boolean {
+  const owned = proof && typeof proof === 'object'
+    ? workflowNodeCallAuthorityProofs.get(proof as object)
+    : undefined;
+  return Boolean(
+    owned
+    && owned.prepared === prepared
+    && owned.binding === preparedWorkflowNodeCallAuthorities.get(prepared as object)
+    && proof.kind === 'workflow_v3_call_authority_proof'
+    && proof.authorityBindingDigest === owned.binding.authorityBindingDigest
+    && proof.logicalCallId === owned.binding.call.logicalCallId,
+  );
+}
+
+export type ActivatePreparedWorkflowNodeCallResult =
+  | {
+      status: 'armed' | 'existing';
+      activationId: string;
+      authorityRootId: string;
+      authorityBindingDigest: string;
+      executable: true;
+    }
+  | {
+      status: 'existing_closed';
+      activationId: string;
+      authorityRootId: string;
+      authorityBindingDigest: string;
+      executable: false;
+    }
+  | {
+      status: 'blocked' | 'conflict' | 'missing' | 'storage_error';
+      reason: string;
+      executable: false;
+    };
+
+export interface WorkflowV3CallConsentRequestV1 {
+  version: 1;
+  sessionBound: true;
+  tool: typeof WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION;
+  args: Readonly<{
+    authorityBindingDigest: string;
+    operationId: string;
+    accountId: string;
+    effect: Exclude<WorkflowNodeInvocationEffectV1, 'read' | 'compute' | 'host_only'>;
+    canonicalArgumentDigest: string;
+  }>;
+  resumeKey: string;
+}
+
+/** Derive the one and only registry payload accepted by the durable v3 arm.
+ * The opaque proof check prevents a runner from manufacturing consent bytes
+ * from a cloned/forged checkpoint. Host-only calls deliberately have no human
+ * consent request; every mutating/admin effect does. */
+export function workflowV3CallConsentRequest(input: {
+  prepared: PreparedWorkflowNodeCallV1;
+  proof: WorkflowNodeCallAuthorityProof;
+}):
+  | { ok: true; request: Readonly<WorkflowV3CallConsentRequestV1> }
+  | { ok: false; reason: 'prepared_call_not_authentic' | 'workflow_v3_call_does_not_require_consent' } {
+  if (!workflowNodeCallAuthorityProofOwnsPrepared(input.proof, input.prepared)) {
+    return { ok: false, reason: 'prepared_call_not_authentic' };
+  }
+  const effect = input.prepared.binding.effect;
+  if (effect === 'read' || effect === 'compute' || effect === 'host_only') {
+    return { ok: false, reason: 'workflow_v3_call_does_not_require_consent' };
+  }
+  const args = Object.freeze({
+    authorityBindingDigest: input.proof.authorityBindingDigest,
+    operationId: input.prepared.binding.operationId,
+    accountId: input.prepared.binding.accountId,
+    effect,
+    canonicalArgumentDigest: input.prepared.canonicalArgumentDigest,
+  });
+  return {
+    ok: true,
+    request: Object.freeze({
+      version: 1 as const,
+      sessionBound: true as const,
+      tool: WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION,
+      args,
+      resumeKey: `workflow-v3:${input.prepared.logicalCallId}`,
+    }),
+  };
+}
+
+/** Convert exactly one authentic process checkpoint into its durable v3 root.
+ * Structural clones fail before SQLite. Until a richer risk evaluator is
+ * represented, every mutating effect requires one exact registry approval;
+ * its CAS is owned by the same transaction as activation/binding/root. */
+export function activatePreparedWorkflowNodeCall(input: {
+  sessionId: string;
+  prepared: PreparedWorkflowNodeCallV1;
+  proof: WorkflowNodeCallAuthorityProof;
+  oneShotActivationAuthorization?: OneShotActivationAuthorization;
+}): ActivatePreparedWorkflowNodeCallResult {
+  if (!workflowNodeCallAuthorityProofOwnsPrepared(input.proof, input.prepared)) {
+    return { status: 'blocked', reason: 'prepared_call_not_authentic', executable: false };
+  }
+  const authority = preparedWorkflowNodeCallAuthorities.get(input.prepared as object);
+  if (
+    !authority
+    || authority.authorityBindingDigest !== input.proof.authorityBindingDigest
+    || authority.call.logicalCallId !== input.proof.logicalCallId
+  ) return { status: 'blocked', reason: 'prepared_call_not_authentic', executable: false };
+  const effect = input.prepared.binding.effect;
+  if (effect === 'read' || effect === 'compute') {
+    return { status: 'blocked', reason: 'workflow_v3_requires_non_read_checkpoint', executable: false };
+  }
+  if (
+    (effect === 'local_write' || effect === 'external_write' || effect === 'admin')
+    && !input.oneShotActivationAuthorization
+  ) {
+    return { status: 'blocked', reason: 'exact_one_shot_authorization_required', executable: false };
+  }
+  const armed = armWorkflowV3CallAuthority({
+    sessionId: input.sessionId,
+    workflowId: input.prepared.identity.workflowId,
+    workflowRevision: input.prepared.identity.workflowRevision,
+    workflowDigest: input.prepared.identity.workflowDigest,
+    runId: input.prepared.identity.runId,
+    runOccurrenceId: input.prepared.identity.runOccurrenceId,
+    nodeId: input.prepared.identity.nodeId,
+    nodeAttempt: input.prepared.identity.nodeAttempt,
+    invocationPlanDigest: input.prepared.invocationPlanDigest,
+    bindingSnapshotDigest: input.prepared.bindingSnapshotDigest,
+    controlDigest: input.prepared.controlDigest,
+    logicalCallId: input.prepared.logicalCallId,
+    authorityBindingDigest: authority.authorityBindingDigest,
+    requirementId: input.prepared.requirementId,
+    logicalCapabilityId: input.prepared.logicalCapabilityId,
+    canonicalArgumentDigest: input.prepared.canonicalArgumentDigest,
+    sourceArgumentDigest: input.prepared.sourceArgumentDigest,
+    obligationDigest: authority.obligation.obligationDigest,
+    binding: {
+      capabilityId: input.prepared.binding.capabilityId,
+      manifestId: input.prepared.binding.manifestId,
+      manifestDigest: input.prepared.binding.manifestDigest,
+      operationId: input.prepared.binding.operationId,
+      operationVersion: input.prepared.binding.operationVersion,
+      schemaDigest: input.prepared.binding.schemaDigest,
+      providerVersion: input.prepared.binding.providerVersion,
+      liveFingerprint: input.prepared.binding.liveFingerprint,
+      accountId: input.prepared.binding.accountId,
+      effect,
+      invokePortId: input.prepared.binding.invokePortId,
+      argumentCompiler: { ...input.prepared.binding.argumentCompiler },
+    },
+    ...(input.oneShotActivationAuthorization
+      ? { oneShotActivationAuthorization: input.oneShotActivationAuthorization }
+      : {}),
+  });
+  if ('ref' in armed) {
+    return {
+      status: armed.status,
+      activationId: armed.ref.activationId,
+      authorityRootId: armed.ref.authorityRootId,
+      authorityBindingDigest: authority.authorityBindingDigest,
+      executable: armed.status !== 'existing_closed',
+    } as ActivatePreparedWorkflowNodeCallResult;
+  }
+  return {
+    status: armed.status === 'closed' ? 'conflict' : armed.status,
+    reason: armed.reason,
+    executable: false,
+  };
+}
+
+/** Public v3 execution adapter. It owns no alternate executor: all work enters
+ * the existing one-call workflow kernel under the durable activation id. */
+export async function executeActivatedWorkflowNodeCall(input: {
+  activationId: string;
+  invocationPlan: unknown;
+  args: Record<string, unknown>;
+  signal?: AbortSignal;
+}): Promise<ExecuteWorkflowCallKernelResult> {
+  return executeWorkflowV3Call(input);
 }
 
 function logicalCallIdOf(input: {
@@ -409,6 +745,7 @@ function prepareWorkflowNodeCallBinding(
     completeness: freezeClone(plan.completeness),
     continuation: freezeClone(plan.continuation),
   });
+  rememberPreparedWorkflowNodeCall(prepared);
   return { ok: true, prepared, resolved: resolved.resolved };
 }
 
@@ -440,8 +777,9 @@ function workflowNodeCallAuthorityRequirement(
 /**
  * Resolve and seal an exact workflow call without arming authority or crossing
  * a capability port. Non-read calls deliberately stop in a typed preparation
- * state until workflow_v3_call exists; callers must not project that state as
- * a user-facing failure or success.
+ * checkpoint. The checkpoint is exact and opaque, but deliberately
+ * non-executable until a durable activation/consent/recovery adapter is wired;
+ * callers must not project it as a user-facing failure or success.
  */
 export function prepareWorkflowNodeCall(
   input: Parameters<typeof prepareWorkflowNodeCallBinding>[0],
@@ -468,12 +806,25 @@ export function prepareWorkflowNodeCall(
       ) as Extract<PrepareWorkflowNodeReadResult, { ok: false }>,
     };
   }
+  const authority = bindPreparedWorkflowNodeCallAuthority(candidate.prepared);
+  if (!authority.ok) {
+    return {
+      kind: 'blocked',
+      preparation: block(
+        'workflow_activation_lineage_unrepresented',
+        'The prepared workflow call lost its opaque authority provenance.',
+      ) as Extract<PrepareWorkflowNodeReadResult, { ok: false }>,
+    };
+  }
   return {
-    kind: 'authority_unavailable',
+    kind: 'authority_checkpoint',
     effect,
     prepared: candidate.prepared,
     resolved: candidate.resolved,
     requirement: workflowNodeCallAuthorityRequirement(effect),
+    authority: authority.binding,
+    proof: authority.proof,
+    executable: false,
   };
 }
 

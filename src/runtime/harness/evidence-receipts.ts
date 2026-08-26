@@ -44,7 +44,10 @@ import {
   redeemSuccessfulSettlementResultForHost,
   type SuccessfulSettlementResultEvidence,
 } from './result-handle.js';
-import { inspectProviderEnvelope } from './provider-read-evidence.js';
+import {
+  exactProviderDataPayload,
+  inspectProviderEnvelope,
+} from './provider-read-evidence.js';
 import { verifyHostSealedArtifactDerivationForWrite } from './artifact-ledger.js';
 import { verifyAtomicContentCommit } from './atomic-content-commit-proof.js';
 import { loadSealedNodeBinding } from './host-capability-catalog-factory.js';
@@ -1236,8 +1239,9 @@ function createdPayloadOf(raw: unknown): {
   receipt?: string;
   writtenDigest?: string;
 } {
-  if (!raw || typeof raw !== 'object') return {};
-  const record = raw as Record<string, unknown>;
+  const providerPayload = exactProviderDataPayload(raw);
+  if (!providerPayload || typeof providerPayload !== 'object') return {};
+  const record = providerPayload as Record<string, unknown>;
   const nested = record.created && typeof record.created === 'object'
     ? record.created as Record<string, unknown>
     : record;
@@ -1416,7 +1420,7 @@ function findReadbackDigest(input: {
       logicalToolCallId: row.logical_tool_call_id,
     });
     if (redeemed.status !== 'ok') continue;
-    const raw = redeemed.value.rawPayload;
+    const raw = exactProviderDataPayload(redeemed.value.rawPayload);
     if (!raw || typeof raw !== 'object') continue;
     const record = raw as { id?: string; handle?: string; content?: unknown };
     if (record.id !== input.createdId || record.content === undefined) continue;

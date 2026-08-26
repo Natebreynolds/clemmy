@@ -13,8 +13,10 @@ import { armAcceptedTaskAuthority } from './accepted-task-authority.js';
 import {
   authorizeGeneratedArtifactReadback,
   authorizeHostSealedArtifactReadback,
+  createHostSealedArtifactContentContract,
   generatedArtifactReadContentVerified,
   generatedArtifactWriteContentVerified,
+  hostArtifactContentDigest,
 } from './artifact-ledger.js';
 import { compileGoogleSheetsSheetFromJsonContract } from './sheet-from-json-content-contract.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
@@ -50,7 +52,9 @@ import {
   refinePreDispatchReadEvidence,
   type FiniteReadStructuralProof,
 } from './read-evidence-refinement.js';
-import { inspectProviderEnvelope } from './provider-read-evidence.js';
+import {
+  inspectProviderEnvelope,
+} from './provider-read-evidence.js';
 import { recordsAtRecordPath, resultHasMalformedPagination } from './result-facts.js';
 import {
   redeemedReadIsExhausted,
@@ -70,9 +74,15 @@ import {
   classifyRuntimeToolEffect,
   inspectTrustedRuntimeEffectCarrier,
   runtimeExpectedWorkProjection,
+  unwrapRuntimeEffectiveToolIdentity,
   type RuntimeToolEffect,
   type TrustedRuntimeEffectCarrier,
 } from './tool-effect.js';
+import { digestSchema } from '../../tools/tool-contract-store.js';
+import {
+  loadSealedNodeBinding,
+  type SealedNodeBinding,
+} from './host-capability-catalog-factory.js';
 
 export interface ExpectedWorkUniverseSelectorV1 {
   /** RFC 6901 pointer into the normalized inner tool arguments. */
@@ -1000,6 +1010,8 @@ function dependencyReadyForCurrentOperation(
   currentItemId: string | undefined,
   currentTool: string,
   currentArgs: unknown,
+  currentEvidenceArgs: unknown,
+  currentEvidenceInputSchema: unknown,
 ): boolean {
   const discharged = dischargedRequirementSettlements(db, contract, dependency.id);
   const instancesReady = (
@@ -1068,8 +1080,13 @@ function dependencyReadyForCurrentOperation(
         contractId: contract.contractId,
         createLogicalToolCallId: predecessors[0]!.logical_tool_call_id,
         verificationRequirementId: current.id,
-        readToolName: currentTool,
-        readArgs: currentArgs,
+        readToolName: unwrapRuntimeEffectiveToolIdentity(currentTool, currentArgs).toolName ?? currentTool,
+        readArgs: currentEvidenceArgs,
+        readProviderInputSchemaDigest: digestSchema(currentEvidenceInputSchema),
+        readAccountId: currentArgs && typeof currentArgs === 'object' && !Array.isArray(currentArgs)
+          && typeof (currentArgs as Record<string, unknown>).connected_account_id === 'string'
+          ? (currentArgs as Record<string, unknown>).connected_account_id as string
+          : undefined,
       });
       if (hostSealed.status === 'authorized') return true;
     }
@@ -1139,6 +1156,403 @@ function generatedSheetContentContractForAdmission(input: {
     return { ok: false, reason: 'generated Sheet dataFrom source must be one exact read' };
   }
   return { ok: true, contentContract: sheetContract };
+}
+
+function exactContentDigestOccurrences(value: unknown, targetDigest: string, depth = 0): number {
+  if (depth > 8) return 0;
+  if (typeof value === 'string') {
+    if (Buffer.byteLength(value, 'utf8') > 16_000_000) return 0;
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (hostArtifactContentDigest(parsed) === targetDigest) return 1;
+      return exactContentDigestOccurrences(parsed, targetDigest, depth + 1);
+    } catch {
+      return 0;
+    }
+  }
+  if (Array.isArray(value)) {
+    if (hostArtifactContentDigest(value) === targetDigest) return 1;
+    return value.reduce(
+      (count, child) => count + exactContentDigestOccurrences(child, targetDigest, depth + 1),
+      0,
+    );
+  }
+  if (!value || typeof value !== 'object') return 0;
+  if (hostArtifactContentDigest(value) === targetDigest) return 1;
+  return Object.values(value as Record<string, unknown>)
+    .reduce<number>(
+      (count, child) => count + exactContentDigestOccurrences(child, targetDigest, depth + 1),
+      0,
+    );
+}
+
+type HostSealedArtifactLineage = {
+  /** Immediate producer whose exact settled bytes the create must consume. */
+  contentNode: ExpectedWorkOperationV1;
+  /** One dataFrom chain, ordered from its terminal read to contentNode. */
+  orderedNodes: ExpectedWorkOperationV1[];
+};
+
+function resolveHostSealedArtifactLineage(
+  contract: AcceptedTaskWorkContractV1,
+  create: ExpectedWorkOperationV1,
+): { ok: true; lineage: HostSealedArtifactLineage } | { ok: false; reason: string } {
+  if (create.dataFrom.length !== 1 || !create.dependsOn.includes(create.dataFrom[0]!)) {
+    return {
+      ok: false,
+      reason: 'generated artifact create requires one exact dependency-bound dataFrom source',
+    };
+  }
+  const byId = new Map(contract.operations.map((operation) => [operation.id, operation]));
+  const contentNode = byId.get(create.dataFrom[0]!);
+  if (!contentNode) {
+    return { ok: false, reason: 'generated artifact dataFrom lineage is missing' };
+  }
+  const reverseNodes: ExpectedWorkOperationV1[] = [];
+  const visited = new Set<string>();
+  let current: ExpectedWorkOperationV1 | undefined = contentNode;
+  while (current) {
+    if (visited.has(current.id) || reverseNodes.length >= contract.operations.length) {
+      return { ok: false, reason: 'generated artifact dataFrom lineage is cyclic or ambiguous' };
+    }
+    visited.add(current.id);
+    reverseNodes.push(current);
+    if (current.cardinality.kind !== 'once') {
+      return { ok: false, reason: 'generated artifact lineage nodes must be exact once operations' };
+    }
+    if (current.effect === 'read') {
+      if (current.dataFrom.length !== 0) {
+        return { ok: false, reason: 'generated artifact source read cannot inherit another dataFrom source' };
+      }
+      return {
+        ok: true,
+        lineage: { contentNode, orderedNodes: [...reverseNodes].reverse() },
+      };
+    }
+    if (current.effect !== 'compute') {
+      return {
+        ok: false,
+        reason: 'generated artifact lineage permits only exact compute nodes after one source read',
+      };
+    }
+    if (current.dataFrom.length !== 1 || !current.dependsOn.includes(current.dataFrom[0]!)) {
+      return {
+        ok: false,
+        reason: 'generated artifact compute lineage requires one exact dependency-bound dataFrom source',
+      };
+    }
+    current = byId.get(current.dataFrom[0]!);
+    if (!current) {
+      return { ok: false, reason: 'generated artifact dataFrom lineage is missing' };
+    }
+  }
+  return { ok: false, reason: 'generated artifact lineage has no exact source read' };
+}
+
+function sealedBindingEffectMatches(
+  operation: ExpectedWorkOperationV1,
+  binding: SealedNodeBinding,
+): boolean {
+  if (binding.nodeId !== operation.id) return false;
+  if (operation.effect === 'compute') {
+    return binding.effect === 'compute'
+      || binding.effect === 'host_only'
+      || binding.effect === 'none';
+  }
+  return binding.effect === operation.effect;
+}
+
+interface SettledHostSealedLineageNode {
+  operation: ExpectedWorkOperationV1;
+  binding: SealedNodeBinding;
+  logicalToolCallId: string;
+  argumentDigest: string;
+  records: unknown[];
+}
+
+function exactSettledHostSealedLineageNode(input: {
+  db: Database.Database;
+  contract: AcceptedTaskWorkContractV1;
+  operation: ExpectedWorkOperationV1;
+}): { ok: true; node: SettledHostSealedLineageNode } | { ok: false; reason: string } {
+  const rows = input.db.prepare(`
+    SELECT b.logical_tool_call_id, b.tool_name, b.argument_digest,
+           b.effect_kind, b.cardinality_kind
+      FROM expected_work_call_bindings b
+      JOIN logical_call_settlements s
+        ON s.session_id = b.session_id
+       AND s.source_user_seq = b.source_user_seq
+       AND s.logical_tool_call_id = b.logical_tool_call_id
+     WHERE b.session_id = ? AND b.source_user_seq = ?
+       AND b.contract_id = ? AND b.requirement_id = ?
+       AND s.outcome_kind = 'succeeded'
+       AND s.continues_requirement = 0
+  `).all(
+    input.contract.identity.sessionId,
+    input.contract.identity.sourceUserSeq,
+    input.contract.contractId,
+    input.operation.id,
+  ) as Array<{
+    logical_tool_call_id: string;
+    tool_name: string;
+    argument_digest: string;
+    effect_kind: string;
+    cardinality_kind: string;
+  }>;
+  if (rows.length !== 1) {
+    return {
+      ok: false,
+      reason: `generated artifact lineage settlement for ${input.operation.id} is missing or ambiguous`,
+    };
+  }
+  const row = rows[0]!;
+  const binding = loadSealedNodeBinding(
+    input.contract.identity.sessionId,
+    input.contract.identity.sourceUserSeq,
+    input.operation.id,
+  );
+  if (
+    !binding
+    || !sealedBindingEffectMatches(input.operation, binding)
+    || binding.logicalToolName !== row.tool_name
+    || row.effect_kind !== input.operation.effect
+    || row.cardinality_kind !== 'once'
+  ) {
+    return {
+      ok: false,
+      reason: `generated artifact lineage binding for ${input.operation.id} is not exact`,
+    };
+  }
+  const redeemed = redeemSuccessfulSettlementResultForHost({
+    sessionId: input.contract.identity.sessionId,
+    sourceUserSeq: input.contract.identity.sourceUserSeq,
+    acceptedTaskId: input.contract.acceptedTaskId,
+    logicalToolCallId: row.logical_tool_call_id,
+  });
+  if (redeemed.status !== 'ok') {
+    return {
+      ok: false,
+      reason: `generated artifact lineage bytes for ${input.operation.id} are unavailable: ${redeemed.reason}`,
+    };
+  }
+  const records = recordsAtRecordPath(
+    redeemed.value.rawPayload,
+    redeemed.value.handle.recordPath,
+  );
+  if (
+    inspectProviderEnvelope(redeemed.value.rawPayload).verdict !== 'clean'
+    || !records
+  ) {
+    return {
+      ok: false,
+      reason: `generated artifact lineage result for ${input.operation.id} is not one clean record collection`,
+    };
+  }
+  return {
+    ok: true,
+    node: {
+      operation: input.operation,
+      binding,
+      logicalToolCallId: row.logical_tool_call_id,
+      argumentDigest: row.argument_digest,
+      records,
+    },
+  };
+}
+
+function hostExecutorPayloadDigest(value: unknown): string | null {
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? null : expectedWorkDigest(json);
+  } catch {
+    return null;
+  }
+}
+
+function exactHostExecutorLineageArgs(input: {
+  args: unknown;
+  nodeId: string;
+  binding: SealedNodeBinding;
+  payload: unknown;
+}): boolean {
+  if (!input.args || typeof input.args !== 'object' || Array.isArray(input.args)) return false;
+  const args = input.args as Record<string, unknown>;
+  const expectedKeys = ['capabilityId', 'digest', 'nodeId', 'schemaDigest', 'schemaVersion'];
+  if (
+    Object.keys(args).length !== expectedKeys.length
+    || expectedKeys.some((key) => !Object.prototype.hasOwnProperty.call(args, key))
+  ) return false;
+  const payloadDigest = hostExecutorPayloadDigest(input.payload);
+  return payloadDigest !== null
+    && args.nodeId === input.nodeId
+    && args.capabilityId === input.binding.capabilityId
+    && args.schemaVersion === input.binding.schemaVersion
+    && args.schemaDigest === input.binding.schemaDigest
+    && args.digest === payloadDigest;
+}
+
+function exactHostExecutorLineageArgumentDigest(input: {
+  contract: AcceptedTaskWorkContractV1;
+  node: SettledHostSealedLineageNode;
+  payload: unknown;
+}): boolean {
+  const payloadDigest = hostExecutorPayloadDigest(input.payload);
+  if (!payloadDigest) return false;
+  const exactArgs = {
+    nodeId: input.node.operation.id,
+    capabilityId: input.node.binding.capabilityId,
+    schemaVersion: input.node.binding.schemaVersion,
+    schemaDigest: input.node.binding.schemaDigest,
+    digest: payloadDigest,
+  };
+  const logical = durableLogicalCallContract(
+    input.contract.acceptedTaskId,
+    input.node.binding.logicalToolName,
+    exactArgs,
+  );
+  return logical?.argumentDigest === input.node.argumentDigest;
+}
+
+/**
+ * Provider-neutral content authority for a generic create. It is minted only
+ * when the frozen DAG has one exact read, an optional exact compute chain, the
+ * create, and one exact-id readback. The create must consume the immediate
+ * producer's settled bytes; a transformed artifact can never borrow authority
+ * from the raw ancestor. No semantic label can substitute for byte equality.
+ */
+function hostSealedContentContractForAdmission(input: {
+  db: Database.Database;
+  contract: AcceptedTaskWorkContractV1;
+  operation: ExpectedWorkOperationV1;
+  evidenceArgs: unknown;
+}): { ok: true; contentContract: unknown } | { ok: false; reason: string } | null {
+  if (
+    input.operation.cardinality.kind !== 'once'
+    || (input.operation.effect !== 'external_write' && input.operation.effect !== 'local_write')
+    // This proof protects content claimed to descend from a prior source.
+    // A zero-lineage create carries user/model-supplied content directly and
+    // remains governed by its exact plan, capability risk, and consent proof.
+    || input.operation.dataFrom.length === 0
+  ) return null;
+  const createBindingRow = input.db.prepare(`
+    SELECT binding_json, binding_digest
+      FROM graph_node_bindings
+     WHERE session_id = ? AND source_user_seq = ? AND node_id = ?
+  `).get(
+    input.contract.identity.sessionId,
+    input.contract.identity.sourceUserSeq,
+    input.operation.id,
+  ) as { binding_json: string; binding_digest: string } | undefined;
+  if (!createBindingRow) return null;
+  const sealedCreate = loadSealedNodeBinding(
+    input.contract.identity.sessionId,
+    input.contract.identity.sourceUserSeq,
+    input.operation.id,
+  );
+  if (!sealedCreate) return { ok: false, reason: 'generated artifact create binding is unreadable' };
+  const createOperationName = sealedCreate.providerOperationId.toUpperCase();
+  if (!/(?:^|_)(?:CREATE|PROVISION|REGISTER)(?:_|$)/.test(createOperationName)) return null;
+  if (
+    sealedCreate.nodeId !== input.operation.id
+    || sealedCreate.bindingDigest !== createBindingRow.binding_digest
+    || !sealedBindingEffectMatches(input.operation, sealedCreate)
+  ) return { ok: false, reason: 'generated artifact create binding contradicts the frozen DAG' };
+  const lineage = resolveHostSealedArtifactLineage(input.contract, input.operation);
+  if (!lineage.ok) return lineage;
+  const readbacks = input.contract.operations.filter((operation) => (
+    operation.effect === 'read'
+    && operation.cardinality.kind === 'once'
+    && operation.dependsOn.includes(input.operation.id)
+  ));
+  if (readbacks.length !== 1) {
+    return { ok: false, reason: 'generated artifact requires one exact declared create successor readback' };
+  }
+  const readback = readbacks[0]!;
+  const settledLineage: SettledHostSealedLineageNode[] = [];
+  for (const operation of lineage.lineage.orderedNodes) {
+    const settled = exactSettledHostSealedLineageNode({
+      db: input.db,
+      contract: input.contract,
+      operation,
+    });
+    if (!settled.ok) return settled;
+    if (operation.effect === 'compute') {
+      const predecessor = settledLineage.at(-1);
+      if (
+        !predecessor
+        || !exactHostExecutorLineageArgumentDigest({
+          contract: input.contract,
+          node: settled.node,
+          payload: predecessor.records,
+        })
+      ) {
+        return {
+          ok: false,
+          reason: `generated artifact transform ${operation.id} did not consume its exact settled predecessor bytes`,
+        };
+      }
+    }
+    settledLineage.push(settled.node);
+  }
+  const contentNode = settledLineage.at(-1);
+  if (!contentNode || contentNode.operation.id !== lineage.lineage.contentNode.id) {
+    return { ok: false, reason: 'generated artifact settled content lineage is missing or ambiguous' };
+  }
+  const records = contentNode.records;
+  const contentDigest = hostArtifactContentDigest(records);
+  if (
+    !exactHostExecutorLineageArgs({
+      args: input.evidenceArgs,
+      nodeId: input.operation.id,
+      binding: sealedCreate,
+      payload: records,
+    })
+    && exactContentDigestOccurrences(input.evidenceArgs, contentDigest) !== 1
+  ) {
+    return { ok: false, reason: 'generated artifact create arguments do not contain the exact source records once' };
+  }
+
+  const readbackBindingRow = input.db.prepare(`
+    SELECT binding_json, binding_digest
+      FROM graph_node_bindings
+     WHERE session_id = ? AND source_user_seq = ? AND node_id = ?
+  `).get(
+    input.contract.identity.sessionId,
+    input.contract.identity.sourceUserSeq,
+    readback.id,
+  ) as { binding_json: string; binding_digest: string } | undefined;
+  const sealedReadback = readbackBindingRow
+    ? loadSealedNodeBinding(
+        input.contract.identity.sessionId,
+        input.contract.identity.sourceUserSeq,
+        readback.id,
+      )
+    : null;
+  if (!readbackBindingRow || !sealedReadback) {
+    return { ok: false, reason: 'generated artifact readback binding is missing or unreadable' };
+  }
+  if (
+    sealedReadback.nodeId !== readback.id
+    || sealedReadback.bindingDigest !== readbackBindingRow.binding_digest
+    || !sealedBindingEffectMatches(readback, sealedReadback)
+  ) return { ok: false, reason: 'generated artifact sealed bindings contradict the frozen DAG' };
+  return {
+    ok: true,
+    contentContract: createHostSealedArtifactContentContract({
+      acceptedTaskId: input.contract.acceptedTaskId,
+      graphId: input.contract.graphId,
+      graphHash: input.contract.graphHash,
+      lineageNodeId: contentNode.operation.id,
+      createNodeId: input.operation.id,
+      readbackNodeId: readback.id,
+      lineageContentDigest: contentDigest,
+      intendedContentDigest: contentDigest,
+      createBindingDigest: createBindingRow.binding_digest,
+      readbackBindingDigest: readbackBindingRow.binding_digest,
+      createEffect: input.operation.effect,
+      readbackEffect: 'read',
+    }),
+  };
 }
 
 function ensureGeneratedArtifactContractSchema(db: Database.Database): void {
@@ -2122,6 +2536,8 @@ export function admitExpectedWorkInvocation(input: {
           input.universeItemId ?? undefined,
           input.tool,
           input.args,
+          evidenceArgs,
+          evidenceInputSchema,
         )) return refusedWithPlan(
           'work_dependency_pending',
           `dependency ${dependencyId} is not durably satisfied${
@@ -2283,6 +2699,15 @@ export function admitExpectedWorkInvocation(input: {
       if (generatedSheetContract && !generatedSheetContract.ok) {
         return refusedWithPlan('work_source_witness_missing', generatedSheetContract.reason);
       }
+      const generatedArtifactContract = generatedSheetContract ?? hostSealedContentContractForAdmission({
+        db,
+        contract,
+        operation,
+        evidenceArgs,
+      });
+      if (generatedArtifactContract && !generatedArtifactContract.ok) {
+        return refusedWithPlan('work_source_witness_missing', generatedArtifactContract.reason);
+      }
 
       const freeze = prepared
         ? freezePreparedExpectedWorkContractInTransaction(db, {
@@ -2336,8 +2761,8 @@ export function admitExpectedWorkInvocation(input: {
         schemaDigest,
         new Date().toISOString(),
       );
-      if (generatedSheetContract?.ok) {
-        const frozenJson = JSON.stringify(generatedSheetContract.contentContract);
+      if (generatedArtifactContract?.ok) {
+        const frozenJson = JSON.stringify(generatedArtifactContract.contentContract);
         if (Buffer.byteLength(frozenJson, 'utf8') > 1_000_000) {
           throw new Error('generated artifact content contract exceeds the durable bound');
         }
@@ -2374,8 +2799,8 @@ export function admitExpectedWorkInvocation(input: {
         ...(evidenceBasis ? { evidenceBasis } : {}),
         ...(schemaFingerprint ? { schemaFingerprint } : {}),
         ...(schemaDigest ? { schemaDigest } : {}),
-        ...(generatedSheetContract?.ok
-          ? { generatedArtifactContentContract: generatedSheetContract.contentContract }
+        ...(generatedArtifactContract?.ok
+          ? { generatedArtifactContentContract: generatedArtifactContract.contentContract }
           : {}),
       };
       return { status: 'bound', binding, contract };

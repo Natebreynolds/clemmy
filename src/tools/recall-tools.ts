@@ -1,6 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { getToolOutput, TOOL_OUTPUT_MAX_BYTES } from '../runtime/harness/eventlog.js';
+import { getToolOutput, getToolOutputSlice } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './inner-dispatch.js';
@@ -13,8 +13,8 @@ import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
  * call when auto-compact (Layer 1) has clipped it from the conversation.
  *
  * Lossless fetch from the `tool_outputs` table (populated at write-time
- * in hooks.ts with up to TOOL_OUTPUT_MAX_BYTES of original output,
- * before the event-log copy is clipped to 8KB). Pass `offset` to page
+ * in hooks.ts using inline plus content-addressed chunks before the event-log
+ * copy is clipped to 8KB). Pass `offset` to page
  * through a payload larger than a single 30KB slice.
  *
  * Scoping: reads the session id from the harness AsyncLocalStorage
@@ -129,18 +129,24 @@ export function registerRecallTools(server: McpServer): void {
         );
       }
 
-      const row = getToolOutput(ctx.sessionId, callId);
+      const row = getToolOutputSlice(ctx.sessionId, callId, offset, maxChars);
       if (!row) {
         return textResult(
           `No tool output found for call_id "${callId}" in this session. Check the [clipped: ...] stub for the correct call_id, or proceed with the summary.`,
         );
       }
+      if (row.truncatedAtWrite) {
+        return textResult(
+          `ERROR: tool output "${callId}" is incomplete (${row.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be recalled as authoritative data.`,
+        );
+      }
 
-      // Slice [offset, offset+maxChars) so a payload bigger than one slice can be
-      // paged across calls, and account for actual returned bytes.
-      const total = row.output.length;
-      const start = Math.min(offset, total);
-      const slice = row.output.slice(start, start + maxChars);
+      // The range reader uses persisted UTF-16 offsets and fetches only BLOBs
+      // intersecting this page; it does not rebuild/hash an unrelated 100MB
+      // tail on every 30KB recall call.
+      const total = row.totalChars;
+      const start = row.start;
+      const slice = row.output;
       const sliceBytes = Buffer.byteLength(slice, 'utf8');
 
       // Budget check — only when a HarnessRunContext provided one.
@@ -151,14 +157,11 @@ export function registerRecallTools(server: McpServer): void {
         if (err) return textResult(`ERROR: ${err}`);
       }
 
-      const end = start + slice.length;
+      const end = row.end;
       const header = [
         `Recalled chars ${start}–${end} of ${total} (${row.contentBytes} total bytes)`,
         row.tool ? `tool=${row.tool}` : null,
         `recorded at ${row.createdAt}`,
-        row.truncatedAtWrite
-          ? `⚠ original was tail-truncated at write-time (${Math.round(TOOL_OUTPUT_MAX_BYTES / 1_000_000)}MB cap)`
-          : null,
         end < total
           ? `(more remains — call again with offset: ${end} to continue)`
           : null,
@@ -195,6 +198,11 @@ export function registerRecallTools(server: McpServer): void {
       const row = getToolOutput(ctx.sessionId, callId);
       if (!row) {
         return textResult(`No tool output found for call_id "${callId}" in this session.`);
+      }
+      if (row.truncatedAtWrite) {
+        return textResult(
+          `ERROR: tool output "${callId}" is incomplete (${row.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be queried as authoritative data.`,
+        );
       }
       let parsed: unknown;
       let recoveredClippedArrayPrefix = false;

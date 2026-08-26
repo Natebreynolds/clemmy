@@ -12,9 +12,11 @@ process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 
 const {
+  bindPreparedWorkflowNodeCallAuthority,
   executeWorkflowNodeRead,
   prepareWorkflowNodeCall,
   prepareWorkflowNodeRead,
+  workflowNodeCallAuthorityProofOwnsPrepared,
 } = await import('./workflow-node-invocation-executor.js');
 const {
   createWorkflowNodeInvocationPlan,
@@ -375,7 +377,7 @@ test('exact typed sources produce one immutable deterministic pre-kernel call co
   assert.equal(crossings, 0);
 });
 
-test('ordinary writes and high-risk admin calls seal exact bytes but stop at typed v60 authority preparation', () => {
+test('ordinary writes and high-risk admin calls seal exact bytes into an opaque workflow_v3 authority checkpoint', () => {
   let bodies = 0;
   const ordinaryEntry = registered({
     capabilityId: 'capability.write.ordinary',
@@ -393,8 +395,8 @@ test('ordinary writes and high-risk admin calls seal exact bytes but stop at typ
     entry: ordinaryEntry,
     plan: ordinaryPlan,
   }));
-  assert.equal(ordinary.kind, 'authority_unavailable');
-  if (ordinary.kind === 'authority_unavailable') {
+  assert.equal(ordinary.kind, 'authority_checkpoint');
+  if (ordinary.kind === 'authority_checkpoint') {
     assert.equal(ordinary.effect, 'external_write');
     assert.equal(ordinary.prepared.binding.effect, 'external_write');
     assert.equal(ordinary.prepared.invocationPlanDigest, ordinaryPlan.bindingDigest);
@@ -412,6 +414,48 @@ test('ordinary writes and high-risk admin calls seal exact bytes but stop at typ
     });
     assert.equal(Object.isFrozen(ordinary.requirement), true);
     assert.equal(Object.isFrozen(ordinary.requirement.recovery), true);
+    assert.equal(ordinary.executable, false);
+    assert.equal(ordinary.authority.authorityKind, 'workflow_v3_call');
+    assert.equal(ordinary.authority.durability, 'process_checkpoint');
+    assert.equal(ordinary.authority.executionState, 'not_armed');
+    assert.equal(ordinary.authority.workflow.runOccurrenceId, 'occurrence.alpha');
+    assert.equal(ordinary.authority.call.canonicalArgumentDigest, ordinary.prepared.canonicalArgumentDigest);
+    assert.equal(ordinary.authority.capability.accountId, 'account.write.ordinary');
+    assert.equal(ordinary.authority.obligation.requirementId, 'requirement.records');
+    assert.equal(ordinary.authority.obligation.effect, 'external_write');
+    assert.equal(
+      workflowNodeCallAuthorityProofOwnsPrepared(ordinary.proof, ordinary.prepared),
+      true,
+    );
+    assert.equal(
+      workflowNodeCallAuthorityProofOwnsPrepared(
+        { ...ordinary.proof },
+        ordinary.prepared,
+      ),
+      false,
+      'a structural proof clone is inert',
+    );
+    assert.equal(
+      workflowNodeCallAuthorityProofOwnsPrepared(
+        JSON.parse(JSON.stringify(ordinary.proof)) as typeof ordinary.proof,
+        ordinary.prepared,
+      ),
+      false,
+      'a JSON-round-tripped proof is inert',
+    );
+    assert.equal(
+      workflowNodeCallAuthorityProofOwnsPrepared(
+        ordinary.proof,
+        structuredClone(ordinary.prepared),
+      ),
+      false,
+      'a structural prepared-call clone is inert',
+    );
+    assert.deepEqual(
+      bindPreparedWorkflowNodeCallAuthority(structuredClone(ordinary.prepared)),
+      { ok: false, reason: 'prepared_call_not_authentic' },
+      'a structural prepared-call clone cannot mint a fresh proof',
+    );
   }
 
   const adminEntry = registered({
@@ -427,8 +471,8 @@ test('ordinary writes and high-risk admin calls seal exact bytes but stop at typ
   });
   const adminPlan = planFor(adminEntry, { effect: 'admin' });
   const highRisk = prepareWorkflowNodeCall(prepareInput({ entry: adminEntry, plan: adminPlan }));
-  assert.equal(highRisk.kind, 'authority_unavailable');
-  if (highRisk.kind === 'authority_unavailable') {
+  assert.equal(highRisk.kind, 'authority_checkpoint');
+  if (highRisk.kind === 'authority_checkpoint') {
     assert.equal(highRisk.requirement.authorityKind, 'workflow_v3_call');
     assert.equal(highRisk.requirement.consent, 'exact_user_grant');
     assert.deepEqual(highRisk.requirement.recovery, {
@@ -436,6 +480,8 @@ test('ordinary writes and high-risk admin calls seal exact bytes but stop at typ
       possiblyStarted: 'reconcile_never_blind_retry',
       settled: 'replay_exact_settlement',
     });
+    assert.equal(highRisk.executable, false);
+    assert.equal(highRisk.authority.obligation.effect, 'admin');
   }
 
   const publicRead = prepareWorkflowNodeRead(prepareInput({
@@ -448,6 +494,160 @@ test('ordinary writes and high-risk admin calls seal exact bytes but stop at typ
     assert.equal(publicRead.provenNoCrossing, true);
   }
   assert.equal(bodies, 0, 'preparation, high-risk pause and read compatibility never own a body');
+});
+
+test('workflow_v3 authority binds exact workflow, arguments, capability, and read/write obligation identity', () => {
+  const readEntry = registered();
+  const readPlan = planFor(readEntry);
+  const readPrepared = prepareWorkflowNodeCall(prepareInput({ entry: readEntry, plan: readPlan }));
+  assert.equal(readPrepared.kind, 'ready');
+  if (readPrepared.kind !== 'ready') return;
+  const readAuthority = bindPreparedWorkflowNodeCallAuthority(readPrepared.prepared);
+  assert.equal(readAuthority.ok, true);
+  if (!readAuthority.ok) return;
+  assert.equal(readAuthority.binding.obligation.effect, 'read');
+  assert.equal(readAuthority.binding.obligation.requirementId, readPlan.requirementId);
+
+  const writeEntry = registered({
+    capabilityId: 'capability.write.exact',
+    manifest: manifest({
+      manifestId: 'manifest.write.exact',
+      operationId: 'operation.write.exact',
+      definitionFingerprint: digest('schema.write.exact'),
+      accountId: 'account.write.exact',
+      effect: 'external_write',
+    }),
+  });
+  const writePlan = planFor(writeEntry, { effect: 'external_write' });
+  const exact = prepareWorkflowNodeCall(prepareInput({
+    entry: writeEntry,
+    plan: writePlan,
+    workflowInputs: { scope: 'scope.exact' },
+    identity: executionIdentity(writePlan, 'authority-exact'),
+  }));
+  const otherArgs = prepareWorkflowNodeCall(prepareInput({
+    entry: writeEntry,
+    plan: writePlan,
+    workflowInputs: { scope: 'scope.other' },
+    identity: executionIdentity(writePlan, 'authority-exact'),
+  }));
+  const otherOccurrence = prepareWorkflowNodeCall(prepareInput({
+    entry: writeEntry,
+    plan: writePlan,
+    workflowInputs: { scope: 'scope.exact' },
+    identity: {
+      ...executionIdentity(writePlan, 'authority-exact'),
+      runOccurrenceId: 'occurrence.authority-other',
+    },
+  }));
+  assert.equal(exact.kind, 'authority_checkpoint');
+  assert.equal(otherArgs.kind, 'authority_checkpoint');
+  assert.equal(otherOccurrence.kind, 'authority_checkpoint');
+  if (
+    exact.kind !== 'authority_checkpoint'
+    || otherArgs.kind !== 'authority_checkpoint'
+    || otherOccurrence.kind !== 'authority_checkpoint'
+  ) return;
+  assert.notEqual(exact.authority.authorityBindingDigest, otherArgs.authority.authorityBindingDigest);
+  assert.notEqual(exact.authority.authorityBindingDigest, otherOccurrence.authority.authorityBindingDigest);
+  assert.equal(workflowNodeCallAuthorityProofOwnsPrepared(exact.proof, otherArgs.prepared), false);
+  assert.equal(workflowNodeCallAuthorityProofOwnsPrepared(exact.proof, otherOccurrence.prepared), false);
+  assert.equal(workflowNodeCallAuthorityProofOwnsPrepared(readAuthority.proof, exact.prepared), false);
+
+  const exactIdentity = executionIdentity(writePlan, 'authority-exact');
+  const workflowDrifts: Array<[string, WorkflowNodeReadExecutionIdentityV1]> = [
+    ['workflow revision', { ...exactIdentity, workflowRevision: exactIdentity.workflowRevision + 1 }],
+    ['workflow digest', { ...exactIdentity, workflowDigest: digest('workflow.digest.other') }],
+    ['run id', { ...exactIdentity, runId: 'run.authority-other' }],
+    ['node id', { ...exactIdentity, nodeId: 'node.authority-other' }],
+    ['node attempt', { ...exactIdentity, nodeAttempt: exactIdentity.nodeAttempt + 1 }],
+    ['binding snapshot', { ...exactIdentity, bindingSnapshotDigest: digest('binding.snapshot.other') }],
+    ['control', { ...exactIdentity, controlDigest: digest('control.other') }],
+  ];
+  for (const [label, identity] of workflowDrifts) {
+    const drifted = prepareWorkflowNodeCall(prepareInput({
+      entry: writeEntry,
+      plan: writePlan,
+      workflowInputs: { scope: 'scope.exact' },
+      identity,
+    }));
+    assert.equal(drifted.kind, 'authority_checkpoint', label);
+    if (drifted.kind !== 'authority_checkpoint') continue;
+    assert.notEqual(
+      drifted.authority.authorityBindingDigest,
+      exact.authority.authorityBindingDigest,
+      `${label} must change authority identity`,
+    );
+    assert.equal(
+      workflowNodeCallAuthorityProofOwnsPrepared(exact.proof, drifted.prepared),
+      false,
+      `${label} cannot borrow the exact proof`,
+    );
+  }
+
+  const otherObligationPlan = createWorkflowNodeInvocationPlan({
+    requirementId: 'requirement.records.write.other',
+    logicalCapabilityId: writePlan.logicalCapabilityId,
+    binding: writePlan.binding,
+    arguments: writePlan.arguments,
+    evidence: writePlan.evidence,
+    completeness: writePlan.completeness,
+    continuation: writePlan.continuation,
+  });
+  const obligationDrift = prepareWorkflowNodeCall(prepareInput({
+    entry: writeEntry,
+    plan: otherObligationPlan,
+    workflowInputs: { scope: 'scope.exact' },
+    identity: executionIdentity(otherObligationPlan, 'authority-exact'),
+  }));
+  assert.equal(obligationDrift.kind, 'authority_checkpoint');
+  if (obligationDrift.kind === 'authority_checkpoint') {
+    assert.notEqual(
+      exact.authority.obligation.obligationDigest,
+      obligationDrift.authority.obligation.obligationDigest,
+    );
+    assert.notEqual(
+      exact.authority.authorityBindingDigest,
+      obligationDrift.authority.authorityBindingDigest,
+    );
+    assert.equal(
+      workflowNodeCallAuthorityProofOwnsPrepared(exact.proof, obligationDrift.prepared),
+      false,
+    );
+  }
+
+  const otherCapability = registered({
+    capabilityId: 'capability.write.other-account',
+    manifest: manifest({
+      manifestId: 'manifest.write.other-account',
+      operationId: 'operation.write.exact',
+      definitionFingerprint: digest('schema.write.exact'),
+      accountId: 'account.write.other',
+      effect: 'external_write',
+    }),
+  });
+  const otherPlan = planFor(otherCapability, { effect: 'external_write' });
+  const capabilityDrift = prepareWorkflowNodeCall(prepareInput({
+    entry: otherCapability,
+    plan: otherPlan,
+    workflowInputs: { scope: 'scope.exact' },
+    identity: executionIdentity(otherPlan, 'authority-exact'),
+  }));
+  assert.equal(capabilityDrift.kind, 'authority_checkpoint');
+  if (capabilityDrift.kind === 'authority_checkpoint') {
+    assert.notEqual(
+      exact.authority.authorityBindingDigest,
+      capabilityDrift.authority.authorityBindingDigest,
+    );
+    assert.equal(
+      workflowNodeCallAuthorityProofOwnsPrepared(exact.proof, capabilityDrift.prepared),
+      false,
+    );
+  }
+  assert.equal(Object.isFrozen(exact.authority), true);
+  assert.equal(Object.isFrozen(exact.authority.workflow), true);
+  assert.equal(Object.isFrozen(exact.authority.capability), true);
+  assert.equal(Object.isFrozen(exact.authority.obligation), true);
 });
 
 test('one exact read crosses the immutable port once and replays its durable result after restart', async () => {

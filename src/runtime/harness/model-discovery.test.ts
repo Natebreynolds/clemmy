@@ -15,6 +15,7 @@ import {
   warmModelDiscovery,
   _setDiscoveredModelsForTest,
   _setModelDiscoverersForTest,
+  claudeSdkModelDiscoveryOptions,
 } from './model-discovery.js';
 import { resolveProvider } from './model-wire-registry.js';
 
@@ -77,6 +78,18 @@ test('FUTURE model ids ROUTE to the right provider (a picked discovered model mu
   assert.equal(resolveProvider('codex-large'), 'codex');
   // BYO ids stay BYO.
   assert.equal(resolveProvider('glm-5.2'), 'byo');
+});
+
+test('Claude subscription model discovery owns no executable SDK surface', () => {
+  assert.deepEqual(claudeSdkModelDiscoveryOptions(), {
+    maxTurns: 1,
+    persistSession: false,
+    settingSources: [],
+    skills: [],
+    tools: [],
+    allowedTools: [],
+    mcpServers: {},
+  });
 });
 
 test('picker choices include DISCOVERED models after presets, deduped against presets', async () => {

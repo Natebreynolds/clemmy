@@ -40,8 +40,6 @@
  *     best-effort from harness events for legacy progress surfaces.
  */
 import { runConversation, verifiedWorkflowRunDispatchReceipts, type RunConversationOptions } from './loop.js';
-import { resolveAcceptedTurnRead, type AcceptedTurnReadPorts, type AcceptedTurnReadResult } from '../read-path/read-lane-chat.js';
-import { buildProductionReadPortsForAcceptedTurn } from '../read-path/read-lane-adapters.js';
 import { currentAcceptedReadAuthority } from '../read-path/accepted-read-authority.js';
 import {
   resolveTurnCapabilityCandidates,
@@ -132,7 +130,6 @@ import {
 } from './turn-engine-selection.js';
 import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
 import { typedClassificationFromLastInterpretation } from '../semantic-boundary/interpret-accepted-source.js';
-import { recordWarmProcedureUse } from '../../memory/procedure-receipts.js';
 import { warmReadToolPolicyDigest } from '../read-path/warm-read-policy.js';
 import {
   assessCompletedAnswerReplay,
@@ -438,271 +435,6 @@ async function blockedPreRunResponse(
   });
 }
 
-/**
- * Serve a verified warm read as the whole turn (E4). Returns null on any
- * decline — the ordinary brain then runs unchanged with the same request.
- * The accepted source and the exactly-once TurnOutcome commit use the SAME
- * machinery as every other bridge terminal: nothing here is a second
- * committer.
- */
-async function serveAcceptedTurnReadUnderAuthority(
-  surface: HarnessSurface,
-  request: AssistantRequest,
-  authority: NonNullable<ReturnType<typeof currentAcceptedReadAuthority>>,
-): Promise<AssistantResponse | null> {
-  let ports: AcceptedTurnReadPorts | null = null;
-  try {
-    ports = await acceptedTurnReadPortsImpl(surface, request);
-  } catch { ports = null; }
-  if (!ports) return null; // fail closed: no derived authority, no lane
-  if (await warmReadCancellationRequested(request, authority)) return null;
-  let served: AcceptedTurnReadResult;
-  try {
-    served = await resolveAcceptedTurnRead(
-      { sessionId: request.sessionId, message: request.message, seq: String(authority.source.seq) },
-      ports,
-    );
-  } catch {
-    return null; // typed resolver trouble never breaks an ordinary turn
-  }
-  if (served.kind === 'spent') {
-    const stoppedResponse = (): AssistantResponse => withRouteDiagnostics({
-      text: 'That read stopped after the provider was contacted, so I did not run it again.',
-      sessionId: request.sessionId,
-      stoppedReason: 'cancelled',
-      raw: {
-        readLane: {
-          warm: true,
-          spent: true,
-          terminalCommitted: false,
-          counters: served.counters,
-        },
-      },
-    }, {
-      routeKind: 'harness',
-      surface,
-      requestedModel: request.model,
-      effectiveModel: 'read-lane-warm',
-      provider: 'verified-procedure',
-      transport: 'read_lane_warm_spent',
-      mode: getModelRoutingMode(),
-    });
-
-    // A spent read must never fall through into another brain/provider. Only
-    // the still-current, non-killed attempt may publish a durable blocked
-    // terminal; a stale invocation returns a non-retrying stopped response and
-    // leaves a newer attempt's terminal authority untouched.
-    const current = currentAcceptedReadAuthority(
-      request.sessionId,
-      request.sourceUserSeq,
-      request.runId,
-      request.message,
-    );
-    if (!current || current.attempt.attemptId !== authority.attempt.attemptId
-      || await warmReadCancellationRequested(request, authority)) {
-      try { finishRunAttempt(authority.attempt, 'cancelled'); } catch { /* telemetry */ }
-      return stoppedResponse();
-    }
-    try {
-      const sourceUserEvent = authority.source;
-      const identity: TurnIdentity = {
-        sessionId: request.sessionId,
-        turn: sourceUserEvent.turn,
-        sourceUserSeq: sourceUserEvent.seq,
-      };
-      const committedCounters = {
-        ...served.counters,
-        public_terminals: served.counters.public_terminals + 1,
-      };
-      const committed = commitTurnOutcomeImpl({
-        version: 2,
-        id: turnOutcomeId(identity),
-        identity,
-        status: 'blocked',
-        resumable: false,
-        presentation: {
-          kind: 'blocked',
-          text: 'The connected read ran, but its result could not be safely presented. I did not run it again.',
-        },
-      }, {
-        legacyReason: 'warm_read_spent',
-        metadata: {
-          transport: 'read_lane_warm_spent',
-          laneDigest: served.laneDigest,
-          counters: committedCounters as unknown as Record<string, unknown>,
-          warmReadPolicyDigest: warmReadToolPolicyDigest(request),
-        },
-      });
-      if (!committed.inserted) {
-        try { finishRunAttempt(authority.attempt, 'superseded'); } catch { /* telemetry */ }
-        return responseForExactTerminalReplayUnderPolicy(surface, request, {
-          kind: 'terminal',
-          event: committed.event,
-          presentation: committed.presentation,
-        });
-      }
-      served.counters.public_terminals = committedCounters.public_terminals;
-      await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
-      try { finishRunAttempt(authority.attempt, 'failed'); } catch { /* telemetry */ }
-      clearRunInFlightAfterTerminal(
-        request.sessionId,
-        authority.attempt.attemptId,
-        authority.source.seq,
-      );
-      return withRouteDiagnostics({
-        text: committed.presentation.text,
-        sessionId: request.sessionId,
-        stoppedReason: 'error',
-        raw: {
-          readLane: {
-            warm: true,
-            spent: true,
-            terminalCommitted: true,
-            counters: served.counters,
-          },
-        },
-      }, {
-        routeKind: 'harness',
-        surface,
-        requestedModel: request.model,
-        effectiveModel: 'read-lane-warm',
-        provider: 'verified-procedure',
-        transport: 'read_lane_warm_spent',
-        mode: getModelRoutingMode(),
-      });
-    } catch {
-      return stoppedResponse();
-    }
-  }
-  if (served.kind !== 'served') return null;
-  const stoppedAfterSuccessfulDispatch = (): AssistantResponse => withRouteDiagnostics({
-    text: 'That read stopped after the provider returned, so I did not run it again.',
-    sessionId: request.sessionId,
-    stoppedReason: 'cancelled',
-    raw: {
-      readLane: {
-        warm: true,
-        spent: true,
-        terminalCommitted: false,
-        artifactId: served.artifactId,
-        counters: served.counters,
-      },
-    },
-  }, {
-    routeKind: 'harness',
-    surface,
-    requestedModel: request.model,
-    effectiveModel: 'read-lane-warm',
-    provider: 'verified-procedure',
-    transport: 'read_lane_warm_stopped',
-    mode: getModelRoutingMode(),
-  });
-  if (await warmReadCancellationRequested(request, authority)) {
-    try { finishRunAttempt(authority.attempt, 'cancelled'); } catch { /* telemetry */ }
-    return stoppedAfterSuccessfulDispatch();
-  }
-  try {
-    // Provider work may have awaited account/schema state. Re-prove that the
-    // exact same physical attempt still owns this accepted source before the
-    // public terminal is committed.
-    const current = currentAcceptedReadAuthority(
-      request.sessionId,
-      request.sourceUserSeq,
-      request.runId,
-      request.message,
-    );
-    if (!current || current.attempt.attemptId !== authority.attempt.attemptId) {
-      try { finishRunAttempt(authority.attempt, 'cancelled'); } catch { /* telemetry */ }
-      return stoppedAfterSuccessfulDispatch();
-    }
-    const sourceUserEvent = authority.source;
-    const identity: TurnIdentity = {
-      sessionId: request.sessionId,
-      turn: sourceUserEvent.turn,
-      sourceUserSeq: sourceUserEvent.seq,
-    };
-    const committedCounters = {
-      ...served.counters,
-      public_terminals: served.counters.public_terminals + 1,
-    };
-    const committed = commitTurnOutcomeImpl({
-      version: 2,
-      id: turnOutcomeId(identity),
-      identity,
-      status: 'done',
-      resumable: false,
-      presentation: { kind: 'answer', text: served.draft },
-    }, {
-      metadata: {
-        transport: 'read_lane_warm',
-        artifactId: served.artifactId,
-        laneDigest: served.laneDigest,
-        counters: committedCounters as unknown as Record<string, unknown>,
-        warmReadPolicyDigest: warmReadToolPolicyDigest(request),
-      },
-    });
-    if (!committed.inserted) {
-      try { finishRunAttempt(authority.attempt, 'superseded'); } catch { /* telemetry */ }
-      return responseForExactTerminalReplayUnderPolicy(surface, request, {
-        kind: 'terminal',
-        event: committed.event,
-        presentation: committed.presentation,
-      });
-    }
-    served.counters.public_terminals = committedCounters.public_terminals;
-    // A provider receipt is not a served answer. Credit the artifact only
-    // after its exact public TurnOutcome has durably won publication.
-    try { recordWarmProcedureUse(served.artifactId); } catch { /* telemetry */ }
-    await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
-    try { finishRunAttempt(authority.attempt, 'completed'); } catch { /* telemetry */ }
-    clearRunInFlightAfterTerminal(
-      request.sessionId,
-      authority.attempt.attemptId,
-      authority.source.seq,
-    );
-    return withRouteDiagnostics({
-      text: committed.presentation.text,
-      sessionId: request.sessionId,
-      raw: {
-        readLane: {
-          warm: true,
-          artifactId: served.artifactId,
-          counters: served.counters,
-        },
-      },
-    }, {
-      routeKind: 'harness',
-      surface,
-      requestedModel: request.model,
-      effectiveModel: 'read-lane-warm',
-      provider: 'verified-procedure',
-      transport: 'read_lane_warm',
-      mode: getModelRoutingMode(),
-    });
-  } catch {
-    // Provider work and a verified receipt already exist. A commit race may
-    // replay its durable winner, but must never fall through to another brain.
-    try {
-      const winner = exactTerminalReplayForRequest(request);
-      if (winner) return responseForExactTerminalReplayUnderPolicy(surface, request, winner);
-    } catch { /* return the non-retrying stopped response below */ }
-    return stoppedAfterSuccessfulDispatch();
-  }
-}
-
-/**
- * One daemon owns one in-process warm activation per accepted attempt/source.
- * Followers await the exact same promise, so two concurrent transports cannot
- * both pass the preflight check and dispatch before terminal de-duplication.
- * Cross-process/durable admission remains graph-engine work; this deliberately
- * does not pretend to provide it.
- */
-interface AcceptedWarmReadInFlight {
-  policyDigest: string;
-  promise: Promise<AssistantResponse | null>;
-}
-const acceptedWarmReadsInFlight = new Map<string, AcceptedWarmReadInFlight>();
-
 function responseForWarmReadPolicyConflict(
   surface: HarnessSurface,
   request: AssistantRequest,
@@ -716,76 +448,6 @@ function responseForWarmReadPolicyConflict(
     ...routeForHarness(surface, request),
     transport: 'read_lane_policy_conflict',
   });
-}
-
-async function warmReadCancellationRequested(
-  request: AssistantRequest,
-  authority: NonNullable<ReturnType<typeof currentAcceptedReadAuthority>>,
-): Promise<boolean> {
-  if (isKillRequested(request.sessionId, {
-    attemptId: authority.attempt.attemptId,
-    runId: authority.attempt.runId,
-    sourceUserSeq: authority.source.seq,
-  })) return true;
-  const current = currentAcceptedReadAuthority(
-    request.sessionId,
-    request.sourceUserSeq,
-    request.runId,
-    request.message,
-  );
-  if (!current || current.attempt.attemptId !== authority.attempt.attemptId) return true;
-  if (!request.shouldCancel) return false;
-  try {
-    if (!await request.shouldCancel()) return false;
-    try {
-      requestKill(request.sessionId, 'cancelled by caller before warm-read dispatch', authority.attempt);
-    } catch { /* the exact attempt may have been superseded while polling */ }
-    return true;
-  } catch {
-    // Match the ordinary bridge cancellation contract: a broken predicate is
-    // observability trouble, not cancellation authority.
-    return false;
-  }
-}
-
-async function tryServeAcceptedTurnRead(
-  surface: HarnessSurface,
-  request: AssistantRequest,
-): Promise<AssistantResponse | null> {
-  // Warm execution never creates its own authority. Only an outer surface that
-  // already accepted the user event and bound the current active attempt may
-  // enter; every other request continues through the ordinary brain, whose
-  // existing acceptance path remains unchanged.
-  const authority = currentAcceptedReadAuthority(
-    request.sessionId,
-    request.sourceUserSeq,
-    request.runId,
-    request.message,
-  );
-  if (!authority) return null;
-  if (Array.isArray(request.allowedToolNames)
-    && !request.allowedToolNames.includes('composio_execute_tool')) return null;
-  if (request.excludeToolNames?.includes('composio_execute_tool')) return null;
-  if (await warmReadCancellationRequested(request, authority)) return null;
-
-  const key = `${request.sessionId}:${authority.source.seq}:${authority.attempt.attemptId}`;
-  const existing = acceptedWarmReadsInFlight.get(key);
-  const policyDigest = warmReadToolPolicyDigest(request);
-  if (existing) {
-    if (existing.policyDigest === policyDigest) return existing.promise;
-    // Same accepted source presented concurrently under different authority is
-    // not coalescible and must not fall through to a second brain/provider.
-    return responseForWarmReadPolicyConflict(surface, request);
-  }
-
-  const activation = serveAcceptedTurnReadUnderAuthority(surface, request, authority);
-  const entry = { policyDigest, promise: activation };
-  acceptedWarmReadsInFlight.set(key, entry);
-  try {
-    return await activation;
-  } finally {
-    if (acceptedWarmReadsInFlight.get(key) === entry) acceptedWarmReadsInFlight.delete(key);
-  }
 }
 
 function routeForHarness(surface: HarnessSurface, request: AssistantRequest, modelOverride?: string): AssistantRouteDiagnostics {
@@ -829,12 +491,6 @@ type ClaudeAgentBrainFn = typeof respondViaClaudeAgentSdkBrain;
 type RecoveryListEventsFn = typeof listEvents;
 type CommitTurnOutcomeFn = typeof commitTurnOutcome;
 type ResolveTurnCandidatesFn = typeof resolveTurnCapabilityCandidates;
-/** The shared accepted-turn read resolver (E4). Production default builds
- *  fail-closed ports; tests inject deterministic ones. */
-type AcceptedTurnReadPortsFactory = (
-  surface: HarnessSurface,
-  request: AssistantRequest,
-) => AcceptedTurnReadPorts | null | Promise<AcceptedTurnReadPorts | null>;
 let runConversationImpl: RunConversationFn = runConversation;
 let buildAgentImpl: BuildAgentFn = buildOrchestratorAgent;
 let configureImpl: ConfigureFn = configureHarnessRuntime;
@@ -849,27 +505,6 @@ let recoveryListEventsImpl: RecoveryListEventsFn = listEvents;
 let commitTurnOutcomeImpl: CommitTurnOutcomeFn = commitTurnOutcome;
 let resolveTurnCandidatesImpl: ResolveTurnCandidatesFn = resolveTurnCapabilityCandidates;
 let completedAnswerReplayProtectionImpl: CompletedAnswerReplayProtectionReader = readCompletedAnswerReplayProtection;
-const productionAcceptedTurnReadPorts: AcceptedTurnReadPortsFactory = async (_surface, request) => {
-  const authority = currentAcceptedReadAuthority(
-    request.sessionId,
-    request.sourceUserSeq,
-    request.runId,
-    request.message,
-  );
-  if (!authority) return null;
-  return buildProductionReadPortsForAcceptedTurn({
-    sessionId: request.sessionId,
-    sourceUserSeq: authority.source.seq,
-    sourceTurn: authority.source.turn,
-    attemptId: authority.attempt.attemptId,
-    runId: authority.attempt.runId,
-    message: request.message,
-    allowedToolNames: request.allowedToolNames,
-    excludedToolNames: request.excludeToolNames,
-    cancellationRequested: () => warmReadCancellationRequested(request, authority),
-  });
-};
-let acceptedTurnReadPortsImpl: AcceptedTurnReadPortsFactory = productionAcceptedTurnReadPorts;
 export function _setBridgeImplsForTests(impls: {
   runConversation?: RunConversationFn | null;
   buildAgent?: BuildAgentFn | null;
@@ -879,7 +514,6 @@ export function _setBridgeImplsForTests(impls: {
   recoveryListEvents?: RecoveryListEventsFn | null;
   commitTurnOutcome?: CommitTurnOutcomeFn | null;
   completedAnswerReplayProtection?: CompletedAnswerReplayProtectionReader | null;
-  acceptedTurnReadPorts?: AcceptedTurnReadPortsFactory | null;
   resolveTurnCandidates?: ResolveTurnCandidatesFn | null;
 }): void {
   runConversationImpl = impls.runConversation ?? runConversation;
@@ -890,7 +524,6 @@ export function _setBridgeImplsForTests(impls: {
   recoveryListEventsImpl = impls.recoveryListEvents ?? listEvents;
   commitTurnOutcomeImpl = impls.commitTurnOutcome ?? commitTurnOutcome;
   completedAnswerReplayProtectionImpl = impls.completedAnswerReplayProtection ?? readCompletedAnswerReplayProtection;
-  acceptedTurnReadPortsImpl = impls.acceptedTurnReadPorts ?? productionAcceptedTurnReadPorts;
   resolveTurnCandidatesImpl = impls.resolveTurnCandidates ?? resolveTurnCapabilityCandidates;
 }
 
@@ -2432,16 +2065,9 @@ async function respondPreferHarnessOnce(
       { reason: 'invalid_turn_engine' },
     );
   }
-  // E4: the shared accepted-turn READ resolver — ONE provider-neutral entry
-  // both brains flow through with the same accepted source. A deterministic
-  // decline costs ordinary chat nothing (no model call, no tool schema, no
-  // discovery); a verified warm read commits ONE typed terminal through the
-  // existing exactly-once committer and no brain runs at all.
-  if (!isHostTurnEngine(turnEngine)) {
-    const readServed = await tryServeAcceptedTurnRead(surface, request);
-    if (readServed) return readServed;
-  }
-
+  // Deliberately no pre-brain provider read runs at this boundary. The typed
+  // resolver components remain dormant until they can enter through the same
+  // durable carrier and physical-authority kernel as every other provider I/O.
   const useStandaloneClaudeExecutionBrain = claudeAgentSdkBrainEnabled(surface)
     && (SURFACE_CONFIG[surface].kind === 'execution' || allowStandaloneClaudeInteractiveBrainForTests);
   if (useStandaloneClaudeExecutionBrain) {

@@ -642,6 +642,23 @@ async function preparePermutation(
       assert.equal(limit, MAX_RETURNED_REFS_PER_ROLE);
       const role = /destination|spreadsheet|json rows/i.test(query) ? 'destination' : 'source';
       const rows = catalog.boundedCandidates(role, limit);
+      // Production Composio search deposits the complete provider row in the
+      // live schema cache before the planning-disclosure callback runs. This
+      // bounded fixture bypasses that adapter, so mirror the same observation:
+      // input, operation version, and an explicit provider-owned absence of an
+      // output schema. The later exact loader remains independent and is still
+      // the freeze-time revalidation read counted below.
+      const providerObservedAt = Math.max(0, Date.now() - 1_000);
+      for (const row of rows) {
+        if (!row.schema || typeof row.schema !== 'object' || Array.isArray(row.schema)) continue;
+        schemaCache.rememberToolSchema(
+          row.name,
+          row.schema,
+          providerObservedAt,
+          `fixture-${catalog.toolkit}-v1`,
+          null,
+        );
+      }
       providerMetadataRows += rows.length;
       return rows;
     },
@@ -765,7 +782,16 @@ async function preparePermutation(
     const durable = disclosedByRef.get(row.capabilityRef);
     assert.ok(durable, `ref-only result has no exact disclosure row: ${row.capabilityRef}`);
     assert.equal(durable?.identifier, row.name);
-    assert.match(String(durable?.schemaFingerprint ?? ''), /^[a-f0-9]{64}$/);
+    const providerDefinition = durable?.providerDefinition as Record<string, unknown> | undefined;
+    assert.equal(providerDefinition?.version, 1);
+    assert.match(String(providerDefinition?.providerInputSchemaDigest ?? ''), /^[a-f0-9]{64}$/);
+    assert.match(String(providerDefinition?.definitionFingerprint ?? ''), /^[a-f0-9]{64}$/);
+    assert.notEqual(providerDefinition?.providerInputSchemaDigest, providerDefinition?.definitionFingerprint,
+      'the full definition fingerprint must not alias the provider input-schema digest');
+    assert.equal(providerDefinition?.providerOperationVersion, `fixture-${catalog.toolkit}-v1`);
+    assert.equal(providerDefinition?.providerOutputSchemaDigest, null);
+    assert.equal(providerDefinition?.invokePortId,
+      `port:cap:resolved:${row.name.toLowerCase()}:${row.name}`);
     assert.ok(durable?.descriptor && typeof durable.descriptor === 'object');
   }
 
@@ -929,6 +955,91 @@ test('GATE: 100 cold 10K-catalog permutations stay bounded and freeze only live 
     <= INITIAL_PLANNING_SURFACE_CEILING);
   assert.ok(Math.max(...allMetrics.map((metric) => metric.discoverySchemaBytes))
     <= DISCOVERY_SCHEMA_CEILING);
+});
+
+test('GATE: a legacy input-digest disclosure rebuilds full staged identity after restart', {
+  timeout: 60_000,
+}, async () => {
+  const catalog = generatedCatalog(9_901);
+  const staged = await preparePermutation(catalog);
+  await staged.invocation.finish();
+
+  const selectedRefs = new Set([staged.sourceRef, staged.destinationRef]);
+  const currentRows = eventlog.listEvents(staged.identity.sessionId, { types: ['capability_discovered'] })
+    .flatMap((event) => Array.isArray(event.data.capabilities)
+      ? event.data.capabilities as Array<Record<string, unknown>>
+      : [])
+    .filter((row) => selectedRefs.has(String(row.capabilityRef ?? '')));
+  assert.equal(currentRows.length, 2);
+  const legacyRows = currentRows.map((row) => {
+    const providerDefinition = row.providerDefinition as Record<string, unknown> | undefined;
+    assert.match(String(providerDefinition?.providerInputSchemaDigest ?? ''), /^[a-f0-9]{64}$/);
+    const { providerDefinition: _removed, ...legacy } = row;
+    return {
+      ...legacy,
+      schemaFingerprint: providerDefinition!.providerInputSchemaDigest,
+    };
+  });
+
+  const session = eventlog.createSession({
+    id: 'large-catalog-legacy-disclosure-restart',
+    kind: 'chat',
+    userId: 'large-catalog-legacy-user',
+  });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: catalog.objective },
+  });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  const planningCandidates = [catalog.sourceSlug, catalog.destinationSlug].map((name) => ({
+    name,
+    schema: catalog.schemaOf(name)!,
+    carrier: 'work_call' as const,
+    sourceKind: 'authorized_composio' as const,
+  }));
+  await providerSources.stageDisclosedPlanningProviderCandidates({
+    ...identity,
+    candidates: planningCandidates,
+  });
+  eventlog.appendEvent({
+    sessionId: session.id,
+    turn: source.turn,
+    role: 'system',
+    type: 'capability_discovered',
+    data: { sourceUserSeq: source.seq, capabilities: legacyRows },
+  });
+
+  // Process state is gone, while the provider observation's original TTL and
+  // durable contract remain. Replay may use that current evidence to upgrade
+  // the legacy input digest, but may not reinterpret it as the full digest.
+  schemaCache._clearToolSchemaCacheForTest();
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) throw new Error(primed.reason);
+  assert.deepEqual(
+    primed.planning.capabilities.map((entry) => entry.id).sort(),
+    [staged.sourceRef, staged.destinationRef].sort(),
+  );
+
+  const rawPlan = buildPlanTaskTool({ planning: primed.planning }) as unknown as Invokable;
+  const planTool = brackets.wrapToolForHarness(rawPlan as never) as unknown as Invokable;
+  const deliveredPreambles: string[] = [];
+  const callId = 'plan-legacy-disclosure-after-restart';
+  const invocation = createHostInvocationSession([planTool], identity, deliveredPreambles);
+  const output = returnedText(await invocation.invoke(planTool, {
+    preamble: 'I’ll collect the restaurant rows and create the new spreadsheet.',
+    draft: planDraft(catalog, staged.sourceRef, staged.destinationRef),
+  }, callId, []));
+  await invocation.finish();
+  const body = JSON.parse(output) as { ok?: boolean; requirements?: unknown[]; detail?: string };
+  assert.equal(body.ok, true, output);
+  assert.equal(body.requirements?.length, 2);
+  assert.equal(deliveredPreambles.length, 1);
+  assert.ok(eventlog.getTurnGraphEventForSource(identity.sessionId, identity.sourceUserSeq));
+  assert.equal(businessCrossings, 0);
 });
 
 test('GATE: removal, rename, schema drift, and missing operation version fail typed before business I/O', {

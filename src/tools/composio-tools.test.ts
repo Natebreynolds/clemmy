@@ -400,17 +400,28 @@ test('single connected account learning binds normalized stable identity, never 
 });
 
 test('strict preferred identity selects only its exact active account and carries that pair to the dispatch boundary', async () => {
-  const { __test__: composioClientTest } = await import('../integrations/composio/client.js');
+  const composioClient = await import('../integrations/composio/client.js');
+  const composioClientTest = composioClient.__test__;
   const schemaCache = await import('./composio-schema-cache.js');
   const slug = 'OUTLOOK_LIST_MESSAGES';
-  schemaCache.rememberToolSchema(slug, { type: 'object', properties: {}, additionalProperties: false }, Date.now());
+  composioClient.resetComposioClient();
+  composioClientTest.setComposioApiKeyOverride('test-api-key-strict-preferred');
+  schemaCache.rememberToolSchema(
+    slug,
+    { type: 'object', properties: {}, additionalProperties: false },
+    Date.now(),
+    'test-operation-version',
+    null,
+  );
   composioClientTest.setConnectedAccountsLoader(async () => [
     {
       id: 'ca_exact_work', toolkit: { slug: 'outlook' }, status: 'ACTIVE',
+      user_id: 'provider-owner-work',
       data: { user_info: { email: 'work@example.com' } },
     },
     {
       id: 'ca_other_home', toolkit: { slug: 'outlook' }, status: 'ACTIVE',
+      user_id: 'provider-owner-home',
       data: { user_info: { email: 'home@example.com' } },
     },
   ]);
@@ -437,7 +448,7 @@ test('strict preferred identity selects only its exact active account and carrie
         return { successful: true, data: { items: [] } };
       },
     }));
-    assert.equal(dispatched.ok, true);
+    assert.equal(dispatched.ok, true, JSON.stringify(dispatched));
     assert.deepEqual(boundaryContext, {
       toolSlug: slug,
       args: {},
@@ -445,6 +456,7 @@ test('strict preferred identity selects only its exact active account and carrie
       identity: 'work@example.com',
       schemaFingerprint: schemaCache.liveComposioSchemaFingerprint(slug),
       providerInputSchemaDigest: exact.providerInputSchemaDigest,
+      providerOperationVersion: 'test-operation-version',
     });
 
     const absent = await resolveComposioDispatch(slug, {}, undefined, {
@@ -455,6 +467,8 @@ test('strict preferred identity selects only its exact active account and carrie
     if (!absent.ok) assert.equal(absent.reason, 'identity-absent');
   } finally {
     composioClientTest.setConnectedAccountsLoader(null);
+    composioClientTest.setComposioApiKeyOverride(null);
+    composioClient.resetComposioClient();
   }
 });
 
@@ -696,22 +710,26 @@ test('composioDispatchErrorProvesNoCommit accepts only an in-process pre-dispatc
 });
 
 test('a trusted dispatch-boundary refusal settles pre-dispatch and never calls the provider thunk', async () => {
-  const { __test__: composioClientTest } = await import('../integrations/composio/client.js');
+  const composioClient = await import('../integrations/composio/client.js');
+  const composioClientTest = composioClient.__test__;
   const schemaCache = await import('./composio-schema-cache.js');
   const slug = 'SLACK_SEND_MESSAGE';
+  composioClient.resetComposioClient();
+  composioClientTest.setComposioApiKeyOverride('test-api-key-boundary-refusal');
   schemaCache.rememberToolSchema(slug, {
     type: 'object',
     required: ['channel', 'markdown_text'],
     properties: { channel: { type: 'string' }, markdown_text: { type: 'string' } },
-  }, Date.now());
+  }, Date.now(), 'test-operation-version', null);
   composioClientTest.setConnectedAccountsLoader(async () => [{
-    id: 'ca_boundary_refusal', toolkit: { slug: 'slack' }, status: 'ACTIVE', data: {},
+    id: 'ca_boundary_refusal', toolkit: { slug: 'slack' }, status: 'ACTIVE',
+    user_id: 'provider-owner-boundary-refusal', data: {},
   }]);
+  await composioClient.listConnectedToolkits({ requireFresh: true });
   const anchor = anchorAcceptedTask('send one exact message');
   let providerCrossings = 0;
   try {
-    await assert.rejects(
-      withAnchoredRunContext(anchor, () => dispatchComposioTool(slug, {
+    const refusalAttempt = await withAnchoredRunContext(anchor, () => dispatchComposioTool(slug, {
         channel: 'C_EXACT', markdown_text: 'exact body',
       }, {
         dispatchBoundary: async (_resolved, providerDispatch) => {
@@ -722,8 +740,17 @@ test('a trusted dispatch-boundary refusal settles pre-dispatch and never calls t
           void crossProvider;
           throw new ExternalWritePreDispatchError('schema changed before provider invocation');
         },
-      })),
-      (error: unknown) => error instanceof ExternalWritePreDispatchError,
+      })).then(
+        (returned) => ({ kind: 'returned' as const, returned }),
+        (error: unknown) => ({ kind: 'thrown' as const, error }),
+      );
+    assert.equal(
+      refusalAttempt.kind,
+      'thrown',
+      refusalAttempt.kind === 'returned' ? JSON.stringify(refusalAttempt.returned) : undefined,
+    );
+    assert.ok(
+      refusalAttempt.kind === 'thrown' && refusalAttempt.error instanceof ExternalWritePreDispatchError,
     );
     assert.equal(providerCrossings, 0);
     // dispatchComposioTool is the logical-call owner here, not a brackets
@@ -764,6 +791,8 @@ test('a trusted dispatch-boundary refusal settles pre-dispatch and never calls t
     assert.equal(listEvents(anchor.sessionId, { types: ['external_write_orphaned'] }).length, 0);
   } finally {
     composioClientTest.setConnectedAccountsLoader(null);
+    composioClientTest.setComposioApiKeyOverride(null);
+    composioClient.resetComposioClient();
   }
 });
 
@@ -1728,26 +1757,30 @@ test('a gateway refusal is a nominal pre-dispatch RETURN and performs zero provi
   assert.ok((out as unknown) instanceof ExternalWritePreDispatchResult,
     'the refusal reaches the harness as the nominal typed class, never SDK error prose');
   const refusal = out as unknown as InstanceType<typeof ExternalWritePreDispatchResult>;
-  assert.match(refusal.output, /provider-dispatch:not-started:not-connected/i);
+  assert.match(refusal.output, /provider-dispatch:not-started:(?:not-connected|identity-absent)/i);
   assert.match(refusal.reason, /provider-dispatch:not-started/);
   assert.equal(dispatches, 0);
 });
 
 test('a current closed no-arg read repairs invented inner args once and dispatches exactly {}', async () => {
   const { runComposioExecuteWithGatewayForTest } = await import('./composio-tools.js');
-  const { __test__: composioClientTest } = await import('../integrations/composio/client.js');
+  const composioClient = await import('../integrations/composio/client.js');
+  const composioClientTest = composioClient.__test__;
   const { ExternalWritePreDispatchResult } = await import('../runtime/harness/external-write-admission.js');
   const schemaCache = await import('./composio-schema-cache.js');
   const slug = 'PROOF_LIST_TASKS';
+  composioClient.resetComposioClient();
+  composioClientTest.setComposioApiKeyOverride('test-api-key-no-arg-read');
   schemaCache.rememberToolSchema(slug, {
     type: 'object',
     properties: {},
     additionalProperties: false,
-  }, Date.now());
+  }, Date.now(), 'test-operation-version', null);
   composioClientTest.setConnectedAccountsLoader(async () => [{
     id: 'ca_proof_no_arg_read',
     toolkit: { slug: 'proof' },
     status: 'ACTIVE',
+    user_id: 'provider-owner-proof',
     data: { user_info: { email: 'proof@example.test' } },
   }]);
 
@@ -1785,7 +1818,7 @@ test('a current closed no-arg read repairs invented inner args once and dispatch
       type: 'object',
       properties: { status: { type: 'string' } },
       additionalProperties: false,
-    }, Date.now());
+    }, Date.now(), 'test-operation-version', null);
     const filteredAnchor = anchorAcceptedTask('list the filtered proof tasks', 'sess-nonempty-schema-no-repair');
     const filtered = await withAnchoredRunContext(filteredAnchor, () => runComposioExecuteWithGatewayForTest(
       filteredSlug,
@@ -1801,7 +1834,7 @@ test('a current closed no-arg read repairs invented inner args once and dispatch
       type: 'object',
       properties: {},
       additionalProperties: false,
-    }, Date.now());
+    }, Date.now(), 'test-operation-version', null);
     const writeAnchor = anchorAcceptedTask('update the proof task', 'sess-write-no-repair');
     const write = await withAnchoredRunContext(writeAnchor, () => runComposioExecuteWithGatewayForTest(
       writeSlug,
@@ -1814,6 +1847,8 @@ test('a current closed no-arg read repairs invented inner args once and dispatch
     assert.equal(outOfScopeDispatches, 0, 'the repair never broadens to nonempty schemas or writes');
   } finally {
     composioClientTest.setConnectedAccountsLoader(null);
+    composioClientTest.setComposioApiKeyOverride(null);
+    composioClient.resetComposioClient();
   }
 });
 

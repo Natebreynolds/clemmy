@@ -320,9 +320,10 @@ export function enqueueSpaceActionApproval(
   return { approvalId: registered.row.approvalId, subject };
 }
 
-/** Execute one resolved-approved action. A durable receipt is replayed before
- * mutable Workspace checks so an archive/edit after provider success cannot
- * erase truth or trigger a second dispatch. */
+/** Execute one resolved-approved action. A durable compatibility receipt for
+ * a local runner is replayed before mutable Workspace checks so an archive/edit
+ * cannot erase truth or trigger a second spawn. Historical Composio rows are
+ * refused by replaySpaceActionMutation and are never provider authority. */
 async function executeApprovedSpaceActionOnce(row: PendingApprovalRow): Promise<void> {
   if (
     row.tool !== SPACE_ACTION_TOOL

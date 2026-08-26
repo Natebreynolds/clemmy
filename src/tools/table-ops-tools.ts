@@ -7,7 +7,7 @@
  * lossless PARKED OUTPUT (`left_call_id`) or a staged file (`left_file`), so a
  * 10k-row sheet read is reconciled WITHOUT the rows ever entering model
  * context (the visible read was digest-clipped at 12k bytes; the park keeps
- * every byte up to its durable cap and fails closed beyond it). Results over the inline cap spill to a staged JSONL file
+ * every byte from its inline-plus-chunk durable record and fails closed on legacy/corrupt incomplete storage). Results over the inline cap spill to a staged JSONL file
  * whose path chains straight back in as `left_file` — or onward to an
  * upload via the file pipeline.
  */
@@ -59,7 +59,7 @@ function loadSide(
     if (resolution.status === 'failed') throw new Error(`stored output for call id "${input.callId}" cannot be used because ${resolution.reason} — re-run the source read.`);
     if (resolution.record.truncatedAtWrite) {
       throw new Error(
-        `stored output for call id "${input.callId}" is incomplete (${resolution.record.contentBytes} original bytes exceeded the durable output cap), so table_ops will not compute totals from a prefix. `
+        `stored output for call id "${input.callId}" is incomplete (${resolution.record.contentBytes} original bytes; legacy truncation or missing/corrupt chunks), so table_ops will not compute totals from a prefix. `
         + 'Re-read/page the provider source until every page is present, or stage the full result as a file and pass it as left_file/right_file.',
       );
     }
@@ -100,7 +100,7 @@ export function registerTableOpsTools(server: McpServer): void {
     'table_ops',
     [
       'Deterministic table operations over lists/rows — diff, intersect, join, dedupe, aggregate (group+count/sum/avg/min/max), select (filter/project/limit). Use this instead of eyeballing rows in context: it is exact at any size.',
-      'Inputs: pass ONE source per side — inline rows (JSON array / JSONL / CSV / TSV string), a PRIOR TOOL CALL id (left_call_id — operates on the lossless parked output even when the model-visible copy was clipped), or a staged file path (left_file). A provider result that exceeded the durable cap fails closed; page/re-read it or stage the full result as a file.',
+      'Inputs: pass ONE source per side — inline rows (JSON array / JSONL / CSV / TSV string), a PRIOR TOOL CALL id (left_call_id — operates on the lossless parked output even when the model-visible copy was clipped), or a staged file path (left_file). A legacy-truncated or corrupt/missing chunked result fails closed; page/re-read it or stage the full result as a file.',
       'key = comma-separated column name(s) to match on (string compare is trimmed + case-insensitive — email-friendly).',
       'Examples: who is in the CRM but not the sheet → op:diff, left_call_id:<crm read>, right_call_id:<sheet read>, key:email. Dedupe sheet rows → op:dedupe, key:email. Tally by owner → op:aggregate, group_by:owner.',
       'Large results spill to a JSONL file whose filePath chains back in as left_file or onward to uploads.',

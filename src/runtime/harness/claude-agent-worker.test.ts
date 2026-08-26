@@ -74,6 +74,8 @@ test('renderClaudeAgentWorkerSystemAppend tells Claude to use named skills and s
   assert.match(prompt, /READ-ONLY\/local-context/);
   assert.match(prompt, /call `skill_read`/);
   assert.match(prompt, /Worker intent: design/);
+  assert.doesNotMatch(prompt, /report hero/, 'per-item data stays out of the shared system prefix');
+  assert.match(prompt, /final field of the attached Packet JSON/);
 });
 
 test('agentic Claude worker guidance is compose-only for Composio mutations', () => {

@@ -5356,11 +5356,11 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        // approve → "Approval not found" → task failed, row still pending).
 	        const resolveDrainApproval = drainApprovalResolverForTests
               ?? (await import('./approval-drain.js')).resolveDrainApproval;
-	        const result = await resolveDrainApproval({
-	          approvalId: resolution.approvalId,
-	          approved: resolution.approved,
-	          legacyResolve: () => assistant.getRuntime().resolveApproval(resolution.approvalId, resolution.approved),
-	        });
+		        const result = await resolveDrainApproval({
+		          approvalId: resolution.approvalId,
+		          approved: resolution.approved,
+		          sessionId: task.runSessionId,
+		        });
         if (heartbeatTimer) clearInterval(heartbeatTimer);
 
         switch (result.status) {

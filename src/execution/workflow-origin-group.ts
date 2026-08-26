@@ -2814,6 +2814,18 @@ export function registerWorkflowRunDrainKick(
   };
 }
 
+/** Request an immediate workflow-run drain after durable queue admission.
+ *
+ * This is latency-only: callers must invoke it after the run record is durable,
+ * callback failure is ignored, and the daemon's periodic drain remains the
+ * recovery path. Keeping the request beside registration lets every queue
+ * producer use the same hook without importing the daemon. */
+export function requestWorkflowRunDrainKick(runIds: readonly string[]): void {
+  const exact = [...new Set(runIds.map((runId) => runId.trim()).filter(Boolean))];
+  if (exact.length === 0) return;
+  try { workflowRunDrainKick?.(exact); } catch { /* timer is recovery */ }
+}
+
 /** Activation is restart-safe: member sidecars and held→queued transitions are
  * individually idempotent; the create-only receipt owns complete activation,
  * while the pre-release callback enforces publish-before-execute. */
@@ -2883,7 +2895,7 @@ export function activateWorkflowOriginGroup(
   if (!active || active.activation.activationDigest !== activation.activationDigest) {
     throw new Error('workflow origin group activation did not become durable and complete');
   }
-  try { workflowRunDrainKick?.(active.activation.memberRunIds); } catch { /* timer is recovery */ }
+  requestWorkflowRunDrainKick(active.activation.memberRunIds);
   return active;
 }
 

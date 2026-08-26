@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Agent, RunState, Runner, setDefaultOpenAIKey } from '@openai/agents';
+import { Agent, Runner, setDefaultOpenAIKey } from '@openai/agents';
 import { ASSISTANT_NAME, MODELS, OPENAI_API_KEY } from '../config.js';
 import type {
   ApprovalResolutionResult,
@@ -11,11 +11,7 @@ import type {
 } from '../types.js';
 import { AgentRuntimeCancelledError, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
 import { ApprovalStore } from './approval-store.js';
-import { getCoreToolsAsync } from '../tools/registry.js';
-import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
 import { addNotification } from './notifications.js';
-import { defaultOrchestratorHandoffs } from '../agents/sub-agents.js';
-import { buildPlannerTool } from '../agents/planner.js';
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -84,16 +80,6 @@ function toolActivityFromRunItem(item: unknown): ToolActivity | null {
 export class OpenAIRuntime implements AgentRuntime {
   private readonly runner: Runner;
   private readonly approvals = new ApprovalStore();
-  // Single namespaced shim wrapping every configured MCP server.
-  // Wrapped in an array because the SDK signature is `mcpServers: MCPServer[]`.
-  // The shim itself flattens N underlying servers into one tool surface
-  // with `<server>__<tool>` names, eliminating duplicate-name throws.
-  // Lazily resolved on each agent build so dashboard MCP edits land on
-  // the next request (invalidateConfiguredMcpServers() drops the cache).
-  private get mcpServers() {
-    return [getOrCreateConfiguredMcpServers()];
-  }
-
   constructor() {
     if (OPENAI_API_KEY) {
       setDefaultOpenAIKey(OPENAI_API_KEY);
@@ -103,40 +89,24 @@ export class OpenAIRuntime implements AgentRuntime {
       workflowName: 'clementine-next',
       groupId: 'clementine',
     });
+    // This compatibility runtime is model-only. Pending SDK RunState rows from
+    // older builds carry no authority in the shared host kernel, so preserve
+    // their opaque evidence but remove them from the executable queue.
+    this.approvals.retirePending();
   }
 
   private async createAgent(request: RunRequest): Promise<Agent<RuntimeContextValue>> {
-    // Keep Composio token-efficient: expose the compact broker tools
-    // (`composio_search_tools` -> `composio_execute_tool`) instead of
-    // injecting one cx_* function per connected action into every run.
-    const tools = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-    const exclude = request.excludeToolNames && request.excludeToolNames.length > 0
-      ? new Set(request.excludeToolNames)
-      : null;
-    // Code-level backstop for per-call tool restriction. See
-    // RunRequest.excludeToolNames — used e.g. by the Workflow Architect
-    // chat to hide workflow_* tools so the model can't bypass the
-    // diff-card flow even if the prompt is ignored.
-    const filteredTools = exclude
-      ? tools.filter((t) => !exclude.has((t as { name?: string }).name ?? ''))
-      : tools;
+    // Direct SDK execution is retained only for model text (for example the
+    // controller's strict JSON decisions). The shared host harness is the
+    // sole executable tool and handoff owner.
     return new Agent<RuntimeContextValue>({
       name: ASSISTANT_NAME,
       instructions:
         request.instructions ||
         'You are Clementine, a persistent executive assistant. Be concise, accurate, and action-oriented.',
       model: request.model || MODELS.primary,
-      // Core tool surface plus the Planner-as-tool — the orchestrator
-      // can invoke `draft_plan` to think before executing on complex
-      // multi-step work without transferring control.
-      tools: [...filteredTools, buildPlannerTool()],
-      // Chat path runs as the orchestrator: it can hand off to specialized
-      // sub-agents (Researcher / Writer / Reviewer / Executor / Deployer)
-      // exactly like the autonomy path. The Executor + Deployer handoffs
-      // are gated behind an active tracked execution so risky mutations
-      // require the user to promote work into a tracked task first.
-      handoffs: await defaultOrchestratorHandoffs({ requireWorkflowApprovalForExecution: true }),
-      mcpServers: this.mcpServers,
+      tools: [],
+      handoffs: [],
     });
   }
 
@@ -144,30 +114,11 @@ export class OpenAIRuntime implements AgentRuntime {
     return this.approvals.listPending();
   }
 
-  private notifyApprovalPending(approval: PendingApproval): void {
+  private notifyApprovalResolved(result: ApprovalResolutionResult, approval: PendingApproval): void {
     addNotification({
-      id: `${Date.now()}-approval-${approval.id}`,
+      id: `${Date.now()}-approval-${result.approvalId}-${result.status}`,
       kind: 'approval',
-      title: `Approval required: ${approval.toolName}`,
-      body: `Approval ${approval.id} is required before work can continue.`,
-      createdAt: new Date().toISOString(),
-      read: false,
-      metadata: {
-        approvalId: approval.id,
-        sessionId: approval.sessionId,
-        toolName: approval.toolName,
-        userId: approval.userId,
-        channel: approval.channel,
-        discordUserId: approval.channel?.startsWith('discord:') ? approval.userId : undefined,
-      },
-    });
-  }
-
-  private notifyApprovalResolved(result: ApprovalResolutionResult, approval: PendingApproval, approved: boolean): void {
-    addNotification({
-      id: `${Date.now()}-approval-${result.approvalId}-${approved ? 'approved' : 'rejected'}`,
-      kind: 'approval',
-      title: `Approval ${approved ? 'approved' : 'rejected'}: ${approval.toolName}`,
+      title: `Approval ${result.status}: ${approval.toolName}`,
       body: result.text,
       createdAt: new Date().toISOString(),
       read: false,
@@ -188,85 +139,18 @@ export class OpenAIRuntime implements AgentRuntime {
       throw new Error(`Approval ${approvalId} not found.`);
     }
 
-    const agent = await this.createAgent({
-      sessionId: approval.sessionId,
-      prompt: '',
-      model: MODELS.primary,
-    });
-
-    const state = await RunState.fromString<RuntimeContextValue, Agent<RuntimeContextValue>>(agent, approval.state);
-    const interruption = state.getInterruptions()[0];
-    if (!interruption) {
-      throw new Error(`Approval ${approvalId} no longer has a pending interruption.`);
+    if (approval.status === 'pending') {
+      this.approvals.updateStatus(approvalId, 'rejected');
     }
-
-    const resolutionStatus: ApprovalResolutionResult['status'] = approved ? 'approved' : 'rejected';
-
-    if (approved) {
-      state.approve(interruption);
-    } else {
-      state.reject(interruption);
-    }
-
-    const resumed = await this.runner.run(agent, state, {
-      context: {
-        sessionId: approval.sessionId,
-      },
-      maxTurns: 12,
-    });
-
-    const nextApproval = resumed.interruptions[0];
-    if (nextApproval) {
-      this.approvals.updateStatus(approvalId, approved ? 'approved' : 'rejected', resumed.state.toString());
-      const followUpId = randomUUID();
-      const rawItem = nextApproval.toJSON().rawItem as { name?: string };
-      this.approvals.add({
-        id: followUpId,
-        sessionId: approval.sessionId,
-        agentName: ASSISTANT_NAME,
-        toolName: rawItem.name || 'unknown_tool',
-        userId: approval.userId,
-        channel: approval.channel,
-        createdAt: new Date().toISOString(),
-        status: 'pending',
-        state: resumed.state.toString(),
-      });
-
-      const outcome = {
-        approvalId,
-        status: resolutionStatus,
-        sessionId: approval.sessionId,
-        text: `Resolved ${approvalId}. Another approval is required: ${followUpId}`,
-        nextApprovalId: followUpId,
-      };
-      this.notifyApprovalResolved(outcome, approval, approved);
-      this.notifyApprovalPending({
-        id: followUpId,
-        sessionId: approval.sessionId,
-        agentName: ASSISTANT_NAME,
-        toolName: rawItem.name || 'unknown_tool',
-        userId: approval.userId,
-        channel: approval.channel,
-        createdAt: new Date().toISOString(),
-        status: 'pending',
-        state: resumed.state.toString(),
-      });
-      return outcome;
-    }
-
-    const finalText = typeof resumed.finalOutput === 'string'
-      ? resumed.finalOutput
-      : JSON.stringify(resumed.finalOutput);
-
-    this.approvals.updateStatus(approvalId, approved ? 'approved' : 'rejected', resumed.state.toString());
-
-    const outcome = {
+    const outcome: ApprovalResolutionResult = {
       approvalId,
-      status: resolutionStatus,
+      status: 'rejected',
       sessionId: approval.sessionId,
-      text: finalText || `Approval ${approvalId} ${approved ? 'approved' : 'rejected'}.`,
+      text: approved
+        ? `Legacy approval ${approvalId} was retired and was not executed. Re-submit the action through Clementine's shared harness so it can receive current authority.`
+        : `Approval ${approvalId} rejected. Its legacy runtime state was not executed.`,
     };
-    this.notifyApprovalResolved(outcome, approval, approved);
+    this.notifyApprovalResolved(outcome, approval);
     return outcome;
   }
 
@@ -299,28 +183,11 @@ export class OpenAIRuntime implements AgentRuntime {
 	    }
     const text = typeof result.finalOutput === 'string' ? result.finalOutput : JSON.stringify(result.finalOutput);
 
-    const approval = result.interruptions[0];
-    if (approval) {
-      const approvalId = randomUUID();
-      const rawItem = approval.toJSON().rawItem as { name?: string };
-      const pendingApproval: PendingApproval = {
-        id: approvalId,
-        sessionId: context.sessionId,
-        agentName: ASSISTANT_NAME,
-        toolName: rawItem.name || 'unknown_tool',
-        userId: context.userId,
-        channel: context.channel,
-        createdAt: new Date().toISOString(),
-        status: 'pending',
-        state: result.state.toString(),
-      };
-      this.approvals.add(pendingApproval);
-      this.notifyApprovalPending(pendingApproval);
-
+    if (result.interruptions[0]) {
       return {
-        text: `Approval required before I continue. Pending approval ID: ${approvalId}`,
+        text: 'A tool request from the retired direct runtime was not started. Re-submit the work through Clementine\'s shared harness.',
         sessionId: context.sessionId,
-        pendingApprovalId: approvalId,
+        stoppedReason: 'blocked',
         raw: result,
       };
     }

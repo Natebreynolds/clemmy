@@ -43,8 +43,8 @@ export type DrainApprovalResolutionResult =
  *   runConversationFromResume (which carries BOTH resume paths: serialized
  *   interrupt state and the no-blob approved-payload replay), and map the
  *   outcome back to the drain's ApprovalResolutionResult contract.
- *   No registry row → the legacy runtime store is authoritative (codex-native
- *   in-memory approvals) and the caller's original call runs unchanged.
+ *   No registry row → fail closed. Opaque legacy runtime approvals cannot
+ *   mint shared-host authority and are never deserialized or resumed here.
  *
  * Rejections never resume: the drain aborts the task on rejection, so a
  * resume turn would spend tokens narrating a stop that is already decided.
@@ -52,9 +52,12 @@ export type DrainApprovalResolutionResult =
 export async function resolveDrainApproval(opts: {
   approvalId: string;
   approved: boolean;
+  /** Owning task session, used only to return a truthful blocked disposition
+   * when no canonical registry row exists. */
+  sessionId?: string;
   resolver?: string;
-  /** The drain's original path: assistant.getRuntime().resolveApproval(...). */
-  legacyResolve: () => Promise<ApprovalResolutionResult>;
+  /** Deprecated compatibility seam. It is intentionally never invoked. */
+  legacyResolve?: () => Promise<ApprovalResolutionResult>;
   /** Test seams; default to the real registry + resume implementations. */
   registryForTest?: {
     get: (id: string) => { sessionId: string; status: string; resolution?: string | null } | undefined;
@@ -69,7 +72,16 @@ export async function resolveDrainApproval(opts: {
   const registry = opts.registryForTest
     ?? await import('../runtime/harness/approval-registry.js');
   const row = registry.get(opts.approvalId);
-  if (!row) return opts.legacyResolve();
+  if (!row) {
+    const reason = `Legacy approval ${opts.approvalId} is retired and was not executed because it has no canonical shared-host registry authority.`;
+    return {
+      approvalId: opts.approvalId,
+      status: 'blocked',
+      sessionId: opts.sessionId ?? '',
+      text: reason,
+      reason,
+    };
+  }
 
   const resolver = opts.resolver ?? 'background-task-drain';
   if (row.status === 'pending') {

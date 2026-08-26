@@ -87,7 +87,7 @@ const {
   recordRunAttemptUserInput,
 } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, claimOrphanedToolCompletions, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText, _terminalQuestionTextForTest } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, _acceptResumeConversationInputForTest, finalizeDeferredToolCallsLimitTerminal, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, claimOrphanedToolCompletions, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText, _terminalQuestionTextForTest } = await import('./loop.js');
 const {
   isSafeDurableMemoryReceiptPresentation,
   looksLikeHealthyDurableMemoryAcknowledgement,
@@ -2668,6 +2668,7 @@ test('ToolCallsLimitExceeded thrown by run surfaces as guardrail_tripped', async
   });
 
   assert.equal(result.status, 'limit_exceeded');
+  assert.equal(result.limitKind, 'tool_calls');
   // Filter to the specific kind — v0.5.18 preflight gate now emits
   // an additional guardrail_tripped(kind:preflight_budget_check) per
   // turn for observability, so a length:1 assertion is too tight.
@@ -3084,6 +3085,68 @@ test('runConversationFromResume publishes the exact new approval requested by th
     'SELECT state FROM accepted_task_authority WHERE session_id = ? AND source_user_seq = ?',
   ).get(sess.id, accepted.seq) as { state: string } | undefined;
   assert.ok(authorityRow, 'the resume source is armed');
+});
+
+test('runConversationFromResume keeps a deferred tool ceiling nonterminal for its exact approval source', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeDeferredToolLimitTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume deferred tool limit' });
+  sess.saveInterruptState(makeApprovalRunState(agent, 'approved_tool'));
+  const approval = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'approved exact action',
+    tool: 'approved_tool',
+    args: {},
+  });
+  const sourceUserSeq = _acceptResumeConversationInputForTest({
+    sessionId: sess.id,
+    approvalId: approval.approvalId,
+    decision: 'approve',
+  });
+  const runtimeTerminals: string[] = [];
+  const unsubscribe = actionBus.subscribe((event) => {
+    if (
+      event.sessionId === sess.id
+      && (event.kind === 'runtime.completed' || event.kind === 'runtime.failed')
+    ) runtimeTerminals.push(event.kind);
+  });
+
+  try {
+    const checkpoint = await runConversationFromResume({
+      agent,
+      sessionId: sess.id,
+      sourceUserSeq,
+      approvalId: approval.approvalId,
+      decision: 'approve',
+      resolver: 'unit-test',
+      deferToolCallsLimitTerminal: true,
+      makeRunner: makeRunnerStub,
+      runRunner: async () => { throw new ToolCallsLimitExceeded(1); },
+    });
+
+    assert.equal(checkpoint.status, 'limit_exceeded');
+    assert.equal(checkpoint.limitKind, 'tool_calls');
+    assert.equal(checkpoint.publicPresentation, undefined);
+    assert.equal(getSession(sess.id)?.status, 'active');
+    assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).length, 0);
+    assert.deepEqual(runtimeTerminals, []);
+    assert.deepEqual(
+      listEvents(sess.id, { types: ['user_input_received'] }).map((event) => event.seq),
+      [sourceUserSeq],
+    );
+
+    const finalized = finalizeDeferredToolCallsLimitTerminal({
+      checkpoint,
+      sourceUserSeq,
+      outcome: { kind: 'limit_exceeded' },
+    });
+    assert.equal(finalized.publicPresentation?.needs?.kind, 'continue');
+    assert.equal(getSession(sess.id)?.status, 'failed');
+    assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).length, 1);
+    assert.deepEqual(runtimeTerminals, ['runtime.completed']);
+  } finally {
+    unsubscribe();
+  }
 });
 
 test('runConversationFromResume continuation publishes its exact SDK approval instead of the resolved prior card', async () => {
@@ -8150,8 +8213,9 @@ test('objective judge: continuation budget caps retries, then delivery verifier 
 // Workflow/controller mechanics only: this deliberately does not claim
 // standard chat/action acceptance coverage. The typed chat dispatcher owns a
 // participated action before the legacy model loop can recurse.
-// TODO(host-runner-default-cutover): prove false,false,true standard-chat
-// continuation at the host-runner seam once typed execution exposes it.
+// Host-owned continuation/checkpoint behavior is exercised through the real
+// production host builder in host-turn-runner.test.ts; this fixture remains a
+// narrow regression for the legacy workflow/controller loop.
 test('runConversation workflow-controller mechanics: recurses through done=false steps until done=true', async () => {
   const sess = HarnessSession.create({ kind: 'workflow' });
   const runner = scriptedRunner([

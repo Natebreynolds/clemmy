@@ -103,18 +103,37 @@ export const _bindResolutionInputForTest = bindResolutionInput;
 // resolution deadline expired. The abandoned resolution leg keeps running
 // (the fetch has no abort seam) and would otherwise land its AUTHORITATIVE
 // write for a source that decided without it — observed live +64s after
-// disclosure. First writer wins: the deadline outcome supersedes the leg.
-const supersededResolutionSources = new Set<string>();
+// disclosure.
+//
+// Suppression is owned by the still-running leg, not by a capped FIFO of
+// completed source tombstones. A FIFO made the 513th simultaneous timeout
+// evict source one while its provider promise was still pending, allowing that
+// older promise to publish late authority. Each abandoned leg now contributes
+// one lifecycle token; it releases that token only after the leg settles. A
+// genuinely wedged promise necessarily retains its small token because it is
+// still capable of publishing. Completed legs leave no unbounded tombstone.
+const supersededResolutionLegs = new Map<string, Set<symbol>>();
 
 export function markAdmissionCapabilityResolutionSuperseded(
   sessionId: string,
   sourceUserSeq: number,
+  untilSettled: PromiseLike<unknown>,
 ): void {
-  supersededResolutionSources.add(`${sessionId}#${sourceUserSeq}`);
-  if (supersededResolutionSources.size > 512) {
-    const oldest = supersededResolutionSources.values().next().value;
-    if (oldest !== undefined) supersededResolutionSources.delete(oldest);
-  }
+  const key = `${sessionId}#${sourceUserSeq}`;
+  const token = Symbol(key);
+  const tokens = supersededResolutionLegs.get(key) ?? new Set<symbol>();
+  tokens.add(token);
+  supersededResolutionLegs.set(key, tokens);
+  const release = (): void => {
+    const current = supersededResolutionLegs.get(key);
+    if (!current) return;
+    current.delete(token);
+    if (current.size === 0) supersededResolutionLegs.delete(key);
+  };
+  // Attach both handlers directly instead of `.finally()`: a rejected
+  // abandoned leg is expected degradation, and must not create a second
+  // unhandled rejected promise merely to release its suppression token.
+  void untilSettled.then(release, release);
 }
 
 export function recordAdmissionCapabilityResolution(input: {
@@ -124,7 +143,7 @@ export function recordAdmissionCapabilityResolution(input: {
   entries: CapabilityResolutionEntry[];
 }): void {
   if (input.entries.length === 0) return;
-  if (supersededResolutionSources.has(`${input.sessionId}#${input.sourceUserSeq}`)) return;
+  if (supersededResolutionLegs.has(`${input.sessionId}#${input.sourceUserSeq}`)) return;
   const resolution = bindResolutionInput(
     { entries: input.entries, registryAvailable: true },
     input.acceptedInput,

@@ -77,19 +77,19 @@ test('a partial proven capability cannot withhold the first missing-capability d
   assert.ok(first, 'the first search for the unresolved capability is admitted');
   assert.equal(first.category, 'broad_discovery');
 
-  // A synonym carrier for the same toolkit SHARES the claim rather than minting
-  // a second one — that is the invariant. It is no longer refused for it: the
-  // caller already paid for this call, and a refusal only bought a reformulated
-  // retry through yet another door.
-  const synonym = admitDiscoveryBoundary({
-    sessionId: session.id,
-    sourceUserSeq: source.seq,
-    turn: 1,
-    attemptId: 'partial-capability-attempt',
-    toolName: 'composio_list_tools',
-    input: { toolkit_slug: 'apify', limit: 200 },
-    callId: 'apify-discovery-synonym-2',
-  });
-  assert.ok(synonym, 'the synonym carrier is admitted against the claim already held');
-  assert.equal(synonym.subject, first.subject, 'synonyms and carriers share one claim subject');
+  // A synonym carrier shares the durable subject but not its physical provider
+  // authority. A different call id is denied before provider I/O.
+  assert.throws(
+    () => admitDiscoveryBoundary({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      turn: 1,
+      attemptId: 'partial-capability-attempt',
+      toolName: 'composio_list_tools',
+      input: { toolkit_slug: 'apify', limit: 200 },
+      callId: 'apify-discovery-synonym-2',
+    }),
+    (error: unknown) => error instanceof DiscoveryBudgetDeniedError
+      && error.reason === 'new_call_requires_retry_epoch',
+  );
 });

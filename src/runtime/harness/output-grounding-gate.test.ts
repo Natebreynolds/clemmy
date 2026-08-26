@@ -36,7 +36,7 @@ const {
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
 function writeAuthoritativeOutput(
-  input: Parameters<typeof writeToolOutput>[0],
+  input: Parameters<typeof writeToolOutput>[0] & { arguments?: unknown },
   sourceUserSeq?: number,
 ): void {
   const effect = 'read';
@@ -47,6 +47,7 @@ function writeAuthoritativeOutput(
     type: 'tool_called',
     data: {
       tool: input.tool ?? 'unknown_tool', callId: input.callId, effect,
+      ...(input.arguments === undefined ? {} : { arguments: input.arguments }),
       ...(sourceUserSeq ? { sourceUserSeq } : {}),
     },
   });
@@ -356,6 +357,35 @@ test('evaluateOutputGrounding: no-plausible-source figure is ADVISORY, not a blo
     const r = await evaluateOutputGrounding(sess.id, 'Traffic looks healthy and the conversion rate is 47%.', { kind: 'chat' });
     assert.equal(r.action, 'advisory', 'no-source → inform, do not wedge');
     assert.ok(r.figures.includes('47%'));
+  } finally {
+    _setOutputGroundingJudgeForTests(null);
+  }
+});
+
+test('evaluateOutputGrounding: renamed and one-digit request echoes cannot self-certify a figure', async () => {
+  resetEventLog();
+  _resetOutputGroundingStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  writeAuthoritativeOutput({
+    sessionId: sess.id,
+    callId: 'renamed-numeric-echo',
+    tool: 'provider_search',
+    arguments: { query: 5 },
+    output: JSON.stringify({ ok: true, query: 5, response: { items: [] } }),
+  });
+  let judgeCalled = false;
+  _setOutputGroundingJudgeForTests(async () => {
+    judgeCalled = true;
+    return {
+      verdict: 'unverifiable',
+      offending: [{ figure: '5%', kind: 'no_source', note: 'request echo is not an observation' }],
+      reason: 'The provider response contained no observed growth figure.',
+    };
+  });
+  try {
+    const result = await evaluateOutputGrounding(sess.id, 'Growth was 5%.', { kind: 'chat' });
+    assert.notEqual(result.action, 'allow', 'the request value is not deterministic source evidence');
+    assert.equal(judgeCalled, true);
   } finally {
     _setOutputGroundingJudgeForTests(null);
   }

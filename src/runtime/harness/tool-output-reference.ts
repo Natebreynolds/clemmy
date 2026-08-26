@@ -1,8 +1,7 @@
 import { getRuntimeEnv } from '../../config.js';
-import { resolveToolOutputForAuthority } from './eventlog.js';
+import { projectToolOutputValueForAutomaticAuthority, resolveToolOutputForAuthority } from './eventlog.js';
 import { parseShellToolOutput } from '../../tools/inner-dispatch.js';
 import { gatherTrustedEvidence } from './trusted-evidence.js';
-import { pruneProviderRequestEchoes } from './provider-read-evidence.js';
 
 /** Kill-switch for the dispatch-time resolution wiring (the primitive itself is
  *  always available). Default ON, but a no-op for any call without the syntax. */
@@ -134,7 +133,16 @@ function resolveOne(sessionId: string, ref: ToolOutputRef, trustedCallIds: Set<s
     return undefined;
   }
   const row = resolution.record;
-  const parsed = pruneProviderRequestEchoes(parseParkedOutput(row.output));
+  const projected = projectToolOutputValueForAutomaticAuthority(
+    sessionId,
+    ref.callId,
+    parseParkedOutput(row.output),
+  );
+  if (projected.status !== 'ok') {
+    errors.push(`$fromToolOutput: output for "${ref.callId}" cannot authorize a field because ${projected.reason}`);
+    return undefined;
+  }
+  const parsed = projected.value;
   if (parsed === undefined) {
     errors.push(`$fromToolOutput: output for "${ref.callId}" is not JSON — cannot resolve a reference from it`);
     return undefined;

@@ -106,7 +106,7 @@ export function registerExtractStructuredTools(server: McpServer, extractorOverr
     [
       'Extract VALIDATED structured data from unstructured text — the schema-guided bridge from an email/document to a CRM record, form payload, or template variables.',
       'Target shape: pass `schema` (a JSON Schema object string) OR `tool_slug` (uses the cached input schema of that Composio action — search/list the tool first to populate it, then extract EXACTLY the args the create call needs).',
-      'Source (exactly one): `text`, `file` (PDF/DOCX auto-convert), or `call_id` (a prior tool call\'s lossless parked output). Oversized sources are auto-focused to the passages relevant to the schema fields. A provider result that exceeded the durable cap fails closed; page/re-read it or stage the full result as a file.',
+      'Source (exactly one): `text`, `file` (PDF/DOCX auto-convert), or `call_id` (a prior tool call\'s lossless parked output). Oversized sources are auto-focused to the passages relevant to the schema fields. A legacy-truncated or corrupt/missing chunked result fails closed; page/re-read it or stage the full result as a file.',
       'The result is deterministically validated (required fields present; parse-repaired) with one corrective retry; missing required fields come back as an explicit list, never silently invented.',
     ].join(' '),
     {
@@ -159,7 +159,7 @@ export function registerExtractStructuredTools(server: McpServer, extractorOverr
           if (resolution.status === 'failed') return textResult(`ERROR: stored output for call id "${args.call_id}" cannot be used because ${resolution.reason}. Re-run the source read.`);
           if (resolution.record.truncatedAtWrite) {
             return textResult(
-              `ERROR: stored output for call id "${args.call_id}" is incomplete (${resolution.record.contentBytes} original bytes exceeded the durable output cap), so extract_structured will not validate an object from a prefix. `
+              `ERROR: stored output for call id "${args.call_id}" is incomplete (${resolution.record.contentBytes} original bytes; legacy truncation or missing/corrupt chunks), so extract_structured will not validate an object from a prefix. `
               + 'Re-read/page the provider source until every page is present, or stage the full result as a file and pass that file.',
             );
           }

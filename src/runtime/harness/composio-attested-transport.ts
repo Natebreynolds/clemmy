@@ -42,21 +42,54 @@ import { isolatedTestContractActive } from './isolated-test-contract.js';
 export function buildComposioAttestedTransport(): AttestedTransport {
   const transport: AttestedTransport = {
     digest: 'composio-gateway-transport-v1',
-    async execute({ operationId, args }) {
+    async execute({ operationId, args, accountId, expected }) {
       // Deferred import: this module is reached from typed-runtime boot, and
       // the composio toolset imports broadly across the harness.
-      const { resolveComposioDispatch } = await import('../../tools/composio-tools.js');
-      const { executePreparedComposioTool } = await import('../../integrations/composio/client.js');
-      const resolved = await resolveComposioDispatch(operationId, { ...args }, undefined, {
-        preparedExecution: true,
-      });
-      if (!resolved.ok) {
-        throw new Error(`${operationId} refused pre-dispatch (${resolved.reason}): ${resolved.message}`);
+      const {
+        resolveComposioDispatch,
+        executePreparedComposioGatewayTool,
+        withRegisteredComposioTerminalManifest,
+      } = await import('../../tools/composio-tools.js');
+      const dispatch = async () => {
+        const resolved = await resolveComposioDispatch(operationId, { ...args }, accountId, {
+          preparedExecution: true,
+        });
+        if (!resolved.ok) {
+          throw new Error(`${operationId} refused pre-dispatch (${resolved.reason}): ${resolved.message}`);
+        }
+        if (!resolved.preparedDispatch) {
+          throw new Error(`${operationId} refused pre-dispatch: terminal one-shot preparation is absent`);
+        }
+        return executePreparedComposioGatewayTool(resolved.preparedDispatch);
+      };
+      if (!expected) {
+        throw new Error(
+          `${operationId} refused pre-dispatch: sealed Composio manifest identity is required`,
+        );
       }
-      if (!resolved.preparedDispatch) {
-        throw new Error(`${operationId} refused pre-dispatch: terminal one-shot preparation is absent`);
+      if (
+        expected.providerKind !== 'composio'
+        || expected.providerIdentity !== 'composio'
+        || !expected.providerInputSchemaDigest
+        || expected.providerOutputSchemaObserved !== true
+        || !Object.prototype.hasOwnProperty.call(expected, 'providerOutputSchemaDigest')
+      ) {
+        throw new Error(`${operationId} refused pre-dispatch: sealed Composio definition is incomplete`);
       }
-      return executePreparedComposioTool(resolved.preparedDispatch);
+      return withRegisteredComposioTerminalManifest({
+        manifestId: expected.manifestId,
+        manifestDigest: expected.manifestDigest,
+        providerKind: 'composio',
+        operationId,
+        accountId,
+        providerIdentity: 'composio',
+        providerVersion: expected.providerVersion,
+        providerOperationVersion: expected.operationVersion,
+        providerInputSchemaDigest: expected.providerInputSchemaDigest,
+        providerOutputSchemaDigest: expected.providerOutputSchemaDigest ?? null,
+        definitionFingerprint: expected.definitionFingerprint,
+        invokePortId: expected.invokePortId,
+      }, dispatch);
     },
     observe({ operationId, accountId }) {
       const schema = getCachedToolSchema(operationId);

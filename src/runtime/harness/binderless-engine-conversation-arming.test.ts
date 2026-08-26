@@ -1,17 +1,10 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/harness/binderless-engine-conversation-arming.test.ts
  *
- * Arm only what the lane can discharge. Typed expected-work requirements are
- * discharged only by a binder that writes call bindings: the interactive host
- * engine's carrier admission, or the typed construct run behind a
- * participated source. A binder-less engine settles every call without ever
- * writing a binding, so a binding-requiring deterministic contract armed
- * there matched "no observed operation is bound" and held delivered work
- * forever (live 2026-08-25: workflow …09b41f held with 2 ops / 0 bindings;
- * the conversation-shaped control …55e374 delivered with 0 ops).
- *
- * The pin: a binder-less session arms conversation-shaped and its settled
- * work finalizes; a bindable engine and a participated source keep the full
- * binding demand byte-identically.
+ * A deterministic work contract is never conversation-shaped merely because
+ * the selected engine has no expected-work binding writer. Such a lane must
+ * refuse before execution. On a lane with the production binder, zero work,
+ * failed work, and partial work keep the exact read+write contract open; only
+ * exact successful bindings for both requirements may finalize it.
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -29,11 +22,11 @@ const eventlog = await import('./eventlog.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
 const contracts = await import('./expected-work-contract.js');
+const admission = await import('./expected-work-admission.js');
 const dispatch = await import('./dispatch-ledger.js');
 const outcomes = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const resolution = await import('./resolution-ledger.js');
-const disposition = await import('../semantic-boundary/semantic-disposition.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -43,10 +36,17 @@ test.after(() => {
 let serial = 0;
 
 /** The exact live shape: act + collect-then-construct compiles a deterministic
- * contract of one complete_set read and one external write — operations that
- * can only be discharged through explicit call bindings. */
+ * contract of one complete_set read and one external write. */
 const BINDING_REQUIRING_TEXT =
   'Find the top 5 widgets based on ratings and add them to a new workbook for me.';
+const READ_TOOL = 'FIRECRAWL_SEARCH';
+const READ_ARGS = { query: 'top rated widgets', limit: 5 };
+const WRITE_TOOL = 'GOOGLESHEETS_SHEET_FROM_JSON';
+const WRITE_ARGS = {
+  title: 'Top widgets',
+  sheet_name: 'Widgets',
+  sheet_json: [{ name: 'Widget A', rating: 5 }],
+};
 
 interface Task {
   sessionId: string;
@@ -55,7 +55,15 @@ interface Task {
   acceptedTaskId: string;
 }
 
-function accept(kind: 'chat' | 'workflow', participation?: 'participated'): Task {
+type WorkContract = Extract<
+  ReturnType<typeof contracts.loadExpectedWorkContract>,
+  { status: 'ok' }
+>['contract'];
+
+function accept(
+  kind: 'chat' | 'execution' | 'workflow',
+  surface: 'direct' | 'background' | 'cron' = 'direct',
+): Task {
   const session = eventlog.createSession({ id: `binderless-arming-${kind}-${++serial}`, kind });
   const source = eventlog.appendEvent({
     sessionId: session.id,
@@ -64,11 +72,9 @@ function accept(kind: 'chat' | 'workflow', participation?: 'participated'): Task
     type: 'user_input_received',
     data: { text: BINDING_REQUIRING_TEXT },
   });
-  if (participation) {
-    disposition.recordSemanticParticipation(session.id, source.seq, participation);
-  }
   assert.ok(shadow.recordTurnGraphShadow({
     identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+    surface,
   }));
   return {
     sessionId: session.id,
@@ -78,103 +84,248 @@ function accept(kind: 'chat' | 'workflow', participation?: 'participated'): Task
   };
 }
 
-/** One settled unbound business read — the lane's real work: it settles
- * per-call, and no binding row is ever written. */
-function settleUnboundRead(task: Task): void {
-  const logicalToolCallId = `logical:read:${serial}`;
-  const begun = dispatch.beginPhysicalDispatch({
-    identity: {
-      ...task,
-      logicalToolCallId,
-      physicalDispatchId: `dispatch:read:${serial}`,
-      ordinal: 0,
-    },
-    tool: 'alpha_records_search',
-    args: {},
+function freezeAndActivate(task: Task): WorkContract {
+  const frozen = contracts.requireKnownExpectedWorkContract(task);
+  assert.equal(frozen.status, 'bound');
+  if (frozen.status !== 'bound') throw new Error('deterministic contract was not bound');
+  assert.deepEqual(
+    frozen.contract.operations.map((operation) => operation.effect),
+    ['read', 'external_write'],
+  );
+  const activated = admission.activateActionExpectedWork(task);
+  assert.ok(
+    activated.status === 'activated' || activated.status === 'replayed',
+    JSON.stringify(activated),
+  );
+  return frozen.contract;
+}
+
+function openAndBind(input: {
+  task: Task;
+  requirementId: string;
+  suffix: string;
+  tool: string;
+  args: unknown;
+}): string {
+  const logicalToolCallId = `logical:${input.suffix}:${serial}`;
+  const opened = dispatch.admitLogicalCall({
+    identity: { ...input.task, logicalToolCallId },
+    tool: input.tool,
+    args: input.args,
   });
-  assert.equal(begun.status, 'inserted');
+  assert.equal(opened.status, 'inserted', JSON.stringify(opened));
+  const bound = admission.admitExpectedWorkInvocation({
+    sessionId: input.task.sessionId,
+    sourceUserSeq: input.task.sourceUserSeq,
+    logicalToolCallId,
+    proposal: null,
+    requirementId: input.requirementId,
+    tool: input.tool,
+    args: input.args,
+  });
+  assert.equal(bound.status, 'bound', JSON.stringify(bound).slice(0, 400));
+  return logicalToolCallId;
+}
+
+function settleBoundRead(input: {
+  task: Task;
+  contract: WorkContract;
+  succeeded: boolean;
+}): string {
+  const requirement = input.contract.operations.find((operation) => operation.effect === 'read');
+  assert.ok(requirement);
+  const logicalToolCallId = openAndBind({
+    task: input.task,
+    requirementId: requirement!.id,
+    suffix: input.succeeded ? 'read-ok' : 'read-failed',
+    tool: READ_TOOL,
+    args: READ_ARGS,
+  });
+  const physicalDispatchId = `dispatch:${logicalToolCallId}`;
+  const begun = dispatch.beginPhysicalDispatch({
+    identity: { ...input.task, logicalToolCallId, physicalDispatchId, ordinal: 0 },
+    tool: READ_TOOL,
+    args: READ_ARGS,
+  });
+  assert.equal(begun.status, 'inserted', JSON.stringify(begun));
+  if (begun.status !== 'inserted') return logicalToolCallId;
+  assert.equal(dispatch.settlePhysicalDispatch({
+    identity: begun.identity,
+    tool: READ_TOOL,
+    outcome: 'returned',
+  }).status, 'inserted');
+  const settled = settlements.commitLogicalCallSettlement({
+    identity: { ...input.task, logicalToolCallId },
+    contract: { toolName: READ_TOOL, args: READ_ARGS },
+    execution: { kind: 'provider_execution' },
+    result: {
+      payload: input.succeeded
+        ? {
+            successful: true,
+            data: { web: [{ title: 'Widget A', rating: 5 }] },
+            meta: { complete: true, count: 1, total: 1 },
+          }
+        : { successful: false, error: { code: 'UPSTREAM_FAILURE' } },
+    },
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: input.succeeded }),
+    recovery: {
+      businessCall: true,
+      mutating: false,
+      requirementId: requirement!.id,
+    },
+    observer: { lane: 'composio', turn: input.task.turn },
+  });
+  assert.equal(settled.status, 'committed', JSON.stringify(settled));
+  return logicalToolCallId;
+}
+
+function settleBoundWrite(task: Task, contract: WorkContract): void {
+  const requirement = contract.operations.find((operation) => operation.effect === 'external_write');
+  assert.ok(requirement);
+  const logicalToolCallId = openAndBind({
+    task,
+    requirementId: requirement!.id,
+    suffix: 'write-ok',
+    tool: WRITE_TOOL,
+    args: WRITE_ARGS,
+  });
+  const physicalDispatchId = `dispatch:${logicalToolCallId}`;
+  const begun = dispatch.beginPhysicalDispatch({
+    identity: { ...task, logicalToolCallId, physicalDispatchId, ordinal: 0 },
+    tool: WRITE_TOOL,
+    args: WRITE_ARGS,
+  });
+  assert.equal(begun.status, 'inserted', JSON.stringify(begun));
   if (begun.status !== 'inserted') return;
   assert.equal(dispatch.settlePhysicalDispatch({
     identity: begun.identity,
-    tool: 'alpha_records_search',
+    tool: WRITE_TOOL,
     outcome: 'returned',
   }).status, 'inserted');
   const settled = settlements.commitLogicalCallSettlement({
     identity: { ...task, logicalToolCallId },
-    contract: { toolName: 'alpha_records_search', args: {} },
+    contract: { toolName: WRITE_TOOL, args: WRITE_ARGS },
     execution: { kind: 'provider_execution' },
-    result: { payload: { successful: true, data: { records: [{ id: 'a' }] }, meta: { complete: true } } },
+    result: {
+      payload: {
+        successful: true,
+        data: {
+          spreadsheetId: 'sheet-exact-completion',
+          spreadsheetUrl: 'https://docs.google.com/spreadsheets/d/sheet-exact-completion/edit',
+        },
+      },
+    },
     outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
-    recovery: { businessCall: true, mutating: false },
+    recovery: {
+      businessCall: true,
+      mutating: true,
+      requirementId: requirement!.id,
+    },
     observer: { lane: 'composio', turn: task.turn },
   });
   assert.equal(settled.status, 'committed', JSON.stringify(settled));
 }
 
-test('a binder-less engine arms conversation-shaped and settled work finalizes', () => {
+function operationCount(task: Task): number {
+  return (eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS count FROM accepted_task_operations
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(task.sessionId, task.sourceUserSeq) as { count: number }).count;
+}
+
+test('a binderless non-chat work graph refuses authority before execution', () => {
   const task = accept('workflow');
   const expected = resolution.expectedTaskFor(task.sessionId, task.sourceUserSeq);
-  assert.equal(expected.status, 'ok', JSON.stringify(expected).slice(0, 200));
-  if (expected.status !== 'ok') return;
-  assert.equal(expected.graph.classification.route, 'act');
-  assert.equal(expected.graph.classification.multiItem.collectThenConstruct, true);
-  assert.equal(
-    expected.expectation.workKind,
-    'conversation',
-    'no binder runs for this engine, so no typed work node may be projected into authority',
+  assert.equal(expected.status, 'ambiguous');
+  assert.match(
+    expected.status === 'ambiguous' ? expected.reason : '',
+    /no expected-work binding writer/,
   );
-  assert.equal(expected.expectation.workNodeId, undefined);
-
-  const frozen = contracts.requireKnownExpectedWorkContract(task);
-  assert.equal(frozen.status, 'bound');
-  settleUnboundRead(task);
-  const finalized = resolution.finalizeResolutionAgainstExpectedWork(task);
-  assert.equal(
-    finalized.status,
-    'finalized',
-    `settled work must not hold on bindings no writer exists for: ${JSON.stringify(finalized).slice(0, 300)}`,
-  );
-  const frozenState = resolution.frozenResolutionFor(task.sessionId, task.sourceUserSeq);
-  assert.equal(frozenState.status, 'ok', JSON.stringify(frozenState).slice(0, 300));
-  assert.equal(
-    frozenState.status === 'ok' && frozenState.resolution.expectationsSatisfied,
-    true,
-    'the frozen verdict must recompute byte-for-byte from durable rows',
-  );
+  assert.throws(() => contracts.requireKnownExpectedWorkContract(task));
+  const db = eventlog.openEventLog();
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS count FROM accepted_task_authority
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(task.sessionId, task.sourceUserSeq) as { count: number }).count, 0);
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS count FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(task.sessionId, task.sourceUserSeq) as { count: number }).count, 0);
 });
 
-test('the interactive engine keeps the full binding-requiring contract (chat byte-identical)', () => {
-  const task = accept('chat');
-  const expected = resolution.expectedTaskFor(task.sessionId, task.sourceUserSeq);
-  assert.equal(expected.status, 'ok');
-  if (expected.status !== 'ok') return;
-  assert.notEqual(expected.expectation.workKind, 'conversation');
-  assert.ok(expected.expectation.workNodeId);
+test('exact background and cron execution owners retain binding-demanding work', () => {
+  for (const surface of ['background', 'cron'] as const) {
+    const task = accept('execution', surface);
+    const expected = resolution.expectedTaskFor(task.sessionId, task.sourceUserSeq);
+    assert.equal(expected.status, 'ok', `${surface}: ${JSON.stringify(expected)}`);
+    assert.notEqual(
+      expected.status === 'ok' ? expected.expectation.workKind : 'conversation',
+      'conversation',
+      `${surface}: the execution owner must not erase deterministic work`,
+    );
+    const contract = freezeAndActivate(task);
+    assert.equal(contract.operations.length, 2, `${surface}: exact read + write contract`);
+    assert.equal(
+      admission.actionExpectedWorkState(task).status,
+      'required',
+      `${surface}: action carrier is active before provider construction`,
+    );
+  }
+});
 
-  const frozen = contracts.requireKnownExpectedWorkContract(task);
-  assert.equal(frozen.status, 'bound');
-  assert.equal(frozen.status === 'bound' && frozen.contract.operations.length, 2);
-  settleUnboundRead(task);
+test('zero observed operations cannot discharge deterministic read plus write', () => {
+  const task = accept('chat');
+  freezeAndActivate(task);
   const finalized = resolution.finalizeResolutionAgainstExpectedWork(task);
-  assert.equal(finalized.status, 'incomplete', 'a bindable lane keeps the binding demand');
+  assert.equal(finalized.status, 'incomplete', JSON.stringify(finalized));
   assert.ok(
     finalized.status === 'incomplete'
-      && finalized.match.gaps.some((gap) => gap.kind === 'requirement_unobserved'),
-    'the unbound write requirement stays owed where a binder can discharge it',
+      && finalized.match.gaps.filter((gap) => gap.kind === 'requirement_unobserved').length >= 2,
+  );
+  assert.equal(operationCount(task), 0);
+});
+
+test('a failed bound read cannot discharge deterministic read plus write', () => {
+  const task = accept('chat');
+  const contract = freezeAndActivate(task);
+  const logicalToolCallId = settleBoundRead({ task, contract, succeeded: false });
+  const settlement = eventlog.openEventLog().prepare(`
+    SELECT outcome_kind FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, logicalToolCallId) as { outcome_kind: string };
+  assert.notEqual(settlement.outcome_kind, 'succeeded');
+  assert.equal(operationCount(task), 0, 'a failed call is not an observed successful operation');
+  const finalized = resolution.finalizeResolutionAgainstExpectedWork(task);
+  assert.equal(finalized.status, 'incomplete', JSON.stringify(finalized));
+});
+
+test('a successful bound read alone cannot discharge its dependent write', () => {
+  const task = accept('chat');
+  const contract = freezeAndActivate(task);
+  settleBoundRead({ task, contract, succeeded: true });
+  assert.equal(operationCount(task), 1);
+  const write = contract.operations.find((operation) => operation.effect === 'external_write');
+  const finalized = resolution.finalizeResolutionAgainstExpectedWork(task);
+  assert.equal(finalized.status, 'incomplete', JSON.stringify(finalized));
+  assert.ok(
+    finalized.status === 'incomplete'
+      && finalized.match.gaps.some((gap) => (
+        gap.kind === 'requirement_unobserved' && gap.requirementId === write?.id
+      )),
+    JSON.stringify(finalized).slice(0, 400),
   );
 });
 
-test('a participated source keeps the demand even on a non-interactive session', () => {
-  // Capability, not surface name: participation means the typed construct
-  // run — a real binding writer — owns discharge, so the demand stands.
-  const task = accept('workflow', 'participated');
-  const expected = resolution.expectedTaskFor(task.sessionId, task.sourceUserSeq);
-  assert.equal(expected.status, 'ok');
-  if (expected.status !== 'ok') return;
-  assert.notEqual(expected.expectation.workKind, 'conversation');
-
-  const frozen = contracts.requireKnownExpectedWorkContract(task);
-  assert.equal(frozen.status, 'bound');
-  settleUnboundRead(task);
-  assert.equal(resolution.finalizeResolutionAgainstExpectedWork(task).status, 'incomplete');
+test('the production binder finalizes only after both exact requirements succeed', () => {
+  const task = accept('chat');
+  const contract = freezeAndActivate(task);
+  settleBoundRead({ task, contract, succeeded: true });
+  settleBoundWrite(task, contract);
+  assert.equal(operationCount(task), 2);
+  const finalized = resolution.finalizeResolutionAgainstExpectedWork(task);
+  assert.equal(finalized.status, 'finalized', JSON.stringify(finalized));
+  assert.equal(finalized.status === 'finalized' && finalized.match.status, 'complete');
+  const frozen = resolution.frozenResolutionFor(task.sessionId, task.sourceUserSeq);
+  assert.equal(frozen.status, 'ok', JSON.stringify(frozen));
+  assert.equal(frozen.status === 'ok' && frozen.resolution.expectationsSatisfied, true);
 });

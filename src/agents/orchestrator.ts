@@ -24,7 +24,7 @@ import {
 } from './external-mcp-scope-lock.js';
 import { harnessInstructions } from './harness-context.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
-import { enabledExternalServerNames, getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
+import { enabledExternalServerNames } from '../runtime/mcp-servers.js';
 import { batchShapeDirective } from '../tools/batch-shape-directive.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
@@ -57,6 +57,7 @@ import { buildWorkCall, type BuildWorkCallOptions } from '../tools/work-call.js'
 import { buildPlanTaskTool } from '../tools/plan-tools.js';
 import {
   disclosePrimaryModelPlanningCapabilities,
+  snapshotPrimaryModelPlanningContext,
   type HostFreshPlanningContextV1,
 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
 import { actionExpectedWorkCarrierSelection } from '../runtime/harness/action-expected-work-boundary.js';
@@ -86,9 +87,19 @@ import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js'
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import { buildWorkerJobPrompt, resolveWorkerMaxTurns, uniformFailureSignature, workerPacketKey, WorkerToolInputSchema, WorkerToolCallSchema, workerCallItems, workerResultIndicatesFailure, type WorkerToolInput, type WorkerToolCall } from './worker-job-packet.js';
-import { runBoundedPool } from '../execution/bounded-pool.js';
 import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from './worker-respawn-guard.js';
-import { acquireWorkerSlot } from './worker-concurrency.js';
+import { acquireWorkerSlot, workerBatchPoolWidth } from './worker-concurrency.js';
+import {
+  completedWorkerBatchPacket,
+  isWorkerBatchGenerationCancellation,
+  renderWorkerBatchRemainder,
+  runResumableWorkerBatch,
+  workerBatchKey,
+  WorkerBatchIdentityError,
+  WorkerBatchOwnershipConflictError,
+  type WorkerBatchExecutionResult,
+  type WorkerBatchExecutionLease,
+} from './worker-batch-execution.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
@@ -101,12 +112,15 @@ import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 import {
   checkpointPreparedWorker,
   completedPreparedWorker,
+  fencePreparedWorkerInFlight,
   prepareWorkerManifest,
   summarizePreparedWorkerReuse,
   type PreparedWorkerManifest,
   type WorkerManifestDescriptor,
 } from '../runtime/harness/work-manifest.js';
 import { evaluateQuantifiedWorkManifestGate } from '../runtime/harness/quantified-work-manifest.js';
+import { currentToolAbortDeadlineAt, currentToolAbortSignal } from '../runtime/tool-abort-context.js';
+import type { DispatchLeaseRef } from '../runtime/harness/dispatch-lease.js';
 import {
   actionExpectedWorkRequired,
   bindWorkerPacketExpectedWork,
@@ -1513,8 +1527,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // negatives; none of them may remove a safety-recovery capability. Tool
   // availability does not invoke the Planner — its description keeps ordinary
   // Q&A and direct execution in the primary loop.
-  const plannerTool = buildPlannerTool();
-  const batchShapeMandate = batchShapeDirective({
+  // Plain conversation and action-carrier lanes never include draft_plan in
+  // structuralTools. Building its nested planner agent anyway eagerly expands
+  // the full local runtime schema surface, only to discard it below. Keep the
+  // construction aligned with the sole lane that can actually advertise it.
+  const plannerTool = !factorySkip && !carrierWork
+    ? buildPlannerTool()
+    : null;
+  // Fresh host planning already carries one provider-neutral topology card and
+  // the lean rubric's fan-out rule. Repeating the 1.9KiB batch mandate before
+  // any capability is disclosed made the cold planning surface exceed its
+  // competitive byte ceiling without adding authority or behavior.
+  const batchShapeMandate = hostFreshPlanning ? '' : batchShapeDirective({
     mcpServersInScope: mcpToolScope.allowedServerSlugs?.length ?? 0,
     allowAllMcp: !!mcpToolScope.allowAll,
     fanoutPreferred: options.allowToolJit === true && !!multiItem?.isMultiItem,
@@ -1733,32 +1757,102 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // a brain that would have serialized N run_worker calls no longer pays
         // N× wall time. Per-item worker slots keep provider throttling honest;
         // per-item callId suffixes keep tool_outputs/reduce-tier rows distinct.
-        const outs: Array<string | null> = new Array(callItems.length).fill(null);
-        let batchCancellation: unknown;
-        await runBoundedPool(
-          callItems.map((item, index) => ({ item, index })),
-          Math.min(callItems.length, 16),
-          async ({ item, index }) => {
-            if (batchCancellation) throw batchCancellation;
-            const perDetails = details?.toolCall?.callId
-              ? { ...details, toolCall: { ...details.toolCall, callId: `${details.toolCall.callId}-i${index}` } }
-              : details;
-            try {
-              outs[index] = String(await runOneOrchestratorWorker(
-                { ...packetBase, item } as WorkerToolInput, runContext, perDetails, manifestBinding,
-              ) ?? '');
-            } catch (err) {
-              if (err instanceof KillRequested || err instanceof AgentRuntimeCancelledError) throw err;
-              outs[index] = `ERROR: worker for "${item}" failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`;
-            }
-          },
-          (err) => {
-            if (err instanceof KillRequested || err instanceof AgentRuntimeCancelledError) {
-              batchCancellation ??= err;
-            }
-          },
-        );
-        if (batchCancellation) throw batchCancellation;
+        const specs = callItems.map((item, index) => {
+          const workerInput = { ...packetBase, item } as WorkerToolInput;
+          return { item, index, input: workerInput, packetKey: workerPacketKey(workerInput) };
+        });
+        const outputContext = getToolOutputContext();
+        const batchHarnessContext = harnessRunContextStorage.getStore();
+        if (!manifestBinding && (!manifestSessionId || !batchHarnessContext?.dispatchLease)) {
+          return 'ERROR: workers were NOT started — an ordinary batch needs an exact accepted-source dispatch lease so concurrent/restart execution can be fenced durably.';
+        }
+        let exactBatchKey: string;
+        try {
+          exactBatchKey = workerBatchKey({
+            sessionId: manifestSessionId,
+            sourceUserSeq: manifestSourceUserSeq,
+            workflowRunId: outputContext?.workflowRunId,
+            manifestScopeId: manifestBinding
+              ? `${manifestBinding.manifestId}:${manifestBinding.contractVersion}:${manifestBinding.phase}`
+              : undefined,
+            logicalCallId: outputContext?.callId ?? details?.toolCall?.callId,
+            packetKeys: specs.map((entry) => entry.packetKey),
+          });
+        } catch (error) {
+          if (error instanceof WorkerBatchIdentityError) {
+            return `ERROR: workers were NOT started — ${error.message}.`;
+          }
+          throw error;
+        }
+        const previewRoute = resolveChatWorkerModel(specs[0]!.input);
+        const previewModel = getSessionWorkerModelOverride(manifestSessionId)
+          ?? previewRoute.model
+          ?? resolveRoleModel('worker').modelId;
+        const previewProvider = resolveEffectiveProviderForModel(previewModel);
+        let batch: WorkerBatchExecutionResult<string>;
+        try {
+          batch = await runResumableWorkerBatch({
+            batchKey: exactBatchKey,
+            items: specs,
+            maxConcurrency: workerBatchPoolWidth({ provider: previewProvider, modelId: previewModel }),
+            deadlineAt: currentToolAbortDeadlineAt(),
+            callerSignal: currentToolAbortSignal() ?? (details as { signal?: AbortSignal } | undefined)?.signal,
+            ...(!manifestBinding && batchHarnessContext?.dispatchLease ? {
+              durableOwner: {
+                sessionId: manifestSessionId,
+                parentLease: batchHarnessContext.dispatchLease,
+              },
+            } : {}),
+            beforeGeneration: (lease) => {
+              if (manifestBinding && manifestSessionId) {
+                fencePreparedWorkerInFlight(manifestSessionId, manifestBinding, callItems, lease.generationId);
+              }
+            },
+            execute: async (spec, lease) => {
+              const perDetails = {
+                ...(details as Record<string, unknown> | undefined),
+                signal: lease.signal,
+                ...(details?.toolCall?.callId
+                  ? { toolCall: { ...details.toolCall, callId: `${details.toolCall.callId}-i${spec.index}` } }
+                  : {}),
+              };
+              try {
+                return String(await runOneOrchestratorWorker(
+                  spec.input,
+                  runContext,
+                  perDetails,
+                  manifestBinding,
+                  lease,
+                ) ?? '');
+              } catch (err) {
+                if (
+                  err instanceof KillRequested
+                  || err instanceof AgentRuntimeCancelledError
+                  || isWorkerBatchGenerationCancellation(err, lease.signal)
+                ) throw err;
+                return `ERROR: worker for "${spec.item}" failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`;
+              }
+            },
+            failed: workerResultIndicatesFailure,
+            failureReason: (output) => output.split('\n')[0]?.slice(0, 300) ?? '',
+          });
+        } catch (error) {
+          if (error instanceof WorkerBatchOwnershipConflictError) {
+            return 'ERROR: workers were NOT started — this exact batch already has a live durable owner. Wait for that generation to settle; do not start overlapping work.';
+          }
+          throw error;
+        }
+        const outs = batch.items.map((entry) => entry.output ?? null);
+        if (batch.status === 'parked') {
+          return [
+            ...(heavyAdvisory ? [heavyAdvisory] : []),
+            `Batch parked safely before the unchanged run_worker deadline: ${batch.remainder.settled.length}/${callItems.length} settled; ${batch.remainder.failed.length} failed; ${batch.remainder.in_flight.length} in_flight; ${batch.remainder.pending.length} pending. No worker body remains active. Re-run the exact same items to reuse settled receipts and continue only the remainder.`,
+            renderWorkerBatchRemainder(batch.remainder),
+            ...batch.items
+              .filter((entry) => entry.output !== undefined)
+              .map((entry) => `--- item: ${entry.item} ---\n${entry.output}`),
+          ].join('\n\n');
+        }
         const rendered = callItems.map((item, index) => {
           const text = outs[index] ?? `ERROR: worker for "${item}" crashed before returning a result.`;
           return { item, text, failed: workerResultIndicatesFailure(text) };
@@ -1847,6 +1941,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     det: any,
     maxTurnsForItem: number,
     mcpToolScopeOverride?: McpToolScope | null,
+    dispatchLeaseOverride?: DispatchLeaseRef,
   ): Promise<unknown> => {
     const parent = harnessRunContextStorage.getStore();
     const sessionId = parent?.sessionId ?? extractSessionId(ctx) ?? '';
@@ -1865,7 +1960,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           : parent?.mcpToolScope !== undefined
             ? { mcpToolScope: parent.mcpToolScope }
             : {}),
-        ...(parent?.dispatchLease ? { dispatchLease: parent.dispatchLease } : {}),
+        ...(dispatchLeaseOverride
+          ? { dispatchLease: dispatchLeaseOverride }
+          : parent?.dispatchLease
+            ? { dispatchLease: parent.dispatchLease }
+            : {}),
         ...(parent?.runAttemptId ? { runAttemptId: parent.runAttemptId } : {}),
         ...(workerThrashGuardEnabled()
           ? { guardrailScopeId: `${sessionId}::wkr:${Date.now()}-${(workerBudgetScopeSeq = (workerBudgetScopeSeq + 1) % 1_000_000)}` }
@@ -1882,6 +1981,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     runContext: any,
     details: any,
     manifestBinding?: PreparedWorkerManifest,
+    batchLease?: WorkerBatchExecutionLease,
   ) => {
     {
       const input = params as WorkerToolInput;
@@ -1891,6 +1991,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const sessionId = extractSessionId(runContext);
       const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
       const assertWorkerMayStart = (): void => {
+        batchLease?.assertCurrent();
         if (!sessionId) return;
         assertNotKilled(
           sessionId,
@@ -1944,6 +2045,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         modelId: workerModel,
         provider: workerProvider,
         assertCanStart: assertWorkerMayStart,
+        signal: batchLease?.signal,
       });
       try {
       const appendWorkerRoute = (data: Record<string, unknown>) => {
@@ -1980,10 +2082,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         if (!sessionId) return;
         const { preRun, checkpointManifest = true, ...eventData } = data;
         let resultEvent: ReturnType<typeof appendEvent> | undefined;
+        batchLease?.assertCurrent();
         try {
-          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, packetKey, toolCallId } });
+          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, packetKey, toolCallId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}) } });
         } catch { /* durable trace is best-effort */ }
         if (manifestBinding && checkpointManifest) {
+          batchLease?.assertCurrent();
           try {
             checkpointPreparedWorker(
               sessionId,
@@ -1991,7 +2095,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               input.item,
               data.ok ? 'succeeded' : 'failed',
               {
-                attemptId: toolCallId ?? packetKey,
+                attemptId: batchLease ? `${batchLease.generationId}:${packetKey}` : toolCallId ?? packetKey,
                 ...(data.ok && resultEvent
                   ? { evidence: [{ kind: 'worker_result', ref: `event:${resultEvent.seq}` }] }
                   : {}),
@@ -2040,7 +2144,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // ~8 results in a fan-out window, a compact parked digest replaces the
       // verbatim payload and shard summaries ride along in-band; small
       // fan-outs and ERROR results are byte-identical to today.
-      const reduceReturn = async (output: unknown): Promise<string> => {
+      const reduceReturn = async (output: unknown, reuseParkedOutput = false): Promise<string> => {
         const text = typeof output === 'string' ? output : String(output ?? '');
         return buildWorkerReturn({
           sessionId,
@@ -2048,6 +2152,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           item: input.item,
           text,
           callId: toolCallId ?? `call_w_${workerRouteStartedAt}_${packetKey.slice(0, 12)}`,
+          ...(reuseParkedOutput ? { reuseParkedOutput: true } : {}),
         });
       };
       const appendWorkerResultFromOutput = (
@@ -2104,6 +2209,30 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           });
         } catch { /* visibility trace is best-effort */ }
       };
+      // Forward-only receipt for an interrupted ordinary batch. It is narrower
+      // than the session-wide replay guard: exact source-bound batchKey + exact
+      // packet + recoverable content-addressed output are all required.
+      if (
+        batchLease
+        && sessionId
+        && completedWorkerBatchPacket(sessionId, batchLease.batchKey, packetKey)
+      ) {
+        const ctx = getToolOutputContext();
+        const parentRunId = ctx?.workflowRunId || sessionId;
+        const prior = findCompletedSubagentOutput(parentRunId, input.item, packetKey);
+        if (prior?.trim()) {
+          appendWorkerResult({
+            item: input.item,
+            ok: true,
+            model: workerModel,
+            toolUses: [],
+            reason: 'resume: reused exact interrupted-batch receipt',
+            preRun: true,
+            checkpointManifest: false,
+          });
+          return await reduceReturn(prior, true);
+        }
+      }
       // Manifest identity survives a changed model packet and a daemon restart.
       // If this exact logical item already has evidence-backed success on the
       // active contract, reuse its persisted output and never dispatch it again.
@@ -2135,7 +2264,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             preRun: true,
             checkpointManifest: false,
           });
-          return await reduceReturn(reused);
+          return await reduceReturn(reused, Boolean(prior?.trim()));
         }
       }
       // Wave 4 Stage 1 — durable-resume idempotency, checked BEFORE the fuzzy
@@ -2163,7 +2292,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             preRun: true,
             checkpointManifest: false,
           });
-          return await reduceReturn(prior);
+          return await reduceReturn(prior, true);
         }
         // No recoverable output → do NOT claim success; re-execute below.
       }
@@ -2220,12 +2349,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       } catch { /* telemetry is best-effort */ }
       if (sessionId) {
         try {
-          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
+          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
         } catch { /* telemetry is best-effort */ }
         if (manifestBinding) {
           try {
             checkpointPreparedWorker(sessionId, manifestBinding, input.item, 'running', {
-              attemptId: toolCallId ?? packetKey,
+              attemptId: batchLease ? `${batchLease.generationId}:${packetKey}` : toolCallId ?? packetKey,
             });
           } catch { /* manifest visibility is best-effort */ }
         }
@@ -2242,8 +2371,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             sessionId,
             sourceUserSeq,
             harnessRunContextStorage.getStore()?.mcpToolScope,
-            harnessRunContextStorage.getStore()?.dispatchLease,
+            batchLease?.dispatchLease ?? harnessRunContextStorage.getStore()?.dispatchLease,
+            batchLease?.signal,
           );
+          batchLease?.assertCurrent();
           appendWorkerRoute({
             ...(route.trace ?? {
               seam: 'chat',
@@ -2277,6 +2408,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           });
           return await reduceReturn(sdkResult.text ?? '');
         } catch (err) {
+          if (isWorkerBatchGenerationCancellation(err, batchLease?.signal)) throw err;
           // Claude SDK worker overloaded OR its auth expired BEFORE committing
           // anything (no tool ran, nothing streamed) → fall THIS item over to the
           // nested worker lane on the next brain (Codex→GLM via RouterModelProvider,
@@ -2309,11 +2441,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               details,
               resolveWorkerMaxTurns(input.intent, workerMaxTurns),
               scopedWorker.scope,
+              batchLease?.dispatchLease,
             );
+            batchLease?.assertCurrent();
             recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), next.modelId);
             appendWorkerResultFromOutput(output, { model: next.modelId, toolUses: [] });
             return await reduceReturn(output);
           } catch (fallbackErr) {
+            if (isWorkerBatchGenerationCancellation(fallbackErr, batchLease?.signal)) throw fallbackErr;
             appendWorkerResult({ item: input.item, ok: false, model: next.modelId, toolUses: [], reason: workerResultReason(fallbackErr) });
             recordWorkerSubagent(`ERROR: ${workerResultReason(fallbackErr)}`, next.modelId);
             throw fallbackErr;
@@ -2359,11 +2494,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           details,
           resolveWorkerMaxTurns(input.intent, workerMaxTurns),
           scopedWorker.scope,
+          batchLease?.dispatchLease,
         );
+        batchLease?.assertCurrent();
         recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), workerModel);
         appendWorkerResultFromOutput(output, { model: workerModel, toolUses: [] });
         return await reduceReturn(output);
       } catch (err) {
+        if (isWorkerBatchGenerationCancellation(err, batchLease?.signal)) throw err;
         appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(err) });
         recordWorkerSubagent(`ERROR: ${workerResultReason(err)}`, workerModel);
         // Infra-shaped failure (credentials/auth/provider config): every sibling
@@ -2640,6 +2778,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         ? new Set([...firstClassNames].filter((name) => (
             actionControlNames.has(name)
             && actionControlContextFor(name) !== 'task_recovery'
+            && (!hostFreshPlanning || name === 'tool_search')
             // On an action turn these exact mutations must cross work_call's
             // requirement binder. Their ordinary graph-neutral control
             // exposure is unchanged on non-action turns.
@@ -2697,7 +2836,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         ? {
             ...dispatcherOptions,
             frozenContract,
-            ...(hostFreshPlanning ? { requireHostPlan: true } : {}),
+            ...(hostFreshPlanning ? {
+              requireHostPlan: true,
+              hostPlanningReady: () => {
+                const planning = snapshotPrimaryModelPlanningContext(hostFreshPlanning.authority);
+                return Boolean(planning && planning.capabilities.length > 0);
+              },
+            } : {}),
             catalogIdentifiers: [...workCallBuiltinNames],
             ...(options.turnCandidates?.sourceStrategyBinding
               ? { sourceStrategyBinding: options.turnCandidates.sourceStrategyBinding }
@@ -2724,12 +2869,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               },
               admitBuiltinAcquisition: (targetName) => admitBuiltinAcquisition(targetName),
               controlOnlyBuiltins: true,
+              ...(hostFreshPlanning ? {
+                modelVisibility: () => actionExpectedWorkRequired(hostFreshPlanning.identity),
+              } : {}),
             })
           : buildCallTool(dispatcherOptions);
       const catalogText = buildCompactToolCatalog({ allowedNames: discoverableNames });
       searchCatalogCount = discoverableNames.size;
       searchCatalogTokens = Math.round(catalogText.length / 4);
-      catalogBlock = [
+      catalogBlock = hostFreshPlanning ? null : [
         // Leads with an unambiguous "you HAVE access" — live 2026-07-08 a model
         // read the name-only listing as evidence it had NO tool access and
         // refused the task outright (A_zero_tools stall). The catalog must be
@@ -2776,7 +2924,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       deniedNames: excludes,
       mcpToolScope,
       frozenContract,
-      ...(hostFreshPlanning ? { requireHostPlan: true } : {}),
+      ...(hostFreshPlanning ? {
+        requireHostPlan: true,
+        hostPlanningReady: () => {
+          const planning = snapshotPrimaryModelPlanningContext(hostFreshPlanning.authority);
+          return Boolean(planning && planning.capabilities.length > 0);
+        },
+      } : {}),
       catalogIdentifiers: [...workCallBuiltinNames],
       ...(options.turnCandidates?.sourceStrategyBinding
         ? { sourceStrategyBinding: options.turnCandidates.sourceStrategyBinding }
@@ -2840,12 +2994,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // every act-routed multi-item task unable to fan out at all (live
     // 2026-08-11, long-horizon-manifest run 4).
     ? hostFreshPlanning
-      ? [buildPlanTaskTool({ planning: hostFreshPlanning }), buildAskUserQuestionTool(), runWorkerTool]
+      ? [buildPlanTaskTool({ planning: hostFreshPlanning }), runWorkerTool]
       : [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool]
     : localMemoryScope
-    ? [plannerTool, buildAskUserQuestionTool()]
+    ? [plannerTool!, buildAskUserQuestionTool()]
     : [
-        plannerTool,
+        plannerTool!,
         buildRequestApprovalTool(),
         buildAskUserQuestionTool(),
         runWorkerTool,
@@ -2890,12 +3044,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     excludeToolNames: options.excludeToolNames,
     reason: 'orchestrator local harness tools',
   });
-  // An action turn advertises one business carrier. External MCP authority is
-  // retained for work_call's exact named dispatch, while its first-class list
-  // is zero-width so a second unbound business path cannot tempt the model.
-  const advertisedMcpScope: McpToolScope = carrierWork
-    ? { ...mcpToolScope, maxTools: 0 }
-    : externalMcpAttachmentScope(mcpToolScope, searchDecision.active);
   if (options.sessionId) {
     try {
       appendEvent({
@@ -2964,15 +3112,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           { actionExpectedWork: true },
         )
       : userChoiceToolUseBehavior,
-    // External MCP servers (DataForSEO, Supabase, browsermcp, etc.) the
-    // user has configured. Tools surface as `<server>__<tool>` (e.g.
-    // `dataforseo__serp_organic_live_advanced`). Without this the
-    // Orchestrator couldn't discover or route MCP-only capabilities —
-    // it would mistakenly tell the user "DataForSEO isn't connected"
-    // when in fact the MCP server is running with 118 tools loaded.
-    mcpServers: [
-      getOrCreateExternalMcpServers(advertisedMcpScope),
-    ],
+    // Provider-backed MCP servers are deliberately not attached to the model
+    // SDK. Discovery stays available through the inert catalog, and an exact
+    // selected name executes through call_tool/work_call so the host owns the
+    // logical call, physical crossing, approval, and terminal settlement.
     // Phase 2: handoffs intentionally omitted. Sub-agents are tools
     // (run_researcher / run_writer / run_reviewer / run_executor /
     // run_deployer). This puts the Orchestrator in control of every

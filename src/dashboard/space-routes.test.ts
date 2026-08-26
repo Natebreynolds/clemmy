@@ -644,24 +644,29 @@ test('iframe-authored correction kinds remain Workspace-local and cannot poison 
   assert.equal(count, 0, 'an authored iframe label is not human authority');
 });
 
-test('refresh runs a provably read-only Composio source and persists its JSON', async () => {
+test('manual refresh contains a read-only Composio source until shared durable authority is wired', async () => {
   const slug = 'refresh-rt';
   store.spaceStore.save({ id: slug, title: 'Refresh RT', dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }] });
-  spaceRunner._setSpaceComposioDispatchForTests(async () => ({
-    ok: true as const,
-    result: { rows: [{ name: 'Acme', amount: 1000 }] },
-    connectionId: 'ca-proof',
-    identity: 'proof@example.test',
-  }));
+  let providerBodies = 0;
+  spaceRunner._setSpaceComposioDispatchForTests(async () => {
+    providerBodies += 1;
+    return {
+      ok: true as const,
+      result: { rows: [{ name: 'Acme', amount: 1000 }] },
+      connectionId: 'ca-proof',
+      identity: 'proof@example.test',
+    };
+  });
   try {
     const ref = await j(await fetch(`${base}/api/console/spaces/${slug}/refresh`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sourceId: 'pull' }),
     }));
     assert.equal(ref.status, 200);
-    assert.equal(ref.body.results[0].ok, true);
-    // Persisted under the source id, with a _meta marker.
-    assert.deepEqual(ref.body.data.pull, { rows: [{ name: 'Acme', amount: 1000 }] });
-    assert.equal(ref.body.data._meta.pull.ok, true);
+    assert.equal(ref.body.results[0].ok, false);
+    assert.match(ref.body.results[0].error, /no shared durable call authority/i);
+    assert.equal(providerBodies, 0);
+    assert.equal(Object.hasOwn(ref.body.data, 'pull'), false);
+    assert.equal(ref.body.data._meta.pull.ok, false);
   } finally {
     spaceRunner._setSpaceComposioDispatchForTests(null);
   }
@@ -711,7 +716,7 @@ test('paused workspace rejects data writes (423) but still serves the view', asy
   assert.equal(view.status, 200); // read-only cached view still serves
 });
 
-test('action route runs a proven READ-class Composio action immediately, merges args, records a note', async () => {
+test('action route contains even a READ-class Composio action without shared durable authority', async () => {
   const slug = 'action-rt';
   store.spaceStore.save({
     id: slug, title: 'Action RT',
@@ -722,23 +727,28 @@ test('action route runs a proven READ-class Composio action immediately, merges 
       argsTemplate: { scope: 'team' },
     }],
   });
-  spaceRunner._setSpaceComposioDispatchForTests(async (_toolSlug, args) => ({
-    ok: true as const,
-    result: { received: args },
-    connectionId: 'ca-proof',
-    identity: 'proof@example.test',
-  }));
+  let providerBodies = 0;
+  spaceRunner._setSpaceComposioDispatchForTests(async (_toolSlug, args) => {
+    providerBodies += 1;
+    return {
+      ok: true as const,
+      result: { received: args },
+      connectionId: 'ca-proof',
+      identity: 'proof@example.test',
+    };
+  });
   try {
     const res = await j(await fetch(`${base}/api/console/spaces/${slug}/action`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ actionId: 'refresh-list', args: { limit: 10 } }),
     }));
-    assert.equal(res.status, 200);
-    assert.equal(res.body.ok, true);
-    assert.deepEqual(res.body.result.received, { scope: 'team', limit: 10 });
+    assert.equal(res.status, 502);
+    assert.equal(res.body.ok, false);
+    assert.match(res.body.error, /no shared durable call authority/i);
+    assert.equal(providerBodies, 0);
 
     const notes = await j(await fetch(`${base}/api/console/spaces/${slug}/notes`));
-    assert.ok(notes.body.notes.some((n: any) => n.kind === 'action' && /Refresh list/.test(n.text)));
+    assert.ok(notes.body.notes.some((n: any) => n.kind === 'action' && /Refresh list.*failed/i.test(n.text)));
   } finally {
     spaceRunner._setSpaceComposioDispatchForTests(null);
   }

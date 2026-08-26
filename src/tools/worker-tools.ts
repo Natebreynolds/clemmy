@@ -2,10 +2,20 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import { WorkerToolCallSchema, uniformFailureSignature, workerCallItems, workerPacketKey, workerResultIndicatesFailure, type WorkerToolCall, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { bindWorkerPacketExpectedWork } from '../runtime/harness/expected-work-admission.js';
-import { runBoundedPool } from '../execution/bounded-pool.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from '../agents/subagent-runs.js';
 import { runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
-import { acquireWorkerSlot } from '../agents/worker-concurrency.js';
+import { acquireWorkerSlot, workerBatchPoolWidth } from '../agents/worker-concurrency.js';
+import {
+  completedWorkerBatchPacket,
+  isWorkerBatchGenerationCancellation,
+  renderWorkerBatchRemainder,
+  runResumableWorkerBatch,
+  workerBatchKey,
+  WorkerBatchIdentityError,
+  WorkerBatchOwnershipConflictError,
+  type WorkerBatchExecutionResult,
+  type WorkerBatchExecutionLease,
+} from '../agents/worker-batch-execution.js';
 import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from '../agents/worker-respawn-guard.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getClaudeBrainModel, getRuntimeEnv } from '../config.js';
@@ -26,12 +36,14 @@ import { assertNotKilled, harnessRunContextStorage, KillRequested } from '../run
 import {
   checkpointPreparedWorker,
   completedPreparedWorker,
+  fencePreparedWorkerInFlight,
   prepareWorkerManifest,
   summarizePreparedWorkerReuse,
   type PreparedWorkerManifest,
   type WorkerManifestDescriptor,
 } from '../runtime/harness/work-manifest.js';
 import { evaluateQuantifiedWorkManifestGate } from '../runtime/harness/quantified-work-manifest.js';
+import { currentToolAbortDeadlineAt, currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 
 /**
  * `run_worker` for the CLAUDE AGENT SDK BRAIN.
@@ -229,26 +241,83 @@ export function registerWorkerTools(server: McpServer): void {
         // Deterministic batch: the harness owns the parallelism (bounded pool;
         // real provider throttling stays with the per-item worker slots), so a
         // brain that would have serialized N calls no longer pays N× wall time.
-        const outs: Array<string | null> = new Array(callItems.length).fill(null);
-        let batchCancellation: unknown;
-        await runBoundedPool(
-          callItems.map((item, index) => ({ input: { ...packetBase, item } as WorkerToolInput, index })),
-          Math.min(callItems.length, 16),
-          async ({ input: perItem, index }) => {
-            if (batchCancellation) throw batchCancellation;
-            try {
-              const out = await runOneWorker(perItem, manifestBinding);
-              outs[index] = String((out as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '');
-            } catch (err) {
-              if (err instanceof KillRequested) throw err;
-              outs[index] = `ERROR: worker for "${perItem.item}" failed: ${firstLine(err)}`;
-            }
-          },
-          (err) => {
-            if (err instanceof KillRequested) batchCancellation ??= err;
-          },
-        );
-        if (batchCancellation) throw batchCancellation;
+        const specs = callItems.map((item) => {
+          const input = { ...packetBase, item } as WorkerToolInput;
+          return { item, input, packetKey: workerPacketKey(input) };
+        });
+        const outputContext = getToolOutputContext();
+        const batchHarnessContext = harnessRunContextStorage.getStore();
+        if (!manifestBinding && (!manifestSessionId || !batchHarnessContext?.dispatchLease)) {
+          return textResult('ERROR: workers were NOT started — an ordinary batch needs an exact accepted-source dispatch lease so concurrent/restart execution can be fenced durably.');
+        }
+        let exactBatchKey: string;
+        try {
+          exactBatchKey = workerBatchKey({
+            sessionId: manifestSessionId,
+            sourceUserSeq: manifestSourceUserSeq,
+            workflowRunId: outputContext?.workflowRunId,
+            manifestScopeId: manifestBinding
+              ? `${manifestBinding.manifestId}:${manifestBinding.contractVersion}:${manifestBinding.phase}`
+              : undefined,
+            logicalCallId: outputContext?.callId,
+            packetKeys: specs.map((entry) => entry.packetKey),
+          });
+        } catch (error) {
+          if (error instanceof WorkerBatchIdentityError) {
+            return textResult(`ERROR: workers were NOT started — ${error.message}.`);
+          }
+          throw error;
+        }
+        const batchRoute = resolveSdkBrainWorker(call.intent || undefined, call.model || undefined);
+        const batchProvider = resolveEffectiveProviderForModel(batchRoute.modelId);
+        let batch: WorkerBatchExecutionResult<string>;
+        try {
+          batch = await runResumableWorkerBatch({
+            batchKey: exactBatchKey,
+            items: specs,
+            maxConcurrency: workerBatchPoolWidth({ provider: batchProvider, modelId: batchRoute.modelId }),
+            deadlineAt: currentToolAbortDeadlineAt(),
+            callerSignal: currentToolAbortSignal(),
+            ...(!manifestBinding && batchHarnessContext?.dispatchLease ? {
+              durableOwner: {
+                sessionId: manifestSessionId,
+                parentLease: batchHarnessContext.dispatchLease,
+              },
+            } : {}),
+            beforeGeneration: (lease) => {
+              if (manifestBinding && manifestSessionId) {
+                fencePreparedWorkerInFlight(manifestSessionId, manifestBinding, callItems, lease.generationId);
+              }
+            },
+            execute: async (spec, lease) => {
+              try {
+                const out = await runOneWorker(spec.input, manifestBinding, lease);
+                return String((out as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '');
+              } catch (err) {
+                if (err instanceof KillRequested || isWorkerBatchGenerationCancellation(err, lease.signal)) throw err;
+                return `ERROR: worker for "${spec.item}" failed: ${firstLine(err)}`;
+              }
+            },
+            failed: workerResultIndicatesFailure,
+            failureReason: firstLine,
+          });
+        } catch (error) {
+          if (error instanceof WorkerBatchOwnershipConflictError) {
+            return textResult('ERROR: workers were NOT started — this exact batch already has a live durable owner. Wait for that generation to settle; do not start overlapping work.');
+          }
+          throw error;
+        }
+        const outs = batch.items.map((entry) => entry.output ?? null);
+        if (batch.status === 'parked') {
+          return textResult([
+            ...(heavyAdvisory ? [heavyAdvisory] : []),
+            `Batch parked safely before the unchanged run_worker deadline: ${batch.remainder.settled.length}/${callItems.length} settled; ${batch.remainder.failed.length} failed; ${batch.remainder.in_flight.length} in_flight; ${batch.remainder.pending.length} pending. No worker body remains active. Re-run the exact same items to reuse settled receipts and continue only the remainder.`,
+            renderWorkerBatchRemainder(batch.remainder),
+            ...batch.items
+              .filter((entry) => entry.output !== undefined)
+              .map((entry) => `--- item: ${entry.item} ---\n${entry.output}`),
+          ].join('\n\n'));
+        }
         const rendered = callItems.map((item, index) => {
           const text = outs[index] ?? `ERROR: worker for "${item}" crashed before returning a result.`;
           return { item, text, failed: workerResultIndicatesFailure(text) };
@@ -327,7 +396,11 @@ export function registerWorkerTools(server: McpServer): void {
     },
   );
 
-  const runOneWorker = async (params: WorkerToolInput, manifestBinding?: PreparedWorkerManifest) => {
+  const runOneWorker = async (
+    params: WorkerToolInput,
+    manifestBinding?: PreparedWorkerManifest,
+    batchLease?: WorkerBatchExecutionLease,
+  ) => {
     {
       const input = params as WorkerToolInput;
       const sessionId = getToolOutputContext()?.sessionId;
@@ -342,6 +415,7 @@ export function registerWorkerTools(server: McpServer): void {
       const sourceUserSeq = activeHarnessContext?.sourceUserSeq;
       const mcpToolScope = activeHarnessContext?.mcpToolScope;
       const assertWorkerMayStart = (): void => {
+        batchLease?.assertCurrent();
         assertNotKilled(
           sessionId,
           Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
@@ -359,10 +433,12 @@ export function registerWorkerTools(server: McpServer): void {
         checkpointManifest = true,
       ): void => {
         let resultEvent: ReturnType<typeof appendEvent> | undefined;
+        batchLease?.assertCurrent();
         try {
-          resultEvent = appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, packetKey, ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
+          resultEvent = appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, packetKey, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
         } catch { /* durable trace is best-effort */ }
         if (manifestBinding && checkpointManifest) {
+          batchLease?.assertCurrent();
           try {
             checkpointPreparedWorker(
               sessionId,
@@ -370,7 +446,7 @@ export function registerWorkerTools(server: McpServer): void {
               input.item,
               ok ? 'succeeded' : 'failed',
               {
-                attemptId: packetKey,
+                attemptId: batchLease ? `${batchLease.generationId}:${packetKey}` : packetKey,
                 ...(ok && resultEvent
                   ? { evidence: [{ kind: 'worker_result', ref: `event:${resultEvent.seq}` }] }
                   : {}),
@@ -380,6 +456,29 @@ export function registerWorkerTools(server: McpServer): void {
           } catch { /* manifest visibility is best-effort */ }
         }
       };
+
+      // Exact interrupted-batch receipt reuse also applies to ordinary `items`
+      // calls without a user-supplied workManifest. batchKey includes the exact
+      // accepted source identity, so a later chat turn is never mistaken for a
+      // restart of this operation.
+      if (
+        batchLease
+        && completedWorkerBatchPacket(sessionId, batchLease.batchKey, packetKey)
+      ) {
+        const parentRunId = getToolOutputContext()?.workflowRunId || sessionId;
+        const prior = findCompletedSubagentOutput(parentRunId, input.item, packetKey);
+        if (prior?.trim()) {
+          recordResult(true, 'resume: reused exact interrupted-batch receipt', undefined, false);
+          return textResult(await buildWorkerReturn({
+            sessionId,
+            parentRunId,
+            item: input.item,
+            text: prior,
+            callId: `call_w_batch_resume_${packetKey.slice(0, 16)}`,
+            reuseParkedOutput: true,
+          }));
+        }
+      }
 
       // A packet identifies one model call; the prepared manifest identifies the
       // logical work across calls and restarts. A resumed brain is free to phrase
@@ -413,6 +512,7 @@ export function registerWorkerTools(server: McpServer): void {
             item: input.item,
             text: reused,
             callId: `call_w_manifest_resume_${packetKey.slice(0, 16)}`,
+            reuseParkedOutput: Boolean(prior?.trim()),
           }));
         }
       } catch { /* fail-open to the older packet-key guard */ }
@@ -442,6 +542,7 @@ export function registerWorkerTools(server: McpServer): void {
               item: input.item,
               text: prior,
               callId: `call_w_resume_${packetKey.slice(0, 16)}`,
+              reuseParkedOutput: true,
             }));
           }
           // No recoverable output → do NOT claim success; re-execute below.
@@ -537,6 +638,7 @@ export function registerWorkerTools(server: McpServer): void {
         modelId: workerModel,
         provider: workerProvider,
         assertCanStart: assertWorkerMayStart,
+        signal: batchLease?.signal,
       });
       assertWorkerMayStart();
       // worker_spawned: a slot was acquired and the worker is about to run.
@@ -594,12 +696,12 @@ export function registerWorkerTools(server: McpServer): void {
       // running specialist immediately, not only when worker_result lands). Cheap,
       // fail-open. provider/role let the UI badge it (Claude/Codex/GLM + specialty).
       try {
-        appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'sdk_brain' } });
+        appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'sdk_brain' } });
       } catch { /* telemetry is best-effort */ }
       if (manifestBinding) {
         try {
           checkpointPreparedWorker(sessionId, manifestBinding, input.item, 'running', {
-            attemptId: packetKey,
+            attemptId: batchLease ? `${batchLease.generationId}:${packetKey}` : packetKey,
           });
         } catch { /* manifest visibility is best-effort */ }
       }
@@ -617,12 +719,22 @@ export function registerWorkerTools(server: McpServer): void {
               sessionId,
               sourceUserSeq,
               mcpToolScope,
-              harnessRunContextStorage.getStore()?.dispatchLease,
+              batchLease?.dispatchLease ?? harnessRunContextStorage.getStore()?.dispatchLease,
+              batchLease?.signal,
             )
           : await (async () => {
               const { runCrossProviderWorker } = await import('../agents/sub-agents.js');
-              return runCrossProviderWorker(input, workerModel, sessionId, sourceUserSeq, mcpToolScope);
+              return runCrossProviderWorker(
+                input,
+                workerModel,
+                sessionId,
+                sourceUserSeq,
+                mcpToolScope,
+                batchLease?.signal,
+                batchLease?.dispatchLease,
+              );
             })();
+        batchLease?.assertCurrent();
         const ok = !workerResultIndicatesFailure(result.text);
         // #6: the SDK-brain worker surfaces a turn-cap as ERROR text, but the
         // hooks.ts worker_capped emit only fires in the nested lane — so the
@@ -682,7 +794,7 @@ export function registerWorkerTools(server: McpServer): void {
           callId: `call_${subagentRunId}`,
         }));
       } catch (err) {
-        if (err instanceof KillRequested) throw err;
+        if (err instanceof KillRequested || isWorkerBatchGenerationCancellation(err, batchLease?.signal)) throw err;
         recordResult(false, firstLine(err), workerModel);
         recordModelRouteOutcome({
           decisionId: routeDecisionId,

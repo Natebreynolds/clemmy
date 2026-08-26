@@ -149,9 +149,24 @@ async function discoverAnthropicViaApiKey(apiKey: string): Promise<DiscoveredMod
 /** Subscription path: /v1/models rejects the Claude-Code OAuth grant (401), but
  *  the Agent SDK exposes supportedModels() — the models the user's SUBSCRIPTION
  *  can run, straight from the horse's mouth. One short-lived child per TTL. */
+export function claudeSdkModelDiscoveryOptions(): Record<string, unknown> {
+  return {
+    maxTurns: 1,
+    persistSession: false,
+    // Model discovery is metadata, not an execution surface. Do not inherit
+    // user/project settings, skills, built-ins, or configured MCP servers into
+    // the short-lived SDK child.
+    settingSources: [],
+    skills: [],
+    tools: [],
+    allowedTools: [],
+    mcpServers: {},
+  };
+}
+
 async function discoverAnthropicViaSdk(): Promise<DiscoveredModel[]> {
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
-  const q = query({ prompt: 'ok', options: { maxTurns: 1, persistSession: false, allowedTools: [] } as never });
+  const q = query({ prompt: 'ok', options: claudeSdkModelDiscoveryOptions() as never });
   try {
     const models = await (q as unknown as { supportedModels: () => Promise<Array<{ value?: string; resolvedModel?: string; displayName?: string }>> }).supportedModels();
     const out: DiscoveredModel[] = [];

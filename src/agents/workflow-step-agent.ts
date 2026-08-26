@@ -6,13 +6,15 @@ import path from 'node:path';
 import { z } from 'zod';
 import { MODELS } from '../config.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
-import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { RuntimeContextValue } from '../types.js';
 import { wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
 import { harnessInstructions } from './harness-context.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
-import { externalMcpScopeForAllowedToolLock } from './external-mcp-scope-lock.js';
+import {
+  externalMcpScopeForAllowedToolLock,
+  externalMcpScopeFromResolvedTools,
+} from './external-mcp-scope-lock.js';
 import {
   allRegistryNames,
   buildCompactToolCatalog,
@@ -24,7 +26,10 @@ import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { buildCallTool, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
 import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import { peekStepResult } from '../tools/step-result-tool.js';
-import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
+import {
+  bindAgentMcpToolScope,
+  canonicalMcpToolIdentity,
+} from '../runtime/mcp-tool-authority.js';
 import { runWorkspaceDir } from '../execution/workflow-run-workspace.js';
 import { STEP_STRUCTURAL_BASELINE_TOOLS } from '../execution/workflow-step-structural-tools.js';
 import { queryWorkspaceArtifact } from '../tools/workspace-artifact-tools.js';
@@ -229,12 +234,46 @@ export function workflowStepExternalMcpScopeForLock(
   fallback?: McpToolScope | null,
   serverNames?: string[],
 ): McpToolScope | null | undefined {
-  return externalMcpScopeForAllowedToolLock({
+  // A compiled workflow may already carry the exact plan/catalog authority.
+  // Preserve that exact immutable set even when this process cannot rediscover
+  // configured server metadata (for example, a resumed isolated worker). The
+  // explicit allowedTools lock must name only identities inside the carried set.
+  if (stepAllowedToolsLock(allowed) && fallback?.authority === 'exact') {
+    const carried = new Set(
+      (fallback.allowedToolNames ?? [])
+        .map(canonicalMcpToolIdentity)
+        .filter((name): name is string => Boolean(name)),
+    );
+    const requested = [...new Set(
+      (allowed ?? [])
+        .filter((name): name is string => typeof name === 'string')
+        .map(canonicalMcpToolIdentity)
+        .filter((name): name is string => Boolean(name)),
+    )].sort();
+    if (requested.length > 0 && requested.every((name) => carried.has(name))) {
+      return {
+        ...fallback,
+        reason: 'workflow step exact allowedTools lock (plan-carried)',
+        allowAll: false,
+        authority: 'exact',
+        allowedToolNames: requested,
+      };
+    }
+  }
+  const scoped = externalMcpScopeForAllowedToolLock({
     allowed,
     fallback,
     serverNames,
     reason: 'workflow step allowedTools lock',
   });
+  if (!scoped || !stepAllowedToolsLock(allowed)) return scoped;
+  const exact = externalMcpScopeFromResolvedTools(
+    (allowed ?? []).filter((name): name is string => typeof name === 'string').join(' '),
+    serverNames,
+  );
+  return exact?.authority === 'exact'
+    ? { ...exact, reason: 'workflow step exact allowedTools lock' }
+    : scoped;
 }
 
 const STEP_INSTRUCTIONS = [
@@ -510,6 +549,35 @@ export async function buildWorkflowStepAgent(
       compactCatalog,
     ].filter(Boolean).join('\n');
   }
+  // An explicit external-tool lock has no first-class provider schema now that
+  // raw SDK MCP attachments are gone. Mount the same local carrier used by a
+  // foreground work_call. The accepted host call still has to bind the exact
+  // immutable manifest/account/schema/invoke port; this tiny surface grants no
+  // catalog-wide or server-wide execution fallback.
+  const exactLockedExternal = surfaceLocked
+    && !options.resultOnlyTools
+    && !options.exactTools
+    && externalMcpScope?.authority === 'exact'
+    && (externalMcpScope.allowedToolNames?.length ?? 0) > 0;
+  if (exactLockedExternal) {
+    const firstClassNames = new Set(
+      lockedTools
+        .map((toolRef) => (toolRef as { name?: string }).name ?? '')
+        .filter(Boolean),
+    );
+    const dispatcher = buildCallTool({
+      reachableBuiltinNames: new Set<string>(),
+      firstClassNames,
+      deniedNames: WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
+      mcpToolScope: externalMcpScope,
+    }) as Tool<RuntimeContextValue>;
+    tools = [...lockedTools.filter((toolRef) => toolRef.name !== 'call_tool'), dispatcher];
+    catalogBlock = [
+      '[workflow-exact-external-tool] Invoke the exact locked external capability through `call_tool` using one of these names only:',
+      ...(externalMcpScope.allowedToolNames ?? []).map((name) => `- ${name}`),
+      'The host will refuse before provider I/O unless the accepted step owns the exact current manifest, schema, account, configuration, and immutable invoke port.',
+    ].join('\n');
+  }
   // Recall the proven tool for this step's intent — but ONLY for an UNBOUND step.
   // A step whose allowedTools LOCK the surface already has its tool chosen, so the
   // recall block would be noise; an unbound / composio step is where the model picks
@@ -534,13 +602,6 @@ export async function buildWorkflowStepAgent(
   const instructions = learnedRecall
     ? () => `${baseInstructions()}\n\n${learnedRecall}`
     : baseInstructions;
-  // An unbound schema-on-demand step reaches external MCPs through
-  // mcp_list_tools/call_tool, so attaching every configured server (and every
-  // schema) up front is unnecessary. Explicit MCP allowedTools locks retain
-  // their narrowed native attachment.
-  const externalMcpServers = schemaOnDemand || externalMcpScope === null
-    ? []
-    : [getOrCreateExternalMcpServers(externalMcpScope)];
   const agent = new Agent<RuntimeContextValue, any>({
     name: 'WorkflowStep',
     instructions,
@@ -554,7 +615,9 @@ export async function buildWorkflowStepAgent(
     // model another way to fail after doing useful work.
     tools: tools.map((t) => wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>),
     toolUseBehavior: workflowStepToolUseBehavior(options.sessionId),
-    ...(externalMcpServers.length > 0 ? { mcpServers: externalMcpServers } : {}),
+    // Provider-backed MCP execution must cross the local call_tool carrier;
+    // exact locked steps fail closed until that carrier is present rather than
+    // delegating an invisible body to the model SDK.
     inputGuardrails: harnessInputGuardrails,
     outputGuardrails: harnessOutputGuardrails,
   });

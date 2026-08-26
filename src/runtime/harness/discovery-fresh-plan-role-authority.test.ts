@@ -96,32 +96,36 @@ test('fresh-plan authority preserves one exact claim per frozen unresolved role'
     ['clause-0:read', 'clause-1:write'],
   );
 
-  // An invented or already-resolved role no longer refuses the search. What it
-  // must never do is become the claim key: role_key arrives from the MODEL, and
-  // the claim primary key contains the subject, so both collapse onto ONE
-  // host-owned subject. Frozen roles above keep their exact claims.
-  for (const roleKey of ['invented-provider-role', 'clause-2:write'] as const) {
-    const admission = admitDiscoveryBoundary({
+  // Both unusable roles collapse onto ONE host-owned subject. Its first
+  // physical owner is admitted; the second cannot use a new id to execute
+  // another provider body.
+  const coerced = admitDiscoveryBoundary({
+    ...key,
+    toolName: 'tool_search',
+    input: { query: 'spoofed search', role_key: 'invented-provider-role', limit: 8 },
+    callId: 'fresh-coerced-invented-provider-role',
+    freshPlanCatalogDisclosure: true,
+  });
+  assert.equal(coerced?.subject, HOST_UNSCOPED_DISCOVERY_SUBJECT);
+  assert.throws(
+    () => admitDiscoveryBoundary({
       ...key,
       toolName: 'tool_search',
-      input: { query: 'spoofed search', role_key: roleKey, limit: 8 },
-      callId: `fresh-coerced-${roleKey}`,
+      input: { query: 'spoofed search', role_key: 'clause-2:write', limit: 8 },
+      callId: 'fresh-coerced-clause-2:write',
       freshPlanCatalogDisclosure: true,
-    });
-    assert.ok(admission, `${roleKey} still gets its search`);
-    assert.equal(
-      admission.subject,
-      HOST_UNSCOPED_DISCOVERY_SUBJECT,
-      `${roleKey} may never key the claim ledger`,
-    );
-  }
+    }),
+    (error: unknown) => error instanceof DiscoveryBudgetDeniedError
+      && error.reason === 'new_call_requires_retry_epoch',
+  );
 });
 
 // Every frozen role gets its look. The old eight-claim ceiling meant a task
 // with nine real requirements could never discover the ninth — the requirement
 // existed, the model knew it was unresolved, and no action could reach it.
 // Distinct roles are bounded by the task's own frozen requirements, so this
-// needs no separate cap; repeats of a role it already claimed are free replays.
+// needs no separate cap; repeats of a role it already claimed are denied before
+// another provider body can run.
 test('every frozen unresolved role gets its own broad search', () => {
   const roles = Array.from({ length: 9 }, (_, index) => ({ roleKey: `clause-${index}:unknown` }));
   const key = acceptedTask('nine-live-roles', roles);

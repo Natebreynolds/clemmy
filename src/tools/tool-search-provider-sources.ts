@@ -134,20 +134,22 @@ export function buildAuthorizedToolSearchCandidateSources(
 
   const composio: ToolSearchCandidateSource = {
     kind: 'authorized_composio',
-    async search({ query, limit }) {
+    async search({ query }) {
       // Memory/index rows are ranking hints, never completeness or liveness
       // proof. Every admitted unresolved role gets exactly one bounded live
       // filtered search; only identifiers present in that response may be
       // returned or acquire a planning ref.
       const indexed = searchCapabilityOperations(query, {
-        limit,
+        // Rank hints cover the same bounded provider window even when the
+        // caller asks for the default eight-row first page.
+        limit: 20,
         carrierKind: 'composio',
       });
       const indexScore = new Map(indexed.map((hit) => [
         hit.identifier.trim().toLowerCase(),
         hit.score,
       ]));
-      const candidates = await searchComposioBrokerCandidates(query, limit);
+      const candidates = await searchComposioBrokerCandidates(query, 20);
       return candidates
         .map((candidate, index): ToolSearchBrokerCandidate => ({
           name: candidate.slug,
@@ -167,7 +169,10 @@ export function buildAuthorizedToolSearchCandidateSources(
           guidance: `Build the action arguments from this exact live schema. Invoke work_call with inner name composio_execute_tool; set tool_slug to ${candidate.slug} and serialize the action arguments into the arguments field.`,
         }))
         .sort((left, right) => (right.score ?? 0) - (left.score ?? 0) || left.name.localeCompare(right.name))
-        .slice(0, Math.max(1, Math.min(limit, 8)));
+        // Keep the broker's full bounded snapshot. tool_search owns visible
+        // page size/cursors; truncating here made provider rank nine impossible
+        // to recover without another physical discovery epoch.
+        .slice(0, 20);
     },
   };
 

@@ -70,6 +70,7 @@ const composioClient = await import('../integrations/composio/client.js');
 const capabilityResolution = await import('../runtime/harness/capability-resolution.js');
 const independentObservations = await import('../runtime/harness/independent-capability-observation.js');
 const externalRiskLoader = await import('../runtime/harness/external-capability-risk-loader.js');
+const composioProviderIdentity = await import('../integrations/composio/provider-definition-identity.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const hostConsent = await import('../runtime/harness/host-interactive-consent.js');
 
@@ -1047,6 +1048,9 @@ function exactLocalPlanDraft(input: {
 }
 
 test('exact accepted local plans bind reversible Workspace, workflow, and file work before execution', async (t) => {
+  const priorCatalog = catalogs.peekHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  t.after(() => catalogs.installHostCapabilityCatalogFactory(priorCatalog));
   const cases = [
     {
       label: 'reversible local file create',
@@ -1240,8 +1244,16 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
           let output: unknown[];
           if (modelCalls === 1) {
             assert.ok(tools.includes('tool_search'));
-            assert.ok(tools.includes('plan_task'));
-            assert.ok(tools.includes('work_call'));
+            assert.equal(
+              tools.includes('plan_task'),
+              false,
+              'plan_task stays absent until foreground search discloses one exact citable ref',
+            );
+            assert.equal(
+              tools.includes('work_call'),
+              false,
+              'write work_call stays absent until plan_task freezes exact work',
+            );
             assert.doesNotMatch(serialized, new RegExp(definition.capabilityRef));
             output = [functionCall(`planned-local-search-${index}`, 'tool_search', {
               query: candidate.name,
@@ -1249,12 +1261,18 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
               limit: 8,
             })];
           } else if (modelCalls === 2) {
+            assert.ok(
+              tools.includes('plan_task'),
+              'the same opaque planning authority must expose plan_task after exact disclosure',
+            );
             assert.match(serialized, new RegExp(definition.capabilityRef));
             output = [functionCall(`planned-local-plan-${index}`, 'plan_task', {
               preamble: `I’ll complete the requested ${candidate.label} now.`,
               draft: exactLocalPlanDraft({ label: candidate.label, operationId, definition }),
             })];
           } else if (modelCalls === 3) {
+            assert.ok(tools.includes('work_call'), 'settled plan_task must expose exact planned work');
+            assert.equal(tools.includes('plan_task'), false, 'settled plan_task is one-shot');
             const db = eventlog.openEventLog();
             const authority = db.prepare(`
               SELECT accepted_task_id, state, expected_work_required,
@@ -1790,6 +1808,53 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       source: null,
     },
     {
+      label: 'source-derived generic create without exact readback repairs before mutation I/O',
+      expected: 'source_proof_repair',
+      operation: 'FIXTURE_CREATE_REPORT_FROM_RECORDS',
+      destinationFamily: 'fixture',
+      prompt: 'Create one fixture report from the exact source records and verify its content.',
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['title', 'records'],
+        properties: {
+          title: { type: 'string' },
+          records: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['name', 'status'],
+              properties: {
+                name: { type: 'string' },
+                status: { type: 'string' },
+              },
+            },
+          },
+        },
+      },
+      args: {
+        title: 'Release Source Report',
+        records: [{ name: 'alpha', status: 'ready' }],
+      },
+      result: { successful: true, id: 'must-not-run-without-readback' },
+      source: {
+        operation: 'FIXTURE_LIST_REPORT_RECORDS',
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['query'],
+          properties: { query: { type: 'string' } },
+        },
+        args: { query: 'release source report records' },
+        result: {
+          records: [{ name: 'alpha', status: 'ready' }],
+          total: 1,
+          has_more: false,
+        },
+      },
+    },
+    {
       label: 'unknown external mutation repairs before I/O',
       expected: 'repair',
       operation: 'FIXTURE_SYNC_RESOURCE',
@@ -1997,6 +2062,21 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       const accountId = `account:release:${index}`;
       const schemaDigest = externalRiskLoader.canonicalExternalInputSchemaDigestV1(candidate.schema);
       assert.ok(schemaDigest, 'provider schema must have one canonical full digest');
+      const operationVersion = '1';
+      const invokePortId = `journey:provider-neutral:${index}:invoke`;
+      // `null` is an explicit provider-owned absence of an output schema;
+      // `undefined` would mean the output surface was never observed and may
+      // not mint execution authority.
+      const providerOutputSchema = null;
+      const definitionFingerprint = composioProviderIdentity.fingerprintComposioProviderDefinition({
+        operationId: candidate.operation,
+        operationVersion,
+        accountId,
+        invokePortId,
+        inputSchema: candidate.schema as Record<string, unknown>,
+        outputSchema: providerOutputSchema,
+      });
+      assert.ok(definitionFingerprint, 'provider definition must have one full canonical identity');
       const destinationPosture = 'destinationPosture' in candidate
         ? candidate.destinationPosture
         : 'create_new' as const;
@@ -2005,10 +2085,22 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
         manifestId: capabilityRef,
         providerKind: 'composio',
         operationId: candidate.operation,
-        providerIdentity: `composio:release-fixture:${index}`,
-        providerVersion: 'release-fixture-v1',
-        operationVersion: '1',
-        definitionFingerprint: schemaDigest!,
+        providerIdentity: 'composio',
+        providerVersion: composioProviderIdentity.COMPOSIO_PROVIDER_SURFACE_VERSION,
+        operationVersion,
+        definitionFingerprint: definitionFingerprint!,
+        externalDefinition: {
+          version: 1,
+          providerInputSchemaDigest: schemaDigest!,
+          providerOutputSchemaObserved: true,
+          semanticName: candidate.operation,
+          behaviorHints: {
+            readOnly: false,
+            destructive: false,
+            idempotent: null,
+            openWorld: false,
+          },
+        },
         effect: 'external_write',
         destination: { family: candidate.destinationFamily, posture: destinationPosture },
         accountId,
@@ -2032,26 +2124,55 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           ? ['destination', 'send']
           : ['destination', 'create'],
         argumentCompiler: { id: 'journey:exact-provider-args:v1', version: '1' },
-        invokePortId: `journey:provider-neutral:${index}:invoke`,
+        invokePortId,
         reconcilePortId: `journey:provider-neutral:${index}:reconcile`,
       });
-      const manifestDigest = manifests.capabilityManifestDigest(manifest);
       const sourceCapabilityRef = candidate.source
         ? `cap:release:${candidate.source.operation.toLowerCase()}:${index}`
         : null;
       const sourceSchemaDigest = candidate.source
         ? externalRiskLoader.canonicalExternalInputSchemaDigestV1(candidate.source.schema)
         : null;
-      const sourceManifest = candidate.source && sourceCapabilityRef && sourceSchemaDigest
+      const sourceInvokePortId = `journey:provider-neutral:${index}:source-invoke`;
+      const sourceDefinitionFingerprint = candidate.source
+        ? composioProviderIdentity.fingerprintComposioProviderDefinition({
+            operationId: candidate.source.operation,
+            operationVersion,
+            accountId,
+            invokePortId: sourceInvokePortId,
+            inputSchema: candidate.source.schema as Record<string, unknown>,
+            outputSchema: providerOutputSchema,
+          })
+        : null;
+      if (candidate.source) {
+        assert.ok(sourceSchemaDigest, 'source schema must have one canonical input digest');
+        assert.ok(sourceDefinitionFingerprint, 'source definition must have one full canonical identity');
+      }
+      const sourceManifest = candidate.source
+        && sourceCapabilityRef
+        && sourceSchemaDigest
+        && sourceDefinitionFingerprint
         ? manifests.attachSemanticContract({
             version: 1,
             manifestId: sourceCapabilityRef,
             providerKind: 'composio',
             operationId: candidate.source.operation,
-            providerIdentity: `composio:release-fixture:${index}`,
-            providerVersion: 'release-fixture-v1',
-            operationVersion: '1',
-            definitionFingerprint: sourceSchemaDigest,
+            providerIdentity: 'composio',
+            providerVersion: composioProviderIdentity.COMPOSIO_PROVIDER_SURFACE_VERSION,
+            operationVersion,
+            definitionFingerprint: sourceDefinitionFingerprint,
+            externalDefinition: {
+              version: 1,
+              providerInputSchemaDigest: sourceSchemaDigest,
+              providerOutputSchemaObserved: true,
+              semanticName: candidate.source.operation,
+              behaviorHints: {
+                readOnly: true,
+                destructive: false,
+                idempotent: true,
+                openWorld: false,
+              },
+            },
             effect: 'read',
             accountId,
             idempotency: { required: false, policy: 'none' },
@@ -2070,7 +2191,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
             lifecycle: { state: 'current' },
             advisoryRoles: ['source', 'collection'],
             argumentCompiler: { id: 'journey:exact-provider-args:v1', version: '1' },
-            invokePortId: `journey:provider-neutral:${index}:source-invoke`,
+            invokePortId: sourceInvokePortId,
           })
         : null;
       const selectedManifests = [
@@ -2108,9 +2229,19 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       }]);
       composioSchemas._setToolSchemaLoaderForTests(async (identifier) => (
         identifier === candidate.operation
-          ? { inputParameters: candidate.schema, providerObservedAt: Date.now() }
+          ? {
+              inputParameters: candidate.schema,
+              outputParameters: providerOutputSchema,
+              providerObservedAt: Date.now(),
+              providerOperationVersion: operationVersion,
+            }
           : candidate.source && identifier === candidate.source.operation
-            ? { inputParameters: candidate.source.schema, providerObservedAt: Date.now() }
+            ? {
+                inputParameters: candidate.source.schema,
+                outputParameters: providerOutputSchema,
+                providerObservedAt: Date.now(),
+                providerOperationVersion: operationVersion,
+              }
           : null
       ));
       const schemasByOperation = new Map<string, Readonly<Record<string, unknown>>>([
@@ -2128,6 +2259,8 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           selectedManifest.operationId,
           selectedSchema,
           observedAt,
+          selectedManifest.operationVersion,
+          providerOutputSchema,
         );
         const liveSourceFingerprint = composioSchemas.liveComposioSchemaFingerprint(
           selectedManifest.operationId,
@@ -2306,7 +2439,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           return new Promise<never>((_resolve, reject) => {
             const watchdog = setTimeout(() => {
               reject(new Error('fixture watchdog: host deadline did not settle the unknown write'));
-            }, 200);
+            }, 2_000);
             watchdog.unref();
           });
         }
@@ -2637,12 +2770,17 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       }
       const expectedBodies = candidate.expected === 'proceed'
         ? candidate.source ? 2 : 1
+        : candidate.expected === 'source_proof_repair'
+          ? 1
         : 0;
       assert.equal(bodies, expectedBodies, `${candidate.label}: provider body cardinality`);
       assert.equal(localBodies, 0, `${candidate.label}: local mutation must not cross before consent`);
       assert.equal(
         sourceBodies,
-        candidate.expected === 'proceed' && candidate.source ? 1 : 0,
+        candidate.source && (
+          candidate.expected === 'proceed'
+          || candidate.expected === 'source_proof_repair'
+        ) ? 1 : 0,
         `${candidate.label}: source body cardinality`,
       );
       assert.equal(
@@ -2669,9 +2807,15 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
         assert.equal(workBindings.length, 0, `${candidate.label}: no work may bind`);
         assert.equal(workHostBindings.length, 0, `${candidate.label}: no call may bind`);
       } else {
+        // Source-derived content proof is checked before the mutation claim is
+        // minted, so only the already-settled source binding remains. Later
+        // policy refusals retain the exact work claim for durable audit.
+        const expectedWorkBindingCount = candidate.expected === 'source_proof_repair'
+          ? 1
+          : candidate.source ? 2 : ordinarySiblingOperationId ? 2 : 1;
         assert.equal(
           workBindings.length,
-          candidate.source ? 2 : ordinarySiblingOperationId ? 2 : 1,
+          expectedWorkBindingCount,
           `${candidate.label}: expected-work binding cardinality`,
         );
         assert.equal(workHostBindings.length, 1, `${candidate.label}: host binding cardinality`);
@@ -2710,7 +2854,10 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
         candidate.expected === 'plan_repair' || candidate.expected === 'needs_user' ? 0 : 1,
         `${candidate.label}: settlement cardinality`,
       );
-      if (candidate.expected === 'repair') {
+      if (
+        candidate.expected === 'repair'
+        || candidate.expected === 'source_proof_repair'
+      ) {
         assert.match(String(workResult ?? ''), /refused_pre_dispatch|replan/);
       }
       assert.equal(
@@ -2804,7 +2951,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
             hostTurnEngine: 'host_v1',
             hostApprovalId: approval.approvalId,
             ...(resumeScenario === 'approve_unknown_restart'
-              ? { hostToolDeadlineMs: 20 }
+              ? { hostToolDeadlineMs: 250 }
               : {}),
             context: { sessionId: plannedSession.id, sourceUserSeq: source.seq, turn: 2 },
           } as never,
@@ -2935,7 +3082,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
               maxTurns: 6,
               hostTurnEngine: 'host_v1',
               hostApprovalId: approval.approvalId,
-              hostToolDeadlineMs: 20,
+              hostToolDeadlineMs: 250,
               context: { sessionId: plannedSession.id, sourceUserSeq: source.seq, turn: 3 },
             } as never,
           ));
@@ -2945,6 +3092,92 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           assert.equal(modelCalls, 2);
           assert.ok(functionResultIds(replayed.history).includes(workCallId));
           assert.deepEqual(unmatchedFunctionCallIds({ input: replayed.history }), []);
+
+          // The source-local reconciliation fence must survive in history
+          // without poisoning a later, unrelated accepted source.
+          const durableSession = HarnessSession.load(plannedSession.id);
+          assert.ok(durableSession, 'the exact planned session must survive restart');
+          durableSession.recordTurnResult({
+            history: resumed.history,
+            lastResponseId: resumed.lastResponseId,
+            turn: 1,
+          });
+          const reloadedSession = HarnessSession.load(plannedSession.id);
+          assert.ok(reloadedSession, 'the paired uncertain result must survive restart');
+          assert.ok(functionResultIds(reloadedSession.toInputItems()).includes(workCallId));
+          assert.deepEqual(unmatchedFunctionCallIds({ input: reloadedSession.toInputItems() }), []);
+
+          const nextPrompt = 'Now list the configured workspace roots for this unrelated request.';
+          const nextSource = reloadedSession.recordUserInput(nextPrompt, 4);
+          const readCallId = `post-crossing-unrelated-read-${index}`;
+          const readBodies: Array<Record<string, unknown>> = [];
+          const readTool = recordingTool({
+            name: 'workspace_roots',
+            seen: readBodies,
+            result: JSON.stringify({ roots: ['/fixture'] }),
+          });
+          const readModel = scriptedModel([
+            [functionCall(readCallId, 'workspace_roots', {})],
+            [assistantText('The unrelated workspace read completed normally.')],
+          ]);
+          const readAgent = {
+            model: readModel,
+            tools: [readTool],
+            instructions: 'Handle only the unrelated safe read; never retry an older mutation.',
+          };
+          bindSurface(plannedSession.id, readAgent, [readTool]);
+          const nextOutcome = await brackets.withHarnessRunContext({
+            sessionId: plannedSession.id,
+            sourceUserSeq: nextSource.seq,
+            turn: 4,
+            counter: new brackets.ToolCallsCounter(6),
+            behaviorScopeId: `${plannedSession.id}::turn:4`,
+          }, () => hostRunRunner(
+            throwingRunner() as never,
+            readAgent as never,
+            [
+              ...reloadedSession.toInputItems(),
+              { role: 'user', content: nextPrompt },
+            ] as never,
+            {
+              maxTurns: 3,
+              hostTurnEngine: 'host_v1',
+              context: {
+                sessionId: plannedSession.id,
+                sourceUserSeq: nextSource.seq,
+                turn: 4,
+              },
+            } as never,
+          ));
+          assert.equal(nextOutcome.terminal, undefined);
+          assert.equal(nextOutcome.finalOutput, 'The unrelated workspace read completed normally.');
+          assert.equal(readModel.calls(), 2);
+          assert.equal(readBodies.length, 1, 'the unrelated read crosses exactly once');
+          assert.equal(bodies, 1, 'the old uncertain provider mutation never redispatches');
+          assert.deepEqual(unmatchedFunctionCallIds(readModel.inputs()[0]), []);
+          assert.deepEqual(unmatchedFunctionCallIds(readModel.inputs()[1]), []);
+          assert.deepEqual(functionResultIds(
+            (readModel.inputs()[1] as { input?: unknown } | undefined)?.input,
+          ).slice(-1), [readCallId]);
+          assert.doesNotMatch(JSON.stringify(nextOutcome), FORBIDDEN_PUBLIC_GATE);
+
+          const oldPhysicalAfterNextSource = resumedDb.prepare(`
+            SELECT logical_tool_call_id, tool_name, state, execution_site
+              FROM physical_dispatches
+             WHERE session_id = ? AND source_user_seq = ?
+               AND logical_tool_call_id = ?
+             ORDER BY logical_tool_call_id, ordinal
+          `).all(plannedSession.id, source.seq, workCallId);
+          const oldSettlementAfterNextSource = resumedDb.prepare(`
+            SELECT logical_tool_call_id, execution_kind, outcome_kind, business_call,
+                   mutating, requirement_id, physical_crossing_count
+              FROM logical_call_settlements
+             WHERE session_id = ? AND source_user_seq = ?
+               AND logical_tool_call_id = ?
+             ORDER BY logical_tool_call_id
+          `).all(plannedSession.id, source.seq, workCallId);
+          assert.deepEqual(oldPhysicalAfterNextSource, resumedPhysical);
+          assert.deepEqual(oldSettlementAfterNextSource, resumedSettlements);
           return;
         }
         assert.equal(resumed.terminal, undefined, 'approved exact grant must not become a generic block');
@@ -3160,8 +3393,9 @@ test('retired bare SDK adapter pairs unsupported discovery without becoming a pu
       assert.deepEqual(functionCallIds(result.outcome?.history), [callId]);
       assert.deepEqual(functionResultIds(result.outcome?.history), [callId]);
       assert.deepEqual(unmatchedFunctionCallIds({ input: result.outcome?.history }), []);
+      const secondRequest = result.model.inputs()[1] as { input?: unknown } | undefined;
       assert.match(
-        String(functionResultTextFor(result.model.inputs()[1], callId)),
+        String(functionResultTextFor(secondRequest?.input, callId)),
         /discovery budget denied \(task_not_initialized\)/,
       );
       assert.doesNotMatch(String(result.outcome?.finalOutput), FORBIDDEN_PUBLIC_GATE);
@@ -3608,335 +3842,12 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
   assert.equal(bodies, 0);
 });
 
-test('an approved pending frame whose tool surface disappears is paired and replanned without a public block', async () => {
-  const resumeSession = HarnessSession.create({
-    id: 'discord-like-approved-resume-surface-loss',
-    kind: 'chat',
-    channel: 'discord',
-  });
-  const callId = 'approved-resume-surface-loss-call';
-  let bodies = 0;
-  let surfaceAvailable = true;
-  let refreshFailures = 0;
-  const pendingTool = brackets.wrapToolForHarness({
-    type: 'function',
-    name: 'write_file',
-    description: 'Recording-only approved write whose callable surface disappears before resume.',
-    strict: true,
-    parameters: strictSchema({
-      path: { type: 'string' },
-      content: { type: 'string' },
-      append: { type: 'boolean' },
-    }, ['path', 'content', 'append']),
-    needsApproval: async () => true,
-    invoke: async () => {
-      bodies += 1;
-      return 'must not run after the surface disappears';
-    },
-  } as never) as FunctionTool;
-  const model = scriptedModel([
-    [functionCall(callId, 'write_file', {
-      path: '/fixture/resume-surface.txt',
-      content: 'fixture',
-      append: false,
-    })],
-    [assistantText('The unavailable approved action was safely replanned.')],
-  ]);
-  const agent = {
-    model,
-    tools: [pendingTool],
-    instructions: 'Continue from paired no-effect results.',
-    async getAllTools() {
-      if (!surfaceAvailable) {
-        refreshFailures += 1;
-        throw new Error('fixture tool surface unavailable after approval');
-      }
-      return [pendingTool];
-    },
-  };
-  bindSurface(resumeSession.id, agent, [pendingTool]);
-  const source = resumeSession.recordUserInput('Create the approved local fixture draft.', 1);
-  const parent = {
-    sessionId: resumeSession.id,
-    sourceUserSeq: source.seq,
-    turn: 1,
-    counter: new brackets.ToolCallsCounter(6),
-    behaviorScopeId: `${resumeSession.id}::turn:1`,
-  };
-  const options = {
-    maxTurns: 4,
-    hostTurnEngine: 'host_v1',
-    context: { sessionId: resumeSession.id, sourceUserSeq: source.seq, turn: 1 },
-  };
-  const paused = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    [{ role: 'user', content: 'Create the approved local fixture draft.' }] as never,
-    options as never,
-  ));
-  assert.equal(paused.hasInterruptions, true);
-  assert.equal(model.calls(), 1);
-  assert.equal(bodies, 0);
-  const state = HostInterruptState.fromString(paused.serializedState!);
-  for (const interruption of state.getInterruptions()) state.approve(interruption);
-
-  surfaceAvailable = false;
-  const resumed = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    state as never,
-    options as never,
-  ));
-  const crossings = (eventlog.openEventLog().prepare(`
-    SELECT COUNT(*) AS n FROM physical_dispatches
-     WHERE session_id = ? AND source_user_seq = ?
-  `).get(resumeSession.id, source.seq) as { n: number }).n;
-  assert.equal(refreshFailures >= 1, true);
-  assert.equal(model.calls(), 2, 'the paired refusal must reach one normal model replan step');
-  assert.equal(bodies, 0);
-  assert.equal(crossings, 0);
-  assert.equal(resumed.terminal, undefined);
-  assert.equal(resumed.finalOutput, 'The unavailable approved action was safely replanned.');
-  assert.deepEqual(functionResultIds(resumed.history), [callId]);
-  assert.deepEqual(unmatchedFunctionCallIds({ input: resumed.history }), []);
-  const secondRequest = model.inputs()[1] as { input?: unknown; tools?: unknown } | undefined;
-  assert.deepEqual(functionResultIds(secondRequest?.input), [callId]);
-  assert.deepEqual(unmatchedFunctionCallIds(secondRequest), []);
-  assert.deepEqual(secondRequest?.tools, [], 'fallback model step must expose an empty callable surface');
-  assert.doesNotMatch(JSON.stringify(resumed), FORBIDDEN_PUBLIC_GATE);
-});
-
-test('a post-crossing unknown write is held, paired, and never redispatched after restart', async (t) => {
-  const unknownSession = HarnessSession.create({
-    id: 'discord-like-post-crossing-unknown-write',
-    kind: 'chat',
-    channel: 'discord',
-  });
-  const callId = 'unknown-write-call';
-  let bodies = 0;
-  const uncertainTool = brackets.wrapToolForHarness({
-    type: 'function',
-    name: 'write_file',
-    description: 'Recording-only write that deliberately never acknowledges completion.',
-    strict: true,
-    parameters: strictSchema({
-      path: { type: 'string' },
-      content: { type: 'string' },
-      append: { type: 'boolean' },
-    }, ['path', 'content', 'append']),
-    // This fixture starts from a real user decision so it tests only the
-    // after-crossing disposition. The ordinary matrix separately requires
-    // authorized reversible writes to reach this boundary with zero prompts.
-    needsApproval: async () => true,
-    invoke: async () => {
-      bodies += 1;
-      return new Promise<never>(() => {});
-    },
-  } as never) as FunctionTool;
-  const model = scriptedModel([
-    [functionCall(callId, 'write_file', {
-      path: '/fixture/uncertain.txt', content: 'uncertain', append: false,
-    })],
-    [assistantText('This model step must remain unreachable while the write is uncertain.')],
-  ]);
-  const agent = { model, tools: [uncertainTool], instructions: 'Never replay an uncertain write.' };
-  bindSurface(unknownSession.id, agent, [uncertainTool]);
-  const source = unknownSession.recordUserInput('Perform the approved fixture write exactly once.', 1);
-  const parent = {
-    sessionId: unknownSession.id,
-    sourceUserSeq: source.seq,
-    turn: 1,
-    counter: new brackets.ToolCallsCounter(6),
-    behaviorScopeId: `${unknownSession.id}::turn:1`,
-  };
-  const options = {
-    maxTurns: 3,
-    hostTurnEngine: 'host_v1',
-    hostToolDeadlineMs: 20,
-    context: { sessionId: unknownSession.id, sourceUserSeq: source.seq, turn: 1 },
-  } as const;
-  const paused = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    [{ role: 'user', content: 'Perform the approved fixture write exactly once.' }] as never,
-    options as never,
-  ));
-  assert.equal(paused.hasInterruptions, true, 'the fixture must begin from an explicit user decision');
-  assert.equal(bodies, 0, 'approval precedes the physical boundary');
-  const approved = HostInterruptState.fromString(paused.serializedState!);
-  approved.approve(approved.getInterruptions()[0]);
-  const approvedRestartBlob = approved.toString();
-
-  const held = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    approved as never,
-    options as never,
-  ));
-  const restartedApproved = HostInterruptState.fromString(approvedRestartBlob);
-  const replayHeld = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    restartedApproved as never,
-    options as never,
-  ));
-
-  const db = eventlog.openEventLog();
-  const physical = db.prepare(`
-    SELECT state FROM physical_dispatches
-     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
-     ORDER BY ordinal
-  `).all(unknownSession.id, source.seq, callId) as Array<{ state: string }>;
-  const settlement = db.prepare(`
-    SELECT outcome_kind, recovery_action, retry_same_candidate,
-           requires_reconciliation, physical_crossing_count
-      FROM logical_call_settlements
-     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
-  `).get(unknownSession.id, source.seq, callId) as {
-    outcome_kind: string;
-    recovery_action: string;
-    retry_same_candidate: number;
-    requires_reconciliation: number;
-    physical_crossing_count: number;
-  } | undefined;
-  const observed = {
-    bodies,
-    modelCalls: model.calls(),
-    physical,
-    settlement,
-    heldTerminal: held.terminal ?? null,
-    heldResultIds: functionResultIds(held.history),
-    heldUnmatched: unmatchedFunctionCallIds({ input: held.history }),
-    replayTerminal: replayHeld.terminal ?? null,
-    replayResultIds: functionResultIds(replayHeld.history),
-    replayUnmatched: unmatchedFunctionCallIds({ input: replayHeld.history }),
-  };
-  t.diagnostic(`post-crossing unknown observation: ${JSON.stringify(observed)}`);
-  assert.deepEqual(observed, {
-    bodies: 1,
-    modelCalls: 1,
-    physical: [{ state: 'unknown' }],
-    settlement: {
-      outcome_kind: 'uncertain_write',
-      recovery_action: 'reconcile_then_decide',
-      retry_same_candidate: 0,
-      requires_reconciliation: 1,
-      // The wrapped local carrier owns the one physical row; the outer
-      // logical settlement correctly does not claim a second host crossing.
-      physical_crossing_count: 0,
-    },
-    heldTerminal: { status: 'blocked', reason: 'tool_effect_uncertain' },
-    heldResultIds: [callId],
-    heldUnmatched: [],
-    replayTerminal: { status: 'blocked', reason: 'tool_effect_uncertain' },
-    replayResultIds: [callId],
-    replayUnmatched: [],
-  });
-
-  // Persist the real, paired uncertain outcome exactly as the host produced it.
-  // Its mutation remains reconciliation-owned, but that source-local fence
-  // must not poison the protocol for an unrelated accepted source.
-  unknownSession.recordTurnResult({
-    history: held.history,
-    lastResponseId: held.lastResponseId,
-    turn: 1,
-  });
-  const restartedSession = HarnessSession.load(unknownSession.id);
-  assert.ok(restartedSession, 'the paired uncertain outcome must survive restart');
-  assert.deepEqual(functionResultIds(restartedSession.toInputItems()), [callId]);
-  assert.deepEqual(unmatchedFunctionCallIds({ input: restartedSession.toInputItems() }), []);
-
-  const readCallId = 'post-crossing-unrelated-read-call';
-  const readBodies: Array<Record<string, unknown>> = [];
-  const readTool = recordingTool({
-    name: 'workspace_roots',
-    seen: readBodies,
-    result: JSON.stringify({ roots: ['/fixture'] }),
-  });
-  const readModel = scriptedModel([
-    [functionCall(readCallId, 'workspace_roots', {})],
-    [assistantText('The unrelated workspace read completed normally.')],
-  ]);
-  const readAgent = {
-    model: readModel,
-    tools: [readTool],
-    instructions: 'Handle only the unrelated safe read; never retry an older mutation.',
-  };
-  bindSurface(unknownSession.id, readAgent, [readTool]);
-  const nextPrompt = 'Now list the configured workspace roots for this unrelated request.';
-  const nextAcceptedSource = restartedSession.recordUserInput(nextPrompt, 2);
-  const nextParent = {
-    sessionId: unknownSession.id,
-    sourceUserSeq: nextAcceptedSource.seq,
-    turn: 2,
-    counter: new brackets.ToolCallsCounter(6),
-    behaviorScopeId: `${unknownSession.id}::turn:2`,
-  };
-  const nextSource = await brackets.withHarnessRunContext(nextParent, () => hostRunRunner(
-    throwingRunner() as never,
-    readAgent as never,
-    [
-      ...restartedSession.toInputItems(),
-      { role: 'user', content: nextPrompt },
-    ] as never,
-    {
-      maxTurns: 3,
-      hostTurnEngine: 'host_v1',
-      context: {
-        sessionId: unknownSession.id,
-        sourceUserSeq: nextAcceptedSource.seq,
-        turn: 2,
-      },
-    } as never,
-  ));
-  const nextPhysical = db.prepare(`
-    SELECT logical_tool_call_id, tool_name, state FROM physical_dispatches
-     WHERE session_id = ? AND source_user_seq = ? ORDER BY ordinal
-  `).all(unknownSession.id, nextAcceptedSource.seq);
-  const nextSettlements = db.prepare(`
-    SELECT logical_tool_call_id, execution_kind, outcome_kind, recovery_action,
-           retry_same_candidate, requires_reconciliation, physical_crossing_count
-      FROM logical_call_settlements
-     WHERE session_id = ? AND source_user_seq = ? ORDER BY logical_tool_call_id
-  `).all(unknownSession.id, nextAcceptedSource.seq);
-
-  t.diagnostic(`post-crossing unrelated-source observation: ${JSON.stringify({
-    sourceUserSeq: nextAcceptedSource.seq,
-    terminal: nextSource.terminal ?? null,
-    finalOutput: nextSource.finalOutput ?? null,
-    modelCalls: readModel.calls(),
-    readBodies: readBodies.length,
-    oldMutationBodies: bodies,
-    firstRequestUnmatched: unmatchedFunctionCallIds(readModel.inputs()[0]),
-    physical: nextPhysical,
-    settlements: nextSettlements,
-  })}`);
-  assert.equal(nextSource.terminal, undefined);
-  assert.equal(nextSource.finalOutput, 'The unrelated workspace read completed normally.');
-  assert.equal(readModel.calls(), 2);
-  assert.equal(readBodies.length, 1, 'the new safe read crosses exactly once');
-  assert.equal(bodies, 1, 'the old uncertain mutation must never be redispatched');
-  assert.deepEqual(unmatchedFunctionCallIds(readModel.inputs()[0]), []);
-  assert.deepEqual(unmatchedFunctionCallIds(readModel.inputs()[1]), []);
-  assert.deepEqual(functionResultIds(
-    (readModel.inputs()[1] as { input?: unknown } | undefined)?.input,
-  ).slice(-1), [readCallId]);
-  assert.doesNotMatch(JSON.stringify(nextSource), FORBIDDEN_PUBLIC_GATE);
-
-  const oldPhysicalAfterNextSource = db.prepare(`
-    SELECT state FROM physical_dispatches
-     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
-     ORDER BY ordinal
-  `).all(unknownSession.id, source.seq, callId) as Array<{ state: string }>;
-  const oldSettlementAfterNextSource = db.prepare(`
-    SELECT outcome_kind, recovery_action, retry_same_candidate,
-           requires_reconciliation, physical_crossing_count
-      FROM logical_call_settlements
-     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
-  `).get(unknownSession.id, source.seq, callId);
-  assert.deepEqual(oldPhysicalAfterNextSource, physical);
-  assert.deepEqual(oldSettlementAfterNextSource, settlement);
-});
+// The real accepted-work variants above own these two lifecycle gates:
+// `approve_surface_loss` proves a vanished approved surface replans before
+// I/O, and `approve_unknown_restart` proves an uncertain crossing cannot be
+// redispatched after restart. Raw `write_file` calls have no accepted-task
+// authority and must repair before approval, so duplicating those scenarios
+// with an unplanned local carrier would test the opposite security contract.
 
 test('legacy SDK owner pairs a multi-call turn but does not enforce the host capability seal', async (t) => {
   const legacySession = eventlog.createSession({

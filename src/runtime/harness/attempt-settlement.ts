@@ -51,8 +51,57 @@ import {
   acceptedTurnCallAuthorityFor,
 } from './accepted-turn-call-authority.js';
 import { currentHostToolInvocationObservation } from './tool-invocation-observation-context.js';
+import { ExternalWritePreDispatchResult } from './external-write-admission.js';
 
 export { normalizeCallableArguments, toResultHandle };
+
+/**
+ * Nominal result for a host-owned callable-schema rejection.
+ *
+ * The Agents SDK deliberately returns `errorFunction` values to the model. A
+ * plain string at that boundary loses the only fact that matters to settlement:
+ * validation failed before any provider body could start. Keep the familiar
+ * model-facing bytes on the existing pre-dispatch result carrier, and add an
+ * exact attempt outcome that downstream lanes can consume without interpreting
+ * those bytes.
+ */
+export class InvalidArgumentsPreDispatchResult extends ExternalWritePreDispatchResult {
+  readonly executionKind = 'refused_pre_dispatch' as const;
+  readonly outcomeKind = 'invalid_arguments' as const;
+
+  constructor(
+    output: string,
+    readonly schemaAvailable = true,
+  ) {
+    super(output, 'invalid_arguments');
+  }
+}
+
+/** Translate a nominal returned carrier into the shared settlement signals.
+ * Provider/model prose can never satisfy this check. */
+export function attemptSignalsFromTypedResult(result: unknown): AttemptSignals {
+  if (result instanceof InvalidArgumentsPreDispatchResult) {
+    return {
+      preDispatch: true,
+      argumentValidationFailed: true,
+      schemaAvailable: result.schemaAvailable,
+    };
+  }
+  // A locally constructed policy refusal may return corrective bytes to the
+  // model/MCP client without throwing. The nominal base class prevents provider
+  // prose from forging no-dispatch truth; the explicit subclass field names the
+  // recovery class without coupling this kernel to any tool implementation.
+  if (
+    result instanceof ExternalWritePreDispatchResult
+    && (result as ExternalWritePreDispatchResult & { policyRefused?: unknown }).policyRefused === true
+  ) {
+    return {
+      preDispatch: true,
+      policyRefused: true,
+    };
+  }
+  return {};
+}
 
 /** Translate the host's typed shell truth into the shared outcome vocabulary.
  * No stdout/stderr wording participates in this decision. */
@@ -408,16 +457,17 @@ function record(value: unknown): Record<string, unknown> | null {
  * inspects wording, so a provider changing its phrasing changes nothing.
  */
 function signalsFromResult(result: unknown): AttemptSignals {
+  const typed = attemptSignalsFromTypedResult(result);
   const envelope = record(result);
   if (!envelope) {
     // A bare string/array result carries no structure. Emptiness is still a
     // fact we can observe without reading meaning into the characters.
     const empty = (typeof result === 'string' && result.trim().length === 0)
       || (Array.isArray(result) && result.length === 0);
-    return empty ? { emptyResult: true } : {};
+    return empty ? { ...typed, emptyResult: true } : typed;
   }
 
-  const signals: AttemptSignals = {};
+  const signals: AttemptSignals = { ...typed };
   const successful = envelope.successful ?? envelope.success ?? envelope.ok;
   if (typeof successful === 'boolean') signals.envelopeSuccessful = successful;
   if (typeof envelope.isError === 'boolean') signals.providerReportedError = envelope.isError;

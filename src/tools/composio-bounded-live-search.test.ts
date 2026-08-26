@@ -163,6 +163,84 @@ test('cold Composio discovery uses one bounded SDK search and treats the index a
   assert.ok(Buffer.byteLength(JSON.stringify(found), 'utf8') < 32 * 1024);
 });
 
+test('the broker retains provider rank sixteen despite ten thousand advisory decoys', async () => {
+  schemaCache.resetToolSchemaCache();
+  capabilityIndex._resetCapabilityIndexForTest();
+  composio.resetComposioClient();
+  composio.__test__.setComposioApiKeyOverride('rank-sixteen-key');
+  composio.__test__.setConnectedAccountsLoader(async () => [{
+    id: 'connection-mega-rank-sixteen',
+    status: 'ACTIVE',
+    user_id: 'rank-sixteen-user',
+    toolkit: { slug: 'mega' },
+  }]);
+
+  capabilityIndex.recordCapabilityOperations(Array.from({ length: 10_000 }, (_, index) => ({
+    identifier: `MEGA_ADVISORY_DECOY_${String(index).padStart(5, '0')}`,
+    carrierKind: 'composio' as const,
+    carrier: 'mega',
+    displayName: `Needle boundary advisory decoy ${index}`,
+    description: 'needle boundary provider operation',
+    effectClass: 'read' as const,
+    effectProvenance: 'inferred' as const,
+  })));
+
+  const targetSlug = 'MEGA_NEEDLE_BOUNDARY_REQUIRED_OPERATION';
+  const providerRows = [
+    ...Array.from({ length: 15 }, (_, index) => ({
+      slug: `MEGA_NEEDLE_BOUNDARY_PROVIDER_${String(index + 1).padStart(2, '0')}`,
+      name: `Needle boundary provider operation ${index + 1}`,
+      description: 'needle boundary provider operation',
+      toolkit: { slug: 'mega' },
+      inputParameters: DISTRACTOR_SCHEMA,
+    })),
+    {
+      slug: targetSlug,
+      name: 'Needle boundary required operation',
+      description: 'needle boundary provider operation',
+      toolkit: { slug: 'mega' },
+      inputParameters: SOURCE_SCHEMA,
+    },
+  ];
+  assert.equal(providerRows[15]?.slug, targetSlug, 'fixture pins the correct operation at provider rank sixteen');
+
+  let providerCalls = 0;
+  composio.__test__.setComposioClient({
+    tools: {
+      async getRawComposioTools(input: Record<string, unknown>) {
+        providerCalls += 1;
+        assert.deepEqual(input, {
+          toolkits: ['mega'],
+          search: 'needle boundary provider operation',
+          limit: 16,
+        });
+        return providerRows;
+      },
+    },
+  });
+
+  const sources = providerSources.buildAuthorizedToolSearchCandidateSources({
+    reason: 'rank sixteen production boundary',
+    authority: 'catalog',
+    allowedServerSlugs: [],
+    toolPatterns: [],
+    maxTools: 0,
+  } as never);
+  const source = sources.find((candidate) => candidate.kind === 'authorized_composio');
+  assert.ok(source);
+  const found = await source!.search({
+    query: 'needle boundary provider operation',
+    limit: 20,
+  });
+
+  assert.equal(providerCalls, 1, 'ten thousand local hints cannot create a provider rescan');
+  assert.equal(found.length, 16, 'the whole bounded provider oversample remains locally pageable');
+  assert.ok(found.some((candidate) => candidate.name === targetSlug),
+    'the exact live rank-sixteen operation survives the former eight-row cliff');
+  assert.equal(found.some((candidate) => candidate.name.startsWith('MEGA_ADVISORY_DECOY_')), false,
+    'advisory rows can rank exact live members but never join the result universe');
+});
+
 test('a filtered SDK failure never falls back to unfiltered toolkit enumeration', async () => {
   composio.resetComposioClient();
   composio.__test__.setComposioApiKeyOverride('bounded-search-key');

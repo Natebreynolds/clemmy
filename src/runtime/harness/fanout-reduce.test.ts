@@ -102,6 +102,45 @@ test('digest mode parks the FULL output retrievably under the callId', async () 
   assert.equal(parked!.output, big, 'parked payload is lossless');
 });
 
+test('an evidence-backed replay aliases the exact parked payload instead of duplicating it', async () => {
+  process.env.CLEMMY_REDUCE_FANOUT_THRESHOLD = '1';
+  const sess = freshSession();
+  const full = `stable worker result\n${'detail '.repeat(800)}FINAL=accepted`;
+  emitWorkerResult(sess, 1);
+  await buildWorkerReturn({
+    sessionId: sess,
+    parentRunId: sess,
+    item: 'same-item',
+    text: full,
+    callId: 'call_original_worker_output',
+  });
+
+  emitWorkerResult(sess, 2);
+  const replay = await buildWorkerReturn({
+    sessionId: sess,
+    parentRunId: sess,
+    item: 'same-item',
+    text: full,
+    callId: 'call_restart_replay',
+    reuseParkedOutput: true,
+  });
+  assert.match(replay, /tool_output_query \{"call_id":"call_original_worker_output"\}/);
+  assert.equal(getToolOutput(sess, 'call_original_worker_output')?.output, full);
+  assert.equal(getToolOutput(sess, 'call_restart_replay'), null,
+    'the replay call does not persist a second copy of proven-identical bytes');
+
+  emitWorkerResult(sess, 3);
+  await buildWorkerReturn({
+    sessionId: sess,
+    parentRunId: sess,
+    item: 'same-item',
+    text: full,
+    callId: 'call_unproven_repeat',
+  });
+  assert.equal(getToolOutput(sess, 'call_unproven_repeat')?.output, full,
+    'matching content alone cannot alias without an evidence-backed replay signal');
+});
+
 test('ERROR results are NEVER digested or truncated — the full diagnostic survives at any length', async () => {
   const sess = freshSession();
   for (let n = 1; n <= 12; n++) await workerReturn(sess, n);
@@ -165,9 +204,10 @@ test('an 8-item fan-out with pre-appended events stays fully verbatim (the live-
 });
 
 test('zeroLlmDigest preserves head figures and stays bounded', () => {
-  const digest = zeroLlmDigest(`Line one has id ACC-9912 and total $14,205.\n${'padding '.repeat(400)}`);
+  const digest = zeroLlmDigest(`Line one has id ACC-9912 and total $14,205.\n${'padding '.repeat(400)}FINAL_REQUIRED_FIELD=approved`);
   assert.match(digest, /ACC-9912/);
   assert.match(digest, /\$14,205/);
+  assert.match(digest, /FINAL_REQUIRED_FIELD=approved/, 'a bounded digest keeps load-bearing tail fields visible');
   assert.ok(digest.length <= 700);
 });
 
@@ -192,6 +232,55 @@ test('the shard summary arrives in-band ON the envelope of the result that fills
   assert.equal(artifact!.items.length, 5);
   assert.equal(artifact!.degraded, false);
   assert.ok(existsSync(path.join(fanoutReduceDir(sess), 'index.json')));
+});
+
+test('K+1 reducer input preserves a final expected field at the 4,000/4,001 boundary and types any omission', async () => {
+  process.env.CLEMMY_REDUCE_SHARD_SIZE = '5';
+  process.env.CLEMMY_REDUCE_FANOUT_THRESHOLD = '1'; // K=1; item 2 is the first compacted result
+
+  for (const size of [4_000, 4_001]) {
+    const sentinel = `FINAL_EXPECTED_FIELD_${size}=accepted`;
+    const text = `${'x'.repeat(size - sentinel.length)}${sentinel}`;
+    let observedPrompt = '';
+    _setShardReducerForTests(async (prompt) => {
+      observedPrompt = prompt;
+      const keys = [...prompt.matchAll(/<<<ITEM key="([^"]+)" BEGIN/g)].map((m) => m[1]);
+      return JSON.stringify({
+        perItem: keys.map((itemKey) => ({
+          itemKey,
+          gist: itemKey === 'item-2' && prompt.includes(sentinel)
+            ? sentinel
+            : `gist of ${itemKey}`,
+        })),
+      });
+    });
+
+    const sess = freshSession();
+    await workerReturn(sess, 1);
+    await workerReturn(sess, 2, text); // K+1: queued for the shard reducer
+    for (let n = 3; n <= 5; n++) await workerReturn(sess, n);
+    const filling = await workerReturn(sess, 6); // item 2 + four peers fill the shard
+
+    assert.match(observedPrompt, new RegExp(sentinel), `size ${size}: reducer must see the final expected field`);
+    assert.match(filling, new RegExp(sentinel), `size ${size}: the shard summary must preserve the final expected field`);
+    const item = readShardArtifact(sess, 0)?.items.find((candidate) => candidate.itemKey === 'item-2');
+    assert.ok(item, 'the compacted K+1 item is represented in the durable shard artifact');
+    if (size > 4_000) {
+      assert.match(observedPrompt, /<<<HEAD \d+ CHARS>>>[\s\S]*<<<TAIL \d+ CHARS>>>/, 'oversize input is a structured head+tail excerpt');
+      assert.match(filling, /UNRESOLVED|EXCERPTED/i, 'omitted source bytes are typed, never silently presented as complete synthesis');
+      assert.equal(item!.reductionStatus, 'excerpted_unresolved');
+      assert.equal(item!.sourceChars, 4_001);
+      assert.equal(item!.shownChars, 4_000);
+      assert.equal(item!.omittedChars, 1);
+    } else {
+      assert.doesNotMatch(filling, /UNRESOLVED|EXCERPTED/i, 'an exactly bounded source remains complete');
+      assert.equal(item!.reductionStatus, 'complete');
+      assert.equal(item!.sourceChars, 4_000);
+      assert.equal(item!.shownChars, 4_000);
+      assert.equal(item!.omittedChars, 0);
+    }
+    assert.ok(observedPrompt.length < 25_000, 'five-item reducer prompt remains bounded');
+  }
 });
 
 test('a slow reducer falls back to piggyback delivery on a later envelope', async () => {
@@ -266,6 +355,13 @@ test('shardFingerprint: order-insensitive, content-sensitive, injective on membe
   const boundary1 = [{ itemKey: 'ab', text: 'c' }];
   const boundary2 = [{ itemKey: 'a', text: 'bc' }];
   assert.notEqual(shardFingerprint(boundary1), shardFingerprint(boundary2), 'length-prefixing keeps identity injective');
+
+  // Queued members retain only their bounded head+tail text. The full-source
+  // hash must therefore keep a middle-only change content-sensitive too.
+  const excerpt = 'h'.repeat(2_400) + 't'.repeat(1_600);
+  const preparedA = [{ itemKey: 'z', text: excerpt, sourceChars: 4_001, omittedChars: 1, sourceSha256: 'a'.repeat(64) }];
+  const preparedB = [{ itemKey: 'z', text: excerpt, sourceChars: 4_001, omittedChars: 1, sourceSha256: 'b'.repeat(64) }];
+  assert.notEqual(shardFingerprint(preparedA), shardFingerprint(preparedB), 'a changed omitted middle re-fingerprints through the full-source hash');
 });
 
 test('runShardReduce is fingerprint-idempotent: an unchanged shard never re-reduces on resume', async () => {

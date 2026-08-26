@@ -1124,10 +1124,12 @@ export function loadEmbeddingsForChunks(chunkIds: number[]): Map<number, Float32
 }
 
 /**
- * Find consolidated_facts that don't yet have an embedding — or whose
- * stored embedding is stale because the fact's content changed — and
- * embed them. Mirrors `embedMissingChunks` exactly (same batching,
- * circuit breaker, idempotency) but over the `fact_embeddings` table.
+ * Find recallable consolidated_facts that don't yet have an embedding — or
+ * whose stored embedding is stale because the fact's content/provider space
+ * changed — and embed them. Recallable means either live (`active = 1`) or a
+ * recoverable archive row (`active = 0` without a superseding replacement).
+ * Superseded history is deliberately excluded: it is not an archive-recall
+ * candidate and spending provider work on it cannot improve recall.
  *
  * Staleness check: `fact_embeddings.content_hash != consolidated_facts.
  * content_hash`. updateFact recomputes the fact's content_hash, so a
@@ -1163,14 +1165,16 @@ export async function embedMissingFacts(options: { maxChunks?: number; newestFir
   // oldest-first order the nightly backfill uses for eventual full coverage.
   const order = options.newestFirst ? 'DESC' : 'ASC';
 
-  // Re-embed on missing, stale content, OR a provider model/dim change.
+  // Re-embed on missing, stale content, OR a provider model/dim change. Live
+  // facts always win the bounded batch; archive repair must never delay the
+  // active semantic leg after a large provider migration.
   const rows = db.prepare(`
     SELECT cf.id AS id, cf.content AS content, cf.content_hash AS hash
     FROM consolidated_facts cf
     LEFT JOIN fact_embeddings fe ON fe.fact_id = cf.id
-    WHERE cf.active = 1
+    WHERE (cf.active = 1 OR (cf.active = 0 AND cf.superseded_by_fact_id IS NULL))
       AND (fe.fact_id IS NULL OR fe.content_hash != cf.content_hash OR fe.model != ? OR fe.dim != ?)
-    ORDER BY cf.id ${order}
+    ORDER BY cf.active DESC, cf.id ${order}
     LIMIT ?
   `).all(provider.model, provider.dim, limit) as { id: number; content: string; hash: string }[];
 

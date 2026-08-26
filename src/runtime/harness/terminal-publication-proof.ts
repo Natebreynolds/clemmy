@@ -14,7 +14,10 @@
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { ObligationManifest } from './obligation-manifest.js';
-import { inspectProviderEnvelope } from './provider-read-evidence.js';
+import {
+  exactProviderDataPayload,
+  inspectProviderEnvelope,
+} from './provider-read-evidence.js';
 import {
   deriveResultHandleFactsFromRaw,
   reconcileStoredEnvelopeMetadata,
@@ -355,6 +358,8 @@ function sealedBindingDigest(binding: Record<string, unknown>): string | null {
     || !boundedIdentity(binding.logicalToolName)
     || !boundedIdentity(binding.toolName)
     || !boundedIdentity(binding.schemaVersion)
+    || (binding.providerInputSchemaDigest !== undefined
+      && !digest64(binding.providerInputSchemaDigest))
     || !digest64(binding.schemaDigest)
     || !digest64(binding.argumentDigest)
     || typeof binding.effect !== 'string'
@@ -366,6 +371,7 @@ function sealedBindingDigest(binding: Record<string, unknown>): string | null {
     logicalToolName: binding.logicalToolName,
     toolName: binding.toolName,
     schemaVersion: binding.schemaVersion,
+    providerInputSchemaDigest: binding.providerInputSchemaDigest ?? null,
     schemaDigest: binding.schemaDigest,
     argumentDigest: binding.argumentDigest,
     account: binding.account ?? null,
@@ -1029,8 +1035,9 @@ function createdPayload(raw: unknown): {
   handle?: string;
   receipt?: string;
 } {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
-  const record = raw as Record<string, unknown>;
+  const providerPayload = exactProviderDataPayload(raw);
+  if (!providerPayload || typeof providerPayload !== 'object' || Array.isArray(providerPayload)) return {};
+  const record = providerPayload as Record<string, unknown>;
   const nested = record.created && typeof record.created === 'object' && !Array.isArray(record.created)
     ? record.created as Record<string, unknown>
     : record;
@@ -1042,9 +1049,10 @@ function createdPayload(raw: unknown): {
 }
 
 function recordsValue(raw: unknown): unknown[] | null {
-  if (Array.isArray(raw)) return raw;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const records = (raw as { records?: unknown }).records;
+  const providerPayload = exactProviderDataPayload(raw);
+  if (Array.isArray(providerPayload)) return providerPayload;
+  if (!providerPayload || typeof providerPayload !== 'object' || Array.isArray(providerPayload)) return null;
+  const records = (providerPayload as { records?: unknown }).records;
   return Array.isArray(records) ? records : null;
 }
 
@@ -1315,8 +1323,6 @@ function verifyHostSealedWriteReceipt(input: {
   if (
     !contentContract
     || contentContract.acceptedTaskId !== input.acceptedTaskId
-    || `logical:${contentContract.createNodeId}` !== receipt.logical_tool_call_id
-    || `logical:${contentContract.readbackNodeId}` !== artifact.verification_logical_call_id
     || contentContract.intendedContentDigest !== receipt.intended_digest
     || contentContract.lineageContentDigest !== receipt.intended_digest
   ) return { ok: false, status: 'conflict', reason: 'write content contract contradicts the receipt' };
@@ -1481,10 +1487,11 @@ function verifyHostSealedWriteReceipt(input: {
     logicalToolCallId: artifact.verification_logical_call_id,
   });
   if (!readback.ok) return { ok: false, status: 'conflict', reason: readback.reason };
-  if (!readback.raw || typeof readback.raw !== 'object' || Array.isArray(readback.raw)) {
+  const readbackRaw = exactProviderDataPayload(readback.raw);
+  if (!readbackRaw || typeof readbackRaw !== 'object' || Array.isArray(readbackRaw)) {
     return { ok: false, status: 'conflict', reason: 'write readback result is malformed' };
   }
-  const readbackValue = readback.raw as { id?: unknown; content?: unknown };
+  const readbackValue = readbackRaw as { id?: unknown; content?: unknown };
   if (
     readbackValue.id !== receipt.created_id
     || readbackValue.content === undefined

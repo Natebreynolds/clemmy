@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -6,8 +7,10 @@ import type {
   HostCapabilityDescriptorV1,
   TurnSemanticProposalV1,
 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
+import type { TurnGraphIR } from '../runtime/graph/turn-graph-ir.js';
 import {
   admitAndCompilePrimaryModelProposal,
+  snapshotPrimaryModelPlanningContext,
   type HostFreshPlanningContextV1,
 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
 import { requireAcceptedTaskAuthority } from '../runtime/harness/accepted-task-authority.js';
@@ -21,6 +24,15 @@ import {
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { currentLogicalCall } from '../runtime/harness/attempt-identity.js';
 import { recordPlanTaskPreambleDelivery } from '../runtime/harness/plan-task-post-settlement.js';
+import { bindAdmittedNodeCapability } from '../runtime/harness/graph-node-capability.js';
+import {
+  freezeCatalogSnapshotForSource,
+  persistSealedNodeBinding,
+  sealBoundCapability,
+} from '../runtime/harness/host-capability-catalog-factory.js';
+import {
+  loadDurableAuthorizedLocalPlanningDefinition,
+} from '../runtime/harness/local-planning-capability.js';
 import {
   ActionWorkTopologySchema,
   WorkTopologyIdSchema,
@@ -107,7 +119,9 @@ function settledPreamble(raw: string): string {
 }
 
 function planningCatalogText(capabilities: readonly HostCapabilityDescriptorV1[]): string {
-  if (capabilities.length === 0) return '(No exact capability descriptors were supplied; do not invent capabilityRef values.)';
+  if (capabilities.length === 0) {
+    return '(The initial planning card had no exact capability descriptors. Use foreground tool_search; cite only exact capabilityRef values it returns.)';
+  }
   return JSON.stringify(capabilities.map((capability) => ({
     capabilityRef: capability.id,
     effect: capability.effect,
@@ -127,6 +141,127 @@ function requestedEffectOf(
   return order.reduce((highest, effect) => (
     effects.includes(effect) && order.indexOf(effect) > order.indexOf(highest) ? effect : highest
   ), 'read');
+}
+
+async function sealFreshPlanCapabilityBindings(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  acceptedText: string;
+  graph: TurnGraphIR;
+  operationIds: readonly string[];
+}): Promise<boolean> {
+  const frozen = freezeCatalogSnapshotForSource({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+  });
+  if (!frozen.ok) return false;
+  const operationIds = new Set(input.operationIds);
+  const nodes = input.graph.nodes.filter((node) => operationIds.has(node.id));
+  if (
+    nodes.length !== operationIds.size
+    || [...operationIds].some((operationId) => !nodes.some((node) => node.id === operationId))
+  ) return false;
+  const sealed = await Promise.all(nodes.map(async (node) => {
+    const refs = node.capabilities
+      ?.filter((requirement) => requirement.kind === 'tool' && requirement.resolution === 'explicit')
+      .flatMap((requirement) => requirement.names ?? [])
+      ?? [];
+    const localRef = refs.length === 1 && refs[0]!.startsWith('cap:local:')
+      ? refs[0]!
+      : null;
+    let bound: ReturnType<typeof bindAdmittedNodeCapability>;
+    if (localRef) {
+      const local = await loadDurableAuthorizedLocalPlanningDefinition({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        capabilityRef: localRef,
+      });
+      if (!local.ok) return null;
+      const definition = local.definition;
+      const descriptor = definition.descriptor;
+      bound = bindAdmittedNodeCapability({
+        node,
+        graph: input.graph,
+        identity: {
+          sessionId: input.sessionId,
+          sourceUserSeq: input.sourceUserSeq,
+          acceptedTaskId: input.acceptedTaskId,
+        },
+        acceptedText: input.acceptedText,
+        // Local planning refs deliberately do not become provider-catalog
+        // entries: their source-bound durable definition is the exact
+        // authority, and this read revalidates its configured schema and
+        // registry semantics again after graph persistence. Adapt only that
+        // single revalidated ref into the common binder; every non-local ref
+        // must still resolve through the immutable frozen host catalog above.
+        catalog: {
+          bind: (request) => {
+            const requestedRefs = request.node.capabilities
+              ?.filter((requirement) => requirement.kind === 'tool' && requirement.resolution === 'explicit')
+              .flatMap((requirement) => requirement.names ?? [])
+              ?? [];
+            if (
+              requestedRefs.length !== 1
+              || requestedRefs[0] !== definition.capabilityRef
+            ) return null;
+            return {
+              capabilityId: definition.capabilityRef,
+              toolName: definition.name,
+              schemaVersion: String(definition.version),
+              schemaDigest: definition.envelopeFingerprint,
+              args: { capabilityId: definition.capabilityRef },
+              account: definition.accountIdentity,
+              effect: descriptor.effect,
+              ...(descriptor.destinationPosture
+                ? {
+                    destination: {
+                      family: descriptor.deliverableKind,
+                      posture: descriptor.destinationPosture,
+                    },
+                  }
+                : {}),
+              manifestDigest: descriptor.manifestDigest,
+              providerKind: 'local_registry',
+              liveFingerprint: definition.envelopeFingerprint,
+              invoke: async () => {
+                throw new Error('local planning selection seals identity only; work_call owns invocation');
+              },
+            };
+          },
+        },
+      });
+    } else {
+      bound = bindAdmittedNodeCapability({
+        node,
+        graph: input.graph,
+        identity: {
+          sessionId: input.sessionId,
+          sourceUserSeq: input.sourceUserSeq,
+          acceptedTaskId: input.acceptedTaskId,
+        },
+        acceptedText: input.acceptedText,
+        catalog: frozen.catalog,
+      });
+    }
+    if (!bound.ok) return null;
+    return sealBoundCapability({
+      nodeId: node.id,
+      binding: bound.binding,
+      // This is a capability-selection seal, not invocation identity. The
+      // same host-owned projection is used by the admitted graph executor.
+      argumentDigest: createHash('sha256').update(JSON.stringify({
+        nodeId: node.id,
+        capabilityId: bound.binding.capabilityId,
+      }), 'utf8').digest('hex'),
+    });
+  }));
+  if (sealed.some((binding) => binding === null)) return false;
+  return sealed.every((binding) => persistSealedNodeBinding({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    binding: binding!,
+  }));
 }
 
 export function derivePlanConstructFromTopology(
@@ -258,8 +393,17 @@ async function executePlanTask(
       detail: 'plan_task is only for action work; answer or use a direct read without freezing an action graph.',
     });
   }
-
   const authority = requireAcceptedTaskAuthority({ sessionId, sourceUserSeq });
+  if (!await sealFreshPlanCapabilityBindings({
+    sessionId,
+    sourceUserSeq,
+    acceptedTaskId: authority.acceptedTaskId,
+    acceptedText: objective,
+    graph: planned.compiled.graph,
+    operationIds: input.draft.topology.operations.map((operation) => operation.id),
+  })) {
+    throw new Error('plan_task could not seal every exact selected graph capability');
+  }
   const expectedWork = freezePrimaryModelExpectedWorkContract({ sessionId, sourceUserSeq });
   if (expectedWork.status !== 'fixed' && expectedWork.status !== 'replayed') {
     throw new Error('plan_task admitted a graph whose expected-work topology is not deterministically projectable');
@@ -325,22 +469,25 @@ export function buildPlanTaskTool(input: {
       `Exact host planning catalog: ${planningCatalogText(input.planning.capabilities)}`,
     ].join(' '),
     parameters: PlanTaskInputSchema,
-    // A plan can only be admitted against a capability the host DISCLOSED:
-    // every binding must carry a capabilityRef, and admission refuses any ref
-    // outside the catalog. With an empty catalog the schema demands a value the
-    // description forbids inventing and the gate rejects unconditionally — the
-    // model cannot comply by any action available to it. Measured on the real
-    // home: 16 plan_task calls, 16 `plan_not_admitted` refusals, zero
-    // successes, six consecutive attempts inside a single turn before the model
-    // gave up and took the direct route that worked all along.
-    //
-    // So don't offer the door when it cannot open. This removes wasted model
-    // calls, not capability: the catalog is populated from provisioned
-    // capabilities, and when there are none there is nothing plan_task could
-    // have frozen.
-    isEnabled: async () => input.planning.capabilities.length > 0
-      && !actionExpectedWorkRequired(input.planning.identity),
-    execute: async (args) => executePlanTask(args as PlanTaskInput, input.planning),
+    // A plan can only be admitted against a capability the host DISCLOSED, so
+    // an actually empty live catalog keeps this door absent. Foreground
+    // tool_search may disclose an exact ref later in the same agent run. The
+    // SDK re-evaluates isEnabled before every model request, so re-read the
+    // authority's immutable current snapshot here instead of pinning the empty
+    // initial card forever. Invalid/unminted authorities remain disabled.
+    isEnabled: async () => {
+      const planning = snapshotPrimaryModelPlanningContext(input.planning.authority);
+      return Boolean(
+        planning
+        && planning.capabilities.length > 0
+        && !actionExpectedWorkRequired(planning.identity),
+      );
+    },
+    execute: async (args) => {
+      const planning = snapshotPrimaryModelPlanningContext(input.planning.authority);
+      if (!planning) throw new Error('plan_task requires a live host-minted planning catalog');
+      return executePlanTask(args as PlanTaskInput, planning);
+    },
   });
 }
 

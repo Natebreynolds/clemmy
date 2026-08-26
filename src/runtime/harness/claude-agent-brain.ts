@@ -21,7 +21,10 @@ import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import { stableContextGeneration } from '../stable-context-generation.js';
 import { isUnparseableToolCallError } from '../../execution/transient-error.js';
-import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import {
+  autoCaptureProvenanceFromAcceptedEvent,
+  captureInteractionSignals,
+} from '../../memory/auto-capture.js';
 import {
   evaluateLearningCandidate,
   recordLearningDecision,
@@ -2094,6 +2097,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           sessionId,
           sourceEventId: `user-source:${userInputEvent.seq}`,
           occurredAt: userInputEvent.createdAt,
+          sourceProvenance: autoCaptureProvenanceFromAcceptedEvent(userInputEvent),
         })
       : { candidates: [], facts: [], queuedCandidateIds: [], profilePatch: undefined, profile: undefined };
     const queuedCandidateCount = captured.queuedCandidateIds?.length ?? 0;

@@ -1,9 +1,8 @@
 /**
- * Workspace data-source executor — runs a PROVABLY READ-ONLY declared Composio
- * source server-side with no LLM (the token-saving core), then persists the
- * result into data.json. Installed legacy runner declarations take a one-time,
- * time-bounded human migration decision bound to their pinned entrypoint hash
- * and schedule; new/unapproved/drifted entrypoints fail closed before spawn.
+ * Workspace data-source executor. Composio declarations may execute only by
+ * redeeming the shared durable call kernel; local runner and CLI declarations
+ * remain zero-process until they are compiled into that same kernel. Legacy
+ * trust decisions are retained as migration metadata, never call authority.
  *
  * Used by the on-demand /refresh route and (later) the scheduled daily poll —
  * one execution path for both. Fail-safe: a source error is captured into
@@ -11,19 +10,7 @@
  * whole Workspace breaking.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import {
-  chmodSync,
-  closeSync,
-  existsSync,
-  fstatSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import path from 'node:path';
-import { resolveInSpace, runnerFilenameError, spaceStore, type SpaceDataSource, type SpaceAction } from './store.js';
+import { runnerFilenameError, spaceStore, type SpaceDataSource, type SpaceAction } from './store.js';
 import { appendAudit, type WriteDataResult, type WriteDataError } from './data-store.js';
 import {
   bootstrapWorkspaceObservationHistory,
@@ -35,16 +22,7 @@ import {
   type WorkspaceObservationCommitItem,
 } from './workspace-db.js';
 import { finalizeWorkspaceObservationCommit } from './workspace-observation-finalize.js';
-import { augmentPath } from '../runtime/spawn-env.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
-import {
-  interpreterFor, resolveOnPath, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript,
-} from '../runtime/sandboxed-script.js';
-import {
-  executeWorkflowCallMutation,
-  replayWorkflowCallMutationSlot,
-  type WorkflowCallMutationSlotInput,
-} from '../execution/workflow-call-receipts.js';
 import {
   workspaceActionRequiresApproval,
   workspaceDataSourceSafetyError,
@@ -56,211 +34,100 @@ import {
   registerRunnerTrustRefreshHandler,
 } from './space-data-runner-trust.js';
 
-// Tunable so a heavy data pull can be given more room without a code change.
-const RUNNER_TIMEOUT_MS = (() => {
-  const raw = Number.parseInt(process.env.SPACE_RUNNER_TIMEOUT_MS ?? '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 5 * 60 * 1000;
-})();
-// Hard cap on captured stdout so a runaway runner can't OOM the daemon.
-const RUNNER_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
-
 export interface RunSourceOk { ok: true; data: unknown }
 export interface RunSourceErr {
   ok: false;
   error: string;
   /** Nominal executor proof; never inferred from runner-controlled output. */
   provenNoDispatch?: true;
-  /** Exact human decision that can unlock a legacy compatibility refresh. */
+  /** Exact legacy migration decision; never shared-kernel call authority. */
   pendingApprovalId?: string;
 }
 export type RunSourceResult = RunSourceOk | RunSourceErr;
 
-/** Reuse the structured-workflow mutation ledger for approved Workspace
- * actions. Approval ids are globally unique, and itemKey keeps equal action ids
- * in different Workspaces in distinct durable slots. */
+/** Legacy wrapper namespace retained only to recognize historical diagnostic
+ * rows. It is not a Space execution or replay authority. */
 export const SPACE_ACTION_MUTATION_WORKFLOW_SLUG = '__clementine-space-actions';
 
 export interface SpaceActionRunOptions {
   /** Present only after the canonical approval registry resolved this action. */
   approvalId?: string;
   /**
-   * Present only for STANDING-covered invocations (a prior approval whose
-   * exact authority still holds). Each covered click is its own effect
-   * instance, so the durable receipt slot must be unique per invocation —
-   * otherwise the second refresh would REPLAY the first run's stale result
-   * instead of executing. Standing coverage is restricted to non-outbound
-   * runner actions, so per-invocation slots do not weaken send idempotency.
+   * Compatibility input retained for standing-decision callers. It cannot mint
+   * a shared-kernel activation or unlock local process execution.
    */
   executionNonce?: string;
+  /**
+   * Exact authority already armed by Clementine's shared durable call kernel.
+   * Dashboard, tool, scheduler, and recovery callers intentionally do not
+   * synthesize this value. Until their Space declaration is compiled into the
+   * shared workflow authority graph, Composio-backed actions fail closed.
+   */
+  composioAuthority?: SpaceSharedDurableComposioAuthority;
 }
 
-type SpaceComposioDispatch = typeof import('../tools/composio-tools.js').dispatchComposioTool;
-let spaceComposioDispatchForTest: SpaceComposioDispatch | null = null;
-type RunnerEntrypointSnapshotHook = (snapshot: {
-  sourcePath: string;
-  snapshotPath: string;
-}) => void;
-let runnerEntrypointSnapshotHookForTest: RunnerEntrypointSnapshotHook | null = null;
+/**
+ * Opaque address of an authority root owned by the existing durable workflow
+ * call kernel. This object carries no provider callback and grants nothing by
+ * itself: the selected kernel reopens the activation, validates the exact
+ * invocation-plan digest and canonical arguments, claims physical I/O, and
+ * settles/replays the result. A forged or stale address is therefore a
+ * zero-body refusal.
+ */
+export interface SpaceSharedDurableComposioAuthority {
+  version: 1;
+  kernel: 'workflow_v1_read_only' | 'workflow_v3_call';
+  activationId: string;
+  invocationPlan: unknown;
+}
 
-/** Focused-test seam at the already-resolved Composio gateway boundary. */
+export interface SpaceDataSourceRunOptions {
+  composioAuthority?: SpaceSharedDurableComposioAuthority;
+}
+
+type RetiredSpaceComposioDispatchCanary = (
+  toolSlug: string,
+  args: Record<string, unknown>,
+  opts: {
+    dispatchBoundary?: (
+      resolved: Record<string, unknown>,
+      dispatch: () => Promise<unknown>,
+    ) => Promise<unknown>;
+  },
+) => Promise<unknown>;
+
+/**
+ * Compatibility-only zero-body canary. Space execution no longer owns a raw
+ * Composio gateway seam, so installing this callback cannot authorize or
+ * trigger a provider call. It remains temporarily exported so containment
+ * tests (and older fixtures) can prove the retired body was not reached.
+ */
 export function _setSpaceComposioDispatchForTests(
-  dispatch: SpaceComposioDispatch | null,
+  dispatch: RetiredSpaceComposioDispatchCanary | null,
 ): void {
-  spaceComposioDispatchForTest = dispatch;
+  void dispatch;
 }
 
-/** Focused race-test seam after approved bytes are frozen but before spawn. */
-export function _setRunnerEntrypointSnapshotHookForTests(
-  hook: RunnerEntrypointSnapshotHook | null,
-): void {
-  runnerEntrypointSnapshotHookForTest = hook;
-}
-
-function spaceActionMutationSlot(
-  slug: string,
-  actionId: string,
-  approvalId: string,
-): WorkflowCallMutationSlotInput {
-  return {
-    workflowSlug: SPACE_ACTION_MUTATION_WORKFLOW_SLUG,
-    runId: approvalId,
-    stepId: actionId,
-    itemKey: slug,
-  };
-}
-
-function replayedRunnerResult(value: unknown): RunSourceResult {
-  if (
-    value
-    && typeof value === 'object'
-    && (value as { ok?: unknown }).ok === true
-    && 'data' in value
-  ) {
-    return value as RunSourceOk;
-  }
-  return {
-    ok: false,
-    error: 'The durable Workspace action receipt was unreadable; the action was NOT dispatched again.',
-  };
-}
-
-/** Recovery probe that never crosses a provider/script boundary. A committed
- * result must remain replayable even if the Workspace was edited or archived
- * after dispatch but before its UI outcome was projected. */
+/** Recovery probe that never crosses a provider/script boundary. Historical
+ * Space mutation rows are diagnostics only: the retired wrapper did not own an
+ * accepted logical call or the shared kernel's physical-I/O claim. */
 export function replaySpaceActionMutation(
   slug: string,
   action: SpaceAction,
   approvalId: string,
 ): { replayed: false } | { replayed: true; result: RunSourceResult } {
-  const replay = replayWorkflowCallMutationSlot(
-    spaceActionMutationSlot(slug, action.id, approvalId),
-  );
-  if (!replay.replayed) return replay;
-  return {
-    replayed: true,
-    result: action.composioSlug
-      ? { ok: true, data: replay.result }
-      : replayedRunnerResult(replay.result),
-  };
+  void slug;
+  void action;
+  void approvalId;
+  return { replayed: false };
 }
-
-type PreparedRunnerEntrypoint =
-  | {
-    ok: true;
-    executionPath: string;
-    cleanup: () => void;
-  }
-  | {
-    ok: false;
-    error: string;
-  };
 
 /**
- * Freeze the one authority field Clementine can enforce generically: the
- * approved entrypoint bytes. Reading through one open descriptor prevents a
- * path replacement from changing which bytes are hashed; writing those bytes
- * to a random hidden sibling means the interpreter opens the same bytes even
- * if another process edits the installed runner between verification and
- * spawn. The sibling preserves extension and directory semantics, so relative
- * imports and dirname(import.meta.url) keep resolving as installed.
- *
- * Helpers, packages, CLIs, local files, auth state, and network services are
- * deliberately not presented as immutable. They remain live compatibility
- * dependencies and are disclosed as such on the approval card.
+ * Compatibility entrypoint retained for callers that still compile against
+ * the old Space runner API. A pinned file hash or a human trust decision is not
+ * shared-kernel logical/physical authority, so this boundary is intentionally
+ * zero-body until Space declarations are compiled into that existing kernel.
  */
-function prepareVerifiedRunnerEntrypoint(
-  target: string,
-  runner: string,
-  expectedSha256: string,
-): PreparedRunnerEntrypoint {
-  if (!/^[a-f0-9]{64}$/i.test(expectedSha256)) {
-    return { ok: false, error: 'runner approval is missing a valid entrypoint SHA-256 digest' };
-  }
-
-  let fd: number | null = null;
-  let sourceBytes: Buffer;
-  let sourceMode = 0o400;
-  try {
-    fd = openSync(target, 'r');
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) {
-      return { ok: false, error: `runner entrypoint is not a regular file: data/${runner}` };
-    }
-    sourceMode = stat.mode;
-    sourceBytes = readFileSync(fd);
-  } catch (error) {
-    return {
-      ok: false,
-      error: `runner trust could not read the approved entrypoint: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  } finally {
-    if (fd !== null) {
-      try { closeSync(fd); } catch { /* best-effort descriptor cleanup */ }
-    }
-  }
-
-  const actualSha256 = createHash('sha256').update(sourceBytes).digest('hex');
-  if (actualSha256 !== expectedSha256.toLowerCase()) {
-    return {
-      ok: false,
-      error: `runner entrypoint changed after approval; data/${runner} was not executed`,
-    };
-  }
-
-  const extension = path.extname(runner);
-  const stem = extension ? runner.slice(0, -extension.length) : runner;
-  const snapshotPath = path.join(
-    path.dirname(target),
-    `.clementine-entry-${stem}-${randomUUID()}${extension}`,
-  );
-  try {
-    const ownerMode = (sourceMode & 0o111) !== 0 ? 0o500 : 0o400;
-    writeFileSync(snapshotPath, sourceBytes, { flag: 'wx', mode: ownerMode });
-    chmodSync(snapshotPath, ownerMode);
-    runnerEntrypointSnapshotHookForTest?.({
-      sourcePath: target,
-      snapshotPath,
-    });
-  } catch (error) {
-    try { unlinkSync(snapshotPath); } catch { /* no snapshot or already gone */ }
-    return {
-      ok: false,
-      error: `runner entrypoint could not be frozen before spawn: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-
-  return {
-    ok: true,
-    executionPath: snapshotPath,
-    cleanup: () => {
-      try { unlinkSync(snapshotPath); } catch { /* crash-safe best effort */ }
-    },
-  };
-}
-
-/** Low-level runner executor. Approval-gated callers pass the approved
- * entrypoint digest so the same verified bytes—not the mutable source path—are
- * opened by the interpreter. This does not freeze runtime dependencies. */
 export async function runScript(
   slug: string,
   runner: string,
@@ -269,183 +136,110 @@ export async function runScript(
 ): Promise<RunSourceResult> {
   const runnerError = runnerFilenameError(runner);
   if (runnerError) return { ok: false, error: runnerError, provenNoDispatch: true };
-  let target: string;
-  try {
-    target = resolveInSpace(slug, path.join('data', runner));
-  } catch (err) {
-    return { ok: false, error: (err as Error).message, provenNoDispatch: true };
-  }
-  if (!existsSync(target)) {
-    return { ok: false, error: `runner script not found: data/${runner}`, provenNoDispatch: true };
-  }
-  const prepared = opts.expectedSha256
-    ? prepareVerifiedRunnerEntrypoint(target, runner, opts.expectedSha256)
-    : {
-      ok: true as const,
-      executionPath: target,
-      cleanup: () => undefined,
-    };
-  if (!prepared.ok) {
-    return {
-      ok: false,
-      error: prepared.error,
-      provenNoDispatch: true,
-    };
-  }
-
-  try {
-    const augmentedPath = augmentPath(process.env.PATH);
-    const interp = interpreterFor(prepared.executionPath, augmentedPath);
-    if (!interp) {
-      return {
-        ok: false,
-        error: `unsupported runner extension for data/${runner} (use .mjs/.js/.cjs/.ts/.py/.sh or an executable)`,
-        provenNoDispatch: true,
-      };
-    }
-
-    const spaceDir = resolveInSpace(slug, 'data');
-    const payload = JSON.stringify({ ...(extra ?? {}), slug, runner });
-    const env = scrubbedChildEnv({
-      CLEMENTINE_SPACE_SLUG: slug,
-      ...electronNodeEnv(interp.command, interp.isElectron),
-    });
-    const outcome = await spawnSandboxedScript({
-      command: interp.command, args: interp.args, cwd: spaceDir, env,
-      stdinPayload: payload, timeoutMs: RUNNER_TIMEOUT_MS, maxOutputBytes: RUNNER_MAX_OUTPUT_BYTES,
-    });
-    if (outcome.launchError) {
-      return {
-        ok: false,
-        error: `runner failed to launch: ${outcome.launchError.message}`,
-        provenNoDispatch: true,
-      };
-    }
-    if (outcome.overflowed) return { ok: false, error: `runner output exceeded ${RUNNER_MAX_OUTPUT_BYTES} bytes (print a single JSON document to stdout)` };
-    if (outcome.timedOut) return { ok: false, error: `runner timed out after ${RUNNER_TIMEOUT_MS}ms` };
-    if (outcome.code !== 0) {
-      return { ok: false, error: `runner exited ${outcome.signal ?? outcome.code}: ${[outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join(' | ').slice(0, 2000)}` };
-    }
-    const out = outcome.stdout.trim();
-    if (!out) return { ok: false, error: 'runner produced no output (expected JSON on stdout)' };
-    try {
-      return { ok: true, data: JSON.parse(out) };
-    } catch {
-      return { ok: false, error: `runner stdout was not valid JSON: ${out.slice(0, 200)}` };
-    }
-  } finally {
-    prepared.cleanup();
-  }
+  void extra;
+  void opts;
+  return {
+    ok: false,
+    error: `Workspace "${slug}" local runner "${runner}" is unavailable: no shared durable call authority was supplied. The process was not started.`,
+    provenNoDispatch: true,
+  };
 }
 
 /**
- * Execute an APPROVED frozen CLI declaration. The argv comes from the trust
- * decision (the exact vector the human approved), never from caller input.
- * No shell is involved: the command resolves to an installed binary on the
- * augmented PATH and every argument is passed as data. Stdout is the dataset —
- * JSON when the CLI emits it (the common `-r json` case), otherwise wrapped as
- * `{ stdout }` so text-mode CLIs still produce a usable dataset.
+ * Retired raw CLI boundary. The exact argv trust record remains useful
+ * declaration/migration metadata, but cannot mint shared-kernel authority.
  */
 async function runCliSource(slug: string, cliArgv: string[]): Promise<RunSourceResult> {
   const commandLabel = cliArgv.join(' ');
-  const augmentedPath = augmentPath(process.env.PATH);
-  const command = resolveOnPath(cliArgv[0], augmentedPath);
-  if (!command) {
-    return {
-      ok: false,
-      error: `CLI "${cliArgv[0]}" was not found on PATH; install it (or fix the declared command) and refresh again`,
-      provenNoDispatch: true,
-    };
-  }
-  const spaceDir = resolveInSpace(slug, 'data');
-  // CLI-only workspaces have no authored runner files, so data/ may not exist
-  // yet — and a missing spawn cwd is a launch ENOENT, not a clear error.
-  mkdirSync(spaceDir, { recursive: true });
-  const env = scrubbedChildEnv({ CLEMENTINE_SPACE_SLUG: slug });
-  const outcome = await spawnSandboxedScript({
-    command,
-    args: cliArgv.slice(1),
-    cwd: spaceDir,
-    env,
-    stdinPayload: '',
-    timeoutMs: RUNNER_TIMEOUT_MS,
-    maxOutputBytes: RUNNER_MAX_OUTPUT_BYTES,
-  });
-  if (outcome.launchError) {
-    return {
-      ok: false,
-      error: `CLI failed to launch: ${outcome.launchError.message}`,
-      provenNoDispatch: true,
-    };
-  }
-  if (outcome.overflowed) return { ok: false, error: `CLI output exceeded ${RUNNER_MAX_OUTPUT_BYTES} bytes ("${commandLabel}")` };
-  if (outcome.timedOut) return { ok: false, error: `CLI timed out after ${RUNNER_TIMEOUT_MS}ms ("${commandLabel}")` };
-  if (outcome.code !== 0) {
-    return { ok: false, error: `CLI exited ${outcome.signal ?? outcome.code} ("${commandLabel}"): ${[outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join(' | ').slice(0, 2000)}` };
-  }
-  const out = outcome.stdout.trim();
-  if (!out) return { ok: false, error: `CLI produced no output ("${commandLabel}")` };
-  try {
-    return { ok: true, data: JSON.parse(out) };
-  } catch {
-    return { ok: true, data: { stdout: out } };
-  }
+  return {
+    ok: false,
+    error: `Workspace "${slug}" local CLI "${commandLabel}" is unavailable: no shared durable call authority was supplied. The process was not started.`,
+    provenNoDispatch: true,
+  };
 }
 
-/** Space composio dispatch — through the SAME gateway as chat/workflow (owner
- *  resolution, sender constraints, typed blocks). A blocked resolution surfaces
- *  as the source/action error with the gateway's deterministic message, so a
- *  Space can never dispatch under an ambiguous or non-compliant account. */
+/**
+ * Space Composio execution may only redeem an authority root owned by the
+ * shared durable workflow kernel. Space routes do not fall back to the raw
+ * gateway and do not wrap that gateway in the legacy workflow-mutation receipt
+ * helper: neither path carries accepted-source lineage or physical authority.
+ */
 async function runSpaceComposio(
   slug: string,
   toolSlug: string,
   args: Record<string, unknown>,
-  mutationSlot?: WorkflowCallMutationSlotInput,
+  authority: SpaceSharedDurableComposioAuthority | undefined,
+  requiredEffect: 'read' | 'action',
 ): Promise<RunSourceResult> {
+  const carrierLabel = `Workspace "${slug}" ${requiredEffect === 'read' ? 'refresh' : 'action'} "${toolSlug}"`;
+  if (!authority) {
+    return {
+      ok: false,
+      error: `${carrierLabel} is unavailable: no shared durable call authority was supplied. The provider call was not started.`,
+      provenNoDispatch: true,
+    };
+  }
+  if (
+    authority.version !== 1
+    || typeof authority.activationId !== 'string'
+    || !authority.activationId.trim()
+    || (authority.kernel !== 'workflow_v1_read_only' && authority.kernel !== 'workflow_v3_call')
+  ) {
+    return {
+      ok: false,
+      error: `${carrierLabel} was refused: the shared durable call authority address is malformed. The provider call was not started.`,
+      provenNoDispatch: true,
+    };
+  }
+
+  const { parseWorkflowNodeInvocationPlan } = await import('../memory/workflow-node-invocation-plan.js');
+  const parsed = parseWorkflowNodeInvocationPlan(authority.invocationPlan);
+  if (
+    !parsed.ok
+    || parsed.plan.binding.operationId !== toolSlug
+    || (requiredEffect === 'read' && parsed.plan.binding.effect !== 'read')
+    || (authority.kernel === 'workflow_v1_read_only' && parsed.plan.binding.effect !== 'read')
+    || (authority.kernel === 'workflow_v3_call'
+      && !['local_write', 'external_write', 'admin'].includes(parsed.plan.binding.effect))
+  ) {
+    return {
+      ok: false,
+      error: `${carrierLabel} was refused: the shared authority does not bind this exact declared operation and effect. The provider call was not started.`,
+      provenNoDispatch: true,
+    };
+  }
+
   const {
-    composioDispatchErrorProvesNoCommit,
-    composioFailureProvesNoCommit,
-    detectComposioFailure,
-    dispatchComposioTool,
-  } = await import('../tools/composio-tools.js');
-  const dispatchThroughGateway = spaceComposioDispatchForTest ?? dispatchComposioTool;
-  const outcome = await dispatchThroughGateway(toolSlug, args, {
-    sessionId: `space:${slug}`,
-    ...(mutationSlot
-      ? {
-        dispatchBoundary: (resolved, dispatch) => executeWorkflowCallMutation({
-          ...mutationSlot,
-          tool: resolved.toolSlug,
-          account: {
-            ...(resolved.connectionId ? { connectionId: resolved.connectionId } : {}),
-            ...(resolved.identity ? { identity: resolved.identity } : {}),
-          },
-          args: resolved.args,
-        }, dispatch, {
-          classifyFailure: (result) => {
-            const failure = detectComposioFailure(result);
-            return failure.failed
-              ? {
-                summary: failure.summary || 'provider reported failure',
-                provenNoCommit: composioFailureProvesNoCommit(result),
-              }
-              : null;
-          },
-          classifyThrownFailure: (error) => (
-            composioDispatchErrorProvesNoCommit(error)
-              ? (error instanceof Error ? error.message : String(error))
-              : null
-          ),
-        }),
-      }
-      : {}),
-  });
-  if (!outcome.ok) return { ok: false, error: `blocked (${outcome.reason}): ${outcome.message}` };
-  return { ok: true, data: outcome.result };
+    executeWorkflowReadOnlyCall,
+    executeWorkflowV3Call,
+  } = await import('../runtime/harness/workflow-read-only-call-kernel.js');
+  const outcome = authority.kernel === 'workflow_v1_read_only'
+    ? await executeWorkflowReadOnlyCall({
+      activationId: authority.activationId,
+      invocationPlan: authority.invocationPlan,
+      args,
+    })
+    : await executeWorkflowV3Call({
+      activationId: authority.activationId,
+      invocationPlan: authority.invocationPlan,
+      args,
+    });
+  if (outcome.status === 'completed' || outcome.status === 'replayed') {
+    return { ok: true, data: outcome.result };
+  }
+  return {
+    ok: false,
+    error: `${carrierLabel} was ${outcome.status} by the shared durable call kernel: ${outcome.reason}`,
+    ...(outcome.zeroBody ? { provenNoDispatch: true as const } : {}),
+  };
 }
 
 /** Run a single declared data source (no persistence). */
-export async function runSpaceDataSource(slug: string, source: SpaceDataSource): Promise<RunSourceResult> {
+export async function runSpaceDataSource(
+  slug: string,
+  source: SpaceDataSource,
+  opts: SpaceDataSourceRunOptions = {},
+): Promise<RunSourceResult> {
   if (source.runner?.trim()) {
     const trust = authorizeInstalledDataRunner(slug, source);
     if (trust.state !== 'approved') {
@@ -479,7 +273,13 @@ export async function runSpaceDataSource(slug: string, source: SpaceDataSource):
   if (safetyError) return { ok: false, error: safetyError, provenNoDispatch: true };
   if (source.composioSlug && source.composioSlug.trim()) {
     try {
-      return await runSpaceComposio(slug, source.composioSlug.trim(), source.composioArgs ?? {});
+      return await runSpaceComposio(
+        slug,
+        source.composioSlug.trim(),
+        source.composioArgs ?? {},
+        opts.composioAuthority,
+        'read',
+      );
     } catch (err) {
       return { ok: false, error: `composio call failed: ${(err as Error).message}` };
     }
@@ -512,57 +312,25 @@ export async function runSpaceAction(
       provenNoDispatch: true,
     };
   }
-  const approvalId = authority.ok ? authority.approvalId ?? '' : '';
-  const nonce = opts.executionNonce?.trim() ?? '';
-  const slotRunId = approvalId && nonce ? `${approvalId}#${nonce}` : approvalId;
-  const mutationSlot = slotRunId
-    ? spaceActionMutationSlot(slug, action.id, slotRunId)
-    : undefined;
   if (action.composioSlug && action.composioSlug.trim()) {
     try {
-      if (mutationSlot) {
-        const replay = replaySpaceActionMutation(slug, action, slotRunId);
-        if (replay.replayed) return replay.result;
-      }
-      return await runSpaceComposio(slug, action.composioSlug.trim(), args, mutationSlot);
+      return await runSpaceComposio(
+        slug,
+        action.composioSlug.trim(),
+        args,
+        opts.composioAuthority,
+        'action',
+      );
     } catch (err) {
       return { ok: false, error: `action failed: ${(err as Error).message}` };
     }
   }
   if (action.runner && action.runner.trim()) {
-    const approvedEntrypointSha256 = authority.ok ? authority.runnerSha256 : undefined;
-    if (!mutationSlot || !approvedEntrypointSha256) {
-      return {
-        ok: false,
-        error: `action "${action.id}" requires approval bound to a valid runner entrypoint digest before execution`,
-        provenNoDispatch: true,
-      };
-    }
-    try {
-      const replay = replaySpaceActionMutation(slug, action, slotRunId);
-      if (replay.replayed) return replay.result;
-      return await executeWorkflowCallMutation({
-        ...mutationSlot,
-        tool: `space-runner:${action.runner.trim()}`,
-        args,
-      }, () => runScript(
-        slug,
-        action.runner!.trim(),
-        { args },
-        { expectedSha256: approvedEntrypointSha256 },
-      ), {
-        classifyFailure: (result) => (
-          result.ok
-            ? null
-            : {
-              summary: result.error,
-              provenNoCommit: result.provenNoDispatch === true,
-            }
-        ),
-      });
-    } catch (err) {
-      return { ok: false, error: `action failed: ${(err as Error).message}` };
-    }
+    return {
+      ok: false,
+      error: `Workspace "${slug}" action "${action.id}" is unavailable: local runner execution has no shared durable call authority. The process was not started.`,
+      provenNoDispatch: true,
+    };
   }
   return { ok: false, error: `action "${action.id}" declares neither a runner nor a composio_slug` };
 }
@@ -611,6 +379,14 @@ export interface RefreshSpaceOptions {
   refreshId?: string;
   /** Optional durable batch identity for diagnostics. */
   batchId?: string;
+  /**
+   * Exact shared-kernel authority per declared source. Ordinary dashboard,
+   * scheduler, creation-smoke, and retry callers provide no entries and thus
+   * cannot reach Composio until a production compiler/activation adapter is
+   * wired. Local runner and CLI declarations remain zero-body as well; their
+   * legacy trust records are not shared-kernel authority.
+   */
+  composioAuthorityBySourceId?: Readonly<Record<string, SpaceSharedDurableComposioAuthority>>;
 }
 
 export async function refreshSpaceData(slug: string, sourceId?: string, opts: RefreshSpaceOptions = {}): Promise<RefreshResult[]> {
@@ -669,7 +445,12 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
   // Phase A observability: the workspace data-refresh lifecycle on the operator view.
   recordOperationalEvent({ source: 'workspace', type: 'workspace_data_refresh_started', workspaceId: slug, actor: 'space-runner', payload: { sourceCount: sources.length, sourceId } });
   for (const source of sources) {
-    const run = await runSpaceDataSource(slug, source);
+    const authorityMap = opts.composioAuthorityBySourceId;
+    const run = await runSpaceDataSource(slug, source, {
+      composioAuthority: authorityMap && Object.prototype.hasOwnProperty.call(authorityMap, source.id)
+        ? authorityMap[source.id]
+        : undefined,
+    });
     const observedAt = new Date().toISOString();
     // Repeated clicks while the same trust card is pending are one observation,
     // not new facts. The approval id is already exact to workspace + source +

@@ -16,7 +16,11 @@ import type {
   GraphNodeCapabilityReconcile,
 } from './graph-node-capability.js';
 import type { GraphNodeInvocationEnvelopeV1 } from './graph-node-envelope.js';
-import { attachSemanticContract, type CapabilityManifestV1 } from './capability-manifest.js';
+import {
+  attachSemanticContract,
+  capabilityManifestDigest,
+  type CapabilityManifestV1,
+} from './capability-manifest.js';
 import { isolatedTestContractActive } from './isolated-test-contract.js';
 import {
   requireAttestedTransport,
@@ -40,6 +44,7 @@ export interface ProductionTransportCall {
   operationId: string;
   args: Record<string, unknown>;
   accountId: string;
+  expected?: AttestedTransportCall['expected'];
 }
 
 export type ProductionTransport = (call: ProductionTransportCall) => Promise<unknown>;
@@ -311,9 +316,37 @@ export async function executeSealed(
     return attested.execute({ operationId, args, accountId, ...(expected ? { expected } : {}) });
   }
   if (isolatedTestContractActive() && installedTransport) {
-    return installedTransport({ operationId, args, accountId });
+    return installedTransport({ operationId, args, accountId, ...(expected ? { expected } : {}) });
   }
   throw new Error(`${operationId} transport unavailable`);
+}
+
+function attestedExpectationForManifest(
+  manifest: CapabilityManifestV1,
+): NonNullable<AttestedTransportCall['expected']> {
+  const external = manifest.externalDefinition;
+  return {
+    manifestId: manifest.manifestId,
+    manifestDigest: capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    providerIdentity: manifest.providerIdentity,
+    providerVersion: manifest.providerVersion,
+    operationVersion: manifest.operationVersion,
+    definitionFingerprint: manifest.definitionFingerprint,
+    ...(external
+      ? {
+          providerInputSchemaDigest: external.providerInputSchemaDigest,
+          ...(external.providerOutputSchemaObserved === true
+            ? {
+                providerOutputSchemaObserved: true as const,
+                providerOutputSchemaDigest: external.providerOutputSchemaDigest ?? null,
+              }
+            : {}),
+        }
+      : {}),
+    invokePortId: manifest.invokePortId,
+    argumentCompiler: { ...manifest.argumentCompiler },
+  };
 }
 
 export function observeComposioIndependently(operationId: string): LiveCapabilityObservation | 'missing' {
@@ -426,6 +459,10 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
     acceptedInputKinds: Object.freeze([...manifest.acceptedInputKinds]),
     producedOutputKinds: Object.freeze([...manifest.producedOutputKinds]),
   });
+  // Construct only at the provider edge. Host-only adapters and provenance
+  // probes may intentionally carry a minimal synthetic manifest and never
+  // cross a transport; they must not be upgraded into provider authority.
+  const expectedTransport = () => Object.freeze(attestedExpectationForManifest(manifest));
   return async ({ payload, role, envelope, binding, authority }) => {
     refuseRoleSwitch(role, sealed.purpose);
     if (binding.capabilityId && binding.capabilityId !== sealed.manifestId) {
@@ -468,7 +505,7 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
         query: query.query,
         fields: [...query.fields],
         count: query.count,
-      }, accountId);
+      }, accountId, expectedTransport());
       const record = asRecord(result);
       const locator = firstString(record, ['locator']) || query.locator;
       return { locator, query: firstString(record, ['query']) || query.query, fields: query.fields, count: query.count };
@@ -478,7 +515,7 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
       const result = await executeSealed(sealed.operationId, {
         locator: compiled.locator,
         query: compiled.query ?? '',
-      }, accountId);
+      }, accountId, expectedTransport());
       const records = asRecords(result);
       assertDistinctReadyRecords(records, envelope?.cardinality);
       return { records };
@@ -500,7 +537,7 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
           throw new Error(`create missing required field ${field}`);
         }
       }
-      const result = await executeSealed(sealed.operationId, createArgs, accountId);
+      const result = await executeSealed(sealed.operationId, createArgs, accountId, expectedTransport());
       const artifact = sheetArtifactFromProvider(result);
       return {
         ...artifact,
@@ -533,7 +570,7 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
         const result = await executeSealed(sealed.operationId, {
           spreadsheet_id: id,
           ranges: [range],
-        }, accountId);
+        }, accountId, expectedTransport());
         const record = asRecord(result);
         const returnedId = firstString(record, ['spreadsheet_id', 'spreadsheetId', 'id']) || id;
         if (returnedId !== id) throw new Error('readback spreadsheet id does not match the created id');
@@ -561,16 +598,23 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
           : null
       );
       if (!compiled) throw new Error('live read requires canonical object arguments');
-      const result = await executeSealed(sealed.operationId, compiled, accountId, {
-        providerKind: sealed.providerKind,
-        providerIdentity: sealed.providerIdentity,
-        providerVersion: sealed.providerVersion,
-        operationVersion: sealed.operationVersion,
-        definitionFingerprint: sealed.definitionFingerprint,
-        invokePortId: sealed.invokePortId,
-        argumentCompiler: { ...sealed.argumentCompiler },
-      });
+      const result = await executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
       return { result, complete: true };
+    }
+    // Exact native-MCP manifests are provider-neutral callable operations, not
+    // one of the beta demo purposes above. The registered port has already
+    // sealed server configuration, account, operation/schema versions,
+    // definition fingerprint, compiler, and transport expectation. Forward
+    // only the canonical object payload through that immutable port; metadata
+    // enumeration is never consulted here.
+    if (sealed.providerKind === 'native_mcp') {
+      const compiled = authority?.canonicalArgs ?? (
+        payload && typeof payload === 'object' && !Array.isArray(payload)
+          ? payload as Record<string, unknown>
+          : null
+      );
+      if (!compiled) throw new Error('native MCP invoke requires canonical object arguments');
+      return executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
     }
     throw new Error(`no sealed invoke for exact operation ${sealed.operationId}`);
   };

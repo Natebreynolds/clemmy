@@ -150,7 +150,11 @@ export interface WorkflowStepInput {
    * Exact provider-neutral invocation authority. Unlike `call`, this never
    * dispatches by a display/tool name and never stores rendered user args.
    * It is content-addressed and revalidated against the live capability
-   * catalog at every node admission. v1 admits read/compute only.
+   * catalog at every node admission. A standalone plan is the read-only
+   * pilot/recurrence lane. Paired with `call`, it is the exact runner lane:
+   * the call's rendered args must equal the typed compiler output, and
+   * host/write/admin effects execute only through their durable authority
+   * root (mutations/admin consume exact one-shot consent atomically).
    */
   invocationPlan?: WorkflowNodeInvocationPlanV1;
   /**

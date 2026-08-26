@@ -12,7 +12,8 @@ import pino from 'pino';
  *  messages — never from harness/judge/stall/grounding/outcome re-prompts that
  *  the loop records as user_input_received. Those were being stored as pinned
  *  "Standing prohibition" facts injected into every chat + voice prompt. Kill
- *  switch (default on); =off restores the old always-capture behavior. */
+ *  switch (default on); =off disables only this legacy text layer. Exact
+ *  source-provenance admission below is unconditional. */
 function autoCaptureHarnessSkipEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_AUTO_CAPTURE_HARNESS_SKIP', 'on') ?? 'on').toLowerCase() !== 'off';
 }
@@ -61,6 +62,113 @@ export interface AutoCaptureResult {
   callId?: string | null;
   profilePatch?: Record<string, unknown>;
   profile?: UserProfile;
+}
+
+/** Immutable source authority for automatic memory admission. Automatic
+ * memory must never infer authorship from prose: runtime-authored carriers are
+ * also stored as `user_input_received`, so eligibility follows the exact
+ * accepted event (or an explicit direct-user boundary) instead. */
+export type AutoCaptureSourceProvenance =
+  | {
+      authority: 'accepted_user_input';
+      sessionId: string;
+      eventId: string;
+      seq: number;
+      role: string;
+      type: string;
+      data: Record<string, unknown>;
+    }
+  | {
+      authority: 'direct_user_input';
+      role: 'user';
+      type: 'direct_user_input';
+      data: Record<string, unknown> & { synthetic: false };
+    };
+
+type AcceptedAutoCaptureEvent = {
+  sessionId: string;
+  id: string;
+  seq: number;
+  role: string;
+  type: string;
+  data: Record<string, unknown>;
+};
+
+export function autoCaptureProvenanceFromAcceptedEvent(
+  event: AcceptedAutoCaptureEvent,
+): AutoCaptureSourceProvenance {
+  return {
+    authority: 'accepted_user_input',
+    sessionId: event.sessionId,
+    eventId: event.id,
+    seq: event.seq,
+    role: event.role,
+    type: event.type,
+    data: event.data,
+  };
+}
+
+export function autoCaptureProvenanceFromDirectUserInput(
+  source: string,
+): AutoCaptureSourceProvenance {
+  return {
+    authority: 'direct_user_input',
+    role: 'user',
+    type: 'direct_user_input',
+    data: { synthetic: false, source },
+  };
+}
+
+const MACHINE_CAPTURE_CARRIER_RE =
+  /(?:^|[^a-z0-9])(?:outcome|system|harness|notification|daemon|workflow|background|execution|cron|controller|agent)(?:$|[^a-z0-9])/i;
+
+function machineCarrierValue(value: unknown): boolean {
+  return typeof value === 'string' && MACHINE_CAPTURE_CARRIER_RE.test(value.trim());
+}
+
+/** Pure, fail-closed provenance predicate shared with the independently
+ * re-derived durable host receipt. Missing provenance is never user authority. */
+export function isEligibleAutoCaptureSourceProvenance(
+  provenance: AutoCaptureSourceProvenance | undefined,
+  expected: { sessionId?: string; sourceEventId?: string } = {},
+): boolean {
+  if (!provenance || provenance.role !== 'user') return false;
+  if (provenance.authority === 'accepted_user_input') {
+    if (
+      provenance.type !== 'user_input_received'
+      || !provenance.sessionId
+      || !provenance.eventId
+      || !Number.isSafeInteger(provenance.seq)
+      || provenance.seq <= 0
+    ) return false;
+    // The accepted-event variant is exact only when the capture request binds
+    // the same durable session + sequence. A detached EventRow-shaped object
+    // is not sufficient authority by itself.
+    if (!expected.sessionId || !expected.sourceEventId) return false;
+    if (provenance.sessionId !== expected.sessionId) return false;
+    if (expected.sourceEventId !== `user-source:${provenance.seq}`) return false;
+  } else if (provenance.data.synthetic !== false) {
+    // A direct boundary has no event row to re-read, so it must positively
+    // attest that the input came from the user-facing request boundary.
+    return false;
+  }
+
+  const data = provenance.data;
+  if (data.synthetic === true || data.system === true || data.notification === true) return false;
+  // Malformed/non-boolean machine flags fail closed instead of being coerced.
+  if ('synthetic' in data && data.synthetic !== undefined && typeof data.synthetic !== 'boolean') return false;
+  if ('system' in data && data.system !== undefined && typeof data.system !== 'boolean') return false;
+  if ('notification' in data && data.notification !== undefined && typeof data.notification !== 'boolean') return false;
+  if (
+    machineCarrierValue(data.source)
+    || machineCarrierValue(data.carrier)
+    || machineCarrierValue(data.origin)
+  ) return false;
+  return true;
+}
+
+function emptyAutoCaptureResult(): AutoCaptureResult {
+  return { candidates: [], facts: [], profilePatch: undefined, profile: undefined };
 }
 
 const PROJECT_TERMS = /\b(clementine|clemmy|agent|assistant|dashboard|discord|composio|memory|workflow|autonom(?:y|ous)|setup|install|mcp|oauth|keychain|electron|tooling|project)\b/i;
@@ -741,12 +849,19 @@ export function captureInteractionSignals(input: {
   sourceEventId?: string;
   occurredAt?: string;
   maxFacts?: number;
+  sourceProvenance: AutoCaptureSourceProvenance;
 }): AutoCaptureResult {
+  if (!isEligibleAutoCaptureSourceProvenance(input.sourceProvenance, {
+    sessionId: input.sessionId,
+    sourceEventId: input.sourceEventId,
+  })) {
+    return emptyAutoCaptureResult();
+  }
   // Harness-injected re-prompts (judge/stall/parse/grounding/YOLO/outcome) are
   // recorded as user_input_received but are NOT user messages — never learn from
   // them. (Defense-in-depth; the loop also gates capture to the first chat turn.)
   if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(input.message)) {
-    return { candidates: [], facts: [], profilePatch: undefined, profile: undefined };
+    return emptyAutoCaptureResult();
   }
   const candidates = extractAutoMemoryCandidates(input.message, input.maxFacts ?? 3);
 

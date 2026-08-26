@@ -467,7 +467,22 @@ export async function registerProofProvisionedCapabilities(identity: {
           if (!args) {
             throw new Error(`proof-provisioned ${slug} could not compile schema-grounded arguments`);
           }
-          return executeSealed(slug, args, accountId);
+          return executeSealed(slug, args, accountId, {
+            manifestId: manifest.manifestId,
+            manifestDigest: capabilityManifestDigest(manifest),
+            providerKind: manifest.providerKind,
+            providerIdentity: manifest.providerIdentity,
+            providerVersion: manifest.providerVersion,
+            operationVersion: manifest.operationVersion,
+            definitionFingerprint: manifest.definitionFingerprint,
+            providerInputSchemaDigest:
+              manifest.externalDefinition!.providerInputSchemaDigest,
+            providerOutputSchemaObserved: true,
+            providerOutputSchemaDigest:
+              manifest.externalDefinition!.providerOutputSchemaDigest ?? null,
+            invokePortId: manifest.invokePortId,
+            argumentCompiler: { ...manifest.argumentCompiler },
+          });
         },
       });
       registered.push(capabilityId);

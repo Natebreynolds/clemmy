@@ -59,6 +59,9 @@ export interface CheckpointWorkItemInput {
   itemId: string;
   status: Exclude<WorkItemStatus, 'pending' | 'needs_validation'>;
   attemptId?: string;
+  /** Compare-and-set guard used only by generation invalidation. The fence is
+   * applied iff the reducer still sees this exact running attempt. */
+  fencedAttemptId?: string;
   evidence?: WorkEvidenceRef[];
   reason?: string;
 }
@@ -117,6 +120,8 @@ export interface WorkItemPhaseState {
   status: WorkItemStatus;
   contractVersion: string;
   attempts: number;
+  /** Latest physical worker generation allowed to settle this logical item. */
+  attemptId?: string;
   evidence: WorkEvidenceRef[];
   reason?: string;
   updatedAt?: string;
@@ -447,8 +452,42 @@ function applyCheckpoint(manifests: Map<string, MutableManifest>, event: EventRo
   if (!['running', 'succeeded', 'failed', 'invalidated'].includes(rawStatus)) return;
   const prior = item.phases.get(phaseId) ?? emptyPhaseState(manifest.contractVersion);
   const incomingEvidence = normalizeEvidence(data.evidence);
+  const incomingAttemptId = clean(data.attemptId, 500) || undefined;
+  const fencedAttemptId = clean(data.fencedAttemptId, 500) || undefined;
   let status = rawStatus;
   let reason = clean(data.reason, 1_000) || undefined;
+  if (
+    status === 'invalidated'
+    && fencedAttemptId
+    && (prior.status !== 'running' || prior.attemptId !== fencedAttemptId)
+  ) {
+    // The old attempt may have won with a proven success between the fence's
+    // read and append. This compare-and-set prevents a later invalidation row
+    // from erasing that success. Conversely, when the fence wins first, its new
+    // attempt id rejects the old terminal checkpoint below.
+    pushAnomaly(
+      manifest,
+      `Ignored stale generation fence for "${item.id}" in phase "${phaseId}"; expected running attempt "${fencedAttemptId}".`,
+    );
+    manifest.updatedAt = event.createdAt;
+    return;
+  }
+  if (
+    (status === 'succeeded' || status === 'failed')
+    && (prior.status === 'running' || prior.status === 'invalidated')
+    && prior.attemptId
+    && incomingAttemptId
+    && prior.attemptId !== incomingAttemptId
+  ) {
+    // A newer generation already owns this item. An old provider body that
+    // returned after cancellation cannot overwrite the current fence.
+    pushAnomaly(
+      manifest,
+      `Ignored stale terminal checkpoint for "${item.id}" in phase "${phaseId}" from attempt "${incomingAttemptId}"; current attempt is "${prior.attemptId}".`,
+    );
+    manifest.updatedAt = event.createdAt;
+    return;
+  }
   if (status === 'succeeded' && incomingEvidence.length === 0 && prior.evidence.length === 0) {
     status = 'needs_validation';
     reason = reason ?? 'Success checkpoint had no durable evidence reference.';
@@ -462,6 +501,7 @@ function applyCheckpoint(manifests: Map<string, MutableManifest>, event: EventRo
     status,
     contractVersion: manifest.contractVersion,
     attempts: prior.attempts + 1,
+    ...(incomingAttemptId ? { attemptId: incomingAttemptId } : prior.attemptId ? { attemptId: prior.attemptId } : {}),
     evidence: mergeEvidence(prior.evidence, incomingEvidence),
     ...(reason ? { reason } : prior.reason ? { reason: prior.reason } : {}),
     updatedAt: event.createdAt,
@@ -686,6 +726,7 @@ export function checkpointWorkItem(input: CheckpointWorkItemInput): EventRow {
       itemId: clean(input.itemId, 500),
       status: input.status,
       ...(input.attemptId?.trim() ? { attemptId: input.attemptId.trim() } : {}),
+      ...(input.fencedAttemptId?.trim() ? { fencedAttemptId: input.fencedAttemptId.trim() } : {}),
       ...(evidence.length > 0 ? { evidence } : {}),
       ...(input.reason?.trim() ? { reason: input.reason.trim().slice(0, 1_000) } : {}),
     },
@@ -927,6 +968,7 @@ export function checkpointPreparedWorker(
   status: 'running' | 'succeeded' | 'failed' | 'invalidated',
   options: {
     attemptId?: string;
+    fencedAttemptId?: string;
     evidence?: WorkEvidenceRef[];
     reason?: string;
   } = {},
@@ -942,6 +984,35 @@ export function checkpointPreparedWorker(
     status,
     ...options,
   });
+}
+
+/**
+ * Fence only stale `running` rows before a resumed batch generation starts.
+ * Pending/failed work stays eligible and proven successes remain monotonic.
+ */
+export function fencePreparedWorkerInFlight(
+  sessionId: string,
+  binding: PreparedWorkerManifest,
+  items: readonly string[],
+  generationId: string,
+): string[] {
+  const summary = summarizeWorkManifest(sessionId, binding.manifestId);
+  if (!summary || summary.contractVersion !== binding.contractVersion) return [];
+  const byId = new Map(summary.items.map((entry) => [entry.id, entry]));
+  const fenced: string[] = [];
+  for (const item of items) {
+    const itemId = binding.itemIds.get(item);
+    if (!itemId) continue;
+    const state = byId.get(itemId)?.phases[binding.phase];
+    if (!state || state.status !== 'running') continue;
+    checkpointPreparedWorker(sessionId, binding, item, 'invalidated', {
+      attemptId: `fence:${generationId}`,
+      fencedAttemptId: state.attemptId,
+      reason: 'prior worker batch generation was fenced before resume',
+    });
+    fenced.push(item);
+  }
+  return fenced;
 }
 
 /**

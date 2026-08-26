@@ -23,6 +23,9 @@ import {
   admitHostLogicalCallInTransaction,
   admitWorkflowLogicalCallInTransaction,
   poisonAcceptedTurnCallAuthorityInTransaction,
+  workflowReadOnlyPhysicalClaimAttestationMatches,
+  workflowV3AttestedEffectForLogicalContract,
+  workflowV3PhysicalClaimAttestationMatches,
   type AcceptedTurnCallAuthority,
   type CallAdmissionEffect,
 } from './accepted-turn-call-authority.js';
@@ -412,6 +415,12 @@ type CallAdmissionAuthority =
       acceptedTaskId: string;
       identity: { sessionId: string; sourceUserSeq: number; turn: number };
       authority: AcceptedTurnCallAuthority;
+    }
+  | {
+      authorityKind: 'workflow_v3_call';
+      acceptedTaskId: string;
+      identity: { sessionId: string; sourceUserSeq: number; turn: number };
+      authority: AcceptedTurnCallAuthority;
     };
 
 function ensureCallAdmissionOpenInTransaction(
@@ -449,7 +458,7 @@ function ensureCallAdmissionOpenInTransaction(
         effect,
         isNew,
       })
-    : authority.authorityKind === 'workflow_v1_read_only'
+    : authority.authorityKind === 'workflow_v1_read_only' || authority.authorityKind === 'workflow_v3_call'
       ? admitWorkflowLogicalCallInTransaction(db, {
         sessionId: input.sessionId,
         sourceEventSeq: input.sourceUserSeq,
@@ -609,11 +618,15 @@ function expectedForAdmission(
       },
     };
   }
-  if (root.status === 'ok' && root.authority.authorityKind === 'workflow_v1_read_only') {
+  if (
+    root.status === 'ok'
+    && (root.authority.authorityKind === 'workflow_v1_read_only'
+      || root.authority.authorityKind === 'workflow_v3_call')
+  ) {
     return {
       status: 'ok',
       authority: {
-        authorityKind: 'workflow_v1_read_only',
+        authorityKind: root.authority.authorityKind,
         acceptedTaskId: root.authority.identity.acceptedTaskId,
         identity: {
           sessionId: root.authority.identity.sessionId,
@@ -683,7 +696,13 @@ export function admitLogicalCall(input: {
   if (expectedState.status !== 'ok') return expectedState;
   const authority = expectedState.authority;
   const contract = durableLogicalCallContract(authority.acceptedTaskId, input.tool, input.args);
-  const effect = classifyRuntimeToolEffect(input.tool, input.args).effect;
+  const effect = contract
+    ? workflowV3AttestedEffectForLogicalContract({
+        acceptedTaskId: authority.acceptedTaskId,
+        toolName: contract.toolName,
+        argumentDigest: contract.argumentDigest,
+      }) ?? classifyRuntimeToolEffect(input.tool, input.args).effect
+    : classifyRuntimeToolEffect(input.tool, input.args).effect;
   try {
     const db = openEventLog();
     const transaction = db.transaction((): LogicalCallAdmissionInTransactionResult => {
@@ -903,7 +922,8 @@ export function logicalCallAuthorityState(
         | 'host_v1'
         | 'host_v1_read_only'
         | 'workflow_v1_read_only'
-        | 'workflow_v2_paginated_read';
+        | 'workflow_v2_paginated_read'
+        | 'workflow_v3_call';
       authority_state: 'open' | 'closed' | 'conflict';
       resolution_state: 'open' | 'finalized' | 'legacy_ambiguous' | null;
     } | undefined;
@@ -981,6 +1001,72 @@ export function beginPhysicalDispatch(input: CompatibilityPhysicalDispatchInput)
 }
 
 /**
+ * Reserve one host-owned metadata/preflight provider crossing. This is a
+ * deliberately separate entry point: compatibility callers cannot manufacture
+ * `relation=probe` on the ordinary business API, while a trusted adapter can
+ * account for a real network/stdio freshness check before its business body.
+ * A preparation is the first crossing of its logical call and is never a retry.
+ */
+export function beginPreparationPhysicalDispatch(
+  input: Omit<CompatibilityPhysicalDispatchInput, 'relation'>,
+): DispatchAdmissionResult {
+  if (input.identity.retryOf) {
+    return { status: 'conflict', reason: 'preparation crossing cannot be a retry' };
+  }
+  return beginPhysicalDispatchCore(
+    { ...input, relation: 'probe' },
+    undefined,
+    undefined,
+    'host',
+  );
+}
+
+/** Exact workflow-owned preparation admission. Copyable occurrence fields are
+ * accepted only while the matching process-opaque workflow-v1/v3 attestation
+ * is ambient, binding the probe to the same root, activation and logical call
+ * that will own the following business crossing. */
+export function beginWorkflowPreparationPhysicalDispatch(input: {
+  identity: PhysicalCrossingIdentity;
+  tool: string;
+  args?: unknown;
+  turn?: number;
+  dispatchLease?: DispatchLeaseRef;
+  activationId: string;
+  activationDigest: string;
+  authorityDigest: string;
+  authorityRevision: number;
+}): DispatchAdmissionResult {
+  if (input.identity.retryOf) {
+    return { status: 'conflict', reason: 'workflow preparation crossing cannot be a retry' };
+  }
+  const exact = {
+    sessionId: input.identity.sessionId,
+    sourceEventSeq: input.identity.sourceUserSeq,
+    authorityRootId: input.identity.acceptedTaskId,
+    activationId: input.activationId,
+    activationDigest: input.activationDigest,
+    authorityDigest: input.authorityDigest,
+    authorityRevision: input.authorityRevision,
+    logicalCallId: input.identity.logicalToolCallId,
+    physicalToolName: input.tool,
+  };
+  if (
+    !workflowReadOnlyPhysicalClaimAttestationMatches(exact)
+    && !workflowV3PhysicalClaimAttestationMatches(exact)
+  ) {
+    return { status: 'conflict', reason: 'workflow preparation lacks its exact opaque call attestation' };
+  }
+  return beginPhysicalDispatchCore({
+    identity: input.identity,
+    tool: input.tool,
+    args: input.args,
+    turn: input.turn,
+    relation: 'probe',
+    dispatchLease: input.dispatchLease,
+  }, undefined, undefined, 'workflow');
+}
+
+/**
  * Consume one process-opaque staged attempt at the final pre-body edge.  The
  * copyable IDs stored in SQLite are deliberately not accepted by this API;
  * they are only evidence that the opaque carrier still re-opens exactly.
@@ -1013,9 +1099,13 @@ function beginPhysicalDispatchCore(
   input: CompatibilityPhysicalDispatchInput,
   typed?: TypedPhysicalDispatchPersist,
   staged?: StagedPhysicalDispatchPersist,
+  preparation: 'host' | 'workflow' | null = null,
 ): DispatchAdmissionResult {
   if (typed && staged) {
     return { status: 'conflict', reason: 'physical dispatch cannot combine graph and staged authority' };
+  }
+  if (preparation && (typed || staged)) {
+    return { status: 'conflict', reason: 'preparation crossing requires compatibility host authority' };
   }
   const expectedState = expectedForAdmission(input.identity.sessionId, input.identity.sourceUserSeq);
   if (expectedState.status !== 'ok') return expectedState;
@@ -1044,6 +1134,13 @@ function beginPhysicalDispatchCore(
     ? trustedAdmissionCarrier.decision
     : null;
   const admissionEffect = staged?.state.effect ?? trustedAdmissionDecision?.effect
+    ?? (contract
+      ? workflowV3AttestedEffectForLogicalContract({
+          acceptedTaskId: authority.acceptedTaskId,
+          toolName: contract.toolName,
+          argumentDigest: contract.argumentDigest,
+        })
+      : undefined)
     ?? classifyRuntimeToolEffect(input.tool, input.args).effect;
   const dispatchLease = input.dispatchLease ?? currentDispatchLease();
   if (
@@ -1364,9 +1461,14 @@ function beginPhysicalDispatchCore(
         input.identity.sourceUserSeq,
         input.identity.logicalToolCallId,
       ) as { ordinal: number }).ordinal;
-      const relation: DispatchRelation = input.identity.retryOf
-        ? 'retry'
-        : ordinal === 1 ? 'primary' : 'child';
+      if (preparation === 'host' && ordinal !== 1) {
+        return { status: 'conflict', reason: 'preparation must be the first physical crossing' };
+      }
+      const relation: DispatchRelation = preparation
+        ? 'probe'
+        : input.identity.retryOf
+          ? 'retry'
+          : ordinal === 1 ? 'primary' : 'child';
       if (input.relation && input.relation !== relation) {
         return { status: 'conflict', reason: 'caller relation does not match the host-assigned crossing' };
       }
@@ -1384,6 +1486,18 @@ function beginPhysicalDispatchCore(
           : null;
         const effect = typedEffect?.ok ? typedEffect.authority.resolvedEffect : '';
         const blocking = predecessors.some((row) => row.state === 'started' || row.state === 'unknown' || !row.state);
+        if (
+          preparation === 'workflow'
+          && (
+            blocking
+            || predecessors.some((row) => row.relation !== 'probe')
+          )
+        ) {
+          return {
+            status: 'conflict',
+            reason: 'workflow preparation requires only settled predecessor probes before business dispatch',
+          };
+        }
         if (WRITE_EFFECTS.has(effect) && blocking) {
           const retryOk = relation === 'retry' && typed?.typedAuthorityJson && typedEffect?.ok
             && exactRetryPredecessorInTransaction(db, typedEffect.authority, typed).ok;
@@ -1480,14 +1594,18 @@ function beginPhysicalDispatchCore(
         ordinal: persistOrdinal,
         relation: persistRelation,
       };
-      reserveWriteEvidenceDispatchInTransaction(db, {
-        sessionId: input.identity.sessionId,
-        sourceUserSeq: input.identity.sourceUserSeq,
-        acceptedTaskId: authority.acceptedTaskId,
-        logicalToolCallId: input.identity.logicalToolCallId,
-        physicalDispatchId: input.identity.physicalDispatchId,
-        ordinal: persistOrdinal,
-      });
+      // A provider metadata probe is a real paid crossing, but it is not the
+      // business write and must not create a second write-evidence reservation.
+      if (!preparation) {
+        reserveWriteEvidenceDispatchInTransaction(db, {
+          sessionId: input.identity.sessionId,
+          sourceUserSeq: input.identity.sourceUserSeq,
+          acceptedTaskId: authority.acceptedTaskId,
+          logicalToolCallId: input.identity.logicalToolCallId,
+          physicalDispatchId: input.identity.physicalDispatchId,
+          ordinal: persistOrdinal,
+        });
+      }
       mirror = insertInternalEventInTransaction(db, {
         sessionId: input.identity.sessionId,
         turn: input.turn ?? authority.identity.turn,

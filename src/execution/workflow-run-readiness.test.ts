@@ -65,7 +65,7 @@ function workflowWithResources(resources: Record<string, WorkflowResourceBinding
     steps: [{
       id: 'refresh',
       prompt: 'Refresh the dashboard.',
-      deterministic: { runner: 'refresh.mjs' },
+      sideEffect: 'read',
     }],
   };
 }
@@ -226,125 +226,65 @@ test('renderWorkflowVisualContract summarizes blocking and warning checks for au
   assert.doesNotMatch(msg, /\[PASS\] Graph structure/);
 });
 
-test('required Salesforce account blocks a Friday-shaped run when fresh org display proves auth is missing', () => {
-  const calls: Array<{ command: string; args: readonly string[]; timeoutMs: number }> = [];
+test('required Salesforce account fails closed without provider or CLI execution authority', () => {
   const readiness = checkWorkflowRunReadiness(
     workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
     FRIDAY_SHAPE_SLUG,
-    {
-      resourceProbeRunner: (request) => {
-        calls.push(request);
-        return {
-          status: 1,
-          stdout: JSON.stringify({
-            status: 1,
-            name: 'NamedOrgNotFoundError',
-            message: 'No authorization information found for ops@example.test.',
-          }),
-          stderr: 'Warning: a CLI update is available.',
-        };
-      },
-    },
   );
 
   assert.equal(readiness.ok, false);
   assert.equal(readiness.blockers.length, 1);
-  assert.equal(readiness.blockers[0]?.status, 'missing');
-  assert.match(readiness.blockers[0]?.reason ?? '', /signed out or missing/i);
+  assert.equal(readiness.blockers[0]?.kind, 'cli');
+  assert.equal(readiness.blockers[0]?.name, 'sf:salesforce_org');
+  assert.equal(readiness.blockers[0]?.status, 'unknown');
+  assert.match(readiness.blockers[0]?.reason ?? '', /admitted exact-account read/i);
+  assert.match(readiness.blockers[0]?.reason ?? '', /no provider or CLI execution authority/i);
+  assert.match(readiness.blockers[0]?.evidence?.[0]?.detail ?? '', /zero provider or CLI process calls/i);
   assert.match(readiness.message, /was not queued/);
-  // A negative per-account lookup is corroborated against the enumeration
-  // before a cause is asserted; here it reports nothing, so "signed out" stands.
-  assert.deepEqual(calls, [
-    {
-      command: 'sf',
-      args: ['org', 'display', '--target-org', 'ops@example.test', '--json'],
-      timeoutMs: 8_000,
-    },
-    {
-      command: 'sf',
-      args: ['org', 'list', '--json'],
-      timeoutMs: 8_000,
-    },
-  ]);
 });
 
-// An absent credential and one the local store refuses to decrypt produce the
-// SAME per-account "not found" error. Asserting "signed out" from that sends the
-// user to re-authorize an account that was never signed out, while the real
-// cause goes unmentioned. Observed live: `sf org display` returned
-// NamedOrgNotFoundError while the auth file existed and the macOS keychain had
-// refused it, so the remedy Clem gave could not have worked.
-test('a credential the local store refuses to release is not reported as signed out', () => {
+test('binary registration and generic auth-health cache do not attest an exact Salesforce org', () => {
+  const stateDir = path.join(TMP_HOME, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path.join(stateDir, 'connected-clis.json'), JSON.stringify({
+    version: 'v1',
+    entries: {
+      salesforce: {
+        id: 'salesforce',
+        command: 'sf',
+        vendor: 'Salesforce',
+        name: 'Salesforce CLI',
+        installedAt: '2026-08-25T09:00:00.000Z',
+        authDocsUrl: 'https://example.test/salesforce-auth',
+      },
+    },
+  }), 'utf8');
+  writeFileSync(path.join(stateDir, 'cli-auth-health.json'), JSON.stringify({
+    version: 'v1',
+    entries: {
+      salesforce: {
+        id: 'salesforce',
+        command: 'sf',
+        installed: true,
+        authStatus: 'ok',
+        username: 'ops@example.test',
+        checkedAt: '2026-08-25T09:00:00.000Z',
+      },
+    },
+  }), 'utf8');
+
   const readiness = checkWorkflowRunReadiness(
     workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
     FRIDAY_SHAPE_SLUG,
-    {
-      resourceProbeRunner: (request) => {
-        if (request.args.includes('display')) {
-          return {
-            status: 1,
-            stdout: JSON.stringify({
-              status: 1,
-              name: 'NamedOrgNotFoundError',
-              message: 'No authorization information found for ops@example.test.',
-            }),
-            stderr: '',
-          };
-        }
-        return {
-          status: 0,
-          stdout: JSON.stringify({
-            status: 0,
-            result: { other: [], nonScratchOrgs: [] },
-            warnings: [
-              'The auth file for ops@example.test is invalid. Due to: Command failed with response:\n - security: SecKeychainItemCreateFromContent (<default>): The user name or passphrase you entered is not correct.\n',
-            ],
-          }),
-          stderr: '',
-        };
-      },
-    },
   );
 
   assert.equal(readiness.ok, false);
-  assert.equal(readiness.blockers.length, 1);
-  assert.equal(readiness.blockers[0]?.status, 'missing');
-  assert.doesNotMatch(
-    readiness.blockers[0]?.reason ?? '',
-    /signed out/i,
-    'the account is present — telling the user to sign in again is the wrong remedy',
-  );
-  assert.match(readiness.blockers[0]?.reason ?? '', /credential store refused/i);
-  assert.match(
-    readiness.blockers[0]?.evidence?.[0]?.detail ?? '',
-    /keychain|passphrase/i,
-    'the real store-level failure must reach the user, not the misleading lookup error',
-  );
-});
-
-test('fresh successful Salesforce org display lets the required account pass', () => {
-  const readiness = checkWorkflowRunReadiness(
-    workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
-    FRIDAY_SHAPE_SLUG,
-    {
-      resourceProbeRunner: () => ({
-        status: 0,
-        stdout: JSON.stringify({
-          status: 0,
-          result: { username: 'ops@example.test', connectedStatus: 'Connected' },
-        }),
-        stderr: '',
-      }),
-    },
-  );
-
-  assert.equal(readiness.ok, true);
-  assert.equal(readiness.blockers.length, 0);
-  assert.equal(readiness.warnings.length, 0);
+  assert.equal(readiness.blockers[0]?.name, 'sf:salesforce_org');
+  assert.equal(readiness.blockers[0]?.status, 'unknown');
+  assert.match(readiness.blockers[0]?.reason ?? '', /cannot be verified/i);
 });
 
 test('unsupported required account CLI is an informative warning, not a blocker', () => {
-  let calls = 0;
   const readiness = checkWorkflowRunReadiness(
     workflowWithResources({
       source_account: {
@@ -356,97 +296,50 @@ test('unsupported required account CLI is an informative warning, not a blocker'
       },
     }),
     FRIDAY_SHAPE_SLUG,
-    { resourceProbeRunner: () => { calls += 1; throw new Error('must not run'); } },
   );
 
   assert.equal(readiness.ok, true);
   assert.equal(readiness.blockers.length, 0);
   assert.equal(readiness.warnings.length, 1);
-  assert.match(readiness.warnings[0]?.reason ?? '', /no authoritative read-only account probe/i);
-  assert.equal(calls, 0);
+  assert.match(readiness.warnings[0]?.reason ?? '', /no authoritative local account snapshot/i);
 });
 
-test('probe errors and unrecognized failures warn without refusing the run', () => {
-  const thrown = checkWorkflowRunReadiness(
-    workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
-    FRIDAY_SHAPE_SLUG,
-    { resourceProbeRunner: () => { throw new Error('spawn failed'); } },
-  );
-  const unrecognized = checkWorkflowRunReadiness(
-    workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
-    FRIDAY_SHAPE_SLUG,
-    {
-      resourceProbeRunner: () => ({
-        status: 1,
-        stdout: JSON.stringify({ status: 1, name: 'UnexpectedError', message: 'Service unavailable.' }),
-        stderr: '',
-      }),
-    },
-  );
-
-  for (const readiness of [thrown, unrecognized]) {
-    assert.equal(readiness.ok, true);
-    assert.equal(readiness.blockers.length, 0);
-    assert.equal(readiness.warnings.length, 1);
-    assert.equal(readiness.warnings[0]?.status, 'unknown');
-  }
-});
-
-test('non-required account resources are not probed and cannot block', () => {
-  let calls = 0;
+test('non-required account resources do not participate in readiness', () => {
   const account = requiredSalesforceAccount();
   account.required = false;
   const readiness = checkWorkflowRunReadiness(
     workflowWithResources({ salesforce_org: account }),
     FRIDAY_SHAPE_SLUG,
-    { resourceProbeRunner: () => { calls += 1; throw new Error('must not run'); } },
   );
 
   assert.equal(readiness.ok, true);
   assert.equal(readiness.blockers.length, 0);
   assert.equal(readiness.warnings.length, 0);
-  assert.equal(calls, 0);
 });
 
-test('account selector validation prevents option or shell injection and degrades to a warning', () => {
-  let calls = 0;
+test('an invalid required Salesforce selector is a typed blocker, never a command argument', () => {
   const readiness = checkWorkflowRunReadiness(
     workflowWithResources({
       salesforce_org: requiredSalesforceAccount('--json; touch /tmp/not-allowed'),
     }),
     FRIDAY_SHAPE_SLUG,
-    { resourceProbeRunner: () => { calls += 1; throw new Error('must not run'); } },
   );
 
-  assert.equal(readiness.ok, true);
-  assert.equal(readiness.blockers.length, 0);
-  assert.equal(readiness.warnings.length, 1);
-  assert.match(readiness.warnings[0]?.reason ?? '', /cannot be safely probed/i);
-  assert.equal(calls, 0);
+  assert.equal(readiness.ok, false);
+  assert.equal(readiness.blockers.length, 1);
+  assert.equal(readiness.blockers[0]?.status, 'unknown');
+  assert.match(readiness.blockers[0]?.reason ?? '', /selector is missing or invalid/i);
 });
 
-test('Salesforce readiness probe is read-only by construction and does not mutate the binding', () => {
+test('Salesforce readiness is local-only and does not mutate the binding', () => {
   const resource = Object.freeze(requiredSalesforceAccount('alias-1'));
   const before = JSON.stringify(resource);
-  let observed: { command: string; args: readonly string[]; timeoutMs: number } | undefined;
   const readiness = checkWorkflowRunReadiness(
     workflowWithResources({ salesforce_org: resource }),
     FRIDAY_SHAPE_SLUG,
-    {
-      resourceProbeRunner: (request) => {
-        observed = request;
-        return {
-          status: 0,
-          stdout: JSON.stringify({ status: 0, result: { alias: 'alias-1' } }),
-          stderr: '',
-        };
-      },
-    },
   );
 
-  assert.equal(readiness.ok, true);
-  assert.equal(observed?.command, 'sf');
-  assert.deepEqual(observed?.args, ['org', 'display', '--target-org', 'alias-1', '--json']);
-  assert.equal(observed?.args.includes('login'), false);
+  assert.equal(readiness.ok, false);
+  assert.equal(readiness.blockers[0]?.name, 'sf:salesforce_org');
   assert.equal(JSON.stringify(resource), before);
 });

@@ -1229,15 +1229,13 @@ test('nested call_tool dispatch reuses the ambient run counter', async () => {
   }
 });
 
-test('an external MCP name (<server>__<tool>) passes authority and reaches MCP resolution (2026-07-08 live gap)', async () => {
-  // The model tried call_tool→dataforseo__kw_data_google_ads_search_volume live
-  // and got not_reachable, then fell back to hand-rolling the provider REST API
-  // through shell calls. MCP names must pass the built-in allowlist and be
-  // enforced DOWNSTREAM by the session's connected-MCP scope. Here no MCP server
-  // is connected, so dispatch fails — but with an MCP-resolution error, NOT the
-  // authority refusal.
+test('a guessed external MCP name fails exact binding before any broad resolution', async () => {
+  // A namespaced shape is not execution authority. Without a host-minted exact
+  // manifest/account/schema/port binding, call_tool must refuse locally rather
+  // than selecting a cached server or rebuilding a routing map from listTools.
   const out = String(await invokeCallTool('sess-mcp', 'fakeserver__fake_tool', '{"q":1}'));
-  assert.ok(!out.includes('not_reachable'), 'MCP names must not be refused by the built-in authority check');
+  assert.match(out, /exact_mcp_binding_missing/);
+  assert.match(out, /not_reachable/);
 });
 
 test('malformed outer call_tool envelopes consume budget and hit the loop ceiling before SDK validation', async () => {

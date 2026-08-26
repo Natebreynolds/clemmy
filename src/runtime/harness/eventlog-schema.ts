@@ -58,7 +58,8 @@ export interface AcceptedTurnCallAuthorityDigestInput {
     | 'host_v1'
     | 'host_v1_read_only'
     | 'workflow_v1_read_only'
-    | 'workflow_v2_paginated_read';
+    | 'workflow_v2_paginated_read'
+    | 'workflow_v3_call';
   sessionId: string;
   sourceUserSeq: number;
   acceptedTaskId: string;
@@ -328,6 +329,7 @@ function createV51AcceptedCallAuthoritySchema(
   db: Database.Database,
   includePaginated = false,
   includeProductionHost = false,
+  includeWorkflowV3 = false,
 ): void {
   db.exec(`
     CREATE TABLE accepted_turn_call_authorities (
@@ -340,6 +342,7 @@ function createV51AcceptedCallAuthoritySchema(
                                   'turn_graph','host_v1_read_only','workflow_v1_read_only'
                                   ${includeProductionHost ? ",'host_v1'" : ''}
                                   ${includePaginated ? ",'workflow_v2_paginated_read'" : ''}
+                                  ${includeWorkflowV3 ? ",'workflow_v3_call'" : ''}
                                 )),
       source_event_id           TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
       source_event_digest       TEXT NOT NULL CHECK (length(source_event_digest) = 64),
@@ -385,7 +388,8 @@ function createV51AcceptedCallAuthoritySchema(
       PRIMARY KEY (session_id, source_user_seq),
       CHECK (
         authority_kind IN ('workflow_v1_read_only'
-          ${includePaginated ? ",'workflow_v2_paginated_read'" : ''})
+          ${includePaginated ? ",'workflow_v2_paginated_read'" : ''}
+          ${includeWorkflowV3 ? ",'workflow_v3_call'" : ''})
         OR accepted_task_id = 'task:' || session_id || '#' || source_user_seq
       ),
       CHECK (
@@ -524,6 +528,33 @@ function createV51AcceptedCallAuthoritySchema(
           AND control_digest IS NOT NULL
           AND workflow_logical_call_id IS NULL)
         ` : ''}
+        ${includeWorkflowV3 ? `
+        OR
+        (authority_kind = 'workflow_v3_call'
+          AND engine_version = 'workflow_v3_call'
+          AND surface_version = 'workflow_node_invocation_plan_v1'
+          AND effect_ceiling IN ('host_only','local_write','external_write','admin')
+          AND effect_bounds_json = '["' || effect_ceiling || '"]'
+          AND max_logical_calls = 1
+          AND max_parallel_calls = 1
+          AND catalog_revision_digest = binding_snapshot_digest
+          AND binding_revision_digest IS NOT NULL
+          AND graph_event_id IS NULL
+          AND graph_hash IS NULL
+          AND workflow_activation_id IS NOT NULL
+          AND workflow_activation_digest IS NOT NULL
+          AND workflow_id IS NOT NULL
+          AND workflow_revision IS NOT NULL
+          AND workflow_digest IS NOT NULL
+          AND run_id IS NOT NULL
+          AND run_occurrence_id IS NOT NULL
+          AND workflow_node_id IS NOT NULL
+          AND workflow_node_attempt IS NOT NULL
+          AND invocation_plan_digest IS NOT NULL
+          AND binding_snapshot_digest IS NOT NULL
+          AND control_digest IS NOT NULL
+          AND workflow_logical_call_id IS NOT NULL)
+        ` : ''}
       )
     );
 
@@ -544,10 +575,19 @@ function createV51AcceptedCallAuthoritySchema(
       ) WHERE authority_kind = 'workflow_v2_paginated_read';
     ` : ''}
 
+    ${includeWorkflowV3 ? `
+    CREATE INDEX idx_accepted_workflow_v3_call_authority_occurrence
+      ON accepted_turn_call_authorities(
+        workflow_id, workflow_revision, run_occurrence_id,
+        workflow_node_id, workflow_node_attempt
+      ) WHERE authority_kind = 'workflow_v3_call';
+    ` : ''}
+
     CREATE TRIGGER trg_accepted_turn_call_authority_source_exact
     BEFORE INSERT ON accepted_turn_call_authorities
     WHEN NEW.authority_kind NOT IN ('workflow_v1_read_only'
-      ${includePaginated ? ",'workflow_v2_paginated_read'" : ''}) AND NOT EXISTS (
+      ${includePaginated ? ",'workflow_v2_paginated_read'" : ''}
+      ${includeWorkflowV3 ? ",'workflow_v3_call'" : ''}) AND NOT EXISTS (
       SELECT 1 FROM events e
        WHERE e.id = NEW.source_event_id
          AND e.seq = NEW.source_user_seq
@@ -612,6 +652,41 @@ function createV51AcceptedCallAuthoritySchema(
     )
     BEGIN
       SELECT RAISE(ABORT, 'paginated workflow call authority requires its exact durable activation');
+    END;
+    ` : ''}
+
+    ${includeWorkflowV3 ? `
+    CREATE TRIGGER trg_accepted_workflow_v3_call_authority_source_exact
+    BEFORE INSERT ON accepted_turn_call_authorities
+    WHEN NEW.authority_kind = 'workflow_v3_call' AND NOT EXISTS (
+      SELECT 1
+        FROM workflow_node_invocation_activations w
+        JOIN workflow_v3_call_activation_bindings b
+          ON b.activation_id = w.activation_id
+       WHERE w.activation_id = NEW.workflow_activation_id
+         AND w.activation_digest = NEW.workflow_activation_digest
+         AND w.authority_root_id = NEW.accepted_task_id
+         AND w.session_id = NEW.session_id
+         AND w.source_event_seq = NEW.source_user_seq
+         AND w.source_event_id = NEW.source_event_id
+         AND w.source_event_digest = NEW.source_event_digest
+         AND w.workflow_id = NEW.workflow_id
+         AND w.workflow_revision = NEW.workflow_revision
+         AND w.workflow_digest = NEW.workflow_digest
+         AND w.run_id = NEW.run_id
+         AND w.run_occurrence_id = NEW.run_occurrence_id
+         AND w.node_id = NEW.workflow_node_id
+         AND w.node_attempt = NEW.workflow_node_attempt
+         AND w.invocation_plan_digest = NEW.invocation_plan_digest
+         AND w.binding_snapshot_digest = NEW.binding_snapshot_digest
+         AND w.control_digest = NEW.control_digest
+         AND w.logical_call_id = NEW.workflow_logical_call_id
+         AND b.session_id = NEW.session_id
+         AND b.authority_binding_digest = NEW.binding_revision_digest
+         AND b.effect = NEW.effect_ceiling
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'workflow v3 call authority requires its exact durable activation binding');
     END;
     ` : ''}
 
@@ -1467,21 +1542,25 @@ function rebuildAcceptedCallAuthoritiesForPagination(db: Database.Database): voi
 /** V54 widens only the root enum/closed CHECK for the effect-capable host.
  * Existing v53 roots and every child row stay byte-identical. The table
  * rebuild is intentionally the same legacy-rename pattern rehearsed by v52. */
-function rebuildAcceptedCallAuthoritiesForProductionHost(db: Database.Database): void {
+function rebuildAcceptedCallAuthoritiesForProductionHost(
+  db: Database.Database,
+  includeWorkflowV3 = false,
+): void {
   const table = db.prepare(
     `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'accepted_turn_call_authorities'`,
   ).get() as { sql: string | null } | undefined;
-  if (!table?.sql) throw new Error('schema v54 call-authority root is missing');
-  if (table.sql.includes("'host_v1'")) {
+  const schemaVersion = includeWorkflowV3 ? 64 : 54;
+  if (!table?.sql) throw new Error(`schema v${schemaVersion} call-authority root is missing`);
+  if (table.sql.includes(includeWorkflowV3 ? "'workflow_v3_call'" : "'host_v1'")) {
     const relevantTables = foreignKeyClosure(db, ['accepted_turn_call_authorities']);
     const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
       .filter((violation) => relevantTables.has(violation.table));
     if (violations.length > 0) {
-      throw new Error(`schema v54 existing host root has ${violations.length} relevant foreign-key violation(s)`);
+      throw new Error(`schema v${schemaVersion} existing host root has ${violations.length} relevant foreign-key violation(s)`);
     }
     const integrity = db.pragma('integrity_check') as Array<{ integrity_check: string }>;
     if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {
-      throw new Error(`schema v54 existing host-root integrity failed: ${JSON.stringify(integrity).slice(0, 240)}`);
+      throw new Error(`schema v${schemaVersion} existing host-root integrity failed: ${JSON.stringify(integrity).slice(0, 240)}`);
     }
     return;
   }
@@ -1532,12 +1611,15 @@ function rebuildAcceptedCallAuthoritiesForProductionHost(db: Database.Database):
     for (const object of rootObjects) {
       db.exec(`DROP ${object.type.toUpperCase()} ${quotedSchemaIdentifier(object.name)}`);
     }
-    db.exec('ALTER TABLE accepted_turn_call_authorities RENAME TO accepted_turn_call_authorities_v53');
-    createV51AcceptedCallAuthoritySchema(db, true, true);
+    const retiredName = includeWorkflowV3
+      ? 'accepted_turn_call_authorities_v63'
+      : 'accepted_turn_call_authorities_v53';
+    db.exec(`ALTER TABLE accepted_turn_call_authorities RENAME TO ${retiredName}`);
+    createV51AcceptedCallAuthoritySchema(db, true, true, includeWorkflowV3);
     const columnList = columns.map(quotedSchemaIdentifier).join(', ');
     db.exec(`INSERT INTO accepted_turn_call_authorities (${columnList})
-      SELECT ${columnList} FROM accepted_turn_call_authorities_v53`);
-    db.exec('DROP TABLE accepted_turn_call_authorities_v53');
+      SELECT ${columnList} FROM ${retiredName}`);
+    db.exec(`DROP TABLE ${retiredName}`);
   } finally {
     db.pragma(`legacy_alter_table = ${priorLegacyRename ? 'ON' : 'OFF'}`);
   }
@@ -1566,7 +1648,7 @@ function rebuildAcceptedCallAuthoritiesForProductionHost(db: Database.Database):
     || logicalFks !== afterLogicalFks
     || logicalObjectNames !== afterLogicalObjectNames
   ) {
-    throw new Error('schema v54 changed authority/logical rows, foreign keys, indexes, or triggers');
+    throw new Error(`schema v${schemaVersion} changed authority/logical rows, foreign keys, indexes, or triggers`);
   }
   for (const [name, before] of childSnapshot) {
     const rows = (db.prepare(`SELECT COUNT(*) AS n FROM ${quotedSchemaIdentifier(name)}`).get() as { n: number }).n;
@@ -1574,18 +1656,18 @@ function rebuildAcceptedCallAuthoritiesForProductionHost(db: Database.Database):
       `PRAGMA foreign_key_list(${quotedSchemaIdentifier(name)})`,
     ).all());
     if (rows !== before.rows || foreignKeys !== before.foreignKeys) {
-      throw new Error(`schema v54 changed authority child rows or foreign keys for ${name}`);
+      throw new Error(`schema v${schemaVersion} changed authority child rows or foreign keys for ${name}`);
     }
   }
   const relevantTables = foreignKeyClosure(db, ['accepted_turn_call_authorities']);
   const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
     .filter((violation) => relevantTables.has(violation.table));
   if (violations.length > 0) {
-    throw new Error(`schema v54 foreign-key check failed for ${violations.length} authority row(s)`);
+    throw new Error(`schema v${schemaVersion} foreign-key check failed for ${violations.length} authority row(s)`);
   }
   const integrity = db.pragma('integrity_check') as Array<{ integrity_check: string }>;
   if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {
-    throw new Error(`schema v54 integrity check failed: ${JSON.stringify(integrity).slice(0, 240)}`);
+    throw new Error(`schema v${schemaVersion} integrity check failed: ${JSON.stringify(integrity).slice(0, 240)}`);
   }
 }
 
@@ -8719,7 +8801,17 @@ const MIGRATIONS: EventLogMigration[] = [
      * admission for all newly returned presign attempts.
      */
     version: 63,
-    sql: `
+    sql: '',
+    backfill: (db) => {
+      const secretTable = db.prepare(
+        "SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'staged_transfer_secret_payloads'",
+      ).get() as { ok: number } | undefined;
+      // Legacy migration rehearsals intentionally contain no event spine and
+      // therefore no staged-transfer graph. Preserve that sparse shape while
+      // still stamping the corrective version; there is no secret row to
+      // retire or trigger surface to install.
+      if (!secretTable) return;
+      db.exec(`
       DROP TRIGGER IF EXISTS trg_staged_transfer_secret_exact_attempt;
       DROP TRIGGER IF EXISTS trg_staged_transfer_secret_immutable;
       DROP TRIGGER IF EXISTS trg_staged_transfer_secret_delete_immutable;
@@ -8763,7 +8855,369 @@ const MIGRATIONS: EventLogMigration[] = [
          WHERE stage_authority_id = OLD.stage_authority_id
       )
       BEGIN SELECT RAISE(ABORT, 'staged secret payload ownership is immutable'); END;
-    `,
+      `);
+    },
+  },
+  {
+    /**
+     * Durable workflow_v3 call identity. Existing v1/v2 activation rows stay
+     * byte-identical; one append-only 1:1 binding supplies the exact mutation
+     * authority fields that v63 could not represent. The accepted-root rebuild
+     * widens only its closed authority-kind CHECK and adds the exact v3 join.
+     * Any pre-standard lookalike table is retired instead of trusted.
+     */
+    version: 64,
+    sql: '',
+    foreignKeysOff: true,
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      // As with v62/v63, sparse historical rehearsal stores have no accepted
+      // event spine and cannot carry workflow execution authority. Do not
+      // invent the spine merely to install an unreachable v3 table.
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        'sessions',
+        'events',
+        'pending_approvals',
+        'workflow_node_invocation_activations',
+        'accepted_turn_call_authorities',
+        'logical_tool_calls',
+      ]) {
+        if (!tables.has(prerequisite)) {
+          throw new Error(`schema v64 prerequisite missing: ${prerequisite}`);
+        }
+      }
+
+      // v63 had no sanctioned table by this name. Retaining a local/partial
+      // experiment would silently promote copyable rows into authority.
+      db.exec(`
+        DROP TRIGGER IF EXISTS trg_workflow_v3_call_binding_exact_activation;
+        DROP TRIGGER IF EXISTS trg_workflow_v3_call_binding_immutable;
+        DROP TRIGGER IF EXISTS trg_workflow_v3_call_binding_delete_immutable;
+        DROP TABLE IF EXISTS workflow_v3_call_activation_bindings;
+
+        CREATE TABLE workflow_v3_call_activation_bindings (
+          activation_id              TEXT PRIMARY KEY
+                                     REFERENCES workflow_node_invocation_activations(activation_id)
+                                     ON DELETE CASCADE,
+          session_id                 TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          authority_binding_digest   TEXT NOT NULL UNIQUE
+                                     CHECK (length(authority_binding_digest) = 64
+                                       AND authority_binding_digest NOT GLOB '*[^0-9a-f]*'),
+          requirement_id             TEXT NOT NULL CHECK (length(requirement_id) BETWEEN 1 AND 256),
+          logical_capability_id      TEXT NOT NULL CHECK (length(logical_capability_id) BETWEEN 1 AND 256),
+          effect                     TEXT NOT NULL
+                                     CHECK (effect IN ('host_only','local_write','external_write','admin')),
+          canonical_argument_digest  TEXT NOT NULL
+                                     CHECK (length(canonical_argument_digest) = 64
+                                       AND canonical_argument_digest NOT GLOB '*[^0-9a-f]*'),
+          source_argument_digest     TEXT NOT NULL
+                                     CHECK (length(source_argument_digest) = 64
+                                       AND source_argument_digest NOT GLOB '*[^0-9a-f]*'),
+          obligation_digest          TEXT NOT NULL
+                                     CHECK (length(obligation_digest) = 64
+                                       AND obligation_digest NOT GLOB '*[^0-9a-f]*'),
+          capability_id              TEXT NOT NULL CHECK (length(capability_id) BETWEEN 1 AND 512),
+          manifest_id                TEXT NOT NULL CHECK (length(manifest_id) BETWEEN 1 AND 512),
+          manifest_digest            TEXT NOT NULL
+                                     CHECK (length(manifest_digest) = 64
+                                       AND manifest_digest NOT GLOB '*[^0-9a-f]*'),
+          operation_id               TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 512),
+          operation_version          TEXT NOT NULL CHECK (length(operation_version) BETWEEN 1 AND 128),
+          schema_digest              TEXT NOT NULL
+                                     CHECK (length(schema_digest) = 64
+                                       AND schema_digest NOT GLOB '*[^0-9a-f]*'),
+          provider_version           TEXT NOT NULL CHECK (length(provider_version) BETWEEN 1 AND 128),
+          live_fingerprint           TEXT NOT NULL
+                                     CHECK (length(live_fingerprint) = 64
+                                       AND live_fingerprint NOT GLOB '*[^0-9a-f]*'),
+          account_id                 TEXT NOT NULL CHECK (length(account_id) BETWEEN 1 AND 512),
+          invoke_port_id             TEXT NOT NULL CHECK (length(invoke_port_id) BETWEEN 1 AND 512),
+          argument_compiler_id       TEXT NOT NULL CHECK (length(argument_compiler_id) BETWEEN 1 AND 256),
+          argument_compiler_version  TEXT NOT NULL CHECK (length(argument_compiler_version) BETWEEN 1 AND 128),
+          activated_at               TEXT NOT NULL
+        );
+
+        CREATE INDEX idx_workflow_v3_call_binding_session
+          ON workflow_v3_call_activation_bindings(session_id, activated_at);
+
+        CREATE TRIGGER trg_workflow_v3_call_binding_exact_activation
+        BEFORE INSERT ON workflow_v3_call_activation_bindings
+        WHEN clementine_workflow_v3_binding_admitted_v1(
+          NEW.activation_id,
+          NEW.session_id,
+          NEW.authority_binding_digest,
+          NEW.requirement_id,
+          NEW.logical_capability_id,
+          NEW.effect,
+          NEW.canonical_argument_digest,
+          NEW.source_argument_digest,
+          NEW.obligation_digest,
+          NEW.capability_id,
+          NEW.manifest_id,
+          NEW.manifest_digest,
+          NEW.operation_id,
+          NEW.operation_version,
+          NEW.schema_digest,
+          NEW.provider_version,
+          NEW.live_fingerprint,
+          NEW.account_id,
+          NEW.invoke_port_id,
+          NEW.argument_compiler_id,
+          NEW.argument_compiler_version,
+          NEW.activated_at
+        ) != 1 OR NOT EXISTS (
+          SELECT 1 FROM workflow_node_invocation_activations activation
+           WHERE activation.activation_id = NEW.activation_id
+             AND activation.session_id = NEW.session_id
+             AND activation.logical_call_id IS NOT NULL
+             AND activation.activated_at = NEW.activated_at
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'workflow v3 binding lacks its exact opaque activation admission');
+        END;
+
+        CREATE TRIGGER trg_workflow_v3_call_binding_immutable
+        BEFORE UPDATE ON workflow_v3_call_activation_bindings
+        BEGIN
+          SELECT RAISE(ABORT, 'workflow v3 activation bindings are immutable');
+        END;
+
+        CREATE TRIGGER trg_workflow_v3_call_binding_delete_immutable
+        BEFORE DELETE ON workflow_v3_call_activation_bindings
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN
+          SELECT RAISE(ABORT, 'workflow v3 activation bindings are append-only');
+        END;
+      `);
+
+      rebuildAcceptedCallAuthoritiesForProductionHost(db, true);
+
+      const relevantTables = foreignKeyClosure(db, [
+        'workflow_v3_call_activation_bindings',
+        'accepted_turn_call_authorities',
+      ]);
+      const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
+        .filter((violation) => relevantTables.has(violation.table));
+      if (violations.length > 0) {
+        throw new Error(`schema v64 foreign-key check failed for ${violations.length} workflow-v3 row(s)`);
+      }
+      const integrity = db.pragma('integrity_check') as Array<{ integrity_check: string }>;
+      if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {
+        throw new Error(`schema v64 integrity check failed: ${JSON.stringify(integrity).slice(0, 240)}`);
+      }
+    },
+  },
+  {
+    // Lossless large tool-output storage. The legacy row remains the compact
+    // lookup/preview record; bytes beyond its inline segment live in ordered,
+    // content-addressed chunks. This removes the old 16MB terminal tail cliff
+    // without forcing every lookup or SQL scan to hydrate a very large value.
+    // Exact invocation rows get an independent chunk spine so reused SDK call
+    // ids cannot alias evidence across physical attempts.
+    version: 65,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      const addManifestColumns = (table: string): void => {
+        if (!tables.has(table)) return;
+        const columns = new Set(
+          (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+            .map((column) => column.name),
+        );
+        if (!columns.has('output_sha256')) {
+          db.exec(`ALTER TABLE ${table} ADD COLUMN output_sha256 TEXT`);
+        }
+        if (!columns.has('chunk_count')) {
+          db.exec(`ALTER TABLE ${table} ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0`);
+        }
+        if (!columns.has('output_chars')) {
+          db.exec(`ALTER TABLE ${table} ADD COLUMN output_chars INTEGER`);
+        }
+        if (!columns.has('inline_sha256')) {
+          db.exec(`ALTER TABLE ${table} ADD COLUMN inline_sha256 TEXT`);
+        }
+        if (!columns.has('inline_bytes')) {
+          db.exec(`ALTER TABLE ${table} ADD COLUMN inline_bytes INTEGER`);
+        }
+        if (!columns.has('inline_chars')) {
+          db.exec(`ALTER TABLE ${table} ADD COLUMN inline_chars INTEGER`);
+        }
+      };
+
+      addManifestColumns('tool_outputs');
+      addManifestColumns('tool_output_invocations');
+
+      // v65 chunk/continuation names had no sanctioned predecessor. Refuse a
+      // local lookalike instead of stamping arbitrary columns/foreign keys as
+      // durable result authority.
+      for (const table of [
+        'tool_output_chunks',
+        'tool_output_invocation_chunks',
+        'tool_search_continuations',
+      ]) {
+        if (tables.has(table)) {
+          throw new Error(`schema v65 refuses preexisting unsanctioned table ${table}`);
+        }
+      }
+
+      if (tables.has('tool_outputs')) {
+        const select = db.prepare(
+          `SELECT session_id, call_id, output_full FROM tool_outputs
+            WHERE output_sha256 IS NULL OR output_chars IS NULL OR inline_sha256 IS NULL
+               OR inline_bytes IS NULL OR inline_chars IS NULL
+            ORDER BY session_id, call_id LIMIT 1`,
+        );
+        const update = db.prepare(
+          `UPDATE tool_outputs
+              SET output_sha256 = COALESCE(output_sha256, ?),
+                  output_chars = COALESCE(output_chars, ?),
+                  inline_sha256 = ?, inline_bytes = ?, inline_chars = ?
+            WHERE session_id = ? AND call_id = ?`,
+        );
+        while (true) {
+          // Never hydrate every legacy 16MB side-store row together during an
+          // upgrade. Select, hash, and retire one manifest gap at a time; the
+          // update makes it ineligible for the next bounded query.
+          const row = select.get() as { session_id: string; call_id: string; output_full: string } | undefined;
+          if (!row) break;
+          const bytes = Buffer.from(row.output_full, 'utf8');
+          const sha256 = createHash('sha256').update(bytes).digest('hex');
+          update.run(
+            sha256,
+            row.output_full.length,
+            sha256,
+            bytes.length,
+            row.output_full.length,
+            row.session_id,
+            row.call_id,
+          );
+        }
+      }
+      if (tables.has('tool_output_invocations')) {
+        const select = db.prepare(
+          `SELECT session_id, call_id, invocation_nonce, output_full
+             FROM tool_output_invocations
+            WHERE output_sha256 IS NULL OR output_chars IS NULL OR inline_sha256 IS NULL
+               OR inline_bytes IS NULL OR inline_chars IS NULL
+            ORDER BY session_id, call_id, invocation_nonce LIMIT 1`,
+        );
+        const update = db.prepare(
+          `UPDATE tool_output_invocations
+              SET output_sha256 = COALESCE(output_sha256, ?),
+                  output_chars = COALESCE(output_chars, ?),
+                  inline_sha256 = ?, inline_bytes = ?, inline_chars = ?
+            WHERE session_id = ? AND call_id = ? AND invocation_nonce = ?`,
+        );
+        while (true) {
+          const row = select.get() as {
+            session_id: string;
+            call_id: string;
+            invocation_nonce: string;
+            output_full: string;
+          } | undefined;
+          if (!row) break;
+          const bytes = Buffer.from(row.output_full, 'utf8');
+          const sha256 = createHash('sha256').update(bytes).digest('hex');
+          update.run(
+            sha256,
+            row.output_full.length,
+            sha256,
+            bytes.length,
+            row.output_full.length,
+            row.session_id,
+            row.call_id,
+            row.invocation_nonce,
+          );
+        }
+      }
+
+      if (tables.has('tool_outputs')) {
+        db.exec(`
+          CREATE TABLE tool_output_chunks (
+            session_id    TEXT NOT NULL,
+            call_id       TEXT NOT NULL,
+            chunk_index   INTEGER NOT NULL CHECK (chunk_index >= 0),
+            chunk_bytes   BLOB NOT NULL,
+            content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
+            char_start     INTEGER NOT NULL CHECK (char_start >= 0),
+            char_count     INTEGER NOT NULL CHECK (char_count > 0),
+            chunk_sha256  TEXT NOT NULL
+                          CHECK (length(chunk_sha256) = 64
+                            AND chunk_sha256 NOT GLOB '*[^0-9a-f]*'),
+            PRIMARY KEY (session_id, call_id, chunk_index),
+            FOREIGN KEY (session_id, call_id)
+              REFERENCES tool_outputs(session_id, call_id) ON DELETE CASCADE
+          );
+          CREATE INDEX idx_tool_outputs_session_created_call
+            ON tool_outputs(session_id, created_at DESC, call_id ASC);
+        `);
+      }
+      if (tables.has('tool_output_invocations')) {
+        db.exec(`
+          CREATE TABLE tool_output_invocation_chunks (
+            session_id       TEXT NOT NULL,
+            call_id          TEXT NOT NULL,
+            invocation_nonce TEXT NOT NULL,
+            chunk_index      INTEGER NOT NULL CHECK (chunk_index >= 0),
+            chunk_bytes      BLOB NOT NULL,
+            content_bytes    INTEGER NOT NULL CHECK (content_bytes >= 0),
+            char_start        INTEGER NOT NULL CHECK (char_start >= 0),
+            char_count        INTEGER NOT NULL CHECK (char_count > 0),
+            chunk_sha256     TEXT NOT NULL
+                             CHECK (length(chunk_sha256) = 64
+                               AND chunk_sha256 NOT GLOB '*[^0-9a-f]*'),
+            PRIMARY KEY (session_id, call_id, invocation_nonce, chunk_index),
+            FOREIGN KEY (session_id, call_id, invocation_nonce)
+              REFERENCES tool_output_invocations(session_id, call_id, invocation_nonce)
+              ON DELETE CASCADE
+          );
+        `);
+      }
+
+      // `tool_search` result/schema cursors are local reads of one already
+      // admitted discovery snapshot. Persist those exact bytes under the
+      // durable session so a daemon/MCP restart cannot strand the cursor and
+      // tempt a second provider discovery. The content/entry ceilings are
+      // enforced again by the eventlog API inside each write transaction.
+      if (tables.has('sessions')) {
+        db.exec(`
+          CREATE TABLE tool_search_continuations (
+            session_id     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            kind           TEXT NOT NULL CHECK (kind IN ('page', 'schema')),
+            content_sha256 TEXT NOT NULL
+                           CHECK (length(content_sha256) = 64
+                             AND content_sha256 NOT GLOB '*[^0-9a-f]*'),
+            content_text   TEXT NOT NULL,
+            content_bytes  INTEGER NOT NULL
+                           CHECK (content_bytes BETWEEN 1 AND 1048576),
+            created_at     TEXT NOT NULL,
+            accessed_at    TEXT NOT NULL,
+            access_seq     INTEGER NOT NULL CHECK (access_seq > 0),
+            PRIMARY KEY (session_id, kind, content_sha256)
+          );
+          CREATE INDEX idx_tool_search_continuations_lru
+            ON tool_search_continuations(session_id, access_seq);
+        `);
+      }
+
+      const violations = db.pragma('foreign_key_check') as Array<{ table: string }>;
+      const relevant = new Set([
+        'tool_output_chunks',
+        'tool_output_invocation_chunks',
+        'tool_search_continuations',
+      ]);
+      const v65Violations = violations.filter((row) => relevant.has(row.table));
+      if (v65Violations.length > 0) {
+        throw new Error(`schema v65 foreign-key check failed for ${v65Violations.length} row(s)`);
+      }
+    },
   },
 ];
 

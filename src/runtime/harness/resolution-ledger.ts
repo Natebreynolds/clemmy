@@ -139,20 +139,38 @@ function aggregateWorkOwner(
  * writes call bindings: the interactive host engine's carrier admission, or
  * the typed construct run behind a participated source. This is an engine
  * CAPABILITY question — which writers will run for this session — never a
- * session-name test. A persisted-state legacy resume of an interactive
- * session keeps the demand, and a participated source keeps it on any
- * session kind.
+ * session-name test. A non-conversational graph without such a writer is not
+ * executable authority: it must hold before execution instead of being
+ * reinterpreted as conversation-shaped work.
  */
-function expectedWorkBinderPresent(sessionId: string, sourceUserSeq: number): boolean {
+function expectedWorkBinderPresent(
+  sessionId: string,
+  sourceUserSeq: number,
+  graph: TurnGraphIR,
+): boolean {
   try {
-    const sessionKind = getSession(sessionId)?.kind ?? 'chat';
+    const session = getSession(sessionId);
+    if (!session) return false;
+    const sessionKind = session.kind;
     if (isHostTurnEngine(selectTurnEngine({ sessionKind }))) return true;
+    // Background and cron are the two non-interactive surfaces whose
+    // execution owner constructs the action expected-work carrier before it
+    // exposes business tools (both the standard agent and the full Claude SDK
+    // brain mount work_call from the activated source). Require the exact,
+    // hash-validated graph to agree with the live immutable session kind: a
+    // generic legacy-sdk label, a workflow controller, or an agent session is
+    // not evidence that this writer exists.
+    if (
+      sessionKind === 'execution'
+      && graph.source.sessionKind === 'execution'
+      && (graph.source.surface === 'background' || graph.source.surface === 'cron')
+    ) return true;
+    return readSemanticDisposition(sessionId, sourceUserSeq)?.participation === 'participated';
   } catch {
-    // An unreadable session store or unconfigurable engine keeps the
-    // historical demand rather than widening this door on an error.
-    return true;
+    // An unreadable session store or unconfigurable engine cannot prove that
+    // a binding writer will run. Refuse the work graph below.
+    return false;
   }
-  return readSemanticDisposition(sessionId, sourceUserSeq)?.participation === 'participated';
 }
 
 /** Load the one accepted-source graph and project only its authority fields. */
@@ -169,46 +187,23 @@ export function expectedTaskFor(sessionId: string, sourceUserSeq: number): Expec
 
   const candidates = workNodes(graph);
   const aggregate = candidates.length > 1 ? aggregateWorkOwner(graph, candidates) : null;
-  // ARM ONLY WHAT THE LANE CAN DISCHARGE. A work-node projection exists to
-  // bind TYPED work, and typed requirements are satisfiable only where a
-  // binding writer runs. Where none will, projecting typed work arms
-  // obligations nothing can discharge: the deterministic contract then holds
-  // fully settled work on "no observed operation is bound" (live 2026-08-25:
-  // workflow …09b41f held with 2 ops / 0 bindings; the conversation-shaped
-  // control …55e374 delivered). Such a source arms conversation-shaped —
-  // every call still settles per-call under the same effect gates — and the
-  // shadow graph stays recorded for observability.
-  const typedWorkDischargeable = graph.classification.route === 'direct_reply'
-    || expectedWorkBinderPresent(sessionId, sourceUserSeq);
-  if (typedWorkDischargeable) {
-    if (candidates.length > 1 && !aggregate) {
-      return {
-        status: 'ambiguous',
-        reason: `turn graph contains ${candidates.length} primary work nodes without one exact verification rendezvous`,
-      };
-    }
-    if (graph.classification.route !== 'direct_reply' && candidates.length !== 1) {
-      if (!aggregate && candidates.length === 0) {
-        // A unique work node exists to bind TYPED work. An UNPARTICIPATED
-        // source (no semantic claim — execution surfaces skip the pre-model
-        // ceremony by owner decision, 2026-08-25) has nothing typed to bind:
-        // the heuristic prose graph classifies act-shaped but carries zero
-        // work nodes, and demanding one killed a scheduled run at admission
-        // plumbing ("no unique work node", scorpion-facebook-trends). Such a
-        // source arms conversation-shaped; every call it makes still settles
-        // per-call under the same effect gates. A PARTICIPATED source keeps
-        // the demand — a typed claim must bind or refuse.
-        if (readSemanticDisposition(sessionId, sourceUserSeq)?.participation !== 'participated') {
-          // Fall through to the conversation-shaped expectation below.
-        } else {
-          return { status: 'ambiguous', reason: 'non-conversational graph has no unique work node' };
-        }
-      } else if (!aggregate) {
-        return { status: 'ambiguous', reason: 'non-conversational graph has no unique work node' };
-      }
-    }
+  const nonConversational = graph.classification.route !== 'direct_reply';
+  if (nonConversational && !expectedWorkBinderPresent(sessionId, sourceUserSeq, graph)) {
+    return {
+      status: 'ambiguous',
+      reason: 'non-conversational graph has no expected-work binding writer',
+    };
   }
-  const work = typedWorkDischargeable ? aggregate ?? candidates[0] : undefined;
+  if (candidates.length > 1 && !aggregate) {
+    return {
+      status: 'ambiguous',
+      reason: `turn graph contains ${candidates.length} primary work nodes without one exact verification rendezvous`,
+    };
+  }
+  if (nonConversational && candidates.length !== 1 && !aggregate) {
+    return { status: 'ambiguous', reason: 'non-conversational graph has no unique work node' };
+  }
+  const work = aggregate ?? candidates[0];
   const workKind: WorkKind = aggregate
     ? 'execute'
     : work
@@ -999,30 +994,6 @@ function zeroWorkRetrieveTerminalInTransaction(input: {
     && sourceSettledOnlyControlCallsInTransaction(input.db, input.sessionId, input.sourceUserSeq);
 }
 
-/**
- * The deterministic planner compiles its contract from the shadow graph even
- * when the armed authority is conversation-shaped (no binder runs for this
- * engine, so no typed work node was projected — see expectedTaskFor). Those
- * operations are a record of what the graph sketched, not armed obligations:
- * demanding call bindings for them would hold settled work forever on a lane
- * with no binding writer. The armed shape owns the verdict, so such a
- * contract discharges as the conversational terminal. A bindable lane never
- * reaches this door: an operations-bearing deterministic contract requires
- * work nodes, and a lane with a binder projects those nodes into the
- * expectation. The one-read deterministic retrieve contract keeps its
- * stricter implicit-binding adjudication — its coverage demands are
- * dischargeable without bindings and remain real.
- */
-function conversationShapedContractDischarge(
-  expected: AcceptedTaskExpectation,
-  contract: Extract<ReturnType<typeof loadExpectedWorkContract>, { status: 'ok' }>['contract'],
-): boolean {
-  return expected.workKind === 'conversation'
-    && contract.plannerSource === 'deterministic'
-    && contract.operations.length > 0
-    && !isDeterministicImplicitRetrieveContract(contract);
-}
-
 export type ExpectedWorkResolutionFinalization =
   | {
       status: 'finalized' | 'replayed';
@@ -1149,14 +1120,12 @@ export function finalizeResolutionAgainstExpectedWork(input: {
         sessionId: input.sessionId,
         sourceUserSeq: input.sourceUserSeq,
       });
-      const conversationShaped = conversationShapedContractDischarge(expected, loaded.contract);
-
       if (resolution.state === 'finalized') {
         if (
           resolution.operation_count !== operations.length
           || resolution.operations_digest !== digest
           || resolution.expectations_satisfied !== 1
-          || (adjudicated.match.status !== 'complete' && !zeroWorkTerminal && !conversationShaped)
+          || (adjudicated.match.status !== 'complete' && !zeroWorkTerminal)
         ) {
           return {
             status: 'conflict',
@@ -1180,13 +1149,10 @@ export function finalizeResolutionAgainstExpectedWork(input: {
       if (hasUnsettledToolWorkInTransaction(db, expected)) {
         return { status: 'not_ready', reason: 'accepted task still has unsettled logical or physical work' };
       }
-      if (adjudicated.match.status === 'incomplete' && !zeroWorkTerminal && !conversationShaped) {
+      if (adjudicated.match.status === 'incomplete' && !zeroWorkTerminal) {
         return { status: 'incomplete', match: adjudicated.match };
       }
-      // A conflict verdict is also a per-operation binding judgment; over a
-      // conversation-shaped arming it has no obligation to stand on, and the
-      // per-call settlement wall already adjudicated every real effect.
-      if (adjudicated.match.status === 'conflict' && !conversationShaped) {
+      if (adjudicated.match.status === 'conflict') {
         return { status: 'conflict', match: adjudicated.match };
       }
 
@@ -1423,7 +1389,6 @@ export function frozenResolutionFor(
         return { status: 'ambiguous', reason: adjudicated.reason };
       }
       recomputedSatisfied = adjudicated.match.status === 'complete'
-        || conversationShapedContractDischarge(expectedState.expectation, contract.contract)
         || zeroWorkRetrieveTerminalInTransaction({
           db,
           contract: contract.contract,

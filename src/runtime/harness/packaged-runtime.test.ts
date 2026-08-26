@@ -60,21 +60,48 @@ test('packaged extract has no source ts and invokes the attested adapter once', 
     const bound = transport.createAttestedTransport(manifest.artifacts.transportIsolated.sha256);
     invoke.bindAttestedTransport(bound);
     transport.bindIsolatedTransportHandler(async (call) => {
+      if (!call.expected
+        || call.expected.manifestId !== 'cap-pack'
+        || !/^[a-f0-9]{64}$/.test(call.expected.manifestDigest)
+        || call.expected.providerKind !== 'composio'
+        || call.expected.providerIdentity !== 'composio'
+        || call.expected.providerVersion !== 'pack-provider-v1'
+        || call.expected.operationVersion !== '1'
+        || call.expected.definitionFingerprint !== '${'d'.repeat(64)}'
+        || call.expected.invokePortId !== 'port-pack'
+        || call.expected.argumentCompiler?.id !== 'create_sheet') {
+        throw new Error('packaged invoke omitted or changed its exact manifest expectation');
+      }
       if (call.operationId.includes('SHEET_FROM_JSON')) {
         return { spreadsheet_id: 'sheet-pack-1', spreadsheet_url: 'https://docs.google.com/spreadsheets/d/sheet-pack-1' };
       }
       return { ok: true };
     });
     const fn = invoke.invokeForSealedManifest({
-      operationId: 'GOOGLESHEETS_SHEET_FROM_JSON',
-      effect: 'external_write',
-      accountId: 'acct-pack',
+      version: 1,
       manifestId: 'cap-pack',
-      invokePortId: 'port-pack',
-      argumentCompiler: { id: 'create_sheet', version: '1' },
+      providerKind: 'composio',
+      operationId: 'GOOGLESHEETS_SHEET_FROM_JSON',
+      providerIdentity: 'composio',
+      providerVersion: 'pack-provider-v1',
+      operationVersion: '1',
+      definitionFingerprint: '${'d'.repeat(64)}',
+      effect: 'external_write',
+      destination: { family: 'spreadsheet', posture: 'create_new' },
+      accountId: 'acct-pack',
+      idempotency: { required: true, policy: 'key_before_dispatch' },
+      reconciliation: { supported: false, policy: 'none' },
+      outputContract: { kind: 'created_resource' },
+      purpose: 'persist_collection',
       acceptedInputKinds: ['records'],
       producedOutputKinds: ['created_resource'],
-      purpose: 'persist_collection',
+      applicableDeliverableKinds: ['spreadsheet'],
+      evidenceContract: { kinds: ['receipt', 'readback'], readbackRequired: true },
+      readbackContract: { required: true, contentDigestRequired: true },
+      provenance: { issuer: 'host:packaged-runtime-test', issuedAt: '2026-08-25T00:00:00.000Z', trusted: true },
+      lifecycle: { state: 'current' },
+      argumentCompiler: { id: 'create_sheet', version: '1' },
+      invokePortId: 'port-pack',
     });
     fn({
       nodeId: 'op-write',

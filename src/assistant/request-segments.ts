@@ -51,7 +51,11 @@ const RESULT_ACTION_SEGMENT_RE = new RegExp(
 const LEADING_COORDINATOR_RE =
   /^\s*(?:and|but|now|okay|ok|also|then)\b[,\s]*/i;
 
-export const REQUEST_SEMANTIC_SEGMENT_LIMIT = 8;
+/** Keep accepted semantic work aligned with the executable plan topology.
+ * `plan_task` and the frozen work graph both admit at most 32 operations; a
+ * lower retrieval ceiling silently erased later operations before the agent
+ * could assign their host-owned discovery roles. */
+export const REQUEST_SEMANTIC_SEGMENT_LIMIT = 32;
 
 /** Whether one already-segmented clause is a concrete downstream result
  * mutation/construction/delivery. Shared by the intent classifier so semantic
@@ -77,7 +81,10 @@ export function requestSemanticSegments(
 ): string[] {
   const normalized = (text ?? '').replace(/\s+/g, ' ').trim();
   if (!normalized) return [];
-  const limit = Math.max(1, Math.min(options.limit ?? REQUEST_SEMANTIC_SEGMENT_LIMIT, 16));
+  const limit = Math.max(
+    1,
+    Math.min(options.limit ?? REQUEST_SEMANTIC_SEGMENT_LIMIT, REQUEST_SEMANTIC_SEGMENT_LIMIT),
+  );
   const minTokens = Math.max(1, Math.min(options.minTokens ?? 2, 8));
   const explicit = normalized.split(SEGMENT_BOUNDARY_RE);
   const raw = DIRECT_READ_PIPELINE_OPENING_RE.test(normalized)

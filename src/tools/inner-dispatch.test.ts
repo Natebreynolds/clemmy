@@ -166,7 +166,7 @@ test('normalizeInnerDispatchToolResult: Composio warning-prefixed FAILED banners
   assert.match(out.error ?? '', /exceeds grid limits/);
 });
 
-test('normalizeInnerDispatchToolResult: an over-cap parked exact result fails closed instead of exposing its prefix', async () => {
+test('normalizeInnerDispatchToolResult: a chunked exact result exposes the full tail, never a prefix', async () => {
   const { createSession, writeToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('../runtime/harness/eventlog.js');
   const sess = createSession({ kind: 'chat' });
   // Sized FROM the cap ('a,1\n' = 4 bytes/row) so the fixture keeps crossing
@@ -185,13 +185,9 @@ test('normalizeInnerDispatchToolResult: an over-cap parked exact result fails cl
     'provider_list_rows',
     { modelVisible: 'structured clipped preview' },
     { sessionId: sess.id, callId: 'call_truncated_inner_result' },
-  ) as { ok?: boolean; error?: string; error_kind?: string; truncated_at_write?: boolean; result_handle?: string };
-  assert.equal(out.ok, false);
-  assert.equal(out.error_kind, 'truncated_tool_output');
-  assert.equal(out.truncated_at_write, true);
-  assert.equal(out.result_handle, 'call_truncated_inner_result');
-  assert.match(out.error ?? '', /will not consume the parked prefix/);
-  assert.equal('group' in out, false, 'no partial provider data escapes in the normalized object');
+  );
+  assert.equal(out, full);
+  assert.match(String(out).slice(-32), /a,1/);
 });
 
 test('dispatchBatchItemTool establishes tool-output context for the inner tool (background-handoff regression)', async () => {

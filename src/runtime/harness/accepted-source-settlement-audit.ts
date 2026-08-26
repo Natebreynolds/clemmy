@@ -118,63 +118,6 @@ function turnEventsForAcceptedSource(sessionId: string, sourceUserSeq: number): 
   return [...sourceWindow, ...exactLaterResolutions];
 }
 
-/**
- * Does this ambiguous write deserve to veto the whole turn?
- *
- * An uncertain write is always REPORTED — the work report renders every one of
- * them as a caveat. The question here is narrower: may it also refuse delivery
- * of everything else the source accomplished? Only when the effect is not
- * provably reversible. The danger an uncertain write guards against is a
- * duplicated or half-applied change the user cannot undo; a reversible one is a
- * disclosure, not a hazard.
- *
- * Live case (2026-08-12): a business-hours Slack review read every channel,
- * updated its tracking sheet, and finished — but one GOOGLESHEETS_INSERT_DIMENSION
- * came back HTTP 400 invalid_arguments, which parks as ambiguous because a
- * provider may commit before returning a 4xx. The model then REPAIRED the
- * arguments and the insert succeeded. The reversible ambiguity nonetheless
- * vetoed the terminal, so the user received none of the review. Reversibility
- * is the same predicate that decides off-plan work in the expected-work matcher;
- * an unclassified write still fails closed here.
- */
-function uncertainWriteVetoesDelivery(event: EventRow): boolean {
-  // Classify by the canonical ACTION, never the carrier: `toolName` on a
-  // write-evidence event names the dispatch tool, and ONE carrier fans out
-  // every provider action — keying the plane exemption on it would exempt
-  // genuine business writes (live: GOOGLESHEETS_BATCH_UPDATE write events
-  // carry the carrier's toolName). `shapeKey` is the action's own identity.
-  const data = event.data as { shapeKey?: unknown; slug?: unknown };
-  const action = [data.shapeKey, data.slug]
-    .find((value): value is string => typeof value === 'string' && value.trim().length > 0) ?? '';
-  if (platformMetaPlaneOperation(action)) return false;
-  return event.data.irreversible !== false;
-}
-
-/**
- * The tool-platform's own management/catalog plane — connection pokes,
- * catalog searches, schema retrievals — recognized by the operation's
- * namespace being the platform carrier itself, never a slug list. An
- * ambiguous outcome there is ambiguity about Clementine's own tool plumbing,
- * not about the user's external state: no business record moved, so nothing
- * exists for a human to reconcile. Mirroring the refused_pre_dispatch
- * exemption below, letting such a poke veto delivery makes the harness's own
- * preparation instruments the reason she cannot report (live 2026-08-25: a
- * composio_manage_connections probe settled uncertain_write AFTER the real
- * scrape succeeded and was captured, and the blocked step skipped notify).
- * A real provider business write settling uncertain_write must keep vetoing —
- * that hazard is this audit's entire purpose.
- */
-function platformMetaPlaneOperation(toolName: string): boolean {
-  const normalized = toolName.trim().toLowerCase().replace(/[-\s]+/g, '_');
-  const namespace = normalized.split('_')[0] ?? '';
-  if (namespace !== 'composio') return false;
-  // The execute wrapper dispatches a NESTED business action: its namespace is
-  // the platform's, but its EFFECT is the user's external state. It is never
-  // plane-exempt — only the platform's own management/catalog verbs are.
-  if (normalized.includes('execute')) return false;
-  return true;
-}
-
 interface ReversibleWriteShape {
   /** Write shape plus its exact target set: the same action on the same
    * resource. Two inserts into one spreadsheet share this key; an insert into a
@@ -329,6 +272,24 @@ export function auditAcceptedSourceSettlementTruth(input: {
       && event.data.sourceUserSeq === input.sourceUserSeq
       && event.data.successfulAuthoringResult === true).length;
     const reversibleWrites = reversibleWriteShapeIndex(turnEvents);
+    const writeEvidence = resolveWriteEvidence(turnEvents);
+    // `resolveWriteEvidence` accepts only a terminal for the exact reservation
+    // call. A later similar write is not reconciliation: it may be a duplicate.
+    // Both proved-present and proved-absent readback terminals remove the
+    // reservation from uncertainty; expected-work/business-evidence gates then
+    // decide whether an absent effect still needs a real retry.
+    const reservationCountByCallId = new Map<string, number>();
+    for (const event of turnEvents) {
+      if (event.type !== 'external_write' || event.data.preDispatch !== true) continue;
+      const callId = writeCallId(event);
+      if (!callId) continue;
+      reservationCountByCallId.set(callId, (reservationCountByCallId.get(callId) ?? 0) + 1);
+    }
+    const resolvedWriteCallIds = new Set(
+      [...writeEvidence.confirmed, ...writeEvidence.failed]
+        .map(writeCallId)
+        .filter((callId) => Boolean(callId) && reservationCountByCallId.get(callId) === 1),
+    );
     const successful = settlements.filter(succeeded);
     const successfulIdentities = successful.map(recoveryIdentity);
     const successfulIdentityKeys = new Set(successfulIdentities.map(recoveryIdentityKey));
@@ -337,22 +298,18 @@ export function auditAcceptedSourceSettlementTruth(input: {
       .filter((entry): entry is ReversibleWriteShape => entry !== undefined);
     const failed = settlements.filter((row) => !succeeded(row));
     const uncertainSettlements = failed.filter((row) => row.outcome_kind === 'uncertain_write');
-    // A logical uncertain-write outcome is only a delivery veto when the host
-    // could not prove the underlying effect reversible. The external-write
-    // reservation is the authority for that classification; a settlement for
-    // a call present in the reversible index remains a reportable failure, but
-    // it is not the one deterministic reason to make a human inspect state.
+    // Logical ambiguity clears only when the exact reservation has a durable
+    // terminal. Reversibility means the host can repair after readback; it does
+    // not prove whether the original effect happened.
     const blockingUncertainSettlements = uncertainSettlements.filter(
-      (row) => !platformMetaPlaneOperation(row.tool_name)
-        && !reversibleWrites.has(row.logical_tool_call_id),
+      (row) => !resolvedWriteCallIds.has(row.logical_tool_call_id),
     );
     const unrecovered = failed.filter((row) => {
-      // PLATFORM-PLANE AMBIGUITY IS NOT A BUSINESS FAILURE — see
-      // platformMetaPlaneOperation: the poke moved harness plumbing, not the
-      // user's external state, and its uncertainty stays reported without
-      // withholding the business work that DID settle.
+      // An acknowledged-false mutation is consequential regardless of its
+      // namespace or reversibility. Only the exact reservation's terminal
+      // reconciliation may discharge its ambiguity.
       if (row.outcome_kind === 'uncertain_write') {
-        return !platformMetaPlaneOperation(row.tool_name);
+        return !resolvedWriteCallIds.has(row.logical_tool_call_id);
       }
       // A REFUSAL IS NOT A FAILED EFFECT. `refused_pre_dispatch` means the
       // harness blocked the call before it crossed the boundary: no request was
@@ -403,7 +360,6 @@ export function auditAcceptedSourceSettlementTruth(input: {
       return !successfulIdentityKeys.has(recoveryIdentityKey(recoveryIdentity(row)));
     });
 
-    const writeEvidence = resolveWriteEvidence(turnEvents);
     const facts: AcceptedSourceSettlementAudit['facts'] = {
       openLogicalCalls: logical.open_calls ?? 0,
       conflictingLogicalCalls: logical.conflict_calls ?? 0,
@@ -416,7 +372,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       confirmedWrites: writeEvidence.confirmed.length,
       uncertainWrites: writeEvidence.uncertain.length,
       blockingUncertainWrites: Math.max(
-        writeEvidence.uncertain.filter(uncertainWriteVetoesDelivery).length,
+        writeEvidence.uncertain.length,
         blockingUncertainSettlements.length,
       ),
       successfulBusinessIdentities: successfulIdentities,

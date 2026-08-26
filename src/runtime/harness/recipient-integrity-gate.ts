@@ -1,7 +1,11 @@
 import { getRuntimeEnv } from '../../config.js';
 import { asksForCompleteRecallSet } from '../../memory/recall-memory.js';
 import { extractDuplicateIdentityKeys } from './grounding-gate.js';
-import { gatherTrustedEvidence } from './trusted-evidence.js';
+import {
+  recentToolOutputs,
+  resolveToolOutputTermMatchesForAuthority,
+} from './eventlog.js';
+import { gatherTrustedEvidence, type TrustedSource } from './trusted-evidence.js';
 
 const EMAIL_RE = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
 // Explicit "leave some out" language — a user who signals exclusion intent must
@@ -42,15 +46,51 @@ function emailSet(value: unknown): string[] {
 /** Recipient view over the shared trusted-evidence ledger: the email set is the
  *  field extractor; the gather (which outputs count as evidence, echo/effect
  *  filtering, user messages) is the shared spine, no longer re-derived here. */
-function trustedRecipientSources(sessionId: string): RecipientIntegritySource[] {
+function trustedRecipientSources(
+  sessionId: string,
+  outgoingRecipients: readonly string[],
+  evidence: readonly TrustedSource[],
+): RecipientIntegritySource[] {
   const sources: RecipientIntegritySource[] = [];
-  for (const source of gatherTrustedEvidence(sessionId)) {
+  const trustedToolSources = new Map<string, TrustedSource>();
+  for (const source of evidence) {
     // A compute carrier is mutation-safe, but without typed source lineage its
     // stdout cannot establish a roster for an irreversible multi-recipient
     // send. User input and observed source reads remain authoritative.
     if (source.evidenceRole !== 'source_read') continue;
+    if (source.kind === 'tool') {
+      trustedToolSources.set(source.id, source);
+      continue;
+    }
     const recipients = emailSet(source.text);
     if (recipients.length > 0) sources.push({ id: source.id, tool: source.tool, recipients });
+  }
+  // Bounded excerpts above are enough to identify eligible exact read calls,
+  // but an outgoing address may live in a middle chunk. Stream/hash the full
+  // authoritative bytes while retaining only the addresses we must prove.
+  const candidates = recentToolOutputs(sessionId, { limit: 40 })
+    .filter((candidate) => trustedToolSources.has(candidate.callId));
+  for (const match of resolveToolOutputTermMatchesForAuthority(
+    sessionId,
+    candidates,
+    outgoingRecipients,
+    { readOrComputeOnly: true },
+  )) {
+    const bounded = trustedToolSources.get(match.callId);
+    if (!bounded || match.effect !== 'read') continue;
+    const recipients = new Set(emailSet(bounded.text));
+    for (const recipient of match.matchedTerms) {
+      // A request value is never independent observation evidence. Structured
+      // response fields already survive the pruned bounded projection above;
+      // raw prose cannot regain authority merely by repeating the request.
+      if (match.requestMatchedTerms.includes(recipient)) continue;
+      if (EMAIL_RE.test(recipient)) recipients.add(recipient.toLowerCase());
+    }
+    if (recipients.size > 0) sources.push({
+      id: match.callId,
+      tool: match.tool,
+      recipients: [...recipients].sort(),
+    });
   }
   return sources;
 }
@@ -68,8 +108,10 @@ export function evaluateRecipientSetIntegrity(sessionId: string, rawArgs: unknow
   }
 
   let sources: RecipientIntegritySource[];
+  let trustedEvidence: TrustedSource[];
   try {
-    sources = trustedRecipientSources(sessionId);
+    trustedEvidence = gatherTrustedEvidence(sessionId);
+    sources = trustedRecipientSources(sessionId, recipients, trustedEvidence);
   } catch {
     return {
       action: 'block',
@@ -91,7 +133,7 @@ export function evaluateRecipientSetIntegrity(sessionId: string, rawArgs: unknow
     // no exclusion language. Surface the drop; never block a legitimate subset.
     const omittedRecipients = covering.recipients.filter((recipient) => !recipients.includes(recipient));
     if (omittedRecipients.length > 0) {
-      const userTurns = gatherTrustedEvidence(sessionId).filter((s) => s.kind === 'user').map((s) => s.text);
+      const userTurns = trustedEvidence.filter((s) => s.kind === 'user').map((s) => s.text);
       if (userTurns.some(asksForCompleteRecallSet) && !userTurns.some((t) => EXCLUSION_RE.test(t))) {
         return {
           action: 'allow',

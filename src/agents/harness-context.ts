@@ -440,22 +440,27 @@ export function harnessInstructions(roleInstructions: string, opts?: {
   includeRememberedToolChoices?: boolean;
   includeSessionActions?: boolean;
 }): () => string {
-  return () => {
-    const ctx = renderHarnessMemoryContext({
-      sessionId: opts?.sessionId,
-      focusInput: opts?.focusInput,
-      includeRememberedToolChoices: opts?.includeRememberedToolChoices,
-      includeSessionActions: opts?.includeSessionActions,
-    });
-    if (!ctx) return roleInstructions;
+  // One constructed Agent represents one accepted turn/step activation but
+  // may make several model calls. Snapshot memory at construction so tool
+  // results appended during that activation cannot silently rewrite the
+  // accepted-turn context, move the prompt-cache boundary, or make later model
+  // cycles observe a different memory primer. The next genuine turn rebuilds
+  // the Agent and therefore receives a fresh snapshot.
+  const ctx = renderHarnessMemoryContext({
+    sessionId: opts?.sessionId,
+    focusInput: opts?.focusInput,
+    includeRememberedToolChoices: opts?.includeRememberedToolChoices,
+    includeSessionActions: opts?.includeSessionActions,
+  });
+  const rendered = !ctx
+    ? roleInstructions
     // Parity (default): STABLE role instructions FIRST so the whole prefix
     // (identity + role + tools) can be prompt-cached; the per-turn DYNAMIC
     // memory context goes AFTER the cache-break sentinel. Brains that don't
     // cache (Codex/BYO) strip the sentinel back to a `---` separator at their
     // wire. Legacy order (dynamic-first) restored when parity is off.
-    if (modelParityEnabled()) {
-      return `${roleInstructions}\n\n${CACHE_BREAK_SENTINEL}\n\n${ctx}`;
-    }
-    return `${ctx}\n\n---\n\n${roleInstructions}`;
-  };
+    : modelParityEnabled()
+      ? `${roleInstructions}\n\n${CACHE_BREAK_SENTINEL}\n\n${ctx}`
+      : `${ctx}\n\n---\n\n${roleInstructions}`;
+  return () => rendered;
 }

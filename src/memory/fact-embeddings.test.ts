@@ -29,9 +29,24 @@ process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
 // eslint-disable-next-line import/first
 const { resetMemoryDb, openMemoryDb } = await import('./db.js');
 // eslint-disable-next-line import/first
-const { rememberFact, updateFact, findSimilarFacts, findSimilarFactsScored, getFact, listActiveFacts } = await import('./facts.js');
+const {
+  findSimilarFacts,
+  findSimilarFactsScored,
+  forgetFact,
+  getFact,
+  listActiveFacts,
+  markFactSupersededBy,
+  rememberFact,
+  updateFact,
+} = await import('./facts.js');
 // eslint-disable-next-line import/first
-const { embedMissingFacts, loadFactEmbeddings, isEmbeddingsEnabled } = await import('./embeddings.js');
+const {
+  _setEmbeddingProviderForTest,
+  embedMissingFacts,
+  isEmbeddingsEnabled,
+  loadArchivedFactEmbeddings,
+  loadFactEmbeddings,
+} = await import('./embeddings.js');
 // eslint-disable-next-line import/first
 const {
   consolidateActiveFacts,
@@ -94,6 +109,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   await _drainEmbedAtWriteForTest();
+  _setEmbeddingProviderForTest(undefined);
   globalThis.fetch = realFetch;
 });
 
@@ -130,6 +146,54 @@ test('updateFact content change re-embeds on the next backfill (stale hash)', as
   assert.equal(stats.candidateChunks, 1, 'stale fact is picked up again');
   assert.equal(stats.embedded, 1);
   assert.equal(loadFactEmbeddings([fact.id]).size, 1, 'fresh content-hash fact vector is visible after re-embed');
+});
+
+test('provider migration backfills recoverable archive facts but not superseded history', async () => {
+  const provider = (name: string, model: string, dim: number) => ({
+    name,
+    model,
+    dim,
+    async embed(texts: string[]): Promise<Float32Array[]> {
+      return texts.map((_text, index) => {
+        const vector = new Float32Array(dim);
+        vector[index % dim] = 1;
+        return vector;
+      });
+    },
+  });
+  const oldProvider = provider('local', 'fixture-local-v1', 4);
+  const activeProvider = provider('openai', 'fixture-openai-v2', 6);
+  _setEmbeddingProviderForTest(oldProvider);
+
+  const archived = rememberFact({ kind: 'project', content: 'Recoverable archived launch note.' });
+  const superseded = rememberFact({ kind: 'project', content: 'Superseded launch note.' });
+  const winner = rememberFact({ kind: 'project', content: 'Current authoritative launch note.' });
+  assert.equal((await embedMissingFacts({ maxChunks: 20 })).embedded, 3);
+  assert.equal(forgetFact(archived.id), true);
+  assert.equal(markFactSupersededBy(superseded.id, winner.id), true);
+
+  _setEmbeddingProviderForTest(activeProvider);
+  assert.equal(
+    loadArchivedFactEmbeddings().has(archived.id),
+    false,
+    'old provider vector is invisible in the active archive search space',
+  );
+
+  const stats = await embedMissingFacts({ maxChunks: 20 });
+  assert.equal(stats.candidateChunks, 2, 'current winner and recoverable archive migrate provider space');
+  assert.equal(stats.embedded, 2);
+  assert.equal(loadArchivedFactEmbeddings().has(archived.id), true, 'recoverable archive is searchable again');
+
+  const rows = openMemoryDb().prepare(
+    'SELECT fact_id, model FROM fact_embeddings WHERE fact_id IN (?, ?, ?) ORDER BY fact_id',
+  ).all(archived.id, superseded.id, winner.id) as Array<{ fact_id: number; model: string }>;
+  assert.equal(rows.find((row) => row.fact_id === archived.id)?.model, activeProvider.model);
+  assert.equal(rows.find((row) => row.fact_id === winner.id)?.model, activeProvider.model);
+  assert.equal(
+    rows.find((row) => row.fact_id === superseded.id)?.model,
+    oldProvider.model,
+    'superseded history stays outside the backfill queue',
+  );
 });
 
 test('loadFactEmbeddings returns stored vectors by id', async () => {

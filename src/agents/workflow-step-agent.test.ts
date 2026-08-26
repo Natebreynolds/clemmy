@@ -255,6 +255,33 @@ test('buildWorkflowStepAgent: structural-only lock does not attach external MCP 
   assert.equal(agent.mcpServers.length, 0);
 });
 
+test('buildWorkflowStepAgent: an exact external lock mounts only the local call_tool carrier', async () => {
+  const operationId = 'records_fixture__lookup_records';
+  const exactScope = {
+    reason: 'compiled exact workflow capability',
+    authority: 'exact' as const,
+    allowedServerSlugs: ['records_fixture'],
+    allowedToolNames: [operationId],
+  };
+  assert.deepEqual(
+    workflowStepExternalMcpScopeForLock([operationId], exactScope),
+    {
+      ...exactScope,
+      reason: 'workflow step exact allowedTools lock (plan-carried)',
+      allowAll: false,
+    },
+  );
+  const agent = await buildWorkflowStepAgent({
+    lockTools: [operationId],
+    mcpToolScope: exactScope,
+  });
+  const names = new Set(agent.tools.map((toolRef) => toolRef.name));
+  assert.ok(names.has('call_tool'), 'the exact external workflow has an executable local carrier');
+  assert.ok(names.has('workflow_step_result'), 'the structural result channel remains available');
+  assert.equal(names.has('tool_search'), false, 'exact locks do not reopen discovery authority');
+  assert.equal(agent.mcpServers.length, 0, 'no raw model-SDK MCP server is attached');
+});
+
 test('compiled exact local names cannot collide into MCP server authority', async () => {
   const aliasInferred = workflowStepExternalMcpScopeForLock(
     ['time_slots'],

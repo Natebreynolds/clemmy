@@ -142,15 +142,11 @@ test('D4: finishing a step earns the next search; rephrasing one does not', () =
     ...key, category: 'broad_discovery', callId: 'search-A', outcome: 'succeeded',
   });
 
-  // Shopping the same requirement around still buys no NEW claim — it replays
-  // the one already held. It is no longer refused for it: measured on the real
-  // home, refusing cost a model call that had already been paid for and simply
-  // produced a reworded retry. One turn issued 41 discovery calls, 37 of them
-  // denied. The bound that matters is "one claim per subject per epoch", and
-  // that is what is asserted here.
+  // Shopping the same requirement around buys neither a new claim nor another
+  // provider invocation. Only host-owned evidence can open the next epoch.
   const shopping = governor.admit({ ...key, category: 'broad_discovery', callId: 'search-A2' });
-  assert.equal(shopping.admitted, true);
-  assert.equal(shopping.reason, 'subject_replay');
+  assert.equal(shopping.admitted, false);
+  assert.equal(shopping.reason, 'new_call_requires_retry_epoch');
   assert.equal(shopping.consumedBudget, false, 'no second claim is minted');
 
   // Actually USING what was found is different: "pull the rankings, then email

@@ -42,7 +42,11 @@ import {
 } from '../runtime/harness/attempt-identity.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { isTrustedComposioGateway } from '../runtime/harness/runtime-tool-identity.js';
-import { dispatchBatchItemTool, isMcpNamespacedTool } from './inner-dispatch.js';
+import {
+  _innerDispatchLegacyMcpTestResolverActive,
+  dispatchBatchItemTool,
+  isMcpNamespacedTool,
+} from './inner-dispatch.js';
 import { deriveOrchestratorDiscoveryNames, isRegisteredActionControl, isRegistryDeclaredRead } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
@@ -50,6 +54,7 @@ import { provenComposioSlugForTurn } from '../runtime/harness/capability-resolut
 import { isHarnessRefusalText, textResult } from './shared.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
+import { resolveAcceptedExactMcpCarrier } from '../runtime/harness/accepted-mcp-carrier.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import {
   validateIrreversibleSendPayload,
@@ -320,6 +325,10 @@ function composioCarrierValidationError(target: string, args: unknown): CarrierV
 }
 
 export interface BuildCallToolOptions {
+  /** Model-surface visibility only. The carrier's inner authority checks remain
+   * unchanged; callers use this to keep a prepared dispatcher off an earlier
+   * phase's schema surface until its durable phase predicate becomes true. */
+  modelVisibility?: () => boolean | Promise<boolean>;
   /** Exact built-in names advertised as deferred on this turn. Omit for the
    * legacy full orchestrator surface (tests and non-scoped callers). */
   reachableBuiltinNames?: ReadonlySet<string>;
@@ -442,6 +451,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         : 'Exact tool name to invoke: a built-in from the catalog, OR a connected external MCP tool as <server>__<tool> (e.g. dataforseo__serp_organic_live_advanced).'),
       args_json: z.string().describe('JSON object string of the target tool\'s arguments. Use "{}" for no args.'),
     }),
+    isEnabled: async () => options.modelVisibility
+      ? Boolean(await options.modelVisibility())
+      : true,
     // Preserve the SDK's model-visible corrective for ordinary invocation
     // errors, but never soften the deterministic turn ceiling. A nominal cap
     // result would cost zero calls and could be retried forever.
@@ -643,13 +655,26 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       const activeMcpScope = options.mcpToolScope !== undefined
         ? options.mcpToolScope
         : harnessRunContextStorage.getStore()?.mcpToolScope;
+      let exactMcpInputSchema: unknown | null = null;
       if (isMcpNamespacedTool(target)) {
-        if (!mcpToolAllowedByScope(target, activeMcpScope)) {
-          return refuse({
-            error: 'not_reachable',
-            reason: 'mcp_scope_denied',
-            detail: `"${requestedTarget}" is outside this turn's external MCP scope.`,
-          });
+        if (_innerDispatchLegacyMcpTestResolverActive()) {
+          if (!mcpToolAllowedByScope(target, activeMcpScope)) {
+            return refuse({
+              error: 'not_reachable',
+              reason: 'mcp_scope_denied',
+              detail: `"${requestedTarget}" is outside this turn's external MCP scope.`,
+            });
+          }
+        } else {
+          const exact = resolveAcceptedExactMcpCarrier(target);
+          if (!exact.ok) {
+            return refuse({
+              error: 'not_reachable',
+              reason: 'exact_mcp_binding_missing',
+              detail: `"${requestedTarget}" has no current exact accepted manifest/port binding: ${exact.reason}`,
+            }, 'policy_denial');
+          }
+          exactMcpInputSchema = exact.binding.inputSchema;
         }
       } else {
         if (!reachableBuiltinNames.has(target) && !firstClassNames.has(target)) {
@@ -724,15 +749,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       }
 
       let exactTargetInputSchema: unknown | null = strictParameters
-        ?? (schema ? z.toJSONSchema(schema) : null);
-      // A named external tool may be outside the advertised cap while still
-      // inside the accepted turn's authority. Resolve its real schema from the
-      // exact authorized server catalog before expected-work admission.
-      if (options.aroundResolvedDispatch && !exactTargetInputSchema && isMcpNamespacedTool(target)) {
-        const { resolveAuthorizedExternalMcpToolDefinition } = await import('../runtime/mcp-servers.js');
-        const definition = await resolveAuthorizedExternalMcpToolDefinition(target, activeMcpScope);
-        exactTargetInputSchema = definition?.inputSchema ?? null;
-      }
+        ?? (schema ? z.toJSONSchema(schema) : exactMcpInputSchema);
 
       let evidenceArgs: unknown = dispatchArgs;
       let evidenceInputSchema: unknown | undefined;
@@ -842,6 +859,8 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           undefined,
           { accounting: 'transport_mirror', canonicalCallId: outerCallId },
           activeMcpScope,
+          undefined,
+          Boolean(options.aroundResolvedDispatch),
         );
       let out: unknown;
       try {

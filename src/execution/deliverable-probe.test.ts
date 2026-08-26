@@ -23,7 +23,7 @@ const SHEET_ID = '1tMAbcdEFGhijklmnop1234567890QRSTUVWXYZ';
 function sheetCreatedEvents() {
   return {
     listEventsFn: () => [
-      { sessionId: 's', turn: 0, role: 'tool', type: 'tool_returned', data: { tool: 'composio_execute_tool', ok: true, callId: 'c-sheet' } },
+      { sessionId: 's', turn: 0, role: 'tool', type: 'tool_returned', data: { sourceUserSeq: 7, tool: 'composio_execute_tool', ok: true, callId: 'c-sheet' } },
     ] as never,
     getToolOutputFn: (_s: string, callId: string) =>
       callId === 'c-sheet'
@@ -37,6 +37,7 @@ test('extractDeliverables: pulls a created Google Sheet id from a composio resul
   assert.equal(dels.length, 1);
   assert.equal(dels[0].kind, 'google_sheet');
   assert.equal(dels[0].ref, SHEET_ID);
+  assert.equal(dels[0].sourceUserSeq, 7);
 });
 
 test('probe: a populated objective + a sheet with 0 data rows REFUSES completion with the specific gap', async () => {
@@ -123,6 +124,7 @@ test('probe: nothing extractable → empty result, no block', async () => {
 
 test('countSheetRows: counts the largest values block; -1 when none', () => {
   assert.equal(countSheetRows(JSON.stringify({ valueRanges: [{ values: [['h1', 'h2'], ['a', 'b'], ['c', 'd']] }] })), 3);
+  assert.equal(countSheetRows({ grid: { header: ['h1', 'h2'], rows: [{ h1: 'a' }, { h1: 'b' }] } }), 3);
   assert.equal(countSheetRows(JSON.stringify({ valueRanges: [{ range: 'A1:B1' }] })), -1);
   assert.equal(countSheetRows(''), -1);
 });

@@ -24,13 +24,19 @@ function writeTrustedOutput(input: {
   tool: string;
   output: string;
   effect: 'read' | 'compute';
+  arguments?: unknown;
 }): void {
   const called = appendEvent({
     sessionId: S,
     turn: 1,
     role: 'agent',
     type: 'tool_called',
-    data: { tool: input.tool, callId: input.callId, effect: input.effect },
+    data: {
+      tool: input.tool,
+      callId: input.callId,
+      effect: input.effect,
+      ...(input.arguments === undefined ? {} : { arguments: input.arguments }),
+    },
   });
   writeToolOutput({
     sessionId: S,
@@ -153,6 +159,24 @@ test('fail-closed: provider request echoes are not grounded $fromToolOutput valu
   });
   assert.equal(out.errors.length, 1);
   assert.match(out.errors[0], /resolved to nothing/i);
+});
+
+test('fail-closed: a provider cannot rename request values and reference them as response evidence', () => {
+  const guessed = ['renamed-one@example.com', 'renamed-two@example.com'];
+  writeTrustedOutput({
+    callId: 'renamed-echo-read',
+    invocationNonce: 'nonce-renamed-echo',
+    tool: 'provider_search',
+    arguments: { recipients: guessed },
+    output: JSON.stringify({ ok: true, query: { recipients: guessed }, response: { items: [] } }),
+    effect: 'read',
+  });
+  const out = resolveToolOutputReferences(S, {
+    to: { $fromToolOutput: { callId: 'renamed-echo-read', path: 'query.recipients[*]' } },
+  });
+  assert.equal(out.errors.length, 1);
+  assert.match(out.errors[0], /resolved to nothing|cannot authorize/i);
+  assert.equal((out.resolved as { to?: unknown }).to, undefined);
 });
 
 test('fail-closed: a derived reader call cannot replace the original source authority', () => {

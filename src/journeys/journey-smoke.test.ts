@@ -11,8 +11,8 @@
  *
  *  J1 — a parked background task is answered IN THE CONVERSATION, resumes,
  *       completes, and reports back to its origin chat.
- *  J2 — an approved workflow payload replays VERBATIM on re-admission; a
- *       racing duplicate re-admission cannot double-execute.
+ *  J2 — a restart-lost legacy workflow interruption cannot turn its bare
+ *       approval row into a raw provider dispatch capability.
  *  J3 — a run whose data source is dead gets the empty-result advisory, then
  *       the data-quality checkpoint intercepts its first external write.
  */
@@ -53,7 +53,6 @@ const {
 const reg = await import('../runtime/harness/approval-registry.js');
 const {
   replayApprovedActionForSession,
-  renderApprovedReplayNote,
   setApprovalReplayDispatchForTest,
 } = await import('../execution/approval-replay.js');
 const {
@@ -189,7 +188,7 @@ test('J1: parked task → answered in the conversation → resumes → completes
   }
 });
 
-test('J2: an approved workflow payload replays VERBATIM on re-admission; racing duplicates cannot double-send', async () => {
+test('J2: restart-lost legacy approval remains unconsumed and racing re-admissions execute no body', async () => {
   const session = createSession({ id: 'workflow:journey-j2:post_slack', kind: 'workflow' });
   const row = reg.register({
     sessionId: session.id,
@@ -202,30 +201,22 @@ test('J2: an approved workflow payload replays VERBATIM on re-admission; racing 
   });
   reg.resolve(row.approvalId, 'approved', 'journey-user');
 
-  const dispatched: Array<Record<string, unknown>> = [];
-  setApprovalReplayDispatchForTest(async (slug, args) => {
-    dispatched.push({ slug, ...args });
+  let providerBodies = 0;
+  setApprovalReplayDispatchForTest(async () => {
+    providerBodies += 1;
     return { ok: true, result: { ts: 'sent-1' } };
   });
   try {
-    // Two racing re-admissions claim concurrently — exactly one may execute.
+    // A registry approval is not a provider-dispatch capability. Neither racer
+    // may claim it; recovery requires a frozen durable pending action.
     const [a, b] = await Promise.all([
       replayApprovedActionForSession(session.id),
       replayApprovedActionForSession(session.id),
     ]);
-    const outcomes = [a, b].filter(Boolean);
-    assert.equal(outcomes.length, 1, 'exactly one re-admission won the claim');
-    assert.equal(dispatched.length, 1, 'the approved payload executed exactly once');
-    assert.equal(dispatched[0].slug, 'SLACK_SEND_MESSAGE');
-    assert.equal(dispatched[0].channel, 'C0JOURNEY');
-    assert.equal(dispatched[0].markdown_text, '*Team Activity — EOD*');
-    const note = renderApprovedReplayNote(outcomes[0]!);
-    assert.match(note, /ALREADY EXECUTED/);
-
-    // The grant is consumed — a later re-admission replays nothing and the
-    // registry can never mint a fresh card from this decision.
-    assert.equal(await replayApprovedActionForSession(session.id), null);
-    assert.ok(reg.get(row.approvalId)?.consumedAt, 'grant durably consumed');
+    assert.equal(a, null);
+    assert.equal(b, null);
+    assert.equal(providerBodies, 0, 'no racing legacy re-admission can invoke a provider body');
+    assert.equal(reg.get(row.approvalId)?.consumedAt, null, 'containment occurs before claim');
   } finally {
     setApprovalReplayDispatchForTest(null);
   }

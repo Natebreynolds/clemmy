@@ -1,5 +1,4 @@
-import { listEvents, recentToolOutputs, resolveToolOutputsForAuthority } from './eventlog.js';
-import { pruneProviderRequestEchoes } from './provider-read-evidence.js';
+import { listEvents, recentToolOutputs, resolveToolOutputEvidenceExcerptsForAuthority } from './eventlog.js';
 
 /**
  * The ONE shared trusted-evidence ledger for a session.
@@ -39,22 +38,15 @@ export interface TrustedSource {
    * echoes are removed before this value can authorize a downstream field. */
   text: string;
   kind: 'user' | 'tool';
+  /** True when automatic evidence retained only a verified prefix. Such a
+   * prefix identifies the source but is not parsed as structured field truth. */
+  excerpted?: boolean;
 }
 
 export interface GatherTrustedEvidenceOptions {
   /** Max recent tool outputs to consider (default 40, matching the legacy
    *  recipient gate). User messages are always included. */
   toolOutputLimit?: number;
-}
-
-function trustedToolEvidenceText(output: string): string {
-  const trimmed = output.trim();
-  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return output;
-  try {
-    return JSON.stringify(pruneProviderRequestEchoes(JSON.parse(trimmed) as unknown));
-  } catch {
-    return output;
-  }
 }
 
 export function gatherTrustedEvidence(
@@ -83,10 +75,17 @@ export function gatherTrustedEvidence(
   // longest (possibly stale) bytes there. Re-resolve each candidate against the
   // exact parented read/compute lifecycle before it can source a later field.
   const candidates = recentToolOutputs(sessionId, { limit: toolOutputLimit });
-  for (const output of resolveToolOutputsForAuthority(sessionId, candidates, { readOrComputeOnly: true })) {
+  for (const output of resolveToolOutputEvidenceExcerptsForAuthority(sessionId, candidates, {
+    readOrComputeOnly: true,
+    excerptChars: 5_000,
+  })) {
     const tool = output.tool;
     if (ECHO_TOOL_RE.test(tool ?? '')) continue;
-    if (typeof output.output === 'string' && output.output.length > 0) {
+    if (
+      output.excerpted
+      || output.automaticEvidenceSuppressed
+      || (typeof output.output === 'string' && output.output.length > 0)
+    ) {
       sources.push({
         id: output.callId,
         tool,
@@ -96,8 +95,12 @@ export function gatherTrustedEvidence(
           : output.effect === 'compute'
             ? 'derivation'
             : null,
-        text: trustedToolEvidenceText(output.output),
+        // Parsing an incomplete JSON prefix would re-expose request/input echo
+        // fields that the complete structured projection normally removes.
+        // Purpose-built streaming matchers recover middle identifiers safely.
+        text: output.output,
         kind: 'tool',
+        excerpted: output.excerpted,
       });
     }
   }

@@ -8,15 +8,20 @@ export interface AttestedTransportCall {
   accountId: string;
   /**
    * Optional exact live identity sealed by a generic manifest-backed port.
-   * Legacy curated adapters predate this field. Open-ended carriers must send
-   * it so the transport can re-list/re-observe immediately before dispatch.
+   * The generic surface stays optional for host-only/non-Composio transports;
+   * the Composio transport requires it and fails closed before gateway work.
    */
   expected?: {
+    manifestId: string;
+    manifestDigest: string;
     providerKind: string;
     providerIdentity: string;
     providerVersion: string;
     operationVersion: string;
     definitionFingerprint: string;
+    providerInputSchemaDigest?: string;
+    providerOutputSchemaObserved?: true;
+    providerOutputSchemaDigest?: string | null;
     invokePortId: string;
     argumentCompiler: { id: string; version: string };
   };

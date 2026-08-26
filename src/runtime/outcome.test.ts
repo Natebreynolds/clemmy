@@ -129,6 +129,7 @@ test('proactive report turn stays bound to its appended directive when a newer h
 
   let observedSourceUserSeq: number | undefined;
   let observedReuseRecordedInput: boolean | undefined;
+  let observedSuppressMemoryCapture: boolean | undefined;
   let competingHumanSeq: number | undefined;
   const directiveSource = await outcomeTest.runRecordedProactiveReportTurn({
     sessionId,
@@ -151,11 +152,17 @@ test('proactive report turn stays bound to its appended directive when a newer h
     }).seq;
     observedSourceUserSeq = options.sourceUserSeq;
     observedReuseRecordedInput = options.reuseRecordedUserInput;
+    observedSuppressMemoryCapture = options.suppressMemoryCapture;
   });
 
   assert.notEqual(competingHumanSeq, directiveSource.seq, 'the human input is a distinct, newer source');
   assert.equal(observedSourceUserSeq, directiveSource.seq, 'the proactive turn owns the exact directive row, not latest input');
   assert.equal(observedReuseRecordedInput, true);
+  assert.equal(
+    observedSuppressMemoryCapture,
+    true,
+    'a runtime-authored outcome carrier can never enter automatic memory capture',
+  );
   assert.equal(directiveSource.data.synthetic, true);
   assert.equal(directiveSource.data.source, 'outcome');
   assert.equal(directiveSource.data.deliveryPhase, 'directive');

@@ -316,7 +316,8 @@ function isLayer2PreservedItem(item: AgentInputItem): boolean {
 function recallableToolOutputExists(sessionId: string | undefined, callId: string): boolean {
   if (!sessionId) return true;
   try {
-    return getToolOutput(sessionId, callId) != null;
+    const stored = getToolOutput(sessionId, callId);
+    return stored != null && !stored.truncatedAtWrite;
   } catch {
     return false;
   }
@@ -362,7 +363,8 @@ function completedToolPairs(
     let storedResultText: string | null = null;
     if (sessionId) {
       try {
-        storedResultText = getToolOutput(sessionId, callId)?.output ?? null;
+        const stored = getToolOutput(sessionId, callId);
+        storedResultText = stored && !stored.truncatedAtWrite ? stored.output : null;
       } catch {
         storedResultText = null;
       }

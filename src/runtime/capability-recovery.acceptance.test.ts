@@ -139,12 +139,11 @@ test('scenario 3/4: a failed candidate reopens discovery instead of closing the 
   assert.equal(first.admitted, true);
   governor.settle({ ...key, category: 'broad_discovery', callId: 'search-1', outcome: 'succeeded' });
 
-  // Same task, no new evidence: the repeat replays the claim already held
-  // rather than minting a second one. The bound is on CLAIMS, not on calls —
-  // refusing the call never un-spent it.
+  // Same task, no new evidence: the repeat neither mints a claim nor receives
+  // provider authority under a different physical id.
   const repeat = governor.admit({ ...key, category: 'broad_discovery', callId: 'search-2' });
-  assert.equal(repeat.admitted, true);
-  assert.equal(repeat.reason, 'subject_replay');
+  assert.equal(repeat.admitted, false);
+  assert.equal(repeat.reason, 'new_call_requires_retry_epoch');
   assert.equal(repeat.consumedBudget, false);
 
   // The candidate that search produced turns out not to support the operation.
@@ -181,14 +180,13 @@ test('scenario 3: repairing a DIFFERENT tool never spends the first tool schema 
   });
   assert.equal(second.admitted, true, 'a different tool has its own schema budget');
 
-  // The same tool twice in one epoch replays its existing claim: the point of
-  // this scenario is that a DIFFERENT tool keeps its own budget, and that still
-  // holds above. Re-asking for the same schema mints nothing new.
+  // The same tool twice in one epoch mints neither a claim nor another provider
+  // invocation. A different tool still keeps its independent subject above.
   const repeat = governor.admit({
     ...key, category: 'exact_schema_refresh', subject: 'OUTLOOK_SEND_MAIL', callId: 'schema-3',
   });
-  assert.equal(repeat.admitted, true);
-  assert.equal(repeat.reason, 'subject_replay');
+  assert.equal(repeat.admitted, false);
+  assert.equal(repeat.reason, 'new_call_requires_retry_epoch');
   assert.equal(repeat.consumedBudget, false);
 });
 

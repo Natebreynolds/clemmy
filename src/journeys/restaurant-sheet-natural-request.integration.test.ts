@@ -351,6 +351,9 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   let restaurantReads = 0;
   let sheetCreates = 0;
   let discoveryListings = 0;
+  let rawBusinessRequests = 0;
+  let legacyHighLevelExecuteCalls = 0;
+  const noRetryOptions: unknown[] = [];
   let semanticCalls = 0;
   let settledReadRows: Array<Record<string, unknown>> | null = null;
   let providerScenario: 'standard' | 'bounded_collection' = 'standard';
@@ -422,7 +425,6 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
           detail: `authoritative-${sha256(`${location}:${index}`)}-${'x'.repeat(39_000)}`,
         }));
         const payload = { records, total: records.length, has_more: false };
-        boundedProviderPayloadBytes += Buffer.byteLength(JSON.stringify(payload), 'utf8');
         return payload;
       }
       assert.deepEqual(args, {
@@ -450,6 +452,53 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   };
   composioClient.__test__.setComposioClient({
     client: { baseURL: 'https://backend.composio.dev' },
+    getClient: () => ({
+      withOptions: (options: unknown) => {
+        noRetryOptions.push(options);
+        return {
+          tools: {
+            execute: async (
+              operation: string,
+              body: {
+                arguments?: unknown;
+                connected_account_id?: unknown;
+                user_id?: unknown;
+                version?: unknown;
+              },
+              request?: { signal?: AbortSignal },
+            ) => {
+              rawBusinessRequests += 1;
+              assert.ok(request?.signal instanceof AbortSignal,
+                'the exact raw business request inherits the host abort signal');
+              assert.ok(body.arguments && typeof body.arguments === 'object'
+                && !Array.isArray(body.arguments));
+              assert.equal(body.connected_account_id,
+                operation === RESTAURANT_OPERATION ? 'conn-restaurants' : 'conn-googlesheets');
+              assert.equal(body.user_id, 'fixture-user');
+              assert.equal(body.version,
+                operation === RESTAURANT_OPERATION ? 'fixture-restaurants-v1' : 'fixture-googlesheets-v1');
+              const data = await executeConnectedProvider(
+                operation,
+                body.arguments as Record<string, unknown>,
+              );
+              const logId = `fixture-${rawBusinessRequests}`;
+              if (providerScenario === 'bounded_collection' && operation === RESTAURANT_OPERATION) {
+                // Durable result accounting sees the exact normalized raw-v3.1
+                // return, including transport metadata, rather than only its
+                // nested business payload.
+                boundedProviderPayloadBytes += Buffer.byteLength(JSON.stringify({
+                  data,
+                  error: null,
+                  successful: true,
+                  logId,
+                }), 'utf8');
+              }
+              return { data, error: null, successful: true, log_id: logId };
+            },
+          },
+        };
+      },
+    }),
     tools: {
       async getRawComposioTools(input: { tools?: string[]; toolkits?: string[]; search?: string }) {
         discoveryListings += 1;
@@ -464,9 +513,9 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
           (exact.size === 0 || exact.has(candidate.slug))
           && (toolkits.size === 0 || toolkits.has(candidate.toolkit.slug)));
       },
-      async execute(operation: string, body: { arguments?: unknown }) {
-        assert.ok(body.arguments && typeof body.arguments === 'object' && !Array.isArray(body.arguments));
-        return executeConnectedProvider(operation, body.arguments as Record<string, unknown>);
+      async execute() {
+        legacyHighLevelExecuteCalls += 1;
+        throw new Error('natural journey forbids the legacy Composio high-level execute fallback');
       },
     },
   });
@@ -536,11 +585,11 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
           'the first primary step exposes the exact unresolved discovery role');
         assert.doesNotMatch(serialized, /cap:resolved:restaurants_search|cap:resolved:googlesheets_sheet_from_json/,
           'blank-state capabilities are not planted into the first planning card');
-        assert.ok(tools.includes(PLAN_CONTROL),
-          'fresh host surface exposes the first-class plan control');
+        assert.equal(tools.includes(PLAN_CONTROL), false,
+          'an empty initial planning catalog keeps the impossible plan control off the first model surface');
         assert.ok(tools.includes('tool_search'), 'blank state exposes metadata discovery before planning');
-        assert.ok(tools.includes('work_call'),
-          'the proposal-free carrier is visible before activation only for the sanctioned plan-plus-root-read frame');
+        assert.equal(tools.includes('work_call'), false,
+          'the proposal-free carrier stays hidden until exact disclosure can also expose plan_task');
         assert.equal(tools.includes('run_worker'), false, 'worker dispatch is hidden before plan activation');
         output = [functionCall('discover-capabilities', 'tool_search', {
           query: 'search for restaurants by location and create a new Google Sheet from the results',
@@ -702,8 +751,12 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   assert.equal(modelRequests.filter((request) => request.phase === 'primary').length, 4,
     `one primary loop owns discovery, plan+preamble+root-read, dependent write, and final response: ${JSON.stringify({ modelRequests, trace, deliveryErrors: delivery.errors, events: eventlog.listEvents(session.id).map((event) => ({ type: event.type, data: event.data })) })}`);
   assert.equal(primaryStep, 4);
-  assert.ok(modelRequests[0]?.tools.includes(PLAN_CONTROL), 'plan_task is present on the initial primary surface');
-  assert.ok(modelRequests[0]?.tools.includes('work_call'));
+  assert.equal(modelRequests[0]?.tools.includes(PLAN_CONTROL), false,
+    'the empty initial catalog exposes discovery but not plan_task');
+  assert.ok(modelRequests[1]?.tools.includes(PLAN_CONTROL),
+    'the exact foreground disclosure enables plan_task on the next model surface');
+  assert.equal(modelRequests[0]?.tools.includes('work_call'), false,
+    'blank discovery does not pay or advertise the not-yet-usable business carrier');
   assert.ok(modelRequests[1]?.tools.includes('work_call'));
   assert.ok(modelRequests[2]?.tools.includes('work_call'),
     'work_call remains usable after the source-bound plan is admitted');
@@ -742,6 +795,9 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   assert.equal(restaurantReads, 1);
   assert.equal(sheetCreates, 1);
   assert.equal(providerCalls.length, 2);
+  assert.equal(rawBusinessRequests, 2, 'one raw no-retry request owns each physical business row');
+  assert.equal(legacyHighLevelExecuteCalls, 0, 'the legacy high-level execute path is never a fallback');
+  assert.deepEqual(noRetryOptions, [{ maxRetries: 0 }, { maxRetries: 0 }]);
   assert.equal(forbiddenDirectCatalogCrossings, 0,
     'the raw provider wire proves availability but never becomes a parallel dispatch owner');
   assert.deepEqual(providerCalls.map((call) => call.slug), [RESTAURANT_OPERATION, SHEET_OPERATION]);
@@ -1462,7 +1518,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
                     operations: [{
                       id: 'read_each_area',
                       effect: 'read',
-                      coverage: 'complete_set',
+                      coverage: 'single',
                       dependsOn: [],
                       dataFrom: [],
                       cardinality: { kind: 'each', universeId: 'accepted_areas' },
@@ -1621,7 +1677,8 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   );
 });
 
-// Follow-on release pins.  These are deliberately named here beside the exact
-// cold journey so later work cannot call a warm-only shortcut "universal".
-test.todo('restart after the read or create resumes the same accepted graph/call contract without another provider crossing');
-test.todo('chat and workflow occurrences share the same call-admission, lease, settlement, and evidence kernel');
+// Cross-process restart is enforced by host-process-restart-settled.test.ts,
+// which reopens the exact settled read and write in a fresh OS process without
+// another provider body. Shared chat/workflow call ownership is enforced by
+// harness-restart-kernel-parity.red.test.ts. Keep those production gates beside
+// this natural journey in the release matrix; they are not fixture assumptions.

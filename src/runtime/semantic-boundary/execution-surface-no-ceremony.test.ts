@@ -1,14 +1,9 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/semantic-boundary/execution-surface-no-ceremony.test.ts
  *
- * OWNER DECISION 2026-08-25 ("option B"): execution surfaces do not enter the
- * pre-model semantic ceremony. A full day of live runs showed every workflow
- * failure was a ceremony wall while every success executed in the gated tool
- * loop. A workflow-kind session admits by shadow graph, reads as
- * unparticipated, dispatches to the conversation loop, and arms
- * conversation-shaped authority even when its heuristic prose graph
- * classifies act-shaped with zero work nodes (the exact scorpion-facebook-
- * trends admission failure). Chat keeps the ceremony unchanged; a
- * PARTICIPATED source keeps the unique-work-node demand.
+ * Execution surfaces may skip the pre-model semantic ceremony, but that does
+ * not let a deterministic work graph shed its obligations. A workflow-kind
+ * source that has no expected-work binding writer remains unparticipated and
+ * must refuse before accepted-task authority, logical calls, or physical I/O.
  */
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -22,14 +17,13 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 mkdirSync(path.join(HOME, 'state'), { recursive: true });
 writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-no-ceremony\n', 'utf8');
 
-const { appendEvent, createSession } = await import('../harness/eventlog.js');
+const { appendEvent, createSession, openEventLog } = await import('../harness/eventlog.js');
 const { admitAndCompileAcceptedSource } = await import('./admit-and-compile-accepted-source.js');
-const { dispatchAdmittedSource } = await import('./typed-source-dispatch.js');
 const { readSemanticDisposition } = await import('./semantic-disposition.js');
 const { installTurnSemanticModelPort } = await import('./turn-semantic-port-registry.js');
 const { requireAcceptedTaskAuthority } = await import('../harness/accepted-task-authority.js');
 
-test('a workflow-kind session skips the ceremony, dispatches to the loop, and arms authority', async () => {
+test('a workflow-kind non-conversational source without a binder refuses authority before execution', async () => {
   // A port IS installed and must never be consulted for an execution
   // surface — before option B this port would participate and the ceremony
   // would own the turn (this is the red half of the pin).
@@ -52,11 +46,27 @@ test('a workflow-kind session skips the ceremony, dispatches to the loop, and ar
     'unparticipated',
     'the semantic port declines execution surfaces',
   );
-  const dispatched = await dispatchAdmittedSource(identity);
-  assert.equal(dispatched.kind, 'conversation', 'execution surfaces run the gated model loop');
-  // The scorpion-facebook-trends failure point: act-shaped heuristic graph,
-  // zero work nodes — arming must succeed conversation-shaped, not refuse.
-  const authority = requireAcceptedTaskAuthority({ sessionId: session.id, sourceUserSeq: source.seq });
-  assert.ok(authority, 'authority arms for the unparticipated execution source');
+  assert.throws(
+    () => requireAcceptedTaskAuthority({ sessionId: session.id, sourceUserSeq: source.seq }),
+    /non-conversational graph has no expected-work binding writer/,
+  );
+  const counts = openEventLog().prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM accepted_task_authority
+        WHERE session_id = ? AND source_user_seq = ?) AS authority_count,
+      (SELECT COUNT(*) FROM logical_tool_calls
+        WHERE session_id = ? AND source_user_seq = ?) AS logical_count,
+      (SELECT COUNT(*) FROM physical_dispatches
+        WHERE session_id = ? AND source_user_seq = ?) AS physical_count
+  `).get(
+    session.id, source.seq,
+    session.id, source.seq,
+    session.id, source.seq,
+  ) as { authority_count: number; logical_count: number; physical_count: number };
+  assert.deepEqual(counts, {
+    authority_count: 0,
+    logical_count: 0,
+    physical_count: 0,
+  });
   installTurnSemanticModelPort(null);
 });

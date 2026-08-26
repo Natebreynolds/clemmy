@@ -622,7 +622,7 @@ test('Claude SDK brain creates background sessions as execution sessions, not ch
   }));
 
   await respondViaClaudeAgentSdkBrain('background', {
-    message: 'run this in the background',
+    message: 'Hello Clem.',
     sessionId: 'brain-background-kind',
   });
 

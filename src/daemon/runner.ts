@@ -21,6 +21,7 @@ import { processMonitors } from '../agents/monitors.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
+import { reconcileWorkerBatchDurableOwnershipAtBoot } from '../agents/worker-batch-execution.js';
 import { MODELS, getActiveAuthMode, getByoBackendConfig, getModelRoutingMode, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { warmCapabilityRetrieval } from '../runtime/read-path/capability-candidates.js';
@@ -2032,6 +2033,13 @@ export async function startDaemon(
     if (orphanedAttempts > 0) {
       logger.warn({ orphanedAttempts }, 'Interrupted orphaned run attempts from the previous process on boot');
     }
+    const reconciledWorkerBatchOwners = reconcileWorkerBatchDurableOwnershipAtBoot();
+    if (reconciledWorkerBatchOwners > 0) {
+      logger.warn(
+        { reconciledWorkerBatchOwners },
+        'Revoked worker-batch owners from terminal predecessor attempts on boot',
+      );
+    }
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot run-attempt sweep failed');
   }
@@ -2742,6 +2750,7 @@ export async function startDaemon(
   // to fall back to draining inline on the main tick.
   const workflowRunLane = (getRuntimeEnv('CLEMMY_WORKFLOW_RUN_LANE', 'on') ?? 'on').toLowerCase() !== 'off';
   if (workflowRunLane) {
+    let immediateWorkflowDrainScheduled = false;
     const drainWorkflowRunsTick = () => {
       withDaemonRuntimePhase('daemon.timer.workflow_runs', {}, async () => {
         // A crash after the foreground close node but before source-group
@@ -2834,7 +2843,16 @@ export async function startDaemon(
       });
     };
     registerWorkflowRunDrainKick(() => {
-      setImmediate(drainWorkflowRunsTick);
+      // A scheduler tick or fan-out can durably enqueue several runs in one
+      // event-loop turn. Collapse those notifications into one immediate pass;
+      // processWorkflowRuns still single-flights, and the periodic timer stays
+      // the recovery path if this callback is lost.
+      if (immediateWorkflowDrainScheduled) return;
+      immediateWorkflowDrainScheduled = true;
+      setImmediate(() => {
+        immediateWorkflowDrainScheduled = false;
+        drainWorkflowRunsTick();
+      });
     });
     setImmediate(drainWorkflowRunsTick);
     const workflowRunTimer = setInterval(drainWorkflowRunsTick, 15_000);

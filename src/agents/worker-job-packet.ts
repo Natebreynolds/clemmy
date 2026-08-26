@@ -317,6 +317,13 @@ function resolveWorkerToolInput(inputOrOptions: WorkerToolInput | WorkerToolInpu
 
 export function buildWorkerJobPrompt(inputOrOptions: WorkerToolInput | WorkerToolInputBuilderOptions): string {
   const input = resolveWorkerToolInput(inputOrOptions);
+  // Provider prompt caches are prefix-based. Keep every batch-shared field in
+  // its existing order and append the one per-item value last, independent of
+  // the model/tool decoder's object-property order. Replacing an early `item`
+  // property with object spread preserves its early slot in JavaScript and
+  // made a 100-worker batch diverge before 30% of each wire was cacheable.
+  const { item, ...sharedPacket } = input;
+  const cacheCanonicalPacket = { ...sharedPacket, item };
   // Recall, for workers: a worker runs the same nested-agent loop but never saw
   // the parent's "Remembered Tool Choices" block, so it re-discovered tools the
   // user has already proven. Inject the learned choices RELEVANT to this
@@ -360,6 +367,6 @@ export function buildWorkerJobPrompt(inputOrOptions: WorkerToolInput | WorkerToo
       : []),
     '',
     'Packet JSON:',
-    JSON.stringify(input, null, 2),
+    JSON.stringify(cacheCanonicalPacket, null, 2),
   ].join('\n');
 }

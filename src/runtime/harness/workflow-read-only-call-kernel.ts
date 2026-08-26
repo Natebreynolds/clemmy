@@ -12,15 +12,22 @@ import { createHash } from 'node:crypto';
 
 import {
   closeWorkflowReadOnlyCallAuthority,
+  closeWorkflowV3CallAuthority,
   mintWorkflowReadOnlyCallAttestation,
+  mintWorkflowV3CallAttestation,
   poisonWorkflowReadOnlyCallAuthority,
+  poisonWorkflowV3CallAuthority,
   readWorkflowReadOnlyCallAuthority,
+  readWorkflowV3CallAuthority,
   withWorkflowReadOnlyCallAttestation,
+  withWorkflowV3CallAttestation,
   type AcceptedTurnCallAuthorityReadResult,
   type WorkflowReadOnlyCallAttestationProof,
+  type WorkflowV3CallAttestationProof,
 } from './accepted-turn-call-authority.js';
 import {
   admitLogicalCall,
+  beginWorkflowPreparationPhysicalDispatch,
   beginPhysicalDispatch,
   settlePhysicalDispatch,
   type PhysicalCrossingIdentity,
@@ -137,6 +144,22 @@ const READ_ONLY_WORKFLOW_CALL_AUTHORITY_PORT: WorkflowCallAuthorityPort<
   poison: poisonWorkflowReadOnlyCallAuthority,
 });
 
+function workflowV3CallAuthorityPort(
+  effect: Exclude<WorkflowNodeInvocationEffectV1, 'read' | 'compute'>,
+): WorkflowCallAuthorityPort<WorkflowV3CallAttestationProof> {
+  return Object.freeze({
+    authorityKind: 'workflow_v3_call',
+    effect,
+    mutating: effect === 'local_write' || effect === 'external_write' || effect === 'admin',
+    operationLabel: 'workflow v3 call',
+    read: readWorkflowV3CallAuthority,
+    mint: mintWorkflowV3CallAttestation,
+    withAttestation: withWorkflowV3CallAttestation,
+    close: closeWorkflowV3CallAuthority,
+    poison: poisonWorkflowV3CallAuthority,
+  });
+}
+
 function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
@@ -151,6 +174,33 @@ function physicalDispatchId(input: {
     version: 1,
     ...input,
   }))}`;
+}
+
+function preparationPhysicalDispatchId(input: {
+  activationDigest: string;
+  logicalCallId: string;
+  toolName: string;
+  argumentDigest: string;
+  sequence: number;
+}): string {
+  return `workflow-preparation-dispatch:${sha256(JSON.stringify({
+    version: 1,
+    ...input,
+  }))}`;
+}
+
+function nextWorkflowPreparationSequence(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  logicalCallId: string;
+}): number {
+  const row = openEventLog().prepare(`
+    SELECT COUNT(*) AS n
+      FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+       AND logical_tool_call_id = ? AND relation = 'probe'
+  `).get(input.sessionId, input.sourceUserSeq, input.logicalCallId) as { n: number };
+  return row.n + 1;
 }
 
 function workflowCallLeaseScope(input: {
@@ -444,12 +494,28 @@ function closeWorkflowAndRevokeLease<Proof extends object>(input: {
 function exactPortBinding(input: {
   capabilityId: string;
   args: Record<string, unknown>;
-}): { capability: RegisteredHostCapability; invoke: RegisteredHostCapability['invoke'] } | null {
+}): {
+  capability: RegisteredHostCapability;
+  invoke: RegisteredHostCapability['invoke'];
+  admitPreparation?: () => void;
+  prepareInvocation?: () => Promise<unknown>;
+  invokeWithPreparation?: <T>(proof: unknown, work: () => Promise<T>) => Promise<T>;
+} | null {
   const capability = peekHostCapabilityCatalogFactory()?.get(input.capabilityId);
   if (!capability?.manifest) return null;
   const port = resolveProductionPortsForManifest(capability.manifest);
   if (!port) return null;
-  return { capability, invoke: port.invoke };
+  if (
+    Boolean(port.prepareInvocation) !== Boolean(port.invokeWithPreparation)
+    || Boolean(port.prepareInvocation) !== Boolean(port.admitPreparation)
+  ) return null;
+  return {
+    capability,
+    invoke: port.invoke,
+    ...(port.admitPreparation ? { admitPreparation: port.admitPreparation } : {}),
+    ...(port.prepareInvocation ? { prepareInvocation: port.prepareInvocation } : {}),
+    ...(port.invokeWithPreparation ? { invokeWithPreparation: port.invokeWithPreparation } : {}),
+  };
 }
 
 /**
@@ -538,6 +604,12 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
         activationId: input.activationId,
       };
     }
+    const businessCrossings = durable.status === 'ok'
+      ? durable.settlement.crossings.filter((crossing) => crossing.relation !== 'probe')
+      : [];
+    const preparationCrossings = durable.status === 'ok'
+      ? durable.settlement.crossings.filter((crossing) => crossing.relation === 'probe')
+      : [];
     if (
       durable.settlement.toolName !== recoveryMaterial.toolName
       || durable.settlement.argumentDigest !== recoveryMaterial.argumentDigest
@@ -546,10 +618,12 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
       || durable.settlement.recovery.mutating !== port.mutating
       || durable.settlement.recovery.requirementId !== parsed.plan.requirementId
       || !['succeeded', 'empty_result'].includes(durable.settlement.outcome.kind)
-      || durable.settlement.physicalCrossingCount !== 1
+      || durable.settlement.physicalCrossingCount !== durable.settlement.crossings.length
       || durable.settlement.hostCrossingCount !== 0
-      || durable.settlement.crossings.length !== 1
-      || durable.settlement.crossings[0]?.terminalState !== 'returned'
+      || businessCrossings.length !== 1
+      || businessCrossings[0]?.terminalState !== 'returned'
+      || preparationCrossings.some((crossing) =>
+        crossing.terminalState !== 'returned' && crossing.terminalState !== 'threw')
     ) {
       if (current.authority.state === 'open') {
         poison(port, input.activationId, 'workflow logical settlement conflicts with its activation contract');
@@ -606,7 +680,7 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
           activationId: input.activationId,
         };
       }
-      const crossing = durable.settlement.crossings[0];
+      const crossing = businessCrossings[0]!;
       const crossingIdentity: PhysicalCrossingIdentity = {
         sessionId: current.authority.identity.sessionId,
         sourceUserSeq: current.authority.identity.sourceUserSeq,
@@ -703,6 +777,20 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
       activationId: input.activationId,
     };
   }
+  if (exactPort.admitPreparation) {
+    try {
+      exactPort.admitPreparation();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      poison(port, input.activationId, `workflow provider preparation refused locally: ${reason}`);
+      return {
+        status: 'blocked',
+        reason,
+        zeroBody: true,
+        activationId: input.activationId,
+      };
+    }
+  }
 
   const dispatchId = physicalDispatchId({
     activationDigest: minted.ref.activationDigest,
@@ -772,6 +860,168 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
     crashForTest('after_call_lease');
 
     return runWithDispatchLease(selectedLease.lease, async () => {
+      const settleFailedProviderCrossing = (
+        crossing: PhysicalCrossingIdentity,
+        error: unknown,
+        businessCall: boolean,
+      ): ExecuteWorkflowCallKernelResult => {
+        const physical = settlePhysicalDispatch({
+          identity: crossing,
+          tool: minted.toolName,
+          outcome: 'threw',
+          turn: 0,
+          dispatchLease: selectedLease.lease,
+        });
+        const reason = String(error instanceof Error ? error.message : error)
+          .replace(/\s+/g, ' ').trim().slice(0, 160) || `${port.operationLabel} invocation threw`;
+        const logical = physical.status === 'inserted' || physical.status === 'replayed'
+          ? commitLogicalCallSettlement({
+              identity: {
+                sessionId: identity.sessionId,
+                sourceUserSeq: identity.sourceUserSeq,
+                acceptedTaskId: identity.acceptedTaskId,
+                logicalToolCallId: identity.logicalToolCallId,
+              },
+              contract: { toolName: minted.toolName, args: input.args },
+              execution: { kind: 'provider_execution' },
+              outcome: classifyAttemptOutcome({ executionFailed: true }),
+              recovery: {
+                businessCall,
+                mutating: port.mutating,
+                requirementId: parsed.plan.requirementId,
+              },
+              observer: { lane: 'agents_runner', callId: identity.logicalToolCallId, turn: 0 },
+            })
+          : null;
+        if (!logical || (logical.status !== 'committed' && logical.status !== 'replayed')) {
+          const settlementReason = logical && 'reason' in logical
+            ? logical.reason
+            : 'reason' in physical ? physical.reason : 'settlement did not commit';
+          poison(port, input.activationId, `workflow failed-call settlement refused: ${settlementReason}`);
+        } else {
+          const closed = closeWorkflowAndRevokeLease({
+            activationId: input.activationId,
+            outcome: 'failed',
+            lease: selectedLease.lease,
+            port,
+          });
+          if (closed.status !== 'closed' && closed.status !== 'replayed') {
+            const closeReason = 'reason' in closed
+              ? closed.reason
+              : 'workflow failed-call terminal closure did not commit';
+            poison(port, input.activationId, `workflow failed-call terminal closure refused: ${closeReason}`);
+          }
+        }
+        return {
+          status: 'failed',
+          reason,
+          zeroBody: !businessCall,
+          activationId: input.activationId,
+        };
+      };
+
+      let preparedProof: unknown;
+      let preparationReady = false;
+      if (exactPort.prepareInvocation) {
+        const preparationSequence = nextWorkflowPreparationSequence({
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          logicalCallId: identity.logicalToolCallId,
+        });
+        const preparationIdentity: PhysicalCrossingIdentity = {
+          ...identity,
+          physicalDispatchId: preparationPhysicalDispatchId({
+            activationDigest: minted.ref.activationDigest,
+            logicalCallId: minted.ref.logicalCallId,
+            toolName: minted.toolName,
+            argumentDigest: minted.argumentDigest,
+            sequence: preparationSequence,
+          }),
+        };
+        const preparation = beginWorkflowPreparationPhysicalDispatch({
+          identity: preparationIdentity,
+          tool: minted.toolName,
+          args: input.args,
+          dispatchLease: selectedLease.lease,
+          activationId: minted.ref.activationId,
+          activationDigest: minted.ref.activationDigest,
+          authorityDigest: minted.ref.authorityDigest,
+          authorityRevision: minted.ref.authorityRevision,
+        });
+        if (preparation.status !== 'inserted') {
+          return {
+            status: 'blocked',
+            reason: preparation.status === 'replayed'
+              ? 'prior preparation crossing is already owned; retry under a fresh workflow invocation'
+              : preparation.reason,
+            zeroBody: true,
+            activationId: input.activationId,
+          };
+        }
+        if (!exactPhysicalLeaseMatches(preparation.identity, selectedLease.lease)) {
+          poison(port, input.activationId, 'workflow preparation reservation has a foreign or stale call lease');
+          return {
+            status: 'blocked',
+            reason: 'workflow preparation reservation has a foreign or stale call lease',
+            zeroBody: true,
+            activationId: input.activationId,
+          };
+        }
+        const preparationClaim = claimWorkflowPhysicalIoUnderLease({
+          physicalIdentity: preparation.identity,
+          lease: selectedLease.lease,
+          claim: {
+            identity: {
+              sessionId: identity.sessionId,
+              sourceUserSeq: identity.sourceUserSeq,
+              physicalDispatchId: preparation.identity.physicalDispatchId,
+              authorityRootId: identity.acceptedTaskId,
+              logicalCallId: identity.logicalToolCallId,
+            },
+            activationId: minted.ref.activationId,
+            activationDigest: minted.ref.activationDigest,
+            authorityDigest: minted.ref.authorityDigest,
+            authorityRevision: minted.ref.authorityRevision,
+            toolName: minted.toolName,
+          },
+        });
+        if (!preparationClaim.claimed) {
+          if (preparationClaim.reason !== 'already_claimed') {
+            poison(port, input.activationId, `workflow preparation I/O claim refused: ${preparationClaim.reason}`);
+          }
+          return {
+            status: 'blocked',
+            reason: preparationClaim.reason === 'already_claimed'
+              ? 'prior preparation crossing is already in flight or terminal'
+              : `workflow preparation I/O claim refused: ${preparationClaim.reason}`,
+            zeroBody: true,
+            activationId: input.activationId,
+          };
+        }
+        try {
+          preparedProof = await exactPort.prepareInvocation();
+        } catch (error) {
+          return settleFailedProviderCrossing(preparation.identity, error, false);
+        }
+        const preparedSettlement = settlePhysicalDispatch({
+          identity: preparation.identity,
+          tool: minted.toolName,
+          outcome: 'returned',
+          turn: 0,
+          dispatchLease: selectedLease.lease,
+        });
+        if (preparedSettlement.status !== 'inserted' && preparedSettlement.status !== 'replayed') {
+          poison(port, input.activationId, `workflow preparation settlement refused: ${preparedSettlement.reason}`);
+          return {
+            status: 'failed',
+            reason: preparedSettlement.reason,
+            zeroBody: true,
+            activationId: input.activationId,
+          };
+        }
+        preparationReady = true;
+      }
+
       const begun = beginPhysicalDispatch({
         identity,
         tool: minted.toolName,
@@ -838,89 +1088,43 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
 
       let result: unknown;
       try {
-        result = await exactPort.invoke({
-          nodeId: workflow.nodeId,
-          role: parsed.plan.requirementId,
-          payload: structuredClone(input.args),
-          identity: {
-            sessionId: identity.sessionId,
-            sourceUserSeq: identity.sourceUserSeq,
-            acceptedTaskId: identity.acceptedTaskId,
-          },
-          binding: {
-            capabilityId: exactPort.capability.capabilityId,
-            toolName: exactPort.capability.toolName,
-            schemaVersion: exactPort.capability.schemaVersion,
-            schemaDigest: exactPort.capability.schemaDigest,
-            args: structuredClone(input.args),
-            account: exactPort.capability.account,
-            effect: exactPort.capability.effect,
-            destination: exactPort.capability.destination,
-            manifestDigest: exactPort.capability.manifestDigest,
-            providerKind: exactPort.capability.providerKind,
-            liveFingerprint: exactPort.capability.liveFingerprint,
-            delegatedFrom: exactPort.capability.delegatedFrom,
-            manifest: exactPort.capability.manifest,
-            reconcile: exactPort.capability.reconcile,
-            invoke: exactPort.invoke,
-          },
-        });
-      } catch (error) {
-        const physical = settlePhysicalDispatch({
-          identity: begun.identity,
-          tool: minted.toolName,
-          outcome: 'threw',
-          turn: 0,
-          dispatchLease: selectedLease.lease,
-        });
-        const reason = String(error instanceof Error ? error.message : error)
-          .replace(/\s+/g, ' ').trim().slice(0, 160) || `${port.operationLabel} invocation threw`;
-        const logical = physical.status === 'inserted' || physical.status === 'replayed'
-          ? commitLogicalCallSettlement({
-              identity: {
-                sessionId: identity.sessionId,
-                sourceUserSeq: identity.sourceUserSeq,
-                acceptedTaskId: identity.acceptedTaskId,
-                logicalToolCallId: identity.logicalToolCallId,
-              },
-              contract: { toolName: minted.toolName, args: input.args },
-              execution: { kind: 'provider_execution' },
-              outcome: classifyAttemptOutcome({ executionFailed: true }),
-              recovery: {
-                businessCall: true,
-                mutating: port.mutating,
-                requirementId: parsed.plan.requirementId,
-              },
-              // Compatibility enum: this is the existing provider-neutral
-              // internal runner lane, not an Agents SDK/model invocation.
-              observer: { lane: 'agents_runner', callId: identity.logicalToolCallId, turn: 0 },
-            })
-          : null;
-        if (!logical || (logical.status !== 'committed' && logical.status !== 'replayed')) {
-          const settlementReason = logical && 'reason' in logical
-            ? logical.reason
-            : 'reason' in physical ? physical.reason : 'settlement did not commit';
-          poison(port, input.activationId, `workflow failed-call settlement refused: ${settlementReason}`);
-        } else {
-          const closed = closeWorkflowAndRevokeLease({
-            activationId: input.activationId,
-            outcome: 'failed',
-            lease: selectedLease.lease,
-            port,
+        const invokeBusiness = () => exactPort.invoke({
+            nodeId: workflow.nodeId,
+            role: parsed.plan.requirementId,
+            payload: structuredClone(input.args),
+            identity: {
+              sessionId: identity.sessionId,
+              sourceUserSeq: identity.sourceUserSeq,
+              acceptedTaskId: identity.acceptedTaskId,
+            },
+            binding: {
+              capabilityId: exactPort.capability.capabilityId,
+              toolName: exactPort.capability.toolName,
+              schemaVersion: exactPort.capability.schemaVersion,
+              schemaDigest: exactPort.capability.schemaDigest,
+              args: structuredClone(input.args),
+              account: exactPort.capability.account,
+              effect: exactPort.capability.effect,
+              destination: exactPort.capability.destination,
+              manifestDigest: exactPort.capability.manifestDigest,
+              providerKind: exactPort.capability.providerKind,
+              liveFingerprint: exactPort.capability.liveFingerprint,
+              delegatedFrom: exactPort.capability.delegatedFrom,
+              manifest: exactPort.capability.manifest,
+              reconcile: exactPort.capability.reconcile,
+              invoke: exactPort.invoke,
+            },
           });
-          if (closed.status !== 'closed' && closed.status !== 'replayed') {
-            const closeReason = 'reason' in closed
-              ? closed.reason
-              : 'workflow failed-call terminal closure did not commit';
-            poison(port, input.activationId, `workflow failed-call terminal closure refused: ${closeReason}`);
+        if (exactPort.invokeWithPreparation) {
+          if (!preparationReady) {
+            throw new Error('workflow exact port preparation did not become ready');
           }
+          result = await exactPort.invokeWithPreparation(preparedProof, invokeBusiness);
+        } else {
+          result = await invokeBusiness();
         }
-        return {
-          status: 'failed',
-          reason,
-          zeroBody: false,
-          activationId: input.activationId,
-        };
+      } catch (error) {
+        return settleFailedProviderCrossing(begun.identity, error, true);
       }
 
       const physical = settlePhysicalDispatch({
@@ -1008,4 +1212,29 @@ export async function executeWorkflowReadOnlyCall(input: {
   signal?: AbortSignal;
 }): Promise<ExecuteWorkflowReadOnlyCallResult> {
   return executeWorkflowCallKernel(input, READ_ONLY_WORKFLOW_CALL_AUTHORITY_PORT);
+}
+
+/** workflow_v3 adapter over the same logical/physical/claim/settlement kernel.
+ * The selected effect is read only from the exact content-addressed plan; no
+ * caller-supplied port or effect override can enter the kernel. */
+export async function executeWorkflowV3Call(input: {
+  activationId: string;
+  invocationPlan: unknown;
+  args: Record<string, unknown>;
+  signal?: AbortSignal;
+}): Promise<ExecuteWorkflowCallKernelResult> {
+  const parsed = parseWorkflowNodeInvocationPlan(input.invocationPlan);
+  if (
+    !parsed.ok
+    || parsed.plan.binding.effect === 'read'
+    || parsed.plan.binding.effect === 'compute'
+  ) {
+    return {
+      status: 'blocked',
+      reason: 'workflow v3 execution requires an exact non-read invocation plan',
+      zeroBody: true,
+      activationId: input.activationId,
+    };
+  }
+  return executeWorkflowCallKernel(input, workflowV3CallAuthorityPort(parsed.plan.binding.effect));
 }

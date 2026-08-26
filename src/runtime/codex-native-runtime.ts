@@ -4,7 +4,7 @@ import type { ApprovalResolutionResult, PendingApproval, RunRequest, RunResult }
 import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
 import { ApprovalStore } from './approval-store.js';
 import { addNotification, getNotification } from './notifications.js';
-import { ASSISTANT_NAME, BASE_DIR, DEFAULT_CODEX_MODEL } from '../config.js';
+import { BASE_DIR, DEFAULT_CODEX_MODEL } from '../config.js';
 import {
   assertCodexAccessTokenCanCoverCall,
   getStoredCodexOAuthTokens,
@@ -12,14 +12,9 @@ import {
   isCodexAuthDead,
   getCodexAuthDead,
 } from './auth-store.js';
-import { getCoreToolsAsync } from '../tools/registry.js';
-import { classifyTool } from '../agents/tool-taxonomy.js';
-import { beginToolEvent, recordPendingApproval, recordToolEvent } from '../agents/tool-observability.js';
+import { recordToolEvent } from '../agents/tool-observability.js';
 import { recordModelUsage } from './usage-log.js';
-import { formatRecallableToolText } from './harness/tool-output-format.js';
-import { checkpointWorkingMemory } from '../memory/working-memory.js';
-import { withToolOutputContext } from './harness/tool-output-context.js';
-import type { RuntimeContextValue, ToolActivity } from '../types.js';
+import type { ToolActivity } from '../types.js';
 import { codexDispatcher, detectUndiciTimeout, buildTransportTimeoutError } from './codex-dispatcher.js';
 
 const logger = pino({ name: 'clementine-next.codex-native-runtime' });
@@ -38,12 +33,6 @@ export interface CodexFunctionCall {
   name?: string;
   arguments?: string;
   phase?: unknown;
-}
-
-interface StoredCodexApprovalState {
-  request: RunRequest;
-  toolCall?: CodexFunctionCall;
-  inputHistory?: CodexInputMessage[];
 }
 
 interface CodexResponseResult {
@@ -169,11 +158,6 @@ function wallClockRetryAllowed(channel?: string): boolean {
   return !!channel && WALL_CLOCK_RETRY_CHANNELS.has(channel);
 }
 
-/** P2-F — between-turn working-memory checkpoint kill-switch (default on). */
-function turnCheckpointEnabled(): boolean {
-  return process.env.CLEMENTINE_TURN_CHECKPOINT !== 'off';
-}
-
 // One actionable user-facing notification per calendar day when the
 // Codex OAuth token has expired AND the auto-refresh attempt failed.
 // Without this, the 401 throws unwind to a logger.error stack trace
@@ -204,58 +188,17 @@ async function throwIfCancelled(callbacks?: AgentRuntimeCallbacks): Promise<void
 /**
  * Tool surface presented to the Codex Responses API.
  *
- * Sources are merged in a single flat list:
- *   1. Local SDK tools (`getCoreTools`) — request_destructive_action,
- *      computer-use, local runtime tools, compact Composio broker.
- *   2. (future) computer-use primitives via SDK `computerTool`.
- *
- * The OpenAI Agents SDK does NOT mediate Codex requests (Codex talks
- * to `chatgpt.com/backend-api/codex/responses` directly), so this
- * MCP deliberately does not enter this legacy runtime. The shared host
- * harness owns its accepted-source, call, lease, settlement, and evidence
- * authority; exposing MCP here would create a second execution kernel.
+ * This compatibility runtime talks to the Codex Responses endpoint directly,
+ * but it is model-only. The shared host harness owns every executable tool,
+ * handoff, approval, lease, settlement, and evidence boundary.
  */
-/** Exported for unit tests — verifies excludeToolNames filters the retired
- * legacy SDK surface. Not part of the public runtime API. */
-export async function createCodexToolDefinitions(excludeToolNames?: string[]) {
-  // 1. Local tools (Composio broker + computer + local runtime + planner shims).
-  const local = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  // Code-level backstop for per-call tool restriction. See
-  // RunRequest.excludeToolNames — names listed here are dropped from
-  // the local SDK tools below so the
-  // model never sees them.
-  const exclude = excludeToolNames && excludeToolNames.length > 0
-    ? new Set(excludeToolNames)
-    : null;
-
-  const localDefs = local
-    .filter((tool) => tool.type === 'function')
-    .filter((tool) => !exclude || !exclude.has(tool.name))
-    .map((tool) => ({
-      type: 'function' as const,
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
-      strict: tool.strict,
-    }));
-
-  return localDefs;
-}
-
-async function createToolMap() {
-  const tools = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  return new Map(tools
-    .filter((tool) => tool.type === 'function')
-    .map((tool) => [tool.name, tool]));
-}
-
-/**
- * True if `name` is a stale/hallucinated MCP tool: `<server>__<tool>`.
- * The retired runtime pairs these as no-start feedback instead of looking
- * them up locally or creating a second MCP execution owner.
- */
-function isMcpToolName(name: string): boolean {
-  return name.includes('__');
+/** Exported so the zero-surface provider contract can be pinned directly. */
+export async function createCodexToolDefinitions(
+  _excludeToolNames?: string[],
+): Promise<Array<{ type: 'function'; name: string }>> {
+  // Model text only. All executable capabilities belong to the shared host
+  // harness, irrespective of the historical per-call exclusion list.
+  return [];
 }
 
 function parseSseChunk(buffer: string): { events: CodexSseEvent[]; rest: string } {
@@ -306,16 +249,6 @@ function buildInput(prompt: string): CodexInputMessage[] {
           text: prompt,
         },
       ],
-    },
-  ];
-}
-
-function functionCallOutput(callId: string, output: string): CodexInputMessage[] {
-  return [
-    {
-      type: 'function_call_output',
-      call_id: callId,
-      output,
     },
   ];
 }
@@ -872,15 +805,6 @@ function extractResponseId(payload: Record<string, unknown>): string | undefined
   return undefined;
 }
 
-function stringifyToolOutput(value: unknown): string {
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
 function parseToolArguments(toolCall: CodexFunctionCall): Record<string, unknown> {
   const parsed = safeJsonParse(toolCall.arguments);
   return parsed ?? {};
@@ -891,17 +815,6 @@ function toolActivityFor(toolCall: CodexFunctionCall): ToolActivity {
     toolName: toolCall.name ?? 'unknown_tool',
     input: parseToolArguments(toolCall),
   };
-}
-
-function describeToolCall(toolCall?: CodexFunctionCall): string {
-  if (!toolCall?.arguments) return 'Approval required before I continue.';
-  const parsed = safeJsonParse(toolCall.arguments);
-  const action = typeof parsed?.action === 'string' ? parsed.action : 'Unknown action';
-  const reason = typeof parsed?.reason === 'string' ? parsed.reason : 'No reason provided';
-  if (toolCall.name === 'request_destructive_action') {
-    return `Approval required: ${action}. Reason: ${reason}`;
-  }
-  return `Approval required before running ${toolCall.name ?? 'tool'} with input: ${JSON.stringify(parsed ?? {}, null, 2)}`;
 }
 
 function isTransientCodexStatus(status?: number): boolean {
@@ -924,27 +837,14 @@ function sleep(ms: number): Promise<void> {
 export class CodexNativeRuntime implements AgentRuntime {
   private readonly approvals = new ApprovalStore();
 
-  listPendingApprovals(): PendingApproval[] {
-    return this.approvals.listPending();
+  constructor() {
+    // Preserve historical rows, but remove every opaque legacy approval from
+    // the executable queue. Only the shared host registry can resume work.
+    this.approvals.retirePending();
   }
 
-  private notifyApprovalPending(approval: PendingApproval, toolCall?: CodexFunctionCall): void {
-    addNotification({
-      id: `${Date.now()}-approval-${approval.id}`,
-      kind: 'approval',
-      title: `Approval required: ${approval.toolName}`,
-      body: describeToolCall(toolCall),
-      createdAt: new Date().toISOString(),
-      read: false,
-      metadata: {
-        approvalId: approval.id,
-        sessionId: approval.sessionId,
-        toolName: approval.toolName,
-        userId: approval.userId,
-        channel: approval.channel,
-        discordUserId: approval.channel?.startsWith('discord:') ? approval.userId : undefined,
-      },
-    });
+  listPendingApprovals(): PendingApproval[] {
+    return this.approvals.listPending();
   }
 
   private async performWithRefresh(
@@ -1040,195 +940,16 @@ export class CodexNativeRuntime implements AgentRuntime {
     }
   }
 
-  private async executeToolCall(
-    request: RunRequest,
-    sessionId: string,
+  private async refuseToolCall(
     toolCall: CodexFunctionCall,
     callbacks?: AgentRuntimeCallbacks,
-	  ): Promise<{ output?: string; pendingApprovalId?: string }> {
-	    await throwIfCancelled(callbacks);
-	    const name = toolCall.name;
-    if (!name) return { output: 'Tool call is missing a name.' };
-
-    // MCP tools live behind the namespace shim, not in the SDK tool
-    // map. Route them through the shim, apply the unified approval
-    // taxonomy ourselves (the shim doesn't expose a per-call
-    // needsApproval hook), and stream the result back into the Codex
-    // turn the same way SDK tools flow.
-    if (isMcpToolName(name)) {
-      return this.executeMcpToolCall(request, sessionId, toolCall, callbacks);
-    }
-
-    const tool = (await createToolMap()).get(name);
-    if (!tool) return { output: `Tool "${name}" is not available in this Clementine runtime.` };
-
-    const args = parseToolArguments(toolCall);
-    const runContext = {
-      context: {
-        sessionId,
-        userId: request.userId,
-        channel: request.channel,
-      } satisfies RuntimeContextValue,
-    } as any;
-
-    if (callbacks?.onToolActivity) {
-      await callbacks.onToolActivity(toolActivityFor(toolCall));
-    }
-
-    // Capture the taxonomy classification + the reason the SDK tool
-    // is asking for approval so we have a single observable shape for
-    // every call (local SDK tools + MCP), regardless of which approval
-    // function they wired in.
-    const kind = classifyTool(name, { args });
-    const needsApproval = await tool.needsApproval(runContext, args, toolCall.call_id ?? toolCall.id);
-    if (needsApproval) {
-      const approvalId = randomUUID();
-      const pendingApproval: PendingApproval = {
-        id: approvalId,
-        sessionId,
-        agentName: ASSISTANT_NAME,
-        toolName: name,
-        userId: request.userId,
-        channel: request.channel,
-        createdAt: new Date().toISOString(),
-        status: 'pending',
-        state: JSON.stringify({
-          request,
-          toolCall,
-        } satisfies StoredCodexApprovalState),
-      };
-      this.approvals.add(pendingApproval);
-      this.notifyApprovalPending(pendingApproval, toolCall);
-      recordPendingApproval({ sessionId, toolName: name, kind, args, approvalId, mcp: false });
-      return { pendingApprovalId: approvalId };
-    }
-
-    const finishEvent = beginToolEvent({
-      sessionId,
-      toolName: name,
-      kind,
-      approvalReason: 'auto',
-      args,
-      mcp: false,
-    });
-	    try {
-	      await throwIfCancelled(callbacks);
-	      const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
-	      // Establish the tool-output-context so a tool that formats its OWN
-	      // output internally (run_shell_command, composio, local-runtime via
-	      // formatRecallableToolText) can resolve sessionId/callId — the manual
-	      // codex-native dispatch doesn't propagate them through the SDK
-	      // runContext the way the harness Runner does. Without this, large
-	      // chat outputs fell to plain truncation (no digest, no recall).
-	      const output = await withToolOutputContext(
-	        { sessionId, callId, toolName: name },
-	        () => tool.invoke(runContext, toolCall.arguments ?? '{}', {
-        toolCall: {
-          id: toolCall.id ?? callId,
-          call_id: callId,
-          type: 'function_call',
-          name,
-          arguments: toolCall.arguments ?? '{}',
-        } as any,
-	        }),
-	      );
-	      await throwIfCancelled(callbacks);
-	      finishEvent('success');
-	      return {
-          output: formatRecallableToolText(stringifyToolOutput(output), {
-            sessionId,
-            callId,
-            toolName: name,
-          }),
-        };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      logger.warn({ err: error, tool: name }, 'Native Codex tool execution failed');
-      finishEvent('error', msg);
-      return { output: `Tool "${name}" failed: ${msg}` };
-    }
-  }
-
-  /** A stale/hallucinated MCP call on the retired runtime is returned to the
-   * model as a no-start result. Only the shared host lane may execute MCP. */
-  private async executeMcpToolCall(
-    _request: RunRequest,
-    _sessionId: string,
-    toolCall: CodexFunctionCall,
-    callbacks?: AgentRuntimeCallbacks,
-  ): Promise<{ output?: string; pendingApprovalId?: string }> {
-    const name = toolCall.name!;
-    if (callbacks?.onToolActivity) {
-      await callbacks.onToolActivity(toolActivityFor(toolCall));
-    }
-    await throwIfCancelled(callbacks);
-    return {
-      output: `Tool "${name}" was not started. Replan through Clementine's shared host tool lane.`,
-    };
-  }
-
-  private async executeApprovedToolCall(
-    request: RunRequest,
-    sessionId: string,
-    toolCall: CodexFunctionCall,
   ): Promise<string> {
-    const name = toolCall.name;
-    if (!name) return 'Tool call is missing a name.';
-
-    const args = parseToolArguments(toolCall);
-    const kind = classifyTool(name, { args });
-
-    // Historical legacy approvals do not mint authority in the shared host
-    // lane. Pair the old call back to the model without any tool I/O.
-    if (isMcpToolName(name)) {
-      return `Tool "${name}" was not started. Its historical legacy approval cannot authorize the shared host lane; replan it there.`;
+    await throwIfCancelled(callbacks);
+    if (callbacks?.onToolActivity) {
+      await callbacks.onToolActivity(toolActivityFor(toolCall));
     }
-
-    const tool = (await createToolMap()).get(name);
-    if (!tool) return `Tool "${name}" is not available in this Clementine runtime.`;
-
-    const runContext = {
-      context: {
-        sessionId,
-        userId: request.userId,
-        channel: request.channel,
-      } satisfies RuntimeContextValue,
-    } as any;
-
-    const finish = beginToolEvent({
-      sessionId,
-      toolName: name,
-      kind,
-      approvalReason: 'approved-after-prompt',
-      args,
-      mcp: false,
-    });
-    try {
-      const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
-      const output = await withToolOutputContext(
-        { sessionId, callId, toolName: name },
-        () => tool.invoke(runContext, toolCall.arguments ?? '{}', {
-        toolCall: {
-          id: toolCall.id ?? callId,
-          call_id: callId,
-          type: 'function_call',
-          name,
-          arguments: toolCall.arguments ?? '{}',
-        } as any,
-        }),
-      );
-      finish('success');
-      return formatRecallableToolText(stringifyToolOutput(output), {
-        sessionId,
-        callId,
-        toolName: name,
-      });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      logger.warn({ err: error, tool: name }, 'Approved native Codex tool execution failed');
-      finish('error', msg);
-      return `Tool "${name}" failed after approval: ${msg}`;
-    }
+    const name = toolCall.name || 'unknown_tool';
+    return `Tool "${name}" was not started. The retired direct runtime is model-only; re-submit this work through Clementine's shared host tool lane.`;
   }
 
   private async runToolLoop(
@@ -1313,55 +1034,19 @@ export class CodexNativeRuntime implements AgentRuntime {
         };
       }
 
-	      const nextInput: CodexInputMessage[] = [...currentInput];
-	      for (const toolCall of latestResult.toolCalls) {
-	        await throwIfCancelled(callbacks);
-	        toolCallsTotal++;
-	        const callId = toolCall.call_id ?? toolCall.id;
-        if (!callId) {
-          const fallbackCallId = randomUUID();
-          nextInput.push(functionCallInput({ ...toolCall, call_id: fallbackCallId }));
-          nextInput.push(...functionCallOutput(fallbackCallId, 'Tool call is missing a call_id.'));
-          continue;
-        }
-
-        nextInput.push(functionCallInput(toolCall));
-        const execution = await this.executeToolCall(request, sessionId, toolCall, callbacks);
-        if (execution.pendingApprovalId) {
-          const approval = this.approvals.get(execution.pendingApprovalId);
-          if (approval) {
-            const state = safeJsonParse(approval.state) as StoredCodexApprovalState | null;
-            if (state) {
-              state.inputHistory = nextInput;
-              this.approvals.updateStatus(approval.id, 'pending', JSON.stringify(state));
-            }
-          }
-          return {
-            text: `Approval required before I continue. Pending approval ID: ${execution.pendingApprovalId}`,
-            sessionId,
-            pendingApprovalId: execution.pendingApprovalId,
-            stoppedReason: 'pending-approval',
-            turnsUsed: turn + 1,
-            raw: latestResult,
-          };
-        }
-
-        nextInput.push(...functionCallOutput(callId, execution.output ?? 'Tool completed with no output.'));
-      }
-
-      currentInput = nextInput;
-
-      // P2-F — persist a compact in-flight checkpoint between turns (throttled,
-      // best-effort) so a later wall-clock abort or watchdog re-spawn resumes
-      // from progress rather than zero. refreshWorkingMemory only fires at the
-      // end of respond(), which a mid-loop abort never reaches.
-      if (turnCheckpointEnabled() && turn % 3 === 0) {
-        checkpointWorkingMemory(sessionId, {
-          turn: turn + 1,
-          toolCallsTotal,
-          lastText: latestResult?.text,
-        });
-      }
+      // No tool was advertised, so a provider-emitted function call is stale or
+      // malformed. Stop immediately: do not execute it, serialize it for later,
+      // or spend another model turn trying to continue an ownerless call.
+      toolCallsTotal += latestResult.toolCalls.length;
+      const refusal = await this.refuseToolCall(latestResult.toolCalls[0]!, callbacks);
+      if (callbacks?.onText) await callbacks.onText(refusal);
+      return {
+        text: refusal,
+        sessionId,
+        stoppedReason: 'blocked',
+        turnsUsed: turn + 1,
+        raw: latestResult,
+      };
     }
 
     // Hit the tool-turn cap. Instead of returning a static "ran out of
@@ -1544,41 +1229,17 @@ export class CodexNativeRuntime implements AgentRuntime {
       throw new Error(`Approval ${approvalId} not found.`);
     }
 
-    let outcome: ApprovalResolutionResult;
-    if (!approved) {
-      this.approvals.updateStatus(approvalId, 'rejected', approval.state);
-      outcome = {
-        approvalId,
-        status: 'rejected',
-        sessionId: approval.sessionId,
-        text: `Approval ${approvalId} rejected.`,
-      };
-    } else {
-      const state = safeJsonParse(approval.state) as StoredCodexApprovalState | null;
-      if (!state?.request || !state.toolCall) {
-        throw new Error(`Approval ${approvalId} has no resumable native Codex state.`);
-      }
-      const callId = state.toolCall.call_id ?? state.toolCall.id;
-      if (!callId) {
-        throw new Error(`Approval ${approvalId} is missing a tool call id.`);
-      }
-      this.approvals.updateStatus(approvalId, 'approved', approval.state);
-      const execution = await this.executeApprovedToolCall(state.request, approval.sessionId, state.toolCall);
-      const inputHistory = state.inputHistory?.length
-        ? [...state.inputHistory]
-        : [...buildInput(state.request.prompt), functionCallInput(state.toolCall)];
-      const resumed = await this.runToolLoop(
-        state.request,
-        approval.sessionId,
-        [...inputHistory, ...functionCallOutput(callId, execution)],
-      );
-      outcome = {
-        approvalId,
-        status: 'approved',
-        sessionId: approval.sessionId,
-        text: resumed.text,
-      };
+    if (approval.status === 'pending') {
+      this.approvals.updateStatus(approvalId, 'rejected');
     }
+    const outcome: ApprovalResolutionResult = {
+      approvalId,
+      status: 'rejected',
+      sessionId: approval.sessionId,
+      text: approved
+        ? `Legacy approval ${approvalId} was retired and was not executed. Re-submit the action through Clementine's shared harness so it can receive current authority.`
+        : `Approval ${approvalId} rejected. Its legacy runtime state was not executed.`,
+    };
 
     addNotification({
       id: `${Date.now()}-approval-${approvalId}-${outcome.status}`,

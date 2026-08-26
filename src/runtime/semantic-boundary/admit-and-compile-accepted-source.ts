@@ -64,6 +64,12 @@ import {
 import { recordConnectedGoalCatalog } from '../harness/connected-goal-catalog.js';
 import { digestSchema } from '../../tools/tool-contract-store.js';
 import {
+  getCachedToolSchema,
+  liveComposioOperationVersion,
+  liveComposioOutputSchema,
+} from '../../tools/composio-schema-cache.js';
+import { fingerprintComposioProviderDefinition } from '../../integrations/composio/provider-definition-identity.js';
+import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
   inspectAuthorizedLocalPlanningDisclosureCandidate,
   revalidateLocalPlanningDefinition,
@@ -251,15 +257,177 @@ export type AdmitAndCompileAcceptedSourceResult =
   | { ok: false; reason: string };
 
 const PRIMARY_MODEL_PLANNING_CATALOG_SCOPE = 'primary_model_planning_catalog_v1' as const;
+interface StagedProviderDefinitionV1 {
+  readonly version: 1;
+  readonly providerInputSchemaDigest: string;
+  readonly definitionFingerprint: string;
+  readonly providerOperationVersion: string;
+  readonly providerOutputSchemaDigest: string | null;
+  readonly invokePortId: string;
+}
+
 interface StagedPrimaryModelPlanningCapabilityV1 {
   descriptor: HostCapabilityDescriptorV1;
   identifier: string;
-  schemaDigest: string;
   providerKind: string;
   accountIdentity: string;
+  /** Provider definitions retain their independently meaningful identity
+   * fields. A full definition fingerprint is never aliased to an input-schema
+   * digest (or vice versa). */
+  providerDefinition?: StagedProviderDefinitionV1;
   /** Local rows have no provider manifest. Their exact configured surface and
    * registry semantics are carried here and revalidated at plan freeze. */
   localDefinition?: AuthorizedLocalPlanningDefinitionV1;
+}
+
+interface PrimaryModelPlanningDisclosureV1 {
+  descriptor: HostCapabilityDescriptorV1;
+  identifier: string;
+  providerKind: string;
+  providerDefinition: StagedProviderDefinitionV1 | null;
+}
+
+const PLANNING_IDENTITY_DIGEST = /^[a-f0-9]{64}$/i;
+
+function freezeStagedProviderDefinition(input: {
+  providerInputSchemaDigest: string;
+  definitionFingerprint: string;
+  providerOperationVersion: string;
+  providerOutputSchemaDigest: string | null;
+  invokePortId: string;
+}): StagedProviderDefinitionV1 | null {
+  const providerInputSchemaDigest = input.providerInputSchemaDigest.trim().toLowerCase();
+  const definitionFingerprint = input.definitionFingerprint.trim().toLowerCase();
+  const providerOperationVersion = input.providerOperationVersion.trim();
+  const invokePortId = input.invokePortId.trim();
+  const providerOutputSchemaDigest = input.providerOutputSchemaDigest === null
+    ? null
+    : input.providerOutputSchemaDigest.trim().toLowerCase();
+  if (
+    !PLANNING_IDENTITY_DIGEST.test(providerInputSchemaDigest)
+    || !PLANNING_IDENTITY_DIGEST.test(definitionFingerprint)
+    || (providerOutputSchemaDigest !== null
+      && !PLANNING_IDENTITY_DIGEST.test(providerOutputSchemaDigest))
+    || !providerOperationVersion
+    || !invokePortId
+  ) return null;
+  return Object.freeze({
+    version: 1,
+    providerInputSchemaDigest,
+    definitionFingerprint,
+    providerOperationVersion,
+    providerOutputSchemaDigest,
+    invokePortId,
+  });
+}
+
+function stagedProviderDefinitionFromRegistered(
+  entry: RegisteredHostCapability,
+): StagedProviderDefinitionV1 | null {
+  const manifest = entry.manifest;
+  const external = manifest?.externalDefinition;
+  if (
+    !manifest
+    || external?.providerOutputSchemaObserved !== true
+    || entry.schemaDigest !== manifest.definitionFingerprint
+  ) return null;
+  return freezeStagedProviderDefinition({
+    providerInputSchemaDigest: entry.providerInputSchemaDigest
+      ?? external.providerInputSchemaDigest,
+    definitionFingerprint: manifest.definitionFingerprint,
+    providerOperationVersion: manifest.operationVersion,
+    providerOutputSchemaDigest: external.providerOutputSchemaDigest ?? null,
+    invokePortId: manifest.invokePortId,
+  });
+}
+
+function currentComposioProviderDefinition(input: {
+  identifier: string;
+  schema: Record<string, unknown>;
+  accountIdentity: string;
+}): StagedProviderDefinitionV1 | null {
+  const liveSchema = getCachedToolSchema(input.identifier);
+  const providerInputSchemaDigest = digestSchema(input.schema);
+  if (!liveSchema || digestSchema(liveSchema) !== providerInputSchemaDigest) return null;
+  const providerOperationVersion = liveComposioOperationVersion(input.identifier);
+  const outputSchema = liveComposioOutputSchema(input.identifier);
+  if (!providerOperationVersion || outputSchema === undefined) return null;
+  const invokePortId = `port:cap:resolved:${input.identifier.toLowerCase()}:${input.identifier}`;
+  const definitionFingerprint = fingerprintComposioProviderDefinition({
+    operationId: input.identifier,
+    operationVersion: providerOperationVersion,
+    accountId: input.accountIdentity,
+    invokePortId,
+    inputSchema: input.schema,
+    outputSchema,
+  });
+  if (!definitionFingerprint) return null;
+  return freezeStagedProviderDefinition({
+    providerInputSchemaDigest,
+    definitionFingerprint,
+    providerOperationVersion,
+    providerOutputSchemaDigest: outputSchema ? digestSchema(outputSchema) : null,
+    invokePortId,
+  });
+}
+
+function replayedStagedProviderDefinition(value: unknown): StagedProviderDefinitionV1 | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (
+    row.version !== 1
+    || typeof row.providerInputSchemaDigest !== 'string'
+    || typeof row.definitionFingerprint !== 'string'
+    || typeof row.providerOperationVersion !== 'string'
+    || (row.providerOutputSchemaDigest !== null
+      && typeof row.providerOutputSchemaDigest !== 'string')
+    || typeof row.invokePortId !== 'string'
+  ) return null;
+  return freezeStagedProviderDefinition({
+    providerInputSchemaDigest: row.providerInputSchemaDigest,
+    definitionFingerprint: row.definitionFingerprint,
+    providerOperationVersion: row.providerOperationVersion,
+    providerOutputSchemaDigest: row.providerOutputSchemaDigest,
+    invokePortId: row.invokePortId,
+  });
+}
+
+function stagedProviderDefinitionsEqual(
+  left: StagedProviderDefinitionV1 | null | undefined,
+  right: StagedProviderDefinitionV1 | null | undefined,
+): boolean {
+  return Boolean(left && right && JSON.stringify(left) === JSON.stringify(right));
+}
+
+function legacyProviderInputSchemaDigest(row: Record<string, unknown>): string | null {
+  // A nested-but-invalid providerDefinition is not a legacy row and must not
+  // be silently downgraded to the older, narrower identity shape.
+  if (Object.prototype.hasOwnProperty.call(row, 'providerDefinition')) return null;
+  if (typeof row.schemaFingerprint !== 'string') return null;
+  const digest = row.schemaFingerprint.trim().toLowerCase();
+  return PLANNING_IDENTITY_DIGEST.test(digest) ? digest : null;
+}
+
+/** Upgrade a pre-providerDefinition Composio disclosure from current evidence.
+ * The legacy digest authorizes only the input-schema comparison. Every other
+ * field is independently reconstructed from the still-live provider
+ * observation, so the input digest is never promoted into a full definition
+ * fingerprint by aliasing. */
+function upgradeLegacyComposioProviderDefinition(input: {
+  row: Record<string, unknown>;
+  identifier: string;
+  accountIdentity: string;
+}): StagedProviderDefinitionV1 | null {
+  const legacyInputDigest = legacyProviderInputSchemaDigest(input.row);
+  if (!legacyInputDigest) return null;
+  const schema = getCachedToolSchema(input.identifier);
+  if (!schema || digestSchema(schema) !== legacyInputDigest) return null;
+  const current = currentComposioProviderDefinition({
+    identifier: input.identifier,
+    schema,
+    accountIdentity: input.accountIdentity,
+  });
+  return current?.providerInputSchemaDigest === legacyInputDigest ? current : null;
 }
 
 const primaryModelPlanningCatalogs = new WeakMap<object, {
@@ -269,12 +437,7 @@ const primaryModelPlanningCatalogs = new WeakMap<object, {
   capabilities: HostCapabilityDescriptorV1[];
   /** Every exact currently materialized manifest observed by this planning frame. */
   liveCapabilities: readonly HostCapabilityDescriptorV1[];
-  disclosureByName: ReadonlyMap<string, {
-    descriptor: HostCapabilityDescriptorV1;
-    identifier: string;
-    schemaDigest: string;
-    providerKind: string;
-  }>;
+  disclosureByName: ReadonlyMap<string, PrimaryModelPlanningDisclosureV1>;
   /** Exact foreground-search disclosures that are not executable yet. The
    * selected subset is published and revalidated only inside plan_task. */
   stagedById: Map<string, StagedPrimaryModelPlanningCapabilityV1>;
@@ -286,10 +449,46 @@ export interface PrimaryModelPlanningCatalogAuthorityV1 {
 }
 
 export interface HostFreshPlanningContextV1 {
-  authority: PrimaryModelPlanningCatalogAuthorityV1;
-  identity: { sessionId: string; sourceUserSeq: number };
-  capabilities: readonly HostCapabilityDescriptorV1[];
-  digest: string;
+  readonly authority: PrimaryModelPlanningCatalogAuthorityV1;
+  readonly identity: Readonly<{ sessionId: string; sourceUserSeq: number }>;
+  readonly capabilities: readonly HostCapabilityDescriptorV1[];
+  readonly digest: string;
+}
+
+/** Rebuild the public, immutable view of one live planning authority.
+ *
+ * Foreground tool_search disclosures monotonically update the private catalog
+ * behind the opaque authority. Callers must therefore re-read this view at a
+ * model/tool boundary instead of retaining the initial (possibly empty)
+ * snapshot forever. Each returned digest remains bound to exactly the returned
+ * capability array; previously returned snapshots are never mutated. */
+export function snapshotPrimaryModelPlanningContext(
+  authority: PrimaryModelPlanningCatalogAuthorityV1,
+): HostFreshPlanningContextV1 | null {
+  if (
+    !authority
+    || authority.scope !== PRIMARY_MODEL_PLANNING_CATALOG_SCOPE
+  ) return null;
+  const catalog = primaryModelPlanningCatalogs.get(authority as object);
+  if (!catalog) return null;
+  return Object.freeze({
+    authority,
+    identity: Object.freeze({
+      sessionId: catalog.sessionId,
+      sourceUserSeq: catalog.sourceUserSeq,
+    }),
+    capabilities: Object.freeze(catalog.capabilities.map((descriptor) => Object.freeze({
+      ...descriptor,
+      acceptedInputKinds: Object.freeze([...descriptor.acceptedInputKinds]),
+      producedOutputKinds: Object.freeze([...descriptor.producedOutputKinds]),
+      applicableDeliverableKinds: Object.freeze([...descriptor.applicableDeliverableKinds]),
+      evidenceKinds: Object.freeze([...descriptor.evidenceKinds]),
+      ...(descriptor.advisoryRoles
+        ? { advisoryRoles: Object.freeze([...descriptor.advisoryRoles]) }
+        : {}),
+    }))),
+    digest: catalog.digest,
+  });
 }
 
 function planningWords(value: string): Set<string> {
@@ -298,15 +497,17 @@ function planningWords(value: string): Set<string> {
 
 const FRESH_PLANNING_CARD_LIMIT = 8;
 const FRESH_PLANNING_CARD_BYTES = 8_192;
-/** Bound on the pre-model capability-resolution phase. Observed completed
- *  resolutions on the live home max at 63s (p95 well under 20s); the default
- *  clears every measured success while converting a silent registry wedge
- *  (live: 20+ minutes) into a bounded, recorded degradation. Env override is
+/** One absolute bound on the pre-model capability-resolution phase. Connected
+ *  account resolution now owns a single 15s raw+SDK deadline; the phase starts
+ *  this clock before launching either branch and gives the dependent proof
+ *  projection a 5s tail. It therefore cannot stack a fresh 15s account clock
+ *  behind index work (or a fresh proof clock behind accounts). A provider
+ *  wedge becomes a bounded, recorded index-only degradation. Env override is
  *  an operational tunable, read per-call so tests and incidents can set it
  *  without a reboot. */
 export function capabilityResolutionDeadlineMs(): number {
   const raw = Number(getRuntimeEnv('CAPABILITY_RESOLUTION_DEADLINE_MS', ''));
-  return Number.isFinite(raw) && raw > 0 ? raw : 90_000;
+  return Number.isFinite(raw) && raw > 0 ? raw : 20_000;
 }
 
 function boundedFreshPlanningCard(
@@ -448,7 +649,7 @@ function replayedLocalPlanningDefinition(value: unknown): AuthorizedLocalPlannin
 async function durablePlanningDisclosures(input: {
   sessionId: string;
   sourceUserSeq: number;
-  byName: ReadonlyMap<string, { descriptor: HostCapabilityDescriptorV1; schemaDigest: string }>;
+  byName: ReadonlyMap<string, PrimaryModelPlanningDisclosureV1>;
 }): Promise<{
   descriptors: HostCapabilityDescriptorV1[];
   stagedById: Map<string, StagedPrimaryModelPlanningCapabilityV1>;
@@ -497,7 +698,6 @@ async function durablePlanningDisclosures(input: {
         const staged: StagedPrimaryModelPlanningCapabilityV1 = {
           descriptor: revalidated.definition.descriptor,
           identifier: revalidated.definition.name,
-          schemaDigest: revalidated.definition.schemaFingerprint,
           providerKind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
           accountIdentity: revalidated.definition.accountIdentity,
           localDefinition: revalidated.definition,
@@ -508,19 +708,49 @@ async function durablePlanningDisclosures(input: {
       }
       const match = input.byName.get(identifier);
       if (match) {
+        const durableProviderKind = typeof row.providerKind === 'string'
+          ? row.providerKind
+          : typeof row.kind === 'string'
+            ? row.kind
+            : '';
+        const durableAccountIdentity = typeof row.accountIdentity === 'string'
+          ? row.accountIdentity.trim()
+          : '';
+        const providerDefinition = replayedStagedProviderDefinition(row.providerDefinition);
+        const registeredAccountIdentity = match.descriptor.accountScope.trim();
+        const identityMatches = durableProviderKind === match.providerKind
+          && durableAccountIdentity === registeredAccountIdentity;
+        const upgradedLegacyDefinition = identityMatches
+          && match.providerKind.toLowerCase() === 'composio'
+          && match.providerDefinition
+          && legacyProviderInputSchemaDigest(row) === match.providerDefinition.providerInputSchemaDigest
+          ? match.providerDefinition
+          : null;
         if (
           row.capabilityRef !== match.descriptor.id
           || row.manifestDigest !== match.descriptor.manifestDigest
-          || row.schemaFingerprint !== match.schemaDigest
+          || !identityMatches
+          || !stagedProviderDefinitionsEqual(
+            providerDefinition ?? upgradedLegacyDefinition,
+            match.providerDefinition,
+          )
         ) continue;
         out.set(match.descriptor.id, match.descriptor);
         continue;
       }
       const descriptor = replayedPlanningDescriptor(row.descriptor);
-      const schemaDigest = typeof row.schemaFingerprint === 'string' ? row.schemaFingerprint : '';
       const accountIdentity = typeof row.accountIdentity === 'string' && row.accountIdentity.trim()
         ? row.accountIdentity.trim()
         : 'runtime';
+      const replayedProviderDefinition = replayedStagedProviderDefinition(row.providerDefinition);
+      const providerDefinition = replayedProviderDefinition
+        ?? (row.providerKind === 'composio'
+          ? upgradeLegacyComposioProviderDefinition({
+              row,
+              identifier: typeof row.identifier === 'string' ? row.identifier.trim() : identifier,
+              accountIdentity,
+            })
+          : null);
       const effectClass = descriptor?.effect === 'read'
         ? 'read'
         : descriptor?.effect === 'external_write'
@@ -534,16 +764,16 @@ async function durablePlanningDisclosures(input: {
         || row.manifestDigest !== descriptor.manifestDigest
         || descriptor.id !== `cap:resolved:${identifier}`
         || descriptor.accountScope !== accountIdentity
-        || !/^[a-f0-9]{64}$/i.test(schemaDigest)
+        || !providerDefinition
         || !effectClass
         || !proven.has(JSON.stringify({ identifier, effectClass, accountIdentity }))
       ) continue;
       const staged = {
         descriptor,
         identifier: typeof row.identifier === 'string' ? row.identifier.trim() : identifier,
-        schemaDigest,
         providerKind: 'composio',
         accountIdentity,
+        providerDefinition,
       };
       stagedById.set(descriptor.id, staged);
       out.set(descriptor.id, descriptor);
@@ -579,27 +809,35 @@ export async function primePrimaryModelPlanningCatalog(input: {
     indexedDescriptors = hostDescriptorsFromCapabilityIndex(objective);
   }
   const catalogEntries = peekHostCapabilityCatalogFactory()?.snapshot() ?? [];
-  const catalogDescriptors = catalogEntries
-    .map(hostDescriptorFromRegistered)
-    .filter((entry): entry is HostCapabilityDescriptorV1 => entry !== null);
+  const catalogDescriptors = catalogEntries.flatMap((entry) => {
+    const descriptor = hostDescriptorFromRegistered(entry);
+    if (!descriptor) return [];
+    const providerKind = entry.providerKind ?? entry.manifest?.providerKind ?? 'host';
+    // An incomplete Composio row can never survive selected-definition
+    // revalidation. Keeping it off the planning card prevents plan_task from
+    // being surfaced for authority that is guaranteed to fail at freeze.
+    if (
+      providerKind.toLowerCase() === 'composio'
+      && !stagedProviderDefinitionFromRegistered(entry)
+    ) return [];
+    return [descriptor];
+  });
   // Existing proof/index facts rank only exact live ids. They are never copied
   // into the citable set by this seam.
   const proofDescriptors = hostDescriptorsFromResolutionProof(input.sessionId, input.sourceUserSeq);
-  const disclosureByName = new Map<string, {
-    descriptor: HostCapabilityDescriptorV1;
-    identifier: string;
-    schemaDigest: string;
-    providerKind: string;
-  }>();
+  const disclosureByName = new Map<string, PrimaryModelPlanningDisclosureV1>();
   for (const entry of catalogEntries) {
     const descriptor = hostDescriptorFromRegistered(entry);
     if (!descriptor) continue;
     const identifier = entry.manifest?.operationId?.trim() || entry.toolName.trim();
+    const providerKind = entry.providerKind ?? entry.manifest?.providerKind ?? 'host';
+    const providerDefinition = stagedProviderDefinitionFromRegistered(entry);
+    if (providerKind.toLowerCase() === 'composio' && !providerDefinition) continue;
     const disclosure = {
       descriptor,
       identifier,
-      schemaDigest: entry.schemaDigest,
-      providerKind: entry.providerKind ?? entry.manifest?.providerKind ?? 'host',
+      providerKind,
+      providerDefinition,
     };
     for (const name of [identifier, entry.toolName, descriptor.id]) {
       if (name.trim()) disclosureByName.set(name.trim().toLowerCase(), disclosure);
@@ -629,14 +867,11 @@ export async function primePrimaryModelPlanningCatalog(input: {
     stagedById: replayed.stagedById,
     digest,
   });
+  const planning = snapshotPrimaryModelPlanningContext(authority);
+  if (!planning) return { ok: false, reason: 'host planning catalog snapshot was not installed' };
   return {
     ok: true,
-    planning: {
-      authority,
-      identity: { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
-      capabilities: Object.freeze([...capabilities]),
-      digest,
-    },
+    planning,
   };
 }
 
@@ -661,13 +896,14 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
     kind: string;
     identifier: string;
     effectClass: 'read' | 'write' | 'unknown';
-    schemaFingerprint: string;
     capabilityRef: string;
     manifestDigest: string;
     accountIdentity?: string;
     providerKind?: string;
     descriptor?: HostCapabilityDescriptorV1;
     localAuthority?: AuthorizedLocalPlanningDefinitionV1;
+    schemaFingerprint?: string;
+    providerDefinition?: StagedProviderDefinitionV1;
   }> = [];
   const allowed = new Map(catalog.capabilities.map((descriptor) => [descriptor.id, descriptor]));
   const proofById = new Map(
@@ -699,15 +935,14 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       if (prior && (
         prior.providerKind !== AUTHORIZED_LOCAL_REGISTRY_PROVENANCE
         || prior.identifier !== current.name
-        || prior.schemaDigest !== current.schemaFingerprint
         || prior.accountIdentity !== current.accountIdentity
         || prior.localDefinition?.envelopeFingerprint !== current.envelopeFingerprint
+        || prior.providerDefinition !== undefined
         || JSON.stringify(prior.descriptor) !== JSON.stringify(current.descriptor)
       )) continue;
       const staged: StagedPrimaryModelPlanningCapabilityV1 = prior ?? {
         descriptor: current.descriptor,
         identifier: current.name,
-        schemaDigest: current.schemaFingerprint,
         providerKind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
         accountIdentity: current.accountIdentity,
         localDefinition: current,
@@ -743,9 +978,13 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
           : exact.descriptor.effect === 'external_write' || exact.descriptor.effect === 'local_write'
             ? 'write'
             : 'unknown',
-        schemaFingerprint: exact.schemaDigest,
         capabilityRef: exact.descriptor.id,
         manifestDigest: exact.descriptor.manifestDigest,
+        accountIdentity: exact.descriptor.accountScope,
+        providerKind: exact.providerKind,
+        ...(exact.providerDefinition
+          ? { providerDefinition: exact.providerDefinition }
+          : {}),
       });
       continue;
     }
@@ -767,23 +1006,21 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       if (materialized.status !== 'installed') continue;
       const entry = peekHostCapabilityCatalogFactory()?.get(materialized.manifest.manifestId);
       const descriptor = entry ? hostDescriptorFromRegistered(entry) : null;
-      if (!entry || !descriptor || !entry.providerInputSchemaDigest) continue;
+      const providerDefinition = entry ? stagedProviderDefinitionFromRegistered(entry) : null;
+      if (!entry || !descriptor || !providerDefinition) continue;
       const prior = catalog.stagedById.get(descriptor.id);
       const staged: StagedPrimaryModelPlanningCapabilityV1 = {
         descriptor: Object.freeze({ ...descriptor }),
         identifier: materialized.manifest.operationId,
-        // The provider-input digest is carried independently on the exact
-        // catalog binding. This field preserves the complete manifest
-        // definition identity used by the plan-freeze comparison below.
-        schemaDigest: entry.schemaDigest,
         providerKind: 'native_mcp',
         accountIdentity: materialized.manifest.accountId,
+        providerDefinition,
       };
       if (prior && (
         prior.identifier !== staged.identifier
-        || prior.schemaDigest !== staged.schemaDigest
         || prior.providerKind !== staged.providerKind
         || prior.accountIdentity !== staged.accountIdentity
+        || !stagedProviderDefinitionsEqual(prior.providerDefinition, staged.providerDefinition)
         || JSON.stringify(prior.descriptor) !== JSON.stringify(staged.descriptor)
       )) continue;
       catalog.stagedById.set(descriptor.id, prior ?? staged);
@@ -794,12 +1031,12 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
         kind: 'native_mcp',
         identifier: materialized.manifest.operationId,
         effectClass: descriptor.effect === 'read' ? 'read' : 'write',
-        schemaFingerprint: entry.schemaDigest,
         capabilityRef: descriptor.id,
         manifestDigest: descriptor.manifestDigest,
         accountIdentity: materialized.manifest.accountId,
         providerKind: 'native_mcp',
         descriptor,
+        providerDefinition,
       });
       continue;
     }
@@ -825,22 +1062,31 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       && (entry.effectClass === 'read' || entry.effectClass === 'write')
     ));
     if (!descriptor || !proof) continue;
-    const schemaDigest = digestSchema(candidate.schema);
+    const providerInputSchemaDigest = digestSchema(candidate.schema);
     const accountIdentity = proof.accountIdentity?.trim() || 'runtime';
     if (descriptor.accountScope !== accountIdentity) continue;
+    const providerDefinition = currentComposioProviderDefinition({
+      identifier: name,
+      schema: candidate.schema as Record<string, unknown>,
+      accountIdentity,
+    });
+    if (
+      !providerDefinition
+      || providerDefinition.providerInputSchemaDigest !== providerInputSchemaDigest
+    ) continue;
     const prior = catalog.stagedById.get(capabilityRef);
     if (prior && (
       prior.identifier.toLowerCase() !== name.toLowerCase()
-      || prior.schemaDigest !== schemaDigest
       || prior.accountIdentity !== accountIdentity
+      || !stagedProviderDefinitionsEqual(prior.providerDefinition, providerDefinition)
       || JSON.stringify(prior.descriptor) !== JSON.stringify(descriptor)
     )) continue;
     const staged: StagedPrimaryModelPlanningCapabilityV1 = prior ?? {
       descriptor: Object.freeze({ ...descriptor }),
       identifier: name,
-      schemaDigest,
       providerKind: 'composio',
       accountIdentity,
+      providerDefinition,
     };
     catalog.stagedById.set(capabilityRef, staged);
     refs[name] = capabilityRef;
@@ -850,12 +1096,12 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       kind: 'composio',
       identifier: name,
       effectClass: descriptor.effect === 'read' ? 'read' : 'write',
-      schemaFingerprint: schemaDigest,
       capabilityRef,
       manifestDigest: descriptor.manifestDigest,
       accountIdentity,
       providerKind: 'composio',
       descriptor: staged.descriptor,
+      providerDefinition,
     });
   }
   if (newlyDisclosed.length > 0) {
@@ -1007,15 +1253,28 @@ export async function prepareDurableAcceptedTurnCompile(
   let selectedPrimaryCapabilityRefs = new Set<string>();
   let capabilityResolutionOutcome: 'completed' | 'capability_resolution_deadline_exceeded' = 'completed';
   if (!primaryModelProposal) {
-    // The three resolution legs share one deadline: each leg is additive and
-    // already degrades through its catch, but the awaits inside them reach
-    // live registries with no timeout of their own — a slow registry held a
-    // run in this phase for 20+ minutes with only a watchdog notice. Observed
-    // completed resolutions max at 63s on this home, so the deadline clears
-    // every measured success while bounding the wedge. A miss abandons the
-    // phase rather than cancelling it (the underlying fetch has no abort
-    // seam yet); the late legs at worst record/register additively.
-    const resolutionPhase = (async (): Promise<HostCapabilityDescriptorV1[]> => {
+    // Start one absolute clock before either branch. Index retrieval is
+    // independent of the connected-account view and must not sit behind it;
+    // proof provisioning is not independent and remains strictly downstream
+    // of the connected-goal catalog that produces its proof entries.
+    const resolutionDeadlineAt = Date.now() + capabilityResolutionDeadlineMs();
+    let completedIndexDescriptors: HostCapabilityDescriptorV1[] | null = null;
+    const indexedCatalogLeg = (async (): Promise<HostCapabilityDescriptorV1[]> => {
+      let descriptors: HostCapabilityDescriptorV1[];
+      try {
+        const indexed = await registerIndexedCapabilitiesForTurn({
+          sessionId: input.identity.sessionId,
+          sourceUserSeq: input.identity.sourceUserSeq,
+          objective: durableText,
+        });
+        descriptors = indexed.descriptors;
+      } catch {
+        descriptors = hostDescriptorsFromCapabilityIndex(durableText);
+      }
+      completedIndexDescriptors = descriptors;
+      return descriptors;
+    })();
+    const connectedGoalThenProofLeg = (async (): Promise<void> => {
       try {
         await recordConnectedGoalCatalog({
           sessionId: input.identity.sessionId,
@@ -1026,29 +1285,30 @@ export async function prepareDurableAcceptedTurnCompile(
       try {
         await registerProofProvisionedCapabilities(input.identity);
       } catch { /* proof provision is additive; bind still fail-closes */ }
-      try {
-        const indexed = await registerIndexedCapabilitiesForTurn({
-          sessionId: input.identity.sessionId,
-          sourceUserSeq: input.identity.sourceUserSeq,
-          objective: durableText,
-        });
-        return indexed.descriptors;
-      } catch {
-        return hostDescriptorsFromCapabilityIndex(durableText);
-      }
     })();
+    const resolutionPhase = Promise.all([
+      connectedGoalThenProofLeg,
+      indexedCatalogLeg,
+    ]).then(([, descriptors]) => descriptors);
     const expired = Symbol('capability-resolution-deadline');
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     const raced = await Promise.race([
       resolutionPhase,
       new Promise<typeof expired>((resolve) => {
-        deadlineTimer = setTimeout(() => resolve(expired), capabilityResolutionDeadlineMs());
+        deadlineTimer = setTimeout(
+          () => resolve(expired),
+          Math.max(0, resolutionDeadlineAt - Date.now()),
+        );
       }),
     ]);
     if (deadlineTimer) clearTimeout(deadlineTimer);
     if (raced === expired) {
       capabilityResolutionOutcome = 'capability_resolution_deadline_exceeded';
-      indexDescriptors = hostDescriptorsFromCapabilityIndex(durableText);
+      // Preserve the immutable result of an index leg that completed inside
+      // the deadline. Only an index leg that itself missed the absolute bound
+      // falls back to a same-tick local read.
+      indexDescriptors = completedIndexDescriptors
+        ?? hostDescriptorsFromCapabilityIndex(durableText);
       // The turn proceeds on the index-only catalog; the abandoned leg must
       // not land its authoritative resolution for this source later (observed
       // live +64s after disclosure — a stale-authority write for a decision
@@ -1056,8 +1316,8 @@ export async function prepareDurableAcceptedTurnCompile(
       markAdmissionCapabilityResolutionSuperseded(
         input.identity.sessionId,
         input.identity.sourceUserSeq,
+        resolutionPhase,
       );
-      void resolutionPhase.catch(() => { /* abandoned leg; its catches already absorb */ });
     } else {
       indexDescriptors = raced;
     }
@@ -1082,22 +1342,45 @@ export async function prepareDurableAcceptedTurnCompile(
     const selectedStaged = [...selectedPrimaryCapabilityRefs]
       .map((ref) => primaryPlanningCatalog!.stagedById.get(ref))
       .filter((entry): entry is StagedPrimaryModelPlanningCapabilityV1 => Boolean(entry));
-    const selectedComposioDefinitions = [...selectedPrimaryCapabilityRefs].flatMap((ref) => {
+    const selectedComposioRefs: Array<{
+      identifier: string;
+      accountIdentity: string;
+      providerDefinition: StagedProviderDefinitionV1 | null | undefined;
+    }> = [];
+    for (const ref of selectedPrimaryCapabilityRefs) {
       const staged = primaryPlanningCatalog!.stagedById.get(ref);
       if (staged?.providerKind.toLowerCase() === 'composio') {
-        return [{
+        selectedComposioRefs.push({
           identifier: staged.identifier,
-          schemaDigest: staged.schemaDigest,
           accountIdentity: staged.accountIdentity,
-        }];
+          providerDefinition: staged.providerDefinition,
+        });
+        continue;
       }
       const initial = primaryPlanningCatalog!.disclosureByName.get(ref.trim().toLowerCase());
-      if (initial?.providerKind.toLowerCase() !== 'composio') return [];
-      return [{
+      if (initial?.providerKind.toLowerCase() !== 'composio') continue;
+      selectedComposioRefs.push({
         identifier: initial.identifier,
-        schemaDigest: initial.schemaDigest,
         accountIdentity: initial.descriptor.accountScope,
-      }];
+        providerDefinition: initial.providerDefinition,
+      });
+    }
+    if (selectedComposioRefs.some((entry) => !entry.providerDefinition)) {
+      return { ok: false, reason: 'selected Composio capability lacks its exact staged provider definition' };
+    }
+    const selectedComposioDefinitions = selectedComposioRefs.map((entry) => {
+      const definition = entry.providerDefinition!;
+      return {
+        identifier: entry.identifier,
+        // Selected-definition revalidation still names its input digest
+        // `schemaDigest`; feed it only the explicitly separated input field.
+        schemaDigest: definition.providerInputSchemaDigest,
+        accountIdentity: entry.accountIdentity,
+        definitionFingerprint: definition.definitionFingerprint,
+        outputSchemaDigest: definition.providerOutputSchemaDigest,
+        providerOperationVersion: definition.providerOperationVersion,
+        invokePortId: definition.invokePortId,
+      };
     });
     if (selectedComposioDefinitions.length > 0) {
       const provisioned = await registerProofProvisionedCapabilities(input.identity, {
@@ -1159,7 +1442,8 @@ export async function prepareDurableAcceptedTurnCompile(
         if (
           !revalidated.ok
           || revalidated.definition.capabilityRef !== descriptor.id
-          || revalidated.definition.schemaFingerprint !== staged.schemaDigest
+          || revalidated.definition.schemaFingerprint
+            !== staged.localDefinition.schemaFingerprint
           || revalidated.definition.accountIdentity !== staged.accountIdentity
           || JSON.stringify(revalidated.definition.descriptor) !== JSON.stringify(descriptor)
         ) return { ok: false, reason: 'disclosed local capability changed before plan freeze' };
@@ -1177,10 +1461,18 @@ export async function prepareDurableAcceptedTurnCompile(
       }
       const entry = currentEntriesById.get(descriptor.id);
       const operationId = entry?.manifest?.operationId?.trim() || entry?.toolName.trim() || '';
+      const currentProviderDefinition = entry
+        ? stagedProviderDefinitionFromRegistered(entry)
+        : null;
       if (
         !entry
+        || !staged.providerDefinition
+        || !currentProviderDefinition
         || operationId.toLowerCase() !== staged.identifier.toLowerCase()
-        || entry.schemaDigest !== staged.schemaDigest
+        || !stagedProviderDefinitionsEqual(
+          currentProviderDefinition,
+          staged.providerDefinition,
+        )
         || (entry.providerKind ?? entry.manifest?.providerKind ?? '') !== staged.providerKind
         || (entry.account ?? entry.manifest?.accountId ?? 'runtime') !== staged.accountIdentity
         || current.effect !== staged.descriptor.effect

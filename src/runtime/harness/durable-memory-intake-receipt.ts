@@ -9,7 +9,11 @@
  */
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { extractAutoMemoryCandidates } from '../../memory/auto-capture.js';
+import {
+  autoCaptureProvenanceFromAcceptedEvent,
+  extractAutoMemoryCandidates,
+  isEligibleAutoCaptureSourceProvenance,
+} from '../../memory/auto-capture.js';
 import { openMemoryDb } from '../../memory/db.js';
 import { reflectionCandidateHash } from '../../memory/reflection-candidates.js';
 import {
@@ -243,12 +247,16 @@ function deriveExactEvidence(input: {
     }
     const eventDb = openEventLog();
     const source = eventDb.prepare(`
-      SELECT id, turn, data_json
+      SELECT id, session_id, seq, turn, role, type, data_json
         FROM events
-       WHERE session_id = ? AND seq = ? AND type = 'user_input_received'
+       WHERE session_id = ? AND seq = ?
     `).get(input.sessionId, input.sourceUserSeq) as {
       id: string;
+      session_id: string;
+      seq: number;
       turn: number;
+      role: string;
+      type: string;
       data_json: string;
     } | undefined;
     if (!source) return { status: 'missing', reason: 'accepted user source is missing' };
@@ -257,6 +265,20 @@ function deriveExactEvidence(input: {
       return { status: 'conflict', reason: 'accepted user source is malformed' };
     }
     if (!record(sourceData)) return { status: 'conflict', reason: 'accepted user source is malformed' };
+    const sourceProvenance = autoCaptureProvenanceFromAcceptedEvent({
+      sessionId: source.session_id,
+      id: source.id,
+      seq: source.seq,
+      role: source.role,
+      type: source.type,
+      data: sourceData,
+    });
+    if (!isEligibleAutoCaptureSourceProvenance(sourceProvenance, {
+      sessionId: input.sessionId,
+      sourceEventId: `user-source:${input.sourceUserSeq}`,
+    })) {
+      return { status: 'ineligible', reason: 'accepted source is not genuine user memory authority' };
+    }
     const message = acceptedSourceText(sourceData);
     if (!message) return { status: 'conflict', reason: 'accepted user source has no display text' };
     const normalizedMessage = normalizeMessage(message);

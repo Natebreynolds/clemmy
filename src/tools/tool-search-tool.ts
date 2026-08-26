@@ -15,6 +15,7 @@
  * enabled, catalog discovery can replace most first-class schemas.
  */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
@@ -26,6 +27,14 @@ import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
   issueAuthorizedLocalPlanningDisclosureCandidate,
 } from '../runtime/harness/local-planning-capability.js';
+import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import {
+  readToolSearchContinuation,
+  TOOL_SEARCH_CONTINUATION_MAX_ENTRIES as DURABLE_TOOL_SEARCH_CONTINUATION_MAX_ENTRIES,
+  TOOL_SEARCH_CONTINUATION_MAX_ENTRY_BYTES,
+  TOOL_SEARCH_CONTINUATION_MAX_SESSION_BYTES,
+  writeToolSearchContinuation,
+} from '../runtime/harness/eventlog.js';
 
 function connectedToolkitSlugs(): Set<string> {
   try {
@@ -51,6 +60,20 @@ function candidateToolkitConnected(name: string, connected: Set<string>): boolea
 
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
+/** One physical broker search retains at most the same window the public
+ * surface can request. A smaller first page therefore never makes rank nine
+ * unreachable, while provider/catalog scans remain strictly bounded. */
+export const TOOL_SEARCH_WINDOW_RESULTS = 20;
+/** JSON text is chunked below the generic result ceiling so its enclosing JSON
+ * remains intact even when every source character needs escaping. */
+export const TOOL_SEARCH_SCHEMA_CHUNK_CHARS = 8_000;
+/** Matches the provider-side schema file ceiling. Larger documents are refused
+ * instead of turning schema discovery into an unbounded blob store. */
+export const TOOL_SEARCH_SCHEMA_MAX_BYTES = TOOL_SEARCH_CONTINUATION_MAX_ENTRY_BYTES;
+const TOOL_SEARCH_CONTINUATION_MAX_ENTRIES = DURABLE_TOOL_SEARCH_CONTINUATION_MAX_ENTRIES;
+const TOOL_SEARCH_CONTINUATION_MAX_BYTES = TOOL_SEARCH_CONTINUATION_MAX_SESSION_BYTES;
+const TOOL_SEARCH_PAGE_CURSOR_PREFIX = 'tool_search_page:v1:';
+const TOOL_SEARCH_SCHEMA_CURSOR_PREFIX = 'tool_search_schema:v1:';
 /** Bound on one live candidate source's search. Healthy provider searches
  *  answer in ~1-2s; the local catalog needs no network at all. Generous 10s
  *  keeps slow-but-alive sources contributing while a wedged one can no longer
@@ -60,6 +83,213 @@ export const CANDIDATE_SOURCE_SEARCH_DEADLINE_MS = 10_000;
  *  generous against one slow candidate, fatal to a full-list walk of a slow
  *  provider (~3.3s/fetch measured live × 20 candidates = the 60s stalls). */
 export const PLANNING_DISCLOSURE_DEADLINE_MS = 15_000;
+
+interface ToolSearchSchemaHandle {
+  schema_ref: string;
+  sha256: string;
+  chars: number;
+  bytes: number;
+  cursor: string;
+  encoding: 'json_text_chunks';
+}
+
+type StoredToolSearchContinuation =
+  | { kind: 'page'; text: string; bytes: number }
+  | { kind: 'schema'; text: string; bytes: number };
+
+function sha256Text(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+/** Durable-session continuation store with a bounded per-broker fallback for
+ * synthetic/no-session callers. Every payload remains content-addressed;
+ * neither path permits a cursor to cross its issuing session. */
+class ToolSearchContinuationStore {
+  private readonly entries = new Map<string, StoredToolSearchContinuation>();
+  private retainedBytes = 0;
+
+  private memoryKey(cursor: string, sessionId?: string): string {
+    return JSON.stringify([sessionId ?? null, cursor]);
+  }
+
+  private put(
+    cursor: string,
+    entry: StoredToolSearchContinuation,
+    sessionId?: string,
+  ): boolean {
+    if (entry.bytes > TOOL_SEARCH_CONTINUATION_MAX_ENTRY_BYTES) return false;
+    if (sessionId) {
+      try {
+        const digest = writeToolSearchContinuation({
+          sessionId,
+          kind: entry.kind,
+          text: entry.text,
+        });
+        if (digest && cursor.includes(digest)) return true;
+      } catch {
+        // A transient/unavailable eventlog still leaves the current broker's
+        // bounded fallback usable. It does not mint cross-process authority.
+      }
+    }
+
+    const key = this.memoryKey(cursor, sessionId);
+    const prior = this.entries.get(key);
+    if (prior) {
+      this.entries.delete(key);
+      this.retainedBytes -= prior.bytes;
+    }
+    this.entries.set(key, entry);
+    this.retainedBytes += entry.bytes;
+    while (
+      this.entries.size > TOOL_SEARCH_CONTINUATION_MAX_ENTRIES
+      || this.retainedBytes > TOOL_SEARCH_CONTINUATION_MAX_BYTES
+    ) {
+      const oldest = this.entries.keys().next().value as string | undefined;
+      if (!oldest) break;
+      const evicted = this.entries.get(oldest);
+      this.entries.delete(oldest);
+      this.retainedBytes -= evicted?.bytes ?? 0;
+    }
+    return this.entries.has(key);
+  }
+
+  storePage(text: string, sessionId?: string): string | undefined {
+    const digest = sha256Text(text);
+    const key = `${TOOL_SEARCH_PAGE_CURSOR_PREFIX}${digest}`;
+    return this.put(key, { kind: 'page', text, bytes: Buffer.byteLength(text, 'utf8') }, sessionId)
+      ? key
+      : undefined;
+  }
+
+  storeSchema(schema: unknown, sessionId?: string): ToolSearchSchemaHandle | undefined {
+    let text: string;
+    try {
+      text = JSON.stringify(schema);
+    } catch {
+      return undefined;
+    }
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (!text || bytes > TOOL_SEARCH_SCHEMA_MAX_BYTES) return undefined;
+    const digest = sha256Text(text);
+    const key = `${TOOL_SEARCH_SCHEMA_CURSOR_PREFIX}${digest}`;
+    if (!this.put(key, { kind: 'schema', text, bytes }, sessionId)) return undefined;
+    return {
+      schema_ref: `sha256:${digest}`,
+      sha256: digest,
+      chars: text.length,
+      bytes,
+      cursor: `${key}:0`,
+      encoding: 'json_text_chunks',
+    };
+  }
+
+  private durableText(
+    sessionId: string | undefined,
+    kind: StoredToolSearchContinuation['kind'],
+    digest: string,
+  ): string | null {
+    if (!sessionId) return null;
+    try {
+      return readToolSearchContinuation({ sessionId, kind, digest });
+    } catch {
+      return null;
+    }
+  }
+
+  private memoryEntry(cursor: string, sessionId?: string): StoredToolSearchContinuation | undefined {
+    return this.entries.get(this.memoryKey(cursor, sessionId));
+  }
+
+  private refreshMemoryEntry(
+    cursor: string,
+    sessionId: string | undefined,
+    entry: StoredToolSearchContinuation,
+  ): void {
+    const key = this.memoryKey(cursor, sessionId);
+    if (!this.entries.has(key)) return;
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+  }
+
+  read(cursor: string, sessionId?: string): { text: string; isError?: boolean } {
+    if (cursor.startsWith(TOOL_SEARCH_PAGE_CURSOR_PREFIX)) {
+      const digest = cursor.slice(TOOL_SEARCH_PAGE_CURSOR_PREFIX.length);
+      const durable = /^[a-f0-9]{64}$/.test(digest)
+        ? this.durableText(sessionId, 'page', digest)
+        : null;
+      const entry = durable === null
+        ? this.memoryEntry(cursor, sessionId)
+        : { kind: 'page' as const, text: durable, bytes: Buffer.byteLength(durable, 'utf8') };
+      if (
+        !/^[a-f0-9]{64}$/.test(digest)
+        || entry?.kind !== 'page'
+        || sha256Text(entry.text) !== digest
+      ) {
+        return {
+          text: JSON.stringify({
+            error: 'invalid_or_expired_tool_search_cursor',
+            hint: 'Use only the exact next_cursor returned in this durable session.',
+          }),
+          isError: true,
+        };
+      }
+      this.refreshMemoryEntry(cursor, sessionId, entry);
+      return { text: entry.text };
+    }
+
+    const match = cursor.match(/^tool_search_schema:v1:([a-f0-9]{64}):(\d{1,10})$/);
+    if (!match) {
+      return {
+        text: JSON.stringify({
+          error: 'invalid_or_expired_tool_search_cursor',
+          hint: 'Use only a result next_cursor or schema_handles[*].cursor returned by this tool_search instance.',
+        }),
+        isError: true,
+      };
+    }
+    const [, digest, rawOffset] = match;
+    const key = `${TOOL_SEARCH_SCHEMA_CURSOR_PREFIX}${digest}`;
+    const durable = this.durableText(sessionId, 'schema', digest);
+    const entry = durable === null
+      ? this.memoryEntry(key, sessionId)
+      : { kind: 'schema' as const, text: durable, bytes: Buffer.byteLength(durable, 'utf8') };
+    const offset = Number(rawOffset);
+    if (
+      entry?.kind !== 'schema'
+      || sha256Text(entry.text) !== digest
+      || !Number.isSafeInteger(offset)
+      || offset < 0
+      || offset >= entry.text.length
+    ) {
+      return {
+        text: JSON.stringify({
+          error: 'invalid_or_expired_tool_search_cursor',
+          hint: 'Redeem schema chunks in order from the exact cursor returned with the schema handle.',
+        }),
+        isError: true,
+      };
+    }
+    this.refreshMemoryEntry(key, sessionId, entry);
+    const end = Math.min(entry.text.length, offset + TOOL_SEARCH_SCHEMA_CHUNK_CHARS);
+    const nextCursor = end < entry.text.length
+      ? `${TOOL_SEARCH_SCHEMA_CURSOR_PREFIX}${digest}:${end}`
+      : undefined;
+    return {
+      text: JSON.stringify({
+        kind: 'tool_search_schema_chunk',
+        schema_ref: `sha256:${digest}`,
+        sha256: digest,
+        encoding: 'json_text_chunk',
+        offset_chars: offset,
+        chars: entry.text.length,
+        bytes: entry.bytes,
+        chunk: entry.text.slice(offset, end),
+        ...(nextCursor ? { next_cursor: nextCursor } : {}),
+        complete: nextCursor === undefined,
+      }),
+    };
+  }
+}
 
 const DESCRIPTION = [
   'Search the full built-in tool catalog by intent and get the tools that match — names + one-line summaries for the top results, plus the complete JSON input schema for the closest few so you can call them right the first time.',
@@ -211,6 +441,7 @@ export function registerToolSearchTool(
     ) => Promise<Readonly<Record<string, string>>> | Readonly<Record<string, string>>;
   } = {},
 ): void {
+  const continuations = new ToolSearchContinuationStore();
   server.tool(
     'tool_search',
     DESCRIPTION,
@@ -235,15 +466,37 @@ export function registerToolSearchTool(
         .nullable()
         .optional()
         .describe(`How many ranked results to return (default ${TOP_RESULTS}).`),
+      cursor: z
+        .string()
+        .min(1)
+        .max(160)
+        .nullable()
+        // Default keeps serialized pre-cursor calls/replays valid while the
+        // Codex-strict schema still advertises a required nullable field.
+        .default(null)
+        .describe('Opaque local next_cursor or schema_handles[*].cursor from a prior result in this durable session. Cursor reads survive broker restarts and never re-run provider discovery or mint new planning authority.'),
     },
-    async ({ query, role_key, limit }: { query: string; role_key?: string | null; limit?: number | null }) => {
+    async ({ query, role_key, limit, cursor }: {
+      query: string;
+      role_key?: string | null;
+      limit?: number | null;
+      cursor?: string | null;
+    }) => {
+      const continuationSessionId = getToolOutputContext()?.sessionId;
+      // A continuation is a read of bytes retained by an earlier admitted
+      // search, never another discovery attempt. Invalid/expired cursors fail
+      // locally and cannot fall through into a candidate source.
+      if (cursor) {
+        const continued = continuations.read(cursor, continuationSessionId);
+        return textResult(continued.text, { isError: continued.isError });
+      }
       // An exact tool name is an explicit selection, not another fuzzy search
       // term. Resolve it against the policy-filtered catalog BEFORE semantic
       // ranking so a selected name never pays a cold embedding/model detour.
       // Once selected, neighboring guesses add no value: return only the exact
       // capability and its schema. Natural-language discovery still ranks the
       // whole allowed catalog below.
-      const requestedLimit = Math.min(limit ?? TOP_RESULTS, 20);
+      const requestedLimit = Math.min(limit ?? TOP_RESULTS, TOOL_SEARCH_WINDOW_RESULTS);
       const exactEntry = catalogEntries({ allowedNames: opts.allowedNames })
         .find((entry) => queryExplicitlyNamesTool(query, entry.name));
       const exactKnownButDenied = !exactEntry && catalogEntries()
@@ -267,6 +520,9 @@ export function registerToolSearchTool(
             let deadline: ReturnType<typeof setTimeout> | undefined;
             try {
               const candidates = await Promise.race([
+                // A source may retain a larger bounded provider snapshot than
+                // the visible limit (the Composio adapter does); whatever it
+                // returns is paged locally and never fetched a second time.
                 source.search({ query, limit: requestedLimit }),
                 new Promise<never>((_, reject) => {
                   deadline = setTimeout(
@@ -277,8 +533,12 @@ export function registerToolSearchTool(
               ]);
               return candidates
                 .filter((candidate) => candidate.name.trim() && candidate.summary.trim())
-                .slice(0, requestedLimit)
-                .map((candidate) => ({ ...candidate, sourceKind: source.kind }));
+                .slice(0, TOOL_SEARCH_WINDOW_RESULTS)
+                .map((candidate) => ({
+                  ...candidate,
+                  summary: candidate.summary.trim().slice(0, 600),
+                  sourceKind: source.kind,
+                }));
             } catch {
               return [];
             } finally {
@@ -319,15 +579,15 @@ export function registerToolSearchTool(
             })),
           ].sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
       const seen = new Set<string>();
-      const topN = combined.filter((candidate) => {
+      const rankedWindow = combined.filter((candidate) => {
         const key = candidate.name.toLowerCase();
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
-      }).slice(0, requestedLimit);
+      }).slice(0, TOOL_SEARCH_WINDOW_RESULTS);
       const metadataMap = await toolMetadataMap();
       const planningCandidates: ToolSearchPlanningDisclosureCandidate[] = opts.discloseForPlanning
-        ? (await Promise.all(topN.map(async (candidate) => {
+        ? (await Promise.all(rankedWindow.map(async (candidate) => {
             const sourced = sourceCandidates.find((entry) => entry.name === candidate.name);
             if (sourced) {
               return {
@@ -375,59 +635,27 @@ export function registerToolSearchTool(
           })
         : {};
 
-      // When the model supplied an exact tool name, it has already selected
-      // the capability. Return only that schema instead of spending tokens on
-      // two neighboring suggestions. Natural-language discovery still gets up
-      // to three candidates.
-      const schemaNames = selectedExactly
-        ? [selectedExactly.name]
-        : topN.slice(0, TOP_SCHEMAS).map((r) => r.name);
-      const schemas: Record<string, unknown> = {};
-      for (const name of schemaNames) {
+      const schemaForName = (name: string): unknown => {
         const localPlanning = planningCandidateByName.get(name);
         if (
           localPlanning?.sourceKind === AUTHORIZED_LOCAL_REGISTRY_PROVENANCE
           && localPlanning.schema !== undefined
         ) {
-          schemas[name] = localPlanning.schema;
-          continue;
+          return localPlanning.schema;
         }
         const sourced = sourceCandidates.find((candidate) => candidate.name === name);
         if (sourced?.schema !== undefined) {
-          schemas[name] = relaxJsonSchemaForDeferred(sourced.schema);
-          continue;
+          return relaxJsonSchemaForDeferred(sourced.schema);
         }
         const metadata = metadataMap.get(name);
         if (metadata?.schema !== undefined) {
-          schemas[name] = (opts.dispatchViaCallTool || opts.dispatchCarrier || opts.dispatchCarrierForName)
+          return (opts.dispatchViaCallTool || opts.dispatchCarrier || opts.dispatchCarrierForName)
             ? relaxJsonSchemaForDeferred(metadata.schema)
             : metadata.schema;
         }
-      }
-      // Complex tools carry critical execution contracts beyond their argument
-      // shape (for example Workspace views must call clem.data()). Include the
-      // selected tool's own instructions only when the query named it exactly;
-      // broad discovery remains one-liners + schemas and does not load three
-      // unrelated prompt blocks.
-      const guidance: Record<string, string> = {};
-      if (selectedExactly) {
-        const sourceGuidance = sourceCandidates.find((candidate) => candidate.name === selectedExactly.name)
-          ?.guidance;
-        const description = sourceGuidance ?? metadataMap.get(selectedExactly.name)?.description;
-        if (description) guidance[selectedExactly.name] = description;
-      }
+        return undefined;
+      };
 
-      // Bound our OWN payload: the generic tool-result cap would otherwise slice
-      // the JSON mid-escape and hand the model (and tests) an unparseable blob.
-      // Dropping the largest trailing schema keeps the ranked names intact — a
-      // dropped schema is re-acquirable with a tighter query, per the hint.
-      // Keep this machine-consumable JSON compact. Pretty-printing more than
-      // doubled large but legitimate authoring schemas (space_save: ~5.7K →
-      // ~13.6K), which crossed the 12K result ceiling and caused us to drop the
-      // *only* schema the model explicitly searched for. The live consequence
-      // was a second search followed by an intentional invalid `{}` call just
-      // to obtain that schema. Compact JSON preserves the exact schema while
-      // spending fewer prompt tokens and tool round-trips.
       const exactSourceCarrier = exactSourceHit?.carrier;
       const exactCarrier = exactSourceCarrier ?? (
         exactNamedHit && opts.dispatchCarrierForName
@@ -447,14 +675,13 @@ export function registerToolSearchTool(
         if (fixedCarrier) return dispatchHint(fixedCarrier);
         return opts.allowedNames
           ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
-          : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.';
+          : 'Call the tool you need by name. If a complete schema is behind schema_handles, read its ordered local chunks; this does not repeat provider discovery.';
       })();
-      const render = (): string => JSON.stringify({
-        query,
-        ...(role_key ? { role_key } : {}),
-        results: topN.map((r) => ({
+
+      type RankedWindowRow = (typeof rankedWindow)[number];
+      const publicResult = (r: RankedWindowRow) => ({
           name: r.name,
-          summary: 'summary' in r ? r.summary : r.oneLiner,
+          summary: ('summary' in r ? r.summary : r.oneLiner).slice(0, 600),
           ...(planningRefs[r.name] ? { capabilityRef: planningRefs[r.name] } : {}),
           ...(planningRefs[r.name] && planningCandidateByName.get(r.name)
             ? { planningProvenance: planningCandidateByName.get(r.name)!.sourceKind }
@@ -470,33 +697,109 @@ export function registerToolSearchTool(
                 ? { carrier: opts.dispatchCarrier }
                 : {}),
           ...('invocation' in r && r.invocation ? { invocation: r.invocation } : {}),
-        })),
-        schemas,
-        ...(Object.keys(guidance).length > 0 ? { guidance } : {}),
-        brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
-        hint,
       });
-      let text = render();
-      const shownSchemaNames = [...schemaNames];
-      // Some exact authoring schemas are structurally modest but carry many
-      // long field descriptions (workflow_update is the canonical example).
-      // Never drop the ONE schema the model explicitly requested merely
-      // because annotations exceed the result budget. The selected tool's
-      // overall guidance remains present; strip JSON-Schema annotations while
-      // retaining every property, type, enum, constraint, and required key.
-      if (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && selectedExactly) {
-        const exactName = selectedExactly.name;
-        if (schemas[exactName]) {
-          schemas[exactName] = stripSchemaAnnotations(schemas[exactName]);
+
+      const formatPage = (
+        rows: readonly RankedWindowRow[],
+        page: number,
+        pageCount: number,
+        nextCursor?: string,
+      ): string => {
+        // An exact selection gets only its selected schema. Natural-language
+        // pages get up to three previews, exactly as the original surface did.
+        const schemaNames = selectedExactly
+          ? rows.some((row) => row.name === selectedExactly.name)
+            ? [selectedExactly.name]
+            : []
+          : rows.slice(0, TOP_SCHEMAS).map((row) => row.name);
+        const schemas: Record<string, unknown> = {};
+        for (const name of schemaNames) {
+          const schema = schemaForName(name);
+          if (schema !== undefined) schemas[name] = schema;
+        }
+
+        // Complex tools carry critical execution contracts beyond argument
+        // shape. Broad discovery remains one-liners + schemas.
+        const guidance: Record<string, string> = {};
+        if (selectedExactly && rows.some((row) => row.name === selectedExactly.name)) {
+          const sourceGuidance = sourceCandidates.find((candidate) => candidate.name === selectedExactly.name)
+            ?.guidance;
+          const description = sourceGuidance ?? metadataMap.get(selectedExactly.name)?.description;
+          if (description) guidance[selectedExactly.name] = description;
+        }
+
+        const schemaHandles: Record<string, ToolSearchSchemaHandle> = {};
+        const schemaHandleErrors: Record<string, { error: string; max_bytes: number }> = {};
+        const ensureSchemaHandle = (name: string): void => {
+          if (schemaHandles[name] || schemaHandleErrors[name] || schemas[name] === undefined) return;
+          const handle = continuations.storeSchema(schemas[name], continuationSessionId);
+          if (handle) schemaHandles[name] = handle;
+          else {
+            schemaHandleErrors[name] = {
+              error: 'schema_exceeds_bounded_lossless_store_or_is_not_serializable',
+              max_bytes: TOOL_SEARCH_SCHEMA_MAX_BYTES,
+            };
+          }
+        };
+        const render = (): string => JSON.stringify({
+          query,
+          ...(role_key ? { role_key } : {}),
+          page,
+          page_count: pageCount,
+          total_results: rankedWindow.length,
+          results: rows.map(publicResult),
+          schemas,
+          ...(Object.keys(schemaHandles).length > 0 ? { schema_handles: schemaHandles } : {}),
+          ...(Object.keys(schemaHandleErrors).length > 0 ? { schema_handle_errors: schemaHandleErrors } : {}),
+          ...(Object.keys(guidance).length > 0 ? { guidance } : {}),
+          brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
+          hint,
+          ...(nextCursor ? {
+            next_cursor: nextCursor,
+            continuation_hint: 'Call tool_search again with this exact cursor and the same query. The next page is local and performs no provider search.',
+          } : {}),
+        });
+
+        let text = render();
+        const shownSchemaNames = [...schemaNames];
+        if (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && selectedExactly) {
+          const exactName = selectedExactly.name;
+          if (schemas[exactName] !== undefined) {
+            // Keep a compact structural preview when annotations are the only
+            // reason it crossed the ceiling, but retain the original bytes
+            // behind the content-addressed handle either way.
+            ensureSchemaHandle(exactName);
+            schemas[exactName] = stripSchemaAnnotations(schemas[exactName]);
+            text = render();
+          }
+        }
+        while (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && shownSchemaNames.length > 0) {
+          const moved = shownSchemaNames.pop()!;
+          ensureSchemaHandle(moved);
+          delete schemas[moved];
           text = render();
         }
+        // Guidance is useful but is not an argument contract. If an unusually
+        // large instruction block alone breaches the result ceiling, omit it;
+        // the exact schema remains inline or losslessly addressable.
+        if (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && selectedExactly) {
+          delete guidance[selectedExactly.name];
+          text = render();
+        }
+        return text;
+      };
+
+      const pages: Array<readonly RankedWindowRow[]> = [];
+      if (rankedWindow.length === 0) pages.push([]);
+      for (let offset = 0; offset < rankedWindow.length; offset += requestedLimit) {
+        pages.push(rankedWindow.slice(offset, offset + requestedLimit));
       }
-      while (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && shownSchemaNames.length > 0) {
-        const dropped = shownSchemaNames.pop()!;
-        delete schemas[dropped];
-        delete guidance[dropped];
-        text = render();
+      let nextCursor: string | undefined;
+      for (let index = pages.length - 1; index >= 1; index -= 1) {
+        const pageText = formatPage(pages[index]!, index + 1, pages.length, nextCursor);
+        nextCursor = continuations.storePage(pageText, continuationSessionId);
       }
+      const text = formatPage(pages[0]!, 1, pages.length, nextCursor);
 
       // Do not promote speculative search hits. The selected tool is promoted
       // after call_tool successfully dispatches it; promoting all three schema

@@ -9,7 +9,10 @@ import { SessionStore } from '../memory/session-store.js';
 import type { AssistantRequest, AssistantResponse, RunResult } from '../types.js';
 import { PlanStore } from '../planning/plan-store.js';
 import { refreshWorkingMemory } from '../memory/working-memory.js';
-import { captureInteractionSignals } from '../memory/auto-capture.js';
+import {
+  autoCaptureProvenanceFromDirectUserInput,
+  captureInteractionSignals,
+} from '../memory/auto-capture.js';
 import { refineActivePlanFromMessage } from '../planning/refinement.js';
 import { buildAssistantInstructions, buildTurnContextBlock } from './instructions.js';
 import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRuntime } from '../runtime/provider.js';
@@ -122,6 +125,9 @@ export class ClementineAssistant {
         sourceEventId: request.runId
           ? `run:${request.runId}`
           : `desktop-turn:${sessionBeforeReply.turns.length}`,
+        sourceProvenance: autoCaptureProvenanceFromDirectUserInput(
+          request.channel ?? 'assistant-core',
+        ),
       });
       if (request.runId && (captured.candidates.length > 0 || captured.profilePatch)) {
         // Facts are consolidated asynchronously through the Mem0 resolver

@@ -18,6 +18,7 @@ const data = await import('./data-store.js');
 const sched = await import('./scheduler.js');
 const runner = await import('./runner.js');
 const approvals = await import('../runtime/harness/approval-registry.js');
+const eventlog = await import('../runtime/harness/eventlog.js');
 
 function writeRunner(slug: string, file: string, body: string) {
   const dir = store.resolveInSpace(slug, 'data');
@@ -25,32 +26,50 @@ function writeRunner(slug: string, file: string, body: string) {
   writeFileSync(path.join(dir, file), body, 'utf-8');
 }
 
-test('a due (every-minute) data source fires and persists; dedupes within the minute', async () => {
+async function approveInstalledRunnerFixture(
+  slug: string,
+  source: Parameters<typeof runner.runSpaceDataSource>[1],
+): Promise<void> {
+  const blocked = await runner.runSpaceDataSource(slug, source);
+  assert.equal(blocked.ok, false);
+  const card = approvals.listPending({
+    sessionId: `space-${slug}`,
+    status: 'pending',
+  }).find((row) => row.args?.sourceId === source.id);
+  assert.ok(card);
+  eventlog.openEventLog().prepare(`
+    UPDATE pending_approvals
+       SET status = 'resolved', resolution = 'approved', resolver = ?, resolved_at = ?
+     WHERE approval_id = ? AND status = 'pending'
+  `).run('scheduler-runner-fixture', new Date().toISOString(), card.approvalId);
+}
+
+test('a due approved local source is contained and still dedupes within the minute', async () => {
   const slug = 'sched-due';
+  const source = { id: 'pull', runner: 'pull.mjs', schedule: '* * * * *' };
   store.spaceStore.save({
     id: slug, title: 'Due',
-    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '* * * * *' }],
+    dataSources: [source],
   });
-  runner._setSpaceComposioDispatchForTests(async () => ({
-    ok: true as const, result: { n: 1 }, connectionId: 'ca-proof', identity: 'proof@example.test',
-  }));
+  writeRunner(slug, source.runner, `process.stdout.write(JSON.stringify({n:1}));`);
+  await approveInstalledRunnerFixture(slug, source);
   try {
     const now = new Date('2026-06-08T08:00:00.000Z');
     const first = await sched.processSpaceSchedules(now);
-    assert.equal(first.fired, 1);
-    assert.deepEqual((data.readData(slug) as any).pull, { n: 1 });
+    assert.equal(first.fired, 0);
+    assert.equal(first.errors, 1);
+    assert.equal(Object.hasOwn(data.readData(slug) as object, 'pull'), false);
 
     // Same minute again → no double fire (dedup).
     const second = await sched.processSpaceSchedules(now);
     assert.equal(second.fired, 0);
   } finally {
-    runner._setSpaceComposioDispatchForTests(null);
     // Archive so this every-minute source doesn't re-fire across later tests.
     store.spaceStore.archive(slug);
   }
 });
 
-test('a 24-hour hourly backlog invokes the real refresh path exactly once at the latest occurrence', async () => {
+test('a 24-hour hourly backlog contains one latest occurrence without starting a process', async () => {
   const slug = 'sched-hourly-collapse';
   const stateFile = path.join(process.env.CLEMENTINE_HOME!, 'state', 'space-schedule-state.json');
   const beforeOutage = new Date('2026-06-08T11:01:00.000Z');
@@ -65,26 +84,28 @@ test('a 24-hour hourly backlog invokes the real refresh path exactly once at the
   store.spaceStore.save({
     id: slug,
     title: 'Hourly collapse',
-    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '0 * * * *' }],
+    dataSources: [{ id: 'pull', runner: 'pull.mjs', schedule: '0 * * * *' }],
   });
 
-  let dispatches = 0;
-  runner._setSpaceComposioDispatchForTests(async () => {
-    dispatches += 1;
-    return {
-      ok: true as const,
-      result: { dispatches },
-      connectionId: 'ca-proof',
-      identity: 'proof@example.test',
-    };
-  });
+  const source = store.spaceStore.get(slug)!.dataSources[0]!;
+  writeRunner(slug, 'pull.mjs', `
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+const url = new URL('./dispatch-count.txt', import.meta.url);
+const dispatches = existsSync(url) ? Number(readFileSync(url, 'utf8')) + 1 : 1;
+writeFileSync(url, String(dispatches));
+process.stdout.write(JSON.stringify({dispatches}));`);
+  await approveInstalledRunnerFixture(slug, source);
 
   try {
     const wake = new Date('2026-06-09T11:01:00.000Z');
     const first = await sched.processSpaceSchedules(wake);
-    assert.equal(first.fired, 1, 'the source refreshes once after the outage');
-    assert.equal(dispatches, 1, '24 matched hourly minutes collapse before provider dispatch');
-    assert.deepEqual((data.readData(slug) as any).pull, { dispatches: 1 });
+    assert.equal(first.fired, 0);
+    assert.equal(first.errors, 1, 'the collapsed latest occurrence reports one contained failure');
+    assert.equal(
+      (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/dispatch-count.txt')),
+      false,
+      '24 matched hourly minutes collapse without starting the approved local body',
+    );
     const persisted = JSON.parse(readFileSync(stateFile, 'utf-8')) as {
       lastRunByMinute?: Record<string, string>;
     };
@@ -96,9 +117,12 @@ test('a 24-hour hourly backlog invokes the real refresh path exactly once at the
 
     const sameMinute = await sched.processSpaceSchedules(wake);
     assert.equal(sameMinute.fired, 0, 'the latest occurrence remains idempotent');
-    assert.equal(dispatches, 1, 'same-minute reevaluation never repeats the provider call');
+    assert.equal(
+      (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/dispatch-count.txt')),
+      false,
+      'same-minute reevaluation remains zero-process',
+    );
   } finally {
-    runner._setSpaceComposioDispatchForTests(null);
     store.spaceStore.archive(slug);
   }
 });
@@ -154,85 +178,95 @@ process.stdout.write('{}');`,
   store.spaceStore.archive(slug);
 });
 
-test('E2: a read-only source _reengage signal fires once, dedupes, and re-fires after it clears', async () => {
+test('E2: contained local source output cannot manufacture a re-engage signal', async () => {
   const slug = 'sched-rg';
+  const source = { id: 'pull', runner: 'pull.mjs', schedule: '* * * * *' };
   store.spaceStore.save({
     id: slug, title: 'Reengage',
-    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '* * * * *' }],
+    dataSources: [source],
     reengage: { triggers: ['threshold'] },
   });
-  let current: Record<string, unknown> = { rows: [{ a: 1 }] };
-  const emit = (re: string) => { current = { rows: [{ a: 1 }], _reengage: JSON.parse(re) }; };
+  writeRunner(slug, source.runner, `
+import { readFileSync } from 'node:fs';
+process.stdout.write(readFileSync(new URL('./current.json', import.meta.url), 'utf8'));`);
+  const emit = (re: string) => {
+    writeFileSync(
+      store.resolveInSpace(slug, 'data/current.json'),
+      JSON.stringify({ rows: [{ a: 1 }], _reengage: JSON.parse(re) }),
+      'utf8',
+    );
+  };
   const fires = () => data.listAudit(slug).filter((a) => a.path === '/reengage/threshold').length;
-  runner._setSpaceComposioDispatchForTests(async () => ({
-    ok: true as const, result: current, connectionId: 'ca-proof', identity: 'proof@example.test',
-  }));
+  emit('{"fire":false}');
+  await approveInstalledRunnerFixture(slug, source);
 
   try {
     // T1: condition A crosses → fires once. (1-minute catch-up windows step by step.)
     emit('{"fire":true,"key":"cold-A","message":"3 deals cold"}');
     await sched.processSpaceSchedules(new Date('2026-06-08T10:01:00.000Z'));
-    assert.equal(fires(), 1);
+    assert.equal(fires(), 0);
 
     // T2: same condition (key A) persists → deduped, no new fire.
     await sched.processSpaceSchedules(new Date('2026-06-08T10:02:00.000Z'));
-    assert.equal(fires(), 1);
+    assert.equal(fires(), 0);
 
     // T3: a NEW condition (key B) → fires again.
     emit('{"fire":true,"key":"cold-B","message":"5 deals cold"}');
     await sched.processSpaceSchedules(new Date('2026-06-08T10:03:00.000Z'));
-    assert.equal(fires(), 2);
+    assert.equal(fires(), 0);
 
     // T4: condition clears (fire:false) → no re-engage, dedup reset.
     emit('{"fire":false}');
     await sched.processSpaceSchedules(new Date('2026-06-08T10:04:00.000Z'));
-    assert.equal(fires(), 2);
+    assert.equal(fires(), 0);
 
     // T5: condition A returns → re-fires (the cleared dedup allows it).
     emit('{"fire":true,"key":"cold-A","message":"back cold"}');
     await sched.processSpaceSchedules(new Date('2026-06-08T10:05:00.000Z'));
-    assert.equal(fires(), 3);
+    assert.equal(fires(), 0);
   } finally {
-    runner._setSpaceComposioDispatchForTests(null);
     store.spaceStore.archive(slug);
   }
 });
 
 test('E2: a source with no _reengage signal never fires a re-engage', async () => {
   const slug = 'sched-norg';
+  const source = { id: 'pull', runner: 'pull.mjs', schedule: '* * * * *' };
   store.spaceStore.save({
     id: slug, title: 'NoRe',
-    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '* * * * *' }],
+    dataSources: [source],
     reengage: { triggers: ['threshold'] },
   });
-  runner._setSpaceComposioDispatchForTests(async () => ({
-    ok: true as const, result: { rows: [{ a: 1 }] }, connectionId: 'ca-proof', identity: 'proof@example.test',
-  }));
+  writeRunner(slug, source.runner, `process.stdout.write(JSON.stringify({rows:[{a:1}]}));`);
+  await approveInstalledRunnerFixture(slug, source);
   try {
     await sched.processSpaceSchedules(new Date('2026-06-08T10:06:00.000Z'));
     assert.equal(data.listAudit(slug).filter((a) => a.path === '/reengage/threshold').length, 0);
   } finally {
-    runner._setSpaceComposioDispatchForTests(null);
     store.spaceStore.archive(slug);
   }
 });
 
-test('paused-build auto-retry: a transiently-failing source reactivates the workspace; budget caps + spacing hold', async () => {
+test('paused-build auto-retry spends its bounded attempts but cannot start a local runner', async () => {
   // Archive paused leftovers from earlier tests (shared CLEMENTINE_HOME) so the
   // retry counters below see exactly this test's workspace.
   for (const s of store.spaceStore.list()) if (s.status === 'paused') store.spaceStore.archive(s.id);
   const slug = 'retry-paused';
+  const source = { id: 'pull', runner: 'pull.mjs' };
   store.spaceStore.save({
     id: slug, title: 'Retry Me',
-    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }],
+    dataSources: [source],
   });
-  let outage = true;
-  runner._setSpaceComposioDispatchForTests(async () => {
-    if (outage) throw new Error('api down');
-    return {
-      ok: true as const, result: { rows: [1, 2] }, connectionId: 'ca-proof', identity: 'proof@example.test',
-    };
-  });
+  writeRunner(slug, source.runner, `
+import { readFileSync } from 'node:fs';
+if (readFileSync(new URL('./outage.txt', import.meta.url), 'utf8').trim() === 'on') {
+  process.stderr.write('api down');
+  process.exit(1);
+}
+process.stdout.write(JSON.stringify({rows:[1,2]}));`);
+  const outagePath = store.resolveInSpace(slug, 'data/outage.txt');
+  writeFileSync(outagePath, 'on', 'utf8');
+  await approveInstalledRunnerFixture(slug, source);
   store.spaceStore.update(slug, { status: 'paused' });
 
   // Too fresh (< 5 min since pause) → not touched.
@@ -251,18 +285,19 @@ test('paused-build auto-retry: a transiently-failing source reactivates the work
   const spaced = await sched.retryPausedSpaces(new Date(now1.getTime() + 60_000));
   assert.equal(spaced.examined, 0, '15-min spacing between attempts');
 
-  // Outage clears; attempt 2 → data pulls, workspace REACTIVATES.
-  outage = false;
+  // Even if the runner's own outage fixture clears, attempt 2 remains
+  // contained because no shared-kernel authority exists.
+  writeFileSync(outagePath, 'off', 'utf8');
   const now2 = new Date(now1.getTime() + 16 * 60_000);
   const second = await sched.retryPausedSpaces(now2);
-  assert.equal(second.reactivated, 1);
-  assert.equal(store.spaceStore.get(slug)!.status, 'active');
-  assert.deepEqual((data.readData(slug) as any).pull, { rows: [1, 2] });
+  assert.equal(second.reactivated, 0);
+  assert.equal(second.stillPaused, 1);
+  assert.equal(store.spaceStore.get(slug)!.status, 'paused');
+  assert.equal(Object.hasOwn(data.readData(slug) as object, 'pull'), false);
 
-  // Reactivated → nothing left to retry.
+  // Budget exhausted → nothing left to retry.
   const done = await sched.retryPausedSpaces(new Date(now2.getTime() + 20 * 60_000));
   assert.equal(done.examined, 0);
-  runner._setSpaceComposioDispatchForTests(null);
   store.spaceStore.archive(slug);
 });
 

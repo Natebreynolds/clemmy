@@ -28,6 +28,48 @@ export function pruneProviderRequestEchoes(value: unknown): unknown {
     .map(([key, child]) => [key, pruneProviderRequestEchoes(child)]));
 }
 
+const EXACT_PROVIDER_DATA_ENVELOPE_KEYS = new Set([
+  'data',
+  'error',
+  'successful',
+  'logId',
+  'sessionInfo',
+]);
+
+/**
+ * Recover the provider-owned payload from the exact one-shot SDK envelope.
+ *
+ * This is deliberately narrower than a generic `data` unwrapping heuristic:
+ * only the current transport's closed envelope, with a positive acknowledgement
+ * and no contradictory provider structure, may contribute identity/content
+ * proof. Arbitrary nested model or tool data remains opaque.
+ */
+export function exactProviderDataPayload(value: unknown): unknown {
+  let candidate = value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (
+      !trimmed.startsWith('{')
+      || !trimmed.endsWith('}')
+      || Buffer.byteLength(trimmed, 'utf8') > 1_000_000
+    ) return value;
+    try {
+      candidate = JSON.parse(trimmed) as unknown;
+    } catch {
+      return value;
+    }
+  }
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return value;
+  const record = candidate as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(record, 'data')) return value;
+  if (Object.keys(record).some((key) => !EXACT_PROVIDER_DATA_ENVELOPE_KEYS.has(key))) return value;
+  if (record.successful !== true || (record.error !== null && record.error !== undefined && record.error !== '')) {
+    return value;
+  }
+  if (inspectProviderEnvelope(record).verdict !== 'clean') return value;
+  return record.data;
+}
+
 function structuredTrue(value: unknown): boolean {
   return value === true
     || value === 1

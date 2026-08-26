@@ -28,6 +28,7 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-host-turn\n',
 const {
   hostRunRunner: productionHostRunRunner,
   HostInterruptState,
+  hostToolCallsLimitCheckpointFor,
 } = await import('./host-turn-runner.js');
 const hostRunRunner: typeof productionHostRunRunner = (
   runner,
@@ -41,7 +42,9 @@ const hostRunRunner: typeof productionHostRunRunner = (
   { ...opts, allowUnownedToolInvocationForTests: true } as never,
 );
 const { runConversation, runTurn } = await import('./loop.js');
+const { HarnessSession } = await import('./session.js');
 const eventlog = await import('./eventlog.js');
+const { actionBus } = await import('../action-bus.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
 const logicalContracts = await import('./logical-call-contract.js');
@@ -60,7 +63,9 @@ const {
 const capabilityEnvelopes = await import('../../agents/capability-envelope.js');
 const capabilityCatalogs = await import('./host-capability-catalog-factory.js');
 const capabilityManifests = await import('./capability-manifest.js');
+const capabilityManifestStores = await import('./capability-manifest-store.js');
 const productionPorts = await import('./production-capability-ports.js');
+const productionMcp = await import('./production-mcp-read-carrier.js');
 const continuityRuntime = await import('./task-continuity-runtime.js');
 const turnControl = await import('./turn-control.js');
 const semanticPorts = await import('../semantic-boundary/turn-semantic-port-registry.js');
@@ -71,6 +76,7 @@ const workCallTools = await import('../../tools/work-call.js');
 const callToolTools = await import('../../tools/call-tool.js');
 const workCallMode = await import('../../tools/work-call-mode.js');
 const innerDispatch = await import('../../tools/inner-dispatch.js');
+const mcpToolAuthority = await import('../mcp-tool-authority.js');
 const capabilityResolution = await import('./capability-resolution.js');
 const composioSchemas = await import('../../tools/composio-schema-cache.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
@@ -1677,6 +1683,157 @@ test('production host fans out two independent pure-local reads under one bounde
   }
 });
 
+test('production runConversation surfaces the host tool ceiling and replays its paired checkpoint', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const prompt = 'Inspect the workspace roots and two bounded directory views.';
+  const session = eventlog.createSession({ id: `host-production-tool-ceiling-${++acceptedSerial}`, kind: 'chat' });
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: `host-production-tool-ceiling-${acceptedSerial}` });
+  const source = eventlog.recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: prompt },
+  }, { armRunInFlight: true });
+  const callIds = ['ceiling-roots', 'ceiling-list', 'ceiling-overflow'];
+  const seenResultIds: string[][] = [];
+  let modelCalls = 0;
+  const model = {
+    async getResponse(request: { input?: unknown }) {
+      const input = Array.isArray(request.input)
+        ? request.input as Array<Record<string, unknown>>
+        : [];
+      seenResultIds.push(input
+        .filter((item) => item.type === 'function_call_result')
+        .map((item) => String(item.callId ?? '')));
+      const output = [
+        [toolCall(callIds[0]!, 'workspace_roots', {})],
+        [toolCall(callIds[1]!, 'list_files', { directory: null, limit: 1 })],
+        [toolCall(callIds[2]!, 'list_files', { directory: null, limit: 2 })],
+        [textMsg(JSON.stringify({
+          summary: 'The paired checkpoint resumed.',
+          reply: 'The paired checkpoint resumed.',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        }))],
+      ][Math.min(modelCalls, 3)]!;
+      modelCalls += 1;
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1, inputTokensDetails: [], outputTokensDetails: [] },
+        output,
+        responseId: `tool-ceiling-response-${modelCalls}`,
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  let builtAgent: Awaited<ReturnType<typeof buildOrchestratorAgent>> | undefined;
+  const runtimeTerminals: string[] = [];
+  const detachRuntime = actionBus.subscribe((event) => {
+    if (
+      event.sessionId === session.id
+      && (event.kind === 'runtime.completed' || event.kind === 'runtime.failed')
+    ) runtimeTerminals.push(event.kind);
+  });
+
+  try {
+    const first = await runConversation({
+      sessionId: session.id,
+      input: prompt,
+      sourceUserSeq: source.seq,
+      reuseRecordedUserInput: true,
+      runAttemptId: attempt.attemptId,
+      deferToolCallsLimitTerminal: true,
+      turnEngine: 'host_v1_read_only',
+      maxSteps: 1,
+      maxTurns: 6,
+      toolCallsPerTurn: 2,
+      judgeCompletion: false,
+      buildAgent: async (identity) => {
+        builtAgent = await buildOrchestratorAgent({
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          userInput: prompt,
+          allowToolJit: false,
+          mcpToolScope: {
+            authority: 'none',
+            reason: 'isolated production-builder tool-ceiling regression',
+            allowedServerSlugs: [],
+            toolPatterns: [],
+            maxTools: 0,
+          },
+          model: model as never,
+        });
+        return builtAgent;
+      },
+      makeRunner: () => throwingRunner() as never,
+    });
+
+    assert.equal(first.status, 'limit_exceeded');
+    assert.equal(first.limitKind, 'tool_calls');
+    assert.equal(first.publicPresentation, undefined,
+      'the workflow-owned checkpoint is private until the original source reaches its eventual terminal');
+    assert.equal(eventlog.getSession(session.id)?.status, 'active',
+      'a private checkpoint cannot durably fail the child session between activations');
+    assert.deepEqual(runtimeTerminals, [],
+      'a private checkpoint cannot emit an externally visible runtime terminal');
+    assert.equal(modelCalls, 3, 'the model cannot reason past the typed ceiling');
+    assert.ok(builtAgent);
+
+    const persisted = HarnessSession.load(session.id)?.toInputItems() ?? [];
+    const persistedCallIds = persisted
+      .filter((item) => (item as { type?: unknown }).type === 'function_call')
+      .map((item) => String((item as { callId?: unknown }).callId ?? ''));
+    const persistedResultIds = persisted
+      .filter((item) => (item as { type?: unknown }).type === 'function_call_result')
+      .map((item) => String((item as { callId?: unknown }).callId ?? ''));
+    assert.deepEqual(persistedCallIds.slice(-3), callIds);
+    assert.deepEqual(persistedResultIds.slice(-3), callIds,
+      'settled outputs and the provably unstarted overflow remain exactly paired');
+
+    const calledIds = eventlog.listEvents(session.id, { types: ['tool_called'] })
+      .map((event) => String(event.data.callId ?? ''));
+    assert.deepEqual(calledIds, callIds.slice(0, 2), 'the over-limit body never enters invocation');
+    assert.equal(
+      eventlog.listEvents(session.id, { types: ['conversation_completed'] }).length,
+      0,
+      'a workflow-owned ceiling checkpoint must not become the accepted source terminal',
+    );
+
+    const resumed = await runConversation({
+      agent: builtAgent!,
+      sessionId: session.id,
+      input: 'Pick up where you left off from the paired tool checkpoint.',
+      sourceUserSeq: source.seq,
+      reuseRecordedUserInput: true,
+      runAttemptId: attempt.attemptId,
+      deferToolCallsLimitTerminal: true,
+      turnEngine: 'host_v1_read_only',
+      maxSteps: 1,
+      maxTurns: 3,
+      toolCallsPerTurn: 2,
+      judgeCompletion: false,
+      makeRunner: () => throwingRunner() as never,
+    });
+    assert.equal(resumed.status, 'completed');
+    assert.equal(resumed.publicPresentation?.text, 'The paired checkpoint resumed.');
+    assert.deepEqual(seenResultIds[3]?.slice(-3), callIds,
+      'the real continuation receives the exact checkpoint rather than a stubbed result');
+    assert.deepEqual(
+      eventlog.listEvents(session.id, { types: ['user_input_received'] }).map((event) => event.seq),
+      [source.seq],
+      'continuation reuses the one accepted source instead of manufacturing a second user turn',
+    );
+    const terminals = eventlog.listEvents(session.id, { types: ['conversation_completed'] });
+    assert.equal(terminals.length, 1, 'the accepted source publishes exactly one eventual terminal');
+    assert.equal(terminals[0]?.data?.sourceUserSeq, source.seq);
+    assert.deepEqual(runtimeTerminals, ['runtime.completed']);
+  } finally {
+    detachRuntime();
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
 test('production host call_tool keeps exact v57 authority through strict nullable refinement', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
@@ -1849,7 +2006,7 @@ test('production host refuses a spill-capable table read before its real body', 
   }
 });
 
-test('host lifecycle listener pairs an over-limit pre-invoke refusal and retires the repeated frame', async () => {
+test('host lifecycle listener propagates an over-limit pre-invoke checkpoint', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'off';
   let firstRuns = 0;
@@ -1862,7 +2019,8 @@ test('host lifecycle listener pairs an over-limit pre-invoke refusal and retires
   const counter = new brackets.ToolCallsCounter(1);
   runner.on('agent_tool_start', () => counter.increment());
   try {
-    const outcome = await hostRunRunner(
+    let caught: unknown;
+    await assert.rejects(hostRunRunner(
         runner as never,
         {
         model,
@@ -1880,20 +2038,26 @@ test('host lifecycle listener pairs an over-limit pre-invoke refusal and retires
         } as never,
         [{ type: 'message', role: 'user', content: 'cap-only fixture' }] as never,
         { maxTurns: 3 },
-      );
-    assert.equal(outcome.terminal, undefined);
-    assert.match(String(outcome.finalOutput), /capability is unavailable/i);
-    assert.equal(model.calls(), 3);
-    const callIds = outcome.history
+      ), (error) => {
+        caught = error;
+        return error instanceof brackets.ToolCallsLimitExceeded;
+      });
+    const checkpoint = hostToolCallsLimitCheckpointFor(caught);
+    assert.ok(checkpoint);
+    assert.equal(model.calls(), 1, 'the model cannot reason past host budget control');
+    const callIds = checkpoint.history
       .filter((item) => (item as { type?: string }).type === 'function_call')
       .map((item) => (item as { callId?: string }).callId);
-    const resultIds = outcome.history
+    const resultIds = checkpoint.history
       .filter((item) => (item as { type?: string }).type === 'function_call_result')
       .map((item) => (item as { callId?: string }).callId);
-    assert.deepEqual(resultIds, callIds, 'every repeated frame remains exactly paired');
-    assert.ok(dispositionMarkers(outcome.history).every((marker) => (
-      marker.effect === 'none' && marker.requiresReconciliation === false
-    )));
+    assert.deepEqual(resultIds, callIds, 'the admitted frame remains exactly paired');
+    assert.deepEqual(dispositionMarkers(checkpoint.history), [{
+      disposition: 'not_started',
+      effect: 'none',
+      retry: 'replan',
+      requiresReconciliation: false,
+    }]);
     assert.equal(firstRuns, 1, 'the one admitted call may execute');
     assert.equal(secondRuns, 0, 'the (limit + 1)th listener throw prevents its body');
   } finally {
@@ -1902,7 +2066,7 @@ test('host lifecycle listener pairs an over-limit pre-invoke refusal and retires
   }
 });
 
-test('host-owned accounting pairs an over-limit native MCP refusal and retires the repeated frame', async () => {
+test('host-owned accounting propagates an over-limit native MCP checkpoint', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   let firstRuns = 0;
@@ -1917,7 +2081,8 @@ test('host-owned accounting pairs an over-limit native MCP refusal and retires t
     behaviorScopeId: 'cap-only-no-durable-source::turn',
   };
   try {
-    const outcome = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
+    let caught: unknown;
+    await assert.rejects(brackets.withHarnessRunContext(parent, () => hostRunRunner(
         throwingRunner() as never,
         {
           model,
@@ -1936,20 +2101,26 @@ test('host-owned accounting pairs an over-limit native MCP refusal and retires t
         } as never,
         [{ type: 'message', role: 'user', content: 'cap-only fixture' }] as never,
         { maxTurns: 3 },
-      ));
-    assert.equal(outcome.terminal, undefined);
-    assert.match(String(outcome.finalOutput), /capability is unavailable/i);
-    assert.equal(model.calls(), 3);
-    const callIds = outcome.history
+      )), (error) => {
+        caught = error;
+        return error instanceof brackets.ToolCallsLimitExceeded;
+      });
+    const checkpoint = hostToolCallsLimitCheckpointFor(caught);
+    assert.ok(checkpoint);
+    assert.equal(model.calls(), 1, 'the model cannot reason past host budget control');
+    const callIds = checkpoint.history
       .filter((item) => (item as { type?: string }).type === 'function_call')
       .map((item) => (item as { callId?: string }).callId);
-    const resultIds = outcome.history
+    const resultIds = checkpoint.history
       .filter((item) => (item as { type?: string }).type === 'function_call_result')
       .map((item) => (item as { callId?: string }).callId);
-    assert.deepEqual(resultIds, callIds, 'every repeated frame remains exactly paired');
-    assert.ok(dispositionMarkers(outcome.history).every((marker) => (
-      marker.effect === 'none' && marker.requiresReconciliation === false
-    )));
+    assert.deepEqual(resultIds, callIds, 'the admitted frame remains exactly paired');
+    assert.deepEqual(dispositionMarkers(checkpoint.history), [{
+      disposition: 'not_started',
+      effect: 'none',
+      retry: 'replan',
+      requiresReconciliation: false,
+    }]);
     assert.equal(firstRuns, 1, 'the first native MCP call is admitted exactly once');
     assert.equal(secondRuns, 0, 'the over-limit native MCP body never starts');
   } finally {
@@ -3024,6 +3195,175 @@ test('an uncertain sibling drains started calls, pairs the whole frame, and star
   assert.equal(queuedRuns, 0);
 });
 
+test('a tool ceiling drains its started sibling before propagating the exact paired checkpoint', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const session = eventlog.createSession({ id: 'host-tool-ceiling-frame-drain', kind: 'chat' });
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let releaseStarted!: () => void;
+  const startedRelease = new Promise<void>((resolve) => { releaseStarted = resolve; });
+  let startedLease: dispatchLeases.DispatchLeaseRef | undefined;
+  let overflowRuns = 0;
+  let queuedRuns = 0;
+  const callIds = ['ceiling-started', 'ceiling-overflow', 'ceiling-queued'];
+  const model = stubModel([[
+    toolCall(callIds[0]!, 'list_files', { slot: 'started' }),
+    toolCall(callIds[1]!, 'list_files', { slot: 'overflow' }),
+    toolCall(callIds[2]!, 'list_files', { slot: 'queued' }),
+  ]]);
+  const parent = {
+    sessionId: session.id,
+    counter: new brackets.ToolCallsCounter(1),
+    behaviorScopeId: `${session.id}::turn:1`,
+  };
+
+  try {
+    const pending = brackets.withHarnessRunContext(parent, () => hostRunRunner(
+      throwingRunner() as never,
+      {
+        model,
+        tools: [{
+          type: 'function', name: 'list_files', description: 'ceiling frame drain',
+          parameters: { type: 'object', properties: { slot: { type: 'string' } } },
+          needsApproval: async () => false,
+          invoke: async (_context: unknown, raw: string) => {
+            const slot = (JSON.parse(raw) as { slot: string }).slot;
+            if (slot === 'started') {
+              startedLease = brackets.harnessRunContextStorage.getStore()?.dispatchLease;
+              assert.ok(startedLease);
+              markStarted();
+              await startedRelease;
+              assert.equal(dispatchLeases.isDispatchLeaseCurrent(startedLease), true,
+                'the started call retains its lease until the whole frame drains');
+              return 'started-result-preserved';
+            }
+            if (slot === 'overflow') overflowRuns += 1;
+            else queuedRuns += 1;
+            return 'must-not-run';
+          },
+        }],
+      } as never,
+      [] as never,
+      { maxTurns: 2, toolExecution: { maxFunctionToolConcurrency: 2 } },
+    )).then(
+      (outcome) => ({ outcome, error: undefined as unknown }),
+      (error: unknown) => ({ outcome: undefined, error }),
+    );
+
+    await started;
+    assert.equal(await Promise.race([
+      pending.then(() => 'settled' as const),
+      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 25)),
+    ]), 'pending', 'the ceiling cannot escape while a started sibling is still running');
+    assert.equal(overflowRuns, 0, 'the limit + 1 body never starts');
+    assert.equal(queuedRuns, 0, 'no later call is assigned after the ceiling');
+
+    releaseStarted();
+    const settled = await pending;
+    assert.equal(settled.outcome, undefined);
+    assert.ok(settled.error instanceof brackets.ToolCallsLimitExceeded);
+    const checkpoint = hostToolCallsLimitCheckpointFor(settled.error);
+    assert.ok(checkpoint);
+    const resultItems = checkpoint.history.filter(
+      (item) => (item as { type?: unknown }).type === 'function_call_result',
+    );
+    assert.deepEqual(resultItems.map((item) => String((item as { callId?: unknown }).callId ?? '')), callIds,
+      'started and unstarted calls remain paired in admitted order');
+    assert.match(JSON.stringify(resultItems[0]), /started-result-preserved/,
+      'the settled sibling output survives the control-flow checkpoint');
+    assert.deepEqual(dispositionMarkers(checkpoint.history), [
+      { disposition: 'not_started', effect: 'none', retry: 'replan', requiresReconciliation: false },
+      { disposition: 'not_started', effect: 'none', retry: 'replan', requiresReconciliation: false },
+    ]);
+    assert.ok(!JSON.stringify(resultItems).includes('countsRefusal'),
+      'a budget checkpoint never spends the capability no-progress brake');
+    assert.ok(startedLease);
+    assert.equal(dispatchLeases.isDispatchLeaseCurrent(startedLease), false,
+      'the host revokes the frame lease only after drain and propagation');
+    assert.equal(model.calls(), 1);
+    assert.equal(overflowRuns, 0);
+    assert.equal(queuedRuns, 0);
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('effect uncertainty wins when a sibling also reaches the tool ceiling', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const session = eventlog.createSession({ id: 'host-tool-ceiling-uncertain-precedence', kind: 'chat' });
+  let markUncertainStarted!: () => void;
+  const uncertainStarted = new Promise<void>((resolve) => { markUncertainStarted = resolve; });
+  let releaseUncertain!: () => void;
+  const uncertainRelease = new Promise<void>((resolve) => { releaseUncertain = resolve; });
+  let overflowRuns = 0;
+  let queuedRuns = 0;
+  const callIds = ['uncertain-started', 'uncertain-overflow', 'uncertain-queued'];
+  const parent = {
+    sessionId: session.id,
+    counter: new brackets.ToolCallsCounter(1),
+    behaviorScopeId: `${session.id}::turn:1`,
+  };
+
+  try {
+    const pending = brackets.withHarnessRunContext(parent, () => hostRunRunner(
+      throwingRunner() as never,
+      {
+        model: stubModel([[
+          toolCall(callIds[0]!, 'list_files', { slot: 'uncertain' }),
+          toolCall(callIds[1]!, 'list_files', { slot: 'overflow' }),
+          toolCall(callIds[2]!, 'list_files', { slot: 'queued' }),
+        ]]),
+        tools: [{
+          type: 'function', name: 'list_files', description: 'uncertain ceiling precedence',
+          parameters: { type: 'object', properties: { slot: { type: 'string' } } },
+          needsApproval: async () => false,
+          invoke: async (_context: unknown, raw: string) => {
+            const slot = (JSON.parse(raw) as { slot: string }).slot;
+            if (slot === 'uncertain') {
+              markUncertainStarted();
+              await uncertainRelease;
+              throw new Error('invocation crossed before failure');
+            }
+            if (slot === 'overflow') overflowRuns += 1;
+            else queuedRuns += 1;
+            return 'must-not-run';
+          },
+        }],
+      } as never,
+      [] as never,
+      { maxTurns: 2, toolExecution: { maxFunctionToolConcurrency: 2 } },
+    ));
+
+    await uncertainStarted;
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    assert.equal(overflowRuns, 0);
+    assert.equal(queuedRuns, 0);
+    releaseUncertain();
+    const outcome = await pending;
+    assert.deepEqual(outcome.terminal, { status: 'blocked', reason: 'tool_effect_uncertain' },
+      'a soft budget checkpoint cannot override reconciliation ownership');
+    assert.deepEqual(
+      outcome.history
+        .filter((item) => (item as { type?: string }).type === 'function_call_result')
+        .map((item) => (item as { callId?: string }).callId),
+      callIds,
+    );
+    assert.deepEqual(dispositionMarkers(outcome.history), [
+      { disposition: 'effect_unknown', effect: 'may_have_started', retry: 'do_not_retry', requiresReconciliation: true },
+      { disposition: 'not_started', effect: 'none', retry: 'replan', requiresReconciliation: false },
+      { disposition: 'not_started', effect: 'none', retry: 'replan', requiresReconciliation: false },
+    ]);
+    assert.ok(!JSON.stringify(outcome.history).includes('countsRefusal'),
+      'uncertainty + ceiling does not manufacture a capability-refusal brake');
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
 test('malformed tool arguments become a correlated result without approval or execution', async () => {
   let approvalChecks = 0;
   let bodyRuns = 0;
@@ -4060,6 +4400,180 @@ test('production host external reads require one exact frozen manifest/account/s
     for (const prior of priorPorts) {
       productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
     }
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('accepted native MCP call_tool uses one exact preparation row and one business row without the legacy shim', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorManifestStore = capabilityManifestStores.peekCapabilityManifestStore();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const suffix = ++acceptedSerial;
+  const serverName = `exact_host_${suffix}`;
+  const operationId = `${serverName}__lookup_records`;
+  const inputSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: { city: { type: 'string' } },
+    required: ['city'],
+  };
+  const counts = { list: 0, call: 0, invalidate: 0 };
+  let configuredCommand = '/fixture/exact-host-mcp';
+  const fakeServer = {
+    async invalidateToolsCache() { counts.invalidate += 1; },
+    async listTools() {
+      counts.list += 1;
+      return [{
+        name: operationId,
+        description: 'Return exact records for one city.',
+        inputSchema,
+        annotations: { readOnlyHint: true, destructiveHint: false },
+      }];
+    },
+    async callTool(name: string, args: Record<string, unknown> | null) {
+      counts.call += 1;
+      assert.equal(name, operationId);
+      assert.deepEqual(args, { city: 'Seattle' });
+      return [{ type: 'text', text: JSON.stringify({ records: [{ city: 'Seattle' }] }) }];
+    },
+  };
+  const runtime: productionMcp.ProductionMcpRuntime = {
+    configuredServers: () => [{
+      name: serverName,
+      type: 'stdio',
+      command: configuredCommand,
+      args: ['--stdio'],
+      enabled: true,
+      source: 'user',
+    }] as never,
+    serverForEnumeration: () => fakeServer as never,
+    serverForOperation: () => fakeServer as never,
+  };
+
+  try {
+    capabilityCatalogs.installHostCapabilityCatalogFactory(
+      capabilityCatalogs.createHostCapabilityCatalogFactory(),
+    );
+    capabilityManifestStores.installCapabilityManifestStore(
+      capabilityManifestStores.createCapabilityManifestStore([], { durable: true }),
+    );
+    productionPorts.clearProductionCapabilityPorts();
+    innerDispatch._setInnerDispatchMcpResolverForTests(null);
+    assert.equal(innerDispatch._innerDispatchLegacyMcpTestResolverActive(), false);
+
+    const materialized = await productionMcp.createProductionMcpReadCarrier({
+      serverName,
+      runtime,
+    }).materializeExact({ operationId, inputSchema });
+    assert.equal(materialized.status, 'installed', JSON.stringify(materialized));
+    if (materialized.status !== 'installed') return;
+    const providerCrossingsBeforeCall = counts.list + counts.call;
+    const exactScope = {
+      reason: 'exact accepted host MCP fixture',
+      authority: 'exact' as const,
+      allowedServerSlugs: [serverName],
+      allowedToolNames: [operationId],
+    };
+    const callTool = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+      reachableBuiltinNames: new Set<string>(),
+      firstClassNames: new Set<string>(),
+      mcpToolScope: exactScope,
+    }) as never);
+    const fixture = acceptHostCanarySource(`exact-native-mcp-${suffix}`);
+    const model = stubModel([
+      [toolCall(`exact-native-mcp-call-${suffix}`, 'call_tool', {
+        name: operationId,
+        args_json: JSON.stringify({ city: 'Seattle' }),
+      })],
+      [textMsg('exact native MCP settled')],
+    ]);
+    const agent = { model, tools: [callTool] };
+    mcpToolAuthority.bindAgentMcpToolScope(agent as never, exactScope);
+    bindHostCanarySurface(fixture, agent, [callTool]);
+
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(outcome.finalOutput, 'exact native MCP settled', JSON.stringify(outcome.terminal));
+    assert.equal(counts.call, 1, 'one and only one callTool business body');
+    const rows = eventlog.openEventLog().prepare(`
+      SELECT ordinal, relation, state
+        FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY ordinal
+    `).all(fixture.session.id, fixture.source.seq);
+    assert.deepEqual(rows, [
+      { ordinal: 1, relation: 'probe', state: 'returned' },
+      { ordinal: 2, relation: 'child', state: 'returned' },
+    ]);
+    assert.equal(
+      counts.list + counts.call - providerCrossingsBeforeCall,
+      rows.length,
+      'one live list plus one callTool equals the two physical starts',
+    );
+    assert.deepEqual(eventlog.openEventLog().prepare(`
+      SELECT physical_crossing_count, host_crossing_count
+        FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(fixture.session.id, fixture.source.seq), {
+      physical_crossing_count: 2,
+      host_crossing_count: 0,
+    });
+    assert.equal(innerDispatch._innerDispatchLegacyMcpTestResolverActive(), false);
+
+    const crossingsBeforeConfigDrift = counts.list + counts.call;
+    configuredCommand = '/fixture/wrong-exact-host-mcp';
+    const driftFixture = acceptHostCanarySource(`exact-native-mcp-config-drift-${suffix}`);
+    const driftAgent = {
+      model: stubModel([
+        [toolCall(`exact-native-mcp-drift-call-${suffix}`, 'call_tool', {
+          name: operationId,
+          args_json: JSON.stringify({ city: 'Seattle' }),
+        })],
+        [textMsg('config drift refused')],
+      ]),
+      tools: [callTool],
+    };
+    mcpToolAuthority.bindAgentMcpToolScope(driftAgent as never, exactScope);
+    bindHostCanarySurface(driftFixture, driftAgent, [callTool]);
+    const driftOutcome = await runProductionHost(driftFixture, driftAgent);
+    assert.equal(driftOutcome.finalOutput, 'config drift refused');
+    assert.equal(counts.list + counts.call, crossingsBeforeConfigDrift,
+      'wrong config/account fails before listTools and callTool');
+    assert.equal((eventlog.openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(driftFixture.session.id, driftFixture.source.seq) as { n: number }).n, 0);
+
+    const guessedFixture = acceptHostCanarySource(`exact-native-mcp-guessed-${suffix}`);
+    const guessedAgent = {
+      model: stubModel([
+        [toolCall(`exact-native-mcp-guessed-call-${suffix}`, 'call_tool', {
+          name: `${serverName}__guessed_lookup`,
+          args_json: JSON.stringify({ city: 'Seattle' }),
+        })],
+        [textMsg('guessed name refused')],
+      ]),
+      tools: [callTool],
+    };
+    mcpToolAuthority.bindAgentMcpToolScope(guessedAgent as never, exactScope);
+    bindHostCanarySurface(guessedFixture, guessedAgent, [callTool]);
+    const guessedOutcome = await runProductionHost(guessedFixture, guessedAgent);
+    assert.equal(guessedOutcome.finalOutput, 'guessed name refused');
+    assert.equal(counts.list + counts.call, crossingsBeforeConfigDrift,
+      'a guessed or sibling/cross-server name never reaches metadata or body');
+    assert.equal((eventlog.openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(guessedFixture.session.id, guessedFixture.source.seq) as { n: number }).n, 0);
+  } finally {
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) {
+      productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+    }
+    capabilityManifestStores.installCapabilityManifestStore(priorManifestStore);
     capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
     if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;

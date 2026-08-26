@@ -1,15 +1,10 @@
 /**
  * Run: node scripts/run-tests-isolated.mjs src/runtime/harness/settlement-audit-platform-plane.test.ts
  *
- * PLATFORM-PLANE AMBIGUITY IS NOT A BUSINESS HAZARD (live 2026-08-25,
- * workflow scrape_and_analyze): the model's composio_manage_connections poke
- * settled uncertain_write, and the settlement audit counted that harness-meta
- * operation as an unrecovered BUSINESS failure — the step blocked AFTER the
- * real scrape had succeeded and been captured, so notify was skipped. The
- * audit already exempts refused_pre_dispatch for the same reason ("Clementine's
- * own guardrails" must not be the reason she cannot report); these pin the
- * matching exemption for the uncertain_write leg, and pin its boundary: a real
- * provider business write settling uncertain_write MUST keep vetoing.
+ * An uncertain mutation remains consequential even when its name belongs to a
+ * provider platform namespace. Connection/control operations can change
+ * credentials and routing, and real business actions also use `composio_*`
+ * names. Only refused_pre_dispatch proves no effect crossed the boundary.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,6 +19,7 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-settlement-pl
 
 const eventlog = await import('./eventlog.js');
 const { auditAcceptedSourceSettlementTruth } = await import('./accepted-source-settlement-audit.js');
+const { resolveWriteEvidence } = await import('./work-report.js');
 const identities = await import('./attempt-identity.js');
 const dispatch = await import('./dispatch-ledger.js');
 const outcomes = await import('./attempt-outcome.js');
@@ -38,7 +34,10 @@ test.after(() => {
 interface Accepted { sessionId: string; sourceUserSeq: number; turn: number; acceptedTaskId: string }
 
 function acceptedSource(sessionId: string, text: string): Accepted {
-  eventlog.createSession({ id: sessionId, kind: 'workflow' });
+  // Settlement classification is the subject of this fixture. Use the host
+  // chat engine so its expected-work binder is present; a binderless workflow
+  // must now refuse before any physical row and is pinned separately.
+  eventlog.createSession({ id: sessionId, kind: 'chat' });
   const source = eventlog.appendEvent({
     sessionId,
     turn: 1,
@@ -103,7 +102,7 @@ function settleCall(
   }).status, 'committed');
 }
 
-test('a platform-plane uncertain_write does not veto a source whose business work succeeded', () => {
+test('a mutating platform-management uncertain_write still vetoes delivered business work', () => {
   const accepted = acceptedSource(
     'workflow:meta-plane-veto:scrape_and_analyze',
     'Scrape the listings and analyze them.',
@@ -147,17 +146,17 @@ test('a platform-plane uncertain_write does not veto a source whose business wor
     sourceUserSeq: accepted.sourceUserSeq,
     requiresBusinessEvidence: true,
   });
-  assert.equal(audit.facts.unrecoveredBusinessFailures, 0,
-    'a harness-plane poke is not an unrecovered BUSINESS failure');
-  assert.equal(audit.facts.blockingUncertainWrites, 0,
-    'ambiguity about Clementine\'s own tool plumbing does not demand human reconciliation');
-  assert.equal(audit.status, 'clean',
-    `the platform-plane poke must not withhold delivered business work: ${JSON.stringify(audit)}`);
+  assert.equal(audit.facts.unrecoveredBusinessFailures, 1,
+    'a mutating connection/control operation is an unrecovered external effect');
+  assert.equal(audit.facts.blockingUncertainWrites, 1,
+    'provider-platform ambiguity still requires reconciliation');
+  assert.equal(audit.status, 'uncertain_write',
+    `the uncertain mutation must withhold a clean terminal: ${JSON.stringify(audit)}`);
   assert.equal(audit.facts.uncertainWrites, 1,
-    'the ambiguity stays REPORTED even though it no longer vetoes');
+    'the ambiguity stays reported and continues to veto a clean terminal');
 });
 
-test('a provider business write settling uncertain_write still vetoes delivery', () => {
+test('a composio-prefixed provider business write settling uncertain_write still vetoes delivery', () => {
   const accepted = acceptedSource(
     'workflow:business-write-veto:update_records',
     'Update the records sheet.',
@@ -166,7 +165,7 @@ test('a provider business write settling uncertain_write still vetoes delivery',
   settleCall(
     accepted,
     'sheet-write',
-    'alpha_records_update',
+    'composio_airtable_update_records',
     { rows: [{ id: 1 }] },
     outcomes.classifyAttemptOutcome({ mutating: true, acknowledged: false }),
     true,
@@ -177,8 +176,8 @@ test('a provider business write settling uncertain_write still vetoes delivery',
     role: 'system',
     type: 'external_write',
     data: {
-      shapeKey: 'ALPHA_RECORDS_UPDATE',
-      toolName: 'alpha_records_update',
+      shapeKey: 'COMPOSIO_AIRTABLE_UPDATE_RECORDS',
+      toolName: 'composio_airtable_update_records',
       preDispatch: true,
       canonicalCallId: 'logical:sheet-write',
     },
@@ -268,4 +267,249 @@ test('an execute-wrapped uncertain write still vetoes: the wrapper is platform n
   });
   assert.equal(audit.status, 'uncertain_write',
     `an execute-wrapped business write must never be plane-exempt: ${JSON.stringify(audit)}`);
+});
+
+test('a reversible logical uncertain write remains blocked until its exact reservation is reconciled', () => {
+  const accepted = acceptedSource(
+    'workflow:reversible-logical-veto:update_rows',
+    'Update the tracker rows.',
+  );
+  settleCall(
+    accepted,
+    'reversible-ambiguous',
+    'composio_google_sheets_update_rows',
+    { rows: [{ id: 3 }] },
+    outcomes.classifyAttemptOutcome({ mutating: true, acknowledged: false }),
+    true,
+  );
+  eventlog.appendEvent({
+    sessionId: accepted.sessionId,
+    turn: accepted.turn,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      shapeKey: 'GOOGLESHEETS_UPDATE_ROWS',
+      toolName: 'composio_execute_tool',
+      targets: ['sheet:tracker'],
+      irreversible: false,
+      preDispatch: true,
+      canonicalCallId: 'logical:reversible-ambiguous',
+    },
+  });
+
+  const audit = auditAcceptedSourceSettlementTruth({
+    sessionId: accepted.sessionId,
+    sourceUserSeq: accepted.sourceUserSeq,
+  });
+  assert.equal(audit.status, 'uncertain_write', JSON.stringify(audit));
+  assert.equal(audit.facts.blockingUncertainWrites, 1);
+  assert.equal(audit.facts.unrecoveredBusinessFailures, 1);
+});
+
+test('a later similar write does not reconcile an earlier ambiguous reservation', () => {
+  const accepted = acceptedSource(
+    'workflow:similar-write-is-not-reconcile:update_rows',
+    'Update the tracker rows.',
+  );
+  settleCall(
+    accepted,
+    'first-ambiguous',
+    'composio_google_sheets_update_rows',
+    { rows: [{ id: 4 }] },
+    outcomes.classifyAttemptOutcome({ mutating: true, acknowledged: false }),
+    true,
+  );
+  eventlog.appendEvent({
+    sessionId: accepted.sessionId,
+    turn: accepted.turn,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      shapeKey: 'GOOGLESHEETS_UPDATE_ROWS',
+      targets: ['sheet:tracker'],
+      irreversible: false,
+      preDispatch: true,
+      canonicalCallId: 'logical:first-ambiguous',
+    },
+  });
+  settleCall(
+    accepted,
+    'second-success',
+    'composio_google_sheets_update_rows',
+    { rows: [{ id: 4 }] },
+    outcomes.classifyAttemptOutcome({ mutating: true, acknowledged: true }),
+    true,
+    { successful: true, data: { updated: 1 } },
+  );
+  const secondReservation = eventlog.appendEvent({
+    sessionId: accepted.sessionId,
+    turn: accepted.turn,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      shapeKey: 'GOOGLESHEETS_UPDATE_ROWS',
+      targets: ['sheet:tracker'],
+      irreversible: false,
+      preDispatch: true,
+      canonicalCallId: 'logical:second-success',
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: accepted.sessionId,
+    turn: accepted.turn,
+    role: 'system',
+    type: 'external_write_succeeded',
+    parentEventId: secondReservation.id,
+    data: {
+      shapeKey: 'GOOGLESHEETS_UPDATE_ROWS',
+      targets: ['sheet:tracker'],
+      canonicalCallId: 'logical:second-success',
+    },
+  });
+
+  const audit = auditAcceptedSourceSettlementTruth({
+    sessionId: accepted.sessionId,
+    sourceUserSeq: accepted.sourceUserSeq,
+  });
+  assert.equal(audit.status, 'uncertain_write', JSON.stringify(audit));
+  assert.equal(audit.facts.blockingUncertainWrites, 1);
+});
+
+test('the exact reservation terminal clears logical uncertainty after readback reconciliation', () => {
+  const accepted = acceptedSource(
+    'workflow:exact-reconciliation:update_rows',
+    'Update the tracker rows.',
+  );
+  settleCall(
+    accepted,
+    'reconciled-ambiguous',
+    'composio_google_sheets_update_rows',
+    { rows: [{ id: 5 }] },
+    outcomes.classifyAttemptOutcome({ mutating: true, acknowledged: false }),
+    true,
+  );
+  const reservation = eventlog.appendEvent({
+    sessionId: accepted.sessionId,
+    turn: accepted.turn,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      shapeKey: 'GOOGLESHEETS_UPDATE_ROWS',
+      targets: ['sheet:tracker'],
+      irreversible: false,
+      preDispatch: true,
+      canonicalCallId: 'logical:reconciled-ambiguous',
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: accepted.sessionId,
+    turn: accepted.turn,
+    role: 'system',
+    type: 'external_write_orphaned',
+    parentEventId: reservation.id,
+    data: {
+      shapeKey: 'GOOGLESHEETS_UPDATE_ROWS',
+      targets: ['sheet:tracker'],
+      canonicalCallId: 'logical:reconciled-ambiguous',
+      reason: 'provider outcome unknown',
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: accepted.sessionId,
+    turn: accepted.turn,
+    role: 'system',
+    type: 'external_write_succeeded',
+    parentEventId: reservation.id,
+    data: {
+      shapeKey: 'GOOGLESHEETS_UPDATE_ROWS',
+      targets: ['sheet:tracker'],
+      canonicalCallId: 'logical:reconciled-ambiguous',
+      reason: 'reconciled_present',
+      evidenceCallId: 'readback:tracker-row-5',
+    },
+  });
+
+  const audit = auditAcceptedSourceSettlementTruth({
+    sessionId: accepted.sessionId,
+    sourceUserSeq: accepted.sourceUserSeq,
+    requiresBusinessEvidence: true,
+  });
+  assert.equal(audit.status, 'clean', JSON.stringify(audit));
+  assert.equal(audit.facts.blockingUncertainWrites, 0);
+  assert.equal(audit.facts.unrecoveredBusinessFailures, 0);
+  assert.equal(audit.facts.confirmedWrites, 1);
+});
+
+test('a parented reconciliation cannot settle a sibling reservation that reused its call id', () => {
+  const accepted = acceptedSource(
+    'workflow:reused-call-id-reconciliation:update_rows',
+    'Update the tracker rows.',
+  );
+  settleCall(
+    accepted,
+    'reused-ambiguous',
+    'composio_google_sheets_update_rows',
+    { rows: [{ id: 6 }] },
+    outcomes.classifyAttemptOutcome({ mutating: true, acknowledged: false }),
+    true,
+  );
+  const reserve = () => eventlog.appendEvent({
+    sessionId: accepted.sessionId,
+    turn: accepted.turn,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      shapeKey: 'GOOGLESHEETS_UPDATE_ROWS',
+      targets: ['sheet:tracker'],
+      irreversible: false,
+      preDispatch: true,
+      canonicalCallId: 'logical:reused-ambiguous',
+    },
+  });
+  const first = reserve();
+  const second = reserve();
+  for (const reservation of [first, second]) {
+    eventlog.appendEvent({
+      sessionId: accepted.sessionId,
+      turn: accepted.turn,
+      role: 'system',
+      type: 'external_write_orphaned',
+      parentEventId: reservation.id,
+      data: {
+        shapeKey: 'GOOGLESHEETS_UPDATE_ROWS',
+        targets: ['sheet:tracker'],
+        canonicalCallId: 'logical:reused-ambiguous',
+        reason: 'provider outcome unknown',
+      },
+    });
+  }
+  eventlog.appendEvent({
+    sessionId: accepted.sessionId,
+    turn: accepted.turn,
+    role: 'system',
+    type: 'external_write_succeeded',
+    parentEventId: first.id,
+    data: {
+      shapeKey: 'GOOGLESHEETS_UPDATE_ROWS',
+      targets: ['sheet:tracker'],
+      canonicalCallId: 'logical:reused-ambiguous',
+      reason: 'reconciled_present',
+      evidenceCallId: 'readback:reused-first',
+    },
+  });
+
+  const evidence = resolveWriteEvidence(eventlog.listEvents(accepted.sessionId, { limit: 500 }));
+  assert.deepEqual(evidence.confirmed.map((event) => event.id), [first.id]);
+  assert.deepEqual(evidence.uncertain.map((event) => event.id), [second.id]);
+  const audit = auditAcceptedSourceSettlementTruth({
+    sessionId: accepted.sessionId,
+    sourceUserSeq: accepted.sourceUserSeq,
+  });
+  assert.equal(audit.status, 'uncertain_write', JSON.stringify(audit));
+  assert.equal(audit.facts.blockingUncertainWrites, 1);
+  assert.equal(
+    audit.facts.unrecoveredBusinessFailures,
+    1,
+    'a reused call id cannot map one reservation terminal onto every logical ambiguity',
+  );
 });

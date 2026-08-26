@@ -273,7 +273,7 @@ test.after(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
-test('empty home uses live listTools only, installs exact authority, and crosses the shared workflow kernel once', async () => {
+test('empty home accounts exact live preparation and business workflow crossings separately', async () => {
   const objective = generated('objective').toLowerCase();
   const generatedMcp = generatedRuntime({ objective });
   const { store, factory } = resetAuthoritySurfaces({ durable: true });
@@ -304,6 +304,7 @@ test('empty home uses live listTools only, installs exact authority, and crosses
   );
   assert.equal(ports.listProductionCapabilityPorts().length, 1);
   assert.equal(factory.snapshot().length, 1);
+  const providerCrossingsBeforeExecution = generatedMcp.counts.list + generatedMcp.counts.call;
 
   const entry = factory.get(installed.manifest.manifestId);
   assert.ok(entry);
@@ -311,15 +312,16 @@ test('empty home uses live listTools only, installs exact authority, and crosses
   const armed = arm(plan, 'blank');
   assert.equal(armed.status, 'armed', JSON.stringify(armed));
   if (armed.status !== 'armed') return;
+  const workflowArgs = { token: generated('input') };
   const executed = await kernel.executeWorkflowReadOnlyCall({
     activationId: armed.ref.activationId,
     invocationPlan: plan,
-    args: { token: generated('input') },
+    args: workflowArgs,
   });
   assert.equal(executed.status, 'completed', JSON.stringify(executed));
   assert.equal(generatedMcp.counts.call, 1);
   assert.equal(generatedMcp.calls[0]!.name, installed.manifest.operationId);
-  assert.equal(generatedMcp.counts.list, 4, 'enumerate, refresh, independent refresh, and crossing each re-list');
+  assert.equal(generatedMcp.counts.list, 4, 'execution owns one separately-accounted live preparation list');
 
   const counts = eventlog.openEventLog().prepare(`
     SELECT
@@ -338,7 +340,39 @@ test('empty home uses live listTools only, installs exact authority, and crosses
     armed.ref.sessionId,
     armed.ref.sourceEventSeq,
   ) as { logical_n: number; physical_n: number; settlement_n: number };
-  assert.deepEqual(counts, { logical_n: 1, physical_n: 1, settlement_n: 1 });
+  assert.deepEqual(counts, { logical_n: 1, physical_n: 2, settlement_n: 1 });
+  const crossings = eventlog.openEventLog().prepare(`
+    SELECT ordinal, relation, state
+      FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+     ORDER BY ordinal
+  `).all(armed.ref.sessionId, armed.ref.sourceEventSeq);
+  assert.deepEqual(crossings, [
+    { ordinal: 1, relation: 'probe', state: 'returned' },
+    { ordinal: 2, relation: 'child', state: 'returned' },
+  ]);
+  assert.equal(
+    generatedMcp.counts.list + generatedMcp.counts.call - providerCrossingsBeforeExecution,
+    crossings.length,
+    'one live list plus one callTool equals two admitted physical starts',
+  );
+
+  const providerCrossingsBeforeReplay = generatedMcp.counts.list + generatedMcp.counts.call;
+  const replayed = await kernel.executeWorkflowReadOnlyCall({
+    activationId: armed.ref.activationId,
+    invocationPlan: plan,
+    args: workflowArgs,
+  });
+  assert.equal(replayed.status, 'replayed', JSON.stringify(replayed));
+  assert.equal(
+    generatedMcp.counts.list + generatedMcp.counts.call,
+    providerCrossingsBeforeReplay,
+    'exact replay adds no preparation or business provider crossing',
+  );
+  assert.equal((eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(armed.ref.sessionId, armed.ref.sourceEventSeq) as { n: number }).n, 2);
 
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
   manifestStores.installCapabilityManifestStore(
@@ -575,13 +609,28 @@ test('schema, account, and invoke drift after admission are blocked before MCP c
       } else {
         runtime.state.portRevision = 'changed';
       }
+      const providerCrossingsBeforeExecution = runtime.counts.list + runtime.counts.call;
       const result = await kernel.executeWorkflowReadOnlyCall({
         activationId: armed.ref.activationId,
         invocationPlan: plan,
         args: { token: generated('input') },
       });
-      assert.equal(result.status, 'failed', JSON.stringify(result));
-      assert.equal(runtime.counts.call, 0, 'last-edge list detects drift before tools/call');
+      const physicalStarts = (eventlog.openEventLog().prepare(`
+        SELECT COUNT(*) AS n
+          FROM physical_dispatches
+         WHERE session_id = ? AND source_user_seq = ?
+      `).get(armed.ref.sessionId, armed.ref.sourceEventSeq) as { n: number }).n;
+      const providerCrossings = runtime.counts.list + runtime.counts.call
+        - providerCrossingsBeforeExecution;
+      assert.equal(providerCrossings, physicalStarts);
+      if (drift === 'schema') {
+        assert.equal(result.status, 'failed', JSON.stringify(result));
+        assert.equal(physicalStarts, 1, 'live schema drift settles one admitted preparation crossing');
+      } else {
+        assert.equal(result.status, 'blocked', JSON.stringify(result));
+        assert.equal(physicalStarts, 0, 'local account/invoke drift blocks before physical admission');
+      }
+      assert.equal(runtime.counts.call, 0, 'drift is detected before tools/call');
     });
   }
 });

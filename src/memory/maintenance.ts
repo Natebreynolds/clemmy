@@ -944,12 +944,24 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   if (isAtOrAfterDailyTime(now, MEMORY_BACKUP_NIGHTLY_HOUR, MEMORY_BACKUP_NIGHTLY_MINUTE)) {
     const backupEnabled = (getRuntimeEnv('CLEMMY_MEMORY_BACKUP', 'on') || 'on').toLowerCase() !== 'off';
     if (backupEnabled && maintenanceState.lastBackupDay !== today) {
-      maintenanceState.lastBackupDay = today;
-      writeMaintenanceState(maintenanceState);
       try {
-        const result = backupMemoryDb({ retain: MEMORY_BACKUP_RETAIN });
+        // `today` is the durable cross-process idempotency key. Every daemon
+        // process may reach this branch with a stale in-memory state snapshot,
+        // but exactly one publishes and every loser reports the same file.
+        const result = backupMemoryDb({
+          retain: MEMORY_BACKUP_RETAIN,
+          localDayKey: today,
+        });
         if (result) {
-          logger.info({ backupPath: result.backupPath, bytes: result.bytes }, 'memory.db nightly backup written');
+          // Do not stamp the day before publication: a crash/failure must be
+          // retried. A crash after atomic publication but before this write is
+          // safe because the next process reuses the keyed snapshot.
+          maintenanceState.lastBackupDay = today;
+          writeMaintenanceState(maintenanceState);
+          logger.info(
+            { backupPath: result.backupPath, bytes: result.bytes, reused: result.reused },
+            result.reused ? 'memory.db nightly backup reused' : 'memory.db nightly backup written',
+          );
         } else {
           logger.warn('memory.db nightly backup returned no result');
         }

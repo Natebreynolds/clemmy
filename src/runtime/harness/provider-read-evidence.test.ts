@@ -1,7 +1,25 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { projectProviderResult } from './provider-read-evidence.js';
+import { exactProviderDataPayload, projectProviderResult } from './provider-read-evidence.js';
+
+test('exact provider payload accepts only the closed successful SDK envelope, including durable JSON bytes', () => {
+  const envelope = {
+    data: { id: 'resource-1', handle: 'provider://resources/resource-1' },
+    error: null,
+    successful: true,
+    logId: 'log-1',
+    sessionInfo: { id: 'sdk-session-1' },
+  };
+  assert.deepEqual(exactProviderDataPayload(envelope), envelope.data);
+  assert.deepEqual(exactProviderDataPayload(JSON.stringify(envelope)), envelope.data);
+
+  const arbitrary = { data: envelope.data, successful: true, modelClaim: 'not provider authority' };
+  assert.equal(exactProviderDataPayload(arbitrary), arbitrary);
+  assert.equal(exactProviderDataPayload(JSON.stringify(arbitrary)), JSON.stringify(arbitrary));
+  const failed = { data: envelope.data, successful: false, error: 'denied' };
+  assert.equal(exactProviderDataPayload(failed), failed);
+});
 
 test('auxiliary empty arrays never prove an empty provider result', () => {
   for (const value of [

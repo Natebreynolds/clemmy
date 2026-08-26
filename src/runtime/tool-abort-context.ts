@@ -14,12 +14,20 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-const abortStore = new AsyncLocalStorage<{ signal: AbortSignal }>();
+const abortStore = new AsyncLocalStorage<{ signal: AbortSignal; deadlineAt?: number }>();
 
 /** Run `fn` with `signal` visible to `currentToolAbortSignal()` across every
  *  await boundary reached from inside it. Returns whatever `fn` returns. */
-export function runWithToolAbortSignal<T>(signal: AbortSignal, fn: () => T): T {
-  return abortStore.run({ signal }, fn);
+export function runWithToolAbortSignal<T>(
+  signal: AbortSignal,
+  fn: () => T,
+  deadlineAt?: number,
+): T {
+  const inheritedDeadline = abortStore.getStore()?.deadlineAt;
+  const exactDeadline = Number.isFinite(deadlineAt) && (deadlineAt ?? 0) > 0
+    ? deadlineAt
+    : inheritedDeadline;
+  return abortStore.run({ signal, ...(exactDeadline ? { deadlineAt: exactDeadline } : {}) }, fn);
 }
 
 /** The abort signal for the tool call currently on the stack, or undefined when
@@ -28,4 +36,9 @@ export function runWithToolAbortSignal<T>(signal: AbortSignal, fn: () => T): T {
  *  they do today (fail-open). */
 export function currentToolAbortSignal(): AbortSignal | undefined {
   return abortStore.getStore()?.signal;
+}
+
+/** Exact absolute outer tool deadline, when the invocation owner supplied one. */
+export function currentToolAbortDeadlineAt(): number | undefined {
+  return abortStore.getStore()?.deadlineAt;
 }

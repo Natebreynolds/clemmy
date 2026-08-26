@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { runWithToolAbortSignal } from '../../runtime/tool-abort-context.js';
 import {
   COMPOSIO_AUTH_CONFIGS_URL,
   ComposioNeedsAuthConfigError,
@@ -23,6 +24,8 @@ import {
   composioCliErrorProvesNoDispatch,
   executeComposioTool,
   executePreparedComposioTool,
+  peekConnectedToolkits,
+  peekCurrentConnectedToolkits,
   prepareComposioOneShotDispatch,
   prepareInAppToolkitConnection,
   resetComposioClient,
@@ -49,11 +52,17 @@ test('prepared SDK dispatch is one exact no-retry POST with no core schema/modif
   let rawExecuteCalls = 0;
   const withOptions: unknown[] = [];
   let capturedBody: Record<string, unknown> | undefined;
+  let capturedRequestOptions: { signal?: AbortSignal } | undefined;
   const rawNoRetry = {
     tools: {
-      execute: async (_slug: string, body: Record<string, unknown>) => {
+      execute: async (
+        _slug: string,
+        body: Record<string, unknown>,
+        requestOptions?: { signal?: AbortSignal },
+      ) => {
         rawExecuteCalls += 1;
         capturedBody = body;
+        capturedRequestOptions = requestOptions;
         return {
           data: { id: 'draft-1' },
           error: null,
@@ -85,7 +94,11 @@ test('prepared SDK dispatch is one exact no-retry POST with no core schema/modif
       connectedAccountId: 'ca_exact',
       providerOperationVersion: '20260824_01',
     });
-    const result = await executePreparedComposioTool(prepared);
+    const controller = new AbortController();
+    const result = await runWithToolAbortSignal(
+      controller.signal,
+      () => executePreparedComposioTool(prepared),
+    );
     assert.equal(rawExecuteCalls, 1, 'one business POST');
     assert.equal(coreExecuteCalls, 0, 'no core schema GET, file modifiers, or fallback execute');
     assert.deepEqual(withOptions, [{ maxRetries: 0 }], 'transport retries are disabled');
@@ -95,6 +108,7 @@ test('prepared SDK dispatch is one exact no-retry POST with no core schema/modif
       version: '20260824_01',
       connected_account_id: 'ca_exact',
     });
+    assert.equal(capturedRequestOptions?.signal, controller.signal, 'the raw request owns the host abort signal');
     assert.deepEqual(result, {
       data: { id: 'draft-1' },
       error: null,
@@ -155,6 +169,44 @@ test('prepared SDK dispatch refuses missing current account/version before the r
     resetComposioClient();
     if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
     else process.env.COMPOSIO_BACKEND = previousBackend;
+  }
+});
+
+test('prepared business dispatch refuses CLI-only before spawning a CLI or provider body', () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  const previousCliPath = process.env.COMPOSIO_CLI_PATH;
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'composio-prepared-cli-refusal-'));
+  const marker = path.join(tmp, 'cli-entered');
+  const shim = path.join(tmp, 'composio-cli-must-not-run.mjs');
+  writeFileSync(shim, [
+    `import { writeFileSync } from 'node:fs';`,
+    `writeFileSync(${JSON.stringify(marker)}, 'entered');`,
+    `process.exitCode = 2;`,
+    '',
+  ].join('\n'));
+  chmodSync(shim, 0o755);
+  process.env.COMPOSIO_BACKEND = 'cli';
+  process.env.COMPOSIO_CLI_PATH = shim;
+  __test__.setComposioApiKeyOverride('');
+  try {
+    assert.throws(
+      () => prepareComposioOneShotDispatch({
+        toolSlug: 'COMPOSIO_LIST_TOOLS',
+        args: { query: 'calendar' },
+        providerOperationVersion: '20260825_01',
+      }),
+      (error: unknown) => error instanceof ComposioPreDispatchError
+        && /CLI cannot prove one provider request/.test(error.message),
+    );
+    assert.equal(existsSync(marker), false, 'prepared refusal never even spawns the CLI utility');
+  } finally {
+    __test__.setComposioApiKeyOverride(null);
+    resetComposioClient();
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+    if (previousCliPath === undefined) delete process.env.COMPOSIO_CLI_PATH;
+    else process.env.COMPOSIO_CLI_PATH = previousCliPath;
+    rmSync(tmp, { recursive: true, force: true });
   }
 });
 
@@ -686,6 +738,140 @@ test('ROOT CAUSE: a transient refresh failure serves last-good (never empties a 
     __test__.setConnectedAccountsLoader(null);
     if (prev === undefined) delete process.env.COMPOSIO_USER_ID;
     else process.env.COMPOSIO_USER_ID = prev;
+  }
+});
+
+test('raw + SDK share one absolute deadline; timeout preserves last-good and a late SDK result cannot publish', async (t) => {
+  __test__.setConnectedAccountsLoader(async () => [
+    account('ca_deadline_good', 'outlook', 'owner-deadline-good'),
+  ]);
+  assert.deepEqual(
+    (await listConnectedToolkits({ requireFresh: true })).map((row) => row.connectionId),
+    ['ca_deadline_good'],
+  );
+
+  let sdkCalls = 0;
+  let resolveSdk!: (value: unknown) => void;
+  const lateSdk = new Promise<unknown>((resolve) => { resolveSdk = resolve; });
+  let rawSignal: AbortSignal | undefined;
+  let completed = false;
+  __test__.setComposioApiKeyOverride('account-deadline-fixture-key');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  __test__.setConnectedAccountsListTransports({
+    rawList: ({ signal }) => {
+      rawSignal = signal;
+      return new Promise((resolve) => {
+        setTimeout(() => resolve({
+          ok: false,
+          status: 503,
+          json: async () => ({ items: [] }),
+        }), 10_000);
+      });
+    },
+    sdkList: () => {
+      sdkCalls += 1;
+      return lateSdk;
+    },
+  });
+
+  const flushMicrotasks = async () => {
+    for (let index = 0; index < 8; index += 1) await Promise.resolve();
+  };
+  try {
+    const refresh = listConnectedToolkits({ requireFresh: true });
+    void refresh.then(
+      () => { completed = true; },
+      () => { completed = true; },
+    );
+
+    t.mock.timers.tick(9_999);
+    await flushMicrotasks();
+    assert.equal(completed, false, 'raw leg remains inside the one phase deadline');
+    assert.equal(sdkCalls, 0);
+
+    t.mock.timers.tick(1);
+    await flushMicrotasks();
+    assert.equal(sdkCalls, 1, 'raw failure falls through to SDK with only the remaining time');
+    assert.equal(completed, false);
+
+    t.mock.timers.tick(4_999);
+    await flushMicrotasks();
+    assert.equal(completed, false, 'SDK does not receive a fresh 15 second window');
+
+    t.mock.timers.tick(1);
+    await flushMicrotasks();
+    assert.deepEqual(
+      (await refresh).map((row) => row.connectionId),
+      ['ca_deadline_good'],
+      'the phase timeout serves the seeded last-good snapshot',
+    );
+    assert.equal(rawSignal?.aborted, true, 'the absolute phase deadline aborts the raw transport owner');
+    assert.equal(peekCurrentConnectedToolkits(), null,
+      'a timeout never mints a fresh execution-preparation observation');
+    assert.deepEqual(peekConnectedToolkits().map((row) => row.connectionId), ['ca_deadline_good']);
+
+    resolveSdk({
+      items: [account('ca_deadline_late', 'outlook', 'owner-deadline-late')],
+    });
+    await flushMicrotasks();
+    assert.equal(peekCurrentConnectedToolkits(), null,
+      'the abandoned SDK completion cannot publish current authority');
+    assert.deepEqual(
+      peekConnectedToolkits().map((row) => row.connectionId),
+      ['ca_deadline_good'],
+      'the abandoned SDK completion cannot overwrite last-good',
+    );
+    assert.equal(
+      dispatchUserIdFor('ca_deadline_late', [], 'fallback-after-late-sdk'),
+      'fallback-after-late-sdk',
+      'the abandoned SDK completion cannot record connection-owner authority',
+    );
+  } finally {
+    resolveSdk({ items: [] });
+    await flushMicrotasks();
+    __test__.setConnectedAccountsListTransports(null);
+    __test__.setComposioApiKeyOverride(null);
+    t.mock.timers.reset();
+    resetComposioClient();
+  }
+});
+
+test('a successful provider 200 with an actual empty items array authoritatively clears last-good', async () => {
+  __test__.setConnectedAccountsLoader(async () => [
+    account('ca_before_provider_empty', 'outlook', 'owner-before-provider-empty'),
+  ]);
+  assert.deepEqual(
+    (await listConnectedToolkits({ requireFresh: true })).map((row) => row.connectionId),
+    ['ca_before_provider_empty'],
+  );
+
+  let rawCalls = 0;
+  let sdkCalls = 0;
+  __test__.setComposioApiKeyOverride('account-empty-fixture-key');
+  __test__.setConnectedAccountsListTransports({
+    rawList: async () => {
+      rawCalls += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ items: [] }),
+      };
+    },
+    sdkList: () => {
+      sdkCalls += 1;
+      return Promise.resolve({ items: [account('ca_sdk_must_not_run', 'outlook', 'owner-sdk')] });
+    },
+  });
+  try {
+    assert.deepEqual(await listConnectedToolkits({ requireFresh: true }), []);
+    assert.equal(rawCalls, 1);
+    assert.equal(sdkCalls, 0, 'an authoritative raw response never falls through to SDK');
+    assert.deepEqual(peekConnectedToolkits(), [], 'the authoritative empty replaces last-good');
+    assert.deepEqual(peekCurrentConnectedToolkits(), [], 'the empty provider observation is current');
+  } finally {
+    __test__.setConnectedAccountsListTransports(null);
+    __test__.setComposioApiKeyOverride(null);
+    resetComposioClient();
   }
 });
 

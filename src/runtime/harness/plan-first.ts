@@ -1,7 +1,10 @@
 import { Runner } from '@openai/agents';
 import { surfacePlan, surfaceAskingPlan } from '../../agents/plan-proposals.js';
 import { buildPlannerAgent, sanitizePlanOutput, type Plan } from '../../agents/planner.js';
-import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import {
+  autoCaptureProvenanceFromAcceptedEvent,
+  captureInteractionSignals,
+} from '../../memory/auto-capture.js';
 import { recallHybrid } from '../../memory/recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { runPostTurnHooks } from './post-turn.js';
@@ -395,28 +398,30 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
     type: 'turn_started',
     data: { input: input.input.slice(0, 200), mode: 'plan_first' },
   });
-  let sourceUserSeq: number;
+  let acceptedSource: EventRow;
   if (input.reuseRecordedUserInput) {
     if (input.sourceUserSeq === undefined) {
       throw new Error('reuseRecordedUserInput requires the exact sourceUserSeq.');
     }
-    sourceUserSeq = exactPlanFirstSource(input.sessionId, input.sourceUserSeq).seq;
+    acceptedSource = exactPlanFirstSource(input.sessionId, input.sourceUserSeq);
   } else {
-    const acceptedUserInput = appendEvent({
+    acceptedSource = appendEvent({
       sessionId: input.sessionId,
       turn: 0,
       role: 'user',
       type: 'user_input_received',
       data: { text: input.input },
     });
-    sourceUserSeq = acceptedUserInput.seq;
   }
+  const sourceUserSeq = acceptedSource.seq;
 
   try {
     const captured = captureInteractionSignals({
       message: input.input,
       sessionId: input.sessionId,
-      sourceEventId: 'plan-first:turn:0',
+      sourceEventId: `user-source:${sourceUserSeq}`,
+      occurredAt: acceptedSource.createdAt,
+      sourceProvenance: autoCaptureProvenanceFromAcceptedEvent(acceptedSource),
     });
     if (captured.candidates.length > 0 || captured.profilePatch) {
       appendEvent({

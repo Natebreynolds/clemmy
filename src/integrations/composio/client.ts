@@ -57,6 +57,7 @@ const DERIVED_USER_ID_PREFIX = 'clementine-';
 const RECONNECT_REQUIRED_RE =
   /ConnectedAccountEntityIdMismatch|connected account[^\n]{0,100}(?:user|entity)[ _-]?id[^\n]{0,80}(?:does not match|mismatch)|user[ _-]?id[^\n]{0,80}does not match[^\n]{0,80}provided user[ _-]?id|ToolRouterV2[_-]?NoActiveConnection|\bNoActiveConnection\b|\bno active connection\b|Auth[_ ]?Config[_ ]?AuthSchemeNotFound|\bAuthSchemeNotFound\b|unsupported OAuth2/i;
 const CONNECTIONS_TTL_MS = 60_000;
+const CONNECTED_ACCOUNTS_LIST_TIMEOUT_MS = 15_000;
 const CATALOG_TTL_MS = 60 * 60_000;
 const BACKEND_VALUES = ['auto', 'sdk', 'cli'] as const;
 export const COMPOSIO_AUTH_CONFIGS_URL = 'https://dashboard.composio.dev/~/project/auth-configs';
@@ -342,6 +343,16 @@ let lastGoodConnections: ConnectedToolkit[] | null = null;
 // error propagates (retry contract) rather than degrading to last-good.
 const SNAPSHOT_SUPERSEDED_MESSAGE = 'Composio account state changed during refresh; retry the operation.';
 let connectedAccountsLoaderForTest: (() => Promise<Array<Record<string, unknown>>>) | null = null;
+interface ConnectedAccountsRawListResponse {
+  ok: boolean;
+  status?: number;
+  json(): Promise<unknown>;
+}
+interface ConnectedAccountsListTransports {
+  rawList(input: { apiKey: string; signal: AbortSignal }): Promise<ConnectedAccountsRawListResponse>;
+  sdkList(input: { limit: number }): Promise<unknown> | null;
+}
+let connectedAccountsListTransportsForTest: ConnectedAccountsListTransports | null = null;
 // Test-only override: null follows the real vault/env chain, while an empty
 // string proves the genuinely keyless AUTO lane without touching a developer's
 // local credential files.
@@ -981,44 +992,109 @@ function extractAccountIdentity(state: unknown, data: unknown): AccountIdentity 
   return out;
 }
 
-async function loadConnectedAccountItems(): Promise<Array<Record<string, unknown>>> {
-  if (connectedAccountsLoaderForTest) return connectedAccountsLoaderForTest();
-  const apiKey = readComposioEnv('COMPOSIO_API_KEY');
-  if (!apiKey) return [];
-  // RAW v3 REST first: it exposes each account's OWNER user_id, which the
-  // @composio/core SDK transform strips from connectedAccounts.list(). The
-  // owner is required at dispatch time — Composio validates that userId and
-  // connectedAccountId MATCH, so pinning a connection under the wrong entity
-  // 400s with ConnectedAccountEntityIdMismatch (2026-07-11 live probe:
-  // dashboard-created accounts under pg-test-… vs a stale env user-main).
+type ConnectedAccountItemsLoadOutcome =
+  | { kind: 'authoritative'; items: Array<Record<string, unknown>> }
+  | { kind: 'transient'; reason: string };
+
+function decodeConnectedAccountItems(value: unknown): Array<Record<string, unknown>> | null {
+  if (Array.isArray(value)) return value as Array<Record<string, unknown>>;
+  if (!value || typeof value !== 'object') return null;
+  const items = (value as { items?: unknown }).items;
+  return Array.isArray(items) ? items as Array<Record<string, unknown>> : null;
+}
+
+function connectedAccountLoadFailure(reason: string): ConnectedAccountItemsLoadOutcome {
+  return { kind: 'transient', reason };
+}
+
+/**
+ * Try raw v3 first (it preserves owner user_id), then the SDK compatibility
+ * listing. The caller owns the ONE absolute phase deadline; neither leg gets a
+ * fresh timeout window. A provider response is authoritative only when its
+ * payload contains an actual items array — including a genuine empty array.
+ */
+async function loadConnectedAccountItemsWithinPhase(
+  apiKey: string,
+  signal: AbortSignal,
+): Promise<ConnectedAccountItemsLoadOutcome> {
+  let rawFailure = 'raw connected-account listing was unavailable';
   try {
-    const res = await fetch('https://backend.composio.dev/api/v3/connected_accounts?limit=100', {
-      headers: { 'x-api-key': apiKey },
-      signal: AbortSignal.timeout(15_000),
-    });
+    const res = connectedAccountsListTransportsForTest
+      ? await connectedAccountsListTransportsForTest.rawList({ apiKey, signal })
+      : await fetch('https://backend.composio.dev/api/v3/connected_accounts?limit=100', {
+          headers: { 'x-api-key': apiKey },
+          signal,
+        });
     if (res.ok) {
-      const body = (await res.json()) as { items?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>;
-      const items = Array.isArray(body) ? body : (body?.items ?? []);
-      if (Array.isArray(items)) return items;
+      const items = decodeConnectedAccountItems(await res.json());
+      if (items) return { kind: 'authoritative', items };
+      rawFailure = 'raw connected-account listing returned an invalid payload';
+    } else {
+      rawFailure = `raw connected-account listing returned HTTP ${res.status ?? 'error'}`;
     }
-  } catch { /* fall through to the SDK listing (no owner ids, but functional) */ }
-  const composio = getComposio();
-  if (!composio) return [];
-  // The SDK listing accepts no abort signal, so bound it the same way the raw
-  // path above is bounded — an unbounded fallback here held the admission
-  // stage for the full capability-resolution deadline (live 2026-08-25:
-  // 27% of workflow turns blew the 90s deadline inside this call chain).
-  // A timeout serves the last-good registry view instead of gating the turn.
-  let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+  } catch (err) {
+    if (signal.aborted) return connectedAccountLoadFailure('connected-account listing deadline exceeded');
+    rawFailure = err instanceof Error ? err.message : String(err);
+  }
+
+  if (signal.aborted) return connectedAccountLoadFailure('connected-account listing deadline exceeded');
+
+  // SDK fallback exposes no owner ids, but remains useful when raw v3 is
+  // transiently unavailable. It accepts no AbortSignal, so the outer phase
+  // race is its cancellation owner. A late SDK result resolves only this
+  // abandoned local promise; publication happens solely from the raced outcome.
+  let sdkRequest: Promise<unknown> | null;
   try {
-    const resp = await Promise.race([
-      (composio as any).connectedAccounts.list({ limit: 100 }),
-      new Promise<null>((resolve) => { fallbackTimer = setTimeout(() => resolve(null), 15_000); }),
-    ]);
-    if (resp === null) return [];
-    return Array.isArray(resp) ? resp : (resp?.items ?? []);
+    sdkRequest = connectedAccountsListTransportsForTest
+      ? connectedAccountsListTransportsForTest.sdkList({ limit: 100 })
+      : (() => {
+          const composio = getComposio();
+          return composio
+            ? (composio as any).connectedAccounts.list({ limit: 100 }) as Promise<unknown>
+            : null;
+        })();
+  } catch (err) {
+    return connectedAccountLoadFailure(err instanceof Error ? err.message : String(err));
+  }
+  if (!sdkRequest) return connectedAccountLoadFailure(rawFailure);
+  try {
+    const items = decodeConnectedAccountItems(await sdkRequest);
+    if (signal.aborted) return connectedAccountLoadFailure('connected-account listing deadline exceeded');
+    return items
+      ? { kind: 'authoritative', items }
+      : connectedAccountLoadFailure('SDK connected-account listing returned an invalid payload');
+  } catch (err) {
+    if (signal.aborted) return connectedAccountLoadFailure('connected-account listing deadline exceeded');
+    return connectedAccountLoadFailure(err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function loadConnectedAccountItems(): Promise<ConnectedAccountItemsLoadOutcome> {
+  if (connectedAccountsLoaderForTest) {
+    try {
+      return { kind: 'authoritative', items: await connectedAccountsLoaderForTest() };
+    } catch (err) {
+      return connectedAccountLoadFailure(err instanceof Error ? err.message : String(err));
+    }
+  }
+  const apiKey = readComposioEnv('COMPOSIO_API_KEY');
+  if (!apiKey) return connectedAccountLoadFailure('Composio API key is unavailable');
+
+  const controller = new AbortController();
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<ConnectedAccountItemsLoadOutcome>((resolve) => {
+    deadlineTimer = setTimeout(() => {
+      controller.abort();
+      resolve(connectedAccountLoadFailure('connected-account listing deadline exceeded'));
+    }, CONNECTED_ACCOUNTS_LIST_TIMEOUT_MS);
+  });
+  // Start the deadline before either provider leg. Raw failure therefore leaves
+  // only the remaining phase time for the SDK; it never opens a second 15s wait.
+  const providerPhase = loadConnectedAccountItemsWithinPhase(apiKey, controller.signal);
+  try {
+    return await Promise.race([providerPhase, deadline]);
   } finally {
-    if (fallbackTimer) clearTimeout(fallbackTimer);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
   }
 }
 
@@ -1075,59 +1151,71 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
   if (connectionsInflight?.generation === generation) return connectionsInflight.promise;
   let promise!: Promise<ConnectedToolkit[]>;
   promise = (async (): Promise<ConnectedToolkit[]> => {
-      const items = await loadConnectedAccountItems();
-      const data = items.map((item) => {
-        const toolkit = obj(item.toolkit);
-        const authConfig = obj(item.authConfig);
-        const identity = extractAccountIdentity(item.state, item.data);
-        const slug =
-          str(toolkit.slug) ??
-          str(authConfig.toolkit_slug) ??
-          str(authConfig.toolkitSlug) ??
-          str(item.toolkit_slug) ??
-          str(item.toolkitSlug) ??
-          'unknown';
+    const loaded = await loadConnectedAccountItems();
+    // Generation and outcome are checked BEFORE mapping. Mapping records
+    // connection-owner authority, so even that local side effect must not run
+    // for a superseded request, a timeout, or another transient failure.
+    if (generation !== connectionsGeneration) {
+      throw new Error(SNAPSHOT_SUPERSEDED_MESSAGE);
+    }
+    if (loaded.kind === 'transient') {
+      throw new Error(`Composio connected-account refresh was transient: ${loaded.reason}`);
+    }
+    const decoded = loaded.items.map((item) => {
+      const toolkit = obj(item.toolkit);
+      const authConfig = obj(item.authConfig);
+      const identity = extractAccountIdentity(item.state, item.data);
+      const slug =
+        str(toolkit.slug) ??
+        str(authConfig.toolkit_slug) ??
+        str(authConfig.toolkitSlug) ??
+        str(item.toolkit_slug) ??
+        str(item.toolkitSlug) ??
+        'unknown';
 
-        return {
-          slug,
-          connectionId: str(item.id) ?? str(item.nanoid) ?? str(item.connectionId) ?? '',
-          status: str(item.status) ?? 'UNKNOWN',
-          alias: str(item.alias),
-          accountLabel: identity.label,
-          accountEmail: identity.email,
-          accountName: identity.name,
-          accountAvatarUrl: identity.avatarUrl,
-          createdAt: str(item.createdAt) ?? str(item.created_at),
-          wordId: str(item.wordId) ?? str(item.word_id),
-          ownerUserId: str(item.user_id) ?? str(item.userId),
-        };
-      }).filter((connection) => connection.connectionId && connection.slug !== 'unknown')
-        .map((connection) => {
-          // Identity enrichment: when the listing carries no email (Microsoft
-          // tokens expose none), serve the mailbox a profile probe learned for
-          // this connection — so same-mailbox re-auths merge and named accounts
-          // ("use my acme email") resolve. See identity-cache.ts.
-          // Also persist the owning entity (raw v3 exposes it; the SDK strips it)
-          // so a later v3 outage still pairs the correct owner at dispatch.
-          if (connection.ownerUserId) recordConnectionOwner(connection.connectionId, connection.ownerUserId);
-          if (connection.accountEmail) return connection;
-          const learned = cachedIdentityEmail(connection.connectionId);
-          return learned ? { ...connection, accountEmail: learned } : connection;
-        });
-      if (generation !== connectionsGeneration) {
-        throw new Error(SNAPSHOT_SUPERSEDED_MESSAGE);
-      }
-      connectionsCache = {
-        at: Date.now(),
-        data,
+      return {
+        slug,
+        connectionId: str(item.id) ?? str(item.nanoid) ?? str(item.connectionId) ?? '',
+        status: str(item.status) ?? 'UNKNOWN',
+        alias: str(item.alias),
+        accountLabel: identity.label,
+        accountEmail: identity.email,
+        accountName: identity.name,
+        accountAvatarUrl: identity.avatarUrl,
+        createdAt: str(item.createdAt) ?? str(item.created_at),
+        wordId: str(item.wordId) ?? str(item.word_id),
+        ownerUserId: str(item.user_id) ?? str(item.userId),
       };
-      lastGoodConnections = data;
-      // Connection publication stays metadata-only. Starting an unawaited
-      // 200-definition enumeration here still competes with the foreground
-      // role search (and can outlive its turn); the bounded live search owns
-      // cold discovery. Offline maintenance may call the explicit index
-      // reconciler, but a connection read never starts catalog fan-out.
-      return data;
+    });
+    // A successful provider payload with non-empty but malformed rows is not
+    // proof of an empty account registry. Reject the whole generation rather
+    // than filtering every row away and clearing a healthy last-good view.
+    if (decoded.some((connection) => !connection.connectionId || connection.slug === 'unknown')) {
+      throw new Error('Composio connected-account refresh returned an incomplete snapshot.');
+    }
+    const data = decoded.map((connection) => {
+      // Identity enrichment: when the listing carries no email (Microsoft
+      // tokens expose none), serve the mailbox a profile probe learned for
+      // this connection — so same-mailbox re-auths merge and named accounts
+      // ("use my acme email") resolve. See identity-cache.ts.
+      // Also persist the owning entity (raw v3 exposes it; the SDK strips it)
+      // so a later v3 outage still pairs the correct owner at dispatch.
+      if (connection.ownerUserId) recordConnectionOwner(connection.connectionId, connection.ownerUserId);
+      if (connection.accountEmail) return connection;
+      const learned = cachedIdentityEmail(connection.connectionId);
+      return learned ? { ...connection, accountEmail: learned } : connection;
+    });
+    connectionsCache = {
+      at: Date.now(),
+      data,
+    };
+    lastGoodConnections = data;
+    // Connection publication stays metadata-only. Starting an unawaited
+    // 200-definition enumeration here still competes with the foreground
+    // role search (and can outlive its turn); the bounded live search owns
+    // cold discovery. Offline maintenance may call the explicit index
+    // reconciler, but a connection read never starts catalog fan-out.
+    return data;
   })().finally(() => {
     if (connectionsInflight?.promise === promise) connectionsInflight = null;
   });
@@ -1138,7 +1226,6 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
 export async function listConnectedToolkits(
   options: { requireFresh?: boolean } = {},
 ): Promise<ConnectedToolkit[]> {
-  if (!connectedAccountsLoaderForTest && !getComposio()) return [];
   const now = Date.now();
   // Fresh → serve cached.
   if (connectionsCache && now - connectionsCache.at < CONNECTIONS_TTL_MS) return connectionsCache.data;
@@ -2337,13 +2424,12 @@ export interface PreparedComposioPresignOneShot {
 }
 
 interface PreparedComposioOneShotState {
-  lane: 'sdk' | 'cli';
+  lane: 'sdk';
   toolSlug: string;
   args: Record<string, unknown>;
   connectedAccountId?: string;
   userId: string;
   providerOperationVersion?: string;
-  cliOptions?: { apiKey?: string; userId?: string };
   rawClient?: {
     tools?: {
       execute?: (
@@ -2378,7 +2464,7 @@ interface PreparedComposioPresignOneShotState {
 const preparedComposioPresignOneShots = new WeakMap<object, PreparedComposioPresignOneShotState>();
 
 export interface PreparedComposioOneShotIdentity {
-  lane: 'sdk' | 'cli';
+  lane: 'sdk';
   toolSlug: string;
   providerArgumentDigest: string;
   connectedAccountId: string | null;
@@ -2454,8 +2540,9 @@ function exactPreparedOperationVersion(value: string | undefined): string | unde
 }
 
 /** Pure/current preparation for the terminal adapter. It starts no provider
- * work: CLI readiness and connected-account ownership must already be cached,
- * and SDK construction has telemetry/version checks disabled. */
+ * work: connected-account ownership must already be current, and SDK
+ * construction has telemetry/version checks disabled. CLI execution is not a
+ * prepared lane because the subprocess cannot prove one provider request. */
 export function prepareComposioOneShotDispatch(input: {
   toolSlug: string;
   args: Record<string, unknown>;
@@ -2479,94 +2566,67 @@ export function prepareComposioOneShotDispatch(input: {
 
   const credentials = getComposioCredentialStatus();
   const connectedAccountId = normalizePreparedConnectionId(input.connectedAccountId);
-  let state: PreparedComposioOneShotState;
   if (composioExecutionUsesCliOnlyLane(credentials)) {
-    if (connectedAccountId) {
-      throw new ComposioPreDispatchError(
-        'preparation-required',
-        `${toolSlug} selected a connected account that the CLI lane cannot address.`,
-      );
-    }
-    const cliOptions = { ...composioCliOptions(), userId: credentials.userId };
-    const cli = peekCurrentComposioCliStatus(cliOptions);
-    if (!cli) {
-      throw new ComposioPreDispatchError(
-        'preparation-required',
-        `${toolSlug} has no completed current Composio CLI status observation.`,
-      );
-    }
-    if (!cli.installed || !cli.authenticated) {
-      throw new ComposioPreDispatchError(
-        cli.installed ? 'cli-auth' : 'cli-unavailable',
-        cli.installed
-          ? 'The prepared Composio CLI session is not authenticated.'
-          : 'The prepared Composio CLI binary is unavailable.',
-      );
-    }
-    state = {
-      lane: 'cli',
-      toolSlug,
-      args,
-      userId: credentials.userId,
-      cliOptions,
-    };
-  } else {
-    const providerOperationVersion = exactPreparedOperationVersion(input.providerOperationVersion);
-    if (!providerOperationVersion) {
-      throw new ComposioPreDispatchError(
-        'preparation-required',
-        `${toolSlug} has no exact current provider operation version.`,
-      );
-    }
-    const snapshot = peekCurrentConnectedToolkits();
-    let userId = credentials.userId;
-    if (connectedAccountId) {
-      if (!snapshot) {
-        throw new ComposioPreDispatchError(
-          'preparation-required',
-          `${toolSlug} has no current connected-account observation.`,
-        );
-      }
-      const connection = snapshot.find((row) => row.connectionId === connectedAccountId);
-      if (!connection || !/active|enabled|initiat/i.test(connection.status ?? '')) {
-        throw new ComposioPreDispatchError(
-          'preparation-required',
-          `${toolSlug} connected account ${connectedAccountId} is not current and usable.`,
-        );
-      }
-      const owner = connection.ownerUserId ?? cachedConnectionOwner(connectedAccountId);
-      if (!owner?.trim()) {
-        throw new ComposioPreDispatchError(
-          'preparation-required',
-          `${toolSlug} connected account ${connectedAccountId} has no prepared owning provider identity.`,
-        );
-      }
-      userId = owner.trim();
-    }
-    const composio = getComposio();
-    if (!composio) {
-      throw new ComposioPreDispatchError('sdk-unavailable', 'COMPOSIO_API_KEY is not configured.');
-    }
-    const raw = rawComposioClient(composio);
-    const rawNoRetry = raw && typeof raw.withOptions === 'function'
-      ? raw.withOptions({ maxRetries: 0 })
-      : null;
-    if (!rawNoRetry || typeof rawNoRetry.tools?.execute !== 'function') {
-      throw new ComposioPreDispatchError(
-        'preparation-required',
-        `${toolSlug} has no exact one-request Composio transport.`,
-      );
-    }
-    state = {
-      lane: 'sdk',
-      toolSlug,
-      args,
-      connectedAccountId,
-      userId,
-      providerOperationVersion,
-      rawClient: rawNoRetry,
-    };
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      `${toolSlug} prepared execution requires the exact SDK no-retry transport; the CLI cannot prove one provider request.`,
+    );
   }
+  const providerOperationVersion = exactPreparedOperationVersion(input.providerOperationVersion);
+  if (!providerOperationVersion) {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      `${toolSlug} has no exact current provider operation version.`,
+    );
+  }
+  const snapshot = peekCurrentConnectedToolkits();
+  let userId = credentials.userId;
+  if (connectedAccountId) {
+    if (!snapshot) {
+      throw new ComposioPreDispatchError(
+        'preparation-required',
+        `${toolSlug} has no current connected-account observation.`,
+      );
+    }
+    const connection = snapshot.find((row) => row.connectionId === connectedAccountId);
+    if (!connection || !/active|enabled|initiat/i.test(connection.status ?? '')) {
+      throw new ComposioPreDispatchError(
+        'preparation-required',
+        `${toolSlug} connected account ${connectedAccountId} is not current and usable.`,
+      );
+    }
+    const owner = connection.ownerUserId ?? cachedConnectionOwner(connectedAccountId);
+    if (!owner?.trim()) {
+      throw new ComposioPreDispatchError(
+        'preparation-required',
+        `${toolSlug} connected account ${connectedAccountId} has no prepared owning provider identity.`,
+      );
+    }
+    userId = owner.trim();
+  }
+  const composio = getComposio();
+  if (!composio) {
+    throw new ComposioPreDispatchError('sdk-unavailable', 'COMPOSIO_API_KEY is not configured.');
+  }
+  const raw = rawComposioClient(composio);
+  const rawNoRetry = raw && typeof raw.withOptions === 'function'
+    ? raw.withOptions({ maxRetries: 0 })
+    : null;
+  if (!rawNoRetry || typeof rawNoRetry.tools?.execute !== 'function') {
+    throw new ComposioPreDispatchError(
+      'preparation-required',
+      `${toolSlug} has no exact one-request Composio transport.`,
+    );
+  }
+  const state: PreparedComposioOneShotState = {
+    lane: 'sdk',
+    toolSlug,
+    args,
+    connectedAccountId,
+    userId,
+    providerOperationVersion,
+    rawClient: rawNoRetry,
+  };
 
   const prepared = Object.freeze(Object.create(null)) as PreparedComposioOneShotDispatch;
   preparedComposioOneShots.set(prepared, state);
@@ -2684,7 +2744,7 @@ export async function executePreparedComposioPresign(
   );
 }
 
-/** The terminal body: one CLI execute subprocess OR one no-retry v3.1 POST.
+/** The terminal body: one no-retry v3.1 POST.
  * It performs no schema lookup, account listing, reconnect, version fetch,
  * fallback, upload/download modifier, or retry. */
 export async function executePreparedComposioTool(
@@ -2700,9 +2760,6 @@ export async function executePreparedComposioTool(
   // One-shot ownership: consume before entering the terminal body so neither a
   // returned failure nor a throw can reuse the same preparation.
   preparedComposioOneShots.delete(prepared);
-  if (state.lane === 'cli') {
-    return executeComposioCliTool(state.toolSlug, state.args, state.cliOptions);
-  }
   const execute = state.rawClient?.tools?.execute;
   if (!execute || !state.providerOperationVersion) {
     throw new ComposioPreDispatchError('preparation-required', 'Prepared Composio SDK transport was lost.');
@@ -3266,6 +3323,14 @@ export const __test__ = {
     loader: (() => Promise<Array<Record<string, unknown>>>) | null,
   ): void {
     connectedAccountsLoaderForTest = loader;
+    if (loader) connectedAccountsListTransportsForTest = null;
+    invalidateConnectedAccountSnapshot();
+  },
+  setConnectedAccountsListTransports(
+    transports: ConnectedAccountsListTransports | null,
+  ): void {
+    connectedAccountsListTransportsForTest = transports;
+    if (transports) connectedAccountsLoaderForTest = null;
     invalidateConnectedAccountSnapshot();
   },
 };

@@ -8,7 +8,7 @@ import {
   isHostPlanRequiredWorkCall,
 } from '../../tools/work-call-mode.js';
 import { isFreshPlanDisclosureSearch } from '../../tools/tool-search-mode.js';
-import { runWithToolAbortSignal } from '../tool-abort-context.js';
+import { currentToolAbortSignal, runWithToolAbortSignal } from '../tool-abort-context.js';
 import {
   noteHostToolInvocationObservation,
   requireHostToolInvocationTerminalPhysicalDispatch,
@@ -63,6 +63,7 @@ import {
   actionTopologyRoleForRuntimeCall,
   classifyRuntimeToolEffect,
   projectCanonicalTopLevelToolEvents,
+  unwrapRuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
 import { getRuntimeEnv } from '../../config.js';
 import {
@@ -156,8 +157,10 @@ import {
   scopeArtifactIntentForObjective,
   verifyArtifactBindingFromToolResult,
   verifyGeneratedArtifactContentFromToolResult,
+  verifyHostSealedArtifactContentFromReadback,
   type ArtifactIntent,
 } from './artifact-ledger.js';
+import { exactProviderDataPayload } from './provider-read-evidence.js';
 import { compileGoogleSheetsSheetFromJsonContract } from './sheet-from-json-content-contract.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import {
@@ -173,6 +176,7 @@ import {
 } from './discovery-boundary.js';
 import {
   attemptSignalsFromShellExecutionOutcome,
+  attemptSignalsFromTypedResult,
   settleToolAttempt,
   ToolAttemptSettlementAuthorityError,
 } from './attempt-settlement.js';
@@ -1178,8 +1182,10 @@ export interface HarnessRunContext {
    * write receipts use this to stay attached to one durable objective even
    * when a chat later contains unrelated work. */
   executionId?: string;
-  /** One active model/tool run; loop/discovery counters key here so a long-lived
-   * chat session does not accumulate unrelated calls across user turns. */
+  /** One accepted-source behavior window; loop/discovery counters key here so
+   * harness-authored continuations and infra/fallover retries cannot reset a
+   * runaway merely by advancing the physical turn. A genuinely new accepted
+   * user source gets a new scope, so unrelated chat requests never accumulate. */
   behaviorScopeId?: string;
   /** Explicit Claude local-MCP lane identity. `false` excludes workers and
    * workflow steps from parent-only settled-read steering; `undefined` keeps
@@ -1282,7 +1288,7 @@ export interface HarnessRunContext {
  *  single read" message (2026-07-12 strand-hunt finding). Workers already isolate
  *  via guardrailScopeId; this extends the same isolation to nested dispatch/batch.
  *  Direct orchestrator calls fall through to behaviorScopeId ?? sessionId — the
- *  ENFORCED scope — exactly as before (byte-identical for the non-exempt path). */
+ *  accepted-source ENFORCED scope. */
 export function guardrailScopeKey(
   ctx: Pick<HarnessRunContext, 'sessionId' | 'guardrailScopeId' | 'behaviorScopeId' | 'nestedDispatch' | 'certifiedBatch'>,
 ): string {
@@ -1324,18 +1330,21 @@ export class ExternalWriteReservationError extends Error {
   }
 }
 
-function currentExternalWriteEventAttribution(): {
+function currentExternalWriteEventAttribution(invocationNonce?: string): {
   sourceUserSeq?: number;
   runScopeId?: string;
   executionId?: string;
+  invocationNonce?: string;
 } {
   const ctx = harnessRunContextStorage.getStore();
+  const exactInvocationNonce = invocationNonce?.trim();
   return {
     ...(Number.isSafeInteger(ctx?.sourceUserSeq) && (ctx?.sourceUserSeq ?? 0) > 0
       ? { sourceUserSeq: ctx?.sourceUserSeq as number }
       : {}),
     ...(ctx?.behaviorScopeId ? { runScopeId: ctx.behaviorScopeId } : {}),
     ...(ctx?.executionId ? { executionId: ctx.executionId } : {}),
+    ...(exactInvocationNonce ? { invocationNonce: exactInvocationNonce } : {}),
   };
 }
 
@@ -1998,7 +2007,7 @@ function recordExternalWriteSettlement(
     type,
     ...(exactReservation?.eventId ? { parentEventId: exactReservation.eventId } : {}),
     data: {
-      ...currentExternalWriteEventAttribution(),
+      ...currentExternalWriteEventAttribution(settlementNonce),
       shapeKey,
       actionKey,
       toolName,
@@ -2507,6 +2516,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     sessionId: string,
     parsedInput: unknown,
     callId?: string,
+    settlementNonce?: string,
     claimBeforeAccounting?: () => ArtifactAdmission,
     deferDiscoveryAdmission = false,
   ): Promise<BracketOutcome | undefined> => {
@@ -2713,10 +2723,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
     }
     // A direct, non-poll Composio read that already returned verified data for
     // this EXACT accepted source is settled work. Recover its authoritative
-    // bytes instead of paying the provider again. The durable source identity
-    // survives an infra retry that advances behaviorScopeId; a new user source,
-    // changed args, intervening mutation/steer, poll, worker, program, or batch
-    // all fail open to the ordinary dispatch path.
+    // bytes instead of paying the provider again. Current production retries
+    // retain one accepted-source behaviorScopeId; legacy/custom retry lanes
+    // that advance it remain recoverable too. A new user source, changed args,
+    // intervening mutation/steer, poll, worker, program, or batch all fail open
+    // to the ordinary dispatch path.
     if (
       settledReadRepeatEnabled()
       && ctx.directOrchestrator !== false
@@ -3429,7 +3440,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
                 role: 'system',
                 type: 'external_write',
                 data: {
-                  ...currentExternalWriteEventAttribution(),
+                  ...currentExternalWriteEventAttribution(settlementNonce),
                   shapeKey: mutation.shapeKey,
                   actionKey,
                   toolName: tool.name,
@@ -3571,7 +3582,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
                 role: 'system',
                 type: 'external_write',
                 data: {
-                  ...currentExternalWriteEventAttribution(),
+                  ...currentExternalWriteEventAttribution(settlementNonce),
                   shapeKey: shape.shapeKey,
                   actionKey,
                   toolName: tool.name,
@@ -3694,7 +3705,24 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // deliverable slot and deadlock item 2+ (2026-07-22, surfaced live by
     // the generic classifier).
     if (ctx.certifiedBatch || ctx.batchItem) return {};
-    const rawIntent = artifactIntentForTool(tool.name, parsedInput);
+    const expectedBinding = currentExpectedWorkBinding();
+    const generatedContract = expectedBinding?.generatedArtifactContentContract;
+    const hostSealedGeneratedArtifact = Boolean(
+      generatedContract
+      && typeof generatedContract === 'object'
+      && !Array.isArray(generatedContract)
+      && (generatedContract as { kind?: unknown }).kind === 'host_sealed_artifact_content_v1',
+    );
+    const rawIntent = artifactIntentForTool(tool.name, parsedInput) ?? (
+      hostSealedGeneratedArtifact && expectedBinding
+        ? {
+            kind: 'resource' as const,
+            provider: 'host-sealed-graph',
+            slotKey: `expected-work:${expectedBinding.requirementId}`,
+            createShape: 'HOST_SEALED_EXPECTED_WORK_CREATE',
+          }
+        : null
+    );
     if (!rawIntent) return {};
     const attemptScopeId = guardrailScopeKey(ctx);
     const runScopeId = resolveArtifactRunScopeId(sessionId, attemptScopeId, ctx.sourceUserSeq);
@@ -3704,7 +3732,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
       effectiveTurnObjective(sessionId, recordedObjective, ctx.sourceUserSeq),
       parsedInput,
     );
-    const expectedBinding = currentExpectedWorkBinding();
     const contentContract = expectedBinding?.generatedArtifactContentContract
       ?? compileGoogleSheetsSheetFromJsonContract(tool.name, parsedInput);
     const claim = claimArtifactSlot(
@@ -3803,26 +3830,62 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // calling it unconditionally made every ordinary read/build/tool result
     // appear to participate in artifact history. Real exact-provider readbacks
     // still resolve the root and run the strict ID-matching verifier below.
-    if (!artifactVerificationIntentForTool(tool.name, parsedInput)) return;
+    const providerIntent = artifactVerificationIntentForTool(tool.name, parsedInput);
+    const expectedBinding = currentExpectedWorkBinding();
+    const hostSealedRead = expectedBinding?.effect === 'read';
+    if (!providerIntent && !hostSealedRead) return;
     try {
-      const verified = verifyArtifactBindingFromToolResult(
-        ctx.sessionId,
-        resolveArtifactRunScopeId(ctx.sessionId, guardrailScopeKey(ctx), ctx.sourceUserSeq),
-        tool.name,
-        parsedInput,
-        result,
-        callId,
-      );
-      if (verified) settleExternalWriteFromVerifiedArtifact(ctx.sessionId, verified, callId);
-      if (callId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0) {
-        verifyGeneratedArtifactContentFromToolResult({
-          sessionId: ctx.sessionId,
-          sourceUserSeq: ctx.sourceUserSeq as number,
-          verificationLogicalToolCallId: callId,
-          readToolName: tool.name,
-          readArgs: parsedInput,
-          readResult: result,
-        });
+      if (providerIntent) {
+        const verified = verifyArtifactBindingFromToolResult(
+          ctx.sessionId,
+          resolveArtifactRunScopeId(ctx.sessionId, guardrailScopeKey(ctx), ctx.sourceUserSeq),
+          tool.name,
+          parsedInput,
+          result,
+          callId,
+        );
+        if (verified) settleExternalWriteFromVerifiedArtifact(ctx.sessionId, verified, callId);
+        if (callId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0) {
+          verifyGeneratedArtifactContentFromToolResult({
+            sessionId: ctx.sessionId,
+            sourceUserSeq: ctx.sourceUserSeq as number,
+            verificationLogicalToolCallId: callId,
+            readToolName: tool.name,
+            readArgs: parsedInput,
+            readResult: result,
+          });
+        }
+      }
+      if (
+        hostSealedRead
+        && callId
+        && Number.isSafeInteger(ctx.sourceUserSeq)
+        && (ctx.sourceUserSeq ?? 0) > 0
+      ) {
+        const effective = unwrapRuntimeEffectiveToolIdentity(tool.name, parsedInput);
+        const payload = exactProviderDataPayload(result);
+        if (
+          effective.toolName
+          && effective.args
+          && typeof effective.args === 'object'
+          && !Array.isArray(effective.args)
+          && payload
+          && typeof payload === 'object'
+          && !Array.isArray(payload)
+        ) {
+          const readback = payload as { id?: unknown; content?: unknown };
+          if (typeof readback.id === 'string' && readback.content !== undefined) {
+            verifyHostSealedArtifactContentFromReadback({
+              sessionId: ctx.sessionId,
+              sourceUserSeq: ctx.sourceUserSeq as number,
+              verificationLogicalToolCallId: callId,
+              readToolName: effective.toolName,
+              readArgs: effective.args,
+              returnedResourceId: readback.id,
+              readContent: readback.content,
+            });
+          }
+        }
       }
     } catch {
       // Verification bookkeeping is fail-closed for completion (the row stays
@@ -3951,6 +4014,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           ctx?.sessionId ?? '',
           parsedInput,
           invokeCallId,
+          settlementNonce,
           () => {
             artifact = claimArtifact(ctx, parsedInput, invokeCallId);
             return artifact;
@@ -4089,7 +4153,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
           toolName: tool.name,
           settlementNonce,
         }, () => originalInvoke.call(tt, runContext, input, invokeDetails)));
-        const work = runWithToolAbortSignal(hostOwnedSignal ?? ac!.signal, start);
+        const work = runWithToolAbortSignal(
+          hostOwnedSignal ?? ac!.signal,
+          start,
+          // A host-owned call already installed its one authoritative deadline;
+          // omit here so the abort context inherits it instead of minting a
+          // second timer identity. Legacy/bracket-owned calls expose this exact
+          // absolute edge to deadline-aware run_worker scheduling.
+          hostOwnedSignal ? undefined : Date.now() + timeoutMs,
+        );
         if (hostOwnedSignal) return work;
         if (mayStartProviderJob) {
           // The harness stops WAITING on it; the promise keeps living so its
@@ -4147,7 +4219,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
         if (hostPhysicalReserved) {
           settleHostToolInvocationPhysicalDispatch('returned');
         }
-        const returnedToolSucceeded = toolOutputLooksSuccessful(result);
+        const typedResultSignals = attemptSignalsFromTypedResult(result);
+        const typedPreDispatchFailure = typedResultSignals.preDispatch === true;
+        const returnedToolSucceeded = !typedPreDispatchFailure
+          && toolOutputLooksSuccessful(result);
         // A carrier/nested dispatcher owns the interpretation of its transport
         // envelope. When that boundary has already classified a returned value
         // as failure, preserve the nominal verdict in settlement instead of
@@ -4181,6 +4256,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
                 schemaAvailable: true,
               }
             : {}),
+          ...typedResultSignals,
         };
         if (ctx?.hostOwnsToolDeadlineAndSettlement) {
           noteHostToolInvocationObservation({
@@ -4210,10 +4286,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
             businessCall: bracketOutcome?.discovery == null
               && actionTopologyRoleForRuntimeCall(tool.name, parsedInput) === 'business',
             // Settlement consumes the exact nonce-scoped bytes, not the
-            // model-facing digest. If the durable cap was crossed this value
+            // model-facing digest. If durable storage is incomplete this value
             // is a typed TruncatedToolOutputResult, never a successful prefix.
             result: exactEvidenceResult,
-            ...((shellOutcome || bracketOutcome?.carrierMalformed || carrierReturnedFailure)
+            ...((shellOutcome
+              || bracketOutcome?.carrierMalformed
+              || carrierReturnedFailure
+              || typedPreDispatchFailure)
               ? {
                   signals: hostSignals,
                 }
@@ -4490,7 +4569,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     let artifact: ArtifactAdmission = {};
     let bracketOutcome: BracketOutcome | undefined;
     try {
-      bracketOutcome = await runBrackets(ctx?.sessionId ?? '', input, executeCallId, () => {
+      bracketOutcome = await runBrackets(ctx?.sessionId ?? '', input, executeCallId, settlementNonce, () => {
         artifact = claimArtifact(ctx, input, executeCallId);
         return artifact;
       });
@@ -4566,7 +4645,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
         });
       }
       // S3 abort-on-timeout (legacy execute twin — mirrors the invoke path above).
-      const ac = new AbortController();
+      const hostOwnedSignal = ctx?.hostOwnsToolDeadlineAndSettlement
+        ? currentToolAbortSignal()
+        : undefined;
+      if (ctx?.hostOwnsToolDeadlineAndSettlement && !hostOwnedSignal) {
+        throw new ToolAttemptSettlementAuthorityError(
+          'conflict',
+          'host-owned execute invocation did not inherit its exact abort signal',
+        );
+      }
+      const ac = hostOwnedSignal ? undefined : new AbortController();
       const start = () => Promise.resolve(withToolOutputContext({
         sessionId: ctx?.sessionId,
         sourceUserSeq: ctx?.sourceUserSeq,
@@ -4575,16 +4663,24 @@ export function wrapToolForHarness<T extends WrappableTool>(
         toolName: tool.name,
         settlementNonce,
       }, () => originalExecute(input, runContext)));
-      const work = runWithToolAbortSignal(ac.signal, start);
-      result = await withTimeout(
-        work,
-        timeoutMs,
-        tool.name,
-        {
-          isPaused: isPausedFactory(ctx?.sessionId),
-          onTimeout: () => ac.abort(new ToolTimeout(tool.name, timeoutMs)),
-        },
+      const work = runWithToolAbortSignal(
+        hostOwnedSignal ?? ac!.signal,
+        start,
+        // Host ownership inherits the exact outer absolute deadline. Legacy
+        // execute calls expose their bracket-owned edge to run_worker.
+        hostOwnedSignal ? undefined : Date.now() + timeoutMs,
       );
+      result = hostOwnedSignal
+        ? await work
+        : await withTimeout(
+            work,
+            timeoutMs,
+            tool.name,
+            {
+              isPaused: isPausedFactory(ctx?.sessionId),
+              onTimeout: () => ac!.abort(new ToolTimeout(tool.name, timeoutMs)),
+            },
+          );
     } catch (err) {
       if (hostPhysicalReserved) {
         settleHostToolInvocationPhysicalDispatch('threw');
@@ -4656,7 +4752,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
     if (hostPhysicalReserved) {
       settleHostToolInvocationPhysicalDispatch('returned');
     }
-    const returnedToolSucceeded = toolOutputLooksSuccessful(result);
+    const typedResultSignals = attemptSignalsFromTypedResult(result);
+    const typedPreDispatchFailure = typedResultSignals.preDispatch === true;
+    const returnedToolSucceeded = !typedPreDispatchFailure
+      && toolOutputLooksSuccessful(result);
     const carrierReturnedFailure = !returnedToolSucceeded
       && (tool.name === 'call_tool' || tool.name === 'work_call' || ctx?.nestedDispatch === true);
     settleDiscoveryBoundary(
@@ -4690,7 +4789,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // Execute-path twin of the invoke seam above: durable evidence is the
         // exact invocation result (or typed truncation), never presentation.
         result: exactEvidenceResult,
-        ...((shellOutcome || bracketOutcome?.carrierMalformed || carrierReturnedFailure)
+        ...((shellOutcome
+          || bracketOutcome?.carrierMalformed
+          || carrierReturnedFailure
+          || typedPreDispatchFailure)
           ? {
               signals: {
                 ...attemptSignalsFromShellExecutionOutcome(shellOutcome),
@@ -4702,6 +4804,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
                       schemaAvailable: true,
                     }
                   : {}),
+                ...typedResultSignals,
               },
             }
           : {}),

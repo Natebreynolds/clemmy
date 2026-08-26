@@ -146,6 +146,11 @@ test('Orchestrator builds Clem with the plain-text decision contract even if the
   try {
     const agent = await buildOrchestratorAgent();
     assert.equal(agent.name, 'Clem');
+    assert.equal(
+      agent.mcpServers.length,
+      0,
+      'the model SDK must not own an executable third-party MCP server',
+    );
     // The old emergency revert is intentionally ignored. The model ends its
     // turn with plain text + an optional marker, so a turn can never fail only
     // because the final JSON envelope drifted.

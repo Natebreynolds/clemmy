@@ -101,7 +101,7 @@ test('tool: diff over a PARKED tool output — the 10k-row read never re-enters 
   assert.deepEqual(parsed.rows.map((r: { email: string }) => r.email).sort(), ['new1@x.example', 'new2@x.example']);
 });
 
-test('tool: a >2MB exact read fails closed instead of aggregating the parked CSV prefix', async () => {
+test('tool: a chunked exact read aggregates the complete CSV including its tail row', async () => {
   const sess = createSession({ kind: 'chat' });
   const callId = 'call_truncated_sheet_read';
   const called = appendEvent({
@@ -111,10 +111,7 @@ test('tool: a >2MB exact read fails closed instead of aggregating the parked CSV
     type: 'tool_called',
     data: { callId, tool: 'provider_list_rows', effect: 'read', arguments: {} },
   });
-  // Sized FROM the cap so the fixture keeps crossing it at any ceiling
-  // ('a,1\n' = 4 bytes/row).
-  const trueRowCount = Math.ceil(TOOL_OUTPUT_MAX_BYTES / 4) + 50_000;
-  const csv = `group,value\n${'a,1\n'.repeat(trueRowCount)}`;
+  const csv = `group,value\na,"${'x'.repeat(TOOL_OUTPUT_MAX_BYTES)}"\ntail,1\n`;
   assert.ok(Buffer.byteLength(csv) > TOOL_OUTPUT_MAX_BYTES, 'fixture must cross the durable output cap');
   writeToolOutput({
     sessionId: sess.id,
@@ -135,11 +132,8 @@ test('tool: a >2MB exact read fails closed instead of aggregating the parked CSV
   const handler = captureTool();
   const out = textOf(await withToolOutputContext({ sessionId: sess.id }, () =>
     handler({ op: 'aggregate', left_call_id: callId, group_by: 'group', metrics: 'count' })));
-  assert.match(out, /^ERROR:/);
-  assert.match(out, /incomplete/);
-  assert.match(out, /will not compute totals from a prefix/);
-  assert.match(out, /Re-read\/page|stage the full result/);
-  assert.doesNotMatch(out, /499997/, 'the silently wrong prefix count must never escape');
+  const parsed = JSON.parse(out) as { rows: Array<{ group: string; count: number }> };
+  assert.deepEqual(parsed.rows.find((row) => row.group === 'tail'), { group: 'tail', count: 1 });
 });
 
 test('tool: a large result spills to a staged JSONL file that chains back in as left_file', async () => {
