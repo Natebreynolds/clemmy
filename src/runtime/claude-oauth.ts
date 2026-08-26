@@ -13,7 +13,7 @@
  * a Bearer and never sets x-api-key, so a subscription user can never be
  * silently API-billed.
  */
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -219,23 +219,54 @@ export class ClaudeAuthError extends Error {
   }
 }
 
+// The Keychain read MUST NEVER run synchronously on a request path: `security
+// find-generic-password` can block on a TCC Allow prompt that a headless
+// daemon can never answer, and because the old call was execFileSync it froze
+// the ENTIRE event loop while it waited — live 2026-08-26, every brain went
+// "silent before first content" at once whenever a fresh daemon pid needed
+// keychain authorization, and the fallback ladder benched Claude AND Codex in
+// the same breath. The read is now cache-first: request paths only ever see
+// the cache (or the fast credentials-file fallback); the keychain itself is
+// probed by a BOUNDED async refresh kicked at module load and re-kicked when
+// the cache ages out. A pending prompt costs one 3-second child process, not
+// a frozen daemon.
+const KEYCHAIN_REFRESH_TTL_MS = 5 * 60_000;
+const KEYCHAIN_PROBE_TIMEOUT_MS = 3_000;
+let keychainCache: { raw: string | null; at: number } | null = null;
+let keychainProbeInFlight = false;
+
+function refreshKeychainCacheAsync(): void {
+  if (keychainProbeInFlight) return;
+  if (process.env.CLEMMY_TEST_ISOLATED_HOME === '1') return;
+  if (process.platform !== 'darwin') return;
+  keychainProbeInFlight = true;
+  try {
+    const child = execFile(
+      'security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'],
+      { encoding: 'utf-8', timeout: KEYCHAIN_PROBE_TIMEOUT_MS },
+      (err, stdout) => {
+        keychainProbeInFlight = false;
+        const raw = !err && stdout && stdout.trim() ? stdout.trim() : null;
+        // Negative results are cached too — a denied prompt must not storm.
+        keychainCache = { raw, at: Date.now() };
+      },
+    );
+    child.on('error', () => { keychainProbeInFlight = false; });
+  } catch { keychainProbeInFlight = false; }
+}
+
 function readRawCredentialJsonFromSystem(): string | null {
   // The repository suite owns a disposable filesystem home, but the macOS
   // Keychain is global to the logged-in user. Never let an isolated test probe
   // the developer's real Claude Code credential; tests inject rawCredentialReader
   // when they need to exercise this fallback.
   if (process.env.CLEMMY_TEST_ISOLATED_HOME === '1') return null;
-  // macOS: Keychain. -w prints the secret; may surface a one-time Allow prompt.
   if (process.platform === 'darwin') {
-    try {
-      const raw = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'], {
-        encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      });
-      if (raw && raw.trim()) return raw.trim();
-    } catch {
-      // fall through to the file path
+    if (!keychainCache || Date.now() - keychainCache.at > KEYCHAIN_REFRESH_TTL_MS) {
+      refreshKeychainCacheAsync();
     }
+    if (keychainCache?.raw) return keychainCache.raw;
+    // Cache cold or negative: fall through to the file path without blocking.
   }
   // Linux / fallback: Claude Code's credentials file.
   const credFile = path.join(os.homedir(), '.claude', '.credentials.json');
@@ -244,6 +275,9 @@ function readRawCredentialJsonFromSystem(): string | null {
   }
   return null;
 }
+
+// Pre-warm at module load so the first model call finds a settled cache.
+refreshKeychainCacheAsync();
 
 let rawCredentialReader = readRawCredentialJsonFromSystem;
 function readRawCredentialJson(): string | null {
