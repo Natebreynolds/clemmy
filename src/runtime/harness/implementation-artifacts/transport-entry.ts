@@ -175,6 +175,32 @@ export function observeAttestedTransport(input: {
 }
 
 /**
+ * Deposit an observation this process already established through a
+ * trusted, non-transport channel — a proof-provisioned admission that just
+ * revalidated a Composio schema, or a host-only capability with no provider
+ * to contact at all — so the synchronous observe() above can confirm it
+ * without a second live round trip.
+ *
+ * `independentlyObserveCapability` calls this unconditionally, for every
+ * provider kind, before every readiness check; the isolated test transport
+ * has always implemented it, and only this production transport did not,
+ * which made the call a silent no-op here (shipped-implementation-identity.ts
+ * reaches it through an optional `transportModule.registerIsolatedObservation
+ * ?.()`). That gap meant `observe()` could never find what registration had
+ * just proven and independentlyObserveCapability fell through to null every
+ * time — live 2026-08-26: every proof-provisioned Composio capability and the
+ * host-only transform manifest refused plan admission with
+ * "observation_unavailable" although nothing had thrown, nothing had been
+ * skipped, and registration itself always reported ok:true. This mirrors
+ * transport-isolated-entry.ts's registerIsolatedObservation exactly, so the
+ * one seeding hook independentlyObserveCapability already assumes exists
+ * behaves identically whichever transport artifact is loaded.
+ */
+export function registerIsolatedObservation(observation: AttestedTransportObservation): void {
+  observed.set(observationKey(observation.operationId, observation.accountId), observation);
+}
+
+/**
  * Contact the provider and record what it reports.
  *
  * The schema fingerprint is derived from the provider's own declared input

@@ -231,7 +231,7 @@
           "bytes": 141734
         },
         "src/runtime/harness/discovery-governor.ts": {
-          "bytes": 60955
+          "bytes": 67321
         },
         "src/memory/focus.ts": {
           "bytes": 29105
@@ -357,7 +357,7 @@
           "bytes": 18380
         },
         "src/runtime/harness/independent-capability-observation.ts": {
-          "bytes": 12570
+          "bytes": 13600
         },
         "src/integrations/composio/provider-definition-identity.ts": {
           "bytes": 2569
@@ -576,7 +576,7 @@
           "bytes": 1721
         },
         "src/runtime/harness/production-capability-adapter.ts": {
-          "bytes": 19929
+          "bytes": 20657
         },
         "src/runtime/harness/external-capability-risk.ts": {
           "bytes": 22447
@@ -753,7 +753,7 @@
           "bytes": 15648
         },
         "src/runtime/harness/discovery-boundary.ts": {
-          "bytes": 25083
+          "bytes": 28788
         },
         "src/integrations/github-cli.ts": {
           "bytes": 4605
@@ -840,7 +840,7 @@
           "bytes": 94751
         },
         "src/runtime/mcp-tool-scope.ts": {
-          "bytes": 54119
+          "bytes": 55281
         },
         "src/runtime/mcp-tool-authority.ts": {
           "bytes": 5356
@@ -905,11 +905,8 @@
         "src/execution/workflow-deliverable-hints.ts": {
           "bytes": 3845
         },
-        "src/execution/workflow-raw-subprocess-policy.ts": {
-          "bytes": 2009
-        },
         "src/execution/workflow-validator.ts": {
-          "bytes": 75928
+          "bytes": 77340
         },
         "src/tools/catalog.ts": {
           "bytes": 843
@@ -984,7 +981,7 @@
           "bytes": 53778
         },
         "src/execution/workflow-run-readiness.ts": {
-          "bytes": 16712
+          "bytes": 16492
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 61715
@@ -1131,7 +1128,7 @@
           "bytes": 8401
         },
         "src/execution/workflow-codify.ts": {
-          "bytes": 4732
+          "bytes": 5046
         },
         "src/execution/workflow-authoring.ts": {
           "bytes": 23359
@@ -1197,7 +1194,7 @@
           "bytes": 34076
         },
         "src/execution/trace-to-workflow.ts": {
-          "bytes": 24748
+          "bytes": 25356
         },
         "src/execution/workflow-failure-ledger.ts": {
           "bytes": 4026
@@ -1737,7 +1734,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 649044
+          "bytes": 683375
         },
         "src/execution/automation-recurrence-runtime.ts": {
           "bytes": 19741
@@ -2016,7 +2013,7 @@
           "bytes": 71909
         },
         "src/runtime/harness/host-tool-invocation.ts": {
-          "bytes": 58305
+          "bytes": 60266
         },
         "src/runtime/harness/host-model-frame-policy.ts": {
           "bytes": 6751
@@ -2079,7 +2076,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 611511
+          "bytes": 614579
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2169,7 +2166,7 @@
           "bytes": 66370
         },
         "src/runtime/harness/dispatch-ledger.ts": {
-          "bytes": 107876
+          "bytes": 108371
         },
         "src/runtime/harness/attempt-identity.ts": {
           "bytes": 25036
@@ -2181,7 +2178,7 @@
           "bytes": 6949
         },
         "src/runtime/harness/tool-guardrail.ts": {
-          "bytes": 79503
+          "bytes": 80346
         },
         "src/runtime/harness/turn-control.ts": {
           "bytes": 74166
@@ -2223,13 +2220,13 @@
           "bytes": 5970
         },
         "src/runtime/semantic-boundary/configure-typed-execution-runtime.ts": {
-          "bytes": 11441
+          "bytes": 15816
         },
         "src/runtime/harness/proof-provisioned-catalog.ts": {
-          "bytes": 25434
+          "bytes": 27686
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 82593
+          "bytes": 84717
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9457
@@ -2493,7 +2490,7 @@
           "bytes": 141734
         },
         "src/runtime/harness/discovery-governor.ts": {
-          "bytes": 60955
+          "bytes": 67321
         },
         "src/memory/focus.ts": {
           "bytes": 29105
@@ -2619,7 +2616,7 @@
           "bytes": 18380
         },
         "src/runtime/harness/independent-capability-observation.ts": {
-          "bytes": 12570
+          "bytes": 13600
         },
         "src/integrations/composio/provider-definition-identity.ts": {
           "bytes": 2569
@@ -2838,7 +2835,7 @@
           "bytes": 1721
         },
         "src/runtime/harness/production-capability-adapter.ts": {
-          "bytes": 19929
+          "bytes": 20657
         },
         "src/runtime/harness/external-capability-risk.ts": {
           "bytes": 22447
@@ -3015,7 +3012,7 @@
           "bytes": 15648
         },
         "src/runtime/harness/discovery-boundary.ts": {
-          "bytes": 25083
+          "bytes": 28788
         },
         "src/integrations/github-cli.ts": {
           "bytes": 4605
@@ -3102,7 +3099,7 @@
           "bytes": 94751
         },
         "src/runtime/mcp-tool-scope.ts": {
-          "bytes": 54119
+          "bytes": 55281
         },
         "src/runtime/mcp-tool-authority.ts": {
           "bytes": 5356
@@ -3167,11 +3164,8 @@
         "src/execution/workflow-deliverable-hints.ts": {
           "bytes": 3845
         },
-        "src/execution/workflow-raw-subprocess-policy.ts": {
-          "bytes": 2009
-        },
         "src/execution/workflow-validator.ts": {
-          "bytes": 75928
+          "bytes": 77340
         },
         "src/tools/catalog.ts": {
           "bytes": 843
@@ -3246,7 +3240,7 @@
           "bytes": 53778
         },
         "src/execution/workflow-run-readiness.ts": {
-          "bytes": 16712
+          "bytes": 16492
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 61715
@@ -3393,7 +3387,7 @@
           "bytes": 8401
         },
         "src/execution/workflow-codify.ts": {
-          "bytes": 4732
+          "bytes": 5046
         },
         "src/execution/workflow-authoring.ts": {
           "bytes": 23359
@@ -3459,7 +3453,7 @@
           "bytes": 34076
         },
         "src/execution/trace-to-workflow.ts": {
-          "bytes": 24748
+          "bytes": 25356
         },
         "src/execution/workflow-failure-ledger.ts": {
           "bytes": 4026
@@ -3999,7 +3993,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 649044
+          "bytes": 683375
         },
         "src/execution/automation-recurrence-runtime.ts": {
           "bytes": 19741
@@ -4278,7 +4272,7 @@
           "bytes": 71909
         },
         "src/runtime/harness/host-tool-invocation.ts": {
-          "bytes": 58305
+          "bytes": 60266
         },
         "src/runtime/harness/host-model-frame-policy.ts": {
           "bytes": 6751
@@ -4341,7 +4335,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 611511
+          "bytes": 614579
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -4431,7 +4425,7 @@
           "bytes": 66370
         },
         "src/runtime/harness/dispatch-ledger.ts": {
-          "bytes": 107876
+          "bytes": 108371
         },
         "src/runtime/harness/attempt-identity.ts": {
           "bytes": 25036
@@ -4443,7 +4437,7 @@
           "bytes": 6949
         },
         "src/runtime/harness/tool-guardrail.ts": {
-          "bytes": 79503
+          "bytes": 80346
         },
         "src/runtime/harness/turn-control.ts": {
           "bytes": 74166
@@ -4485,13 +4479,13 @@
           "bytes": 5970
         },
         "src/runtime/semantic-boundary/configure-typed-execution-runtime.ts": {
-          "bytes": 11441
+          "bytes": 15816
         },
         "src/runtime/harness/proof-provisioned-catalog.ts": {
-          "bytes": 25434
+          "bytes": 27686
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 82593
+          "bytes": 84717
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9457
@@ -4544,8 +4538,8 @@
       }
     },
     "transport": {
-      "file": "transport-7100db2a718f72af6182c865464bc01390dc8d8b63fd1a83ca99110104511f08.cjs",
-      "sha256": "7100db2a718f72af6182c865464bc01390dc8d8b63fd1a83ca99110104511f08",
+      "file": "transport-99c4e51a1776c86e98b0c5a4ac97bde4b98b4208a57cd32e935e9756f6bceee0.cjs",
+      "sha256": "99c4e51a1776c86e98b0c5a4ac97bde4b98b4208a57cd32e935e9756f6bceee0",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-support.ts": {
           "bytes": 133
@@ -4566,7 +4560,7 @@
           "bytes": 2569
         },
         "src/runtime/harness/implementation-artifacts/transport-entry.ts": {
-          "bytes": 10268
+          "bytes": 11846
         }
       }
     },
@@ -4583,5 +4577,5 @@
       }
     }
   },
-  "manifestDigest": "ce16123ff65fc4c87b75ba3d15c579ea8d744d4b8bfd7d77e5bfadc84338d90e"
+  "manifestDigest": "ba19158656650c289c785c877278c3642abf79c534da82622869de2c763f9e97"
 }

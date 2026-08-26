@@ -35,7 +35,8 @@ __export(transport_entry_exports, {
   executeAttestedTransport: () => executeAttestedTransport,
   observeAttestedTransport: () => observeAttestedTransport,
   reconcileAttestedTransport: () => reconcileAttestedTransport,
-  refreshAttestedTransportObservation: () => refreshAttestedTransportObservation
+  refreshAttestedTransportObservation: () => refreshAttestedTransportObservation,
+  registerIsolatedObservation: () => registerIsolatedObservation
 });
 module.exports = __toCommonJS(transport_entry_exports);
 var import_node_module = require("node:module");
@@ -374,6 +375,9 @@ function resolveConnectedAccount(client, input) {
 function observeAttestedTransport(input) {
   return observed.get(observationKey(input.operationId, input.accountId)) ?? null;
 }
+function registerIsolatedObservation(observation) {
+  observed.set(observationKey(observation.operationId, observation.accountId), observation);
+}
 async function refreshAttestedTransportObservation(input) {
   observed.delete(observationKey(input.operationId, input.accountId));
   if (loopbackOutboundDenied()) return null;
@@ -457,5 +461,6 @@ function createAttestedTransport(digest) {
   executeAttestedTransport,
   observeAttestedTransport,
   reconcileAttestedTransport,
-  refreshAttestedTransportObservation
+  refreshAttestedTransportObservation,
+  registerIsolatedObservation
 });
