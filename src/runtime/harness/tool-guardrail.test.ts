@@ -1213,3 +1213,21 @@ test('a repeated fan-out refusal escalates to the USER instead of restating itse
   assert.match(repeated, /do not mention harnesses or guardrails/i);
 });
 
+
+test('a control-plane call repeated with identical arguments reaches the terminal backstop', () => {
+  // Live 2026-08-26: one chat turn issued 41 plan_task calls with identical
+  // arguments, each returning the byte-identical deterministic refusal. The
+  // read exemption ("polling is legitimate") let it run five minutes to
+  // budget exhaustion. A control answer computed from the same inputs cannot
+  // change by being asked again — that is a stuck loop, not polling.
+  _resetAllTrackersForTests();
+  const args = { draft: { criteria: ['same'] } };
+  let last;
+  for (let i = 0; i < 40; i += 1) {
+    last = evaluateToolCall('sess-control-repeat', 'plan_task', args);
+    if (last?.action === 'escalate') break;
+  }
+  assert.equal(last?.action, 'escalate',
+    'an identical control-plane repeat must terminate the turn rather than spin');
+  assert.equal(last?.rule, 'exact_args_repeat');
+});

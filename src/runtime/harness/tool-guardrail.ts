@@ -36,6 +36,7 @@ import {
   deriveGuardrailReadMutators,
 } from '../../tools/tool-registry.js';
 import { isAutoApprovedByScope } from '../../agents/plan-scope.js';
+import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import { getRuntimeEnv } from '../../config.js';
 import { classifyRuntimeToolEffect, type RuntimeToolEffect } from './tool-effect.js';
 import { isMandatable, resolveCallable } from './callable-surface.js';
@@ -1185,7 +1186,17 @@ export function evaluateToolCall(
   //     the runaway/budget backstop that still stops the 84×/3-min hang; it
   //     just fires far later, after a long advisory window. Read/idempotent
   //     tools NEVER escalate (polling is legitimate).
-  if (isMut && exactCount >= thresholds.exactArgsHardStopAt) {
+  // A CONTROL-plane call repeated with identical arguments is not polling.
+  // Polling is legitimate because the WORLD may change between reads; a
+  // control call whose answer is computed from the same inputs cannot become
+  // a different answer by being asked again. Live 2026-08-26: one chat turn
+  // issued 41 plan_task calls with identical arguments, each returning the
+  // byte-identical deterministic refusal, burning five minutes and the turn's
+  // whole budget before parking — the read exemption let a provably stuck
+  // loop run to exhaustion. Control repeats now reach the same terminal
+  // backstop mutations do; genuine reads keep their exemption.
+  const controlPlaneRepeat = actionTopologyRoleFor(toolName) === 'control';
+  if ((isMut || controlPlaneRepeat) && exactCount >= thresholds.exactArgsHardStopAt) {
     return {
       action: 'escalate',
       signature,
