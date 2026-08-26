@@ -21,6 +21,7 @@ const { writeCanonicalGraphNodeLeaseFixture } = await import('./canonical-graph-
 const { claimPhysicalIo, physicalIoClaimed } = await import('./physical-io-claim.js');
 const { derivePhysicalDispatchId } = await import('./physical-crossing-identity.js');
 const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
+const { removeV65StructuresFromHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 
 const GRAPH = { graphId: 'g', nodeId: 'n' };
 let serial = 0;
@@ -252,6 +253,9 @@ test('schema 49 carries a claimed legacy I/O marker onto its reservation', () =>
             io_fence = NULL, io_revision = NULL
       WHERE session_id = ? AND physical_dispatch_id = ?`,
   ).run(identity.sessionId, physicalDispatchId);
+  // The runner resumes from MAX(version), so this rewind replays v50..v65 too:
+  // shed what those replays may not meet twice.
+  removeV65StructuresFromHistoricalMigrationFixture(db);
   db.prepare('DELETE FROM schema_version WHERE version >= 49').run();
   assert.equal(physicalIoClaimed({ ...identity, physicalDispatchId }), false);
 

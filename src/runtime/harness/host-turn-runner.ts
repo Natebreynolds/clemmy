@@ -1804,7 +1804,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       || !contract
     ) return null;
 
-    const candidates = surface.snapshot.entries.filter((entry) => {
+    const exactEntryMatches = (entry: RegisteredHostCapability): boolean => {
       const manifest = currentCapabilityManifest(entry.manifest);
       const canonical = canonicalCatalogIdentityOf(entry);
       return Boolean(
@@ -1820,8 +1820,27 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         && entry.effect === decision.effect
         && canonical.invokePortId === manifest.invokePortId
       );
-    });
+    };
+    const candidates = surface.snapshot.entries.filter(exactEntryMatches);
     if (candidates.length > 1) return null;
+    // READ-FAST-PATH (2026-08-26 gauntlet, hole 12): before plan activation
+    // the frozen host surface is deliberately graph-neutral/empty, which made
+    // every read-effect provider call structurally undispatchable — the model
+    // could not even LOOK at the target it must plan against. A read whose
+    // exact operation this turn PROVED may bind the LIVE proof-provisioned
+    // catalog entry instead: the same attested manifest, canonical identity,
+    // effect and invoke-port checks apply, and the full catalog_manifest
+    // attestation still travels with the call. Frozen-snapshot membership
+    // remains the WRITE bar (decision.effect gates this to reads only).
+    const liveProvenReadEntry = candidates.length === 0
+      && decision.effect === 'read'
+      && readDescent
+      ? peekHostCapabilityCatalogFactory()
+          ?.get(`cap:resolved:${readDescent.effectiveName.toLowerCase()}`)
+      : undefined;
+    const provenReadCandidate = liveProvenReadEntry && exactEntryMatches(liveProvenReadEntry)
+      ? liveProvenReadEntry
+      : undefined;
 
     const common = {
       sessionId: identity.sessionId,
@@ -1847,43 +1866,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // inherit the local envelope as a fallback.
     const authorityBinding = runtimeToolAuthorityBinding(decision);
     if (authorityBinding === 'unknown') return null;
-    const catalogEntry = candidates[0];
+    const catalogEntry = candidates[0] ?? provenReadCandidate;
     if (authorityBinding === 'catalog_manifest' || catalogEntry) {
-      if (!catalogEntry && decision.effect === 'read' && readDescent) {
-        // READ-FAST-PATH: no frozen-catalog member exists for this proven
-        // read (pre-plan the production surface is graph-neutral/empty), and
-        // that is fine — frozen membership is the WRITE bar. The carrier
-        // dispatches under its own nested crossing accounting with the host
-        // effect classification (which reads the OPERATION, never a server
-        // name) and this turn's connection proof as the shape check.
-        const binding = {
-          bindingKind: 'local_envelope' as const,
-          capabilityId: capability[0]!.name,
-          schemaFingerprint: capability[0]!.schemaFingerprint,
-          accountId: '',
-          invokePortId: `configured-wrapper:${capability[0]!.schemaFingerprint}`,
-          operationId: name,
-          manifestId: '',
-          manifestDigest: '',
-        };
-        const bindingDigest = hostSurfaceDigest({ version: 1, ...binding, effect: decision.effect });
-        const descentArgs = effective.args && typeof effective.args === 'object' && !Array.isArray(effective.args)
-          ? effective.args as Record<string, unknown>
-          : {};
-        return {
-          attestation: { ...common, ...binding, bindingDigest },
-          effect: decision.effect,
-          boundary: 'nested_owned',
-          logicalToolName: readDescent.effectiveName,
-          logicalArgs: descentArgs,
-          trustedEffectCarrier: trustedRuntimeEffectCarrier(name, args),
-          invoke: async (callSignal) => tool.invoke!(
-            runContextForCall,
-            argumentsJson,
-            { ...(details as Record<string, unknown>), signal: callSignal },
-          ),
-        };
-      }
       const manifest = currentCapabilityManifest(catalogEntry?.manifest);
       if (!catalogEntry || !manifest) return null;
       const port = resolveProductionPortsForManifest(manifest);

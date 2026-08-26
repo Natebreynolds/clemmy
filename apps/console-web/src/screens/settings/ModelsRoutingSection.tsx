@@ -18,17 +18,20 @@ import { ConnectedModelsStrip } from './ConnectedModelsStrip';
  * Everything model-related lives here so Settings has one place to wire models
  * instead of 4–5 overlapping cards.
  */
-export function ModelsRoutingSection() {
+export function ModelsRoutingSection({ sessionId }: { sessionId?: string } = {}) {
   return (
     <Card className="p-5">
       <h3 className="mb-1 text-h3 text-fg">Models &amp; routing</h3>
       <p className="mb-4 text-small text-muted">
         Pick which connected model is the brain and which models serve workers. The judge/checker is
         automatic and uses one visible route for completion checks, write gates, and Second opinion.
-        You can also just tell Clementine in chat (“use DeepSeek for the workers”). Applies on the next message; no restart.
+        You can also just tell Clementine in chat (“use DeepSeek for the workers”).{' '}
+        {sessionId
+          ? 'Applies to your next message; no restart.'
+          : 'A brain switch applies to new conversations right away — a conversation already underway keeps its brain unless you switch from inside it. Worker and judge routes apply on the next message.'}
       </p>
 
-      <ModelRolesCard embedded />
+      <ModelRolesCard embedded sessionId={sessionId} />
 
       <div className="mt-6 border-t border-border pt-5">
         <h4 className="mb-1 text-label text-fg">Connect models</h4>

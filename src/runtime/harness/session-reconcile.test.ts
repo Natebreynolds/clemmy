@@ -437,3 +437,66 @@ test('an accepted-input session whose unfinished attempt lease EXPIRED is termin
   assert.equal(getActiveRunAttempt(wedged.id), null, 'the orphaned attempt was closed, not left claiming the session');
   assert.equal(listEvents(wedged.id).filter((e) => e.type === 'conversation_completed').length, 1);
 });
+
+// ── D4 regression pins (adversarial review 2026-08-26) ──────────────────────
+// (1) RACE DIRECTION: the liveness sweep decides "stale" from a snapshot read.
+// If the real owner publishes its terminal for that exact accepted input
+// between the sweep's read and its own publication, appendTerminalEventOnce
+// answers inserted:false — and the sweep must NOT stamp status='failed' over
+// the owner's real outcome. The status write is only legal AFTER the insert is
+// confirmed OURS.
+test('a lost liveness race never clobbers a real owner outcome: no status write on inserted:false', async () => {
+  resetEventLog();
+  const { reconcileSilentAcceptedInputSessions } = await import('./session-reconcile.js');
+  const { listEvents } = await import('./eventlog.js');
+
+  const raced = createSession({ id: 'sess-liveness-race-1', kind: 'chat', channel: 'desktop' });
+  // Deterministic reconstruction of the race's END STATE: the owner's terminal
+  // for the accepted input already exists (its sourceUserSeq names the input),
+  // while the session ledger still says 'active' (the owner has not finished
+  // its own status write yet) and the input is the NEWEST event the sweep sees.
+  const probe = appendEvent({ sessionId: raced.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
+  const predictedInputSeq = probe.seq + 2;
+  appendEvent({
+    sessionId: raced.id,
+    turn: 1,
+    role: 'assistant',
+    type: 'conversation_completed',
+    data: { sourceUserSeq: predictedInputSeq, status: 'completed', reply: 'the real answer' },
+  });
+  const input = appendEvent({ sessionId: raced.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'question' } });
+  assert.equal(input.seq, predictedInputSeq, 'fixture: the owner terminal names exactly this accepted input');
+
+  const bound = 10 * 60_000;
+  const sweep = reconcileSilentAcceptedInputSessions({ nowMs: Date.now() + bound + 60_000, boundMs: bound });
+
+  assert.equal(sweep.ids.includes(raced.id), false, 'a session whose owner already answered is not reported');
+  assert.equal(getSession(raced.id)?.status, 'active',
+    'the sweep must not stamp failed over a real owner outcome — the owner finishes its own status write');
+  assert.equal(
+    listEvents(raced.id).filter((e) => e.type === 'conversation_completed').length,
+    1,
+    'no duplicate terminal beside the owner one',
+  );
+});
+
+// (2) KIND SCOPE: the measured silent-no-reply class is kind='chat'
+// (sess-branch-1d43…). Work sessions (workflow/execution/agent) have their own
+// reconcilers joined to their owner stores; this sweep must not fabricate
+// failure authority for them from a stale accepted input alone.
+test('the accepted-input liveness sweep is scoped to chat: a stale workflow acceptance is untouched', async () => {
+  resetEventLog();
+  const { reconcileSilentAcceptedInputSessions } = await import('./session-reconcile.js');
+
+  const work = createSession({ id: 'workflow:stale-accepted:s1', kind: 'workflow', channel: 'workflow' });
+  appendEvent({ sessionId: work.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'run it' } });
+  const chat = createSession({ id: 'sess-scope-chat-1', kind: 'chat', channel: 'desktop' });
+  appendEvent({ sessionId: chat.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'hello?' } });
+
+  const bound = 10 * 60_000;
+  const sweep = reconcileSilentAcceptedInputSessions({ nowMs: Date.now() + bound + 60_000, boundMs: bound });
+
+  assert.deepEqual(sweep.ids, [chat.id], 'only the chat-kind silent acceptance is terminalized');
+  assert.equal(getSession(work.id)?.status, 'active', 'work sessions are left to their own reconcilers');
+  assert.equal(getSession(chat.id)?.status, 'failed');
+});

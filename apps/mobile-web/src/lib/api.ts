@@ -1086,10 +1086,15 @@ export async function getModelSettings(): Promise<ModelSettings> {
   return api<ModelSettings>('/m/api/settings/models');
 }
 
-export async function setBrain(value: string): Promise<{ ok: boolean; brain: ResolvedBrain; effectiveValue: string }> {
+/** sessionId is the conversation the switch was made FROM, when there is one
+ *  (the chat-header sheet knows it; Settings does not). Session brain pins mean
+ *  the global flip alone only steers NEW conversations — sending the sessionId
+ *  makes the daemon re-pin that conversation so "applies to your next message"
+ *  stays true where the sheet promises it. */
+export async function setBrain(value: string, sessionId?: string): Promise<{ ok: boolean; brain: ResolvedBrain; effectiveValue: string }> {
   return api('/m/api/settings/models/brain', {
     method: 'POST',
-    body: JSON.stringify({ value }),
+    body: JSON.stringify(sessionId ? { value, sessionId } : { value }),
   });
 }
 

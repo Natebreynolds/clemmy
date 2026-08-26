@@ -42,8 +42,38 @@ writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'machine-host-read-fa
 const eventlog = await import('./eventlog.js');
 const brackets = await import('./brackets.js');
 const composioClient = await import('../../integrations/composio/client.js');
+const production = await import('./production-capability-adapters.js');
+const provisioning = await import('./proof-provisioned-catalog.js');
+const catalogs = await import('./host-capability-catalog-factory.js');
+const schemas = await import('../../tools/composio-schema-cache.js');
+const { digestSchema } = await import('../../tools/tool-contract-store.js');
 const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
 const { hostRunRunner } = await import('./host-turn-runner.js');
+
+const DRIVE_INPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['query'],
+  properties: { query: { type: 'string' } },
+};
+const DRIVE_OUTPUT_SCHEMA = { type: 'object', properties: { files: { type: 'array' } } };
+
+catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+let transportCalls: Array<{ operationId?: string }> = [];
+production.installProductionTransport(async (call: { operationId?: string }) => {
+  transportCalls.push({ operationId: call?.operationId });
+  return { files: [{ id: 'gauntlet-sheet', name: 'Gauntlet Sheet' }] };
+});
+schemas._setToolSchemaLoaderForTests(async (identifier: string) => (
+  identifier === DRIVE_OPERATION
+    ? {
+        inputParameters: DRIVE_INPUT_SCHEMA,
+        outputParameters: DRIVE_OUTPUT_SCHEMA,
+        providerObservedAt: Date.now(),
+        providerOperationVersion: '20260826_01',
+      }
+    : null
+));
 
 const DRIVE_OPERATION = 'GOOGLEDRIVE_FIND_FILE';
 const WRITE_OPERATION = 'GOOGLESHEETS_VALUES_UPDATE';
@@ -115,6 +145,10 @@ composioClient.__test__.setComposioClient({
 });
 
 after(() => {
+  schemas._setToolSchemaLoaderForTests(null);
+  schemas.resetToolSchemaCache();
+  production.installProductionTransport(null);
+  catalogs.installHostCapabilityCatalogFactory(null);
   composioClient.__test__.setComposioClient(null);
   composioClient.__test__.setConnectedAccountsLoader(null);
   composioClient.__test__.setComposioApiKeyOverride(null);
@@ -217,6 +251,27 @@ async function runOneProvenCallTurn(input: {
   // this prepared snapshot and never starts a hidden account refresh.
   await composioClient.listUsableConnectedToolkits();
 
+  // Proof provisioning (the live pre-model prep) registers the proven read
+  // into the LIVE capability factory — exactly what the gauntlet turns had.
+  // The frozen host surface stays graph-neutral/empty regardless: that is
+  // the seam under test.
+  if (input.provenEntries.some((entry) => entry.effectClass === 'read')) {
+    const provisioned = await provisioning.registerProofProvisionedCapabilities(
+      { sessionId: session.id, sourceUserSeq: source.seq },
+      {
+        allowedIdentifiers: [DRIVE_OPERATION],
+        expectedSchemaDigests: [
+          { identifier: DRIVE_OPERATION, schemaDigest: digestSchema(DRIVE_INPUT_SCHEMA) },
+        ],
+      },
+    );
+    assert.equal(provisioned.refusal, undefined, JSON.stringify(provisioned));
+    assert.ok(
+      catalogs.peekHostCapabilityCatalogFactory()?.get(`cap:resolved:${DRIVE_OPERATION.toLowerCase()}`),
+      'the proven read is registered in the live factory (not the frozen surface)',
+    );
+  }
+
   let modelCalls = 0;
   let observedResult = '';
   const model = {
@@ -277,7 +332,7 @@ async function runOneProvenCallTurn(input: {
     counter: new brackets.ToolCallsCounter(6),
     behaviorScopeId: `${session.id}::turn:1`,
   };
-  await brackets.withHarnessRunContext(parent, () => hostRunRunner(
+  const runnerResult = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
     throwingRunner() as never,
     agent as never,
     [{ role: 'user', content: prompt }] as never,
@@ -287,14 +342,30 @@ async function runOneProvenCallTurn(input: {
       context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
     } as never,
   ));
-  assert.equal(modelCalls, 2, JSON.stringify(eventlog.listEvents(session.id).map((event) => ({
-    seq: event.seq, type: event.type, data: event.data,
-  }))));
-  return { resultText: observedResult };
+  assert.ok(modelCalls >= 1);
+  // The durable ledger is the settlement truth; a tool whose behavior ends the
+  // turn on success never reaches a second model step, so read the exact
+  // returned bytes from the eventlog rather than the next model request.
+  const durable = eventlog.getToolOutput(session.id, `proven-call-${input.label}`) as
+    | { output?: unknown }
+    | null;
+  const resultText = observedResult
+    || JSON.stringify(durable?.output ?? durable ?? '')
+    + JSON.stringify((runnerResult as { state?: unknown; finalOutput?: unknown } | undefined) ?? '');
+  if (process.env.CLEM_READ_DESCENT_DEBUG) {
+    console.error('RFP_DEBUG', JSON.stringify({
+      label: input.label,
+      modelCalls,
+      runnerResult,
+      events: eventlog.listEvents(session.id).map((event) => ({ seq: event.seq, type: event.type })),
+    }).slice(0, 3000));
+  }
+  return { resultText };
 }
 
 test('a proven read dispatches with no frozen-catalog member (frozen membership is the write bar)', async () => {
   providerExecutions = [];
+  transportCalls = [];
   const { resultText } = await runOneProvenCallTurn({
     label: 'attested-read',
     call: {
@@ -311,11 +382,12 @@ test('a proven read dispatches with no frozen-catalog member (frozen membership 
   assert.doesNotMatch(resultText, /refused before dispatch/,
     `the read-effect call must pass the host wall: ${resultText}`);
   assert.match(resultText, /Gauntlet Sheet/, resultText);
-  assert.deepEqual(providerExecutions, [DRIVE_OPERATION]);
+  assert.equal(transportCalls.length, 1, JSON.stringify(transportCalls));
 });
 
 test('the same proven read dispatches through a non-attested carrier object (the live claude-lane shape)', async () => {
   providerExecutions = [];
+  transportCalls = [];
   const { resultText } = await runOneProvenCallTurn({
     label: 'unattested-read',
     call: {
@@ -332,11 +404,12 @@ test('the same proven read dispatches through a non-attested carrier object (the
   assert.doesNotMatch(resultText, /refused before dispatch/,
     `a proven discovery read never dies at the provenance wall: ${resultText}`);
   assert.match(resultText, /Gauntlet Sheet/, resultText);
-  assert.deepEqual(providerExecutions, [DRIVE_OPERATION]);
+  assert.equal(transportCalls.length, 1, JSON.stringify(transportCalls));
 });
 
 test('a write through the same non-attested carrier keeps the full wall', async () => {
   providerExecutions = [];
+  transportCalls = [];
   const { resultText } = await runOneProvenCallTurn({
     label: 'unattested-write',
     call: {
@@ -352,5 +425,6 @@ test('a write through the same non-attested carrier keeps the full wall', async 
   });
   assert.match(resultText, /refused before dispatch/,
     `writes keep the attested-carrier + frozen-manifest wall: ${resultText}`);
-  assert.deepEqual(providerExecutions, [], 'no write bytes cross the wall');
+  assert.deepEqual(providerExecutions, [], 'no write bytes cross the provider wire');
+  assert.deepEqual(transportCalls, [], 'no write bytes cross the transport');
 });

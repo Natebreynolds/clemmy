@@ -12,6 +12,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-local-evidence\n', 'utf8');
 
 const eventlog = await import('./eventlog.js');
+const { removeV65StructuresFromHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
 const contracts = await import('./expected-work-contract.js');
@@ -552,6 +553,7 @@ test('the execution-site migration is idempotent and preserves existing dispatch
   live.exec('ALTER TABLE physical_dispatches DROP COLUMN execution_site');
   // The runner resumes from MAX(version), so a store rolled back to its
   // pre-v35 shape must lose every version at or above it.
+  removeV65StructuresFromHistoricalMigrationFixture(live);
   live.prepare('DELETE FROM schema_version WHERE version >= 35').run();
   assert.equal(
     (live.prepare('PRAGMA table_info(physical_dispatches)').all() as Array<{ name: string }>)
@@ -600,6 +602,7 @@ test('a store that recorded a PARTIAL earlier version is repaired, not stranded'
   // The runner resumes from MAX(version), so simulating "never received v36"
   // means dropping every version at or above it — the same property this pin
   // exists to document.
+  removeV65StructuresFromHistoricalMigrationFixture(live);
   live.prepare('DELETE FROM schema_version WHERE version >= 36').run();
   eventlog.closeEventLog();
 

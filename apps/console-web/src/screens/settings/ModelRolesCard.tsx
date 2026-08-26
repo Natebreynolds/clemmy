@@ -223,7 +223,10 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
             Pick the active brain provider and which connected models serve workers and
             the judge/checker (used for completion checks, write gates, and Second opinion).
             Leave the judge on “Automatic” for a fast different-family check, or pick a
-            stronger model. Applies on the next message; no restart.
+            stronger model.{' '}
+            {sessionId
+              ? 'Applies to your next message; no restart.'
+              : 'Applies to new conversations right away — a conversation already underway keeps its brain unless you switch from inside it.'}
           </p>
         </>
       )}

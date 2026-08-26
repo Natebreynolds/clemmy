@@ -51,7 +51,12 @@ const {
   resetToolSchemaCache,
   _setToolSchemaLoaderForTests,
 } = await import('../tools/composio-schema-cache.js');
-const { __test__, resetComposioClient } = await import('../integrations/composio/client.js');
+const {
+  __test__,
+  clearConnectedToolkitsCache,
+  listUsableConnectedToolkits,
+  resetComposioClient,
+} = await import('../integrations/composio/client.js');
 
 test.after(() => {
   __test__.setConnectedAccountsLoader(null);
@@ -96,12 +101,29 @@ function settlementsFor(task: AcceptedTask): Array<Record<string, unknown>> {
 }
 
 function alphaAccount(id: string, email: string): Record<string, unknown> {
-  return { id, toolkit: { slug: 'alpha' }, status: 'ACTIVE', data: { user_info: { email } } };
+  // `user_id` is the account's owning provider identity. A prepared dispatch
+  // refuses to cross the boundary without it, because an exact one-shot
+  // request must be made as the identity that owns the connection.
+  return {
+    id,
+    toolkit: { slug: 'alpha' },
+    status: 'ACTIVE',
+    user_id: 'wire-composio-owner',
+    data: { user_info: { email } },
+  };
 }
 
 function setAccounts(items: Array<Record<string, unknown>>): void {
   __test__.setConnectedAccountsLoader(async () => items);
 }
+
+/**
+ * A prepared dispatch consumes only the exact CURRENT provider observation:
+ * the schema fingerprint, its input digest, AND the operation version. A
+ * contract without the version leg reads as a cold lease and is refused
+ * PREPARATION-REQUIRED before the branch under test is ever reached.
+ */
+const PROVIDER_OPERATION_VERSION = '20260826_01';
 
 const ALPHA_READ = 'ALPHA_LIST_RECORDS';
 const ALPHA_WRITE = 'ALPHA_CREATE_RECORD';
@@ -115,6 +137,7 @@ const OPEN_CONTRACT = {
     properties: { query: { type: 'string' }, title: { type: 'string' } },
   },
   providerObservedAt: Date.now(),
+  providerOperationVersion: PROVIDER_OPERATION_VERSION,
 };
 
 /** The provider's real contract for the write: `title` is REQUIRED. */
@@ -125,6 +148,7 @@ const REQUIRED_TITLE_CONTRACT = {
     properties: { title: { type: 'string' }, notes: { type: 'string' } },
   },
   providerObservedAt: Date.now(),
+  providerOperationVersion: PROVIDER_OPERATION_VERSION,
 };
 
 const REQUIRED_RECIPIENT_CONTRACT = {
@@ -138,6 +162,7 @@ const REQUIRED_RECIPIENT_CONTRACT = {
     },
   },
   providerObservedAt: Date.now(),
+  providerOperationVersion: PROVIDER_OPERATION_VERSION,
 };
 
 interface LaneRow {
@@ -162,6 +187,27 @@ interface LaneRow {
   expectOutput: RegExp;
   /** Why this row exists, in the failure message. */
   because: string;
+}
+
+/**
+ * Bring the lane to the state a prepared dispatch requires before the call:
+ * the exact CURRENT provider definition for the action, and a CURRENT
+ * published observation of the accounts that can own it. Execution consumes
+ * only what is already published — it may not start a hidden schema or
+ * account read between logical admission and the physical attempt — so a
+ * fixture that only installs loaders is refused before it reaches any branch
+ * under test. Dropping the previous case's snapshot is part of the contract:
+ * otherwise its accounts stay current for this one.
+ */
+async function prepareLane(
+  contract: unknown,
+  accounts: Array<Record<string, unknown>>,
+): Promise<void> {
+  resetToolSchemaCache();
+  _setToolSchemaLoaderForTests(async () => contract as never);
+  clearConnectedToolkitsCache();
+  setAccounts(accounts);
+  await listUsableConnectedToolkits({ requireFresh: true });
 }
 
 const ROWS: LaneRow[] = [
@@ -263,9 +309,7 @@ const ROWS: LaneRow[] = [
 
 async function runRow(row: LaneRow): Promise<{ task: AcceptedTask; dispatches: number; output: string }> {
   _resetAttemptSettlementStateForTests();
-  resetToolSchemaCache();
-  _setToolSchemaLoaderForTests(async () => row.contract as never);
-  setAccounts(row.accounts);
+  await prepareLane(row.contract, row.accounts);
   const task = acceptedTask(row.name.split(' ')[0] ?? 'row');
 
   let dispatches = 0;
@@ -374,9 +418,7 @@ for (const row of ROWS) {
 
 test('composio trusted resolver refines routing metadata once before the paid crossing', async () => {
   _resetAttemptSettlementStateForTests();
-  resetToolSchemaCache();
-  _setToolSchemaLoaderForTests(async () => OPEN_CONTRACT as never);
-  setAccounts([alphaAccount('ca_alpha_one', 'owner@alpha.example')]);
+  await prepareLane(OPEN_CONTRACT, [alphaAccount('ca_alpha_one', 'owner@alpha.example')]);
   const task = acceptedTask('resolved-contract');
   let providerArgs: Record<string, unknown> | undefined;
 
@@ -425,10 +467,8 @@ test('composio trusted resolver refines routing metadata once before the paid cr
 
 test('composio replacement repair settles against the effective object, not the stale raw object', async () => {
   _resetAttemptSettlementStateForTests();
-  resetToolSchemaCache();
-  _setToolSchemaLoaderForTests(async () => REQUIRED_RECIPIENT_CONTRACT as never);
+  await prepareLane(REQUIRED_RECIPIENT_CONTRACT, [alphaAccount('ca_alpha_one', 'owner@alpha.example')]);
   await ensureToolSchema(ALPHA_SEND);
-  setAccounts([alphaAccount('ca_alpha_one', 'owner@alpha.example')]);
   const task = acceptedTask('replacement-repair');
   let providerArgs: Record<string, unknown> | undefined;
 
@@ -476,23 +516,29 @@ test('composio replacement repair settles against the effective object, not the 
   });
 });
 
+/**
+ * The provider transport as a PREPARED dispatch reaches it: one exact
+ * no-retry request, taken through `getClient().withOptions(...).tools.execute`.
+ * The legacy top-level shape stays wired to the same body, so a lane that
+ * crossed the boundary twice still fails the dispatch count instead of
+ * hiding one of the two crossings.
+ */
+function stubProviderTransport(execute: (...args: unknown[]) => Promise<unknown>): void {
+  const tools = { execute };
+  __test__.setComposioClient({ tools, getClient: () => ({ withOptions: () => ({ tools }) }) });
+}
+
 // ── the one-shot gateway used by workflow / Space / batch ───────────────────
 
 test('composio one-shot gateway — a successful dispatchComposioTool call settles once', async () => {
   _resetAttemptSettlementStateForTests();
-  resetToolSchemaCache();
-  _setToolSchemaLoaderForTests(async () => OPEN_CONTRACT as never);
-  setAccounts([alphaAccount('ca_alpha_one', 'owner@alpha.example')]);
+  await prepareLane(OPEN_CONTRACT, [alphaAccount('ca_alpha_one', 'owner@alpha.example')]);
   const task = acceptedTask('oneshot-success');
 
   let dispatches = 0;
-  __test__.setComposioClient({
-    tools: {
-      execute: async () => {
-        dispatches += 1;
-        return { successful: true, data: { records: [{ id: 'rec-1' }] } };
-      },
-    },
+  stubProviderTransport(async () => {
+    dispatches += 1;
+    return { successful: true, data: { records: [{ id: 'rec-1' }] } };
   });
 
   try {
@@ -531,19 +577,13 @@ test('composio one-shot gateway — a successful dispatchComposioTool call settl
 
 test('composio one-shot gateway — a provider-returned failure settles before rendering', async () => {
   _resetAttemptSettlementStateForTests();
-  resetToolSchemaCache();
-  _setToolSchemaLoaderForTests(async () => OPEN_CONTRACT as never);
-  setAccounts([alphaAccount('ca_alpha_one', 'owner@alpha.example')]);
+  await prepareLane(OPEN_CONTRACT, [alphaAccount('ca_alpha_one', 'owner@alpha.example')]);
   const task = acceptedTask('oneshot-failure');
 
   let dispatches = 0;
-  __test__.setComposioClient({
-    tools: {
-      execute: async () => {
-        dispatches += 1;
-        return { successful: false, data: { message: 'alpha rejected the request' } };
-      },
-    },
+  stubProviderTransport(async () => {
+    dispatches += 1;
+    return { successful: false, data: { message: 'alpha rejected the request' } };
   });
 
   try {
@@ -589,9 +629,7 @@ test('composio dispatch lane — a transport mirror of one attempt adds ZERO ext
   const row = ROWS[0]!;
 
   _resetAttemptSettlementStateForTests();
-  resetToolSchemaCache();
-  _setToolSchemaLoaderForTests(async () => row.contract as never);
-  setAccounts(row.accounts);
+  await prepareLane(row.contract, row.accounts);
   const task = acceptedTask('mirror');
 
   let dispatches = 0;

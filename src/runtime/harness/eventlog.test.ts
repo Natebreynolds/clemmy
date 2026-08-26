@@ -70,6 +70,7 @@ const {
   HARNESS_DB_PATH,
 } = await import('./eventlog.js');
 const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
+const { removeV65StructuresFromHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 type EventType = import('./eventlog.js').EventType;
 
 test.after(() => {
@@ -79,21 +80,6 @@ test.after(() => {
     /* best effort */
   }
 });
-
-function removeV65StructuresFromHistoricalMigrationFixture(db: Database.Database): void {
-  // These tests start from today's schema and rewind only the version ledger to
-  // exercise an older migration boundary. v65 deliberately rejects these
-  // table names when its version row is absent, because they had no sanctioned
-  // predecessor. Make the synthetic historical store honest by removing the
-  // v65-only structures before replaying migrations; additive parent columns
-  // are restart-safe and may legitimately remain.
-  db.exec(`
-    DROP INDEX IF EXISTS idx_tool_outputs_session_created_call;
-    DROP TABLE IF EXISTS tool_output_chunks;
-    DROP TABLE IF EXISTS tool_output_invocation_chunks;
-    DROP TABLE IF EXISTS tool_search_continuations;
-  `);
-}
 
 test('latest schema upgrades an existing v4 approval table without losing rows', () => {
   resetEventLog();

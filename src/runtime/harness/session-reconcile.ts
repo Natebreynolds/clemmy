@@ -501,7 +501,11 @@ export function reconcileSilentAcceptedInputSessions(
     pendingSessionIds = new Set();
   }
 
-  const active = listSessions({ status: ['active'], limit: 2_000 });
+  // Scoped to kind='chat' — the measured silent-no-reply class (sess-branch-…
+  // was a chat session). Work sessions (workflow/execution/agent) have their
+  // own reconcilers with owner stores this sweep does not join; widening here
+  // would let a missing local harness row fabricate failure authority for them.
+  const active = listSessions({ kind: ['chat'], status: ['active'], limit: 2_000 });
   for (const session of active) {
     if (records.length >= limit) break;
     if (pendingSessionIds.has(session.id)) continue;
@@ -548,8 +552,12 @@ export function reconcileSilentAcceptedInputSessions(
           text: 'This message was accepted but no turn ever started for it. The session was closed by the liveness reaper — send the request again.',
         },
       }, `liveness:${latest.seq}`);
-      updateSession(session.id, { status: 'failed' });
+      // Status write ONLY AFTER the insert is confirmed OURS. If a real owner
+      // already published the terminal for this exact source (inserted:false —
+      // e.g. the turn finished between our staleness read and here), stamping
+      // 'failed' would clobber that owner's outcome with a lost-race lie.
       if (!terminal.inserted) continue; // an owner already published a terminal for this exact source
+      updateSession(session.id, { status: 'failed' });
     } catch {
       continue; // terminal publication refused (e.g. armed authority) — leave for its owner
     }

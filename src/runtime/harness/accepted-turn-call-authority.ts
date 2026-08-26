@@ -380,6 +380,7 @@ export function currentHostCallAttestation(): Readonly<HostCallAttestation> | un
   return hostCallAttestationStorage.getStore();
 }
 
+
 interface WorkflowReadOnlyCallAttestation {
   sessionId: string;
   sourceEventSeq: number;

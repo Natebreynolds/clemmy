@@ -25,6 +25,7 @@ const callAuthority = await import('./accepted-turn-call-authority.js');
 const logicalContracts = await import('./logical-call-contract.js');
 const hostBindings = await import('./host-call-capability-binding.js');
 const terminalDispatchOwners = await import('./terminal-physical-dispatch-owner.js');
+const { removeV65StructuresFromHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 const { tool: sdkTool } = await import('@openai/agents');
 const { z } = await import('zod');
 
@@ -1071,6 +1072,9 @@ test('v57 never invents authority for a historical settled host call and cannot 
   // this rehearsal into an impossible, manually-corrupted schema shape.
   // Reopening must add an empty table, never backfill one from results.
   const db = eventlog.openEventLog();
+  // Rewinding to v56 replays v58..v65 as well, so the store must be honestly
+  // pre-v57 for those replays too.
+  removeV65StructuresFromHistoricalMigrationFixture(db);
   db.exec(`
     DROP TRIGGER IF EXISTS trg_host_call_capability_binding_root_exact;
     DROP TRIGGER IF EXISTS trg_host_call_capability_binding_logical_exact;

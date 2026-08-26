@@ -175,7 +175,15 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             <span class="truncate">{brainLabel}</span>
           </button>
         ) : null}
-        <BrainSheet open={brainOpen} onClose={() => setBrainOpen(false)} onChanged={loadBrain} />
+        {/* This sheet lives in a conversation, so it passes the session id: the
+            daemon re-pins THIS conversation and the switch truly applies to its
+            next message (Settings mounts the same sheet with no session). */}
+        <BrainSheet
+          open={brainOpen}
+          onClose={() => setBrainOpen(false)}
+          onChanged={loadBrain}
+          sessionId={snapshot?.sessionId ?? initialSessionId ?? undefined}
+        />
         {connection === 'recovering' || connection === 'connecting' ? (
           <div class="conn-pill conn-recovering">reconnecting…</div>
         ) : connection === 'detached' ? (

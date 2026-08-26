@@ -33,6 +33,7 @@ import {
   authorizeInstalledDataRunner,
   registerRunnerTrustRefreshHandler,
 } from './space-data-runner-trust.js';
+import { acquireSpaceReadAuthority } from './space-read-authority.js';
 
 export interface RunSourceOk { ok: true; data: unknown }
 export interface RunSourceErr {
@@ -446,11 +447,37 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
   recordOperationalEvent({ source: 'workspace', type: 'workspace_data_refresh_started', workspaceId: slug, actor: 'space-runner', payload: { sourceCount: sources.length, sourceId } });
   for (const source of sources) {
     const authorityMap = opts.composioAuthorityBySourceId;
-    const run = await runSpaceDataSource(slug, source, {
-      composioAuthority: authorityMap && Object.prototype.hasOwnProperty.call(authorityMap, source.id)
-        ? authorityMap[source.id]
-        : undefined,
-    });
+    let composioAuthority = authorityMap && Object.prototype.hasOwnProperty.call(authorityMap, source.id)
+      ? authorityMap[source.id]
+      : undefined;
+    // A declared Composio data source is a READ, and reads redeem the shared
+    // durable workflow_v1_read_only kernel. Mint that authority here so every
+    // caller of refreshSpaceData (dashboard route, scheduler, creation smoke,
+    // Ask Clem) supplies the root the gate demands. A caller-provided
+    // authority always wins; a mint refusal leaves the gate's zero-body
+    // refusal in place and is surfaced beside it below.
+    let mintRefusal: string | undefined;
+    if (
+      !composioAuthority
+      && source.composioSlug?.trim()
+      && !source.runner?.trim()
+      && !source.cliArgv?.length
+      && !workspaceDataSourceSafetyError(source)
+    ) {
+      const minted = acquireSpaceReadAuthority({
+        slug,
+        sourceId: source.id,
+        toolSlug: source.composioSlug.trim(),
+        args: source.composioArgs ?? {},
+        cause,
+      });
+      if (minted.ok) composioAuthority = minted.authority;
+      else mintRefusal = minted.error;
+    }
+    const run = await runSpaceDataSource(slug, source, { composioAuthority });
+    if (!run.ok && mintRefusal) {
+      run.error = `${run.error} Durable read authority could not be minted: ${mintRefusal}`;
+    }
     const observedAt = new Date().toISOString();
     // Repeated clicks while the same trust card is pending are one observation,
     // not new facts. The approval id is already exact to workspace + source +

@@ -16,11 +16,16 @@ import { haptic } from '../lib/native-bridge';
  * connecting a new brain is the Mac's job. Mirrors the console's no-restart
  * contract: a switch applies to your next message.
  */
-export function BrainSheet({ open, onClose, onChanged }: {
+export function BrainSheet({ open, onClose, onChanged, sessionId }: {
   open: boolean;
   onClose: () => void;
   /** Fired after a successful switch so hosts can refresh their own view. */
   onChanged?: () => void;
+  /** The conversation this sheet was opened FROM (the chat header passes it;
+   *  Settings has none). With it, the daemon re-pins that conversation so the
+   *  switch really applies to its next message; without it the switch is
+   *  global-only and steers new conversations. */
+  sessionId?: string;
 }) {
   const [settings, setSettings] = useState<ModelSettings | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -75,7 +80,7 @@ export function BrainSheet({ open, onClose, onChanged }: {
     setSwitchError(null);
     setSwitched(null);
     try {
-      await setBrain(value);
+      await setBrain(value, sessionId);
       haptic('light');
       setSwitched(label);
       setSettings(await getModelSettings().catch(() => settings));
@@ -113,7 +118,7 @@ export function BrainSheet({ open, onClose, onChanged }: {
               <span class="brain-dot ok" aria-hidden="true" />
               <div class="min-w-0">
                 <div class="brain-current-name truncate">{currentLabel}</div>
-                <div class="brain-current-meta">{settings.brain.provider} · answers your next message</div>
+                <div class="brain-current-meta">{settings.brain.provider} · {sessionId ? 'answers your next message' : 'answers new conversations'}</div>
               </div>
             </div>
             {settings.brain.inactiveBinding ? (
@@ -147,10 +152,18 @@ export function BrainSheet({ open, onClose, onChanged }: {
               })}
             </div>
 
-            {switched ? <p class="brain-note switched">Switched to {switched} — applies to your next message.</p> : null}
+            {switched ? (
+              <p class="brain-note switched">
+                Switched to {switched} — {sessionId ? 'applies to your next message.' : 'applies to new conversations.'}
+              </p>
+            ) : null}
             {switchError ? <p class="error brain-note">{switchError}</p> : null}
             {!switched && !switchError ? (
-              <p class="brain-note muted">Switching applies to your next message. No restart needed.</p>
+              <p class="brain-note muted">
+                {sessionId
+                  ? 'Switching applies to your next message. No restart needed.'
+                  : 'Switching applies to new conversations — a conversation already underway keeps its brain unless you switch from inside it.'}
+              </p>
             ) : null}
           </>
         ) : null}
