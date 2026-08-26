@@ -10,7 +10,7 @@
  * server, rather than recomputing "what state are we in?" from raw status.
  * Surfaces used to do that independently and disagreed with each other.
  */
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -63,6 +63,29 @@ export function MobilePanel() {
   const [error, setError] = useState('');
   const [pin, setPin] = useState('');
   const [pinSaved, setPinSaved] = useState(false);
+  // Each QR fetch mints a fresh pairing code with a 10-minute life. The image
+  // is otherwise loaded once and silently rots — a scan after the expiry
+  // consumes a dead token and lands the phone back on the scan screen (live:
+  // "asking me to scan to connect again"). Re-mint before expiry, and when
+  // the user returns to the tab, so the code on screen is always redeemable.
+  const [qrEpoch, setQrEpoch] = useState(() => Date.now());
+  const qrMintedAtRef = useRef(Date.now());
+  useEffect(() => {
+    const remint = () => {
+      qrMintedAtRef.current = Date.now();
+      setQrEpoch(qrMintedAtRef.current);
+    };
+    const interval = setInterval(remint, 8 * 60_000);
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (Date.now() - qrMintedAtRef.current > 60_000) remint();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, []);
 
   const refresh = () => qc.invalidateQueries({ queryKey: ['mobile-status'] });
 
@@ -155,8 +178,12 @@ export function MobilePanel() {
 
       {phase === 'live' && setup.qrReady ? (
         <div className="flex flex-col items-center gap-3 rounded-md border border-border bg-canvas p-4">
-          <img src={qrSrc()} alt="Pairing QR code" className="h-[280px] w-[280px] rounded bg-white p-2" />
-          <p className="text-small text-muted">Scan from the Clem app — not the camera app.</p>
+          <img
+            src={`${qrSrc()}${qrSrc().includes('?') ? '&' : '?'}v=${qrEpoch}`}
+            alt="Pairing QR code"
+            className="h-[280px] w-[280px] rounded bg-white p-2"
+          />
+          <p className="text-small text-muted">Scan from the Clem app — not the camera app. The code stays fresh on its own.</p>
           {setup.url ? <code className="max-w-full truncate text-caption text-muted">{setup.url}</code> : null}
         </div>
       ) : null}
