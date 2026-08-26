@@ -581,6 +581,24 @@ function harnessRefusalString(result: unknown): boolean {
     .some((candidate) => /^\s*Tool call refused by harness:/.test(candidate));
 }
 
+/** A provider-confirmed NOT FOUND is an ANSWER, not an unknown. The carrier
+ * envelope ('⚠️ <label> NOT FOUND (slug=…)') is host-authored and emitted only
+ * when the provider itself reported that the referenced id does not exist —
+ * the crossing completed and the world replied. For a READ that is a
+ * conclusive empty result: the question was asked and answered. Live
+ * 2026-08-26: four SLACK_RETRIEVE_DETAILED_USER_INFORMATION reads for
+ * deactivated accounts settled 'unknown', and a write step's audit counted
+ * four ANSWERED reads as unrecovered business failures, blocking a step whose
+ * work had otherwise completed. A MUTATION is the opposite case and stays out
+ * of this branch — a not-found target means the write never landed, which is a
+ * definitive failure, never an empty success. */
+function providerConfirmedNotFoundString(result: unknown): boolean {
+  return stringCandidates(result).some((candidate) => {
+    const head = candidate.trimStart().split('\n', 1)[0] ?? '';
+    return head.startsWith('⚠️') && /\bNOT FOUND\b/.test(head) && /\bslug=/.test(head);
+  });
+}
+
 /** The Agents SDK's errorFunction launders EVERY invoke error into "An error
  * occurred while running the tool. Please try again. Error: …" and returns it
  * as the tool's own result. The prefix is host/SDK-authored, never provider
@@ -802,6 +820,20 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   if (extracted.preDispatch === undefined && harnessRefusalString(input.result)) {
     extracted.preDispatch = true;
     extracted.policyRefused = true;
+  } else if (providerConfirmedNotFoundString(input.result)) {
+    if (input.mutating === true) {
+      // A mutation whose TARGET does not exist never landed, and the wrong
+      // identifier is exactly what a retry repairs — a typed, repairable
+      // failure, never the success a bare string used to settle.
+      if (extracted.argumentValidationFailed === undefined) {
+        extracted.argumentValidationFailed = true;
+      }
+    } else if (extracted.envelopeSuccessful === undefined) {
+      // The read crossed and the provider answered "no such record": a
+      // conclusive empty result, not an unproven attempt.
+      extracted.envelopeSuccessful = true;
+      extracted.emptyResult = true;
+    }
   } else {
     const laundered = sdkLaunderedErrorString(input.result);
     if (laundered === 'invalid_input' && extracted.argumentValidationFailed === undefined) {

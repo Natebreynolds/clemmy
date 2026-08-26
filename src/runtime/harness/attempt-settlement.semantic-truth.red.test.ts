@@ -183,3 +183,46 @@ test('an ordinary local string result still settles succeeded with host evidence
     'unmarked local returns keep their host-execution evidence; the fix must not orphan local reads');
   assert.equal(settled.outcome.detail, 'host_execution');
 });
+
+test('a provider-confirmed NOT FOUND answers a read (empty result) and fails a write', () => {
+  // Live 2026-08-26 (workflow:1787756650514-p49live:main): four Slack reads
+  // for deactivated accounts returned the carrier's NOT FOUND envelope,
+  // settled 'unknown', and a write step's audit counted four ANSWERED reads
+  // as unrecovered business failures — blocking a step whose work was done.
+  const notFound = [
+    '\u26a0\ufe0f composio_execute_tool NOT FOUND (slug=SLACK_RETRIEVE_DETAILED_USER_INFORMATION): Slack API error: user_not_found',
+    'This is almost certainly a WRONG identifier — the connection works, the id you used does not exist.',
+  ].join('\n');
+
+  const settleBusiness = (task: ReturnType<typeof accept>, callId: string, mutating: boolean) => {
+    admitReturnedHostCrossing({
+      task,
+      logicalToolCallId: callId,
+      tool: 'slack_retrieve_detailed_user_information',
+      args: { user: 'U-GONE' },
+    });
+    return settlement.settleToolAttempt({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      turn: task.turn,
+      lane: 'byo',
+      toolName: 'slack_retrieve_detailed_user_information',
+      callId,
+      args: { user: 'U-GONE' },
+      mutating,
+      businessCall: true,
+      result: notFound,
+    });
+  };
+
+  const readTask = accept('not-found-read');
+  const read = settleBusiness(readTask, 'call-not-found-read', false);
+  assert.equal(read.outcome.kind, 'empty_result',
+    'a read whose provider answered "no such record" is a conclusive empty result');
+
+  const writeTask = accept('not-found-write');
+  const write = settleBusiness(writeTask, 'call-not-found-write', true);
+  assert.notEqual(write.outcome.kind, 'empty_result',
+    'a not-found TARGET means the write never landed — never an empty success');
+  assert.notEqual(write.outcome.kind, 'succeeded');
+});
