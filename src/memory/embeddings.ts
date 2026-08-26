@@ -888,12 +888,34 @@ async function callProviderEmbed(provider: EmbeddingProvider, texts: string[]): 
   }
 }
 
+/**
+ * A same-call rescue for the request already in front of us — never a
+ * change to which provider the PROCESS prefers going forward. That stays
+ * gated on the breaker/demotion thresholds above, by design, so a single
+ * blip cannot flip the process's default provider (see maybeDemoteToLocal).
+ *
+ * getEmbeddingProvider() answers "what should the NEXT call use", and a
+ * TRANSIENT failure keeps it pinned to the just-failed provider until 3
+ * consecutive failures accumulate — which a live chat turn's embedQuery
+ * rarely reaches on its own, because an unrelated success elsewhere in the
+ * process (backfill, another turn) resets the very same counter. This used
+ * to route the rescue through getEmbeddingProvider() too, so a transient
+ * timeout got nothing: measured live 2026-08-26, 24 "no fallback provider
+ * available" refusals in one daemon's lifetime, every one transient, the
+ * breaker never once open at the time, an already-warm local model sitting
+ * idle while the call burned its own ~20s round trip for no result. A
+ * TERMINAL failure (auth/quota) already got a same-call rescue for free —
+ * it opens the breaker AND clears it via immediate demotion within the same
+ * recordFailure() call, so inCooldown() reads false again by the time this
+ * ran. This gives a transient failure the identical rescue, still without
+ * touching consecutiveFailures/demotedToLocal — only the call in front of
+ * us is rescued, never the process's standing choice of provider.
+ */
 async function fallbackProviderAfterFailure(failedProvider: EmbeddingProvider): Promise<EmbeddingProvider | null> {
-  if (inCooldown()) return null;
-  const next = await getEmbeddingProvider();
-  if (!next) return null;
-  if (embeddingProviderCacheKey(next) === embeddingProviderCacheKey(failedProvider)) return null;
-  return next;
+  if (failedProvider.name !== 'openai') return null; // local has no further fallback
+  if (providerOverride() === 'openai') return null; // an explicit force is honored, even for a rescue
+  if (!localEmbeddingsAllowed()) return null;
+  return loadLocalProvider();
 }
 
 type EmbedBatchResult =
@@ -923,7 +945,18 @@ async function embedBatchWithProviderFailover(
     if (fallback) {
       try {
         const vectors = await callProviderEmbed(fallback, texts);
-        recordSuccess(fallback);
+        // Deliberately NOT recordSuccess(fallback): this is a one-off rescue
+        // of the call in front of us, not a use of the process's preferred
+        // provider (getEmbeddingProvider() still returns `provider`, unchanged,
+        // on the next call). recordSuccess resets consecutiveFailures — if it
+        // ran here, a sustained OpenAI outage where every call gets silently
+        // rescued would never reach CONSECUTIVE_FAIL_THRESHOLD, so the breaker
+        // would never open and the process would never demote: every future
+        // call would keep paying OpenAI's own timeout before being rescued,
+        // forever, instead of converging on "skip OpenAI, go straight to
+        // local" the way a sustained failure is supposed to. Leaving the
+        // failure on the books lets the breaker still open/demote normally;
+        // only the caller in front of us is spared the null result.
         logger.warn(
           { ...logContext, err, provider: embeddingProviderCacheKey(provider), fallback: embeddingProviderCacheKey(fallback) },
           'embedding provider failed; fallback provider succeeded',

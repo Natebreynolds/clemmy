@@ -105,3 +105,37 @@ test('embedQuery retries the same request on local after terminal OpenAI failure
   assert.equal(activeEmbeddingModel(), 'test-local-embedding');
   assert.equal(getEmbeddingHealth().breakerOpen, false, 'OpenAI breaker does not gate local recall');
 });
+
+test('embedQuery retries the same request on local after a single TRANSIENT OpenAI timeout', async () => {
+  // Regression pin (2026-08-26): a terminal failure (above) already got a
+  // same-call rescue for free, because it demotes and clears the breaker
+  // within the same recordFailure() call. A transient timeout — measured
+  // live as the actual failure mode, 24 times in one daemon's lifetime, the
+  // breaker never once open — got nothing: fallbackProviderAfterFailure used
+  // to route through getEmbeddingProvider(), which stays pinned to OpenAI
+  // until 3 CONSECUTIVE failures accumulate, so the very first (or second)
+  // timeout returned null and the already-warm local model sat idle. This
+  // must rescue the call on the FIRST transient timeout, while leaving the
+  // process's standing provider choice and the breaker's threshold — both
+  // deliberately conservative, so one blip cannot flip the default provider
+  // — completely untouched.
+  _setLocalProviderForTest(fakeLocalProvider());
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls += 1;
+    throw new Error('The operation was aborted due to timeout');
+  }) as unknown as typeof fetch;
+
+  const vector = await embedQuery('semantic memory should stay online during one bad network patch');
+
+  // openaiEmbedBatch retries a genuinely transient error once internally
+  // before the failure is even recorded toward the breaker.
+  assert.equal(fetchCalls, 2, 'OpenAI is retried once internally before failing this call');
+  assert.ok(vector, 'a single transient timeout still returns a local vector instead of null');
+  assert.equal(vector.length, 4);
+  // The process's default provider is NOT flipped by one rescued call: only
+  // a second breaker-open (two full incidents) demotes it (see the transient
+  // breaker test above).
+  assert.equal(getEmbeddingHealth().breakerOpen, false, 'a single timeout does not open the breaker');
+  assert.equal(getEmbeddingHealth().consecutiveFailures, 1, 'the rescue does not hide the failure from the breaker count');
+});
