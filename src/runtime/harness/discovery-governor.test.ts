@@ -225,7 +225,14 @@ test('restart denies both a settled call id and a new id until an explicit retry
   assert.equal(settlementReplay.reason, 'same_outcome_replay');
 });
 
-test('known tasks cannot re-enter an exact-schema timeout without a new retry epoch', () => {
+test('known tasks re-enter an exact-schema timeout as a bounded continuation, but never the exact same call id', () => {
+  // UPDATED 2026-08-26 (second gauntlet break, sess-desktop-970d457a...
+  // source 85009): this pin used to assert the OPPOSITE of its own title —
+  // a timed-out claim denied every later call id until host evidence opened
+  // a new epoch. That is the exact mechanism that starved a live turn: a
+  // `transient` outcome's own recovery directive is "retry the same
+  // candidate", and a real caller can only retry with a FRESH physical id.
+  // See discovery-governor.continuation.test.ts for the full incident.
   const key = acceptedTask('known-schema-drift');
   const governor = new DiscoveryGovernor();
   governor.initializeTask({ ...key, knownCapability: true });
@@ -247,25 +254,29 @@ test('known tasks cannot re-enter an exact-schema timeout without a new retry ep
   });
   assert.equal(timedOut.recorded, true);
 
-  // Neither a new id nor an uncached re-entry of the old one gets provider
-  // authority. A host-classified retry epoch must authorize a fresh attempt.
+  // A new physical id is the caller's sanctioned retry of the timed-out
+  // attempt — it admits as a bounded continuation, consuming a real
+  // admission (the turn-wide ceiling still bounds it).
   const second = governor.admit({
     ...key,
     category: 'exact_schema_refresh',
     callId: 'schema-drift-2',
   });
-  assert.equal(second.admitted, false);
-  assert.equal(second.reason, 'new_call_requires_retry_epoch');
-  assert.equal(second.consumedBudget, false);
-  assert.equal(second.claim?.outcome, 'timed_out');
+  assert.equal(second.admitted, true, second.reason);
+  assert.equal(second.reason, 'settled_continuation_admitted');
+  assert.equal(second.consumedBudget, true);
+  assert.equal(second.claim?.callId, 'schema-drift-2');
+  assert.equal(second.claim?.outcome, 'pending');
 
+  // The one-physical-owner rule is unchanged: the exact spent id never
+  // re-enters provider code, even after its claim transferred away.
   const samePhysicalRetry = governor.admit({
     ...key,
     category: 'exact_schema_refresh',
     callId: 'schema-drift-1',
   });
   assert.equal(samePhysicalRetry.admitted, false);
-  assert.equal(samePhysicalRetry.reason, 'same_call_replay');
+  assert.equal(samePhysicalRetry.reason, 'new_call_requires_retry_epoch');
 });
 
 async function childAdmission(

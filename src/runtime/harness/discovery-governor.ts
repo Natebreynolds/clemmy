@@ -123,13 +123,33 @@ export type DiscoveryAdmissionReason =
   /** A different physical call cannot borrow a subject's already-spent claim.
    *  Only host-observed evidence may open a new epoch and authorize a retry. */
   | 'new_call_requires_retry_epoch'
-  /** The subject's claim SETTLED SUCCESSFUL and a new physical call arrived:
-   *  a follow-up/pagination/refinement of the already-admitted intent. It is a
-   *  continuation read, not a new physical discovery — denying it starved the
-   *  exact disclosure plan admission demands (2026-08-26 gauntlet: 147
-   *  denials, 1 epoch reopen, 0 external effects). The turn-wide admission
-   *  ceiling remains the runaway bound. */
+  /** The subject's claim SETTLED in a state that authorizes a fresh physical
+   *  attempt: either it SUCCEEDED (a follow-up/pagination/refinement of the
+   *  already-admitted intent) or it TIMED OUT (attempt-outcome.ts's
+   *  `transient` kind is the one outcome whose own recovery directive is
+   *  `retrySameCandidate: true` — the runtime already told the caller this
+   *  exact retry is sanctioned, and a real caller can only retry with a FRESH
+   *  physical id). Denying the timed-out case here left that one sanctioned
+   *  retry with no door — `transient` deliberately never opens a fresh
+   *  evidence epoch either, since nothing was learned (2026-08-26,
+   *  sess-desktop-970d457a6554134620236989 source 85009: one timed-out
+   *  `host:unscoped_role` claim denied 55 later tool_search calls for the
+   *  rest of the turn). `empty`/`failed` still recover only through the
+   *  host-observed evidence epoch — those outcomes really did cost something
+   *  to learn. It is a continuation read, not a new physical discovery —
+   *  denying the succeeded case starved the exact disclosure plan admission
+   *  demands (2026-08-26 gauntlet: 147 denials, 1 epoch reopen, 0 external
+   *  effects). The turn-wide admission ceiling remains the runaway bound. */
   | 'settled_continuation_admitted'
+  /** The subject's claim never settled at all — no outcome, ever — and has
+   *  sat pending far past any discovery-classified surface's longest
+   *  configured timeout. It is provably not in flight any more; some other
+   *  lane's own deadline concluded the physical attempt (the model already
+   *  received a retry-authorizing refusal for it) without ever calling this
+   *  governor's settle() to say so (same live incident as above — the stuck
+   *  claim never settled at all). Treated exactly like a settled TIMED_OUT
+   *  claim: a fresh physical call may take it over. */
+  | 'stale_pending_claim_reclaimed'
   /** The caller named no role, an unknown one, or an already-resolved one. The
    *  search is admitted against a HOST-OWNED subject and the caller is told. */
   | 'role_coerced'
@@ -204,6 +224,7 @@ export interface DiscoveryAdmittedDecision extends DiscoveryDecisionBase {
     | 'schema_refresh_admitted'
     | 'new_evidence_admitted'
     | 'settled_continuation_admitted'
+    | 'stale_pending_claim_reclaimed'
     | 'role_coerced';
 }
 
@@ -316,6 +337,26 @@ export type DiscoveryEvidenceOutcome =
  * indefinitely".
  */
 export const MAX_DISCOVERY_EPOCHS = 4;
+
+/**
+ * How long a still-PENDING claim may sit before admission stops protecting it
+ * and treats it as concluded.
+ *
+ * A pending claim exists to stop a genuinely concurrent physical call from
+ * racing the one already in flight — but this governor has no visibility into
+ * every lane's own settlement path, and a claim whose settlement never
+ * arrives would otherwise hold its subject's slot forever. Live 2026-08-26,
+ * sess-desktop-970d457a6554134620236989 source 85009: a host-owned deadline
+ * settled the tool ATTEMPT (the model got a retry-authorizing refusal) without
+ * ever calling this governor's settle() for the claim it opened — that one
+ * orphaned `pending` row then denied 55 later tool_search calls for the rest
+ * of the turn. Every discovery-classified surface is a metadata lookup, not a
+ * long-running job; the longest configured timeout any of them can reach is
+ * five minutes (the externalApi bucket, for composio_search_tools /
+ * composio_list_tools). This sits comfortably above that, so a claim this old
+ * is provably no longer in flight, not merely slow.
+ */
+export const STALE_PENDING_CLAIM_MS = 6 * 60_000;
 
 /** A complex accepted request may expose many clauses, but foreground broad
  * discovery remains a small control surface. Each admitted claim is still
@@ -1259,19 +1300,38 @@ export class DiscoveryGovernor {
         // no such cached path, so even the same id is denied here rather than
         // re-entering provider code.
         //
-        // ONE exception, per the constraint-ordering law (never demand
-        // evidence while denying the read that produces it): once the claim
-        // has SETTLED SUCCESSFUL, there is no in-flight settlement to protect,
-        // and a new physical call on the same subject is a follow-up /
-        // pagination / refinement of the already-admitted intent — a bounded
-        // continuation read. The claim transfers to the continuation call
-        // (prior outcomes stay durable in the decision/outcome event ledger),
-        // it consumes a real admission, and MAX_TURN_DISCOVERY_ADMISSIONS
-        // remains the runaway bound. Settled-UNSUCCESSFUL claims keep
-        // recovering only through the host-observed evidence epoch.
-        const settledContinuation = existing.callId !== callId
-          && existing.outcome === 'succeeded';
-        if (!settledContinuation) {
+        // TWO exceptions, per the constraint-ordering law (never demand
+        // evidence while denying the read that produces it):
+        //
+        //  1. The claim SETTLED SUCCESSFUL or TIMED OUT. There is no
+        //     in-flight settlement left to protect, and a new physical call on
+        //     the same subject is either a follow-up/pagination/refinement of
+        //     an already-answered intent, or the exact retry a timeout's own
+        //     recovery directive already sanctions (see `settled_continuation_
+        //     admitted` above). `empty`/`failed` still recover only through
+        //     the host-observed evidence epoch.
+        //  2. The claim never settled AT ALL and has sat pending past
+        //     STALE_PENDING_CLAIM_MS. It is provably not in flight any more —
+        //     treated exactly like a settled TIMED_OUT claim (see
+        //     `stale_pending_claim_reclaimed` above).
+        //
+        // Either way the claim transfers to the new call (prior outcomes stay
+        // durable in the decision/outcome event ledger), it consumes a real
+        // admission, and MAX_TURN_DISCOVERY_ADMISSIONS remains the runaway
+        // bound.
+        const retryAuthorizedBySettlement = existing.outcome === 'succeeded'
+          || existing.outcome === 'timed_out';
+        const pendingStale = existing.outcome === 'pending'
+          && Date.now() - Date.parse(existing.admittedAt) > STALE_PENDING_CLAIM_MS;
+        const reclaimReason: 'settled_continuation_admitted' | 'stale_pending_claim_reclaimed' | null =
+          existing.callId === callId
+            ? null
+            : retryAuthorizedBySettlement
+              ? 'settled_continuation_admitted'
+              : pendingStale
+                ? 'stale_pending_claim_reclaimed'
+                : null;
+        if (!reclaimReason) {
           return buildDecision({
             key,
             category: input.category,
@@ -1295,12 +1355,12 @@ export class DiscoveryGovernor {
                  admitted_at = ?, settled_at = NULL
            WHERE session_id = ? AND source_user_seq = ?
              AND epoch = ? AND category = ? AND subject = ?
-             AND call_id = ? AND outcome = 'succeeded'
+             AND call_id = ? AND outcome = ?
         `).run(
           callId, continuationAdmittedAt,
           key.sessionId, key.sourceUserSeq,
           policy.epoch, input.category, subject,
-          existing.callId,
+          existing.callId, existing.outcome,
         );
         const continuationClaim = rowToClaim(db.prepare(`
           SELECT * FROM discovery_governor_claims
@@ -1331,7 +1391,7 @@ export class DiscoveryGovernor {
           subject,
           callId,
           admitted: true,
-          reason: 'settled_continuation_admitted',
+          reason: reclaimReason,
           replay: false,
           consumedBudget: true,
           policy,
