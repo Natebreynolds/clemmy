@@ -72,7 +72,10 @@ export {
   compileProofProviderArgs,
 } from './proof-provider-args.js';
 import { compileProofProviderArgs } from './proof-provider-args.js';
+import pino from 'pino';
 
+
+const logger = pino({ name: 'clementine-next.proof-provisioned-catalog' });
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -413,13 +416,18 @@ export async function registerProofProvisionedCapabilities(identity: {
         operationVersion: manifest.operationVersion,
         observedAt,
         origin: 'independent',
+        // Recompute the instant on every observation, exactly as the local
+        // transform registration below already does. Capturing the
+        // registration instant made an otherwise-current capability age out
+        // of the 60-second freshness window and get evicted mid-plan — the
+        // composio branch never received the fix its sibling documents.
         observe: () => ({
           operationId: manifest.operationId,
           accountId: manifest.accountId,
           definitionFingerprint: manifest.definitionFingerprint,
           providerVersion: manifest.providerVersion,
           operationVersion: manifest.operationVersion,
-          observedAt,
+          observedAt: Date.now(),
         }),
       });
       const primaryRole = advisoryRoles[0]!;
@@ -581,9 +589,23 @@ export async function registerProofProvisionedCapabilities(identity: {
       refreshTypedExecutionReadiness(registered);
     }
     return { registered };
-  } catch {
-    // Provisioning is supply, never a gate: any failure keeps the catalog
-    // as it was and the turn compiles exactly as before.
+  } catch (error) {
+    // Provisioning is supply, never a gate: any failure keeps the catalog as
+    // it was and the turn compiles exactly as before. But it must never be
+    // SILENT. This catch swallowed the only evidence of why a proven,
+    // disclosed capability failed to register, and admission then refused the
+    // turn with "planning catalog no longer matches the frozen host catalog"
+    // — a message describing the symptom of a cause nobody could see (live
+    // 2026-08-26: 29 identical refusals, five capability_discovered events,
+    // an empty snapshot, and no diagnostic anywhere).
+    logger.error(
+      {
+        err: error instanceof Error ? error.message : String(error),
+        registered: registered.length,
+        requested: options?.allowedIdentifiers?.length ?? 0,
+      },
+      'proof-provisioned capability registration failed — the frozen catalog will be missing these capabilities',
+    );
     return { registered };
   }
 }
