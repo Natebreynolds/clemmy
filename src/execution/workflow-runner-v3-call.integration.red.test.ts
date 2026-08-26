@@ -275,11 +275,14 @@ test('exact call+plan validates, survives persistence/graph compilation, and exe
   assert.deepEqual(result, { records: [{ id: 'validated-persisted' }] });
   assert.equal(installed.bodies(), 1);
 
+  // Dropping the invocationPlan no longer refuses the step outright: it
+  // downgrades from an exact v3 call to a bare call, which is its own valid,
+  // gated dispatch lane (60db67d8 required an invocationPlan on every call;
+  // restored — see executeWorkflowBareCallNode in workflow-runner.ts).
   const missingPlan = structuredClone(installed.workflow);
   delete missingPlan.steps[0].invocationPlan;
   const missingValidation = validator.validateWorkflowDefinition(missingPlan);
-  assert.equal(missingValidation.ok, false);
-  assert.ok(missingValidation.errors.some((error) => /missing its exact invocationPlan/.test(error)));
+  assert.equal(missingValidation.ok, true, missingValidation.errors.join('\n'));
 
   const mismatched = structuredClone(installed.workflow);
   mismatched.steps[0].call!.tool = 'operation.not-the-plan';
@@ -378,13 +381,21 @@ test('admin is zero-body and rootless until its exact approval is consumed with 
 test('legacy name/args call and invalid exact identity refuse with zero body and no synthetic turn', async () => {
   const legacy = fixture('legacy-refused');
   delete legacy.step.invocationPlan;
+  // Dropping the invocationPlan makes this a bare call — no exact compiler
+  // proof exists for it, so it dispatches through the ordinary gated composio
+  // gateway (executeWorkflowBareCallNode) instead of refusing outright
+  // (60db67d8 required an invocationPlan on every call; restored). The
+  // synthetic fixture tool has no real composio connection, so the gateway's
+  // own prepared-definition gate refuses it before any provider dispatch —
+  // proof the restored lane is GATED, not raw. Unlike an exact-kernel
+  // refusal, the gateway lane mints its session/turn identity BEFORE
+  // dispatch (pre-60db67d8 behavior), so a session now exists here.
   await assert.rejects(
     runner.executeStep(legacy.step, legacy.ctx),
-    (error: unknown) => error instanceof runner.WorkflowHarnessBlockedSignal
-      && /plan_missing/.test(error.reason),
+    (error: unknown) => error instanceof runner.WorkflowCapabilityBlockedError,
   );
   assert.equal(legacy.bodies(), 0);
-  assert.equal(eventlog.getSession(exactSessionId(legacy)), null);
+  assert.ok(eventlog.getSession(exactSessionId(legacy)));
 
   const invalid = fixture('identity-refused');
   invalid.ctx.workflowSlug = 'invalid workflow slug';
@@ -400,14 +411,25 @@ test('legacy name/args call and invalid exact identity refuse with zero body and
 });
 
 test('call-vs-plan and rendered-args drift refuse before any body', async () => {
-  const toolDrift = fixture('tool-drift');
-  toolDrift.step.call!.tool = 'operation.foreign';
-  await assert.rejects(
-    runner.executeStep(toolDrift.step, toolDrift.ctx),
-    (error: unknown) => error instanceof runner.WorkflowHarnessBlockedSignal
-      && /operation_drift/.test(error.reason),
-  );
-  assert.equal(toolDrift.bodies(), 0);
+  // Direction pin (2026-08-26): the restored bare-call lane must never become
+  // an escape hatch for a step that HAS a plan. A stale/mismatched plan
+  // refuses through the strict typed v3 kernel exactly as before — it must
+  // never silently fall back to the gated composio gateway.
+  let gatewayReached = false;
+  runner._setBeforeWorkflowCallGatewayForTests(() => { gatewayReached = true; });
+  try {
+    const toolDrift = fixture('tool-drift');
+    toolDrift.step.call!.tool = 'operation.foreign';
+    await assert.rejects(
+      runner.executeStep(toolDrift.step, toolDrift.ctx),
+      (error: unknown) => error instanceof runner.WorkflowHarnessBlockedSignal
+        && /operation_drift/.test(error.reason),
+    );
+    assert.equal(toolDrift.bodies(), 0);
+    assert.equal(gatewayReached, false, 'a step with an invocationPlan must never fall back to bare dispatch');
+  } finally {
+    runner._setBeforeWorkflowCallGatewayForTests(null);
+  }
 
   const argsDrift = fixture('args-source-drift');
   argsDrift.step.call!.args = { scope: 'not-the-typed-source' };

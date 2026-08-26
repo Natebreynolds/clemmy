@@ -310,7 +310,11 @@ import type { WorkflowAwaitingInputState } from './workflow-awaiting-input.js';
 import { reconcileAwaitingInputWorkflowRunProjections } from './workflow-awaiting-input-projection.js';
 import {
   assessWorkflowRunMutationRequeue,
+  executeWorkflowCallMutation,
+  readCommittedWorkflowCallMutationOutput,
   redeemExactScheduledSendStepOutput,
+  replayWorkflowCallMutationSlot,
+  workflowCallExpectedArgsDigest,
   workflowCallMutationSlotHasLedger,
   workflowCallMutationSlotHasCommittedReplayAuthority,
   workflowCallMutationSlotHasCommittedResult,
@@ -2312,9 +2316,17 @@ export function renderCallArgs(args: Record<string, unknown> | undefined, inputs
   return out;
 }
 
-/** Execute a structured call node directly — zero LLM. Production calls must
- * carry an exact provider-neutral invocation plan and enter the shared
- * workflow call kernel. A bare name/args call has no dispatch authority. */
+/** Execute a structured call node directly — zero LLM. A step carrying an
+ * exact provider-neutral invocationPlan enters the shared workflow call
+ * kernel (the strict typed v3 lane below) — unchanged. A bare name/args call
+ * (no invocationPlan) has no typed compiler proof to hold it to, so it
+ * dispatches through the gated composio GATEWAY instead — restored below
+ * (see executeWorkflowBareCallNode) after 60db67d8 deleted this lane and
+ * required an invocationPlan on every call, breaking every workflow that
+ * never had one (including the owner's own salesforce-quarterly-to-sheets).
+ * Same owner resolution, sender constraints, prepared-definition gate,
+ * approvals, and mutation-receipt settlement as chat/Space — a bare call can
+ * never dispatch under an ambiguous or non-compliant account either. */
 let workflowCallNodeOverrideForTests:
   | ((step: WorkflowStepInput, ctx: StepExecutionContext, item?: unknown) => Promise<unknown>)
   | undefined;
@@ -2555,6 +2567,231 @@ function throwExactWorkflowKernelBlock(
   });
 }
 
+/**
+ * The zero-LLM structured-call lane still crosses the settlement spine, and
+ * the spine refuses dispatch without an accepted source + persisted turn
+ * graph + ambient run context. Mint the step-session identity once per call
+ * node (idempotent per step/item): session row → accepted user_input_received
+ * (the rendered call IS the step's input) → turn-graph shadow. Without this,
+ * every workflow bare call threw ToolAttemptSettlementAuthorityError
+ * post-spine (live class: scheduled workflows dying on their first dispatch).
+ */
+async function ensureWorkflowCallIdentity(
+  sessionId: string,
+  step: WorkflowStepInput,
+  toolSlug: string,
+  mutationItemKey?: string,
+): Promise<{ sourceUserSeq: number; turn: number } | null> {
+  try {
+    const { createSession, getSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
+    const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+    if (!getSession(sessionId)) createSession({ id: sessionId, kind: 'workflow' });
+    const marker = `${step.id}::${mutationItemKey ?? ''}`;
+    const existing = listEvents(sessionId, { types: ['user_input_received'] })
+      .find((event) => event.data.workflowCallNode === marker);
+    const source = existing ?? appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: {
+        text: `Workflow step ${step.id}: execute ${toolSlug}`,
+        workflowCallNode: marker,
+      },
+    });
+    recordTurnGraphShadow({
+      identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+      surface: 'workflow',
+    });
+    return { sourceUserSeq: source.seq, turn: source.turn };
+  } catch {
+    // Identity minting is dispatch ENABLEMENT — a bookkeeping failure here
+    // must surface as the settlement spine's own typed refusal downstream,
+    // never as a silent skip of the call.
+    return null;
+  }
+}
+
+/** A structured call with no exact invocationPlan: the pre-60db67d8 lane,
+ *  restored. No typed compiler proof exists for this call, so it dispatches
+ *  through the gated composio GATEWAY — same owner resolution, sender
+ *  constraints, and typed blocks as chat/Space — a workflow bare call can
+ *  never dispatch under an ambiguous or non-compliant account. Args are
+ *  rendered against inputs/upstream/(item). */
+async function executeWorkflowBareCallNode(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+  item?: unknown,
+  mutationItemKey?: string,
+): Promise<unknown> {
+  const call = step.call!;
+  const args = renderCallArgs(call.args, ctx.inputs, ctx.stepOutputs, item, resolveWorkflowStepProjectContext(step, ctx.workflow));
+  const mutationSlot = {
+    workflowSlug: ctx.workflowSlug,
+    runId: ctx.runId,
+    stepId: step.id,
+    ...(mutationItemKey ? { itemKey: mutationItemKey } : {}),
+  };
+  const autonomousStructuredSend = !step.requiresApproval
+    && structuredCallSideEffectClass(step) === 'send';
+  const exactScheduledSendDefinition = exactScheduledSendDefinitionEligibility(ctx.workflow, step);
+  if (autonomousStructuredSend && !exactScheduledSendDefinition.eligible) {
+    throw new Error(
+      `Autonomous structured SEND step "${step.id}" lost exact scheduled-send authority `
+      + `before dispatch (${exactScheduledSendDefinition.reason}); provider call refused.`,
+    );
+  }
+  const exactScheduledSend = autonomousStructuredSend && exactScheduledSendDefinition.eligible;
+  if (exactScheduledSend) {
+    const occurrence = exactScheduleOccurrenceAuthority(ctx.workflowSlug, ctx.runId);
+    if (!occurrence.ok) {
+      throw new Error(
+        `Autonomous structured SEND step "${step.id}" has no accepted schedule occurrence `
+        + `(${occurrence.reason}); provider call refused.`,
+      );
+    }
+  }
+  const withExactCommitEvidence = (result: unknown): unknown => {
+    if (!exactScheduledSend) return result;
+    // The durable ledger is authoritative; `result` is intentionally ignored
+    // after successful dispatch/replay and re-read from its checked commit.
+    void result;
+    return readCommittedWorkflowCallMutationOutput(mutationSlot, call.tool, args);
+  };
+  const durableReplay = replayWorkflowCallMutationSlot(mutationSlot);
+  if (durableReplay.replayed) return withExactCommitEvidence(durableReplay.result);
+  let exactSchemaFingerprint: string | undefined;
+  if (exactScheduledSend) {
+    try {
+      exactSchemaFingerprint = await ensureLiveComposioSchemaFingerprint(call.tool);
+    } catch (error) {
+      throw exactSchemaCapabilityError(
+        step,
+        'exact_schema_refresh_unavailable',
+        `Exact provider schema refresh failed${error instanceof Error && error.message ? `: ${error.message}` : '.'}`,
+      );
+    }
+  }
+  if (exactScheduledSend) {
+    const liveAuthority = exactScheduledSendCallEligibility(ctx.workflow, step);
+    if (!exactSchemaFingerprint || !liveAuthority.eligible) {
+      throw exactSchemaCapabilityError(
+        step,
+        'exact_schema_refresh_unavailable',
+        `Autonomous structured SEND could not refresh exact provider schema authority `
+        + `(${liveAuthority.eligible ? 'live_schema_authority_unavailable' : liveAuthority.reason}).`,
+      );
+    }
+  }
+  const {
+    composioDispatchErrorProvesNoCommit,
+    composioFailureProvesNoCommit,
+    detectComposioFailure,
+    dispatchComposioTool,
+  } = await import('../tools/composio-tools.js');
+  // The slug is an independent safety signal: an author-supplied `read` label
+  // must not disable receipts for an obviously create/update/delete call.
+  const mutatesExternally = structuredCallNeedsMutationReceipt(step);
+  const callSessionId = `workflow:${ctx.runId}:${step.id}`;
+  const callIdentity = await ensureWorkflowCallIdentity(callSessionId, step, call.tool, mutationItemKey);
+  const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  const dispatchWithIdentity = <T>(work: () => Promise<T>): Promise<T> => (
+    callIdentity
+      ? Promise.resolve(withHarnessRunContext({
+        sessionId: callSessionId,
+        sourceUserSeq: callIdentity.sourceUserSeq,
+        turn: callIdentity.turn,
+        counter: new ToolCallsCounter(1_000),
+        behaviorScopeId: `${callSessionId}::call-node`,
+      }, work))
+      : work()
+  );
+  if (beforeWorkflowCallGatewayForTests) {
+    await beforeWorkflowCallGatewayForTests({
+      workflowName: ctx.workflowSlug,
+      runId: ctx.runId,
+      stepId: step.id,
+      tool: call.tool,
+    });
+  }
+  const outcome = await dispatchWithIdentity(() => dispatchComposioTool(call.tool, args, {
+    sessionId: callSessionId,
+    ...(mutatesExternally
+      ? {
+        dispatchBoundary: (resolved, dispatch) => {
+          // The gateway already refused every auth-required-but-unconnected
+          // route (`not-connected`/`identity-absent`/`ambiguous-account`/…) as a
+          // typed block BEFORE this boundary is reached — dispatchComposioTool
+          // only invokes the boundary on an `ok` resolution. An `ok` resolution
+          // with no connectionId is a legitimate no-auth toolkit deferring to
+          // composio's default entity; it must still record intent/started/
+          // receipt (the ledger fingerprints a null account as the provider
+          // default), not be permanently refused with no account to connect.
+          if (exactScheduledSend && (
+            resolved.toolSlug !== call.tool
+            || !resolved.schemaFingerprint
+            || resolved.schemaFingerprint !== exactSchemaFingerprint
+          )) {
+            throw exactSchemaCapabilityError(
+              step,
+              'exact_schema_boundary_mismatch',
+              `Exact scheduled SEND resolved a different tool/schema at the provider boundary.`,
+            );
+          }
+          return executeWorkflowCallMutation({
+            workflowSlug: ctx.workflowSlug,
+            runId: ctx.runId,
+            stepId: step.id,
+            ...(mutationItemKey ? { itemKey: mutationItemKey } : {}),
+            tool: resolved.toolSlug,
+            ...(exactScheduledSend ? {
+              schemaFingerprint: resolved.schemaFingerprint!,
+              expectedArgsDigest: workflowCallExpectedArgsDigest(args),
+            } : {}),
+            account: {
+              ...(resolved.connectionId ? { connectionId: resolved.connectionId } : {}),
+              ...(resolved.identity ? { identity: resolved.identity } : {}),
+            },
+            args: resolved.args,
+          }, dispatch, {
+            classifyFailure: (result) => {
+              const failure = detectComposioFailure(result);
+              return failure.failed
+                ? {
+                  summary: failure.summary || 'provider reported failure',
+                  provenNoCommit: composioFailureProvesNoCommit(result),
+                }
+                : null;
+            },
+            classifyThrownFailure: (error) => (
+              composioDispatchErrorProvesNoCommit(error)
+                ? (error instanceof Error ? error.message : String(error))
+                : null
+            ),
+          });
+        },
+      }
+      : {}),
+  }));
+  if (!outcome.ok) {
+    // Typed gateway block → fail the step VISIBLY with the deterministic
+    // corrective (which account / reconnect / fix args) instead of dispatching.
+    // Connection/identity routing blocks are also PROVEN pre-dispatch, so keep
+    // the run alive and resumable instead of throwing away completed work.
+    if (workflowCapabilityBlockIsRecoverable(outcome.reason)) {
+      throw new WorkflowCapabilityBlockedError({
+        stepId: step.id,
+        tool: call.tool,
+        toolkit: outcome.toolkit,
+        reason: outcome.reason,
+        message: outcome.message,
+      });
+    }
+    throw new Error(`composio dispatch blocked (${outcome.reason}): ${outcome.message}`);
+  }
+  return withExactCommitEvidence(outcome.result);
+}
+
 async function executeWorkflowCallNode(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
@@ -2567,11 +2804,7 @@ async function executeWorkflowCallNode(
   const call = step.call!;
   const callSessionId = `workflow:${ctx.runId}:${step.id}`;
   if (!step.invocationPlan) {
-    throw new WorkflowHarnessBlockedSignal({
-      stepId: step.id,
-      sessionId: callSessionId,
-      reason: 'workflow_exact_call_plan_missing: name/args dispatch has no production authority.',
-    });
+    return executeWorkflowBareCallNode(step, ctx, item, mutationItemKey);
   }
   if (item !== undefined || mutationItemKey !== undefined || step.forEach) {
     throw new WorkflowHarnessBlockedSignal({

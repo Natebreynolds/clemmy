@@ -91,6 +91,7 @@ const {
   _setWorkflowHarnessLoopImplsForTests,
   _setWorkflowVoiceRewriteForTests,
   _setWorkflowCallNodeForTests,
+  _setBeforeWorkflowCallGatewayForTests,
   publishWorkflowRunTerminalForTest,
   emitParkedApprovalCardToOriginChat,
   resolveWorkflowDefinitionForRun,
@@ -110,6 +111,7 @@ const {
 // machines). Silent-on-track stub = the byte-identical no-steer path.
 const { _setWorkflowWatcherForTests } = await import('./workflow-runner.js');
 _setWorkflowWatcherForTests(async () => ({ onTrack: true, miss: '', steer: '' }));
+const { validateWorkflowDefinition } = await import('./workflow-validator.js');
 
 // ─── Re-hunt Lane 4 regression (2026-07-09) ───────────────────────
 // The RUNTIME call-node classifier must agree with the validator (both route
@@ -4676,6 +4678,116 @@ test('a structured Composio call preserves its legacy envelope while validating 
   } finally {
     _setWorkflowCallNodeForTests();
   }
+});
+
+// Regression pin (2026-08-26): 60db67d8 made an exact invocationPlan
+// mandatory for any step carrying a structured `call`, deleting the
+// dispatchable bare name/args lane that had worked for months — including
+// the owner's own salesforce-quarterly-to-sheets, which has a bare
+// GOOGLESHEETS_BATCH_UPDATE call step with no invocationPlan. Restored: a
+// bare call (no invocationPlan) validates again and dispatches through the
+// gated composio gateway (executeWorkflowBareCallNode), not a new lane.
+test('THE OWNER\'S SHAPE: a bare call step (no invocationPlan) validates and reaches dispatch', async () => {
+  const workflow = {
+    name: 'salesforce-quarterly-to-sheets-shape',
+    description: 'Write the transformed grid to the target sheet.',
+    enabled: true,
+    trigger: { manual: true },
+    inputs: { spreadsheet_id: { type: 'string' } },
+    steps: [
+      { id: 'grid', prompt: '', deterministic: { runner: 'scripts/to-sheets-grid.mjs' }, sideEffect: 'read' },
+      {
+        id: 'write',
+        prompt: '',
+        dependsOn: ['grid'],
+        sideEffect: 'write',
+        call: {
+          tool: 'GOOGLESHEETS_BATCH_UPDATE',
+          args: {
+            spreadsheet_id: '{{input.spreadsheet_id}}',
+            data: '{{steps.grid.output.data}}',
+            value_input_option: 'RAW',
+          },
+        },
+      },
+    ],
+  };
+  const validation = validateWorkflowDefinition(workflow as never);
+  assert.equal(validation.ok, true, validation.errors.join('\n'));
+
+  const step = workflow.steps[1];
+  const workflowSlug = 'salesforce-quarterly-to-sheets-shape';
+  const runId = 'bare-call-owner-shape-run';
+  const ctx = {
+    workflow,
+    workflowSlug,
+    runId,
+    inputs: { spreadsheet_id: 'sheet-xyz' },
+    stepOutputs: { grid: { data: [['a', 'b']] } },
+    assistant: { respond: async () => ({ text: 'unused' }) },
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof executeStep>[1];
+
+  let gatewayReached: { tool: string } | undefined;
+  _setBeforeWorkflowCallGatewayForTests(({ tool }) => {
+    gatewayReached = { tool };
+  });
+  try {
+    // No live composio connection exists in this sandboxed test home, so the
+    // gateway itself refuses the dispatch — the point here is that dispatch
+    // is REACHED at all (pre-fix this threw workflow_exact_call_plan_missing
+    // before ever calling the gateway hook below).
+    await assert.rejects(() => executeStep(step as never, ctx));
+  } finally {
+    _setBeforeWorkflowCallGatewayForTests(null);
+  }
+  assert.deepEqual(gatewayReached, { tool: 'GOOGLESHEETS_BATCH_UPDATE' });
+});
+
+// Direction pin: the restored bare-call lane must stay GATED — an autonomous
+// SEND-class bare call still hits the SEND-CALL GATE (no approval, no exact
+// scheduled-send authority) and refuses BEFORE the composio gateway, not a
+// raw pass-through. Proves the restored lane isn't a safety regression.
+test('a bare SEND-class call without approval or exact schedule authority refuses before the gateway (gated, not raw)', async () => {
+  const step = {
+    id: 'notify',
+    prompt: '',
+    sideEffect: 'send',
+    call: { tool: 'GMAIL_SEND_EMAIL', args: { to: 'someone@example.com', subject: 'hi', body: 'hi' } },
+  };
+  const ctx = {
+    workflow: {
+      name: 'Bare Send Refused',
+      description: '',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [step],
+    },
+    workflowSlug: 'bare-send-refused',
+    runId: 'bare-send-refused-run',
+    inputs: {},
+    stepOutputs: {},
+    assistant: { respond: async () => ({ text: 'unused' }) },
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof executeStep>[1];
+
+  let gatewayReached = false;
+  _setBeforeWorkflowCallGatewayForTests(() => {
+    gatewayReached = true;
+  });
+  try {
+    await assert.rejects(
+      () => executeStep(step as never, ctx),
+      /lost exact scheduled-send authority/,
+    );
+  } finally {
+    _setBeforeWorkflowCallGatewayForTests(null);
+  }
+  assert.equal(gatewayReached, false, 'an ungated autonomous SEND must refuse before it ever reaches the dispatch gateway');
 });
 
 test('workflow conversion: a plain step routes through the GATED harness loop when CLEMMY_HARNESS_WORKFLOW=on (not the legacy core)', async () => {

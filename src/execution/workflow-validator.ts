@@ -1229,11 +1229,12 @@ export function validateWorkflowDefinition(
       if (!stepHasCall) {
         errors.push(`Step "${step.id ?? '?'}" declares call but no tool. Set call.tool to the tool slug, or remove call.`);
       }
-      if (!stepHasInvocationPlan) {
-        errors.push(
-          `Step "${step.id ?? '?'}" structured call is missing its exact invocationPlan; name/args-only calls have no production dispatch authority.`,
-        );
-      }
+      // A bare call (no invocationPlan) has no typed compiler proof, but it is
+      // still a fully supported dispatch lane: it runs through the gated
+      // composio gateway at runtime (see executeWorkflowBareCallNode in
+      // workflow-runner.ts) — the same owner resolution, approvals, and
+      // mutation-receipt settlement as chat/Space. Requiring an invocationPlan
+      // here broke every pre-existing call-only workflow (60db67d8); restored.
       if (step.deterministic) {
         errors.push(`Step "${step.id ?? '?'}" declares both call and deterministic — pick one non-LLM executor.`);
       }
