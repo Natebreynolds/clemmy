@@ -29,6 +29,8 @@ import {
   sendChatMessageAsync,
 } from '../lib/api';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
+import { getModelSettings } from '../lib/api';
+import { BrainSheet } from '../components/BrainSheet';
 
 interface Props {
   sessionId?: string;
@@ -45,6 +47,19 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const [planActing, setPlanActing] = useState<string | null>(null);
   const [planOutcome, setPlanOutcome] = useState<Record<string, 'approved' | 'rejected' | undefined>>({});
   const [error, setError] = useState<string | null>(null);
+  // §6a: a compact brain chip in the chat header — the same live catalog
+  // sheet as Settings > Brain, mounted where the switch is most often wanted.
+  const [brainLabel, setBrainLabel] = useState('');
+  const [brainOpen, setBrainOpen] = useState(false);
+  const loadBrain = () => {
+    void getModelSettings()
+      .then((data) => {
+        const current = data.options.find((option) => option.value === data.effectiveValue);
+        setBrainLabel(current?.label ?? data.brain.modelId);
+      })
+      .catch(() => setBrainLabel(''));
+  };
+  useEffect(loadBrain, []);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -147,6 +162,20 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       <div class="chat-header">
         <button class="chat-back" onClick={onBack} aria-label="Back">←</button>
         <div class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</div>
+        {brainLabel ? (
+          <button
+            type="button"
+            class="brain-chip"
+            title="Brain — who answers your next message"
+            onClick={() => { haptic('light'); setBrainOpen(true); }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3a4 4 0 0 0-4 4 4 4 0 0 0-3 6.5 4 4 0 0 0 3 6.5h.5" /><path d="M12 3a4 4 0 0 1 4 4 4 4 0 0 1 3 6.5 4 4 0 0 1-3 6.5h-.5" /><path d="M12 3v17" />
+            </svg>
+            <span class="truncate">{brainLabel}</span>
+          </button>
+        ) : null}
+        <BrainSheet open={brainOpen} onClose={() => setBrainOpen(false)} onChanged={loadBrain} />
         {connection === 'recovering' || connection === 'connecting' ? (
           <div class="conn-pill conn-recovering">reconnecting…</div>
         ) : connection === 'detached' ? (

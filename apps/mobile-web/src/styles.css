@@ -2145,3 +2145,281 @@ input, textarea { font: inherit; }
   color: inherit;
   font: inherit;
 }
+
+/* ── settings ─────────────────────────────────────────────────── */
+/* The pocket end of trust minted on the Mac: a status strip you can read in
+   one glance, then quiet cards. Every target keeps the 44px floor. */
+
+/* Settings rides the BOTTOM of the drawer menu (owner IA) — pushed down by
+   the nav, separated by a hairline, never mixed into the section list. */
+.drawer-foot {
+  margin-top: auto;
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--line);
+}
+
+.settings { padding-top: var(--sp-2); }
+
+.settings-status { padding: var(--sp-3) var(--sp-4); }
+.settings-status-row { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
+.settings-status-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-xs);
+  color: var(--fg-3);
+}
+.settings-status-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-3);
+  margin-top: var(--sp-2);
+  font-size: var(--t-sm);
+  color: var(--fg-2);
+}
+
+.settings-card { display: flex; flex-direction: column; }
+.settings-card-title {
+  margin: 0 0 var(--sp-2);
+  font-family: var(--font-display);
+  font-size: var(--t-section);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: 52px;
+  padding: var(--sp-2) 0;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  transition: transform 0.14s var(--ease-out);
+}
+.settings-row:active { transform: scale(0.99); }
+.settings-row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.settings-row-label { font-size: var(--t-body); font-weight: 650; }
+.settings-row-note { font-size: var(--t-xs); color: var(--fg-3); }
+.settings-row-action {
+  flex: 0 0 auto;
+  font-size: var(--t-sm);
+  font-weight: 700;
+  color: var(--accent);
+}
+.settings-row-kind {
+  flex: 0 0 auto;
+  font-size: var(--t-xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--fg-3);
+}
+
+/* iOS-grade switch, honest to the enforced machinery underneath it. */
+.settings-switch {
+  flex: 0 0 auto;
+  width: 50px;
+  height: 30px;
+  border-radius: 999px;
+  background: var(--bg-4);
+  padding: 3px;
+  transition: background 0.25s var(--ease-out);
+}
+.settings-switch i {
+  display: block;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--bg-1);
+  box-shadow: 0 1px 3px rgba(43, 31, 20, 0.25);
+  transition: transform 0.25s var(--ease-out);
+}
+.settings-switch.on { background: var(--accent-2); }
+.settings-switch.on i { transform: translateX(20px); }
+.settings-toggle-row:disabled { opacity: 0.6; }
+
+.settings-list { list-style: none; margin: 0; padding: 0; }
+.settings-list-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 52px;
+  padding: var(--sp-2) 0;
+}
+.settings-list-row + .settings-list-row { border-top: 1px solid var(--line); }
+.settings-this-device { color: var(--accent-2); font-weight: 700; font-size: var(--t-xs); }
+
+.health-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+.health-dot.ok { background: var(--accent-2); }
+.health-dot.warn { background: var(--accent-warn); }
+.health-dot.err { background: var(--accent-fail); }
+
+.settings-danger-btn {
+  flex: 0 0 auto;
+  min-height: 44px;
+  padding: 0 var(--sp-4);
+  border: 1px solid rgba(208, 69, 58, 0.35);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent-fail);
+  font-size: var(--t-sm);
+  font-weight: 700;
+  transition: transform 0.14s var(--ease-out), background 0.2s ease;
+}
+.settings-danger-btn.confirming { background: var(--fail-soft); }
+.settings-danger-btn:active { transform: scale(0.96); }
+.settings-danger-btn:disabled { opacity: 0.5; }
+.settings-signout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+}
+.settings-signout-btn {
+  min-height: 44px;
+  padding: 0 var(--sp-4);
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg);
+  font-size: var(--t-sm);
+  font-weight: 700;
+  transition: transform 0.14s var(--ease-out);
+}
+.settings-signout-btn:active { transform: scale(0.96); }
+
+/* ── brain switcher sheet + chat header chip ──────────────────── */
+.brain-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 44px;
+  max-width: 34vw;
+  padding: 5px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--bg-1);
+  color: var(--fg-2);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  overflow: hidden;
+  white-space: nowrap;
+  transition: transform 0.14s var(--ease-out);
+}
+.brain-chip:active { transform: scale(0.96); }
+.brain-chip svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--accent); }
+
+.brain-layer { position: fixed; inset: 0; z-index: 95; display: flex; align-items: flex-end; justify-content: center; }
+.brain-scrim {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: rgba(43, 31, 20, 0.38);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+}
+.brain-sheet {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(100%, 640px);
+  max-height: min(82dvh, 760px);
+  padding: 8px max(16px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-bottom: 0;
+  border-radius: 28px 28px 0 0;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 -22px 80px rgba(74, 46, 16, 0.16);
+  animation: running-sheet-in 0.24s var(--ease-out);
+}
+@media (prefers-reduced-motion: reduce) {
+  .brain-sheet { animation: none; }
+}
+.brain-sheet-head {
+  display: grid;
+  grid-template-columns: 44px 1fr 44px;
+  align-items: center;
+  min-height: 50px;
+}
+.brain-sheet-head h2 {
+  margin: 0;
+  text-align: center;
+  font-family: var(--font-display);
+  font-size: var(--t-title);
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.brain-sheet-close {
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: 50%;
+  background: var(--bg-2);
+  color: var(--fg-2);
+  font-size: 22px;
+  line-height: 1;
+}
+.brain-current {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-2);
+}
+.brain-current-name { font-size: var(--t-body); font-weight: 700; }
+.brain-current-meta { font-size: var(--t-xs); color: var(--fg-3); }
+.brain-honesty { margin: var(--sp-2) 0 0; font-size: var(--t-sm); }
+.brain-roster {
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--sp-3);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+.brain-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 52px;
+  padding: var(--sp-2) var(--sp-2);
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  transition: transform 0.14s var(--ease-out), background 0.2s ease;
+}
+.brain-row + .brain-row { border-top: 1px solid var(--line); border-radius: 0; }
+.brain-row:active { transform: scale(0.99); }
+.brain-row:disabled { color: var(--fg-3); }
+.brain-row.current { color: var(--accent-deep); background: var(--accent-soft); border-radius: var(--r-sm); }
+.brain-row-label { flex: 1 1 auto; min-width: 0; font-size: var(--t-body); font-weight: 650; }
+.brain-row-note { flex: 0 0 auto; font-size: var(--t-xs); color: var(--fg-3); }
+.brain-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+.brain-dot.ok { background: var(--accent-2); }
+.brain-dot.off { background: var(--bg-4); }
+.brain-note { margin: var(--sp-3) 0 0; font-size: var(--t-sm); }
+.brain-note.switched { color: var(--accent-2); font-weight: 650; }

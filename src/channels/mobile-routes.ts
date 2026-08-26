@@ -3731,6 +3731,281 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     res.json({ ok: true, removed });
   });
 
+  // ─── Settings: brain switcher, connections health, devices ──────
+  //
+  // Owner mandate 2026-08-25: the model switcher lives on the phone as a
+  // ROUTING choice over the SAME live catalog and env-key stores the console
+  // settings use (model-role-options + config) — never key entry, never a
+  // hardcoded model list. Trust is minted at home on the Mac; these doors
+  // read state and flip routing among already-connected brains only.
+
+  router.get('/api/settings/status', requireMobileSession, async (_req, res) => {
+    try {
+      const { getBuildInfo } = await import('../runtime/build-info.js');
+      const build = getBuildInfo();
+      res.json({ daemon: { version: build.version, packaged: build.packaged } });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get('/api/settings/models', requireMobileSession, async (_req, res) => {
+    try {
+      const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
+      const { brainOptions, effectiveBrainValue } = await import('../runtime/harness/model-role-options.js');
+      const { getActiveAuthMode } = await import('../config.js');
+      res.json({
+        // WHO actually answers the next message — including the honest
+        // inactiveBinding when a saved choice is unavailable.
+        brain: resolveRoleModel('brain'),
+        options: brainOptions(),
+        effectiveValue: effectiveBrainValue(),
+        activeBrain: getActiveAuthMode(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post('/api/settings/models/brain', requireMobileSession, async (req, res) => {
+    try {
+      const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
+      const { brainOptions, effectiveBrainValue } = await import('../runtime/harness/model-role-options.js');
+      const { resolveProvider } = await import('../runtime/harness/model-wire-registry.js');
+      const {
+        DEFAULT_CODEX_MODEL,
+        getActiveAuthMode,
+        getByoBackendConfig,
+        getModelRoutingMode,
+        getRuntimeEnv,
+      } = await import('../config.js');
+      const { updateEnvKey, removeEnvKey } = await import('../tools/shared.js');
+
+      // The ONLY accepted input is an exact selector value from the live
+      // catalog (`codex_oauth:<id>` | `claude_oauth:<id>` | `api_key:<id>`),
+      // so an invented or stale model id is refused before any state moves.
+      const value = typeof req.body?.value === 'string' ? req.body.value.trim() : '';
+      const option = brainOptions().find((o) => o.value === value);
+      if (!option) {
+        res.status(400).json({
+          error: 'UNKNOWN_MODEL',
+          message: 'That model is not in the connected catalog. Pick one of the listed brains.',
+        });
+        return;
+      }
+      if (!option.available) {
+        res.status(409).json({
+          error: 'MODEL_UNAVAILABLE',
+          message: `${option.label} is not connected. Connect it on your Mac first.`,
+        });
+        return;
+      }
+
+      // Apply exactly what the console's active-brain door applies — the same
+      // env keys, the same all_in step-down, the same slot scrub — so the
+      // phone and the desktop can never disagree about what a switch means.
+      const brain = option.id;
+      const brainModelId = option.modelId ?? '';
+      if (brain === 'api_key') {
+        if (!getByoBackendConfig().configured) {
+          res.status(409).json({
+            error: 'BYO_NOT_CONFIGURED',
+            message: 'No BYO model is configured. Add one on your Mac first.',
+          });
+          return;
+        }
+        updateEnvKey('BYO_BRAIN_MODEL_ID', brainModelId);
+        process.env.BYO_BRAIN_MODEL_ID = brainModelId;
+        // Keep the legacy worker slot aligned with the all-in BYO backend so a
+        // fan-out wave never probes a single-family endpoint with gpt-* ids.
+        const allInWorkerModel = getByoBackendConfig().primaryId;
+        updateEnvKey('OPENAI_MODEL_WORKER', allInWorkerModel);
+        process.env.OPENAI_MODEL_WORKER = allInWorkerModel;
+        updateEnvKey('MODEL_ROUTING_MODE', 'all_in');
+        process.env.MODEL_ROUTING_MODE = 'all_in';
+      } else {
+        // A Codex/Claude brain cannot coexist with all-in; drop the BYO brain
+        // override so a later switch back never reuses a stale model silently.
+        removeEnvKey('BYO_BRAIN_MODEL_ID');
+        delete process.env.BYO_BRAIN_MODEL_ID;
+        if (getModelRoutingMode() === 'all_in') {
+          updateEnvKey('MODEL_ROUTING_MODE', 'off');
+          process.env.MODEL_ROUTING_MODE = 'off';
+        }
+        if (brain === 'codex_oauth') {
+          // Honor the exact picked gpt-5.x model and scrub any foreign model
+          // id that leaked into the OPENAI_MODEL_* slots from a prior BYO
+          // brain — otherwise "Codex" would still route to the BYO endpoint.
+          const wantedPrimary = /^gpt-5/i.test(brainModelId) ? brainModelId : '';
+          for (const key of ['OPENAI_MODEL_PRIMARY', 'OPENAI_MODEL_FAST', 'OPENAI_MODEL_DEEP', 'OPENAI_MODEL_WORKER'] as const) {
+            const cur = (getRuntimeEnv(key, '') || '').trim();
+            const polluted = cur !== '' && resolveProvider(cur) !== 'codex';
+            const next = key === 'OPENAI_MODEL_PRIMARY' && wantedPrimary
+              ? wantedPrimary
+              : (polluted ? DEFAULT_CODEX_MODEL : cur);
+            if (next && next !== cur) { updateEnvKey(key, next); process.env[key] = next; }
+          }
+        }
+      }
+      if (brain === 'claude_oauth') {
+        if (brainModelId && resolveProvider(brainModelId) === 'claude') {
+          updateEnvKey('CLAUDE_MODEL', brainModelId);
+          process.env.CLAUDE_MODEL = brainModelId;
+        }
+        // Preflight BEFORE persisting AUTH_MODE, mirroring the console: a
+        // lapsed Claude login answers with the honest 409, not a broken turn.
+        const { loadFreshClaudeAccessToken, ClaudeAuthError } = await import('../runtime/claude-oauth.js');
+        try {
+          await loadFreshClaudeAccessToken();
+        } catch (err) {
+          res.status(409).json({
+            error: 'CLAUDE_LOGIN_REQUIRED',
+            message: err instanceof Error ? err.message : 'Claude subscription auth is not ready.',
+            kind: err instanceof ClaudeAuthError ? err.kind : 'missing',
+          });
+          return;
+        }
+      }
+
+      updateEnvKey('AUTH_MODE', brain);
+      process.env.AUTH_MODE = brain;
+
+      // Re-resolve next turn — the no-restart contract ("applies to your next
+      // message") depends on dropping every brain-specific cache here.
+      const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
+      const { resetClaudeModelCache } = await import('../runtime/harness/claude-model.js');
+      const { resetByoModelCache } = await import('../runtime/harness/byo-model.js');
+      const { clearAutonomyAgentCache } = await import('../agents/autonomy-v2.js');
+      resetHarnessRuntimeConfig();
+      resetClaudeModelCache();
+      resetByoModelCache();
+      clearAutonomyAgentCache();
+
+      res.json({
+        ok: true,
+        brain: resolveRoleModel('brain'),
+        effectiveValue: effectiveBrainValue(),
+        activeBrain: getActiveAuthMode(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get('/api/settings/connections', requireMobileSession, async (_req, res) => {
+    // Read-only health: name + state + one honest cause line per row. v1 has
+    // NO reauth ceremony on the phone — a broken row points at the Mac.
+    type ConnectionRow = {
+      id: string;
+      name: string;
+      kind: 'composio' | 'cli';
+      state: 'ok' | 'warn' | 'err';
+      cause: string | null;
+    };
+    const connections: ConnectionRow[] = [];
+    try {
+      const {
+        getComposioCredentialStatus,
+        listConnectedToolkits,
+        toComposioDashboardConnection,
+        readComposioConnectionSuppressionState,
+        displayNameFor,
+      } = await import('../integrations/composio/client.js');
+      const cred = getComposioCredentialStatus();
+      if (cred.enabled) {
+        const suppression = readComposioConnectionSuppressionState();
+        const rows = (await listConnectedToolkits())
+          .map((connection) => toComposioDashboardConnection(connection, suppression));
+        const bySlug = new Map<string, typeof rows>();
+        for (const row of rows) {
+          const list = bySlug.get(row.slug) ?? [];
+          list.push(row);
+          bySlug.set(row.slug, list);
+        }
+        for (const [slug, accounts] of bySlug) {
+          const usable = accounts.some((account) => account.usable);
+          const needsReconnect = accounts.some((account) => account.needsReconnect);
+          const broken = accounts.find((account) => account.needsReconnect || !account.usable);
+          connections.push({
+            id: `composio:${slug}`,
+            name: displayNameFor(slug),
+            kind: 'composio',
+            state: usable && !needsReconnect ? 'ok' : needsReconnect ? 'err' : 'warn',
+            cause: usable && !needsReconnect
+              ? null
+              : broken?.suppressionReason
+                ?? (needsReconnect
+                  ? 'Stopped working — fix on your Mac'
+                  : `Status: ${broken?.providerStatus ?? 'unknown'}`),
+          });
+        }
+      }
+    } catch { /* a broken integration must not blank the whole list */ }
+    try {
+      const { getSavedClis } = await import('../runtime/saved-clis.js');
+      const { readPersistedHealth } = await import('../integrations/cli-catalog/auth-health.js');
+      const health = Object.values(readPersistedHealth());
+      for (const command of getSavedClis()) {
+        const row = health.find((entry) => entry.command === command);
+        const state: ConnectionRow['state'] = !row
+          ? 'warn'
+          : !row.installed
+            ? 'err'
+            : row.authStatus === 'ok' ? 'ok' : row.authStatus === 'signed_out' ? 'err' : 'warn';
+        connections.push({
+          id: `cli:${command}`,
+          name: command,
+          kind: 'cli',
+          state,
+          cause: state === 'ok'
+            ? (row?.username ? `Signed in as ${row.username}` : null)
+            : !row
+              ? 'Not checked yet'
+              : !row.installed
+                ? 'Not installed — fix on your Mac'
+                : row.authStatus === 'signed_out'
+                  ? 'Signed out — fix on your Mac'
+                  : row.authStatus === 'error'
+                    ? 'Health check failed — fix on your Mac'
+                    : 'Not checked yet',
+        });
+      }
+    } catch { /* same: CLI health is best-effort */ }
+    res.json({ connections });
+  });
+
+  // ─── Devices & security ─────────────────────────────────────────
+  //
+  // The same session store the console MobilePanel manages, exposed through
+  // the phone's own door. A safe projection only: session records hold token
+  // hashes and device keys that must never leave the daemon.
+
+  router.get('/api/devices', requireMobileSession, (req, res) => {
+    const ctx = req.mobileSession!;
+    const devices = listSessions(stateOpts).map((row) => ({
+      deviceId: row.deviceId,
+      deviceLabel: row.deviceLabel,
+      createdAt: row.createdAt,
+      lastSeenAt: row.lastSeenAt,
+      expiresAt: row.expiresAt,
+      pushSubscribed: row.pushSubscribed === true,
+      binding: row.binding ?? 'cookie',
+      current: row.deviceId === ctx.record.deviceId,
+    }));
+    res.json({ devices });
+  });
+
+  router.post('/api/devices/revoke-all', requireMobileSession, async (_req, res) => {
+    const removed = await revokeAllSessions(stateOpts);
+    res.json({ ok: true, removed });
+  });
+
+  router.post('/api/devices/:deviceId/revoke', requireMobileSession, async (req, res) => {
+    const deviceId = typeof req.params.deviceId === 'string' ? req.params.deviceId : '';
+    const removed = await revokeSessionByDeviceId(deviceId, stateOpts);
+    res.json({ ok: true, removed });
+  });
+
   // ─── PWA static assets ──────────────────────────────────────────
   //
   // Order matters: this runs AFTER the auth + API routes above, so a

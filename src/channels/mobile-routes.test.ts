@@ -2846,3 +2846,109 @@ test('mobile chat cancel requires the exact live attempt and stops it', async ()
     await h.close();
   }
 });
+
+// ─── Mobile Settings: model switcher, connections, devices ─────────────────
+//
+// Owner mandate 2026-08-25: the model switcher lives on mobile as a ROUTING
+// choice over the same live catalog the console uses — never key entry, and
+// never a hardcoded model list that can drift. Every settings door is
+// session-gated exactly like its neighbors.
+
+test('mobile settings routes are session-gated: anon requests get 401 at every door', async () => {
+  const h = await startHarness();
+  try {
+    for (const p of ['/m/api/settings/models', '/m/api/settings/connections', '/m/api/settings/status', '/m/api/devices']) {
+      const anon = await fetch(`${h.url}${p}`);
+      assert.equal(anon.status, 401, `GET ${p} must demand a mobile session`);
+    }
+    for (const p of ['/m/api/settings/models/brain', '/m/api/devices/dev-x/revoke', '/m/api/devices/revoke-all']) {
+      const anon = await fetch(`${h.url}${p}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+      assert.equal(anon.status, 401, `POST ${p} must demand a mobile session`);
+    }
+  } finally { await h.close(); }
+});
+
+test('brain switch serves the live catalog and rejects anything not a known model id', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Settings phone');
+    const catalog = await fetch(`${h.url}/m/api/settings/models`, { headers: { cookie } });
+    assert.equal(catalog.status, 200);
+    const body = (await catalog.json()) as {
+      brain?: { modelId?: string; provider?: string };
+      options?: Array<{ value?: string; label?: string; available?: boolean }>;
+      effectiveValue?: string;
+    };
+    assert.ok(body.brain?.modelId, 'the resolved brain (who actually answers) is reported');
+    assert.ok(Array.isArray(body.options) && body.options.length > 0,
+      'options come from the live brainOptions catalog, same as the console');
+    // Anything that is not an exact catalog value is refused before any state
+    // is touched — an invented id, a cross-provider mismatch, or an empty pick.
+    for (const bad of ['api_key:not-a-model', 'made-up-brain', 'claude_oauth:gpt-oops', '']) {
+      const res = await fetch(`${h.url}/m/api/settings/models/brain`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ value: bad }),
+      });
+      assert.equal(res.status, 400, `"${bad}" is not a known brain option and must be refused`);
+    }
+    // A real catalog row that is not connected in this bare test home is
+    // refused honestly (409 + reason), never half-applied.
+    const unavailable = (body.options ?? []).find((o) => o.available === false);
+    if (unavailable?.value) {
+      const res = await fetch(`${h.url}/m/api/settings/models/brain`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ value: unavailable.value }),
+      });
+      assert.equal(res.status, 409, 'an unavailable brain is refused with the reason');
+    }
+  } finally { await h.close(); }
+});
+
+test('connections health is a session-gated read-only list', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Connections phone');
+    const res = await fetch(`${h.url}/m/api/settings/connections`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { connections?: Array<{ id: string; name: string; state: string }> };
+    assert.ok(Array.isArray(body.connections), 'a plain list the phone can render as rows');
+  } finally { await h.close(); }
+});
+
+test('devices list names this device, revokes a peer, and revoke-all cuts everything', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'First phone');
+    const peerCookie = await loginMobile(h, 'Second phone');
+
+    const list = await fetch(`${h.url}/m/api/devices`, { headers: { cookie } });
+    assert.equal(list.status, 200);
+    const body = (await list.json()) as {
+      devices: Array<{ deviceId: string; deviceLabel?: string; current?: boolean }>;
+    };
+    assert.ok(body.devices.some((d) => d.current === true && d.deviceLabel === 'First phone'),
+      'the caller can see which row is THIS device');
+    const peer = body.devices.find((d) => d.deviceLabel === 'Second phone');
+    assert.ok(peer, 'the peer device is listed');
+    assert.ok(!JSON.stringify(body).includes('tokenHash'), 'no token material may leave the daemon');
+
+    const revoke = await fetch(`${h.url}/m/api/devices/${encodeURIComponent(peer!.deviceId)}/revoke`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(revoke.status, 200);
+    const peerAfter = await fetch(`${h.url}/m/api/devices`, { headers: { cookie: peerCookie } });
+    assert.equal(peerAfter.status, 401, 'the revoked peer is signed out');
+
+    const all = await fetch(`${h.url}/m/api/devices/revoke-all`, { method: 'POST', headers: { cookie } });
+    assert.equal(all.status, 200);
+    const selfAfter = await fetch(`${h.url}/m/api/devices`, { headers: { cookie } });
+    assert.equal(selfAfter.status, 401, 'revoke-all includes this session — an honest sign-out-everywhere');
+  } finally { await h.close(); }
+});

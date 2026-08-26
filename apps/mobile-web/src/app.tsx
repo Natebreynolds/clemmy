@@ -20,9 +20,10 @@ import { Chats } from './screens/Chats';
 import { Memory } from './screens/Memory';
 import { Workflows } from './screens/Workflows';
 import { Workspaces } from './screens/Workspaces';
+import { Settings } from './screens/Settings';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
 
-type Tab = 'home' | 'chats' | 'spaces' | 'workflows' | 'memory' | 'activity';
+type Tab = 'home' | 'chats' | 'spaces' | 'workflows' | 'memory' | 'activity' | 'settings';
 
 export function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
@@ -299,15 +300,6 @@ export function App() {
           <span class={`conn-pill conn-${door}`} title={DOOR_COPY[door].hint}>
             <span class="conn-dot" aria-hidden="true" />{DOOR_COPY[door].label}
           </span>
-          <button
-            class="icon-btn"
-            aria-label="Sign out"
-            onClick={async () => { await logout(); await refreshAuth(); }}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
-            </svg>
-          </button>
         </div>
       </header>
 
@@ -361,6 +353,27 @@ export function App() {
                 </button>
               ))}
             </nav>
+            {/* Settings rides the bottom of the menu (owner IA): the pocket
+                end of trust minted on the Mac — quiet, always reachable. */}
+            <div class="drawer-foot">
+              <button
+                class="drawer-item"
+                aria-current={tab === 'settings' ? 'page' : undefined}
+                onClick={() => {
+                  if (tab !== 'settings') haptic('light');
+                  setTab('settings');
+                  closeDrawer();
+                }}
+              >
+                <span class="drawer-item-icon">
+                  <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+                    <circle cx="12" cy="12" r="3" />
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                  </svg>
+                </span>
+                <span class="drawer-item-label">Settings</span>
+              </button>
+            </div>
           </aside>
         </div>
       ) : null}
@@ -379,6 +392,13 @@ export function App() {
           ) : tab === 'workflows' ? <Workflows />
             : tab === 'spaces' ? <Workspaces />
             : tab === 'memory' ? <Memory />
+            : tab === 'settings' ? (
+              <Settings
+                door={door}
+                doorCopy={DOOR_COPY[door]}
+                onSignOut={async () => { await logout(); await refreshAuth(); }}
+              />
+            )
             : <Activity />}
         </ScreenBoundary>
       </main>
@@ -434,6 +454,7 @@ const TAB_TITLES: Record<Tab, string> = {
   workflows: 'Flows',
   memory: 'Memory',
   activity: 'Activity',
+  settings: 'Settings',
 };
 
 const stroke = { fill: 'none', stroke: 'currentColor', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' } as const;

@@ -68,3 +68,38 @@ test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the cu
   assert.match(css, /\.drawer-item \{[\s\S]*?min-height: 48px/);
   assert.match(css, /\.drawer-item\[aria-current='page'\] \{[\s\S]*?var\(--accent\)/);
 });
+
+/**
+ * Owner mandates 2026-08-25: Settings rides the drawer (gear row at the
+ * BOTTOM of the menu), the header sign-out moves into Settings > Devices &
+ * security, and the Brain switcher is a routing choice over the daemon's
+ * live catalog. Trust is minted at home on the Mac and only EXERCISED in
+ * the pocket — so nothing key-shaped may ever render on the phone.
+ */
+test('Settings is reachable from the drawer bottom and the header sign-out is gone', () => {
+  const app = read('../app.tsx');
+  assert.match(app, /'settings'/, 'the settings tab exists');
+  assert.match(app, /class="drawer-foot"[\s\S]*?Settings/,
+    'Settings is a dedicated row at the bottom of the drawer menu');
+  assert.doesNotMatch(app, /aria-label="Sign out"/,
+    'the header sign-out moved into Settings > Devices & security');
+});
+
+test('Settings holds nothing key-shaped — routing choices only', () => {
+  const settings = read('../screens/Settings.tsx');
+  assert.doesNotMatch(settings, /<input/i,
+    'no input fields at all: connecting accounts and minting trust happen on the Mac');
+  assert.doesNotMatch(settings, /type="password"|autocomplete="current-password"/i);
+});
+
+test('the brain switcher renders from the live catalog, never a hardcoded roster', () => {
+  const sheet = read('../components/BrainSheet.tsx');
+  assert.match(sheet, /getModelSettings/,
+    'the roster comes from the daemon catalog route');
+  const settings = read('../screens/Settings.tsx');
+  for (const literal of ['gpt-5', 'claude-opus', 'claude-sonnet', 'glm-', 'deepseek', 'minimax']) {
+    const re = new RegExp(literal, 'i');
+    assert.doesNotMatch(sheet, re, `model id "${literal}" must not be hardcoded in the sheet`);
+    assert.doesNotMatch(settings, re, `model id "${literal}" must not be hardcoded in Settings`);
+  }
+});

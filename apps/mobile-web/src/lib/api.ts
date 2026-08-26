@@ -1036,3 +1036,87 @@ export async function refreshWorkspace(id: string, sourceId?: string): Promise<W
     body: JSON.stringify(sourceId ? { sourceId } : {}),
   });
 }
+
+// ── Settings: brain switcher, connections health, devices ───────
+
+/** WHO answers the next message, resolved by the daemon's role registry. */
+export interface ResolvedBrain {
+  modelId: string;
+  provider: string;
+  source: string;
+  /** Present when a SAVED choice is unavailable — the honest "X is saved but
+   *  Y actually answers" line comes straight from the daemon. */
+  inactiveBinding?: { modelId: string; provider: string; reason: string };
+}
+
+/** One row of the LIVE brain catalog — the same brainOptions the console
+ *  renders. Nothing model-shaped is ever hardcoded on the phone. */
+export interface BrainOptionRow {
+  id: string;
+  value: string;
+  label: string;
+  available: boolean;
+  modelId?: string;
+  providerId?: string;
+}
+
+export interface ModelSettings {
+  brain: ResolvedBrain;
+  options: BrainOptionRow[];
+  effectiveValue: string;
+  activeBrain: string;
+}
+
+export async function getModelSettings(): Promise<ModelSettings> {
+  return api<ModelSettings>('/m/api/settings/models');
+}
+
+export async function setBrain(value: string): Promise<{ ok: boolean; brain: ResolvedBrain; effectiveValue: string }> {
+  return api('/m/api/settings/models/brain', {
+    method: 'POST',
+    body: JSON.stringify({ value }),
+  });
+}
+
+export interface ConnectionHealthRow {
+  id: string;
+  name: string;
+  kind: 'composio' | 'cli';
+  state: 'ok' | 'warn' | 'err';
+  cause: string | null;
+}
+
+export async function getConnectionsHealth(): Promise<{ connections: ConnectionHealthRow[] }> {
+  return api('/m/api/settings/connections');
+}
+
+export interface DaemonStatus {
+  daemon: { version?: string; packaged?: boolean };
+}
+
+export async function getDaemonStatus(): Promise<DaemonStatus> {
+  return api('/m/api/settings/status');
+}
+
+export interface MobileDeviceRow {
+  deviceId: string;
+  deviceLabel?: string;
+  createdAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
+  pushSubscribed: boolean;
+  binding: 'key' | 'cookie';
+  current: boolean;
+}
+
+export async function listDevices(): Promise<{ devices: MobileDeviceRow[] }> {
+  return api('/m/api/devices');
+}
+
+export async function revokeDevice(deviceId: string): Promise<{ ok: boolean; removed: boolean }> {
+  return api(`/m/api/devices/${encodeURIComponent(deviceId)}/revoke`, { method: 'POST', body: '{}' });
+}
+
+export async function revokeAllDevices(): Promise<{ ok: boolean; removed: number }> {
+  return api('/m/api/devices/revoke-all', { method: 'POST', body: '{}' });
+}
