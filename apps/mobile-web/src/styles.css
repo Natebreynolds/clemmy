@@ -262,8 +262,10 @@ input, textarea { font: inherit; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 38px;
-  height: 38px;
+  /* 44px is the minimum touch target; the box grows, the glyph does not —
+     the svg stays 17px so the control reads the same weight as before. */
+  width: 44px;
+  height: 44px;
   border-radius: 50%;
   border: 1px solid var(--line);
   background: var(--bg-2);
