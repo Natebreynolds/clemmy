@@ -18,8 +18,11 @@ import {
 import {
   boardCardForActivity,
   runningTaskActions,
-  serverElapsedLabel,
 } from '@/lib/running-tasks';
+import {
+  presentWorkingNow,
+  type PresentedWorkingNowEntry,
+} from '@/lib/activity-presentation';
 import { cn } from '@/lib/cn';
 
 const POLL_MS = 4_000;
@@ -42,20 +45,16 @@ export function RunningTasksDrawer({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLElement>(null);
-  const rows = (activity.data?.entries ?? []).slice(0, MAX_RENDERED_TASKS);
-  const total = activity.data?.entries.length ?? 0;
-  // "N current tasks" lumped live work with needs-attention remnants (live
-  // 2026-08-25: 33 acknowledged blocked runs read as "37 current tasks").
-  // The trigger says what is true: how many are RUNNING and how many wait
-  // on the user — two different invitations.
-  const allEntries = activity.data?.entries ?? [];
-  const needsYou = allEntries.filter((entry) => entry.needsAttention
-    || entry.lifecycle === 'blocked' || entry.lifecycle === 'awaiting_input').length;
-  const running = total - needsYou;
-  const pillLabel = [
-    running > 0 ? `${running} running` : null,
-    needsYou > 0 ? `${needsYou} need${needsYou === 1 ? 's' : ''} you` : null,
-  ].filter(Boolean).join(' · ') || `${total} current ${total === 1 ? 'task' : 'tasks'}`;
+  // ONE presenter for counts, label, tone, pulse, and elapsed — the same
+  // function the badge, /tasks, and mobile render from. "37 current tasks"
+  // (live 2026-08-25) was this drawer counting for itself.
+  const view = presentWorkingNow(
+    activity.data?.entries ?? [],
+    activity.data?.observedAt ?? '',
+  );
+  const rows = view.entries.slice(0, MAX_RENDERED_TASKS);
+  const total = view.total;
+  const pillLabel = view.label;
   const cards = useMemo(() => board.data?.cards ?? [], [board.data]);
 
   const close = useCallback(() => {
@@ -151,21 +150,33 @@ export function RunningTasksDrawer({
 
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] overscroll-contain sm:p-4">
               {notice && <p role="status" className="rounded-md bg-danger-tint px-3 py-2 text-small text-danger">{notice}</p>}
-              {rows.map((entry) => {
+              {rows.map((presented) => {
+                const entry = presented.entry;
                 const card = boardCardForActivity(entry, cards);
                 const actions = runningTaskActions(entry, card);
-                const elapsed = serverElapsedLabel(entry.startedAt, activity.data?.observedAt ?? entry.lastEvidenceAt);
                 const stopping = confirmStop === entry.runKey;
                 return (
                   <article key={entry.runKey} className="rounded-lg border border-border bg-canvas p-4">
                     <div className="flex items-start gap-3">
-                      <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-primary" aria-hidden />
+                      {/* The pulse is a certificate: animated only when the
+                          server said liveness === 'live'. */}
+                      <span
+                        className={cn(
+                          'mt-1.5 h-2 w-2 shrink-0 rounded-full',
+                          presented.pulse
+                            ? 'animate-pulse bg-primary'
+                            : presented.presentation === 'needs_you'
+                              ? 'bg-warning'
+                              : 'bg-border-strong',
+                        )}
+                        aria-hidden
+                      />
                       <div className="min-w-0 flex-1">
                         <h3 className="truncate text-body font-semibold text-fg">{entry.headline}</h3>
                         <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-faint">
                           <span>{kindLabel(entry.kind)}</span>
-                          <StatusPill tone={entryTone(entry)}>{lifecycleLabel(entry.lifecycle)}</StatusPill>
-                          {elapsed && <span>{elapsed}</span>}
+                          <StatusPill tone={presentedTone(presented)}>{lifecycleLabel(entry.lifecycle)}</StatusPill>
+                          {presented.elapsed && <span>{presented.elapsed}</span>}
                         </div>
                       </div>
                     </div>
@@ -258,7 +269,9 @@ function lifecycleLabel(lifecycle: string): string {
   return labels[lifecycle] ?? 'Status unavailable';
 }
 
-function entryTone(entry: ForegroundActivityEntry): Tone {
-  if (entry.needsAttention || entry.liveness === 'stale') return 'warning';
-  return entry.lifecycle === 'queued' || entry.lifecycle === 'accepted' ? 'neutral' : 'live';
+/** Tone from the shared presentation only. 'live' is the certificate —
+ *  reachable exclusively through the presenter's `pulse` flag. */
+function presentedTone(presented: PresentedWorkingNowEntry<ForegroundActivityEntry>): Tone {
+  if (presented.presentation === 'needs_you') return 'warning';
+  return presented.pulse ? 'live' : 'neutral';
 }

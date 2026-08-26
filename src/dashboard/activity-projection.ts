@@ -79,6 +79,8 @@ interface RawRunRecordLike {
   capabilityBlock?: unknown;
   mutationBlock?: unknown;
   reportBackAcknowledgedAt?: unknown;
+  /** The parked clarification, when the run is awaiting_input. */
+  awaitingInput?: { question?: unknown } | null;
   /** Live step progress stamped by the runner's shared event seam. */
   currentStepId?: unknown;
   stepsCompleted?: unknown;
@@ -100,6 +102,12 @@ const LIFECYCLES: Record<string, SurfaceLifecycle> = {
   blocked_mutation: 'blocked',
   awaiting_approval: 'awaiting_approval',
   awaiting_input: 'awaiting_input',
+  // Held-for-a-decision statuses: a person must choose before the run can
+  // move, so they are needs-you. Left unmapped they projected as the anonymous
+  // 'accepted' row — a dead task pinned under every task pill with no next
+  // action (live 2026-08-25).
+  awaiting_catchup_decision: 'awaiting_approval',
+  awaiting_project_bind: 'awaiting_approval',
   parked: 'awaiting_approval',
   blocked: 'blocked',
   completed: 'completed',
@@ -219,7 +227,14 @@ export function projectWorkflowRunActivity(
         }
       : lifecycle === 'blocked' && block
         ? { detail: text(block.message)?.slice(0, 300) ?? `Connect ${text(block.toolkit) ?? 'the required account'} to resume.` }
-        : {}),
+        // The question the run is parked on IS the row's meaning: without it a
+        // surface can only say "waiting for input" with no idea what for. The
+        // question was authored to be shown to the user, so it is public here
+        // like a background task's pendingQuestion — the strict foreground DTO
+        // still strips it with every other detail.
+        : lifecycle === 'awaiting_input' && text(raw.awaitingInput?.question)
+          ? { detail: text(raw.awaitingInput?.question)!.slice(0, 300) }
+          : {}),
     startedAt: text(raw.startedAt) ?? text(raw.createdAt) ?? observedAt,
     // Durable-evidence time only: the record's own timestamps, never poll time.
     lastEvidenceAt,

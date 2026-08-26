@@ -10,7 +10,8 @@ import { ErrorBoundary } from './ErrorBoundary';
 import { LocalRecordingBanner } from './LocalRecordingBanner';
 import { ALL_NAV } from '@/lib/nav';
 import { usePoll } from '@/lib/poll';
-import { listWorkingNow } from '@/lib/activity';
+import { listWorkingNowSnapshot } from '@/lib/activity';
+import { presentWorkingNow } from '@/lib/activity-presentation';
 
 function titleForPath(pathname: string): string {
   // Longest matching prefix wins (so /advanced/usage beats /advanced).
@@ -28,19 +29,19 @@ export function AppShell() {
   const title = titleForPath(location.pathname);
 
   const navigate = useNavigate();
-  // ONE working-now source for the whole app. The badge used to count from its
-  // own board-derived feed while the drawer, /tasks, and mobile counted from
-  // the activity/v2 projection — two numbers for one question, and they
-  // disagreed. Same projection everywhere, and the click goes to /tasks: the
-  // one place that shows every running thing with a timer and a Stop.
-  const workingNow = usePoll(['working-now-badge'], listWorkingNow, 12_000);
+  // ONE working-now source for the whole app: the server projection, rendered
+  // through the ONE shared presenter (presentWorkingNow) that the drawer,
+  // /tasks, and mobile also render from — never a private count of the raw
+  // entries. The conversation the user is currently watching is omitted in
+  // the presenter call: its bubble already narrates itself.
+  const workingNow = usePoll(['working-now-badge'], listWorkingNowSnapshot, 12_000);
   const currentChatMatch = /^\/chat\/([^/]+)/.exec(location.pathname);
   const currentChatSession = currentChatMatch ? decodeURIComponent(currentChatMatch[1]) : null;
-  // The badge never counts the conversation the user is currently watching —
-  // its bubble already narrates itself; other live work counts.
-  const liveRunCount = (workingNow.data ?? []).filter(
-    (entry) => !(currentChatSession && entry.sessionId === currentChatSession),
-  ).length;
+  const workingView = presentWorkingNow(
+    workingNow.data?.entries ?? [],
+    workingNow.data?.observedAt ?? '',
+    { omitSessionId: currentChatSession },
+  );
 
   // A 401 from the daemon dispatches a global `clem:needs-login` event
   // (see lib/api.ts). Nothing surfaced it before, so an expired session was a
@@ -77,7 +78,8 @@ export function AppShell() {
           title={title}
           sidebarCollapsed={collapsed}
           onToggleSidebar={() => setCollapsed((v) => !v)}
-          liveRunCount={liveRunCount}
+          runningCount={workingView.running}
+          needsYouCount={workingView.needsYou}
           onOpenTasks={() => navigate('/tasks')}
         />
         <LocalRecordingBanner />

@@ -254,7 +254,10 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
             const live = !TERMINAL_RUN_STATUSES.has(run.status);
             return (
               <article key={run.id} class={`card rise ${live ? 'card-live' : ''}`} style={{ '--i': i }}>
-                {live ? <span class="pulse-dot" aria-hidden="true" /> : null}
+                {/* No liveness certificate on run summaries: an active run
+                    reads active, but nothing breathes without the server's
+                    liveness — a stalled run must not look alive. */}
+                {live ? <span class="running-task-state" style={{ background: 'var(--accent)' }} aria-hidden="true" /> : null}
                 <button class="run-open min-w-0" onClick={() => setSelectedRun(run)}>
                   <div class="card-title-sm truncate">{run.id}</div>
                   <div class="card-when">

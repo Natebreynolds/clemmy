@@ -6,13 +6,13 @@ import {
 import { useScreenData } from '../lib/use-screen-data';
 import { haptic } from '../lib/native-bridge';
 import {
-  elapsedLabel,
   hasExpandableTaskFacts,
   kindLabel,
   lifecycleLabel,
   mobileRunControl,
   workerCountLabel,
 } from '../lib/running-tasks';
+import { presentWorkingNow } from '@clem/chat-engine';
 import { RunControl } from './RunControl';
 
 const POLL_MS = 4_000;
@@ -30,7 +30,12 @@ export function RunningTasksSheet({
   composerRef?: { current: HTMLTextAreaElement | null };
 }) {
   const { data, refresh } = useScreenData(listWorkingNow, { intervalMs: POLL_MS });
-  const entries = (data?.entries ?? []).slice(0, MAX_VISIBLE_TASKS);
+  // ONE presenter for counts, label, pulse, and elapsed — the same function
+  // the desktop badge and drawer render from, so the phone and the desktop
+  // can never disagree about how much is running.
+  const view = presentWorkingNow(data?.entries ?? [], data?.observedAt ?? '');
+  const presented = view.entries.slice(0, MAX_VISIBLE_TASKS);
+  const entries = presented.map((p) => p.entry);
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
@@ -82,17 +87,9 @@ export function RunningTasksSheet({
 
   if (entries.length === 0) return null;
   // "37 current tasks" (live 2026-08-25) counted every needs-attention
-  // remnant as current work. The pill says what is true: how many are
-  // actually RUNNING and how many are waiting on the user — two different
-  // invitations.
-  const all = data?.entries ?? entries;
-  const needsYou = all.filter((entry) => entry.needsAttention
-    || entry.lifecycle === 'blocked' || entry.lifecycle === 'awaiting_input').length;
-  const running = all.length - needsYou;
-  const pillLabel = [
-    running > 0 ? `${running} running` : null,
-    needsYou > 0 ? `${needsYou} need${needsYou === 1 ? 's' : ''} you` : null,
-  ].filter(Boolean).join(' · ') || `${all.length} current ${all.length === 1 ? 'task' : 'tasks'}`;
+  // remnant as current work. The presenter's label says what is true: how
+  // many are actually RUNNING and how many are waiting on the user.
+  const pillLabel = view.label;
 
   return (
     <div class="running-tasks-affordance">
@@ -119,15 +116,22 @@ export function RunningTasksSheet({
             </header>
             <div class="running-tasks-filter">{pillLabel}</div>
             <div class="running-tasks-list">
-              {entries.map((entry) => {
+              {presented.map((p) => {
+                const entry = p.entry;
                 const expandable = hasExpandableTaskFacts(entry);
                 const expanded = expandable && selected === entry.runKey;
                 const control = mobileRunControl(entry);
-                const elapsed = elapsedLabel(entry.startedAt, data?.observedAt ?? entry.lastEvidenceAt);
+                const elapsed = p.elapsed;
                 return (
                   <article key={entry.runKey} class={`running-task-card${expanded ? ' expanded' : ''}`}>
                     <div class="running-task-card-head">
-                      <span class="running-task-state" aria-hidden="true" />
+                      {/* Accent only under the liveness certificate; a row a
+                          person is blocking shows quiet, not "working". */}
+                      <span
+                        class="running-task-state"
+                        style={p.pulse ? undefined : { background: 'var(--line-strong)' }}
+                        aria-hidden="true"
+                      />
                       <div class="running-task-identity">
                         <h3>{entry.headline}</h3>
                         <div class="running-task-meta">
@@ -165,8 +169,8 @@ export function RunningTasksSheet({
                   </article>
                 );
               })}
-              {all.length > entries.length ? (
-                <p class="running-tasks-more">+{all.length - entries.length} more</p>
+              {view.total > presented.length ? (
+                <p class="running-tasks-more">+{view.total - presented.length} more</p>
               ) : null}
             </div>
           </section>

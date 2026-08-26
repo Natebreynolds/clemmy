@@ -30,7 +30,8 @@ import { PushPrompt } from '../components/PushPrompt';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
 import { RunControl } from '../components/RunControl';
-import { mobileRunControl } from '../lib/running-tasks';
+import { lifecycleLabel, mobileRunControl } from '../lib/running-tasks';
+import { presentWorkingNow } from '@clem/chat-engine';
 import { useScreenData } from '../lib/use-screen-data';
 
 const POLL_MS = 5000;
@@ -48,7 +49,9 @@ interface HomeData {
   reminders: ReminderItem[];
   runs: RunSummary[];
   sessions: ChatSession[];
-  working: ActivityEntry[];
+  /** The server snapshot WITH its own clock: elapsed is observedAt−startedAt,
+   *  never the phone's clock against a server timestamp. */
+  working: { observedAt: string; entries: ActivityEntry[] };
 }
 
 export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
@@ -56,7 +59,7 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
   // Every section degrades on its own: one failing endpoint must not blank
   // the whole home screen, and a section that failed THIS round keeps its
   // last good rows. Only when everything fails does the screen say so.
-  const lastGood = useRef<HomeData>({ approvals: [], plans: [], workspaceChoosers: [], reminders: [], runs: [], sessions: [], working: [] });
+  const lastGood = useRef<HomeData>({ approvals: [], plans: [], workspaceChoosers: [], reminders: [], runs: [], sessions: [], working: { observedAt: '', entries: [] } });
   const loadHome = useCallback(async (): Promise<HomeData> => {
     const [a, p, w, r, runsResult, chats, workingNow] = await Promise.all([
       listApprovals().then((v) => ({ v }), (e) => ({ e })),
@@ -76,7 +79,7 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
       reminders: 'v' in r ? r.v.items : lastGood.current.reminders,
       runs: 'v' in runsResult ? runsResult.v.runs : lastGood.current.runs,
       sessions: 'v' in chats ? chats.v.sessions : lastGood.current.sessions,
-      working: 'v' in workingNow ? workingNow.v.entries : lastGood.current.working,
+      working: 'v' in workingNow ? workingNow.v : lastGood.current.working,
     };
     lastGood.current = merged;
     return merged;
@@ -87,11 +90,12 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
   const decisionCount = approvals.length + plans.length + workspaceChoosers.length;
   useEffect(() => { onDecisionCount(decisionCount); }, [decisionCount, onDecisionCount]);
 
-  // The canonical server-owned working-now projection — the SAME one the
-  // running-tasks sheet and the desktop drawer read. Home used to filter the
-  // chat-run summaries instead, mobile's two-truths drift: a workflow
-  // dispatched from chat showed in the sheet but not here, and this screen's
-  // Stop buttons targeted the run-cancel route that 409s for chat-lane rows.
+  // The canonical server-owned working-now projection, rendered through the
+  // ONE shared presenter the sheet and the desktop also use. The pulse is a
+  // certificate: it animates only for entries the server certified
+  // liveness === 'live', and elapsed is server-clock, so this section can
+  // never show a dead task as alive or a stale age as fresh.
+  const workingView = presentWorkingNow(working.entries, working.observedAt);
   const recentChats = sessions.slice(0, 3);
   const greeting = timeGreeting(new Date().getHours(), greetingName(name));
 
@@ -108,7 +112,7 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
     <div class="home">
       <header class="home-greet rise" style={{ '--i': 0 }}>
         <h1>{greeting}</h1>
-        <p class="home-status">{statusLine({ decisionCount, working: working.length, loading })}</p>
+        <p class="home-status">{statusLine({ decisionCount, working: workingView.running, waiting: workingView.needsYou, loading })}</p>
       </header>
 
       <form class="ask rise" style={{ '--i': 1 }} onSubmit={submitAsk}>
@@ -133,7 +137,7 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
         error={error}
         offline={offline}
         onRetry={() => void refresh()}
-        hasData={decisionCount + working.length + reminders.length + recentChats.length > 0}
+        hasData={decisionCount + workingView.total + reminders.length + recentChats.length > 0}
       />
 
       {decisionCount > 0 ? (
@@ -146,19 +150,26 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
         </section>
       ) : null}
 
-      {working.length > 0 ? (
+      {workingView.total > 0 ? (
         <section class="home-section">
           <h2 class="section-head">Working on it</h2>
           <div class="stack">
-            {working.map((entry, i) => {
+            {workingView.entries.map((p, i) => {
+              const entry = p.entry;
               const control = mobileRunControl(entry);
               return (
                 <article key={entry.runKey} class="card card-live rise" style={{ '--i': i }}>
-                  <span class="pulse-dot" aria-hidden="true" />
+                  {/* The pulse is a certificate: it animates only when the
+                      server said liveness === 'live'. Anything else gets a
+                      quiet dot — a stale or waiting row must not look alive. */}
+                  {p.pulse
+                    ? <span class="pulse-dot" aria-hidden="true" />
+                    : <span class="running-task-state" style={{ background: 'var(--line-strong)' }} aria-hidden="true" />}
                   <div class="min-w-0">
                     <div class="card-title-sm">{entry.headline || 'Working…'}</div>
                     <div class="card-when">
-                      {entry.activity?.text || entry.lifecycle.replace(/_/g, ' ')} · {relativeTime(entry.startedAt)}
+                      {entry.activity?.text || lifecycleLabel(entry.lifecycle)}
+                      {p.elapsed ? ` · ${p.elapsed}` : ''}
                     </div>
                   </div>
                   {control ? (
@@ -214,7 +225,7 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
 
       {loading ? <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div> : null}
 
-      {!loading && decisionCount === 0 && working.length === 0 && reminders.length === 0 && recentChats.length === 0 ? (
+      {!loading && decisionCount === 0 && workingView.total === 0 && reminders.length === 0 && recentChats.length === 0 ? (
         <div class="empty">
           <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
           <p class="empty-title">All clear</p>
@@ -225,13 +236,16 @@ export function Home({ name, onAsk, onOpenChat, onDecisionCount }: Props) {
   );
 }
 
-function statusLine({ decisionCount, working, loading }: { decisionCount: number; working: number; loading: boolean }): string {
+function statusLine({ decisionCount, working, waiting, loading }: { decisionCount: number; working: number; waiting: number; loading: boolean }): string {
   if (loading) return 'Catching up…';
-  if (decisionCount > 0) {
-    const noun = decisionCount === 1 ? 'decision' : 'decisions';
+  // Decisions and tasks parked on a reply are the same invitation: you.
+  // Running counts only what is actually running — a dead task in the
+  // greeting is how the pill lost the owner's trust.
+  const needsYou = decisionCount + waiting;
+  if (needsYou > 0) {
     return working > 0
-      ? `${decisionCount} ${noun} for you · ${working} running`
-      : `${decisionCount} ${noun} waiting on you`;
+      ? `${needsYou} waiting on you · ${working} running`
+      : `${needsYou} waiting on you`;
   }
   if (working > 0) return working === 1 ? 'Clem is working on something' : `Clem is running ${working} things`;
   return 'Everything is quiet';

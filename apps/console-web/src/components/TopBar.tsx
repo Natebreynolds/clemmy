@@ -11,13 +11,17 @@ export function TopBar({
   title,
   onToggleSidebar,
   sidebarCollapsed,
-  liveRunCount,
+  runningCount,
+  needsYouCount,
   onOpenTasks,
 }: {
   title: string;
   onToggleSidebar: () => void;
   sidebarCollapsed: boolean;
-  liveRunCount: number;
+  /** Both counts come from the ONE shared presenter (presentWorkingNow) via
+   *  AppShell. TopBar renders them verbatim and derives nothing. */
+  runningCount: number;
+  needsYouCount: number;
   onOpenTasks: () => void;
 }) {
   const openPalette = () => window.dispatchEvent(new Event('clem:command-palette'));
@@ -63,15 +67,26 @@ export function TopBar({
           variant="ghost"
           size="sm"
           onClick={onOpenTasks}
-          aria-label={liveRunCount > 0 ? `Tasks, ${liveRunCount} working` : 'Tasks'}
+          aria-label={[
+            'Tasks',
+            runningCount > 0 ? `${runningCount} running` : null,
+            needsYouCount > 0 ? `${needsYouCount} waiting on you` : null,
+          ].filter(Boolean).join(', ')}
           title="Everything Clem is working on right now"
           className="relative gap-2"
         >
           <Activity className="h-4 w-4" aria-hidden />
           <span className="hidden lg:inline">Tasks</span>
-          {liveRunCount > 0 && (
+          {/* Running and needs-you are two different invitations — never one
+              lump sum (the "37 current tasks" pill was dead tasks). */}
+          {runningCount > 0 && (
             <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-caption font-bold text-primary-fg">
-              {liveRunCount > 99 ? '99+' : liveRunCount}
+              {runningCount > 99 ? '99+' : runningCount}
+            </span>
+          )}
+          {needsYouCount > 0 && (
+            <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-warning px-1.5 text-caption font-bold text-primary-fg">
+              {needsYouCount > 99 ? '99+' : needsYouCount}
             </span>
           )}
         </Button>

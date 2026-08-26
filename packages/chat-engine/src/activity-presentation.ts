@@ -217,3 +217,121 @@ export function activityTerminalOutcomeFromHarnessEvents(
   }
   return 'interrupted';
 }
+
+// ─── The ONE Working-Now presenter ───────────────────────────────────────────
+//
+// The Working-Now surfaces (desktop badge, desktop drawer, mobile pill,
+// mobile Home) each re-derived "running" and "needs you" from the raw projection and
+// disagreed — the owner met a task pill full of dead tasks and a stale mobile
+// task section. Every surface now renders THIS function's output and nothing
+// else.
+//
+// The design law it enforces: a pulsing "Working" state is a CERTIFICATE. It
+// is only renderable when the server said `liveness === 'live'`; the
+// 'working' presentation (and its `pulse` flag) is structurally unreachable
+// for any other entry. Elapsed time is the distance between two SERVER
+// timestamps (startedAt → the snapshot's observedAt) — the client clock never
+// enters.
+
+/** The structural slice of a projection entry the presenter needs. Both the
+ *  operational Activity DTO and the strict foreground DTO satisfy it. */
+export interface WorkingNowEntryLike {
+  runKey: string;
+  lifecycle: string;
+  /** Server-owned: lease truth, never "no event for N seconds". */
+  liveness: string;
+  needsAttention: boolean;
+  startedAt: string;
+  sessionId?: string;
+  /** Present only on the operational DTO; a settled row is never current. */
+  terminal?: unknown;
+}
+
+export type WorkingNowPresentation = 'working' | 'waiting' | 'needs_you';
+
+export interface PresentedWorkingNowEntry<E extends WorkingNowEntryLike> {
+  entry: E;
+  presentation: WorkingNowPresentation;
+  /** The certificate. True exactly when presentation === 'working', which is
+   *  reachable only through `liveness === 'live'`. Pulse visuals render from
+   *  this flag and from nothing else. */
+  pulse: boolean;
+  /** Server-derived age ('' when the timestamps are unusable). */
+  elapsed: string;
+}
+
+export interface WorkingNowView<E extends WorkingNowEntryLike> {
+  /** Entries actually in flight (certified live or honestly unknown). */
+  running: number;
+  /** Entries a person is blocking: attention-flagged, awaiting_*, or stale. */
+  needsYou: number;
+  total: number;
+  /** The pill text every trigger shows, so no surface words it differently. */
+  label: string;
+  entries: PresentedWorkingNowEntry<E>[];
+}
+
+/** Lifecycles where a person is the blocker, mirrored from the projection's
+ *  own attention set — waiting on you outranks any liveness claim. */
+const NEEDS_YOU_LIFECYCLES: ReadonlySet<string> = new Set([
+  'blocked', 'awaiting_approval', 'awaiting_input', 'paused_budget',
+]);
+
+function workingNowPresentationFor(entry: WorkingNowEntryLike): WorkingNowPresentation {
+  if (entry.needsAttention || NEEDS_YOU_LIFECYCLES.has(entry.lifecycle)) return 'needs_you';
+  // A stale non-terminal run lost its lease: that is a fact for a person,
+  // never quiet background running.
+  if (entry.liveness === 'stale') return 'needs_you';
+  // The certificate: 'working' exists only inside this branch.
+  if (entry.liveness === 'live') return 'working';
+  return 'waiting';
+}
+
+/** Compact server-clock age: "<1m", "12m", "3h", "2d". A label, never a
+ *  status — it may not decide tone, membership, or liveness. */
+export function workingNowElapsedLabel(startedAt: string, observedAt: string): string {
+  const started = Date.parse(startedAt);
+  const observed = Date.parse(observedAt);
+  if (!Number.isFinite(started) || !Number.isFinite(observed) || observed < started) return '';
+  const ms = observed - started;
+  if (ms < 60_000) return '<1m';
+  const min = Math.round(ms / 60_000);
+  if (min < 60) return `${min}m`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h`;
+  return `${Math.round(hr / 24)}d`;
+}
+
+/**
+ * Present the server's Working-Now entries for rendering. Pure and total:
+ * `observedAt` is the snapshot's own server timestamp, passed as data.
+ */
+export function presentWorkingNow<E extends WorkingNowEntryLike>(
+  entries: readonly E[],
+  observedAt: string,
+  options: {
+    /** The conversation the user is currently watching — its bubble already
+     *  narrates itself, so it never counts as detached work. */
+    omitSessionId?: string | null;
+  } = {},
+): WorkingNowView<E> {
+  const current = entries.filter((entry) => !entry.terminal
+    && !(options.omitSessionId && entry.sessionId === options.omitSessionId));
+  const presented = current.map((entry): PresentedWorkingNowEntry<E> => {
+    const presentation = workingNowPresentationFor(entry);
+    return {
+      entry,
+      presentation,
+      pulse: presentation === 'working',
+      elapsed: workingNowElapsedLabel(entry.startedAt, observedAt),
+    };
+  });
+  const needsYou = presented.filter((p) => p.presentation === 'needs_you').length;
+  const running = presented.length - needsYou;
+  const label = [
+    running > 0 ? `${running} running` : null,
+    needsYou > 0 ? `${needsYou} need${needsYou === 1 ? 's' : ''} you` : null,
+  ].filter(Boolean).join(' · ')
+    || `${presented.length} current ${presented.length === 1 ? 'task' : 'tasks'}`;
+  return { running, needsYou, total: presented.length, label, entries: presented };
+}

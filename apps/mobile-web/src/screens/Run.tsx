@@ -78,7 +78,9 @@ export function Run({ sessionId, onBack }: Props) {
           <>
             <div class="run-status-row">
               <span class="card-when">
-                {live ? <span class="pulse-dot run-pulse" aria-hidden="true" /> : <span class={`status-dot status-${run.status}`} aria-hidden="true" />}
+                {/* Status is not a liveness certificate: active reads active,
+                    but only the server's liveness may animate a pulse. */}
+                {live ? <span class="running-task-state" style={{ background: 'var(--accent)' }} aria-hidden="true" /> : <span class={`status-dot status-${run.status}`} aria-hidden="true" />}
                 {run.status.replace(/_/g, ' ')}
                 {run.startedAt ? ` · ${elapsed(run.startedAt, run.lastEventAt, live)}` : ''}
               </span>

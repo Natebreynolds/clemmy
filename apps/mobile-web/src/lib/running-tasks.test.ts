@@ -91,15 +91,17 @@ test('the mobile sheet is bounded, modal, keyboard dismissible, safe-area aware,
     'utf8',
   );
   assert.match(component, /const MAX_VISIBLE_TASKS = 12/);
-  assert.match(component, /const total = data\?\.entries\.length/);
-  assert.match(component, /\{total\} current \{total === 1 \? 'task' : 'tasks'\}/);
-  assert.match(component, />Current · \{total\}</);
+  // Superseded 2026-08-26: counts, label, pulse, and elapsed all come from
+  // the ONE shared presenter — a private derivation here is exactly how the
+  // surfaces came to disagree. Pin the presenter contract instead.
+  assert.match(component, /presentWorkingNow\(data\?\.entries \?\? \[\], data\?\.observedAt \?\? ''\)/);
+  assert.match(component, /const pillLabel = view\.label/);
   assert.doesNotMatch(component, /more running|\{total\} running|>Running · \{total\}</,
     'aggregate copy must not flatten queued, waiting, blocked, or paused rows into running');
   assert.match(component, /aria-haspopup="dialog"/);
   assert.match(component, /role="dialog" aria-modal="true"/);
   assert.match(component, /event\.key === 'Escape'/);
-  assert.match(component, /entries\.length === 0 && open[\s\S]*composerRef\.current\?\.focus\(\)/,
+  assert.match(component, /entries\.length === 0 && open[\s\S]*composerRef\?\.current\?\.focus\(\)/,
     'an auto-empty sheet focuses the adjacent composer before its trigger disappears');
   assert.match(component, /const expandable = hasExpandableTaskFacts\(entry\)/);
   assert.match(component, /const expanded = expandable && selected === entry\.runKey/,
@@ -109,8 +111,10 @@ test('the mobile sheet is bounded, modal, keyboard dismissible, safe-area aware,
   assert.doesNotMatch(component, /getWorkflowRunEvents|buildWorkflowRunDetail|WorkflowSteps|MAX_VISIBLE_STEPS/,
     'foreground chat fetched raw workflow events or rendered a secondary detail path');
 
-  const chat = readFileSync(new URL('../screens/Chat.tsx', import.meta.url), 'utf8');
-  assert.match(chat, /<RunningTasksSheet composerRef=\{textareaRef\} \/>/);
+  // The sheet mounts ONCE at the app shell so running work is reachable from
+  // every tab (not just chat) — pin the global mount, not a per-screen one.
+  const appShell = readFileSync(new URL('../app.tsx', import.meta.url), 'utf8');
+  assert.match(appShell, /<RunningTasksSheet \/>/);
 
   const css = readFileSync(new URL('../styles.css', import.meta.url), 'utf8');
   assert.match(css, /\.running-tasks-trigger \{[\s\S]*?min-height: 44px/);

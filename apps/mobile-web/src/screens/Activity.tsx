@@ -1,5 +1,6 @@
 import { useState } from 'preact/hooks';
 import { isActiveRunStatus, listRecentRuns, listWorkingNow, type ActivityEntry, type RunSummary } from '../lib/api';
+import { presentWorkingNow } from '@clem/chat-engine';
 import { mobileRunControl } from '../lib/running-tasks';
 import { relativeTime } from '../components/Approvals';
 import { RunControl } from '../components/RunControl';
@@ -22,13 +23,16 @@ export function Activity() {
       if ('e' in runsResult && 'e' in workingNow) throw (runsResult as { e: unknown }).e;
       return {
         runs: 'v' in runsResult ? runsResult.v.runs : [],
-        working: 'v' in workingNow ? workingNow.v.entries : [],
+        working: 'v' in workingNow ? workingNow.v : { entries: [], observedAt: new Date().toISOString() },
       };
     },
     { intervalMs: 8000, disabled: openRun !== null },
   );
   const runs = data?.runs ?? [];
-  const working = data?.working ?? [];
+  const working = data?.working ?? { entries: [], observedAt: new Date().toISOString() };
+  // Same certificate as Home: pulse and elapsed come from the ONE shared
+  // presenter — a stale or waiting row must not look alive here either.
+  const workingView = presentWorkingNow(working.entries, working.observedAt);
 
   if (openRun) {
     return <Run sessionId={openRun} onBack={() => { setOpenRun(null); void refresh(); }} />;
@@ -57,12 +61,12 @@ export function Activity() {
   return (
     <div class="home">
       {notice}
-      {working.length > 0 ? (
+      {workingView.total > 0 ? (
         <section class="home-section">
           <h2 class="section-head">Happening now</h2>
           <div class="stack">
-            {working.map((entry, i) => (
-              <LiveCard key={entry.runKey} entry={entry} index={i} onChanged={() => void refresh()} onOpen={setOpenRun} />
+            {workingView.entries.map((p, i) => (
+              <LiveCard key={p.entry.runKey} entry={p.entry} pulse={p.pulse} elapsed={p.elapsed} index={i} onChanged={() => void refresh()} onOpen={setOpenRun} />
             ))}
           </div>
         </section>
@@ -80,8 +84,10 @@ export function Activity() {
 }
 
 
-function LiveCard({ entry, index, onChanged, onOpen }: {
+function LiveCard({ entry, pulse, elapsed, index, onChanged, onOpen }: {
   entry: ActivityEntry;
+  pulse: boolean;
+  elapsed: string;
   index: number;
   onChanged: () => void;
   onOpen: (sessionId: string) => void;
@@ -89,11 +95,16 @@ function LiveCard({ entry, index, onChanged, onOpen }: {
   const control = mobileRunControl(entry);
   const body = (
     <>
-      <span class="pulse-dot" aria-hidden="true" />
+      {/* The pulse is a certificate: it animates only when the server said
+          liveness === 'live'; anything else gets a quiet dot. */}
+      {pulse
+        ? <span class="pulse-dot" aria-hidden="true" />
+        : <span class="running-task-state" style={{ background: 'var(--line-strong)' }} aria-hidden="true" />}
       <div class="min-w-0">
         <div class="card-title-sm">{entry.headline || 'Working…'}</div>
         <div class="card-when">
-          {entry.activity?.text || entry.lifecycle.replace(/_/g, ' ')} · {relativeTime(entry.startedAt)}
+          {entry.activity?.text || entry.lifecycle.replace(/_/g, ' ')}
+          {elapsed ? ` · ${elapsed}` : ''}
         </div>
       </div>
     </>

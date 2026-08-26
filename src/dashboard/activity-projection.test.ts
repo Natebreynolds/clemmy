@@ -651,3 +651,43 @@ test('a blocked run with an acknowledged report-back projects a final terminal',
   );
   assert.equal((acknowledged! as { terminal?: { kind?: string } }).terminal?.kind, 'blocked_acknowledged');
 });
+
+// ─── One Working-Now truth (live 2026-08-25): held runs are needs-you ────────
+// 'awaiting_catchup_decision' (and its sibling hold, 'awaiting_project_bind')
+// was absent from the lifecycle map, so a held run projected as the anonymous
+// 'accepted' row: not needs-you, no next action — a dead task pinned under the
+// task pill with nothing a person could do about it.
+test('a held catch-up decision projects as needs-you, never a nameless accepted row', () => {
+  for (const status of ['awaiting_catchup_decision', 'awaiting_project_bind']) {
+    const entry = projectWorkflowRunActivity({
+      id: `held-${status}`, workflow: 'daily-standup-email', status,
+      createdAt: '2026-08-25T08:00:00.000Z',
+    }, '2026-08-25T09:00:00.000Z');
+    assert.ok(entry, `${status} projects`);
+    assert.equal(entry.lifecycle, 'awaiting_approval', `${status} fell out of the lifecycle map`);
+    assert.equal(entry.needsAttention, true, `${status} is waiting on a person`);
+    assert.equal(entry.terminal, undefined, 'a held run is not settled');
+    assert.ok(entry.nextAction, 'a held run names the one move that unblocks it');
+  }
+});
+
+// The run record already holds the exact question (awaitingInput.question);
+// surfaces showed a bare "Waiting for input" pulse with no idea WHAT for.
+test('an awaiting_input run carries its question so a surface can say what she waits on', () => {
+  const entry = projectWorkflowRunActivity({
+    id: 'input-question', workflow: 'quarterly-report', status: 'awaiting_input',
+    createdAt: '2026-08-25T02:00:00.000Z',
+    awaitingInput: {
+      questionId: 'workflow-input:input-question:pick_quarter:q1',
+      question: 'Which quarter should the report cover?',
+      stepId: 'pick_quarter', askedAt: '2026-08-25T02:10:00.000Z',
+    },
+  }, '2026-08-25T08:00:00.000Z');
+  assert.ok(entry);
+  assert.match(String(entry.detail), /Which quarter should the report cover\?/);
+  assert.notEqual(entry.liveness, 'live', 'a parked question is never certified live');
+  assert.equal(entry.needsAttention, true);
+  // The strict foreground DTO stays prose-free: the question never crosses it.
+  const fg = projectForegroundWorkingNowEntry(entry);
+  assert.equal(Object.hasOwn(fg, 'detail'), false, 'foreground DTO grew prose');
+});
