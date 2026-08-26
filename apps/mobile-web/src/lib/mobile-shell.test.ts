@@ -103,3 +103,14 @@ test('the brain switcher renders from the live catalog, never a hardcoded roster
     assert.doesNotMatch(settings, re, `model id "${literal}" must not be hardcoded in Settings`);
   }
 });
+
+test('the keyboard stays in daylight: color-scheme meta + shell trait override', () => {
+  // WebKit decides KEYBOARD appearance from the color-scheme meta (read
+  // before CSS) and the native view's trait override — the CSS property
+  // alone leaves a dark-mode phone summoning a dark keyboard over the light
+  // page (live 2026-08-26).
+  const indexHtml = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
+  assert.match(indexHtml, /<meta name="color-scheme" content="light" \/>/);
+  const shell = readFileSync(new URL('../../../ios/Clem/PinnedWebView.swift', import.meta.url), 'utf8');
+  assert.match(shell, /overrideUserInterfaceStyle = \.light/);
+});

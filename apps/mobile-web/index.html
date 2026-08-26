@@ -7,6 +7,10 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Clementine" />
     <meta name="theme-color" content="#fcf9f4" />
+    <!-- WebKit reads this before any CSS: it is what keeps the KEYBOARD and
+         form controls light when the phone itself is in dark mode. The CSS
+         color-scheme property alone does not reach the keyboard. -->
+    <meta name="color-scheme" content="light" />
     <link rel="manifest" href="/m/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/m/apple-touch-icon.svg" />
     <link rel="icon" type="image/svg+xml" href="/m/icon.svg" />

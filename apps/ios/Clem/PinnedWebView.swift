@@ -32,6 +32,10 @@ final class WebViewModel: NSObject, ObservableObject {
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
         webView = WKWebView(frame: .zero, configuration: config)
+        // The app is daylight-only: without this the web view inherits the
+        // SYSTEM appearance, so a phone in dark mode summons a dark keyboard
+        // and dark form accessories over the light page (live 2026-08-26).
+        webView.overrideUserInterfaceStyle = .light
         super.init()
         webView.navigationDelegate = self
         webView.uiDelegate = self
