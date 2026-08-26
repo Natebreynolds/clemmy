@@ -68,7 +68,6 @@
   --r-lg: 20px;
   --r-xl: 28px;
 
-  --dock-height: 74px;
   /* Smooth deceleration (ease-out-quint). Deliberately NO overshoot: things
      arrive and settle, they do not bounce. It was once called --ease-spring,
      which described motion this curve never had. */
@@ -117,9 +116,8 @@ body {
   overflow: hidden;
   /* The inset lives HERE, not on <body>. On body it pushed the whole app
      down while #app stayed a full 100dvh tall, so the bottom of every
-     screen hung off the display — which is why the chat composer ended up
-     underneath the floating dock. Global border-box keeps the padding
-     inside the 100dvh. */
+     screen hung off the display and the chat composer sat below the fold.
+     Global border-box keeps the padding inside the 100dvh. */
   padding-top: env(safe-area-inset-top);
 }
 
@@ -143,15 +141,57 @@ input, textarea { font: inherit; }
 
 .app-header {
   flex: 0 0 auto;
-  display: flex;
+  /* 1fr | auto | 1fr keeps the screen title truly centered no matter how
+     wide the right-hand cluster gets. */
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-4) var(--sp-2);
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
   position: relative;
   z-index: 10;
 }
-.brand { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.app-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+}
+/* The drawer opener: same quiet circle as .icon-btn, plus a badge seat —
+   the Home decisions count lives here now that the dock icon is gone. */
+.menu-btn {
+  position: relative;
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--bg-2);
+  color: var(--fg-2);
+  transition: transform 0.14s var(--ease-out), background 0.2s ease;
+}
+.menu-btn:active { transform: scale(0.9); background: var(--bg-3); }
+.menu-btn svg { width: 19px; height: 19px; }
+.menu-badge {
+  position: absolute;
+  top: -3px;
+  right: -4px;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 17px;
+  text-align: center;
+}
 .brand-name {
   font-family: var(--font-display);
   font-size: 17px;
@@ -165,7 +205,7 @@ input, textarea { font: inherit; }
   image-rendering: -webkit-optimize-contrast;
   filter: drop-shadow(0 0 10px rgba(239, 95, 12, 0.30));
 }
-.app-header .meta { display: flex; align-items: center; gap: var(--sp-2); }
+.app-header .meta { justify-self: end; display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
 
 /* The security story, always visible and never shouting. */
 .conn-pill {
@@ -283,8 +323,10 @@ input, textarea { font: inherit; }
   min-height: 0;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
+  /* The dock is gone: content owns the full height, clearing only the
+     home indicator. */
   padding: var(--sp-1) var(--sp-4)
-    max(calc(var(--dock-height) + 44px), calc(var(--dock-height) + 32px + env(safe-area-inset-bottom)));
+    max(var(--sp-5), calc(var(--sp-3) + env(safe-area-inset-bottom)));
   width: 100%;
   max-width: 760px;
   margin: 0 auto;
@@ -686,81 +728,121 @@ input, textarea { font: inherit; }
   font-size: var(--t-sm);
 }
 
-/* ── the dock ───────────────────────────────────────────────────── */
+/* ── the left drawer ───────────────────────────────────────────── */
+/* Owner directive 2026-08-25: every section lives in a clean left-hand
+   collapsing menu; nothing navigational floats at the bottom. Sheet-class
+   motion (300ms, no overshoot); reduced motion collapses to opacity. */
 
-.dock {
-  position: fixed;
-  left: 50%;
-  right: auto;
-  width: calc(100% - 20px);
-  max-width: 460px;
-  transform: translateX(-50%);
-  /* Clear of the home indicator even when the shell reports a zero inset. */
-  bottom: max(22px, calc(env(safe-area-inset-bottom) + 12px));
-  z-index: 40;
-  display: flex;
-  gap: 2px;
-  padding: 6px;
-  border-radius: 999px;
-  background: rgba(255, 253, 248, 0.88);
-  -webkit-backdrop-filter: blur(22px) saturate(1.5);
-  backdrop-filter: blur(22px) saturate(1.5);
-  border: 1px solid var(--line-strong);
-  box-shadow: var(--shadow-lift), inset 0 1px 0 rgba(255, 255, 255, 0.8);
-  max-width: calc(100% - 20px);
+.drawer-layer { position: fixed; inset: 0; z-index: 80; }
+.drawer-scrim {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  padding: 0;
+  background: rgba(43, 31, 20, 0.38);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+  animation: drawer-scrim-in 0.25s var(--ease-out);
 }
-.dock button {
+@keyframes drawer-scrim-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.drawer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
   display: flex;
   flex-direction: column;
+  width: min(82vw, 320px);
+  padding: max(var(--sp-4), env(safe-area-inset-top)) var(--sp-3)
+    max(var(--sp-4), env(safe-area-inset-bottom)) max(var(--sp-3), env(safe-area-inset-left));
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  background: rgba(255, 253, 248, 0.97);
+  -webkit-backdrop-filter: blur(22px) saturate(1.5);
+  backdrop-filter: blur(22px) saturate(1.5);
+  border-right: 1px solid var(--line-strong);
+  box-shadow: var(--shadow-lift);
+  animation: drawer-in 0.3s var(--ease-out);
+}
+@keyframes drawer-in {
+  from { opacity: 0.6; transform: translateX(-24%); }
+  to { opacity: 1; transform: none; }
+}
+/* The exit mirrors the entrance — the layer stays mounted through 'closing'
+   (app.tsx unmounts after the animation), so the drawer leaves the way it
+   arrived instead of vanishing. `forwards` holds the final frame so a slow
+   unmount never flashes the drawer back. */
+.drawer-layer.closing .drawer-scrim { animation: drawer-scrim-out 0.25s var(--ease-out) forwards; }
+.drawer-layer.closing .drawer { animation: drawer-out 0.25s var(--ease-out) forwards; }
+@keyframes drawer-scrim-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes drawer-out {
+  from { opacity: 1; transform: none; }
+  to { opacity: 0.4; transform: translateX(-28%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Opacity only — no travel for people who opted out of motion. */
+  .drawer { animation-name: drawer-scrim-in; }
+  .drawer-layer.closing .drawer { animation-name: drawer-scrim-out; }
+}
+.drawer-brand {
+  display: flex;
   align-items: center;
-  gap: 3px;
-  /* Six destinations have to fit a 390px phone without the dock wrapping or
-     clipping, so the buttons flex down and the labels shrink with them. */
-  flex: 1 1 0;
-  min-width: 0;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2) var(--sp-4);
+}
+.drawer-nav { display: flex; flex-direction: column; gap: 2px; }
+.drawer-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
   min-height: 48px;
-  padding: 7px 4px 6px;
+  padding: 10px var(--sp-3);
   border: none;
+  border-radius: var(--r-md);
   background: transparent;
-  border-radius: 999px;
-  color: var(--fg-3);
+  color: var(--fg-2);
+  text-align: left;
   transition: color 0.2s ease, background 0.24s var(--ease-out), transform 0.14s var(--ease-out);
 }
-.dock button:active { transform: scale(0.92); }
-.dock-icon { position: relative; display: block; line-height: 0; }
-.dock button svg { width: 21px; height: 21px; stroke-width: 1.8; }
-.dock-label {
-  font-size: clamp(8.5px, 2.4vw, 10px);
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  max-width: 100%;
+.drawer-item:active { transform: scale(0.97); }
+.drawer-item svg { width: 21px; height: 21px; stroke-width: 1.8; }
+.drawer-item-icon { display: block; line-height: 0; flex: 0 0 auto; }
+.drawer-item-label {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: var(--font-display);
+  font-size: var(--t-body);
+  font-weight: 700;
+  letter-spacing: -0.01em;
 }
-.dock button.active {
+/* The citrus is spent exactly where the user IS. */
+.drawer-item[aria-current='page'] {
   color: var(--accent);
   background: var(--accent-soft);
 }
-.dock button.active svg { stroke-width: 2.1; filter: drop-shadow(0 0 8px rgba(239, 95, 12, 0.35)); }
-
-/* The unread count rides the icon, so it survives even at the smallest
-   dock width where labels get tight. */
-.dock-badge {
-  position: absolute;
-  top: -5px;
-  right: -8px;
-  min-width: 17px;
-  height: 17px;
-  padding: 0 4px;
+.drawer-item[aria-current='page'] svg { stroke-width: 2.1; filter: drop-shadow(0 0 8px rgba(239, 95, 12, 0.35)); }
+.drawer-badge {
+  flex: 0 0 auto;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
   border-radius: 999px;
   background: var(--accent);
   color: var(--on-accent);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 800;
-  line-height: 17px;
+  line-height: 20px;
   text-align: center;
-  box-shadow: 0 0 0 2px rgba(252, 249, 244, 0.9);
 }
 
 /* ── login / pairing ────────────────────────────────────────────── */
@@ -1406,22 +1488,28 @@ input, textarea { font: inherit; }
 .chat-send:disabled { opacity: 0.3; }
 
 /* ── foreground running-task affordance ────────────────────────── */
-/* Chat remains the page. At zero this entire region is absent; at nonzero it
-   is one quiet line above the composer, opening the durable work projection in
-   a bottom sheet. */
-.running-tasks-affordance { flex: 0 0 auto; }
+/* The screen remains the page. At zero this entire region is absent; at
+   nonzero it is one compact header chip, opening the durable work projection
+   in a bottom sheet. It must never float at the bottom (owner directive). */
+.running-tasks-affordance { flex: 0 0 auto; min-width: 0; }
 .running-tasks-trigger {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-height: 44px;
-  margin: 2px 0 0;
-  padding: 5px 8px;
-  border: 0;
-  background: transparent;
-  color: var(--fg-2);
-  font-size: var(--t-sm);
-  font-weight: 650;
+  max-width: 38vw;
+  margin: 0;
+  padding: 5px 11px;
+  border: 1px solid var(--line-hot);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   text-align: left;
 }
 .running-tasks-trigger:active { transform: scale(0.98); }
@@ -1677,7 +1765,8 @@ input, textarea { font: inherit; }
   background: var(--bg-0);
   box-shadow: var(--shadow-card);
   /* Fills whatever is left after the chrome, on any device. */
-  height: clamp(320px, calc(100dvh - var(--dock-height) - 210px), 720px);
+  /* Fills what the header + surrounding chrome leave, on any device. */
+  height: clamp(320px, calc(100dvh - 230px), 720px);
 }
 .constellation-canvas { position: absolute; inset: 0; }
 .constellation, .constellation-canvas, .constellation-canvas canvas { touch-action: none; }
@@ -1872,15 +1961,11 @@ input, textarea { font: inherit; }
 
 /* ── responsive: the layout earns its keep on real devices ──────── */
 
-/* Landscape phones: vertical room is scarce, so trim the chrome and let
-   the dock hug the bottom. */
+/* Landscape phones: vertical room is scarce, so trim the chrome. */
 @media (max-height: 500px) and (orientation: landscape) {
-  :root { --dock-height: 60px; }
-  .app-header { padding: 6px var(--sp-4) 4px; }
+  .app-header { padding: 4px var(--sp-4); }
   .home { gap: var(--sp-3); }
   .home-greet h1 { font-size: 24px; }
-  .dock button { min-height: 42px; padding: 5px 8px; }
-  .dock-label { display: none; }
   .empty { padding: 20px; }
 }
 

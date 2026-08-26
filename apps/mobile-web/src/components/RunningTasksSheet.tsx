@@ -19,8 +19,9 @@ const POLL_MS = 4_000;
 const MAX_VISIBLE_TASKS = 12;
 
 /** Compact foreground affordance backed only by the daemon's shared
- * durable projection. The trigger disappears at zero; it never replaces chat
- * with a dashboard or manufactures a task from assistant text. */
+ * durable projection. The trigger is a header chip (the dock is gone, so
+ * nothing may float at the bottom); it disappears at zero and never replaces
+ * chat with a dashboard or manufactures a task from assistant text. */
 export function RunningTasksSheet({
   composerRef,
 }: {
@@ -85,7 +86,9 @@ export function RunningTasksSheet({
     ))) setSelected(null);
   }, [composerRef, entries, open, selected]);
 
-  if (entries.length === 0) return null;
+  // Presenter contract: the chip exists only while there is current work —
+  // at zero the entire affordance is absent from the header.
+  if (view.total === 0) return null;
   // "37 current tasks" (live 2026-08-25) counted every needs-attention
   // remnant as current work. The presenter's label says what is true: how
   // many are actually RUNNING and how many are waiting on the user.

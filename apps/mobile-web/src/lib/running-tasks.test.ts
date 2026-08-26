@@ -111,10 +111,15 @@ test('the mobile sheet is bounded, modal, keyboard dismissible, safe-area aware,
   assert.doesNotMatch(component, /getWorkflowRunEvents|buildWorkflowRunDetail|WorkflowSteps|MAX_VISIBLE_STEPS/,
     'foreground chat fetched raw workflow events or rendered a secondary detail path');
 
-  // The sheet mounts ONCE at the app shell so running work is reachable from
-  // every tab (not just chat) — pin the global mount, not a per-screen one.
+  // The dock is gone (owner directive 2026-08-25): the trigger is a compact
+  // HEADER chip, mounted once in the shell header so running work stays
+  // reachable from every screen and nothing floats at the bottom any more.
   const appShell = readFileSync(new URL('../app.tsx', import.meta.url), 'utf8');
-  assert.match(appShell, /<RunningTasksSheet \/>/);
+  assert.match(appShell, /class="meta"[\s\S]*?<RunningTasksSheet \/>/,
+    'the running-tasks chip lives in the sticky header, not a bottom float');
+  // Presenter contract: the chip exists ONLY while view.total > 0 — the
+  // pill disappearing at zero is pinned behavior.
+  assert.match(component, /if \(view\.total === 0\) return null/);
 
   const css = readFileSync(new URL('../styles.css', import.meta.url), 'utf8');
   assert.match(css, /\.running-tasks-trigger \{[\s\S]*?min-height: 44px/);

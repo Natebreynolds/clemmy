@@ -1,6 +1,6 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { Component } from 'preact';
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import {
   adoptOriginSession,
   api,
@@ -30,6 +30,18 @@ export function App() {
   const [pairing, setPairing] = useState(false);
   const [pairError, setPairError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('home');
+  // Left drawer (owner directive 2026-08-25): sections live in a slide-in
+  // menu, never a bottom dock — content gets the full height.
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  // 'closing' keeps the drawer mounted through its exit animation — an
+  // instant unmount is the one visible tell next to a native drawer.
+  const [drawerClosing, setDrawerClosing] = useState(false);
+  const drawerClosingRef = useRef(false);
+  const menuBtnRef = useRef<HTMLButtonElement | null>(null);
+  const drawerRef = useRef<HTMLElement | null>(null);
+  // Swipe-to-close needs horizontal INTENT before it acts, so it can never
+  // fight the drawer's own vertical scrolling.
+  const swipe = useRef<{ x: number; y: number; horizontal: boolean | null }>({ x: 0, y: 0, horizontal: null });
   const [name, setName] = useState('');
   const [decisions, setDecisions] = useState(0);
   /** Set when Home hands a question to Chats — consumed once on arrival. */
@@ -41,6 +53,36 @@ export function App() {
     window.addEventListener(CONNECTION_EVENT, onDoor);
     return () => window.removeEventListener(CONNECTION_EVENT, onDoor);
   }, []);
+
+  // Drawer dialog contract: Escape closes, focus lands inside on open and is
+  // trapped while open — same idiom as the RunningTasksSheet dialog.
+  useEffect(() => {
+    if (!drawerOpen) return;
+    drawerRef.current?.querySelector<HTMLElement>('button:not([disabled])')?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeDrawer();
+        window.requestAnimationFrame(() => menuBtnRef.current?.focus());
+        return;
+      }
+      if (event.key !== 'Tab' || !drawerRef.current) return;
+      const focusable = [...drawerRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+      )];
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [drawerOpen]);
 
   const refreshAuth = useCallback(async () => {
     try {
@@ -214,14 +256,46 @@ export function App() {
     setTab('chats');
   };
 
+  const closeDrawer = () => {
+    if (drawerClosingRef.current) return;
+    drawerClosingRef.current = true;
+    setDrawerClosing(true);
+    // Focus returns to the control that opened the dialog, per the dialog
+    // pattern — the hamburger is always mounted.
+    window.requestAnimationFrame(() => menuBtnRef.current?.focus());
+    // Unmount after the exit animation (matches the 0.25s CSS; reduced-motion
+    // finishes early which only shortens the wait, never strands the layer).
+    window.setTimeout(() => {
+      drawerClosingRef.current = false;
+      setDrawerClosing(false);
+      setDrawerOpen(false);
+    }, 250);
+  };
+
   return (
     <>
       <header class="app-header">
-        <div class="brand">
-          <img class="brand-mark" src="/m/clemmy.png" alt="" width="28" height="28" />
-          <span class="brand-name">{TAB_TITLES[tab]}</span>
-        </div>
+        <button
+          ref={menuBtnRef}
+          class="menu-btn"
+          aria-label="Open menu"
+          aria-haspopup="dialog"
+          aria-expanded={drawerOpen}
+          onClick={() => { haptic('light'); setDrawerOpen(true); }}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="4" y1="7" x2="20" y2="7" /><line x1="4" y1="12" x2="20" y2="12" /><line x1="4" y1="17" x2="20" y2="17" />
+          </svg>
+          {/* The Home decisions count rode the dock icon; with the dock gone
+              the hamburger carries it so the signal survives a closed menu. */}
+          {decisions > 0 ? <span class="menu-badge">{decisions > 9 ? '9+' : decisions}</span> : null}
+        </button>
+        <span class="brand-name app-title">{TAB_TITLES[tab]}</span>
         <div class="meta">
+          {/* Compact running-work chip — the sheet's trigger, which must not
+              float at the bottom now that the dock is gone. Absent at zero
+              (presenter contract: the pill disappears when total is 0). */}
+          <RunningTasksSheet />
           <span class={`conn-pill conn-${door}`} title={DOOR_COPY[door].hint}>
             <span class="conn-dot" aria-hidden="true" />{DOOR_COPY[door].label}
           </span>
@@ -236,6 +310,60 @@ export function App() {
           </button>
         </div>
       </header>
+
+      {drawerOpen ? (
+        <div class={`drawer-layer${drawerClosing ? ' closing' : ''}`} role="dialog" aria-modal="true" aria-label="Menu">
+          <button class="drawer-scrim" type="button" aria-label="Close menu" onClick={closeDrawer} />
+          <aside
+            ref={drawerRef}
+            class="drawer"
+            onTouchStart={(event) => {
+              const t = event.touches[0];
+              swipe.current = { x: t.clientX, y: t.clientY, horizontal: null };
+            }}
+            onTouchMove={(event) => {
+              const t = event.touches[0];
+              const s = swipe.current;
+              // Lock intent once, on the first decisive axis — after that a
+              // vertical menu scroll can never morph into a close gesture.
+              if (s.horizontal === null) {
+                const dx = Math.abs(t.clientX - s.x);
+                const dy = Math.abs(t.clientY - s.y);
+                if (dx > 12 || dy > 12) s.horizontal = dx > dy;
+              }
+            }}
+            onTouchEnd={(event) => {
+              const s = swipe.current;
+              if (s.horizontal && event.changedTouches[0].clientX - s.x < -48) closeDrawer();
+            }}
+          >
+            <div class="drawer-brand">
+              <img class="brand-mark" src="/m/clemmy.png" alt="" width="32" height="32" />
+              <span class="brand-name">Clementine</span>
+            </div>
+            <nav class="drawer-nav" aria-label="Sections">
+              {TABS.map((t) => (
+                <button
+                  key={t.id}
+                  class="drawer-item"
+                  aria-current={tab === t.id ? 'page' : undefined}
+                  onClick={() => {
+                    if (tab !== t.id) haptic('light');
+                    setTab(t.id);
+                    closeDrawer();
+                  }}
+                >
+                  <span class="drawer-item-icon">{t.icon}</span>
+                  <span class="drawer-item-label">{t.label}</span>
+                  {t.id === 'home' && decisions > 0 ? (
+                    <span class="drawer-badge">{decisions > 9 ? '9+' : decisions}</span>
+                  ) : null}
+                </button>
+              ))}
+            </nav>
+          </aside>
+        </div>
+      ) : null}
 
       <main class="app-main" key={tab}>
         <ScreenBoundary tab={tab}>
@@ -255,36 +383,13 @@ export function App() {
         </ScreenBoundary>
       </main>
 
-      {/* Running work is app-level state, not chat state: a workflow started
-          from chat keeps running when the user switches tabs, and this was the
-          only surface showing live timers + Stop — mounted inside Chat, so
-          every other tab went blind. One mount, every tab. */}
-      <RunningTasksSheet />
-
-      <nav class="dock" aria-label="Sections">
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            class={tab === t.id ? 'active' : ''}
-            onClick={() => { if (tab !== t.id) haptic('light'); setTab(t.id); }}
-            aria-label={t.label}
-            aria-current={tab === t.id ? 'page' : undefined}
-          >
-            <span class="dock-icon">
-              {t.icon}
-              {t.id === 'home' && decisions > 0 ? <span class="dock-badge">{decisions > 9 ? '9+' : decisions}</span> : null}
-            </span>
-            <span class="dock-label">{t.label}</span>
-          </button>
-        ))}
-      </nav>
     </>
   );
 }
 
 /**
- * One rendering bug on one screen must not blank the whole app — the dock
- * stays, and the broken screen gets a recovery card. `key={tab}` on the
+ * One rendering bug on one screen must not blank the whole app — the header
+ * and drawer stay, and the broken screen gets a recovery card. `key={tab}` on the
  * boundary resets the error state when the user switches tabs, so a crash on
  * Memory never follows them to Chats.
  */
