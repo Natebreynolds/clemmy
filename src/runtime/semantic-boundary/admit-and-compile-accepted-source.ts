@@ -1386,9 +1386,15 @@ export async function prepareDurableAcceptedTurnCompile(
     });
     if (selectedComposioDefinitions.length > 0) {
       const provisioned = await registerProofProvisionedCapabilities(input.identity, {
-        allowedIdentifiers: selectedStaged
-          .filter((entry) => entry.providerKind.toLowerCase() === 'composio')
-          .map((entry) => entry.identifier),
+        // EVERY selected composio ref, not just the staged ones. A capability
+        // the model selected from the LIVE catalog (disclosureByName, above)
+        // gets its definition revalidated a few lines up and was then omitted
+        // from the publication allowlist — revalidated and never published, so
+        // plan admission froze a catalog without it and refused the proposal
+        // it had just proven (live 2026-08-26: an active, proven Sheets
+        // connection, seven plan_task refusals, zero business calls). The two
+        // lists must name the same set: whatever was revalidated is published.
+        allowedIdentifiers: selectedComposioRefs.map((entry) => entry.identifier),
         selectedDefinitions: selectedComposioDefinitions,
       });
       if (provisioned.refusal) {
