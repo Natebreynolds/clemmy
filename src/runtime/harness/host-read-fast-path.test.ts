@@ -43,6 +43,7 @@ const eventlog = await import('./eventlog.js');
 const brackets = await import('./brackets.js');
 const composioClient = await import('../../integrations/composio/client.js');
 const production = await import('./production-capability-adapters.js');
+const isolatedTransport = await import('./isolated-attested-transport.fixture.js');
 const provisioning = await import('./proof-provisioned-catalog.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
 const schemas = await import('../../tools/composio-schema-cache.js');
@@ -60,7 +61,11 @@ const DRIVE_OUTPUT_SCHEMA = { type: 'object', properties: { files: { type: 'arra
 
 catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
 let transportCalls: Array<{ operationId?: string }> = [];
-production.installProductionTransport(async (call: { operationId?: string }) => {
+// installProductionTransport alone never dispatches under test: executeSealed
+// prefers requireAttestedTransport() first, and isolatedTestContractActive()
+// is true for every `--test` run, which always binds the fake isolated
+// transport artifact ahead of this mock. The fixture binds both seams.
+isolatedTransport.installIsolatedAttestedTransport(async (call: { operationId?: string }) => {
   transportCalls.push({ operationId: call?.operationId });
   return { files: [{ id: 'gauntlet-sheet', name: 'Gauntlet Sheet' }] };
 });

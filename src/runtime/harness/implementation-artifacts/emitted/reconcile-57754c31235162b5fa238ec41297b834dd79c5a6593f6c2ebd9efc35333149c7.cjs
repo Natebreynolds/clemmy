@@ -240,7 +240,7 @@ var init_machine_id = __esm({
 });
 
 // src/tools/tool-contract-store.ts
-var import_node_path3, CONTRACTS_ROOT, CONTRACT_TTL_MS;
+var import_node_path3, CONTRACTS_ROOT, CONTRACT_TTL_MS, MAX_CONTRACT_CACHE_BYTES;
 var init_tool_contract_store = __esm({
   "src/tools/tool-contract-store.ts"() {
     "use strict";
@@ -249,6 +249,7 @@ var init_tool_contract_store = __esm({
     init_machine_id();
     CONTRACTS_ROOT = import_node_path3.default.join(BASE_DIR, "memory", "tool-contracts");
     CONTRACT_TTL_MS = 30 * 24 * 60 * 6e4;
+    MAX_CONTRACT_CACHE_BYTES = 64 * 1024 * 1024;
   }
 });
 

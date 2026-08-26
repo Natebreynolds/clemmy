@@ -272,6 +272,53 @@ var init_machine_id = __esm({
 });
 
 // src/tools/tool-contract-store.ts
+function contractFileIdentity(file) {
+  try {
+    const stat = (0, import_node_fs3.statSync)(file, { bigint: true });
+    if (!stat.isFile()) return null;
+    const fields = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs];
+    if (fields.some((field) => typeof field !== "bigint")) return { cacheable: false };
+    const sizeBytes = stat.size > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(stat.size);
+    return { cacheable: true, key: fields.map(String).join(":"), sizeBytes };
+  } catch {
+    try {
+      return (0, import_node_fs3.existsSync)(file) ? { cacheable: false } : null;
+    } catch {
+      return null;
+    }
+  }
+}
+function deepFreezeContractValue(value, seen = /* @__PURE__ */ new WeakSet()) {
+  if (!value || typeof value !== "object") return value;
+  const object = value;
+  if (seen.has(object)) return value;
+  seen.add(object);
+  for (const nested of Object.values(value)) {
+    deepFreezeContractValue(nested, seen);
+  }
+  return Object.freeze(value);
+}
+function invalidateContractFileCache(file) {
+  const cached2 = contractFileCache.get(file);
+  if (cached2) contractCacheBytes = Math.max(0, contractCacheBytes - cached2.estimatedBytes);
+  contractFileCache.delete(file);
+}
+function conservativeContractCacheBytes(sizeBytes) {
+  if (!Number.isFinite(sizeBytes) || sizeBytes < 0) return contractCacheByteBudget + 1;
+  return Math.max(512, Math.ceil(sizeBytes * 4));
+}
+function cacheContractFile(file, identity, sizeBytes, record) {
+  invalidateContractFileCache(file);
+  const estimatedBytes = conservativeContractCacheBytes(sizeBytes);
+  if (estimatedBytes > contractCacheByteBudget) return;
+  contractFileCache.set(file, { identity, record, estimatedBytes });
+  contractCacheBytes += estimatedBytes;
+  while (contractFileCache.size > MAX_CONTRACTS || contractCacheBytes > contractCacheByteBudget) {
+    const oldest = contractFileCache.keys().next().value;
+    if (oldest === void 0) break;
+    invalidateContractFileCache(oldest);
+  }
+}
 function machineDir() {
   return import_node_path3.default.join(CONTRACTS_ROOT, getMachineId());
 }
@@ -292,21 +339,86 @@ function stableStringify(value) {
   const entries = Object.entries(value).filter(([, v]) => v !== void 0).sort(([a], [b]) => a.localeCompare(b));
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
 }
-function readContractFile(file) {
-  try {
-    if (!(0, import_node_fs3.existsSync)(file)) return null;
-    const parsed = JSON.parse((0, import_node_fs3.readFileSync)(file, "utf-8"));
-    return parsed && typeof parsed === "object" && parsed.identifier ? parsed : null;
-  } catch {
+function readContractFile(file, attempt = 0) {
+  const before = contractFileIdentity(file);
+  if (!before) {
+    invalidateContractFileCache(file);
     return null;
   }
+  if (before.cacheable && before.key) {
+    const cached2 = contractFileCache.get(file);
+    if (cached2?.identity === before.key) {
+      contractFileCache.delete(file);
+      contractFileCache.set(file, cached2);
+      contractCacheHits += 1;
+      return cached2.record;
+    }
+    invalidateContractFileCache(file);
+  }
+  contractCacheMisses += 1;
+  let record = null;
+  try {
+    contractCacheParses += 1;
+    const parsed = JSON.parse((0, import_node_fs3.readFileSync)(file, "utf-8"));
+    record = parsed && typeof parsed === "object" && typeof parsed.identifier === "string" && parsed.identifier ? deepFreezeContractValue(parsed) : null;
+  } catch {
+    record = null;
+  }
+  if (!before.cacheable || !before.key) {
+    invalidateContractFileCache(file);
+    return record;
+  }
+  const after = contractFileIdentity(file);
+  if (!after?.cacheable || !after.key || after.key !== before.key) {
+    invalidateContractFileCache(file);
+    return attempt < 1 ? readContractFile(file, attempt + 1) : null;
+  }
+  if (after.sizeBytes === void 0) {
+    invalidateContractFileCache(file);
+    return record;
+  }
+  cacheContractFile(file, after.key, after.sizeBytes, record);
+  return record;
 }
 function validateToolContractRecord(record, expectedIdentifier) {
   if (!record || record.identifier !== expectedIdentifier) return null;
-  const age = Date.now() - Date.parse(record.savedAt);
-  if (!Number.isFinite(age) || age < 0 || age > CONTRACT_TTL_MS) return null;
-  if (!record.schema || typeof record.schema !== "object" || Array.isArray(record.schema)) return null;
-  if (fingerprintSchema(record.schema) !== record.fingerprint) return null;
+  const now = Date.now();
+  const cachedValidation = contractValidationCache.get(record);
+  if (cachedValidation) {
+    if (cachedValidation.status === "invalid") return null;
+    if (cachedValidation.status === "future") {
+      if (now < cachedValidation.savedAtMs) return null;
+      contractValidationCache.delete(record);
+    } else if (cachedValidation.status === "expired") {
+      if (now > cachedValidation.expiresAtMs) return null;
+      contractValidationCache.delete(record);
+    } else {
+      return now >= cachedValidation.savedAtMs && now <= cachedValidation.expiresAtMs ? record : null;
+    }
+  }
+  contractCacheValidations += 1;
+  const savedAtMs = Date.parse(record.savedAt);
+  if (!Number.isFinite(savedAtMs)) {
+    contractValidationCache.set(record, { status: "invalid" });
+    return null;
+  }
+  const expiresAtMs = savedAtMs + CONTRACT_TTL_MS;
+  if (now < savedAtMs) {
+    contractValidationCache.set(record, { status: "future", savedAtMs });
+    return null;
+  }
+  if (now > expiresAtMs) {
+    contractValidationCache.set(record, { status: "expired", expiresAtMs });
+    return null;
+  }
+  const permanentlyInvalid = () => {
+    contractValidationCache.set(record, { status: "invalid" });
+    return null;
+  };
+  if (!record.schema || typeof record.schema !== "object" || Array.isArray(record.schema)) {
+    return permanentlyInvalid();
+  }
+  if (fingerprintSchema(record.schema) !== record.fingerprint) return permanentlyInvalid();
   const outputFields = [
     record.providerOutputSchema,
     record.providerOutputSchemaDigest,
@@ -314,13 +426,18 @@ function validateToolContractRecord(record, expectedIdentifier) {
   ];
   const hasAnyOutputField = outputFields.some((value) => value !== void 0);
   const hasAllOutputFields = outputFields.every((value) => value !== void 0);
-  if (record.providerOutputSchemaObserved !== void 0 && record.providerOutputSchemaObserved !== true) return null;
+  if (record.providerOutputSchemaObserved !== void 0 && record.providerOutputSchemaObserved !== true) return permanentlyInvalid();
   if (hasAnyOutputField && (!hasAllOutputFields || record.providerOutputSchemaObserved !== true)) {
-    return null;
+    return permanentlyInvalid();
   }
   if (hasAllOutputFields) {
-    if (!record.providerOutputSchema || typeof record.providerOutputSchema !== "object" || Array.isArray(record.providerOutputSchema) || digestSchema(record.providerOutputSchema) !== record.providerOutputSchemaDigest || fingerprintSchema(record.providerOutputSchema) !== record.providerOutputSchemaFingerprint) return null;
+    if (!record.providerOutputSchema || typeof record.providerOutputSchema !== "object" || Array.isArray(record.providerOutputSchema) || digestSchema(record.providerOutputSchema) !== record.providerOutputSchemaDigest || fingerprintSchema(record.providerOutputSchema) !== record.providerOutputSchemaFingerprint) return permanentlyInvalid();
   }
+  contractValidationCache.set(record, {
+    status: "valid",
+    savedAtMs,
+    expiresAtMs
+  });
   return record;
 }
 function caseTwinIdentifier(identifier) {
@@ -343,7 +460,7 @@ function loadToolContract(identifier) {
     return null;
   }
 }
-var import_node_crypto2, import_node_fs3, import_node_path3, CONTRACTS_ROOT, CONTRACT_TTL_MS;
+var import_node_crypto2, import_node_fs3, import_node_path3, CONTRACTS_ROOT, CONTRACT_TTL_MS, MAX_CONTRACTS, MAX_CONTRACT_CACHE_BYTES, contractFileCache, contractValidationCache, contractCacheHits, contractCacheMisses, contractCacheParses, contractCacheValidations, contractCacheBytes, contractCacheByteBudget;
 var init_tool_contract_store = __esm({
   "src/tools/tool-contract-store.ts"() {
     "use strict";
@@ -354,6 +471,16 @@ var init_tool_contract_store = __esm({
     init_machine_id();
     CONTRACTS_ROOT = import_node_path3.default.join(BASE_DIR, "memory", "tool-contracts");
     CONTRACT_TTL_MS = 30 * 24 * 60 * 6e4;
+    MAX_CONTRACTS = 2e3;
+    MAX_CONTRACT_CACHE_BYTES = 64 * 1024 * 1024;
+    contractFileCache = /* @__PURE__ */ new Map();
+    contractValidationCache = /* @__PURE__ */ new WeakMap();
+    contractCacheHits = 0;
+    contractCacheMisses = 0;
+    contractCacheParses = 0;
+    contractCacheValidations = 0;
+    contractCacheBytes = 0;
+    contractCacheByteBudget = MAX_CONTRACT_CACHE_BYTES;
   }
 });
 
@@ -865,6 +992,12 @@ function invokeForSealedManifest(manifest) {
       const compiled = authority?.canonicalArgs ?? (payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null);
       if (!compiled) throw new Error("native MCP invoke requires canonical object arguments");
       return executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
+    }
+    if (sealed.effect === "read" && sealed.providerKind === "composio" && sealed.purpose !== "verify_created_resource") {
+      const compiled = authority?.canonicalArgs ?? (payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null);
+      if (!compiled) throw new Error("proof-provisioned read requires canonical object arguments");
+      const result = await executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
+      return { result, complete: true };
     }
     throw new Error(`no sealed invoke for exact operation ${sealed.operationId}`);
   };

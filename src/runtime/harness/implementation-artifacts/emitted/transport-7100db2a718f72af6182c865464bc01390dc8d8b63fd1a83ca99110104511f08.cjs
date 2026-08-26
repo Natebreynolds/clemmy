@@ -239,6 +239,7 @@ var MACHINE_ID_FILE = import_node_path2.default.join(BASE_DIR, "state", "machine
 // src/tools/tool-contract-store.ts
 var CONTRACTS_ROOT = import_node_path3.default.join(BASE_DIR, "memory", "tool-contracts");
 var CONTRACT_TTL_MS = 30 * 24 * 60 * 6e4;
+var MAX_CONTRACT_CACHE_BYTES = 64 * 1024 * 1024;
 function digestSchema(schema) {
   return (0, import_node_crypto.createHash)("sha256").update(stableStringify(schema)).digest("hex");
 }

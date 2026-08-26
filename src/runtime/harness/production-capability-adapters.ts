@@ -616,6 +616,29 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
       if (!compiled) throw new Error('native MCP invoke requires canonical object arguments');
       return executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
     }
+    // A read-effect Composio operation this turn separately PROVED (proof-
+    // provisioned via registerProofProvisionedCapabilities — not one of the
+    // fixed demo operation ids above) carries a role-derived purpose this
+    // dispatcher never had a name for, and died here with "no sealed invoke"
+    // (2026-08-26 gauntlet, hole 12: GOOGLEDRIVE_FIND_FILE, effect 'read',
+    // proven, still undispatchable). The read-fast-path's contract already
+    // gated entry to this branch on decision.effect === 'read'; that IS the
+    // read bar. A readback-role read (id/range extraction) keeps its own
+    // named branch above and never falls through here.
+    if (
+      sealed.effect === 'read'
+      && sealed.providerKind === 'composio'
+      && sealed.purpose !== 'verify_created_resource'
+    ) {
+      const compiled = authority?.canonicalArgs ?? (
+        payload && typeof payload === 'object' && !Array.isArray(payload)
+          ? payload as Record<string, unknown>
+          : null
+      );
+      if (!compiled) throw new Error('proof-provisioned read requires canonical object arguments');
+      const result = await executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
+      return { result, complete: true };
+    }
     throw new Error(`no sealed invoke for exact operation ${sealed.operationId}`);
   };
 }
