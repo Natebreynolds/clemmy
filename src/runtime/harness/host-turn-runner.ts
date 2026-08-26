@@ -190,6 +190,32 @@ export const HOST_CAPABILITY_UNAVAILABLE_TEXT =
   'That exact capability is unavailable for this request after two safe, no-effect attempts. I kept the conversation intact; choose another available capability or adjust the request before trying again.';
 
 /**
+ * The write operations this turn's accepted graph actually bound.
+ *
+ * A plan-bound refusal is only actionable if it can say WHAT is bound. These
+ * identities are host-declared — read straight from the frozen graph, never
+ * from model text — so echoing them repairs the call without granting it
+ * anything: every gate still runs on the retry.
+ */
+export function plannedWriteOperationIds(sessionId: string, sourceUserSeq: number): string[] {
+  try {
+    const expected = expectedTaskFor(sessionId, sourceUserSeq);
+    if (expected.status !== 'ok') return [];
+    const goals = expected.graph.classification?.goalConstraints;
+    const destinations: readonly { binding?: { operationId?: string } }[] = goals?.destinations?.length
+      ? goals.destinations
+      : (goals?.destination ? [goals.destination] : []);
+    return [...new Set(destinations
+      .map((entry) => entry.binding?.operationId)
+      .filter((operationId): operationId is string => Boolean(operationId)))];
+  } catch {
+    // Repair guidance is an aid, never a gate. Losing it must never change
+    // whether a call is refused.
+    return [];
+  }
+}
+
+/**
  * Retirement terminal WITH the host's own measured cause. Live 2026-08-25
  * (Discord, "top 5 opportunities → sheet"): eleven discovery searches, four
  * minutes, then the bare retirement line — while the CLI auth-health store
@@ -2199,7 +2225,27 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         runContext,
         details,
       )) return undefined;
-      return `Tool '${name}' was refused before dispatch because its exact capability, effect, account, schema, or invoke binding is absent or changed. No local or external mutation was attempted.`;
+      // Name the operations this turn actually bound.
+      //
+      // Live 2026-08-26: the plan bound one write operation, the model read the
+      // exact schemas, decided a different (correct, non-deprecated) operation
+      // was the right one, and was refused. It then guessed a THIRD, was
+      // refused again, and gave up — because the refusal described a category
+      // of problem without naming the one fact that resolves it. An error that
+      // names its own repair gets repaired; this one could not be.
+      //
+      // Value-opaque rule holds: these are HOST-declared identities from the
+      // accepted graph, never model text, and naming them grants nothing —
+      // every gate still runs on the next call.
+      const refusalIdentity = exactHostIdentity();
+      const boundOperations = plannedWriteOperationIds(
+        refusalIdentity.sessionId,
+        refusalIdentity.sourceUserSeq,
+      ).filter((operationId) => operationId !== name.toUpperCase());
+      const repair = boundOperations.length > 0
+        ? ` This turn bound: ${boundOperations.join(', ')}. Use one of those exactly, or call plan_task again to amend the plan before retrying.`
+        : '';
+      return `Tool '${name}' was refused before dispatch because its exact capability, effect, account, schema, or invoke binding is absent or changed. No local or external mutation was attempted.${repair}`;
     }
     // The first live host cut dispatches only a direct, active capability whose
     // exact configured object, callable schema, immutable envelope and current

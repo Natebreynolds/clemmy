@@ -318,9 +318,24 @@ function bindFromRegistry(
   })) {
     return null;
   }
-  const graphDestination = input.graph.classification?.goalConstraints?.destination;
+  // A turn may admit more than one write, and each planned write carries its
+  // OWN exact binding. Reading only the singular destination refused every
+  // planned write except the first — including the write into the destination
+  // this same turn had just created (live 2026-08-26: the sheet was created,
+  // then its header row was refused before dispatch). Matching against the full
+  // bound set is still an exact identity match per capability, so this admits
+  // nothing the plan did not already bind.
+  const goalConstraints = input.graph.classification?.goalConstraints;
+  const graphDestinations = goalConstraints?.destinations?.length
+    ? goalConstraints.destinations
+    : (goalConstraints?.destination ? [goalConstraints.destination] : []);
+  const boundDestinations = graphDestinations.filter((entry) => Boolean(entry?.binding));
   const writeNode = effectRank(nodeEffect) >= effectRank('local_write');
-  if (writeNode && graphDestination?.binding && !destinationBindingMatches(graphDestination.binding, capability)) {
+  if (
+    writeNode
+    && boundDestinations.length > 0
+    && !boundDestinations.some((entry) => destinationBindingMatches(entry.binding!, capability))
+  ) {
     return null;
   }
   return {

@@ -31,6 +31,7 @@ import {
   destinationCandidateLadder,
   unionEvidenceFloor,
   type CanonicalDestinationBindingV1,
+  type DestinationEvidenceFloorV1,
 } from '../harness/destination-binding.js';
 import {
   freezeCatalogSnapshotForPlanAdmission,
@@ -1151,6 +1152,18 @@ export type PrepareDurableAcceptedTurnCompileResult =
 function carryExactDestinationBinding(input: {
   clamped: AdmittedClampedSemanticsV1;
   binding: CanonicalDestinationBindingV1;
+  /** One additional exactly-bound destination per FURTHER planned write.
+   *
+   * A plan that creates a thing and then writes into it names two operations.
+   * Each gets its OWN binding, so nothing here authorizes an operation the plan
+   * did not already admit. Live 2026-08-26: a two-write plan could only ever
+   * execute its first write, because one binding named one operationId and both
+   * consent and the catalog factory then refused every other planned write —
+   * including the write into the very destination this turn had just created. */
+  additional?: readonly {
+    binding: CanonicalDestinationBindingV1;
+    family: string;
+  }[];
 }): { ok: true; clamped: AdmittedClampedSemanticsV1 } | { ok: false; reason: string } {
   const destination = input.clamped.destination;
   const destinations = input.clamped.destinations;
@@ -1176,11 +1189,28 @@ function carryExactDestinationBinding(input: {
     return { ok: false, reason: 'admitted destination already carries a conflicting binding' };
   }
   const boundDestination = { ...canonical, binding: { ...input.binding } };
+  // Each further planned write carries its OWN exact binding and its own
+  // posture (a create is create_new; the write into what it created is
+  // named_existing). The primary destination is untouched, so a single-write
+  // turn freezes exactly what it froze before this existed.
+  const seenOperations = new Set([input.binding.operationId]);
+  const furtherWrites = (input.additional ?? [])
+    .filter((entry) => {
+      if (seenOperations.has(entry.binding.operationId)) return false;
+      seenOperations.add(entry.binding.operationId);
+      return true;
+    })
+    .map((entry) => ({
+      posture: entry.binding.posture,
+      family: entry.family,
+      handleRequired: boundDestination.handleRequired,
+      binding: { ...entry.binding },
+    }));
   return {
     ok: true,
     clamped: {
       ...input.clamped,
-      destinations: [{ ...boundDestination }],
+      destinations: [{ ...boundDestination }, ...furtherWrites],
       destination: { ...boundDestination },
     },
   };
@@ -1705,18 +1735,54 @@ export async function prepareDurableAcceptedTurnCompile(
     // chose for the step; destinationCandidateLadder owns that rule and carries
     // the live evidence for it.
     const candidateLadder = destinationCandidateLadder(clamped.operations);
+    // Bind each referenced capability ON ITS OWN, never as a set. Postures are
+    // carrier metadata and are frequently coarse — measured 2026-08-26, one
+    // carrier labels create_spreadsheet, values_update and batch_update all
+    // 'create_new' — so offering several refs at once is ambiguous by
+    // construction and the whole turn loses its destination. One ref at a time
+    // is always decidable, and a plan's several writes are exactly what a
+    // multi-write plan admitted.
     let bound: ReturnType<typeof bindExecutableDestination> = {
       ok: false,
       reason: 'destination bind requires an exact capability reference',
     };
-    for (const candidateIds of candidateLadder) {
-      bound = bindExecutableDestination({
-        requestedEffect: clamped.effectCeiling,
-        destinationPosture: clamped.destination.posture,
-        candidateIds,
-        catalog: catalogEntries,
-      });
-      if (bound.ok) break;
+    const plannedWrites: {
+      binding: CanonicalDestinationBindingV1;
+      family: string;
+      floor: DestinationEvidenceFloorV1;
+    }[] = [];
+    for (const rung of candidateLadder) {
+      for (const ref of rung) {
+        const entry = catalogEntries.find((candidate) => candidate.capabilityId === ref);
+        const posture = entry?.destination?.posture;
+        if (!entry || (posture !== 'create_new' && posture !== 'named_existing')) continue;
+        const boundOne = bindExecutableDestination({
+          requestedEffect: String(entry.effect),
+          destinationPosture: posture,
+          candidateIds: [ref],
+          catalog: catalogEntries,
+        });
+        if (!boundOne.ok) {
+          if (!bound.ok) bound = boundOne;
+          continue;
+        }
+        if (plannedWrites.some((entry2) => entry2.binding.operationId === boundOne.binding.operationId)) continue;
+        plannedWrites.push({
+          binding: boundOne.binding,
+          family: entry.destination?.family ?? clamped.destination.family,
+          floor: boundOne.floor,
+        });
+      }
+      if (plannedWrites.length > 0) break;
+    }
+    // The singular destination keeps its admitted posture where one of the
+    // planned writes offers it, so a single-write turn is unchanged.
+    const primaryIndex = plannedWrites.findIndex((entry) => (
+      entry.binding.posture === clamped.destination!.posture
+    ));
+    const primary = plannedWrites[primaryIndex >= 0 ? primaryIndex : 0];
+    if (primary) {
+      bound = { ok: true, binding: primary.binding, floor: primary.floor };
     }
     if (!bound.ok) {
       // Never silent. An unbound destination still freezes into the accepted
@@ -1733,7 +1799,17 @@ export async function prepareDurableAcceptedTurnCompile(
     }
     if (bound.ok) {
       destinationBinding = bound.binding;
-      const carried = carryExactDestinationBinding({ clamped, binding: destinationBinding });
+      // Every OTHER planned write travels as its own exactly-bound destination.
+      // Without this the plan is admitted whole and only its first write can
+      // ever execute — including the write into what this turn just created.
+      const furtherWrites = plannedWrites
+        .filter((entry) => entry.binding.operationId !== destinationBinding!.operationId)
+        .map((entry) => ({ binding: entry.binding, family: entry.family }));
+      const carried = carryExactDestinationBinding({
+        clamped,
+        binding: destinationBinding,
+        additional: furtherWrites,
+      });
       if (!carried.ok) return carried;
       clamped = carried.clamped;
       const floor = unionEvidenceFloor(bound.floor, {
