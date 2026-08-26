@@ -539,3 +539,132 @@ test('a ready catalog is never empty and never carries blocking refusals', () =>
     assert.ok(typedExecutionCatalogRefusals().length > 0, 'unready must name a refusal');
   }
 });
+
+/**
+ * Regression pin for the LIVE 2026-08-26 mechanism: registering one
+ * correctly-proven capability collaterally forgot unrelated, still-current
+ * manifests this same long-running daemon had accumulated from earlier,
+ * unrelated sessions, purely because their independent observation had aged
+ * past the 60s freshness window by the time this call ran. A daemon with N
+ * composio operations across its lifetime can accumulate stale residue
+ * indefinitely; scoping readiness to the manifestIds one call actually
+ * touches is what keeps that residue from ever being swept in.
+ */
+test('scoped readiness refresh never forgets an unrelated stale entry outside its scope', () => {
+  resetRuntime();
+  configureTypedExecutionRuntime();
+  const store = peekCapabilityManifestStore();
+  assert.ok(store);
+  const factory = peekHostCapabilityCatalogFactory();
+  assert.ok(factory);
+
+  // residue: installed and registered by an earlier, unrelated turn in this
+  // same process. Its independent observation is already older than
+  // INDEPENDENT_OBSERVATION_FRESHNESS_MS.
+  const residue = provisionedReadManifest('cap:residue-unrelated:v1');
+  assert.equal(store.install(residue).ok, true);
+  assert.equal(registerIndependentCapabilityObservation({
+    operationId: residue.operationId,
+    accountId: residue.accountId,
+    definitionFingerprint: residue.definitionFingerprint,
+    providerVersion: residue.providerVersion,
+    operationVersion: residue.operationVersion,
+    observedAt: Date.now() - 120_000,
+    origin: 'independent',
+    observe: () => ({
+      operationId: residue.operationId,
+      accountId: residue.accountId,
+      definitionFingerprint: residue.definitionFingerprint,
+      providerVersion: residue.providerVersion,
+      operationVersion: residue.operationVersion,
+      observedAt: Date.now() - 120_000,
+    }),
+  }).ok, true);
+  factory.register({
+    capabilityId: residue.manifestId,
+    toolName: residue.operationId,
+    schemaVersion: residue.operationVersion,
+    schemaDigest: residue.definitionFingerprint,
+    effect: residue.effect,
+    account: residue.accountId,
+    manifestDigest: capabilityManifestDigest(residue),
+    providerKind: residue.providerKind,
+    liveFingerprint: residue.definitionFingerprint,
+    manifest: residue,
+    invoke: async () => ({}),
+  });
+
+  // fresh: THIS call's own registration, observed just now with a real port.
+  const fresh = provisionedReadManifest('cap:fresh-registration:v1');
+  assert.equal(store.install(fresh).ok, true);
+  observeAndRegister(fresh);
+
+  // THE LIVE SHAPE: refreshing readiness scoped to only what this call
+  // registered must not touch `residue`, even though residue's own
+  // observation is stale and would be forgotten by an unscoped sweep.
+  refreshTypedExecutionReadiness([fresh.manifestId]);
+
+  assert.ok(factory.get(residue.manifestId), 'an unrelated stale residue must survive a scoped registration');
+  assert.equal(typedExecutionCatalogReady([fresh.manifestId]), true,
+    'the capability this call actually registered is ready on its own');
+  assert.equal(typedExecutionCatalogReady([residue.manifestId]), false,
+    'the residue is still correctly refused for a call that actually needs it — scoping never launders staleness');
+});
+
+/**
+ * Direction pins for the same scoping change: narrowing WHO readiness
+ * inspects must never narrow WHAT it demands from the thing actually asked
+ * about.
+ */
+test('scoped readiness still fails closed for what a call actually needs', () => {
+  resetRuntime();
+  configureTypedExecutionRuntime();
+  const store = peekCapabilityManifestStore();
+  assert.ok(store);
+  const factory = peekHostCapabilityCatalogFactory();
+  assert.ok(factory);
+
+  // A capability whose OWN observation is genuinely stale is not
+  // dispatchable as freshly-proven for the call that needs exactly it, even
+  // when the check is scoped to just that one manifest.
+  const stale = provisionedReadManifest('cap:scoped-stale:v1');
+  assert.equal(store.install(stale).ok, true);
+  assert.equal(registerIndependentCapabilityObservation({
+    operationId: stale.operationId,
+    accountId: stale.accountId,
+    definitionFingerprint: stale.definitionFingerprint,
+    providerVersion: stale.providerVersion,
+    operationVersion: stale.operationVersion,
+    observedAt: Date.now() - 120_000,
+    origin: 'independent',
+    observe: () => ({
+      operationId: stale.operationId,
+      accountId: stale.accountId,
+      definitionFingerprint: stale.definitionFingerprint,
+      providerVersion: stale.providerVersion,
+      operationVersion: stale.operationVersion,
+      observedAt: Date.now() - 120_000,
+    }),
+  }).ok, true);
+  factory.register({
+    capabilityId: stale.manifestId,
+    toolName: stale.operationId,
+    schemaVersion: stale.operationVersion,
+    schemaDigest: stale.definitionFingerprint,
+    effect: stale.effect,
+    account: stale.accountId,
+    manifestDigest: capabilityManifestDigest(stale),
+    providerKind: stale.providerKind,
+    liveFingerprint: stale.definitionFingerprint,
+    manifest: stale,
+    invoke: async () => ({}),
+  });
+  assert.equal(typedExecutionCatalogReady([stale.manifestId]), false,
+    'a genuinely stale observation refuses even when the check is scoped to just itself');
+
+  // A call whose own needed operation was never registered at all (no
+  // current manifest anywhere in the store) still fails closed rather than
+  // reading an empty scope as vacuously ready.
+  assert.equal(typedExecutionCatalogReady(['cap:never-registered:v1']), false,
+    'a call needing an operation with no current manifest fails closed');
+});

@@ -80,17 +80,20 @@ export interface CodifyResult {
  * converts eligible mechanical model steps to `call` steps, preserving the
  * original executor in `codifiedFrom` for reversibility. Returns which steps
  * were codified + operator-facing notes.
+ *
+ * Currently a no-op (2026-08-26): the workflow definition validator and
+ * runner now require ANY `call` step to carry a paired, exact
+ * `invocationPlan` (workflow-validator.ts "structured call is missing its
+ * exact invocationPlan"; workflow-runner.ts `workflow_exact_call_plan_missing`,
+ * landed in the durable-activation wave, commit 60db67d8). Compiling that
+ * plan needs the live capability/schema catalog — machinery this
+ * deterministic, sync, no-LLM pass has no access to (and shouldn't reach for;
+ * see the module doc). Emitting the old bare `call` shape here would save an
+ * un-writable-when-enabled (and un-runnable-when-disabled) workflow instead of
+ * the working model step it replaced, so the pass stands down until a plan
+ * compiler exists for this seam. `proposeCodifiedStep`/`proposeCodifiedSteps`
+ * are untouched — they only report candidates for display.
  */
-export function codifyMechanicalSteps(steps: WorkflowStepInput[]): CodifyResult {
-  const codified: string[] = [];
-  const notes: string[] = [];
-  for (const step of steps) {
-    const proposal = proposeCodifiedStep(step);
-    if (!proposal) continue;
-    step.codifiedFrom = { prompt: step.prompt, ...(step.allowedTools ? { allowedTools: step.allowedTools } : {}) };
-    step.call = { tool: proposal.tool, args: proposal.args };
-    codified.push(step.id);
-    notes.push(`Codified step \`${step.id}\` into a direct ${proposal.tool} call — it now runs as code (no AI, no tokens) every run. If the call ever fails its contract, self-heal restores the AI step.`);
-  }
-  return { codified, notes };
+export function codifyMechanicalSteps(_steps: WorkflowStepInput[]): CodifyResult {
+  return { codified: [], notes: [] };
 }

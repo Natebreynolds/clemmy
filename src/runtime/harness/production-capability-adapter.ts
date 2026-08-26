@@ -74,7 +74,17 @@ export interface ManifestInvokePorts {
 export interface ProductionCapabilityAdapter {
   observe: Record<CapabilityProviderKind, LiveCapabilityObserver>;
   invokesFor(manifest: CapabilityManifestV1): ManifestInvokePorts | null;
-  refresh(): { registered: number; refused: Array<{ manifestId: string; reason: string }> };
+  /**
+   * `scope`, when given, restricts the walk (and every forget it can trigger)
+   * to exactly those manifestIds — see refreshTypedExecutionReadiness's own
+   * scope. Omitting it walks every current manifest in the store, same as
+   * before: this refresh has its own independent staleness/observation check
+   * per entry (observationMatchesManifest + observationIsFresh) and its own
+   * `factory.forget` on failure, so scoping configure-typed-execution-
+   * runtime.ts's evaluateCatalogReadiness alone is not enough — this loop
+   * forgets unrelated, still-current-but-stale manifests on every call too.
+   */
+  refresh(scope?: ReadonlySet<string>): { registered: number; refused: Array<{ manifestId: string; reason: string }> };
 }
 
 export interface AdapterInstallResult {
@@ -293,10 +303,11 @@ export function createProductionCapabilityAdapter(input: {
       if (requiresReconcile && !registered.reconcile) return null;
       return { invoke: registered.invoke, reconcile: registered.reconcile };
     },
-    refresh() {
+    refresh(scope) {
       const refused: Array<{ manifestId: string; reason: string }> = [];
       let registered = 0;
       for (const entry of store.list()) {
+        if (scope && !scope.has(entry.manifest.manifestId)) continue;
         const current = currentCapabilityManifest(entry.manifest);
         if (!current) {
           refused.push({

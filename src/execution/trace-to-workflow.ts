@@ -56,10 +56,15 @@ export interface WorkflowDraftStep {
   /** Declared output contract. Set on an inferred list step so the engine
    *  hard-verifies it yields a non-empty array before the fan-out runs. */
   output?: WorkflowStepOutputContract;
-  /** CALL-2: a structured tool call captured from the trace — the runner
-   *  executes it directly (no LLM). Set when a SINGLE composio call with a
-   *  known slug + parseable args was observed, so the promoted step reproduces
-   *  the exact invocation deterministically instead of re-asking a model. */
+  /** CALL-2 (currently never populated — see buildStep): a structured tool
+   *  call that would run directly with no LLM turn. The validator and runner
+   *  now require a paired, exact `invocationPlan` for ANY `call` step
+   *  (workflow-validator.ts "structured call is missing its exact
+   *  invocationPlan"; workflow-runner.ts `workflow_exact_call_plan_missing`),
+   *  and compiling that plan needs the live capability/schema catalog, which
+   *  an ad-hoc chat trace can't supply. Field kept for when a promotion-time
+   *  plan compiler exists; until then buildStep() falls back to a prose step
+   *  so promotion never emits a step with no production dispatch authority. */
   call?: WorkflowStepCall;
   /** What was observed in the trace (for transparency + refinement). */
   observed: { tool: string; slug?: string; args: string; calls: number };
@@ -176,21 +181,18 @@ function buildStep(grp: DraftGroup, index: number, usedIds: Set<string>): Workfl
 
   if (head.tool === 'composio_execute_tool' && head.slug) {
     const id = slugifyId(head.slug, index, usedIds);
-    // CALL-2: a SINGLE observed call with parseable args → emit a structured
-    // call node that reproduces the exact invocation with zero model turns.
-    // (calls>1 keeps prose: a call node runs once, so a repeated action stays a
-    // refine-into-forEach hint rather than silently dropping the repeats.)
-    const argObj = calls === 1 ? callArgObject(head.args) : null;
-    if (argObj) {
-      return {
-        id,
-        prompt: '',
-        allowedTools: ['composio_execute_tool'],
-        call: { tool: head.slug, args: argObj },
-        ...gate,
-        observed: { tool: head.tool, slug: head.slug, args: head.args.slice(0, 600), calls },
-      };
-    }
+    // CALL-2 used to emit a structured `call` node here for a single observed
+    // call with parseable args, reproducing the invocation with zero model
+    // turns. The workflow definition validator and runner now require ANY
+    // `call` step to carry a paired, exact `invocationPlan` (see
+    // workflow-validator.ts "structured call is missing its exact
+    // invocationPlan" and workflow-runner.ts `workflow_exact_call_plan_missing`)
+    // — compiling one needs the live capability/schema catalog, which this
+    // pure trace reader has no access to. Emitting a bare `call` here would
+    // save a workflow that either 422s at creation or, if it somehow got
+    // saved, hard-blocks at run time. Fall back to the same prose step used
+    // when the slug can't be parsed at all, so a promoted step always has
+    // real dispatch authority (via the ordinary tool-locked model step).
     return {
       id,
       prompt: `Run the ${head.slug} action via composio_execute_tool${argKeySummary(head.args)}${repeated}`,

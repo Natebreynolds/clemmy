@@ -600,3 +600,311 @@ test('S1-residue: stale process-wide catalog residue must not sink a same-turn-d
   assert.equal(providerWrites.length, 1, 'exactly one sheet write crossed the provider wire');
   assert.equal(sha256(JSON.stringify(providerWrites[0]!.title)), sha256(JSON.stringify('Gauntlet Residue Sheet')));
 });
+
+/**
+ * Regression pin for the mechanism S1-residue's own admission-level fix left
+ * standing: registerProofProvisionedCapabilities's post-registration
+ * refreshTypedExecutionReadiness() treated every "current" manifest in the
+ * whole process-wide store as required and forgot (evicted from the LIVE
+ * FACTORY) any whose independent observation had gone stale — including
+ * residue nobody selected. S1-residue only proves admission still succeeds
+ * despite that eviction (an unselected descriptor going missing is tolerated,
+ * per admit-and-compile-accepted-source.ts). It does not prove the eviction
+ * stopped happening. Live 2026-08-26 (session sess-desktop-2f3944f36e1b19eb-
+ * d3fbdc2d): after that admission-side tolerance shipped, a real multi-
+ * attempt plan_task turn still froze a completely empty catalog snapshot and
+ * refused every attempt — the daemon's shared factory had been swept clean.
+ * This subtest re-runs S1-residue's exact shape (its own separate write
+ * operation and residue slugs, so it shares no manifest/port identity with
+ * S1-residue's own turn) and additionally asserts the unrelated residue
+ * capabilities are still registered in the live factory after the turn, not
+ * just that admission tolerated their absence.
+ */
+const SURVIVES_SHEET_OPERATION = 'GOOGLESHEETS_SPREADSHEET_CREATE';
+const SURVIVES_RESIDUE_SLUGS = [
+  'GOOGLESHEETS_CLEAR_VALUES',
+  'GOOGLESHEETS_ADD_SHEET',
+  'GOOGLESHEETS_DELETE_SHEET',
+] as const;
+
+test('S2-residue-survives: registering the selected write must not evict unrelated stale residue from the live factory', { timeout: 120_000 }, async () => {
+  eventlog.resetEventLog();
+  resetHarnessRuntimeConfig();
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+
+  const session = eventlog.createSession({
+    id: 'discord-gauntlet-sheet-stale-residue-survives',
+    kind: 'chat',
+    userId: 'discord-user-gauntlet-residue-survives',
+  });
+
+  const configured = await configureHarnessRuntime();
+  assert.equal(configured.ok, true, configured.ok ? '' : configured.reason);
+
+  productionAdapters.installProductionTransport(async () => {
+    throw new Error('journey forbids direct catalog execution outside work_call');
+  });
+
+  const factory = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  assert.ok(factory, 'runtime installs one empty searchable host catalog');
+  productionPorts.clearProductionCapabilityPorts();
+
+  // THE LIVE PRE-CONDITION, same shape as S1-residue, but this turn's own
+  // residue slugs/account — never touched by S1-residue's turn — so this
+  // pin exercises a fresh registration racing fresh residue, not a replay of
+  // S1-residue's already-registered capability.
+  for (const slug of SURVIVES_RESIDUE_SLUGS) {
+    seedStaleComposioResidue({
+      slug,
+      accountId: 'ca_residue_sheets_survives',
+      purposeWords: 'google sheet spreadsheet',
+    });
+  }
+  const residueCapabilityIds = SURVIVES_RESIDUE_SLUGS.map((slug) => `cap:resolved:${slug.toLowerCase()}`);
+  for (const id of residueCapabilityIds) {
+    assert.ok(factory.get(id), `residue ${id} is seeded live before the turn`);
+  }
+
+  connectedCatalog.installConnectedRegistryPort(() => ({
+    connectedToolkits: ['googlesheets'],
+    tools: [
+      { slug: SURVIVES_SHEET_OPERATION, schema: SHEET_SCHEMA as unknown as Record<string, unknown> },
+    ],
+  }));
+
+  const rawTools = [{
+    slug: SURVIVES_SHEET_OPERATION,
+    name: 'Create Google Sheet',
+    description: 'Create one new Google Sheet with an optional header row.',
+    toolkit: { slug: 'googlesheets' },
+    inputParameters: SHEET_SCHEMA,
+    outputParameters: SHEET_OUTPUT_SCHEMA,
+    version: 'fixture-googlesheets-survives-v1',
+  }];
+  composioClient.__test__.setComposioApiKeyOverride('fixture-composio-key');
+  composioClient.__test__.setConnectedAccountsLoader(async () => [
+    { id: 'conn-googlesheets-residue-survives', status: 'ACTIVE', user_id: 'fixture-user', toolkit: { slug: 'googlesheets' } },
+  ]);
+  const providerWrites: Array<Record<string, unknown>> = [];
+  composioClient.__test__.setComposioClient({
+    client: { baseURL: 'https://backend.composio.dev' },
+    getClient: () => ({
+      withOptions: () => ({
+        tools: {
+          execute: async (
+            operation: string,
+            body: { arguments?: unknown },
+          ) => {
+            assert.equal(operation, SURVIVES_SHEET_OPERATION);
+            const args = body.arguments as Record<string, unknown>;
+            providerWrites.push(structuredClone(args));
+            assert.equal(args.title, 'Gauntlet Residue Sheet');
+            return {
+              data: {
+                successful: true,
+                spreadsheetId: 'gauntlet-residue-sheet-survives',
+                spreadsheetUrl: SHEET_URL,
+              },
+              error: null,
+              successful: true,
+              log_id: `fixture-write-${providerWrites.length}`,
+            };
+          },
+        },
+      }),
+    }),
+    tools: {
+      async getRawComposioTools(input: { tools?: string[]; toolkits?: string[] }) {
+        const exact = new Set((input.tools ?? []).map((value) => value.toUpperCase()));
+        const toolkits = new Set((input.toolkits ?? []).map((value) => value.toLowerCase()));
+        return rawTools.filter((candidate) =>
+          (exact.size === 0 || exact.has(candidate.slug))
+          && (toolkits.size === 0 || toolkits.has(candidate.toolkit.slug)));
+      },
+      async execute() {
+        throw new Error('journey forbids the legacy Composio high-level execute fallback');
+      },
+    },
+  });
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.startsWith('https://backend.composio.dev/api/v3/tools?')) {
+      return new Response(JSON.stringify({ items: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`journey forbids external network: ${url}`);
+  }) as typeof fetch;
+
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('hidden pre-loop semantic model pass'); },
+    async judgeSourceEffect() { throw new Error('hidden pre-loop semantic effect judge'); },
+    async judgePlanGrounding() { throw new Error('hidden pre-loop semantic grounding judge'); },
+  });
+
+  const gateway = composioTools.getComposioRuntimeTools()
+    .find((candidate) => candidate.name === 'composio_execute_tool');
+  assert.ok(gateway, 'the journey uses the production Composio carrier around the raw provider wire');
+  innerDispatch._setInnerDispatchToolsForTests(new Map([
+    ['composio_execute_tool', gateway as never],
+  ]));
+
+  const survivesCapabilityId = `cap:resolved:${SURVIVES_SHEET_OPERATION.toLowerCase()}`;
+  let primaryStep = 0;
+  const scriptedModel = {
+    async getResponse(rawRequest: unknown) {
+      const request = (rawRequest ?? {}) as { tools?: Array<{ name?: string }> };
+      const tools = (request.tools ?? []).map((entry) => entry.name ?? '').filter(Boolean);
+      const serialized = JSON.stringify(rawRequest ?? {});
+      primaryStep += 1;
+      let output: unknown[];
+      if (primaryStep === 1) {
+        assert.match(serialized, /Gauntlet Residue Sheet/, 'the first step sees the accepted request');
+        assert.ok(tools.includes('tool_search'), 'blank state exposes metadata discovery');
+        output = [functionCall('discover-sheet-write', 'tool_search', {
+          query: 'create a new google sheet with a header row',
+          role_key: serialized.match(/clause-\d+:[a-z_]+/i)?.[0] ?? null,
+          limit: 8,
+        })];
+      } else if (primaryStep === 2) {
+        assert.match(serialized, new RegExp(SURVIVES_SHEET_OPERATION),
+          'foreground discovery returns the sheet operation');
+        assert.match(serialized, new RegExp(survivesCapabilityId),
+          'the exact disclosed write ref reaches the model');
+        assert.ok(tools.includes(PLAN_CONTROL),
+          'disclosure exposes plan_task on the next model surface');
+        output = [functionCall('admit-gauntlet-residue-sheet-survives', PLAN_CONTROL, {
+          preamble: PREAMBLE,
+          draft: {
+            criteria: [
+              'One new Google Sheet named "Gauntlet Residue Sheet" exists with the header row Scenario, Status, Notes.',
+            ],
+            cardinality: null,
+            destination: { posture: 'create_new', family: 'googlesheets', handleRequired: true },
+            topology: {
+              version: 1,
+              operations: [{
+                id: WRITE_REQUIREMENT,
+                effect: 'external_write',
+                coverage: null,
+                dependsOn: [],
+                dataFrom: [],
+                cardinality: { kind: 'once' },
+              }],
+              universes: [],
+            },
+            bindings: [{
+              operationId: WRITE_REQUIREMENT,
+              role: 'destination',
+              capabilityRef: survivesCapabilityId,
+              evidence: ['receipt'],
+            }],
+            deliverables: [{ id: 'gauntlet-residue-sheet-survives', kind: 'googlesheets' }],
+            evidenceRequirements: ['receipt'],
+          },
+        })];
+      } else if (primaryStep === 3) {
+        const planRecord = eventlog.getToolOutput(session.id, 'admit-gauntlet-residue-sheet-survives') as { output?: unknown } | null;
+        const planText = String(planRecord?.output ?? '');
+        assert.match(planText, /"ok":\s*true/,
+          `plan_task must admit the same-turn-disclosed write despite stale process-wide residue: ${planText}`);
+        assert.ok(tools.includes('work_call'), 'the activated business carrier is available');
+        output = [functionCall('gauntlet-residue-sheet-create-survives', 'work_call', {
+          requirement_id: WRITE_REQUIREMENT,
+          universe_item_id: null,
+          universe_selector: null,
+          seal_amendment: null,
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            tool_slug: SURVIVES_SHEET_OPERATION,
+            arguments: JSON.stringify({
+              title: 'Gauntlet Residue Sheet',
+              header_row: ['Scenario', 'Status', 'Notes'],
+            }),
+            connected_account_id: 'conn-googlesheets-residue-survives',
+          }),
+        })];
+      } else {
+        output = [textMessage(JSON.stringify({
+          summary: SUCCESS,
+          reply: SUCCESS,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        }))];
+      }
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+        output,
+        responseId: `gauntlet-residue-survives-${primaryStep}`,
+      };
+    },
+    getStreamedResponse: streamResponse,
+  };
+
+  bridge._setBridgeImplsForTests({
+    buildAgent: async (options) => buildOrchestratorAgent({
+      ...options,
+      model: scriptedModel as never,
+    }),
+  });
+
+  const edits: string[] = [];
+  const transport = {
+    async sendInitial() {
+      return { async edit(content: string) { edits.push(content); } };
+    },
+    async sendError(content: string) { edits.push(`ERROR:${content}`); },
+    async sendFollowup(content: string) { edits.push(content); },
+  };
+
+  let acceptedSource: { seq: number } | null = null;
+  await discord.runDiscordHarnessConversation({
+    prompt: PROMPT,
+    rawPrompt: PROMPT,
+    channelId: 'discord-channel-gauntlet-residue-survives',
+    userId: 'discord-user-gauntlet-residue-survives',
+    guildId: 'discord-guild-gauntlet-survives',
+    transport,
+    durableRequest: {
+      sessionId: session.id,
+      runId: 'discord-gauntlet-sheet-residue-survives-request-1',
+      onSourceAccepted(source: { seq: number }) {
+        acceptedSource = { seq: source.seq };
+      },
+    },
+  });
+
+  assert.ok(acceptedSource, 'the exported Discord runner accepted one durable source');
+  const sourceUserSeq = acceptedSource!.seq;
+  assert.equal(primaryStep, 4, JSON.stringify({
+    planOutput: eventlog.getToolOutput(session.id, 'admit-gauntlet-residue-sheet-survives'),
+    edits,
+  }));
+
+  const planRecord = eventlog.getToolOutput(session.id, 'admit-gauntlet-residue-sheet-survives') as { output?: unknown } | null;
+  const planOutput = String(planRecord?.output ?? '');
+  assert.match(planOutput, /"ok":\s*true/, planOutput);
+  assert.doesNotMatch(planOutput, /plan_not_admitted|frozen host catalog|not disclosed/);
+
+  const snapshotRow = eventlog.openEventLog().prepare(`
+    SELECT snapshot_json FROM accepted_source_catalog_snapshots
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(session.id, sourceUserSeq) as { snapshot_json: string } | undefined;
+  assert.ok(snapshotRow, 'plan admission persisted the accepted-source snapshot');
+  assert.notEqual(snapshotRow!.snapshot_json, '[]',
+    'the frozen snapshot must not come back completely empty despite stale process-wide residue');
+  assert.match(snapshotRow!.snapshot_json, new RegExp(survivesCapabilityId),
+    'the frozen catalog contains the same-turn-disclosed write capability');
+
+  assert.equal(providerWrites.length, 1, 'exactly one sheet write crossed the provider wire');
+
+  // THE POINT OF THIS PIN: registering the selected write must not have
+  // collaterally evicted the unrelated, still-stale residue from the LIVE
+  // FACTORY. S1-residue only proves admission tolerates their absence;
+  // this proves they were never forgotten in the first place.
+  for (const id of residueCapabilityIds) {
+    assert.ok(factory.get(id), `unrelated stale residue ${id} must survive this turn's registration in the live factory`);
+  }
+});

@@ -34,15 +34,23 @@ test('composioSlug: extracts the action slug from gateway args', () => {
   assert.equal(composioSlug('run_shell_command', '{"command":"ls"}'), undefined);
 });
 
-test('traceToWorkflowDraft: CALL-2 — a single composio call becomes a STRUCTURED call node (not prose)', () => {
+test('traceToWorkflowDraft: a single composio call becomes a tool-locked PROSE step, never a bare `call` node', () => {
+  // Regression pin (2026-08-26): the workflow definition validator and runner
+  // now require any `call` step to carry a paired, exact `invocationPlan`
+  // (workflow-validator.ts "structured call is missing its exact
+  // invocationPlan"; workflow-runner.ts `workflow_exact_call_plan_missing`,
+  // landed in the durable-activation wave, commit 60db67d8). A pure trace
+  // reader has no access to the live capability/schema catalog needed to
+  // compile that plan, so emitting the old CALL-2 bare `call` shape here
+  // would promote a workflow that either 422s at creation or hard-blocks at
+  // run time. The step must stay a real, dispatchable model step.
   const draft = traceToWorkflowDraft([
     call('composio_execute_tool', '{"tool":"SALESFORCE_GET_RECORDS","arguments":{"soql":"SELECT Id FROM Account"}}'),
   ]);
   assert.equal(draft.steps.length, 1);
   const step = draft.steps[0];
-  // captured as a structured call: exact slug + args reproduced, no prompt
-  assert.deepEqual(step.call, { tool: 'SALESFORCE_GET_RECORDS', args: { soql: 'SELECT Id FROM Account' } });
-  assert.equal(step.prompt, '');
+  assert.equal(step.call, undefined, 'no unpaired structured call — it has no production dispatch authority');
+  assert.match(step.prompt, /Run the SALESFORCE_GET_RECORDS action via composio_execute_tool/);
   assert.deepEqual(step.allowedTools, ['composio_execute_tool']);
   assert.equal(step.observed.slug, 'SALESFORCE_GET_RECORDS');
 });

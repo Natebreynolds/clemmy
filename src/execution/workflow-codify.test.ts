@@ -15,19 +15,23 @@ const mechanical = () => ({
   output: { type: 'object', required_keys: ['metrics'] },
 });
 
-test('codifies a mechanical single-tool step into a direct call, args from the declared contract', () => {
+test('codifyMechanicalSteps is currently a no-op — a bare call has no production dispatch authority', () => {
+  // Regression pin (2026-08-26): the workflow definition validator and
+  // runner now require any `call` step to carry a paired, exact
+  // `invocationPlan` (workflow-validator.ts "structured call is missing its
+  // exact invocationPlan"; workflow-runner.ts `workflow_exact_call_plan_missing`,
+  // landed in the durable-activation wave, commit 60db67d8). This sync,
+  // no-LLM pass has no access to the live capability/schema catalog needed to
+  // compile that plan, so converting a working model step into an
+  // un-writable-when-enabled `call` step would be strictly worse than leaving
+  // it a model step. The candidate report (proposeCodifiedStep, covered by the
+  // other tests below) is unaffected — only the mutating conversion stands down.
   const steps = [mechanical()] as any[];
   const r = codifyMechanicalSteps(steps);
-  assert.deepEqual(r.codified, ['pull']);
-  assert.equal(stepExecutor(steps[0]), 'call');
-  assert.equal(steps[0].call.tool, 'dataforseo_domain_rank_overview');
-  assert.deepEqual(steps[0].call.args, { target: '{{input.domain}}' });
-  // Reversibility: the original model step is preserved.
-  assert.equal(steps[0].codifiedFrom.prompt, 'Fetch the domain rank overview for the prospect.');
-  assert.deepEqual(steps[0].codifiedFrom.allowedTools, ['dataforseo_domain_rank_overview']);
-  // Structure preserved.
-  assert.equal(steps[0].id, 'pull');
-  assert.deepEqual(steps[0].output, { type: 'object', required_keys: ['metrics'] });
+  assert.deepEqual(r.codified, []);
+  assert.equal(stepExecutor(steps[0]), 'model');
+  assert.equal(steps[0].call, undefined);
+  assert.equal(steps[0].codifiedFrom, undefined);
 });
 
 test('does NOT codify a JUDGMENT step behind a mechanical-looking verb', () => {
@@ -69,12 +73,12 @@ test('does NOT codify when args are not mechanically derivable (no declared inpu
   assert.equal(proposeCodifiedStep(step), null);
 });
 
-test('is idempotent — a second pass leaves the already-coded step untouched', () => {
+test('is idempotent — repeated passes stay a no-op', () => {
   const steps = [mechanical()] as any[];
   codifyMechanicalSteps(steps);
   const again = codifyMechanicalSteps(steps);
   assert.deepEqual(again.codified, []);
-  assert.equal(stepExecutor(steps[0]), 'call');
+  assert.equal(stepExecutor(steps[0]), 'model');
 });
 
 test('args resolve by input name and honor an explicit default', () => {

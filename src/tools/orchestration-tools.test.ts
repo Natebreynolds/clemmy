@@ -415,7 +415,11 @@ test('workflow_create/update tool schemas accept contracts and explain structure
   assert.match(callDescription(updateSchema), /data\.records/);
 });
 
-test('workflow_create saves authored step input contracts as direct call nodes when codifiable', async () => {
+test('workflow_create saves authored step input contracts as a model step — codify-to-call is currently a no-op', async () => {
+  // Regression pin (2026-08-26): codifyMechanicalSteps stands down while a
+  // bare `call` step has no production dispatch authority (see
+  // workflow-codify.ts). This step used to get auto-converted to a `call`
+  // node; it must now stay the working model step it was authored as.
   const result = await workflowCreate()({
     name: 'codified-create-flow',
     description: 'Pull domain rank metrics with a direct tool call.',
@@ -432,9 +436,10 @@ test('workflow_create saves authored step input contracts as direct call nodes w
 
   assert.match(resultText(result), /Created workflow "codified-create-flow"/);
   const saved = readWorkflow('codified-create-flow')!.data.steps[0];
-  assert.equal(saved.call?.tool, 'dataforseo_domain_rank_overview');
-  assert.deepEqual(saved.call?.args, { target: '{{input.domain}}' });
-  assert.equal(saved.codifiedFrom?.prompt, 'Fetch the domain rank overview.');
+  assert.equal(saved.call, undefined);
+  assert.equal(saved.codifiedFrom, undefined);
+  assert.equal(saved.prompt, 'Fetch the domain rank overview.');
+  assert.deepEqual(saved.allowedTools, ['dataforseo_domain_rank_overview']);
 });
 
 test('workflow_create accepts durable resources separately from run inputs and workflow_get surfaces them', async () => {

@@ -1713,7 +1713,13 @@ export function beginTypedPhysicalDispatch(input: {
     return { status: 'conflict', reason: 'typed authority envelope is not reconstructable' };
   }
   const authority = checked.authority;
-  if (!typedExecutionCatalogReady()) {
+  // Scoped to the one manifest this dispatch actually needs: mintResolvedCallAuthority
+  // already independently re-verified this exact manifest's observation/identity when
+  // it sealed `authority`, so this is a fresh re-check for that manifest, not a
+  // global sweep. An unscoped check here would gate every dispatch on the freshness
+  // of every manifest the daemon has ever registered, which a long-running process
+  // can practically never satisfy all at once.
+  if (!typedExecutionCatalogReady([authority.manifestId])) {
     return { status: 'conflict', reason: 'typed catalog is not ready' };
   }
   const boundArgs = input.authority.canonicalArgs;

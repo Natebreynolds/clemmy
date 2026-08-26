@@ -568,8 +568,17 @@ export async function registerProofProvisionedCapabilities(identity: {
       if (!peekHostCapabilityCatalogFactory()) installHostCapabilityCatalogFactory(factory);
       // Readiness gates every typed physical crossing on exact ports for the
       // now-required manifests; the refresh reconstructs them (same seam the
-      // beta pack uses at boot).
-      refreshTypedExecutionReadiness();
+      // beta pack uses at boot). Scoped to exactly what this call registered:
+      // an unscoped refresh here treats every OTHER "current" manifest this
+      // long-running daemon has ever installed as required too, and forgets
+      // (from the live factory) any of them whose independent observation has
+      // aged past its freshness window — live 2026-08-26, a fresh, correctly
+      // proven and selected write still refused "no longer matches the frozen
+      // host catalog" with a completely empty frozen snapshot, because that
+      // sweep collaterally wiped unrelated residue from earlier sessions. This
+      // capability's own freshness is still fully enforced below; only the
+      // OTHERS' staleness stops mattering to a call that never asked about them.
+      refreshTypedExecutionReadiness(registered);
     }
     return { registered };
   } catch {
