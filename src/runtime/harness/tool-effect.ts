@@ -6,6 +6,7 @@ import {
   type ToolSideEffect,
 } from '../../tools/tool-registry.js';
 import { classifyShellCommand, classifyShellNetworkMutation, expandLiteralShellCommands } from './destination-gate.js';
+import { peekHostCapabilityCatalogFactory } from './host-capability-catalog-factory.js';
 import { isMutatingExternalWrite } from './execution-gate.js';
 import { resolveCallToolAlias } from '../../tools/call-tool-alias.js';
 import {
@@ -625,6 +626,29 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
   const isNamespaced = normalized.includes('__');
   const isClementineLocal = isClementineLocalNamespace(normalized);
   if (isNamespaced && !isClementineLocal) return classifyNativeMcp(toolName, args);
+
+  // IDENTITY BEFORE SPELLING. If this exact name is a capability the host has
+  // already registered, its effect is a KNOWN, provisioned fact — the registry
+  // recorded it from the manifest at connect time. Ask the registry rather than
+  // inferring an effect from how the name happens to be spelled.
+  //
+  // Live 2026-08-26: the model called a registered write capability by its
+  // registered lowercase name. The SCREAMING_SNAKE test below is case-sensitive,
+  // so it did not match, nothing else recognized the name, and the effect came
+  // back 'unknown' — which the production call boundary refuses outright. The
+  // write was refused five times while the registry two modules away held
+  // `effect: external_write` for that exact toolName. Casing is not a safety
+  // property, and a capability the host itself provisioned should never be
+  // unclassifiable.
+  if (!isNamespaced) {
+    const registered = peekHostCapabilityCatalogFactory()?.snapshot()
+      .find((entry) => entry.toolName.trim().toLowerCase() === normalized.trim().toLowerCase());
+    if (registered && String(registered.providerKind ?? '') === 'composio') {
+      // Same classifier the spelled-correctly path uses; only the way we found
+      // it differs. Every downstream gate still runs on the result.
+      return classifyComposio({ tool_slug: registered.toolName, arguments: args });
+    }
+  }
 
   // A bare SCREAMING_SNAKE name is a Composio slug: tool_search hands the
   // model slugs as exact reachable inner-tool names, and dispatch resolves
